@@ -22,6 +22,25 @@ public static class Startup
     internal static LispFunction? LookupCompilerMacroAsMacro(Symbol sym) =>
         sym.Function is LispFunction ? null : LookupCompilerMacro(sym);
 
+    /// <summary>A number that changes whenever an entry of the compiler's *MACROS*
+    /// tables is stored or removed, or a table is replaced; -1 while those tables
+    /// are not known yet. LookupCompilerMacro's answer for a symbol can only change
+    /// when this does.</summary>
+    internal static long MacroTablesVersion()
+    {
+        var syms = _macroTableSyms;
+        if (syms == null) return -1;
+        long v = 17;
+        foreach (var macrosSym in syms)
+        {
+            if (macrosSym.Value is LispHashTable t)
+                v = v * 1000003 + System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(t) * 65537L + t.Version;
+            else
+                v = v * 1000003;
+        }
+        return v;
+    }
+
     /// <summary>Look up a macro expander in the compiler's *macros* hash table by symbol.
     /// Returns the LispFunction expander if found, null otherwise.</summary>
     internal static LispFunction? LookupCompilerMacro(Symbol sym)
@@ -270,6 +289,7 @@ public static class Startup
     {
         if (_initialized) return;
         _initialized = true;
+        CallTls.Claim();
 
         // Resolve shared-framework assemblies by simple name when the default loader
         // can't satisfy a strong-name reference. The dotcl runtime is a plain net10.0
@@ -871,14 +891,26 @@ public static class Startup
         // invisible to eval, which fails silently inside the hook's ignore-errors.
         DotclPkg.Export(SymInPkg("WRITE-R2R-SIBLING", "DOTCL"));
         RegisterUnaryOnSymbol("WRITE-R2R-SIBLING", "DOTCL", a => {
-            var path = a is LispString ls ? ls.Value
+            var path = Runtime.StringValueOrNull(a) is string ls ? ls
                      : a is LispPathname lp ? lp.ToNamestring()
                      : throw new LispErrorException(new LispProgramError(
                            "WRITE-R2R-SIBLING: not a pathname designator"));
             Runtime.WriteR2rSibling(path);
-            return System.IO.File.Exists(path + ".r2r-" + Runtime.PortableRidForLisp())
+            return System.IO.File.Exists(path + ".r2r-" + Runtime.PortableRid())
                 ? (LispObject)T.Instance : Nil.Instance;
         });
+
+        DotclPkg.Export(SymInPkg("PACKAGE-RID", "DOTCL"));
+        Emitter.CilAssembler.RegisterFunction("PACKAGE-RID", new LispFunction(args =>
+            Runtime.PackageRid() is string r ? new LispString(r) : Nil.Instance, "PACKAGE-RID"));
+        SymInPkg("PACKAGE-RID", "DOTCL").Function = Emitter.CilAssembler.GetFunction("PACKAGE-RID");
+        Emitter.CilAssembler.RegisterFunction("%PACKAGE-RID-FOR", new LispFunction(args =>
+            args.Length == 3
+                && Runtime.PackageRidFor(Runtime.StringValueOrNull(args[0]),
+                                         Runtime.StringValueOrNull(args[1]),
+                                         Runtime.StringValueOrNull(args[2])) is string r
+                ? new LispString(r) : Nil.Instance, "%PACKAGE-RID-FOR"));
+        SymInPkg("%PACKAGE-RID-FOR", "DOTCL").Function = Emitter.CilAssembler.GetFunction("%PACKAGE-RID-FOR");
 
         // The text the debugger banner and the non-interactive diagnostics print
         // for a condition. Not exported: this exists so a test can assert that the
@@ -1902,6 +1934,14 @@ public static class Startup
             var fslFn = new LispFunction(Runtime.FunctionSourceLocation, "DOTCL:FUNCTION-SOURCE-LOCATION", -1);
             RegisterDotcl("FUNCTION-SOURCE-LOCATION", fslFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:FUNCTION-SOURCE-LOCATION", fslFn);
+            var dssFn = new LispFunction(Runtime.DefinitionSources, "DOTCL:DEFINITION-SOURCES", -1);
+            RegisterDotcl("DEFINITION-SOURCES", dssFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:DEFINITION-SOURCES", dssFn);
+            var dsFn = new LispFunction(Runtime.DefinitionSource, "DOTCL:DEFINITION-SOURCE", -1);
+            RegisterDotcl("DEFINITION-SOURCE", dsFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:DEFINITION-SOURCE", dsFn);
+            RegisterDotclInternal("%NOTE-DEFINITION",
+                new LispFunction(Runtime.NoteDefinition, "DOTCL::%NOTE-DEFINITION", -1));
             var rdsFn = new LispFunction(Runtime.RecordDefinitionSourcesForm, "DOTCL:RECORD-DEFINITION-SOURCES", -1);
             RegisterDotcl("RECORD-DEFINITION-SOURCES", rdsFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:RECORD-DEFINITION-SOURCES", rdsFn);
@@ -2119,10 +2159,18 @@ public static class Startup
             LispObject stream = args.Length > 0 ? args[0] : Nil.Instance;
             if (stream is Nil) stream = DynamicBindings.Get(Sym("*STANDARD-OUTPUT*"));
             else if (stream is T) stream = DynamicBindings.Get(Sym("*TERMINAL-IO*"));
-            if (stream is not LispStream && !(stream is LispInstance gi && Runtime.IsGrayOutputStream(gi)))
+            if (stream is not LispStream && !(stream is LispInstance gi && Runtime.IsGrayStream(gi)))
                 throw new LispErrorException(new LispTypeError("CHARPOS: not a stream", stream, Sym("STREAM")));
             return Runtime.StreamColumn(stream) is int col ? Fixnum.Make(col) : Nil.Instance;
         }, "CHARPOS", -1));
+
+        // dotcl:pretty-stream-p: true when STREAM is the stream of a logical
+        // block being printed, as sb-pretty:pretty-stream-p.
+        RegisterDotcl("PRETTY-STREAM-P", new LispFunction(args => {
+            if (args.Length != 1)
+                throw new LispErrorException(new LispProgramError("PRETTY-STREAM-P: wrong number of arguments"));
+            return Runtime.IsPrettyStream(args[0]) ? T.Instance : Nil.Instance;
+        }, "PRETTY-STREAM-P", -1));
 
         // dotcl:symbol-global-value: the global value of a symbol, ignoring any
         // dynamic binding in effect on this thread (like sb-ext:symbol-global-value
@@ -2151,18 +2199,31 @@ public static class Startup
 
         // dotcl:getenv: get environment variable (like sb-posix:getenv on SBCL)
         RegisterDotcl("GETENV", new LispFunction(args => {
-            var name = args[0] is LispString s ? s.Value : args[0].ToString();
+            var name = Runtime.StringValueOrNull(args[0]) ?? args[0].ToString();
             var val = System.Environment.GetEnvironmentVariable(name);
             return val != null ? (LispObject)new LispString(val) : Nil.Instance;
         }));
+
+        // dotcl:getpid: the process id (like sb-posix:getpid on SBCL).
+        RegisterDotcl("GETPID", new LispFunction(_ => Fixnum.Make(
+#if NETSTANDARD2_0
+            System.Diagnostics.Process.GetCurrentProcess().Id
+#else
+            System.Environment.ProcessId
+#endif
+            ), "GETPID", 0));
+
+        // dotcl:string-to-octets, dotcl:octets-to-string: as in sb-ext.
+        RegisterDotcl("STRING-TO-OCTETS", new LispFunction(Runtime.StringToOctets, "STRING-TO-OCTETS"));
+        RegisterDotcl("OCTETS-TO-STRING", new LispFunction(Runtime.OctetsToString, "OCTETS-TO-STRING"));
 
         // dotcl:setenv: set an environment variable (backs (setf uiop:getenv)).
         // Returns the value set.
         RegisterDotcl("SETENV", new LispFunction(args => {
             if (args.Length < 2)
                 throw new LispErrorException(new LispProgramError("SETENV: requires 2 arguments"));
-            var name = args[0] is LispString ns ? ns.Value : args[0].ToString();
-            var value = args[1] is LispString vs ? vs.Value : args[1].ToString();
+            var name = Runtime.StringValueOrNull(args[0]) ?? args[0].ToString();
+            var value = Runtime.StringValueOrNull(args[1]) ?? args[1].ToString();
             System.Environment.SetEnvironmentVariable(name, value);
             return args[1];
         }));
@@ -2172,10 +2233,23 @@ public static class Startup
         RegisterDotcl("UNSETENV", new LispFunction(args => {
             if (args.Length < 1)
                 throw new LispErrorException(new LispProgramError("UNSETENV: requires 1 argument"));
-            var name = args[0] is LispString s ? s.Value : args[0].ToString();
+            var name = Runtime.StringValueOrNull(args[0]) ?? args[0].ToString();
             System.Environment.SetEnvironmentVariable(name, null);
             return Nil.Instance;
         }));
+
+        // dotcl:posix-environ: the environment as "NAME=VALUE" strings, as
+        // sb-ext:posix-environ; the form launch-process's :environment takes.
+        RegisterDotcl("POSIX-ENVIRON", new LispFunction(_ => {
+            var entries = new List<string>();
+            foreach (System.Collections.DictionaryEntry e in System.Environment.GetEnvironmentVariables())
+                entries.Add($"{e.Key}={e.Value}");
+            entries.Sort(StringComparer.Ordinal);
+            LispObject result = Nil.Instance;
+            for (int i = entries.Count - 1; i >= 0; i--)
+                result = new Cons(new LispString(entries[i]), result);
+            return result;
+        }, "POSIX-ENVIRON", 0));
 
         // dotcl:combine-fasls: back uiop:combine-fasls (monolithic FASL bundle).
         // The inputs are not concatenated: a dotcl FASL is a .NET PE assembly, so
@@ -2364,6 +2438,15 @@ public static class Startup
 
         RegisterDotcl("DOTCL-HOMEDIR-PATHNAME", new LispFunction(Runtime.ContribParent));
 
+        // dotcl:*exit-hooks*: functions of no arguments called, in order, when
+        // the process exits: through dotcl:quit or when the program ends, as
+        // sb-ext:*exit-hooks*. An error in one is reported and the next runs.
+        var (exitHooks, _) = DotclPkg.Intern("*EXIT-HOOKS*");
+        DotclPkg.Export(exitHooks);
+        exitHooks.IsSpecial = true;
+        if (exitHooks.Value == null) exitHooks.Value = Nil.Instance;
+        Runtime.InstallExitHooks(exitHooks);
+
         // dotcl:quit: exit the process (like sb-ext:exit on SBCL)
         RegisterDotcl("QUIT", new LispFunction(args => {
             int code = args.Length > 0 && args[0] is Fixnum n ? (int)n.Value : 0;
@@ -2376,7 +2459,7 @@ public static class Startup
         // COMMAND-LINE-ARGUMENTS below is shaped for uiop, which means a script's own
         // arguments sit behind a "--" marker: reading the first element of it answers
         // "dotcl", which is what everyone writes first and it is always wrong. This is
-        // the plain list, empty when dotcl was not started on a script.
+        // the plain list, empty when dotcl was given neither a script nor `--`.
         RegisterDotcl("SCRIPT-ARGUMENTS", new LispFunction(args => {
             LispObject result = Nil.Instance;
             var sa = Runtime.ScriptArgs;
@@ -2389,7 +2472,8 @@ public static class Startup
         // dotcl:command-line-arguments: argv as uiop:raw-command-line-arguments
         // expects it on dotcl.
         //
-        // When invoked as a positional script (`dotcl file.lisp a b c`), return
+        // When invoked as a positional script (`dotcl file.lisp a b c`) or with
+        // `--` (`dotcl --eval F -- a b c`), return
         // a `--`-delimited list: (<script> "--" "a" "b" "c"). uiop's
         // command-line-arguments (non-:executable path) does (rest (member "--" ...)),
         // so this yields the user args ("a" "b" "c"). This is dotcl's chosen
@@ -2441,8 +2525,8 @@ public static class Startup
             if (args.Length < 2)
                 throw new LispErrorException(new LispProgramError(
                     "SIL-TO-FASL: requires input-path and output-path"));
-            var inPath = args[0] is LispString ls ? ls.Value : args[0].ToString();
-            var outPath = args[1] is LispString ls2 ? ls2.Value : args[1].ToString();
+            var inPath = Runtime.StringValueOrNull(args[0]) ?? args[0].ToString();
+            var outPath = Runtime.StringValueOrNull(args[1]) ?? args[1].ToString();
             var source = System.IO.File.ReadAllText(inPath);
             var reader = new Reader(new System.IO.StringReader(source));
             if (!reader.TryRead(out var instrList))
@@ -2711,12 +2795,12 @@ public static class Startup
         // Public API used by uiop:run-program in dotcl/asdf. Takes (exe args-list)
         // where args-list is a list of strings. No shell wrapping; caller decides.
         var runProcess = new LispFunction(args => {
-            var exe = args[0] is LispString es ? es.Value : args[0].ToString();
+            var exe = Runtime.StringValueOrNull(args[0]) ?? args[0].ToString();
             var argList = args.Length > 1 ? args[1] : Nil.Instance;
             var argStrings = new System.Collections.Generic.List<string>();
             var cur = argList;
             while (cur is Cons c) {
-                argStrings.Add(c.Car is LispString ls2 ? ls2.Value : c.Car.ToString());
+                argStrings.Add(Runtime.StringValueOrNull(c.Car) ?? c.Car.ToString());
                 cur = c.Cdr;
             }
             // Built outside the try: an argument that cannot be passed safely to a
@@ -2751,7 +2835,9 @@ public static class Startup
         //           if-input-does-not-exist if-output-exists if-error-output-exists
         //           external-format) -> #<PROCESS>
         // Each of input/output/error is :stream (default), a pathname (file
-        // redirection), nil (EOF / discard), or t/:inherit (inherit parent handle).
+        // redirection), nil (EOF / discard), t/:inherit (inherit parent handle),
+        // or any other Lisp stream, which a thread copies to or from the pipe
+        // (as sb-ext:run-program does). :error :output sends stderr where stdout goes.
         // :environment follows sb-ext:run-program: a list of "VAR=value" strings
         // that REPLACES the child's entire environment; omit the key to inherit
         // the parent's environment (an explicit nil means an empty environment).
@@ -2763,11 +2849,11 @@ public static class Startup
         // All the file/null plumbing lives in LispProcess.Launch so the UIOP
         // #+dotcl branch stays small.
         RegisterDotcl("LAUNCH-PROCESS", new LispFunction(args => {
-            var program = args[0] is LispString es ? es.Value : args[0].ToString();
+            var program = Runtime.StringValueOrNull(args[0]) ?? args[0].ToString();
             var argStrings = new System.Collections.Generic.List<string>();
             var cur = args.Length > 1 ? args[1] : (LispObject)Nil.Instance;
             while (cur is Cons c) {
-                argStrings.Add(c.Car is LispString ls ? ls.Value : c.Car.ToString());
+                argStrings.Add(Runtime.StringValueOrNull(c.Car) ?? c.Car.ToString());
                 cur = c.Cdr;
             }
             LispObject input = Keyword("STREAM"), output = Keyword("STREAM"), error = Keyword("STREAM");
@@ -2800,18 +2886,15 @@ public static class Startup
                 else if (!haveIfOut && k == Keyword("IF-OUTPUT-EXISTS")) { ifOutputExists = v; haveIfOut = true; }
                 else if (!haveIfErr && (k == Keyword("IF-ERROR-EXISTS") || k == Keyword("IF-ERROR-OUTPUT-EXISTS"))) { ifErrorExists = v; haveIfErr = true; }
             }
-            string? dir = directory switch {
-                LispString ds when ds.Value.Length > 0 => ds.Value,
-                LispPathname dp => dp.ToNamestring(),
-                _ => null
-            };
+            string? dir = directory is LispPathname dp ? dp.ToNamestring()
+                : Runtime.StringValueOrNull(directory) is { Length: > 0 } ds ? ds : null;
             System.Collections.Generic.List<string>? env = null;
             if (haveEnv)
             {
                 env = new System.Collections.Generic.List<string>();
                 var ec = environment;
                 while (ec is Cons envCons) {
-                    env.Add(envCons.Car is LispString evs ? evs.Value : envCons.Car.ToString());
+                    env.Add(Runtime.StringValueOrNull(envCons.Car) ?? envCons.Car.ToString());
                     ec = envCons.Cdr;
                 }
             }
@@ -2861,11 +2944,7 @@ public static class Startup
             try
             {
                 if (!p.Process.HasExited)
-#if NETSTANDARD2_0
                     p.Process.Kill();
-#else
-                    p.Process.Kill(entireProcessTree: true);
-#endif
             }
             catch { }
             return Nil.Instance;
@@ -3033,6 +3112,23 @@ public static class Startup
             return new LispString(path);
         }, "REGISTER-NATIVE-PATH", 2));
 
+        RegisterDotclInternal("%ROTATE-BYTE", new LispFunction(args =>
+            args.Length == 3 ? Runtime.RotateByte(args[0], args[1], args[2])
+                : throw new LispErrorException(new LispProgramError("%ROTATE-BYTE: requires 3 arguments")),
+            "DOTCL:%ROTATE-BYTE", 3));
+        RegisterDotclInternal("%SIMD-INSTALL", new LispFunction(args =>
+            args.Length == 1 ? SimdTable.Install(args[0])
+                : throw new LispErrorException(new LispProgramError("%SIMD-INSTALL: requires 1 argument")),
+            "DOTCL:%SIMD-INSTALL", 1));
+        RegisterDotclInternal("%SIMD-FORCE-SCALAR", new LispFunction(args =>
+        {
+            bool old = SimdOps.ForceScalar;
+            SimdOps.ForceScalar = args.Length == 1 && args[0] is not Nil;
+            return old ? T.Instance : Nil.Instance;
+        }, "DOTCL:%SIMD-FORCE-SCALAR", 1));
+        RegisterDotclInternal("%SIMD-TYPE-NAMES", new LispFunction(args => SimdTable.TypeNames(),
+            "DOTCL:%SIMD-TYPE-NAMES", 0));
+
         // REPL readline hook: set by (dotcl-repl:enable)
         RegisterDotclInternal("%SET-REPL-READLINE-HOOK", new LispFunction(args =>
         {
@@ -3073,11 +3169,11 @@ public static class Startup
             // output or standard error, so text going to a string or a file
             // stays plain.
             bool enabled;
-            if (target == null) enabled = ReplColor.Out;
+            if (target == null) enabled = ReplColor.OutOn;
             else if (target is Nil) enabled = false;
             else if (target is T) enabled = true;
             else if (target is Symbol ts)
-                enabled = ts.Name == "ERROR" ? ReplColor.Err : ReplColor.Out;
+                enabled = ts.Name == "ERROR" ? ReplColor.ErrOn : ReplColor.OutOn;
             else
                 return new LispString(ReplColor.ForStream(role, text, target));
             return new LispString(ReplColor.Paint(role, text, enabled));
@@ -3111,6 +3207,25 @@ public static class Startup
             string? term = args[2] is Nil ? null : Runtime.AsStringDesignator(args[2], "%REPL-COLOR-DECISION");
             return ReplColor.Decide(mode, noColor, term, args[3] is not Nil) ? T.Instance : Nil.Instance;
         }, "DOTCL:%REPL-COLOR-DECISION", 4));
+
+        // (%REPL-RUN output error-output color-p readline debugger-read): run
+        // the REPL on this thread, reading through READLINE (and the debugger
+        // through DEBUGGER-READ, or NIL) and writing to the two streams, until
+        // the end of input. For dotcl-repl:run-repl.
+        RegisterDotclInternal("%REPL-RUN", new LispFunction(args =>
+        {
+            if (args.Length != 5 || args[3] is not LispFunction readline)
+                throw new LispErrorException(new LispProgramError(
+                    "DOTCL:%REPL-RUN: requires (output error-output color-p readline debugger-read)"));
+            ReplLoop.RunHosted(args[0], args[1], args[2] is not Nil, readline, args[4] as LispFunction);
+            return Nil.Instance;
+        }, "DOTCL:%REPL-RUN", 5));
+
+        // (%INTERACTIVE-INTERRUPT): what Ctrl+C does at a safepoint, for a
+        // function handed to INTERRUPT-THREAD.
+        RegisterDotclInternal("%INTERACTIVE-INTERRUPT", new LispFunction(args =>
+            ConditionSystem.Error(new LispInteractiveInterrupt()),
+            "DOTCL:%INTERACTIVE-INTERRUPT", 0));
 
         // (%REPL-LINE-EDITING-DECISION pref term input-terminal-p output-terminal-p):
         // whether the REPL reads through the line editor, as a pure function.

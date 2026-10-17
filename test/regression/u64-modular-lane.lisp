@@ -31,17 +31,17 @@
   (%u64l-check 3000)
   nil)
 
-;; Declarations that do not hold give the generic answers: a negative value,
-;; one past 2^64, a value whose high bits a right shift reads.
+;; Declarations that do not hold are a TYPE-ERROR at (safety 1); the
+;; undeclared function gives the generic answer.
 (deftest u64-modular-lane.declarations-broken
-  (list (%u64l-add -1 3)
-        (%u64l-rol -1 4)
-        (%u64l-rol (expt 2 70) 3)
-        (%u64l-shr -8)
-        (%u64l-shr (expt 2 70))
-        (%u64l-mix -5 (expt 2 80) 7))
-  (2 -1 512 #.(logxor (ash -8 -32) (ash -8 -64) (ash -8 -1))
-   #.(logxor (ash (expt 2 70) -32) (ash (expt 2 70) -64) (ash (expt 2 70) -1))
+  (flet ((te (f &rest args) (handler-case (apply f args) (type-error () :type-error))))
+    (list (te #'%u64l-add -1 3)
+          (te #'%u64l-rol -1 4)
+          (te #'%u64l-rol (expt 2 70) 3)
+          (te #'%u64l-shr -8)
+          (te #'%u64l-shr (expt 2 70))
+          (%u64l-mix -5 (expt 2 80) 7)))
+  (:type-error :type-error :type-error :type-error :type-error
    #.(ldb (byte 64 0) (logxor (+ -5 (* (expt 2 80) 3)) (lognot 7) (ash -5 7)))))
 
 (deftest u64-modular-lane.not-an-integer

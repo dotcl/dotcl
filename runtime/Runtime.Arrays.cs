@@ -75,6 +75,47 @@ public static partial class Runtime
         return MakeArray(new[] { dims, Startup.Keyword("ELEMENT-TYPE"), spec });
     }
 
+    /// <summary>MakeArrayOfType with :INITIAL-ELEMENT INIT.</summary>
+    public static LispObject MakeArrayOfTypeInit(LispObject dims, LispObject spec, LispObject init, string name)
+    {
+        if (dims is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue)
+            return new LispVector((int)f.Value, init, name);
+        return MakeArray(new[] { dims, Startup.Keyword("ELEMENT-TYPE"), spec,
+                                 Startup.Keyword("INITIAL-ELEMENT"), init });
+    }
+
+    /// <summary>(MAKE-ARRAY dims :ELEMENT-TYPE (ARRAY-ELEMENT-TYPE array)) with
+    /// ARRAY evaluated: built straight with ARRAY's storage when that is one
+    /// MakeArrayOfType takes, else the generic call with the type
+    /// ARRAY-ELEMENT-TYPE reports.</summary>
+    public static LispObject MakeArrayLike(LispObject dims, LispObject array)
+    {
+        if (dims is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue
+            && array is LispVector v && IsSpecializedStorageName(v.ElementTypeName))
+            return new LispVector((int)f.Value, Nil.Instance, v.ElementTypeName);
+        return MakeArray(new[] { dims, Startup.Keyword("ELEMENT-TYPE"), ArrayElementType(array) });
+    }
+
+    /// <summary>MakeArrayLike with :INITIAL-ELEMENT INIT.</summary>
+    public static LispObject MakeArrayLikeInit(LispObject dims, LispObject array, LispObject init)
+    {
+        if (dims is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue
+            && array is LispVector v && IsSpecializedStorageName(v.ElementTypeName))
+            return new LispVector((int)f.Value, init, v.ElementTypeName);
+        return MakeArray(new[] { dims, Startup.Keyword("ELEMENT-TYPE"), ArrayElementType(array),
+                                 Startup.Keyword("INITIAL-ELEMENT"), init });
+    }
+
+    static bool IsSpecializedStorageName(string name) => name switch
+    {
+        "BIT" or "FIXNUM" or "SINGLE-FLOAT" or "DOUBLE-FLOAT"
+        or "UNSIGNED-BYTE-2" or "UNSIGNED-BYTE-4" or "UNSIGNED-BYTE-7" or "UNSIGNED-BYTE-8"
+        or "UNSIGNED-BYTE-15" or "UNSIGNED-BYTE-16" or "UNSIGNED-BYTE-31" or "UNSIGNED-BYTE-32"
+        or "UNSIGNED-BYTE-62" or "UNSIGNED-BYTE-63" or "UNSIGNED-BYTE-64"
+        or "SIGNED-BYTE-8" or "SIGNED-BYTE-16" or "SIGNED-BYTE-32" or "SIGNED-BYTE-64" => true,
+        _ => false
+    };
+
     public static LispObject MakeArray(LispObject[] args)
     {
         // (make-array dimensions &key element-type initial-element initial-contents adjustable fill-pointer)
@@ -1219,6 +1260,22 @@ public static partial class Runtime
         throw BackingTypeError(array, "UNSIGNED-BYTE-16");
     }
 
+    /// <summary>A fresh (simple-array (unsigned-byte 8) (N)), zero-filled.</summary>
+    internal static LispVector MakeOctetVector(int n)
+        => new LispVector(n, Nil.Instance, "UNSIGNED-BYTE-8");
+
+    /// <summary>A fresh (simple-array (unsigned-byte 8) (*)) holding a copy of
+    /// COUNT bytes of SRC from OFFSET.</summary>
+    internal static LispVector MakeOctetVector(byte[] src, int offset, int count)
+    {
+        var v = MakeOctetVector(count);
+        System.Buffer.BlockCopy(src, offset, (byte[])v._numData!, 0, count);
+        return v;
+    }
+
+    /// <summary>The byte[] behind a vector made by MakeOctetVector.</summary>
+    internal static byte[] OctetVectorBytes(LispVector v) => (byte[])v._numData!;
+
     public static byte[]? BackingU8(LispObject array)
     {
         if (array is LispVector v && v._dimensions == null)
@@ -1293,7 +1350,7 @@ public static partial class Runtime
             new Cons(elementType,
                 new Cons(new Cons(Startup.Sym("*"), Nil.Instance), Nil.Instance)));
 
-    private static LispObject SizedByte(string head, int width) =>
+    internal static LispObject SizedByte(string head, int width) =>
         new Cons(Startup.Sym(head), new Cons(Fixnum.Make(width), Nil.Instance));
 
     // Written out rather than wrapping the plain entries, so a true declaration
@@ -1357,6 +1414,41 @@ public static partial class Runtime
         }
         throw BackingTypeError(array, "SINGLE-FLOAT");
     }
+
+    // Element access without the CLR bounds check, for a subscript the compiled
+    // code has already proven to be inside the buffer. DataX is taken once
+    // before the loop; AtX / SetAtX index from it.
+    private static class EmptySlot<T> { public static T Value = default!; }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ref T Data<T>(T[] a)
+    {
+#if NET
+        return ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(a);
+#else
+        if (a.Length == 0) return ref EmptySlot<T>.Value;
+        return ref a[0];
+#endif
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static ref byte DataU8(byte[] a) => ref Data(a);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static ref ushort DataU16(ushort[] a) => ref Data(a);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static ref int DataI32(int[] a) => ref Data(a);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static ref long DataI64(long[] a) => ref Data(a);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static ref double DataF64(double[] a) => ref Data(a);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static ref float DataF32(float[] a) => ref Data(a);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static long AtU8(ref byte r, long i) => Unsafe.Add(ref r, (nint)i);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static long AtU16(ref ushort r, long i) => Unsafe.Add(ref r, (nint)i);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static long AtI32(ref int r, long i) => Unsafe.Add(ref r, (nint)i);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static long AtI64(ref long r, long i) => Unsafe.Add(ref r, (nint)i);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static double AtF64(ref double r, long i) => Unsafe.Add(ref r, (nint)i);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static double AtF32(ref float r, long i) => Unsafe.Add(ref r, (nint)i);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static void SetAtU8(ref byte r, long i, long v) => Unsafe.Add(ref r, (nint)i) = (byte)v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static void SetAtU16(ref ushort r, long i, long v) => Unsafe.Add(ref r, (nint)i) = (ushort)v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static void SetAtI32(ref int r, long i, long v) => Unsafe.Add(ref r, (nint)i) = (int)v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static void SetAtI64(ref long r, long i, long v) => Unsafe.Add(ref r, (nint)i) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static void SetAtF64(ref double r, long i, double v) => Unsafe.Add(ref r, (nint)i) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)] public static void SetAtF32(ref float r, long i, double v) => Unsafe.Add(ref r, (nint)i) = (float)v;
 
     public static ushort[] BackingU16Checked(LispObject array)
     {
@@ -1514,6 +1606,11 @@ public static partial class Runtime
     public static long U64Bits(LispObject value)
         => IsU64(value) ? Low64(value) : throw NotU64Error(value);
 
+    /// <summary>VALUE, an argument declared (unsigned-byte 64).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject CheckU64Arg(LispObject value)
+        => IsU64(value) ? value : throw TypedEntryTypeError(value, SizedByte("UNSIGNED-BYTE", 64));
+
     private static Exception NotU64Error(LispObject value) =>
         new LispErrorException(new LispTypeError(
             $"element value {value} does not fit (UNSIGNED-BYTE 64)", value,
@@ -1551,6 +1648,127 @@ public static partial class Runtime
         ArefSet(array, Fixnum.Make(index), BoxU64(bits));
         return bits;
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ArefU64Bits2D(LispObject array, long i0, long i1)
+    {
+        if (array is LispVector v && v.IsU64Kind && v._displacedTo == null
+            && v._dimensions != null && v._dimensions.Length == 2
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1])
+            return v.U64Get((int)(i0 * v._dimensions[1] + i1));
+        return U64Bits(Aref2D(array, Fixnum.Make(i0), Fixnum.Make(i1)));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ArefU64Bits3D(LispObject array, long i0, long i1, long i2)
+    {
+        if (array is LispVector v && v.IsU64Kind && v._displacedTo == null
+            && v._dimensions != null && v._dimensions.Length == 3
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1]
+            && (ulong)i2 < (ulong)v._dimensions[2])
+            return v.U64Get((int)((i0 * v._dimensions[1] + i1) * v._dimensions[2] + i2));
+        return U64Bits(Aref3D(array, Fixnum.Make(i0), Fixnum.Make(i1), Fixnum.Make(i2)));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ArefSetU64Bits2D(LispObject array, long i0, long i1, long bits)
+    {
+        if (array is LispVector v && v.IsU64Kind && v._displacedTo == null
+            && v._dimensions != null && v._dimensions.Length == 2
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1])
+        {
+            v.U64Set((int)(i0 * v._dimensions[1] + i1), bits);
+            return bits;
+        }
+        ArefSet2D(array, Fixnum.Make(i0), Fixnum.Make(i1), BoxU64(bits));
+        return bits;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long ArefSetU64Bits3D(LispObject array, long i0, long i1, long i2, long bits)
+    {
+        if (array is LispVector v && v.IsU64Kind && v._displacedTo == null
+            && v._dimensions != null && v._dimensions.Length == 3
+            && (ulong)i0 < (ulong)v._dimensions[0] && (ulong)i1 < (ulong)v._dimensions[1]
+            && (ulong)i2 < (ulong)v._dimensions[2])
+        {
+            v.U64Set((int)((i0 * v._dimensions[1] + i1) * v._dimensions[2] + i2), bits);
+            return bits;
+        }
+        ArefSet3D(array, Fixnum.Make(i0), Fixnum.Make(i1), Fixnum.Make(i2), BoxU64(bits));
+        return bits;
+    }
+
+    /// <summary>The storage of a value declared (SIMPLE-ARRAY elt (D0 D1 [D2])).
+    /// A negative D is a declared *. Anything else is a TYPE-ERROR at every
+    /// safety: the accesses have no other path.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Array BackingND(LispObject array, int kind, int rank, int d0, int d1, int d2,
+                                   int narrow, int check)
+    {
+        if (array is LispVector v && v._dimensions is int[] dims && dims.Length == rank
+            && v._numKind == kind && v._numData is Array data && v.IsSimple
+            && (d0 < 0 || dims[0] == d0) && (d1 < 0 || dims[1] == d1)
+            && (rank < 3 || d2 < 0 || dims[2] == d2)
+            && (check == 0 || kind == 5 || kind == 6 || v._numNarrow == narrow))
+            return data;
+        throw BackingNDError(array, kind, rank, d0, d1, d2, narrow);
+    }
+
+    private static Exception BackingNDError(LispObject array, int kind, int rank,
+                                            int d0, int d1, int d2, int narrow)
+    {
+        LispObject elt = narrow > 0 ? SizedByte("UNSIGNED-BYTE", narrow)
+            : narrow < 0 ? SizedByte("SIGNED-BYTE", -narrow)
+            : kind switch
+            {
+                1 => SizedByte("UNSIGNED-BYTE", 8),
+                2 => SizedByte("UNSIGNED-BYTE", 16),
+                3 => SizedByte("SIGNED-BYTE", 32),
+                11 => SizedByte("UNSIGNED-BYTE", 64),
+                5 => Startup.Sym("SINGLE-FLOAT"),
+                6 => Startup.Sym("DOUBLE-FLOAT"),
+                _ => Startup.Sym("FIXNUM"),
+            };
+        LispObject Dim(int d) => d < 0 ? Startup.Sym("*") : Fixnum.Make(d);
+        LispObject dl = rank == 3
+            ? new Cons(Dim(d0), new Cons(Dim(d1), new Cons(Dim(d2), Nil.Instance)))
+            : new Cons(Dim(d0), new Cons(Dim(d1), Nil.Instance));
+        var expected = new Cons(Startup.Sym("SIMPLE-ARRAY"),
+            new Cons(elt, new Cons(dl, Nil.Instance)));
+        return new LispErrorException(new LispTypeError(
+            $"declared {expected}, got {(array is LispVector lv && !lv.IsSimple ? NotSimpleDescription(array) : Typep2Name(array))}",
+            array, expected));
+    }
+
+    public static byte[] BackingNDU8(LispObject a, int rank, int d0, int d1, int d2, int narrow, int check)
+        => (byte[])BackingND(a, 1, rank, d0, d1, d2, narrow, check);
+    public static ushort[] BackingNDU16(LispObject a, int rank, int d0, int d1, int d2, int narrow, int check)
+        => (ushort[])BackingND(a, 2, rank, d0, d1, d2, narrow, check);
+    public static int[] BackingNDI32(LispObject a, int rank, int d0, int d1, int d2, int narrow, int check)
+        => (int[])BackingND(a, 3, rank, d0, d1, d2, narrow, check);
+    public static long[] BackingNDI64(LispObject a, int rank, int d0, int d1, int d2, int narrow, int check)
+        => (long[])BackingND(a, 4, rank, d0, d1, d2, narrow, check);
+    public static long[] BackingNDU64(LispObject a, int rank, int d0, int d1, int d2, int narrow, int check)
+        => (long[])BackingND(a, 11, rank, d0, d1, d2, 0, check);
+    public static float[] BackingNDF32(LispObject a, int rank, int d0, int d1, int d2, int narrow, int check)
+        => (float[])BackingND(a, 5, rank, d0, d1, d2, 0, check);
+    public static double[] BackingNDF64(LispObject a, int rank, int d0, int d1, int d2, int narrow, int check)
+        => (double[])BackingND(a, 6, rank, d0, d1, d2, 0, check);
+
+    public static long ArrayAxisOrZero(LispObject array, int axis)
+        => array is LispVector v && v._dimensions is int[] d && axis < d.Length ? d[axis] : 0;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long AxisIndexL(long i, long dim, int axis)
+    {
+        if ((ulong)i < (ulong)dim) return i;
+        return AxisIndexError(i, dim, axis);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static long AxisIndexError(long i, long dim, int axis)
+        => throw IndexError("AREF", i, (int)dim, $"axis {axis}");
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long ArefNumL(LispObject array, long index)
@@ -1945,6 +2163,29 @@ public static partial class Runtime
         return value;
     }
 
+    /// <summary>A structure slot declared (UNSIGNED-BYTE 64), read as its
+    /// bits. A slot that is not raw is read boxed and must hold such a value.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long StructRefU64(LispObject obj, int packed)
+    {
+        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
+            && s.TryRawLong(RawPosOf(s, packed, LispStruct.SlotKindU64), out long bits))
+            return bits;
+        return U64Bits(StructRefI(obj, packed));
+    }
+
+    /// <summary>The bits of an (UNSIGNED-BYTE 64) stored into a structure slot
+    /// without boxing it, returning the bits.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long StructSetU64(LispObject obj, int packed, long bits)
+    {
+        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
+            && s.TrySetRaw(RawPosOf(s, packed, LispStruct.SlotKindU64), bits))
+            return bits;
+        StructSetI(obj, packed, BoxU64(bits));
+        return bits;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long StructRefL(LispObject obj, int packed)
     {
@@ -2319,14 +2560,8 @@ public static partial class Runtime
             // Check class hierarchy for :include inheritance
             var cls = FindClassOrNil(s.TypeName) as LispClass;
             var targetCls = FindClassOrNil(sym) as LispClass;
-            if (cls != null && targetCls != null)
-            {
-                // Walk CPL to check if target is an ancestor
-                foreach (var ancestor in cls.ClassPrecedenceList)
-                {
-                    if (ReferenceEquals(ancestor, targetCls)) return T.Instance;
-                }
-            }
+            if (cls != null && targetCls != null && ClassIncludes(cls, targetCls))
+                return T.Instance;
         }
         return Nil.Instance;
     }

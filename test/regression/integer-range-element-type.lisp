@@ -17,11 +17,11 @@
    (unsigned-byte 8) (signed-byte 8) (signed-byte 16)
    (signed-byte 32) (unsigned-byte 63)
    (unsigned-byte 2) bit (unsigned-byte 64) t
-   (signed-byte 2) (signed-byte 2)))
+   (signed-byte 8) (signed-byte 8)))
 
 ;; Upgrading preserves subtype relations (CLHS 15.1.2.1): (eql 0) is in
-;; (integer -1 0) and upgrades to BIT, so a signed range upgrades to at least
-;; (signed-byte 2), which holds BIT. (ANSI UPGRADED-ARRAY-ELEMENT-TYPE.8.)
+;; (integer -1 0) and upgrades to BIT, so a signed range upgrades to a type
+;; that holds BIT. (ANSI UPGRADED-ARRAY-ELEMENT-TYPE.8.)
 (deftest integer-range-element-type.subtype-preserved
   (let* ((types '((eql 0) (eql -1) (integer 0 (1)) (integer -1 (1)) (signed-byte 1)
                   (unsigned-byte 1) bit (integer 0 (256)) (integer -256 (256))

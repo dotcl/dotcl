@@ -466,6 +466,76 @@ want "values" "$out" "OUT-RESTORED still on console"
 want "values" "$out" "ERR-CAPTURED diagnostic"
 echo "  ok: 14 assertions"
 
+# -- DESTROY-THREAD on a host thread ------------------------------------------
+# The host thread outlives the destroy and goes back to host code: only the Lisp
+# it is running may be stopped, never a later wait in C# or a later call.
+echo "=== destroy-thread on host threads ==="
+DES="$WORK2/destroy"
+mkdir -p "$DES"
+cat > "$DES/Program.cs" <<'CSEOF7'
+using DotCL;
+
+DotclHost.EnsureCore();
+DotclHost.EvalString(@"(progn
+  (defvar *victim* nil)
+  (defun save-self () (setf *victim* (dotcl:current-thread)) t)
+  (defun destroy-victim () (dotcl:destroy-thread *victim*))
+  (defun spin (n) (let ((s 0)) (dotimes (i n s) (setf s (logand (+ s i) #xffff)))))
+  (defun lisp-sleep (s) (sleep s) :slept-through))");
+
+string Try(Action a)
+{
+    try { a(); return "ok"; }
+    catch (Exception e) { return e.GetType().Name; }
+}
+
+void Victim(string label, Func<List<string>, Action> body)
+{
+    var saved = new ManualResetEventSlim();
+    var lines = new List<string>();
+    var t = new Thread(() =>
+    {
+        DotclHost.Call("SAVE-SELF"); saved.Set();
+        body(lines)();
+    });
+    t.Start(); saved.Wait(); Thread.Sleep(200);
+    DotclHost.Call("DESTROY-VICTIM");
+    t.Join();
+    Console.WriteLine($"{label} {string.Join(" ", lines)}");
+}
+
+// Outside Lisp: nothing reaches the host code or the next call.
+Victim("IN-CSHARP", lines => () =>
+{
+    lines.Add("sleep=" + Try(() => Thread.Sleep(800)));
+    lines.Add("call=" + Try(() => DotclHost.Call("SPIN", 1000)));
+    lines.Add("sleep2=" + Try(() => Thread.Sleep(100)));
+});
+
+// Computing in Lisp: the call is stopped, and nothing is left over.
+Victim("COMPUTING", lines => () =>
+{
+    lines.Add("call=" + Try(() => DotclHost.Call("SPIN", 2_000_000_000)));
+    lines.Add("sleep=" + Try(() => Thread.Sleep(100)));
+    lines.Add("call2=" + Try(() => DotclHost.Call("SPIN", 10)));
+    lines.Add("sleep2=" + Try(() => Thread.Sleep(100)));
+});
+
+// In a Lisp wait: the same.
+Victim("LISP-SLEEP", lines => () =>
+{
+    lines.Add("call=" + Try(() => DotclHost.Call("LISP-SLEEP", 30)));
+    lines.Add("sleep=" + Try(() => Thread.Sleep(100)));
+    lines.Add("call2=" + Try(() => DotclHost.Call("SPIN", 10)));
+});
+CSEOF7
+emit_csproj "$DES"
+out="$(build_and_run "destroy" "$DES")"
+want "destroy" "$out" "IN-CSHARP sleep=ok call=ok sleep2=ok"
+want "destroy" "$out" "COMPUTING call=ThreadInterruptedException sleep=ok call2=ok sleep2=ok"
+want "destroy" "$out" "LISP-SLEEP call=ThreadInterruptedException sleep=ok call2=ok"
+echo "PASS (destroy): destroying a host thread stops only the Lisp it runs"
+
 echo "=== host with dynamic code disabled (NativeAOT / file-based app) ==="
 cat > "$WORK/runtimeconfig.template.json" <<'RCEOF'
 {

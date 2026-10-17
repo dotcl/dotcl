@@ -342,8 +342,10 @@ var v = DotclHost.EvalString("(restart-case (error \"needs a value\") (use-value
 ```
 
 A failure the runtime raises itself -- a .NET method that threw, reached through
-`dotnet:invoke`, or a type error from `car` -- does not run `*debugger-hook*`: it
-unwinds as a `LispErrorException`. With the hook above installed, the
+`dotnet:invoke`, or a type error from `car` -- runs a `*debugger-hook*` of your own
+(like the restart-choosing one above) as `error` does, but not the hook
+`SetThrowingDebuggerHook` installs: it unwinds as a `LispErrorException`. With that
+hook installed, the
 `DotclHost` entry points (`EvalString`, `EvalStringMv`, `Call`, `CallMv`,
 `LoadLispFile`) turn such a failure into a `DotclConditionException` on its way
 out, so one `catch` covers both kinds. `ClrException` is the original .NET
@@ -352,8 +354,8 @@ it. Only the outermost entry converts: when Lisp code calls back into the host
 and the host calls into Lisp again, the inner failure stays a
 `LispErrorException` until it has passed the Lisp frames in between, whose
 handlers still see the original condition. A host that has bound
-`*debugger-hook*` to anything else gets the `LispErrorException` unchanged, as
-before.
+`*debugger-hook*` to a hook of its own that returns or is NIL gets the
+`LispErrorException` unchanged.
 
 `SetThrowingDebuggerHook(false)` selects the older behaviour, where the hook
 throws an `InvalidOperationException` whose message is `"TYPE: report"` and which

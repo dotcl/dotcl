@@ -106,23 +106,19 @@ note FORM as the one being evaluated, then record VALUES as what it returned."
     (pathname (concatenate 'string dir "session.lisp"))))
 
 (defun rhv-image ()
-  "The image arguments to start the child REPL on: this process's own.
+  "The image arguments to start the child REPL on.
 
-Only --core is forwarded, and only when this process was given one. A build
-without the emitter cannot make a REPL out of nothing and refuses to start
-without an image; a build with the emitter can, and is given none here, which
-is the same thing a developer gets from running the executable by hand.
-
-Read off this process's command line rather than by looking for a core file in
-the tree. A core left behind by an earlier build exists whether or not it has
-anything to do with the build under test, and a child started on one would be
-running different code from the one these tests are about -- silently, and
-with every assertion still passing."
+This process's --core when it was given one (the emit-free run). Otherwise
+compiler/dotcl.core, through REGRESSION-CHILD-CORE: given no image, the
+executable would assemble compiler/cil-out.sil on every start, which costs
+seconds per child. `make test-regression' rebuilds dotcl.core from the
+cil-out.sil the parent runs, so the child runs the same code."
   (let* ((args (dotnet:static "System.Environment" "GetCommandLineArgs"))
          (count (dotnet:invoke args "Length")))
-    (loop for i below (1- count)
-          when (equal (dotnet:invoke args "GetValue" i) "--core")
-            return (list "--core" (dotnet:invoke args "GetValue" (1+ i))))))
+    (or (loop for i below (1- count)
+              when (equal (dotnet:invoke args "GetValue" i) "--core")
+                return (list "--core" (dotnet:invoke args "GetValue" (1+ i))))
+        (list "--core" (regression-child-core)))))
 
 (defun rhv-run (lines)
   "Feed LINES to a REPL in another process and return what it printed.

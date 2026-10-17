@@ -190,11 +190,11 @@
                                  deploy)
                          "--eval" "(print (bdep-sock::probe))")))
         (list (first rd)
-              (subseq lines 0 2)
-              (and (search "bdep-sock.fasl" (third lines)) t)
+              (subseq lines 0 3)
+              (and (search "bdep-sock.fasl" (fourth lines)) t)
               (first b)
               (first r) (and (search "(T T)" (second r)) t)))))
-  (0 ("require dotcl-socket" "require dotcl-thread") t 0 0 t))
+  (0 ("require dotcl-bsd-sockets" "require dotcl-socket" "require dotcl-thread") t 0 0 t))
 
 ;;; A dependency is built the way ASDF builds it: each file is compiled and
 ;;; loaded before the next is read. resolve-deps used to concatenate the

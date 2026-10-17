@@ -70,6 +70,9 @@ public static class DynamicBindings
         if ((uint)idx < (uint)st.Counts.Length && st.Counts[idx] > 0) st.Counts[idx]--;
     }
 
+    public static LispObject GetConstant(Symbol sym)
+        => sym.Value ?? throw new LispErrorException(new LispUnboundVariable(sym));
+
     public static LispObject Get(Symbol sym)
     {
         var st = StackBinding(sym);

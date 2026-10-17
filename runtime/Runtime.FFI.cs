@@ -212,21 +212,18 @@ static class NativeFFI
     /// <summary>
     /// The CLR type to give an argument in the variadic part.
     ///
-    /// C promotes a variadic float to double everywhere. On ARM64 Windows the
-    /// variadic part additionally travels in the general-purpose registers and on
-    /// the stack -- never in v0-v7 -- so a double declared as such is written
-    /// where the callee never looks, and sprintf("%.0f", x) printed 0. Declaring
-    /// it as a 64-bit integer (and passing the double's bit pattern) puts it
-    /// exactly where the variadic callee reads from.
+    /// C promotes a variadic float to double everywhere. On Windows the variadic
+    /// callee reads its arguments from the general-purpose registers (spilled to
+    /// the home area on x64) and the stack -- never from xmm0-3 / v0-v7 -- so a
+    /// double declared as such is written where the callee never looks, and
+    /// sprintf("%.0f", x) printed 0. Declaring it as a 64-bit integer (and passing
+    /// the double's bit pattern) puts it exactly where the variadic callee reads.
     ///
-    /// Not applied elsewhere: x64 passes variadic floats in the SSE registers the
-    /// ordinary convention already uses, and ARM64 macOS puts the whole variadic
-    /// part on the stack, which PlanCall handles separately.
+    /// Not applied elsewhere: System V x64 passes variadic floats in the SSE
+    /// registers the ordinary convention already uses, and ARM64 macOS puts the
+    /// whole variadic part on the stack, which PlanCall handles separately.
     /// </summary>
-    static bool VariadicFloatsAsIntegerBits =>
-        Compat.IsWindows()
-        && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture
-           == System.Runtime.InteropServices.Architecture.Arm64;
+    static bool VariadicFloatsAsIntegerBits => Compat.IsWindows();
 
     /// <summary>
     /// Apple's ARM64 ABI passes the whole variadic part on the stack, each
@@ -246,6 +243,48 @@ static class NativeFFI
 
     const int Arm64ArgRegs = 8;
 
+    /// <summary>x86-64 System V: a variadic callee takes AL as the number of vector
+    /// registers used, and a CALLI cannot set it, so the call goes through a
+    /// thunk that sets EAX and jumps to the target.</summary>
+    static bool SysVX64Variadic =>
+        (Compat.IsLinux() || Compat.IsMacOS())
+        && System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture
+           == System.Runtime.InteropServices.Architecture.X64;
+
+    static readonly Dictionary<(IntPtr, int), IntPtr> _alThunks = new();
+
+    [DllImport("libc", EntryPoint = "mmap", SetLastError = true)]
+    static extern IntPtr Mmap(IntPtr addr, UIntPtr len, int prot, int flags, int fd, IntPtr off);
+    [DllImport("libc", EntryPoint = "mprotect", SetLastError = true)]
+    static extern int Mprotect(IntPtr addr, UIntPtr len, int prot);
+
+    static IntPtr SetAlThunk(IntPtr target, int al)
+    {
+        lock (_alThunks)
+        {
+            if (_alThunks.TryGetValue((target, al), out var t)) return t;
+            const int PROT_READ = 1, PROT_WRITE = 2, PROT_EXEC = 4, MAP_PRIVATE = 2;
+            int mapAnon = Compat.IsMacOS() ? 0x1000 : 0x20;
+            var len = (UIntPtr)4096;
+            var page = Mmap(IntPtr.Zero, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | mapAnon, -1, IntPtr.Zero);
+            if (page == new IntPtr(-1))
+                throw new LispErrorException(new LispError(
+                    $"dotnet:ffi: mmap for a variadic call thunk failed (errno {Marshal.GetLastWin32Error()})"));
+            var code = new byte[18];
+            code[0] = 0x49; code[1] = 0xBB;                      // mov r11, imm64
+            BitConverter.GetBytes(target.ToInt64()).CopyTo(code, 2);
+            code[10] = 0xB8;                                     // mov eax, imm32
+            BitConverter.GetBytes(al).CopyTo(code, 11);
+            code[15] = 0x41; code[16] = 0xFF; code[17] = 0xE3;   // jmp r11
+            Marshal.Copy(code, 0, page, code.Length);
+            if (Mprotect(page, len, PROT_READ | PROT_EXEC) != 0)
+                throw new LispErrorException(new LispError(
+                    $"dotnet:ffi: mprotect for a variadic call thunk failed (errno {Marshal.GetLastWin32Error()})"));
+            _alThunks[(target, al)] = page;
+            return page;
+        }
+    }
+
     /// <summary>The call shape: CLR types the calli is made with, and how many
     /// register-filling dummies sit between the fixed and the variadic part.</summary>
     sealed class CallPlan
@@ -253,6 +292,7 @@ static class NativeFFI
         public List<Type> CallTypes = null!;
         public int PadGp, PadFp;
         public bool StackSlots;   // variadic part passed as 8-byte integer slots
+        public int SysVAl = -1;   // >= 0: call through SetAlThunk with this AL
     }
 
     static bool IsFpType(Type t) => t == typeof(float) || t == typeof(double);
@@ -279,6 +319,8 @@ static class NativeFFI
             return plan;
         }
         plan.CallTypes = argTypes.Select((t, i) => i < fixedCount ? t : VariadicCallType(t)).ToList();
+        if (SysVX64Variadic && fixedCount < argTypes.Count)
+            plan.SysVAl = Math.Min(argTypes.Count(IsFpType), 8);
         return plan;
     }
 
@@ -286,7 +328,7 @@ static class NativeFFI
                                      CallPlan plan, LispObject[] nativeArgs)
     {
         var invokeArgs = new object?[plan.CallTypes.Count + 1];
-        invokeArgs[0] = funcPtr;
+        invokeArgs[0] = plan.SysVAl >= 0 ? SetAlThunk(funcPtr, plan.SysVAl) : funcPtr;
         int k = 1;
         for (int i = 0; i < fixedCount; i++)
             invokeArgs[k++] = ConvertArg(nativeArgs[i], argTypes[i]);
@@ -396,7 +438,7 @@ static class NativeFFI
         // Build invoke args: [funcPtr, nativeArg0, nativeArg1, ...]
         var invokeArgs = BuildInvokeArgs(funcPtr, argTypes, fixedCount, plan, nativeArgs);
 
-        var result = dm.Invoke(null, invokeArgs);
+        var result = InvokeNative(dm, invokeArgs);
         return ConvertReturn(result, retType);
     }
 
@@ -446,7 +488,7 @@ static class NativeFFI
 
         var invokeArgs = BuildInvokeArgs(funcPtr, argTypes, fixedCount, plan, nativeArgs);
 
-        var result = dm.Invoke(null, invokeArgs);
+        var result = InvokeNative(dm, invokeArgs);
         return ConvertReturn(result, retType);
     }
 
@@ -470,6 +512,42 @@ static class NativeFFI
     {
         CallbackEntry e;
         lock (_callbackEntries) e = _callbackEntries[id];
+        if (t_nativeDepth == 0) return RunCallback(e, nativeArgs);
+        // An exception can not unwind through native frames (the process aborts),
+        // so it waits until the native call returns to InvokeNative. Until then
+        // further callbacks on this thread return a zero value without running.
+        if (t_callbackEscape != null) return NativeDefault(e.RetType);
+        try { return RunCallback(e, nativeArgs); }
+        catch (Exception ex)
+        {
+            t_callbackEscape = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
+            return NativeDefault(e.RetType);
+        }
+    }
+
+    [ThreadStatic] static int t_nativeDepth;
+    [ThreadStatic] static System.Runtime.ExceptionServices.ExceptionDispatchInfo? t_callbackEscape;
+
+    static object? InvokeNative(DynamicMethod dm, object?[] invokeArgs)
+    {
+        t_nativeDepth++;
+        object? result;
+        try { result = dm.Invoke(null, invokeArgs); }
+        finally { t_nativeDepth--; }
+        var escape = t_callbackEscape;
+        if (escape != null)
+        {
+            t_callbackEscape = null;
+            escape.Throw();
+        }
+        return result;
+    }
+
+    static object? NativeDefault(Type t)
+        => IsVoidType(t) || !t.IsValueType ? null : Activator.CreateInstance(t);
+
+    static object? RunCallback(CallbackEntry e, object?[] nativeArgs)
+    {
         var lispArgs = new LispObject[nativeArgs.Length];
         for (int i = 0; i < nativeArgs.Length; i++)
             lispArgs[i] = ConvertReturn(nativeArgs[i], e.ArgTypes[i]);

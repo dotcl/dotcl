@@ -36,7 +36,8 @@
     (eval '(symbol-macrolet ((%smm-a 1)) %smm-a))
     (let ((hits '()))
       (do-all-symbols (s)
-        (when (string= (symbol-name s) "SYMBOL-MACRO") (pushnew s hits)))
+        (when (and (string= (symbol-name s) "SYMBOL-MACRO") (not (keywordp s)))
+          (pushnew s hits)))
       hits))
   nil)
 

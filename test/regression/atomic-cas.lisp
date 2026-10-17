@@ -156,3 +156,40 @@
     (list (dotcl:compare-and-swap (car cell) (list 1 2) :swapped)
           (eq (car cell) stored)))
   ((1 2) t))
+
+;; --- one lock, whether or not dotcl-thread is loaded ---
+;; dotcl-thread used to define these three macros again, with a lock of its own:
+;; code expanded before (require "dotcl-thread") and code expanded after it then
+;; took different locks for the same place, so neither excluded the other. Every
+;; expansion now names the runtime's one lock.
+
+(defun %cas-lock-names (tree)
+  (let ((names '()))
+    (labels ((walk (x)
+               (cond ((consp x) (walk (car x)) (walk (cdr x)))
+                     ((and (symbolp x) (search "LOCK" (symbol-name x))
+                           (boundp x))
+                      (pushnew (symbol-name x) names :test #'string=)))))
+      (walk tree))
+    names))
+
+(deftest cas-one-lock-for-every-expansion
+  (mapcar (lambda (form) (%cas-lock-names (macroexpand-1 form)))
+          '((dotcl:compare-and-swap (car x) 1 2)
+            (dotcl:atomic-incf (car x))
+            (dotcl:atomic-decf (svref v 0) 2)
+            (dotcl:compare-and-swap *cas-special* 1 2)
+            (dotcl:atomic-incf *cas-special*)))
+  (("*CAS-LOCK*") ("*CAS-LOCK*") ("*CAS-LOCK*") ("*CAS-LOCK*") ("*CAS-LOCK*")))
+
+;; A globally special variable is read and written by the runtime under that
+;; lock; the result is what the general expansion gives.
+(defvar *cas-sv* 1)
+(deftest cas-special-variable-values
+  (list (dotcl:compare-and-swap *cas-sv* 1 2) *cas-sv*
+        (dotcl:compare-and-swap *cas-sv* 1 3) *cas-sv*
+        (dotcl:atomic-incf *cas-sv* 5) (dotcl:atomic-decf *cas-sv*)
+        (let ((*cas-sv* 100))
+          (list (dotcl:compare-and-swap *cas-sv* 100 101) *cas-sv*))
+        *cas-sv*)
+  (1 2 2 2 7 6 (100 101) 6))

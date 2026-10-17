@@ -28,6 +28,8 @@
          runtime.csproj so the referenced pdb is not regenerated during the pack. -->
     <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
     <DebugSymbols Condition="'$(Configuration)' == 'Release'">false</DebugSymbols>
+    <!-- To step through the C# in a debugger, build with -p:Optimize=false. -->
+    <Optimize Condition="'$(Configuration)' == 'Debug'">true</Optimize>
   </PropertyGroup>
 
   <!-- DotclEmit: is the Reflection.Emit-based JIT/compiler available? Decided once
@@ -245,6 +247,7 @@
     <Compile Remove="Emitter/IlDisasm.cs" />
     <Compile Remove="Emitter/CilAssembler.Emit.cs" />
     <Compile Remove="Emitter/CilAssembler.Tail.cs" />
+    <Compile Remove="Emitter/CilAssembler.SelfFrame.cs" />
     <Compile Remove="Emitter/IlLocalAccess.cs" />
     <Compile Remove="Emitter/CilAssembler.LocalSlots.cs" />
     <Compile Remove="Emitter/CilAssembler.StackTemps.cs" />

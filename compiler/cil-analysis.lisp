@@ -34,11 +34,11 @@
 ;; walks the unexpanded form instead. Giving up is NOT conservative: a closure
 ;; that only appears in a deeper expansion is missed, so a variable it assigns
 ;; is not boxed and the assignment is lost. Keep this at the depth guard in
-;; COMPILE-FORM (500), which counts every nested form including each
-;; expansion: any form the compiler accepts is then walked completely. Code
-;; walkers that wrap each subform in their own macro (cl-environments'
-;; %WALK-FORM) reach more than 50 in ordinary code.
-(defvar *macro-expand-depth-limit* 500)
+;; COMPILE-FORM (*COMPILE-DEPTH-LIMIT*), which counts every nested form
+;; including each expansion: any form the compiler accepts is then walked
+;; completely. Code walkers that wrap each subform in their own macro
+;; (cl-environments' %WALK-FORM) reach more than 50 in ordinary code.
+(defvar *macro-expand-depth-limit* *compile-depth-limit*)
 
 ;; Stub for cross-compilation: always returns T (no stack limit during self-compile)
 (unless (fboundp '%stack-space-available-p)
@@ -65,11 +65,27 @@
 ;; re-runs find-free-vars per lambda, so without this an inner body is walked once
 ;; per enclosing lambda = O(depth^2) on nested closures. The real
 ;; local-bound-p filter is applied at each enclosing merge, not baked into the memo.
+;; Bound to a cons whose car is the table, made on first use.
 (defvar *ffv-free-cache* nil)
 
 ;; Marker heading a (MARKER . TAG) free-var candidate: a GO to TAG seen while
 ;; collecting candidates, resolved to the target tagbody's id variable at merge.
 (defvar *ffv-go-candidate* (list '#:go-candidate))
+
+(defun %ffv-seen (sym free)
+  (let ((table (car free)))
+    (and table (gethash sym table))))
+
+(defun %ffv-add (sym free)
+  (setf (gethash sym (or (car free)
+                         (setf (car free) (make-hash-table :test #'eq))))
+        sym))
+
+(defun %ffv-collected (free)
+  (let ((syms '()))
+    (when (car free)
+      (maphash (lambda (k v) (declare (ignore k)) (push v syms)) (car free)))
+    syms))
 
 (defun %ffv-note-go (tag bnd free-ht)
   "A GO to TAG seen by the free-variable walk: when TAG names a tagbody outside
@@ -77,11 +93,11 @@
   (let ((entry (assoc tag (cstate-go-tags))))
     (when entry
       (let* ((tb-var-name (second entry))
-             (tb-sym (intern tb-var-name :dotcl.cil-compiler)))
+             (tb-sym (compiler-name-sym tb-var-name)))
         (when (and (not (member tb-var-name bnd :test #'string=))
-                   (not (gethash tb-sym free-ht))
+                   (not (%ffv-seen tb-sym free-ht))
                    (local-bound-p tb-sym))
-          (setf (gethash tb-sym free-ht) tb-sym))))))
+          (%ffv-add tb-sym free-ht))))))
 
 (defun %walker-macroexpand (form expander bound)
   "Macroexpand FORM for an analysis walk. Returns (values EXPANSION HITS):
@@ -100,6 +116,7 @@
   "Walk expr finding free variable references. Results accumulated in free-ht.
    Iterative worklist version; no recursion depth limit."
   (let ((worklist (list (cons expr (cons bound 0))))
+        (inline-plans-seen '())
         (*lexical-operators* *lexical-operators*))
     (loop while worklist do
       (let* ((item (pop worklist))
@@ -152,9 +169,9 @@
                                  ;; losing its closure capture.
                                  (not (keywordp e))
                                  (not (bnd-member-p e bnd))
-                                 (not (gethash e free-ht))
+                                 (not (%ffv-seen e free-ht))
                                  (local-bound-p e))
-                        (setf (gethash e free-ht) e)))))
+                        (%ffv-add e free-ht)))))
                ;; Cons: dispatch on head
                ((consp e)
                 (let ((head (car e)))
@@ -214,10 +231,10 @@
                         (dolist (sym (%lambda-free-candidates e))
                           (cond ((not (and (consp sym) (eq (car sym) *ffv-go-candidate*)))
                                  (when (and (not (bnd-member-p sym bnd))
-                                            (not (gethash sym free-ht))
+                                            (not (%ffv-seen sym free-ht))
                                             (or *ffv-assume-bound* (local-bound-p sym)))
-                                   (setf (gethash sym free-ht) sym)))
-                                (*ffv-assume-bound* (setf (gethash sym free-ht) sym))
+                                   (%ffv-add sym free-ht)))
+                                (*ffv-assume-bound* (%ffv-add sym free-ht))
                                 (t (%ffv-note-go (cdr sym) bnd free-ht))))))
                     ;; Let/Let* introduces bindings
                     ((and (symbolp head) (member head '(let let*)) (listp (cadr e)))
@@ -248,7 +265,7 @@
                          ;; were known would cache "captures nothing"). Record
                          ;; the tag itself; the merge resolves it.
                          (let ((m (cons *ffv-go-candidate* (cadr e))))
-                           (setf (gethash m free-ht) m))
+                           (%ffv-add m free-ht))
                          (%ffv-note-go (cadr e) bnd free-ht)))
                     ;; Block introduces a synthetic block-tag variable
                     ((and (symbolp head) (eq head 'block))
@@ -261,21 +278,21 @@
                     ((and (symbolp head) (eq head 'return-from))
                      (let* ((bname (cadr e))
                             (tag-var (block-tag-var-name bname))
-                            (tag-sym (intern tag-var :dotcl.cil-compiler)))
+                            (tag-sym (compiler-name-sym tag-var)))
                        (when (and (not (member tag-var bnd :test #'string=))
-                                  (not (gethash tag-sym free-ht))
+                                  (not (%ffv-seen tag-sym free-ht))
                                   (local-bound-p tag-sym))
-                        (setf (gethash tag-sym free-ht) tag-sym)))
+                        (%ffv-add tag-sym free-ht)))
                      (when (caddr e)
                        (push (cons (caddr e) (cons bnd mdepth)) worklist)))
                     ;; return: (return expr) = (return-from nil expr)
                     ((and (symbolp head) (eq head 'return))
                      (let* ((tag-var (block-tag-var-name nil))
-                            (tag-sym (intern tag-var :dotcl.cil-compiler)))
+                            (tag-sym (compiler-name-sym tag-var)))
                        (when (and (not (member tag-var bnd :test #'string=))
-                                  (not (gethash tag-sym free-ht))
+                                  (not (%ffv-seen tag-sym free-ht))
                                   (local-bound-p tag-sym))
-                        (setf (gethash tag-sym free-ht) tag-sym)))
+                        (%ffv-add tag-sym free-ht)))
                      (when (cadr e)
                        (push (cons (cadr e) (cons bnd mdepth)) worklist)))
                     ;; (function sym) or (function (lambda ...))
@@ -288,11 +305,11 @@
                          ;; other LABELS function, under the mangled name.
                          ((and (consp arg) (eq (car arg) 'setf) (symbolp (cadr arg)))
                           (let* ((nm (concatenate 'string "__LABELFN_" (mangle-name arg)))
-                                 (nm-sym (intern nm :dotcl.cil-compiler)))
+                                 (nm-sym (compiler-name-sym nm)))
                             (when (and (not (member nm bnd :test #'string=))
-                                       (not (gethash nm-sym free-ht))
+                                       (not (%ffv-seen nm-sym free-ht))
                                        (or *ffv-assume-bound* (local-bound-p nm-sym)))
-                              (setf (gethash nm-sym free-ht) nm-sym))))
+                              (%ffv-add nm-sym free-ht))))
                          ((symbolp arg)
                           (if *ffv-assume-bound*
                               ;; Candidate collection: local-bound-p is T for all,
@@ -307,23 +324,23 @@
                                       (mangled-name (concatenate 'string "__LABELFN_"
                                                                  (symbol-name arg))))
                                   (dolist (nm (list mangled-name plain-name))
-                                    (let ((nm-sym (intern nm :dotcl.cil-compiler)))
+                                    (let ((nm-sym (compiler-name-sym nm)))
                                       (when (and (not (member nm bnd :test #'string=))
-                                                 (not (gethash nm-sym free-ht)))
-                                        (setf (gethash nm-sym free-ht) nm-sym))))))
+                                                 (not (%ffv-seen nm-sym free-ht)))
+                                        (%ffv-add nm-sym free-ht))))))
                               (when (and arg (or (not (eq arg t)) (local-bound-p arg))
                                          (not (special-var-p arg))
                                          (local-bound-p arg))
                                 (let* ((plain-name (symbol-name arg))
                                        (mangled-name (concatenate 'string "__LABELFN_" plain-name))
                                        (capture-name (cond
-                                                       ((local-bound-p (intern mangled-name :dotcl.cil-compiler))
+                                                       ((local-bound-name-p mangled-name)
                                                         mangled-name)
                                                        (t plain-name))))
-                                  (let ((capture-sym (intern capture-name :dotcl.cil-compiler)))
+                                  (let ((capture-sym (compiler-name-sym capture-name)))
                                     (when (and (not (member capture-name bnd :test #'string=))
-                                               (not (gethash capture-sym free-ht)))
-                                      (setf (gethash capture-sym free-ht) capture-sym))))))))))
+                                               (not (%ffv-seen capture-sym free-ht)))
+                                      (%ffv-add capture-sym free-ht))))))))))
                     ;; handler-case: body + clauses with optional var binding
                     ((and (symbolp head) (eq head 'handler-case))
                      (let ((body-form (cadr e))
@@ -534,12 +551,26 @@
                              ;; gates this to scopes where such a fn exists.
                              (when (symbolp head)
                                (let* ((name (symbol-name head))
-                                      (mangled (concatenate 'string "__LABELFN_" name))
-                                      (mangled-sym (intern mangled :dotcl.cil-compiler)))
-                                 (when (and (local-bound-p mangled-sym)
-                                            (not (member mangled bnd :test #'string=))
-                                            (not (gethash mangled-sym free-ht)))
-                                   (setf (gethash mangled-sym free-ht) mangled-sym))))
+                                      (mangled (concatenate 'string "__LABELFN_" name)))
+                                 (when (and (or *ffv-assume-bound* (local-bound-name-p mangled))
+                                            (not (member mangled bnd :test #'string=)))
+                                   (let ((mangled-sym (compiler-name-sym mangled)))
+                                     (unless (%ffv-seen mangled-sym free-ht)
+                                       (%ffv-add mangled-sym free-ht)))
+                                   ;; A substituted copy of an INLINE local
+                                   ;; function reads what its body names.
+                                   (let ((plan (and (boundp '*cstate*)
+                                                    (nth 5 (local-function-entry head)))))
+                                     (when (and plan (not (member plan inline-plans-seen :test #'eq)))
+                                       (push plan inline-plans-seen)
+                                       (destructuring-bind (pname pparams pdecls pbody pblockp &rest more)
+                                           plan
+                                         (declare (ignore more))
+                                         (push (cons `(let ,(mapcar (lambda (v) (list v nil)) pparams)
+                                                        ,@pdecls
+                                                        ,@(if pblockp `((block ,pname ,@pbody)) pbody))
+                                                     (cons nil mdepth))
+                                               worklist)))))))
                              ;; Generic walk. The car is in function position only when
                              ;; it is a SYMBOL (function name) or a (setf sym) / (lambda ...)
                              ;; compound form. Symbols in function position must NOT be pushed
@@ -582,7 +613,7 @@
   (let* ((params (cadr e))
          (lbody (cddr e))
          (inner-bound (extract-param-names params))
-         (free-ht (make-hash-table :test #'eq))
+         (free-ht (list nil))
          (*ffv-assume-bound* t))
     ;; &optional/&key/&aux default forms with progressive left-to-right scoping,
     ;; starting from the empty scope (a default referencing an enclosing-bound var
@@ -593,9 +624,7 @@
                           '())
     (dolist (form lbody)
       (find-free-vars-expr form inner-bound free-ht))
-    (let ((keys '()))
-      (maphash (lambda (k v) (declare (ignore k)) (push v keys)) free-ht)
-      keys)))
+    (%ffv-collected free-ht)))
 
 (defun %lambda-free-candidates (e)
   "Memoized wrapper over %compute-free-candidates, keyed by EQ(E) in
@@ -604,10 +633,12 @@
    *locals*-independent, so caching is a behaviour-preserving performance
    transform."
   (if *ffv-free-cache*
-      (multiple-value-bind (cached present) (gethash e *ffv-free-cache*)
-        (if present
-            cached
-            (setf (gethash e *ffv-free-cache*) (%compute-free-candidates e))))
+      (let ((table (or (car *ffv-free-cache*)
+                       (setf (car *ffv-free-cache*) (make-hash-table :test #'eq)))))
+        (multiple-value-bind (cached present) (gethash e table)
+          (if present
+              cached
+              (setf (gethash e table) (%compute-free-candidates e)))))
       (%compute-free-candidates e)))
 
 ;;; ============================================================
@@ -717,6 +748,24 @@
 ;; walk could not be sure of (*EXPANSION-SM-DEPENDENT*) also keeps the
 ;; resolution of the symbol macro names there, and is reused only where they
 ;; resolve the same way.
+(defun %fmc-lambda-list-vars (lambda-list)
+  "The variables LAMBDA-LIST binds: references to them in the function body are
+   the body's own."
+  (let ((vars '()))
+    (do ((pl lambda-list (cdr pl)))
+        ((not (consp pl)))
+      (let ((p (car pl)))
+        (cond ((and p (symbolp p))
+               (unless (member p lambda-list-keywords :test #'eq) (push p vars)))
+              ((consp p)
+               (let ((v (car p)))
+                 (cond ((and v (symbolp v)) (push v vars))
+                       ((and (consp v) (consp (cdr v)) (cadr v) (symbolp (cadr v)))
+                        (push (cadr v) vars))))
+               (when (and (consp (cdr p)) (consp (cddr p)) (caddr p) (symbolp (caddr p)))
+                 (push (caddr p) vars))))))
+    vars))
+
 (defun %fmc-cached-summary (entries)
   "The summary in ENTRIES, a list of (SCOPE SYMBOL-MACROS SIGNATURE . SUMMARY),
    taken in the current macro environment, or NIL. SIGNATURE is :ANY, or an
@@ -848,7 +897,8 @@
                               ((and (symbolp f)
                                     (not (and f (< mdepth limit)
                                               (assoc f *symbol-macros* :test #'eq))))
-                               (cond ((cdr st)
+                               (cond ((and (consp (cdr st)) (member f (cddr st) :test #'eq)))
+                                     ((if (consp (cdr st)) (cadr st) (cdr st))
                                       (unless (symbol-package f) (var-name f))
                                       (push f rin))
                                      (t
@@ -856,17 +906,23 @@
                                       (push f rout))))
                               ((and (atom f) (not (symbolp f))) nil)
                               (t
-                               (let* ((in-lambda (cdr st))
+                               (let* ((own (and (consp (cdr st)) (cddr st)))
+                                      (in-lambda (if (consp (cdr st)) (cadr st) (cdr st)))
                                       (s (%fmc-summary f (or ctx in-lambda) mdepth)))
-                                 (dolist (x (car s)) (push x mut))
-                                 (dolist (x (cadr s)) (push x rin))
+                                 (dolist (x (car s))
+                                   (unless (and own (member x own :test #'eq)) (push x mut)))
+                                 (dolist (x (cadr s))
+                                   (unless (and own (member x own :test #'eq)) (push x rin)))
                                  (if in-lambda
-                                     (dolist (x (cddr s)) (push x rin))
-                                     (dolist (x (cddr s)) (push x rout))))))))
+                                     (dolist (x (cddr s))
+                                       (unless (and own (member x own :test #'eq)) (push x rin)))
+                                     (dolist (x (cddr s))
+                                       (unless (and own (member x own :test #'eq)) (push x rout)))))))))
                         (dolist (st (reverse steps))
                           (if (eq (car st) marker)
                               (push st worklist)
-                              (push (cons (car st) (if (cdr st) (- -1 mdepth) mdepth))
+                              (push (cons (car st) (if (if (consp (cdr st)) (cadr st) (cdr st))
+                                                       (- -1 mdepth) mdepth))
                                     worklist)))))))
       (loop while worklist do
         (let ((item (pop worklist)))
@@ -969,8 +1025,9 @@
                             (let ((p (car pl)))
                               (when (and (consp p) (cadr p))
                                 (push (cons (cadr p) t) steps))))
-                          (dolist (form (cddr e))
-                            (push (cons form t) steps))
+                          (let ((own (%fmc-lambda-list-vars (cadr e))))
+                            (dolist (form (cddr e))
+                              (push (list* form t own) steps)))
                           (run (nreverse steps) 0 t)))
                        ((and (or (eq head 'let) (eq head 'let*)) (listp (cadr e)))
                         (let ((bindings (cadr e))
@@ -986,8 +1043,12 @@
                           ;; then the body with the bound names unshadowed.
                           (when shadowed
                             (push (%fmc-set-step :symbol-macros *symbol-macros*) steps))
-                          (dolist (form (cddr e))
-                            (push (cons form in-lambda) steps))
+                          (let ((own '()))
+                            (do-list-safe (b bindings)
+                              (let ((name (if (consp b) (car b) b)))
+                                (when (and name (symbolp name)) (push name own))))
+                            (dolist (form (cddr e))
+                              (push (list* form in-lambda own) steps)))
                           (when shadowed
                             (push (%fmc-set-step
                                    :symbol-macros
@@ -1020,8 +1081,9 @@
                                 (let ((p (car pl)))
                                   (when (and (consp p) (cadr p))
                                     (push (cons (cadr p) t) steps))))
-                              (dolist (form (cddr fdef))
-                                (push (cons form t) steps)))
+                              (let ((own (%fmc-lambda-list-vars (cadr fdef))))
+                                (dolist (form (cddr fdef))
+                                  (push (list* form t own) steps))))
                             (when (and shadows (eq head 'flet)) (enter))
                             (dolist (form (cddr e))
                               (push (cons form in-lambda) steps)))
@@ -1070,7 +1132,9 @@
                             (push (cons form in-lambda) steps))
                           (run steps mdepth nil)))
                        ((and (symbolp head) (eq head 'symbol-macrolet))
-                        (let ((steps (list (%fmc-set-step :symbol-macros *symbol-macros*))))
+                        (let ((steps (list (%fmc-set-step :mscope *macroexpand-scope*)
+                                           (%fmc-set-step :symbol-macros *symbol-macros*))))
+                          (setf *macroexpand-scope* (cons (cadr e) *macroexpand-scope*))
                           (setf *symbol-macros*
                                 (append (mapcar (lambda (b) (cons (car b) (cadr b))) (cadr e))
                                         *symbol-macros*))
@@ -1314,6 +1378,11 @@
 
    The shape matched is exactly what COMPILE-ARGS-PARAM-INSTRS emits for a rest
    parameter, ending in the store; anything else is left alone."
+  (unless (dolist (i instrs nil)
+            (when (and (consp i) (eq (car i) :call)
+                       (equal (cadr i) "Runtime.CollectRestArgs"))
+              (return t)))
+    (return-from elide-unused-rest-list instrs))
   (let ((reads (make-hash-table :test #'equal))
         (dropped (make-hash-table :test #'equal))
         (out '()))
@@ -1361,6 +1430,19 @@
 
    Not a DEFCONSTANT: a list literal under DEFCONSTANT is re-evaluated to a
    fresh, non-EQL list when the file is reloaded, which SBCL rejects.")
+
+(defparameter +mv-pair-twins+
+  '(("Runtime.Gethash"      . "Runtime.GethashPair")
+    ("Runtime.FloorOp"      . "Runtime.FloorOpPair")
+    ("Runtime.TruncateOp"   . "Runtime.TruncateOpPair")
+    ("Runtime.CeilingOp"    . "Runtime.CeilingOpPair")
+    ("Runtime.RoundOp"      . "Runtime.RoundOpPair")
+    ("Runtime.Values2"      . "Runtime.Values2Pair"))
+  "The same entries as +MV-PRIMARY-TWINS+, paired with an entry that publishes
+   both values in the thread state and returns the primary without an MvReturn.
+   P13 swaps it in when the next instruction reads the values out of the thread
+   state (CaptureForBind, NthValueOf), together with a reader that knows the
+   state is that pair.")
 
 (defun peephole-optimize (instrs)
   "Local peephole pass over a finalized SIL instruction list. Removes
@@ -1421,6 +1503,13 @@
                                           ; FLOOR / TRUNCATE / CEILING / ROUND
                                           ; in single-value position. Pairs are
                                           ; in +mv-primary-twins+.
+     P13 (:call F) (:call \"MultipleValues.CaptureForBind\")
+           -> (:call F-pair) (:call \"MultipleValues.CapturePair\")
+     P13 (:call F) (:ldc-i4 N) (:call \"Runtime.NthValueOf\")
+           -> (:call F-pair) (:ldc-i4 N) (:call \"MultipleValues.PairNth\")
+                                          ; the values are read out of the
+                                          ; thread state at once, so the MvReturn
+                                          ; is not needed (+mv-pair-twins+).
    (P3+P4 compose across the fixpoint to delete the dead nil/unwrap/pop preamble
     that codegen emits at the top of every TCO loop body.)
 
@@ -1471,6 +1560,17 @@
                     (consp i2) (eq (car i2) :pop))
                (setf changed t)
                (push i2 out)
+               (setf cur (cddr cur)))
+              ;; P5 for a SIMD pack: the box is pure and never an MvReturn.
+              ((and (consp i1) (eq (car i1) :call) (stringp (cadr i1))
+                    (> (length (cadr i1)) 9) (string= "Simd.Box." (cadr i1) :end2 9)
+                    (consp i2) (or (eq (car i2) :pop)
+                                   (and (eq (car i2) :call)
+                                        (equal (cadr i2) "Runtime.UnwrapMv"))))
+               (setf changed t)
+               (if (eq (car i2) :pop)
+                   (push i2 out)
+                   (push i1 out))
                (setf cur (cddr cur)))
               ;; P5 for an (unsigned-byte 64): BoxU64 is pure too (a Fixnum or a fresh
               ;; Bignum from the bits).
@@ -1567,6 +1667,25 @@
                (push (list :call (cdr (assoc (cadr i1) +mv-primary-twins+ :test #'equal)))
                      out)
                (setf cur (cddr cur)))
+              ;; P13: the same entries where the next instruction reads the
+              ;; values out of the thread state.
+              ((and (consp i1) (eq (car i1) :call)
+                    (assoc (cadr i1) +mv-pair-twins+ :test #'equal)
+                    (or (and (consp i2) (eq (car i2) :call)
+                             (equal (cadr i2) "MultipleValues.CaptureForBind"))
+                        (and (consp i2) (eq (car i2) :ldc-i4)
+                             (consp i3) (eq (car i3) :call)
+                             (equal (cadr i3) "Runtime.NthValueOf"))))
+               (setf changed t)
+               (push (list :call (cdr (assoc (cadr i1) +mv-pair-twins+ :test #'equal)))
+                     out)
+               (cond ((eq (car i2) :call)
+                      (push '(:call "MultipleValues.CapturePair") out)
+                      (setf cur (cddr cur)))
+                     (t
+                      (push i2 out)
+                      (push '(:call "MultipleValues.PairNth") out)
+                      (setf cur (cdddr cur)))))
               ;; P9: push a string constant then immediately discard it: dead.
               ;; Composes with P8 to delete a string literal in statement
               ;; position, which is what a documentation string compiles to: it
@@ -1619,9 +1738,92 @@
   ;; its lifetime, which a method-wide PDB LocalVariable name can't represent).
   ;; The classic "debug builds don't reuse slots" tradeoff. Peephole still runs.
   (peephole-optimize
-   (if *emit-source-lines*
-       (elide-unused-rest-list instrs)
-       (%merge-disjoint-locals (elide-unused-rest-list instrs)))))
+   (%hoist-loop-mv-resets
+    (if *emit-source-lines*
+        (elide-unused-rest-list instrs)
+        (%merge-disjoint-locals (elide-unused-rest-list instrs))))))
+
+(defparameter +sil-branch-ops+
+  '(:br :brtrue :brfalse :leave :beq :bne :blt :bgt :ble :bge
+    :bne-un :bge-un :bgt-un :ble-un :blt-un))
+
+(defparameter +mv-quiet-ops+
+  '(:label :ldloc :stloc :ldarg :starg :ldc-i4 :ldc-i8 :ldc-r8 :ldsfld
+    :load-const :load-const-cached :load-sym :load-sym-keyword :load-sym-pkg
+    :ldnull :pop :dup :ceq :clt :cgt :add :sub :and :or :xor :declare-local
+    :unbox-fixnum :castclass :isinst :line :nop
+    :br :brtrue :brfalse :leave :beq :bne :blt :bgt :ble :bge))
+
+(defparameter +mv-quiet-calls+
+  '("ConditionSystem.PollInterrupt" "MultipleValues.Reset" "Runtime.IsTruthy"
+    "Runtime.Car" "Runtime.Cdr" "Runtime.Primary" "Runtime.UnwrapMv"
+    "Fixnum.Make" "Runtime.AddFixnumChecked" "Runtime.IsTrueEq" "Runtime.IsTrueEql"
+    "Runtime.IsTrueConsp" "Runtime.IsTrueAtom" "Runtime.IsTrueListp"
+    "Runtime.IsTrueSymbolp" "Runtime.Endp" "Runtime.IsTrueEndp" "Runtime.IsNotNil"))
+
+(defun %mv-quiet-instr-p (x)
+  (and (consp x)
+       (or (member (car x) +mv-quiet-ops+)
+           (and (eq (car x) :call)
+                (member (cadr x) +mv-quiet-calls+ :test #'equal)))))
+
+(defun %hoist-loop-mv-resets (instrs)
+  "A loop whose instructions can neither publish values nor run user code
+   leaves the values channel as it found it, so the resets inside it (one per
+   test of a variable) are replaced by one in front of its head. The loop is a
+   backward branch's target to the branch; nothing outside may jump into it."
+  (unless (member '(:call "MultipleValues.Reset") instrs :test #'equal)
+    (return-from %hoist-loop-mv-resets instrs))
+  (let* ((v (coerce instrs 'simple-vector))
+         (n (length v))
+         (label-pos (make-hash-table :test #'equal))
+         (ends (make-hash-table))
+         (good '()))
+    (dotimes (i n)
+      (let ((x (svref v i)))
+        (when (and (consp x) (eq (car x) :label))
+          (setf (gethash (cadr x) label-pos) i))))
+    (dotimes (i n)
+      (let ((x (svref v i)))
+        (when (and (consp x) (member (car x) +sil-branch-ops+))
+          (let ((tp (gethash (cadr x) label-pos)))
+            (when (and tp (<= tp i) (> i (gethash tp ends -1)))
+              (setf (gethash tp ends) i))))))
+    (maphash
+     (lambda (s e)
+       (when (and (loop for i from s to e always (%mv-quiet-instr-p (svref v i)))
+                  (loop for i from s to e
+                        thereis (equal (svref v i) '(:call "MultipleValues.Reset")))
+                  (loop for i below n
+                        never (and (or (< i s) (> i e))
+                                   (let ((x (svref v i)))
+                                     (and (consp x)
+                                          (flet ((inside (l)
+                                                   (let ((p (gethash l label-pos)))
+                                                     (and p (<= s p e)))))
+                                            (cond ((member (car x) +sil-branch-ops+)
+                                                   (inside (cadr x)))
+                                                  ((eq (car x) :switch)
+                                                   (some #'inside (cadr x))))))))))
+         (push (cons s e) good)))
+     ends)
+    (when (null good)
+      (return-from %hoist-loop-mv-resets instrs))
+    (setq good
+          (remove-if (lambda (r)
+                       (some (lambda (o)
+                               (and (not (eq o r))
+                                    (<= (car o) (cdr r)) (<= (car r) (cdr o))
+                                    (not (and (<= (car r) (car o)) (<= (cdr o) (cdr r))))))
+                             good))
+                     good))
+    (let ((out '()))
+      (dotimes (i n (nreverse out))
+        (let ((x (svref v i)))
+          (cond ((assoc i good) (push '(:call "MultipleValues.Reset") out) (push x out))
+                ((and (equal x '(:call "MultipleValues.Reset"))
+                      (some (lambda (r) (<= (car r) i (cdr r))) good)))
+                (t (push x out))))))))
 
 (defconstant +slot-merge-min-locals+ 32
   "Fewest LispObject locals a body must declare before slot sharing runs at all.")
@@ -1779,6 +1981,334 @@
                        (push new out))))))))))
 
 ;;; ============================================================
+;;; Unused lexical variables
+;;; ============================================================
+;;; SBCL's style warnings for a lexical variable that is never read, or is
+;;; declared IGNORE and used. One walk per top-level form, before it is
+;;; compiled. Uninterned variables are left alone: macros make them.
+
+(defvar *uv-warned* nil
+  "EQ table: binding form -> the variables of it already reported.")
+
+(defvar *uv-warnings* nil)
+
+(defvar *uv-sm-depth* 0)
+
+(defvar *uv-depth* 0)
+
+(defvar *uv-level* 0)
+
+(defun %uv-decls (body doc-p)
+  "(values SPECIALS IGNORES IGNORABLES REST) for the declarations heading BODY."
+  (let ((specials '()) (ignores '()) (ignorables '()))
+    (loop
+      (cond ((and doc-p (consp body) (stringp (car body)) (consp (cdr body)))
+             (setf body (cdr body) doc-p nil))
+            ((and (consp body) (consp (car body)) (eq (caar body) 'declare))
+             (dolist (spec (cdar body))
+               (when (and (consp spec) (listp (cdr spec)))
+                 (case (car spec)
+                   (special (setf specials (append (cdr spec) specials)))
+                   (ignore (setf ignores (append (cdr spec) ignores)))
+                   (ignorable (setf ignorables (append (cdr spec) ignorables))))))
+             (setf body (cdr body)))
+            (t (return))))
+    (values specials ignores ignorables body)))
+
+(defun %uv-entry (sym site specials)
+  (if (member sym specials :test #'eq)
+      (list* sym :special nil)
+      (list* sym :var (vector nil nil site *uv-depth*))))
+
+(defun %uv-free-specials (specials entries env)
+  (dolist (s specials env)
+    (when (and (symbolp s) (not (assoc s entries :test #'eq)))
+      (push (list* s :special nil) env))))
+
+(defun %uv-report (entries ignores ignorables)
+  (dolist (e entries)
+    (when (eq (cadr e) :var)
+      (let* ((sym (car e))
+             (cell (cddr e))
+             (read (svref cell 0))
+             (set (svref cell 1))
+             (site (svref cell 2)))
+        (when (and (symbol-package sym)
+                   (not (member sym (gethash site *uv-warned*) :test #'eq))
+                   (not (global-special-p sym))
+                   (not (constantp sym)))
+          (let ((msgs
+                  (cond ((member sym ignores :test #'eq)
+                         (append (and read '("reading an ignored variable: ~S"))
+                                 (and set '("~S is being set even though it was declared to be ignored."))))
+                        ((member sym ignorables :test #'eq) nil)
+                        (read nil)
+                        (set '("The variable ~S is assigned but never read."))
+                        (t '("The variable ~S is defined but never used.")))))
+            (when msgs
+              (push sym (gethash site *uv-warned*))
+              (dolist (m msgs)
+                (push (cons m sym) *uv-warnings*)))))))))
+
+(defun %uv-note (sym env slot)
+  "SYM is read (SLOT 0) or assigned (SLOT 1) where ENV is visible."
+  (let ((e (assoc sym env :test #'eq)))
+    (when e
+      (case (cadr e)
+        ;; An assignment from a closure counts as a use, as in SBCL.
+        (:var (setf (svref (cddr e) (if (> *uv-depth* (svref (cddr e) 3)) 0 slot)) t))
+        (:sm (when (< *uv-sm-depth* 20)
+               (let ((*uv-sm-depth* (1+ *uv-sm-depth*)))
+                 (%uv-walk (cddr e) env))))))))
+
+(defun %uv-walk-list (forms env)
+  (loop while (consp forms)
+        do (%uv-walk (pop forms) env)))
+
+(defun %uv-body (body env entries doc-p)
+  "Walk BODY, whose leading declarations apply to ENTRIES (just bound, in
+   binding order, already on ENV), and report them."
+  (multiple-value-bind (specials ignores ignorables rest) (%uv-decls body doc-p)
+    (dolist (e entries)
+      (when (and (eq (cadr e) :var) (member (car e) specials :test #'eq))
+        (setf (cadr e) :special)))
+    (%uv-walk-list rest (%uv-free-specials specials entries env))
+    (%uv-report entries ignores ignorables)))
+
+(defun %uv-let (form env sequential)
+  (let* ((bindings (cadr form))
+         (specials (%uv-decls (cddr form) nil))
+         (inner env)
+         (entries '()))
+    (dolist (b (if (listp bindings) bindings '()))
+      (let ((name (if (consp b) (car b) b)))
+        (when (consp b) (%uv-walk (cadr b) (if sequential inner env)))
+        (when (and name (symbolp name))
+          (let ((e (%uv-entry name form specials)))
+            (push e entries)
+            (when sequential (push e inner))))))
+    (unless sequential
+      (setf inner (append entries env)))
+    (let ((shadowed (and *symbol-macros*
+                         (remove-if-not (lambda (e) (assoc (car e) *symbol-macros* :test #'eq))
+                                        entries))))
+      (let ((*symbol-macros* (if shadowed
+                                 (remove-if (lambda (sm) (assoc (car sm) shadowed :test #'eq))
+                                            *symbol-macros*)
+                                 *symbol-macros*)))
+        (%uv-body (cddr form) inner (reverse entries) nil)))))
+
+(defun %uv-lambda (ll body env site macro-p)
+  "Walk a function with lambda list LL (a macro lambda list when MACRO-P) and
+   BODY, defined where ENV is visible."
+  (let ((specials (%uv-decls body t))
+        (inner env)
+        (entries '())
+        (*uv-depth* (1+ *uv-depth*)))
+    (labels ((bind (sym)
+               (when (and sym (symbolp sym) (not (keywordp sym))
+                          (not (member sym lambda-list-keywords :test #'eq)))
+                 (let ((e (%uv-entry sym site specials)))
+                   (push e entries)
+                   (push e inner))))
+             (var (p)
+               (if (and macro-p (consp p)) (walk-ll p) (bind p)))
+             (walk-ll (l)
+               (let ((state :req) (resume :req))
+                 (loop
+                   (cond
+                     ((null l) (return))
+                     ((atom l) (bind l) (return))
+                     (t
+                      (let ((p (pop l)))
+                        (cond
+                          ((eq p '&optional) (setf state :opt))
+                          ((or (eq p '&rest) (eq p '&body)) (setf state :rest))
+                          ((eq p '&key) (setf state :key))
+                          ((eq p '&aux) (setf state :aux))
+                          ((eq p '&allow-other-keys))
+                          ((or (eq p '&whole) (eq p '&environment))
+                           (unless (eq state :one) (setf resume state))
+                           (setf state :one))
+                          ((eq state :one) (var p) (setf state resume))
+                          ((or (eq state :req) (eq state :rest)) (var p))
+                          ((atom p) (bind p))
+                          ((eq state :opt)
+                           (when (consp (cdr p)) (%uv-walk (cadr p) inner))
+                           (var (car p))
+                           (when (and (consp (cdr p)) (consp (cddr p))) (bind (caddr p))))
+                          ((eq state :key)
+                           (when (consp (cdr p)) (%uv-walk (cadr p) inner))
+                           (if (consp (car p)) (var (cadr (car p))) (bind (car p)))
+                           (when (and (consp (cdr p)) (consp (cddr p))) (bind (caddr p))))
+                          ((eq state :aux)
+                           (when (consp (cdr p)) (%uv-walk (cadr p) inner))
+                           (bind (car p)))))))))))
+      (walk-ll ll))
+    (%uv-body body inner (reverse entries) t)))
+
+(defun %uv-flet (form env labels-p)
+  (let* ((defs (if (listp (cadr form)) (cadr form) '()))
+         (shadows (%flet-macro-shadows defs))
+         (*macroexpand-scope* *macroexpand-scope*)
+         (*lexical-operators* *lexical-operators*))
+    (flet ((enter ()
+             (when shadows
+               (setf *macroexpand-scope* (cons defs *macroexpand-scope*)
+                     *lexical-operators* (%flet-lexical-operators shadows)))))
+      (when labels-p (enter))
+      (dolist (d defs)
+        (when (and (consp d) (consp (cdr d)))
+          (%uv-lambda (cadr d) (cddr d) env d nil)))
+      (unless labels-p (enter))
+      (%uv-body (cddr form) env '() nil))))
+
+(defun %uv-macrolet (form env)
+  (let* ((defs (if (listp (cadr form)) (cadr form) '()))
+         (saved (mapcar (lambda (d) (cons (car d) (gethash (car d) *macros*)))
+                        (remove-if-not (lambda (d) (and (consp d) (symbolp (car d)))) defs)))
+         (*macroexpand-scope* *macroexpand-scope*)
+         (*lexical-operators* *lexical-operators*))
+    (dolist (d defs)
+      (when (and (consp d) (consp (cdr d)))
+        (%uv-lambda (cadr d) (cddr d) '() d t)))
+    (unwind-protect
+         (progn
+           (setf *macroexpand-scope* (cons defs *macroexpand-scope*))
+           (dolist (d defs)
+             (when (and (consp d) (symbolp (car d)) (consp (cdr d)))
+               (setf (gethash (car d) *macros*)
+                     (%eval-macrolet-expander (cadr d) (cddr d)))))
+           (setf *lexical-operators* (%macrolet-lexical-operators defs))
+           (%uv-body (cddr form) env '() nil))
+      (dolist (s saved)
+        (if (cdr s)
+            (setf (gethash (car s) *macros*) (cdr s))
+            (remhash (car s) *macros*))))))
+
+(defun %uv-symbol-macrolet (form env)
+  (let ((inner env) (sms '()))
+    (dolist (b (if (listp (cadr form)) (cadr form) '()))
+      (when (and (consp b) (symbolp (car b)) (consp (cdr b)))
+        (push (cons (car b) (cadr b)) sms)
+        (push (list* (car b) :sm (cadr b)) inner)))
+    (let ((*symbol-macros* (append (nreverse sms) *symbol-macros*))
+          (*macroexpand-scope* (cons (cadr form) *macroexpand-scope*)))
+      (%uv-body (cddr form) inner '() nil))))
+
+(defun %uv-handler-case (form env)
+  (%uv-walk (cadr form) env)
+  (dolist (clause (cddr form))
+    (when (and (consp clause) (consp (cdr clause)) (listp (cadr clause)))
+      (if (eq (car clause) :no-error)
+          (%uv-lambda (cadr clause) (cddr clause) env clause nil)
+          (let ((v (car (cadr clause))))
+            (if (and v (symbolp v))
+                (let ((e (%uv-entry v clause '())))
+                  (%uv-body (cddr clause) (cons e env) (list e) nil))
+                (%uv-body (cddr clause) env '() nil)))))))
+
+(defun %uv-restart-case (form env)
+  (%uv-walk (cadr form) env)
+  (dolist (clause (cddr form))
+    (when (and (consp clause) (consp (cdr clause)) (listp (cadr clause)))
+      (let ((body (cddr clause)))
+        (loop while (and (consp body) (member (car body) '(:report :interactive :test))
+                         (consp (cdr body)))
+              do (when (consp (cadr body)) (%uv-walk (cadr body) env))
+                 (setf body (cddr body)))
+        (%uv-lambda (cadr clause) body env clause nil)))))
+
+(defun %uv-walk (form env)
+  (cond
+    ((symbolp form) (when form (%uv-note form env 0)))
+    ((atom form) nil)
+    ((or (> *uv-level* 2000) (not (%stack-space-available-p)))
+     (throw '%uv-give-up nil))
+    (t
+     (let ((head (car form))
+           (*uv-level* (1+ *uv-level*)))
+       (cond
+         ((not (listp (cdr form))) nil)
+         ((consp head)
+          (when (and (eq (car head) 'lambda) (consp (cdr head)))
+            (%uv-lambda (cadr head) (cddr head) env head nil))
+          (%uv-walk-list (cdr form) env))
+         ((not (symbolp head)) (%uv-walk-list (cdr form) env))
+         ((%lexical-function-p head) (%uv-walk-list (cdr form) env))
+         ((eq head 'quote) nil)
+         ((eq head 'function)
+          (let ((f (cadr form)))
+            (when (and (consp f) (eq (car f) 'lambda) (consp (cdr f)))
+              (%uv-lambda (cadr f) (cddr f) env f nil))))
+         ((or (eq head 'lambda) (eq head 'defun) (eq head 'defmacro))
+          (let ((f (if (eq head 'lambda) form (cdr form))))
+            (when (consp (cdr f))
+              (%uv-lambda (cadr f) (cddr f) env form (eq head 'defmacro)))))
+         ((eq head 'setq)
+          (loop for (var val) on (cdr form) by #'cddr
+                do (when (symbolp var) (%uv-note var env 1))
+                   (%uv-walk val env)))
+         ((eq head 'multiple-value-setq)
+          (when (listp (cadr form))
+            (dolist (v (cadr form))
+              (when (symbolp v) (%uv-note v env 0))))
+          (%uv-walk-list (cddr form) env))
+         ((eq head 'let) (%uv-let form env nil))
+         ((eq head 'let*) (%uv-let form env t))
+         ((eq head 'flet) (%uv-flet form env nil))
+         ((eq head 'labels) (%uv-flet form env t))
+         ((eq head 'macrolet) (%uv-macrolet form env))
+         ((eq head 'symbol-macrolet) (%uv-symbol-macrolet form env))
+         ((eq head 'locally) (%uv-body (cdr form) env '() nil))
+         ((eq head 'handler-case) (%uv-handler-case form env))
+         ((eq head 'restart-case) (%uv-restart-case form env))
+         ((or (eq head 'handler-bind) (eq head 'restart-bind))
+          (when (listp (cadr form))
+            (dolist (b (cadr form))
+              (when (consp b) (%uv-walk-list (cdr b) env))))
+          (%uv-walk-list (cddr form) env))
+         ((eq head 'cond)
+          (dolist (clause (cdr form))
+            (when (consp clause) (%uv-walk-list clause env))))
+         ((or (eq head 'block) (eq head 'the) (eq head 'eval-when))
+          (%uv-walk-list (cddr form) env))
+         ((eq head 'return-from) (%uv-walk (caddr form) env))
+         ((eq head 'tagbody)
+          (dolist (f (cdr form)) (when (consp f) (%uv-walk f env))))
+         ((or (eq head 'go) (eq head 'declare) (eq head 'define-symbol-macro)) nil)
+         ((eq head 'load-time-value) (%uv-walk (cadr form) '()))
+         (t
+          (let ((expander (find-macro-expander head)))
+            (let ((expanded (and expander (%walker-macroexpand form expander :none))))
+              (if (and expanded (not (eq expanded form)))
+                  (%uv-walk expanded env)
+                  (%uv-walk-list (cdr form) env))))))))))
+
+(defun note-unused-variables (form)
+  "Signal the unused-variable style warnings for FORM, a top-level form that
+   is about to be compiled."
+  (unless *uv-warned*
+    (setf *uv-warned* (make-hash-table :test #'eq)))
+  (let ((*uv-warnings* '()))
+    (catch '%uv-give-up
+      (handler-case (%uv-walk form '())
+        (error () (setf *uv-warnings* '()))))
+    (dolist (w (nreverse *uv-warnings*))
+      (warn 'style-warning :format-control (car w) :format-arguments (list (cdr w))))))
+
+(defun maybe-note-unused-variables (form)
+  "NOTE-UNUSED-VARIABLES for top-level FORM, unless COMPILE-FORM passes its
+   top-level-ness on to subforms or an expansion, which are walked instead."
+  (let ((op (car form)))
+    (unless (and (symbolp op)
+                 (or (member op '(progn locally macrolet symbol-macrolet eval-when) :test #'eq)
+                     (and (not (gethash op *compile-form-handlers*))
+                          (not (string= (symbol-name op) "DEFMACRO"))
+                          (find-macro-expander op))))
+      (note-unused-variables form))))
+
+;;; ============================================================
 ;;; Top-level compilation
 ;;; ============================================================
 
@@ -1797,16 +2327,23 @@
                                +cs-boxed-vars+ '() +cs-local-functions+ '()))
         (*var-counter* 0)
         (*label-counter* 0)
+        (*compiler-name-syms* (or *compiler-name-syms* (list nil)))
+        (*uninterned-var-names* (if *compiler-name-syms*
+                                    *uninterned-var-names*
+                                    (list nil)))
         (*specials* '())
+        (*lexical-decl-frames* '())
         (*at-toplevel* t)
         (*toplevel-segments-p* nil)
         (*mv-mode-local* nil)
         (*mv-expect-args* nil)
         (*mv-exit-cleanup* nil)
         (*macroexpand-scope* '())
-        (*macroexpand-cache* (make-hash-table :test #'eq))
+        (*macroexpand-cache* (list nil))
+        (*fold-call-memo* (list nil))
         (*bmr-cache* (make-hash-table :test #'eq))
-        (*ffv-free-cache* (make-hash-table :test #'eq))
+        (*ffv-free-cache* (list nil))
+        (*uv-warned* nil)
         (*ltv-hoisted* (and *compile-file-mode* *current-module-id* (list '()))))
     (let ((body (compile-expr expr)))
       `(,@(peephole-optimize (append (%compile-hoisted-ltvs) body))
@@ -1835,7 +2372,12 @@
                                +cs-boxed-vars+ '() +cs-local-functions+ '()))
         (*var-counter* 0)
         (*label-counter* 0)
+        (*compiler-name-syms* (or *compiler-name-syms* (list nil)))
+        (*uninterned-var-names* (if *compiler-name-syms*
+                                    *uninterned-var-names*
+                                    (list nil)))
         (*specials* '())
+        (*lexical-decl-frames* '())
         (*at-toplevel* t)
         (*toplevel-segments-p* t)
         (*in-tail-position* t)
@@ -1846,9 +2388,11 @@
         (*mv-expect-args* nil)
         (*mv-exit-cleanup* nil)
         (*macroexpand-scope* '())
-        (*macroexpand-cache* (make-hash-table :test #'eq))
+        (*macroexpand-cache* (list nil))
+        (*fold-call-memo* (list nil))
         (*bmr-cache* (make-hash-table :test #'eq))
-        (*ffv-free-cache* (make-hash-table :test #'eq))
+        (*ffv-free-cache* (list nil))
+        (*uv-warned* nil)
         ;; Code EVAL (or COMPILE) runs now, also when a macro calls it while
         ;; COMPILE-FILE compiles a top level form: its LOAD-TIME-VALUE forms
         ;; belong to it, not to the fasl being written.

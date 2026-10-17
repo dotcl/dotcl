@@ -3,4 +3,5 @@
 (defsystem "dotcl-socket"
   :description "TCP socket support for dotcl (built-in)."
   :version "1.0"
+  :depends-on ("dotcl-bsd-sockets")
   :class require-system)

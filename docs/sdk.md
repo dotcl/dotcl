@@ -59,6 +59,8 @@ outside, use a package reference.
 | `DotclBaseCore` | the `dotcl.core` shipped in the package | The base image the build compiles against and copies into the output. Point it elsewhere to build against a core of your own. |
 | `DotclDebugInfo` | `true` when `Configuration=Debug`, else `false` | Emit a Portable PDB next to each FASL so a debugger binds breakpoints in the `.lisp` source. |
 | `DotclTrimmerRoots` | `true` | Hand the trimmer a descriptor for the .NET types your Lisp sources name, so a trimmed publish keeps them. See [Trimmed publish](#trimmed-publish). `false` turns it off. |
+| `DotclReadyToRunFasls` | *(unset)* | On a `PublishReadyToRun` publish, compile the published FASLs to native code as well. See [ReadyToRun publish](#readytorun-publish). Unset: a FASL crossgen2 cannot compile is published as IL with a warning. `true`: that fails the publish. `false`: FASLs stay IL. Unlike the rest of this table it does not need `DotclProjectAsd`: it also covers the `dotcl.core` and `contrib/` a plain embedder publishes. |
+| `DotclPublishAllContribs` | *(unset)* | `true` publishes every contrib module, as before. Unset, a publish carries only the contrib modules your systems depend on. See [Contrib modules in a publish](#contrib-modules-in-a-publish). |
 | `DotCLRuntimeVersion` | the version the SDK shipped with | *(SDK wiring only)* Which `DotCL.Runtime` package version the SDK injects. |
 | `DisableImplicitDotCLRuntimeReference` | *(unset)* | *(SDK wiring only)* `true` stops the SDK injecting the package reference, so you can pin the runtime yourself. |
 | `DotclTool` | `dotcl` | *(repo import only)* The CLI to invoke. |
@@ -131,6 +133,67 @@ Not covered, and rooted by hand with your own `TrimmerRootDescriptor` or
   `File` is kept but `StreamReader.ReadLine` is not, unless something else
   keeps it;
 - the dependency FASLs. Only your own system's sources are looked at.
+
+## ReadyToRun publish
+
+`PublishReadyToRun` compiles the application's DLLs to native code, but a FASL
+is only a file to copy as far as the SDK is concerned. The targets fill that
+gap: on a publish with `PublishReadyToRun=true` and a runtime identifier, every
+FASL being published -- `dotcl.core`, the FASLs under `dotcl-fasl/`, and the
+`contrib/` tree -- goes through the same crossgen2 the SDK restored for the
+DLLs, and the native image is published under the FASL's own name.
+
+```
+dotnet publish -c Release -r win-x64 -p:PublishReadyToRun=true
+```
+
+The image replaces the FASL rather than sitting next to it as a sibling (see
+[Ahead-of-time compiled FASLs](readytorun.md)): the publish output belongs to
+one runtime identifier already, and a FASL replaced in place is the only form
+whose first load from a fresh copy reads no IL at all. On Windows most of the
+gain is in that first run.
+
+Measured on a small application that loads the core, two FASLs and one
+contrib, the whole process from start to exit:
+
+| | FASLs as IL | FASLs ReadyToRun |
+|---|---|---|
+| macOS arm64, second run onwards | 335-339 ms | 174-180 ms |
+| Windows x64, second run onwards | 557-603 ms | 323-369 ms |
+| Windows x64, first run of a fresh copy | 1234-1944 ms | 439-481 ms |
+
+The cost is size: a native FASL is about three times its IL form (that
+application's publish grew from 17 to 30-35 MB).
+
+`dotnet build` and a publish without `PublishReadyToRun` leave the FASLs IL. A
+`PublishReadyToRun` publish with no `-r` gets the SDK's own runtime identifier,
+as the DLLs do, and is compiled too. A FASL named in `PublishReadyToRunExclude`
+is left IL, as a DLL named there is. Each FASL compiled is kept under
+`$(IntermediateOutputPath)dotcl-r2r/`, so a publish with nothing changed does
+not run crossgen2 again.
+
+## Contrib modules in a publish
+
+The package copies its whole `contrib/` tree into the build output, so
+`(require "x")` works for any bundled module while you develop. A publish of a
+project with `DotclProjectAsd` keeps only the modules the build's manifest
+requires: the contrib systems your systems (and their dependencies) name in
+`:depends-on`, and the modules those require in turn. The rest are left out,
+the way a static link leaves out what nothing declared.
+
+**If the application REQUIREs a contrib module at run time, say so in an
+`.asd`** (`:depends-on ("dotcl-socket")` in your system), **or publish with
+`DotclPublishAllContribs=true`.** A `(require "x")` evaluated at run time is not
+seen by the build, and in the published application it fails with the module
+not found.
+
+The selection is made before the [ReadyToRun](#readytorun-publish) step, so
+only the modules that are published are compiled. For an application that
+depends on `dotnet-class` and `dotcl-thread`, the macOS arm64 ReadyToRun
+publish went from 48.8 to 32.2 MB (its `contrib/` from 17 MB to 0.4 MB). A project without
+`DotclProjectAsd` (an application that only embeds the runtime) has no manifest
+and publishes the whole tree, as before. `dotnet build` output is not
+narrowed.
 
 ## Adding a dependency: which knob
 

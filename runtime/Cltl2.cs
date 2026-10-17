@@ -5,11 +5,10 @@
 // variable-information / ...) were unbound and trivia failed to load
 // ("Unbound variable: OPTIMIZER": define-declaration compiled as a plain call).
 //
-// dotcl's macro &environment carries no lexical information (always NIL), so a
-// full CLtL2 implementation is impossible. This is a DEFENSIVE MINIMAL backend:
-// every introspection call NEVER errors and degrades to "no information" (nil /
-// safe defaults), so type-i / trivia balland2006 just skip type optimization and
-// emit correct (unoptimized) code instead of failing to compile.
+// The answers come from the compiler (%CLTL2-* in cil-compiler.lisp): the
+// global proclamations, and the lexical state an &environment object made
+// while compiling carries. Without the compiler loaded they degrade to "no
+// information" (nil / safe defaults) and never error.
 //
 // The functions are registered here (C#) rather than in cil-stdlib.lisp because
 // the SIL serialization of a defun whose name lives in a non-CL-USER package does
@@ -75,9 +74,8 @@ public static class Cltl2
     }
 
     // (variable-information variable &optional env) => kind, local-p, decl-alist.
-    // dotcl's macro environments carry no lexical bindings, so this answers for
-    // the global environment only: :CONSTANT, :SPECIAL or :SYMBOL-MACRO from the
-    // symbol's global state, NIL when nothing is known. LOCAL-P is always NIL.
+    // The global kind is worked out here and handed to the compiler, which
+    // answers for the lexical environment of ENV.
     public static LispObject VariableInformation(LispObject[] args)
     {
         if (args.Length < 1 || args.Length > 2)
@@ -99,8 +97,26 @@ public static class Cltl2
         else
             throw new LispErrorException(new LispTypeError(
                 "VARIABLE-INFORMATION: not a symbol", v, Startup.Sym("SYMBOL")));
+        var env = args.Length > 1 ? args[1] : Nil.Instance;
+        if (CompilerFunction("%CLTL2-VARIABLE-INFORMATION") is LispFunction hook)
+            return hook.Invoke(new[] { v, env, kind });
         MultipleValues.Set(kind, Nil.Instance, Nil.Instance);
         return kind;
+    }
+
+    /// <summary>The compiler's implementation of a query, or null before the
+    /// compiler is loaded.</summary>
+    private static LispFunction? CompilerFunction(string name)
+    {
+        foreach (var pkgName in new[] { "DOTCL.CIL-COMPILER", "DOTCL-INTERNAL" })
+        {
+            var pkg = Package.FindPackage(pkgName);
+            if (pkg == null) continue;
+            var (sym, status) = pkg.FindSymbol(name);
+            if (sym != null && status != SymbolStatus.None && sym.Function is LispFunction fn)
+                return fn;
+        }
+        return null;
     }
 
     /// <summary>Whether the compiler holds SYM globally special without the
@@ -142,14 +158,27 @@ public static class Cltl2
         return false;
     }
 
-    // (function-information function &optional env): likewise.
-    public static LispObject FunctionInformation(LispObject[] args) => NoInfo();
+    // (function-information function &optional env) => kind, local-p, decl-alist.
+    public static LispObject FunctionInformation(LispObject[] args)
+    {
+        if (args.Length < 1 || args.Length > 2)
+            throw new LispErrorException(new LispProgramError(
+                $"FUNCTION-INFORMATION: wrong number of arguments: {args.Length} (expected 1-2)"));
+        if (CompilerFunction("%CLTL2-FUNCTION-INFORMATION") is LispFunction hook)
+            return hook.Invoke(new[] { args[0], args.Length > 1 ? args[1] : Nil.Instance });
+        return NoInfo();
+    }
 
-    // (declaration-information decl-name &optional env). Standard OPTIMIZE gets a
-    // neutral default; custom declarations (e.g. trivia's OPTIMIZER) return NIL so
-    // consumers' (when-let ((it (...))) ...) skip them.
+    // (declaration-information decl-name &optional env). Custom declarations
+    // (e.g. trivia's OPTIMIZER) return NIL so consumers' (when-let ((it (...)))
+    // ...) skip them.
     public static LispObject DeclarationInformation(LispObject[] args)
     {
+        if (args.Length < 1 || args.Length > 2)
+            throw new LispErrorException(new LispProgramError(
+                $"DECLARATION-INFORMATION: wrong number of arguments: {args.Length} (expected 1-2)"));
+        if (CompilerFunction("%CLTL2-DECLARATION-INFORMATION") is LispFunction hook)
+            return hook.Invoke(new[] { args[0], args.Length > 1 ? args[1] : Nil.Instance });
         if (args.Length >= 1 && args[0] is Symbol s && s.Name == "OPTIMIZE")
             return Runtime.List(
                 Runtime.List(Startup.Sym("SPEED"), Fixnum.Make(1)),
@@ -160,18 +189,40 @@ public static class Cltl2
         return Nil.Instance;
     }
 
-    // (augment-environment env &key ...): no env object to extend; return it
-    // unchanged so later *-information on it stays "no info".
+    // (augment-environment env &key variable symbol-macro function macro declare)
     public static LispObject AugmentEnvironment(LispObject[] args)
-        => args.Length >= 1 ? args[0] : Nil.Instance;
+    {
+        if (args.Length < 1 || args.Length % 2 != 1)
+            throw new LispErrorException(new LispProgramError(
+                $"AUGMENT-ENVIRONMENT: wrong number of arguments: {args.Length}"));
+        var hook = CompilerFunction("%CLTL2-AUGMENT-ENVIRONMENT");
+        if (hook == null) return args[0];
+        var keys = new[] { "VARIABLE", "SYMBOL-MACRO", "FUNCTION", "MACRO", "DECLARE" };
+        var vals = new LispObject[] { Nil.Instance, Nil.Instance, Nil.Instance, Nil.Instance, Nil.Instance };
+        var seen = new bool[keys.Length];
+        for (int a = 1; a < args.Length; a += 2)
+        {
+            int idx = args[a] is Symbol ks && ks.HomePackage == Startup.KeywordPkg
+                ? Array.IndexOf(keys, ks.Name) : -1;
+            if (idx < 0)
+                throw new LispErrorException(new LispProgramError(
+                    $"AUGMENT-ENVIRONMENT: unknown keyword {args[a]}"));
+            if (!seen[idx]) { vals[idx] = args[a + 1]; seen[idx] = true; }
+        }
+        return hook.Invoke(new[] { args[0], vals[0], vals[1], vals[2], vals[3], vals[4] });
+    }
 
-    // (parse-macro name lambda-list body &optional env) => a macro-expander lambda
-    //   (lambda (whole env) (declare (ignorable env))
-    //     (destructuring-bind <lambda-list> (cdr whole) . <body>))
+    // (parse-macro name lambda-list body &optional env) => a lambda expression
+    // for a macro function of (form env), as DEFMACRO would make.
     public static LispObject ParseMacro(LispObject[] args)
     {
-        var lambdaList = args.Length >= 2 ? args[1] : Nil.Instance;
-        var body = args.Length >= 3 ? args[2] : Nil.Instance;
+        if (args.Length < 3 || args.Length > 4)
+            throw new LispErrorException(new LispProgramError(
+                $"PARSE-MACRO: wrong number of arguments: {args.Length} (expected 3-4)"));
+        if (CompilerFunction("%CLTL2-PARSE-MACRO") is LispFunction hook)
+            return hook.Invoke(new[] { args[0], args[1], args[2] });
+        var lambdaList = args[1];
+        var body = args[2];
         var whole = new Symbol("WHOLE");
         var env = new Symbol("ENV");
         var dsb = new Cons(Startup.Sym("DESTRUCTURING-BIND"),
@@ -188,7 +239,12 @@ public static class Cltl2
     // (enclose lambda-expression &optional env) => function
     public static LispObject Enclose(LispObject[] args)
     {
-        if (args.Length < 1) return Nil.Instance;
+        if (args.Length < 1 || args.Length > 2)
+            throw new LispErrorException(new LispProgramError(
+                $"ENCLOSE: wrong number of arguments: {args.Length} (expected 1-2)"));
+        if (args.Length == 2 && args[1] is not Nil
+            && CompilerFunction("%CLTL2-ENCLOSE") is LispFunction hook)
+            return hook.Invoke(new[] { args[0], args[1] });
         return Runtime.Eval(Runtime.List(Startup.Sym("FUNCTION"), args[0]));
     }
 }

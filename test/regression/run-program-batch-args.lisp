@@ -50,9 +50,10 @@
 (defun rpba-image ()
   (let* ((args (dotnet:static "System.Environment" "GetCommandLineArgs"))
          (count (dotnet:invoke args "Length")))
-    (loop for i below (1- count)
-          when (equal (dotnet:invoke args "GetValue" i) "--core")
-            return (list "--core" (dotnet:invoke args "GetValue" (1+ i))))))
+    (or (loop for i below (1- count)
+              when (equal (dotnet:invoke args "GetValue" i) "--core")
+                return (list "--core" (dotnet:invoke args "GetValue" (1+ i))))
+        (list "--core" (regression-child-core)))))
 
 (defvar *rpba-forward*
   (let ((script (concatenate 'string *rpba-dir* "print-args.lisp"))

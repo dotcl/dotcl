@@ -37,7 +37,7 @@ dotcl cannot tell from a fasl whether its sources looked at the platform, so
 it assumes they did. A wrong fasl is never loaded this way; the cost is the
 compile time on the consumer's machine.
 
-ReadyToRun images (`--r2r`) are per platform by construction: a
+ReadyToRun images (which `dotcl pack --library` adds by default) are per platform by construction: a
 `foo.fasl.r2r-<rid>` sibling is used only on that runtime identifier, and
 anywhere else the fasl's IL is compiled by the JIT as usual (see
 [Ahead-of-time compiled FASLs](readytorun.md)).

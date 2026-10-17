@@ -87,6 +87,23 @@ class Program
         return -1;
     }
 
+    /// <summary>Index of a `--` that ends dotcl's own options, or -1. A `--`
+    /// after a script name or a subcommand other than `repl` is theirs.</summary>
+    static int DoubleDashIndex(string[] args)
+    {
+        bool replSeen = false;
+        for (int i = 0; i < args.Length; i++)
+        {
+            var a = args[i];
+            if (a == "--") return i;
+            if (_globalsWithValue.Contains(a)) { i++; continue; }
+            if (a.StartsWith('-') && a != StdinScript) continue;
+            if (a == "repl" && !replSeen) { replSeen = true; continue; }
+            return -1;
+        }
+        return -1;
+    }
+
     // The positional script meaning standard input. The bare-token rule can
     // never produce it (a bare token does not start with '-'), so a file of
     // that name has to be spelled `./-` to be run instead.
@@ -233,6 +250,15 @@ class Program
         // application and every argument belongs to it (see HasUserFasl).
         bool hasUserFasl = HasUserFasl();
 
+        // Everything after `--` is the program's, never dotcl's options.
+        List<string>? programArgs = null;
+        if (!hasUserFasl && DoubleDashIndex(args) is var dd && dd >= 0)
+        {
+            programArgs = args[(dd + 1)..].ToList();
+            args = args[..dd];
+            Runtime.ScriptArgs = programArgs;
+        }
+
         if (!hasUserFasl && args.Any(a => a == "--help") && FirstNonGlobalArg(args) is var _packHelpAt
             && _packHelpAt >= 0 && args[_packHelpAt] == "pack")
         {
@@ -277,13 +303,15 @@ Optional:
                                collected and compiled ahead of it
                                (repeatable)
   --r2r                        Also crossgen2-compile the fasl per RID
+  --no-r2r                     With --library: no ReadyToRun images
   --library                    Package the system, and the systems it needs
                                that dotcl does not supply, as a library for
                                other dotcl systems to declare with
                                (:nuget ...), not as a tool: needs only
-                               --system and -o. --r2r adds ReadyToRun
-                               images for this platform, and with --from
-                               for the other --rids too
+                               --system and -o. Adds ReadyToRun images for
+                               the desktop --rids unless --no-r2r; without
+                               crossgen2 it warns and packs without them
+                               (--r2r makes that an error)
   --dry-run                    Print the planned fasl and packages
                                without producing them (does not compile)
   --description <text>         Override nuspec fields the .asd would
@@ -314,6 +342,8 @@ Usage:
                                terminal and no program is given)
   dotcl --load file.lisp       Load file.lisp, then exit
   dotcl --eval ""(+ 1 2)""       Evaluate an expression, then exit
+  dotcl [options] -- [args...] Stop reading options: what follows is
+                               the program's arguments, never a script
 
 Options:
   --help                       Display this message
@@ -616,7 +646,8 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         //              [--repository <url[#commit]>] [--readme <file>]
         //              [--tags <csv>] [--authors <text>] [--copyright <text>]
         //   dotcl pack --library --system <name> -o <dir> [--id <pkgid>]
-        //              [--version <ver>] [--r2r --from <dotcl-nupkg-dir> [--rids <csv>]]
+        //              [--version <ver>] [--r2r | --no-r2r] [--rids <csv>]
+        //              [--from <dotcl-nupkg-dir>]
         //              [the metadata options above]
         // Compile the system and its whole closure into a single fasl, then
         // restamp the published dotcl tool packages in --from into the app's
@@ -641,6 +672,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 else if (a == "--dotcl-version" && i + 1 < rest.Count) pack.DotclVersion = rest[++i];
                 else if (a == "--no-android") pack.NoAndroid = true;
                 else if (a == "--r2r") pack.ReadyToRun = true;
+                else if (a == "--no-r2r") pack.ReadyToRun = false;
                 else if (a == "--library") pack.Library = true;
                 else if (a == "--dry-run") pack.DryRun = true;
                 else if (a == "--asd-search-path" && i + 1 < rest.Count) pack.SearchPaths.Add(rest[++i]);
@@ -898,7 +930,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         if (scriptMode)
         {
             // Expose trailing args to (uiop:command-line-arguments).
-            Runtime.ScriptArgs = positionalArgv;
+            Runtime.ScriptArgs = programArgs ?? positionalArgv;
 
             // Set *debugger-hook* to print error and exit (no interactive debugger)
             InstallScriptDebuggerHook();
@@ -907,7 +939,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             {
                 // Register #! as line comment for shebang support
                 var shebangReader = new Reader(new StringReader(
-                    "(set-dispatch-macro-character #\\# #\\! (lambda (s c n) (read-line s nil nil) (values)))"));
+                    "(set-dispatch-macro-character #\\# #\\! (lambda (s c n) (declare (ignore c n)) (read-line s nil nil) (values)))"));
                 if (shebangReader.TryRead(out var shebangForm))
                     Runtime.Eval(shebangForm);
 
@@ -1073,12 +1105,13 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     static void InstallScriptDebuggerHook()
     {
         var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
-        DynamicBindings.Set(hookSym, new LispFunction(hookArgs => {
+        var hook = ConditionSystem.ReportingDebuggerHook(new LispFunction(hookArgs => {
             var cond = hookArgs[0];
             Console.Error.WriteLine(ConditionText.Line(cond));
             Environment.Exit(1);
             return Nil.Instance;
         }, "*SCRIPT-DEBUGGER-HOOK*", 2));
+        DynamicBindings.Set(hookSym, hook);
     }
 
     /// <summary>Whether a hoisted --asm command line (args[0..1] are the --asm pair)
@@ -1272,9 +1305,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// system names in a (:nuget ...) component. The .asd, the sources, their fasls
     /// and a record of the compiler that made them go under dotcl/&lt;system&gt;/
     /// (asdf-nuget does the packing); the system's own (:nuget ...) components
-    /// become the package's dependencies. With --r2r, each fasl also gets a
-    /// ReadyToRun sibling per RID, compiled against the runtime images in the dotcl
-    /// packages in --from, as the tool path does for its one fasl.
+    /// become the package's dependencies. Unless --no-r2r, each fasl also gets a
+    /// ReadyToRun sibling per RID, compiled against this dotcl's runtime images, or
+    /// those in the dotcl packages in --from.
     /// </summary>
     static int RunPackLibrary(PackOptions o, DotclBuild.SystemMeta? asd, string? version)
     {
@@ -1285,7 +1318,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         if (missing.Count > 0)
         {
             Console.Error.WriteLine($"pack: missing required option(s): {string.Join(", ", missing)}");
-            Console.Error.WriteLine("usage: dotcl pack --library --system <name> -o <dir> [--id <pkgid>] [--version <ver>] [--r2r [--from <dotcl-nupkg-dir> --rids <csv>]]");
+            Console.Error.WriteLine("usage: dotcl pack --library --system <name> -o <dir> [--id <pkgid>] [--version <ver>] [--r2r | --no-r2r] [--rids <csv>] [--from <dotcl-nupkg-dir>]");
             return 2;
         }
         var id = o.Id ?? o.System!;
@@ -1335,13 +1368,25 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             return 0;
         }
 
-        if (o.ReadyToRun && PackR2r.EnsureHostCrossgen2() == null)
+        var host = Runtime.PortableRid();
+        var r2rRids = o.ReadyToRun == false ? new List<string>()
+            : (!string.IsNullOrEmpty(o.Rids) ? o.Rids!.Replace(';', ',') : DefaultLibraryRids)
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(r => r != "any").Distinct().ToList();
+        if (r2rRids.Count > 0 && PackR2r.EnsureHostCrossgen2() == null)
         {
-            Console.Error.WriteLine(
-                $"pack: --r2r needs crossgen2 for {PackR2r.HostRid() ?? "this platform"}, and "
-                + "restoring it (dotnet publish -p:PublishReadyToRun=true) did not bring it in");
-            return 1;
+            var why = $"crossgen2 for {host ?? "this platform"} is not available "
+                + "(restoring it with dotnet publish -p:PublishReadyToRun=true did not bring it in)";
+            if (o.ReadyToRun == true)
+            {
+                Console.Error.WriteLine($"pack: --r2r: {why}");
+                return 1;
+            }
+            Console.Error.WriteLine($"pack: warning: {why}; the package carries no ReadyToRun images "
+                + "(it loads correctly, only slower). Pass --no-r2r to skip this.");
+            r2rRids.Clear();
         }
+        bool hostR2r = host != null && r2rRids.Remove(host);
 
         static string Lit(string s) => "\"" + s.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"";
         var form = $@"
@@ -1353,7 +1398,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 {Lit(o.System!)} {Lit(Path.GetFullPath(o.Output!).Replace('\\', '/'))}
                 :id {Lit(id)} :version {Lit(version!)}
                 :authors {Lit(meta.Authors!)} :description {Lit(meta.Description!)}
-                :r2r {(o.ReadyToRun ? "t" : "nil")})))
+                :r2r {(hostR2r ? "t" : "nil")})))
   (error (c) (list :error (princ-to-string c))))";
         string nupkg;
         try
@@ -1373,19 +1418,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             return 1;
         }
 
-        // --r2r alone: the packing itself wrote this platform's siblings, against
-        // the running dotcl. With --from, the other platforms too, against the
-        // runtime images in the dotcl packages there.
-        if (o.ReadyToRun && !string.IsNullOrEmpty(o.From))
-        {
-            var host = PackR2r.HostRid();
-            var rids = (!string.IsNullOrEmpty(o.Rids)
-                    ? o.Rids!.Replace(';', ',')
-                    : "win-x64,win-arm64,linux-x64,linux-arm64,osx-x64,osx-arm64")
-                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Where(r => r != "any" && r != host).ToList();
-            AddLibraryR2r(nupkg, rids, o.From!, o.DotclVersion);
-        }
+        // This platform's siblings were written by the packing itself.
+        if (r2rRids.Count > 0)
+            AddLibraryR2r(nupkg, r2rRids, string.IsNullOrEmpty(o.From) ? null : o.From, o.DotclVersion);
 
         try { PackRestamp.ApplyLibraryMeta(nupkg, meta); }
         catch (Exception ex) { Console.Error.WriteLine($"pack: {ex.Message}"); return 1; }
@@ -1395,33 +1430,51 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         return 0;
     }
 
+    const string DefaultLibraryRids = "win-x64,win-arm64,linux-x64,linux-arm64,osx-x64,osx-arm64";
+
     /// <summary>Add a ReadyToRun sibling (x.fasl.r2r-&lt;rid&gt;) for every fasl in the
-    /// library package, per RID. A RID that will not compile is reported and
-    /// skipped: the fasl beside it is complete, only JIT-compiled at load.</summary>
-    static void AddLibraryR2r(string nupkg, IReadOnlyList<string> rids, string from, string? dotclVersion)
+    /// library package, per RID, against the runtime images in the dotcl packages
+    /// in FROM, or this dotcl's when FROM is null. A RID that will not compile is
+    /// reported and skipped: the fasl beside it is complete, only JIT-compiled at
+    /// load.</summary>
+    static void AddLibraryR2r(string nupkg, IReadOnlyList<string> rids, string? from, string? dotclVersion)
     {
-        dotclVersion ??= PackRestamp.InferDotclVersion(from);
+        if (from != null) dotclVersion ??= PackRestamp.InferDotclVersion(from);
         var work = Path.Combine(Path.GetTempPath(), "dotcl-libr2r-" + Guid.NewGuid().ToString("N"));
         using var zip = System.IO.Compression.ZipFile.Open(nupkg, System.IO.Compression.ZipArchiveMode.Update);
         var fasls = zip.Entries
             .Where(e => e.FullName.StartsWith("dotcl/") && e.FullName.EndsWith(".fasl"))
             .Select(e => e.FullName).ToList();
-        int i = 0;
+        var faslFiles = new List<string>();
         foreach (var name in fasls)
         {
-            var dir = Path.Combine(work, (i++).ToString());
+            var dir = Path.Combine(work, faslFiles.Count.ToString());
             Directory.CreateDirectory(dir);
             var fasl = Path.Combine(dir, "x.fasl");
             using (var s = zip.GetEntry(name)!.Open())
             using (var f = File.Create(fasl))
                 s.CopyTo(f);
-            foreach (var rid in rids)
+            faslFiles.Add(fasl);
+        }
+        foreach (var rid in rids)
+        {
+            if (fasls.Count > 0 && !PackR2r.CanCompile(rid, out var unavailable))
             {
-                var ridPkg = Path.Combine(from, $"dotcl.{rid}.{dotclVersion}.nupkg");
-                var sibling = PackR2r.Compile(fasl, rid, ridPkg, Path.Combine(dir, rid), out var why);
+                Console.Error.WriteLine($"pack: warning: no ReadyToRun images for {rid}: {unavailable}");
+                continue;
+            }
+            int built = 0;
+            for (int i = 0; i < fasls.Count; i++)
+            {
+                var name = fasls[i];
+                var dir = Path.Combine(Path.GetDirectoryName(faslFiles[i])!, rid);
+                var sibling = from == null
+                    ? PackR2r.CompileAgainstRunning(faslFiles[i], rid, dir, out var why)
+                    : PackR2r.Compile(faslFiles[i], rid,
+                                      Path.Combine(from, $"dotcl.{rid}.{dotclVersion}.nupkg"), dir, out why);
                 if (sibling == null)
                 {
-                    Console.Error.WriteLine($"pack: no ReadyToRun image of {name} for {rid}: {why}");
+                    Console.Error.WriteLine($"pack: warning: no ReadyToRun image of {name} for {rid}: {why}");
                     continue;
                 }
                 var entryName = $"{name}.r2r-{rid}";
@@ -1431,8 +1484,10 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 using (var es = e.Open())
                 using (var fs = File.OpenRead(sibling))
                     fs.CopyTo(es);
-                Console.WriteLine($"pack: built ReadyToRun image of {name} for {rid}");
+                built++;
             }
+            if (fasls.Count > 0)
+                Console.WriteLine($"pack: built ReadyToRun images for {rid} ({built}/{fasls.Count} fasls)");
         }
         try { Directory.Delete(work, recursive: true); } catch { }
     }
@@ -1473,7 +1528,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         public string? From;      // dir holding the published dotcl.* nupkgs to restamp
         public string? DotclVersion; // which dotcl version in --from (else inferred)
         public bool NoAndroid = true;   // desktop RIDs only (release default)
-        public bool ReadyToRun;         // also compile the fasl's R2R sibling per RID
+        public bool? ReadyToRun;        // --r2r / --no-r2r; unset: the library path's default is on
         public bool Library;            // pack the system as a library nupkg (dotcl/<system>/)
         public bool DryRun;
         public readonly List<string> SearchPaths = new();
@@ -1702,7 +1757,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         // run per RID and roughly doubles the package, and a package without it is
         // correct, only slower.
         Dictionary<string, string>? r2rForRid = null;
-        if (o.ReadyToRun)
+        if (o.ReadyToRun == true)
         {
             r2rForRid = new Dictionary<string, string>();
             var dotclVersion = o.DotclVersion ?? PackRestamp.InferDotclVersion(o.From!);
@@ -1931,214 +1986,11 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         Debugger.Input = stdin;
         Console.WriteLine($"dotcl REPL. {ExitKeyHint()} to exit.");
 
-        var buffer = new System.Text.StringBuilder();
-
-        while (true)
+        ReplLoop.Run(stdin, ExitKeyHint, OpenReplStdin, () =>
         {
-            // The ABORT restart covers the WHOLE iteration -- prompt, read and
-            // eval -- not just the evaluation. Ctrl-C arriving while the REPL
-            // waits for input used to reach the debugger with an empty restart
-            // cluster: "Available restarts:" followed by nothing, and no way
-            // back to the prompt except Ctrl-D (dotcl/dotcl issue 61). The
-            // interrupt is delivered at a safepoint on this thread, so the
-            // cluster established here is the one it sees.
-            var abortTag = new object();
-            var abortRestart = new LispRestart("ABORT",
-                _ => Nil.Instance,
-                description: "Return to top level.",
-                tag: abortTag);
-            RestartClusterStack.PushCluster(new[] { abortRestart });
-            try
-            {
-            var pkg = DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
-            var pkgName = pkg != null
-                ? new[] { pkg.Name }.Concat(pkg.Nicknames).OrderBy(n => n.Length).First()
-                : "CL-USER";
-
-            // The continuation prompt is as wide as the primary one looks,
-            // which is the plain text: the colour takes no columns.
-            var plainPrimary = $"{pkgName}> ";
-            var primary = ReplColor.ForOut("PROMPT", $"{pkgName}>") + " ";
-            var prompt = buffer.Length == 0 ? primary : new string(' ', plainPrimary.Length);
-
-            string? line;
-            if (Startup.ReadlineHook != null)
-            {
-                // An interrupt that arrives while the editor waits for a key is
-                // not an interrupt of any computation: it means "drop what I
-                // typed". On a Windows console the editor reads Ctrl+C as a key
-                // while it waits (TreatControlCAsInput) and drops the form
-                // itself. On Unix the key arrives as SIGINT instead, so the
-                // condition is caught here rather than entering the debugger,
-                // with the same fresh prompt as the result. The editor also
-                // signals it for Ctrl+C on a continuation line, whose earlier
-                // lines are in this loop's buffer.
-                var interruptTag = new object();
-                HandlerClusterStack.PushCluster(new[] {
-                    new HandlerBinding(Startup.Sym("INTERACTIVE-INTERRUPT"),
-                        new LispFunction(hargs => throw new HandlerCaseInvocationException(
-                            interruptTag, 0, hargs.Length > 0 ? hargs[0] : Nil.Instance),
-                            "%REPL-INPUT-INTERRUPT", -1))
-                });
-                try
-                {
-                    var result = Startup.ReadlineHook.Invoke(new LispObject[] { new LispString(prompt) });
-                    // A reader that ends in READ-LINE returns two values; an
-                    // interpreted one hands them back as a single MvReturn.
-                    if (result is MvReturn mv) result = mv.PrimaryValue;
-                    line = result is Nil ? null : (result as LispString)?.Value ?? result.ToString();
-                }
-                catch (HandlerCaseInvocationException hce) when (ReferenceEquals(hce.Tag, interruptTag))
-                {
-                    Console.WriteLine("^C");
-                    buffer.Clear();
-                    continue;
-                }
-                // Transfers of control are not the editor failing. ABORT from a
-                // debugger entered inside the editor, a THROW, an interrupt: each
-                // goes to whoever established it (the handlers below), and the
-                // editor stays on for the next prompt.
-                catch (RestartInvocationException) { throw; }
-                catch (HandlerCaseInvocationException) { throw; }
-                catch (CatchThrowException) { throw; }
-                catch (BlockReturnException) { throw; }
-                catch (GoException) { throw; }
-                catch (LispErrorException ex) when (ex.Condition is LispInteractiveInterrupt) { throw; }
-                catch (Exception ex)
-                {
-                    // The line editor failed (e.g. --readline forced on a
-                    // non-console where Console.ReadKey/CursorLeft are invalid).
-                    // Disable it and fall back to plain line input for the rest
-                    // of the session instead of crashing the REPL.
-                    Startup.ReadlineHook = null;
-                    Console.Error.WriteLine(
-                        $"; readline failed ({ex.Message}); falling back to basic line input"
-                        + $" ({ExitKeyHint()} to exit)");
-                    stdin = OpenReplStdin();
-                    continue;
-                }
-                finally
-                {
-                    HandlerClusterStack.PopCluster();
-                }
-            }
-            else
-            {
-                Console.Write(prompt);
-                line = stdin.ReadLine();
-                // On a Windows console, Ctrl+C makes the pending ReadLine return
-                // null as if the input had ended. Tell the two apart by the
-                // interrupt the same key requested, and treat it like the
-                // editor's Ctrl+C rather than leaving the REPL.
-                if (line == null && ConditionSystem.TakeConsoleInterrupt())
-                {
-                    Console.WriteLine("^C");
-                    buffer.Clear();
-                    continue;
-                }
-            }
-
-            if (line == null)
-            {
-                // EOF. Drop any pending partial form and exit.
-                break;
-            }
-            if (buffer.Length == 0 && string.IsNullOrWhiteSpace(line)) continue;
-
-            if (buffer.Length > 0) buffer.Append('\n');
-            buffer.Append(line);
-
-            // Try to read all forms from the accumulated buffer. Reader signals
-            // "more input needed" as a LispError of condition type END-OF-FILE
-            // (mid-list, mid-string, after a quote: see
-            // Reader.MakeEndOfFileError), which means "keep the buffer and
-            // re-prompt with the continuation indent". Anything else is a real
-            // syntax error: print and drop the buffer.
-            var forms = new List<LispObject>();
-            bool incomplete = false;
-            bool readError = false;
-            try
-            {
-                var reader = new Reader(new StringReader(buffer.ToString()));
-                while (reader.TryRead(out var expr))
-                    forms.Add(expr);
-            }
-            catch (LispErrorException ex) when (
-                ex.Condition is LispCondition lc && lc.ConditionTypeName == "END-OF-FILE")
-            {
-                incomplete = true;
-            }
-            catch (LispErrorException ex)
-            {
-                Console.Error.WriteLine(ReplColor.ForErr("ERROR", $"; read error: {ConditionText.Line(ex.Condition)}"));
-                readError = true;
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine(ReplColor.ForErr("ERROR", $"; read error: {ex.Message}"));
-                readError = true;
-            }
-
-            if (incomplete) continue;
-            if (readError) { buffer.Clear(); continue; }
-            buffer.Clear();
-
-                // An error the runtime signals while evaluating or printing
-                // (CAR of a non-list, an undefined function, ...) that nothing
-                // handles enters the debugger here, as ERROR does, with the
-                // signalling frames still live for :bt and :locals. Only here:
-                // the reader above signals END-OF-FILE for every unfinished
-                // form, and that must stay a request for more input.
-                ConditionSystem.UnhandledErrorsEnterDebugger = true;
-                try
-                {
-                foreach (var form in forms)
-                {
-                    // The history variables, CLHS 25.1.1. AFTEREVAL runs before
-                    // the result is printed, because printing can run Lisp and
-                    // so can overwrite the values it reads.
-                    ReplHistory.BeforeEval(form);
-                    var result = Runtime.Eval(form);
-                    ReplHistory.AfterEval(result);
-                    Console.WriteLine(ReplColor.ForOut("RESULT", Runtime.FormatTop(result, true)));
-                }
-                }
-                finally
-                {
-                    ConditionSystem.UnhandledErrorsEnterDebugger = false;
-                }
-            }
-            catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, abortTag))
-            {
-                // ABORT invoked -- drop any partial input and re-prompt.
-                buffer.Clear();
-            }
-            catch (LispErrorException ex) when (ex.Condition is LispInteractiveInterrupt)
-            {
-                buffer.Clear();
-                Console.Error.WriteLine(ReplColor.ForErr("ERROR", "; Interrupted."));
-            }
-            catch (DebuggerDeclinedException ex)
-            {
-                // A REPL on a pipe reached the debugger: stop as a script does.
-                Console.Error.WriteLine(ReplColor.ForErr("ERROR", $"; {ConditionText.Line(ex.Condition)}"));
-                Console.Out.Flush();
-                Environment.Exit(1);
-            }
-            catch (LispErrorException ex)
-            {
-                Console.Error.WriteLine(ReplColor.ForErr("ERROR", $"; {ConditionText.Line(ex.Condition)}"));
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine(ReplColor.ForErr("ERROR", $"Error: {ex.Message}"));
-                if (Startup.DebugStacktrace) Console.Error.WriteLine(ex.StackTrace);
-            }
-            finally
-            {
-                RestartClusterStack.PopCluster();
-            }
-        }
+            Console.Out.Flush();
+            Environment.Exit(1);
+        });
     }
 
     private const int STD_OUTPUT_HANDLE = -11;

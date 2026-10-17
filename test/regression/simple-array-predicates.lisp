@@ -39,7 +39,7 @@
                   (%sap-bool (typep s 'simple-array))
                   (%sap-bool (typep s 'string))))
           (%sap-strings))
-  ((t t t t t t) (t t t t t t)
+  ((t nil t t t t) (t nil t t t t)
    (nil nil nil nil nil t) (nil nil nil nil nil t) (nil nil nil nil nil t)))
 
 (deftest simple-array-predicates.simple-vector-p
@@ -91,7 +91,8 @@
 (deftest simple-array-predicates.type-of-names
   (mapcar #'type-of (append (%sap-strings) (%sap-vectors t 0) (%sap-vectors 'bit 1)))
   ;; The T and simple bit vectors carry their dimension, as in SBCL.
-  (simple-base-string simple-base-string base-string base-string base-string
+  ((simple-array character (4)) (simple-array character (4))
+   (vector character 4) (vector character 4) (vector character 4)
    (simple-vector 4) (vector t 4) (vector t 4) (vector t 4)
    (simple-bit-vector 4) bit-vector bit-vector bit-vector))
 

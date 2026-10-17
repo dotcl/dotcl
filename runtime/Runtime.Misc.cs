@@ -36,19 +36,11 @@ public static partial class Runtime
     /// LispTwoWayStream, LispEchoStream, LispSynonymStream, and
     /// LispConcatenatedStream (first component).
     /// </summary>
-    // Fasl paths already warned about, so a module loaded repeatedly says it once.
+    // Fasls already accepted as compiled by another core: not reported again.
     private static readonly HashSet<string> _staleFaslWarned = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Warn when a .fasl was produced by a different compiler than the one
-    /// running. A fasl holds the code generation of the compiler that built it, so
-    /// one built before a codegen fix silently keeps the old behaviour; the fix
-    /// looks inert and the search goes to the compiler instead of to the artifact.
-    /// Warn only; the fasl is still loadable and usually still correct. A fasl with
-    /// no stamp (built before stamping existed, or by a core loaded from memory) is
-    /// left alone rather than reported as suspect.</summary>
-    /// <summary>Count the fasl at PATH as already warned about: its caller has
-    /// said, once for many fasls, that they come from another compiler (a library
-    /// package's shipped fasls), and two lines per file would bury that.</summary>
+    /// <summary>Accept the fasl at PATH as compiled by another core: its caller has
+    /// decided that once for many fasls (a library package's shipped fasls).</summary>
     public static LispObject NoteFaslGeneration(LispObject[] args)
     {
         if (args.Length != 1)
@@ -63,27 +55,100 @@ public static partial class Runtime
         return T.Instance;
     }
 
-    private static void WarnOnStaleFaslGeneration(System.Reflection.Assembly asm, string faslPath)
+    /// <summary>Set by REQUIRE of a bundled contrib for the fasl it loads next: a stale
+    /// contrib fasl is a development tree's leftover, so it is warned about and loaded.</summary>
+    [ThreadStatic] private static bool s_nextFaslMismatchWarnsOnly;
+
+    /// <summary>Signal DOTCL:FASL-VERSION-MISMATCH when ASM was compiled by another
+    /// dotcl: one with another core generation (restartable: LOAD-AS-IS / CONTINUE
+    /// return and the load goes on), or one that needs a newer DotCL.Runtime than
+    /// this one (not restartable: .NET cannot bind it). A fasl with no stamp is
+    /// left alone.</summary>
+    private static void CheckFaslGeneration(System.Reflection.Assembly asm, string faslPath,
+        bool warnOnly)
     {
+        var running = typeof(Runtime).Assembly.GetName().Version;
+        foreach (var r in asm.GetReferencedAssemblies())
+            if (r.Name == "DotCL.Runtime" && r.Version != null && running != null
+                && r.Version > running)
+                SignalNewerRuntimeFasl(faslPath, r.Version.ToString(), running.ToString());
+
+        string? current, stamped = null;
         try
         {
-            var current = Startup.CoreGeneration();
+            current = Startup.CoreGeneration();
             if (current == null) return;
-            string? stamped = null;
             foreach (var a in asm.GetCustomAttributes<System.Reflection.AssemblyMetadataAttribute>())
                 if (a.Key == Startup.CoreGenerationKey) { stamped = a.Value; break; }
-            if (stamped == null || stamped == current) return;
-            lock (_staleFaslWarned)
-                if (!_staleFaslWarned.Add(faslPath)) return;
+        }
+        catch { return; }
+        if (stamped == null || stamped == current) return;
+        lock (_staleFaslWarned)
+            if (_staleFaslWarned.Contains(faslPath)) return;
+        if (warnOnly)
+        {
+            lock (_staleFaslWarned) _staleFaslWarned.Add(faslPath);
             Console.Error.WriteLine(
                 $";; warning: {faslPath} was compiled by a different dotcl core " +
                 $"(fasl {stamped}, running {current}).");
-            Console.Error.WriteLine(
-                ";;          It keeps that core's code generation; recompile it if a " +
-                "compiler fix seems to have no effect.");
+            return;
         }
-        catch { /* diagnostics must never break a load */ }
+        var tag = new object();
+        var loadAsIsSym = Startup.DotclPkg.FindSymbol("LOAD-AS-IS").Item1;
+        const string report = "Load the fasl as it is.";
+        RestartClusterStack.PushCluster(new[] {
+            new LispRestart("LOAD-AS-IS", _ => Nil.Instance, report, tag) { NameSymbol = loadAsIsSym },
+            new LispRestart("CONTINUE", _ => Nil.Instance, report, tag) });
+        try
+        {
+            SignalFaslVersionMismatch(faslPath, stamped,
+                "~A was compiled by a different dotcl core (fasl ~A, running ~A).",
+                new LispString(faslPath), new LispString(stamped), new LispString(current));
+        }
+        catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, tag))
+        {
+            lock (_staleFaslWarned) _staleFaslWarned.Add(faslPath);
+        }
+        finally
+        {
+            RestartClusterStack.PopCluster();
+        }
     }
+
+    private static void SignalNewerRuntimeFasl(string faslPath, string needed, string running) =>
+        SignalFaslVersionMismatch(faslPath, "DotCL.Runtime " + needed,
+            "~A was compiled by a newer dotcl: it needs DotCL.Runtime ~A, and this is ~A. " +
+            "It cannot be loaded as it is; compile its source again.",
+            new LispString(faslPath), new LispString(needed), new LispString(running));
+
+    private static void SignalFaslVersionMismatch(string faslPath, string builtBy,
+        string control, params LispObject[] formatArgs)
+    {
+        LispObject argList = Nil.Instance;
+        for (int i = formatArgs.Length - 1; i >= 0; i--) argList = new Cons(formatArgs[i], argList);
+        LispErrorFormat(new LispObject[] {
+            Startup.DotclPkg.FindSymbol("FASL-VERSION-MISMATCH").Item1!,
+            Startup.Keyword("FORMAT-CONTROL"), new LispString(control),
+            Startup.Keyword("FORMAT-ARGUMENTS"), argList,
+            Startup.Keyword("PATHNAME"), LispPathname.FromString(faslPath),
+            Startup.Keyword("BUILT-BY"), new LispString(builtBy) });
+    }
+
+    private static string RunningRuntimeVersion() =>
+        typeof(Runtime).Assembly.GetName().Version?.ToString() ?? "unknown";
+
+    private static string NeededRuntimeVersion(Exception ex)
+    {
+        var name = ex switch { FileLoadException f => f.FileName, FileNotFoundException f => f.FileName, _ => null };
+        try { return new AssemblyName(name!).Version?.ToString() ?? "?"; }
+        catch { return "?"; }
+    }
+
+    /// <summary>.NET failing to bind DotCL.Runtime, which the reference check in
+    /// CheckFaslGeneration did not foresee.</summary>
+    private static bool IsNewerRuntimeBindFailure(Exception ex) =>
+        (ex switch { FileLoadException f => f.FileName, FileNotFoundException f => f.FileName, _ => null })
+            is string name && name.StartsWith("DotCL.Runtime,", StringComparison.Ordinal);
 
     private static LispError MakeStreamError(LispObject stream, string op) =>
         new LispError($"{op}: stream is closed") { ConditionTypeName = "STREAM-ERROR", StreamErrorStreamRef = stream };
@@ -155,9 +220,10 @@ public static partial class Runtime
                 case Nil:
                     stream = DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
                     continue;
-                // A binary Gray input stream too: character reads go to its
-                // STREAM-READ-CHAR, as on SBCL (the output side does the same).
-                case LispInstance gi when IsGrayInputStream(gi) || IsGrayBinaryInputStream(gi):
+                // A binary Gray input stream too, as on SBCL: READ-CHAR reaches its
+                // STREAM-READ-CHAR. PEEK-CHAR, READ-LINE and LISTEN reach their own
+                // generic functions, whose defaults are for character streams only.
+                case LispInstance gi when IsGrayStream(gi):
                     return new GrayStreamTextReader(gi);
                 case LispStream:
                 case LispInstance:
@@ -199,7 +265,7 @@ public static partial class Runtime
                 // stream with a stream-write-char method is writable as characters.
                 // (write-byte uses a separate path, so pure-binary streams are unaffected
                 // until a character is actually written, where erroring is correct.)
-                case LispInstance gi when IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi):
+                case LispInstance gi when IsGrayStream(gi):
                     return new GrayStreamTextWriter(gi);
                 default: return Console.Out;
             }
@@ -216,33 +282,71 @@ public static partial class Runtime
     // compare wrongly false (order-dependent). Matching by name is robust to
     // duplicate-named gray protocol classes across packages.
 
+    internal const int GrayCharOut = 1, GrayCharIn = 2, GrayBinIn = 4, GrayBinOut = 8, GrayAny = 16, GrayChar = 32;
+
+    internal static int GrayKinds(LispClass cls)
+    {
+        var cpl = cls.ClassPrecedenceList;
+        if (cpl == null) return 0;
+        var cache = cls.GrayKindCache;
+        if (cache != null && ReferenceEquals(cache.Cpl, cpl)) return cache.Kinds;
+        int kinds = 0;
+        bool anyIn = false, anyOut = false;
+        foreach (var c in cpl)
+        {
+            switch (c.Name?.Name)
+            {
+                case "FUNDAMENTAL-CHARACTER-OUTPUT-STREAM": kinds |= GrayCharOut; break;
+                case "FUNDAMENTAL-CHARACTER-INPUT-STREAM": kinds |= GrayCharIn; break;
+                case "FUNDAMENTAL-BINARY-INPUT-STREAM": kinds |= GrayBinIn; break;
+                case "FUNDAMENTAL-BINARY-OUTPUT-STREAM": kinds |= GrayBinOut; break;
+                case "FUNDAMENTAL-INPUT-STREAM": anyIn = true; break;
+                case "FUNDAMENTAL-OUTPUT-STREAM": anyOut = true; break;
+                case "FUNDAMENTAL-STREAM": kinds |= GrayAny; break;
+                case "FUNDAMENTAL-CHARACTER-STREAM": kinds |= GrayChar; break;
+            }
+        }
+        // A stream that is only a FUNDAMENTAL-INPUT/OUTPUT-STREAM (fast-io's) names
+        // no element kind; byte and sequence I/O still go to the Gray generics, as on SBCL.
+        if (anyIn && (kinds & (GrayCharIn | GrayBinIn)) == 0) kinds |= GrayBinIn;
+        if (anyOut && (kinds & (GrayCharOut | GrayBinOut)) == 0) kinds |= GrayBinOut;
+        cls.GrayKindCache = new LispClass.GrayKindEntry(cpl, kinds);
+        return kinds;
+    }
+
+    /// <summary>An instance of FUNDAMENTAL-STREAM, whatever its direction and element classes.</summary>
+    internal static bool IsGrayStream(LispInstance inst)
+        => GrayKinds(inst.Class) != 0;
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<LispInstance, object> GrayClosed = new();
+
+    internal static void MarkGrayClosed(LispInstance inst) => GrayClosed.GetValue(inst, static _ => T.Instance);
+
+    internal static bool IsGrayClosed(LispInstance inst) => GrayClosed.TryGetValue(inst, out _);
+
     /// <summary>Check if a LispInstance is a Gray output stream (subclass of fundamental-character-output-stream).</summary>
     internal static bool IsGrayOutputStream(LispInstance inst)
-        => inst.Class.ClassPrecedenceList?.Any(
-               c => c.Name?.Name == "FUNDAMENTAL-CHARACTER-OUTPUT-STREAM") == true;
+        => (GrayKinds(inst.Class) & GrayCharOut) != 0;
 
     /// <summary>Check if a LispInstance is a Gray input stream (subclass of fundamental-character-input-stream).</summary>
     internal static bool IsGrayInputStream(LispInstance inst)
-        => inst.Class.ClassPrecedenceList?.Any(
-               c => c.Name?.Name == "FUNDAMENTAL-CHARACTER-INPUT-STREAM") == true;
+        => (GrayKinds(inst.Class) & GrayCharIn) != 0;
 
     /// <summary>A Gray input stream of either kind. Character reads (READ-CHAR,
     /// PEEK-CHAR, UNREAD-CHAR, READ-CHAR-NO-HANG) go to the Gray generics for both,
     /// as on SBCL.</summary>
     internal static bool IsGrayAnyInputStream(LispInstance inst)
-        => IsGrayInputStream(inst) || IsGrayBinaryInputStream(inst);
+        => (GrayKinds(inst.Class) & (GrayCharIn | GrayBinIn)) != 0;
 
     /// <summary>Check if a LispInstance is a Gray binary input stream (subclass of fundamental-binary-input-stream).
     /// read-byte/read-sequence dispatch to the stream-read-byte generic on these.</summary>
     internal static bool IsGrayBinaryInputStream(LispInstance inst)
-        => inst.Class.ClassPrecedenceList?.Any(
-               c => c.Name?.Name == "FUNDAMENTAL-BINARY-INPUT-STREAM") == true;
+        => (GrayKinds(inst.Class) & GrayBinIn) != 0;
 
     /// <summary>Check if a LispInstance is a Gray binary output stream (subclass of fundamental-binary-output-stream).
     /// write-byte/write-sequence dispatch to the stream-write-byte generic on these.</summary>
     internal static bool IsGrayBinaryOutputStream(LispInstance inst)
-        => inst.Class.ClassPrecedenceList?.Any(
-               c => c.Name?.Name == "FUNDAMENTAL-BINARY-OUTPUT-STREAM") == true;
+        => (GrayKinds(inst.Class) & GrayBinOut) != 0;
 
     /// <summary>Resolve a stream designator to the outermost LispEchoStream, if any, following synonym streams.</summary>
     private static LispEchoStream? FindEchoStream(LispObject streamObj)
@@ -635,8 +739,8 @@ public static partial class Runtime
         if (args.Length > 1 && args[1] is not Nil)
         {
             var pathnames = args[1];
-            if (pathnames is LispString ps)
-                Load(new LispObject[] { ps });
+            if (StringValueOrNull(pathnames) != null)
+                Load(new LispObject[] { pathnames });
             else if (pathnames is LispPathname pp)
                 Load(new LispObject[] { pp });
             else
@@ -797,7 +901,10 @@ public static partial class Runtime
                     if (name == "quicklisp")
                         Require(new LispObject[] { new LispString("asdf") });
 
-                    Load(new LispObject[] { new LispString(path) });
+                    if (path.EndsWith(".fasl", StringComparison.OrdinalIgnoreCase))
+                        s_nextFaslMismatchWarnsOnly = true;
+                    try { Load(new LispObject[] { new LispString(path) }); }
+                    finally { s_nextFaslMismatchWarnsOnly = false; }
                     if (name == "quicklisp")
                         RegisterQuicklispWithAsdf();
                     if (name == "asdf")
@@ -808,6 +915,7 @@ public static partial class Runtime
                         InstallAsdfModuleProvider();
                         UseAsdfSourceLoadingWithoutCompiler();
                         InstallAsdfR2rHook();
+                        InstallAsdfRecompileOnFaslMismatch();
                         UseErrorOnCompileFileFailure();
                     }
                     return T.Instance;
@@ -1038,6 +1146,34 @@ public static partial class Runtime
         catch { }
     }
 
+    /// <summary>ASDF's LOAD-OP compiles a file again, by its TRY-RECOMPILING restart,
+    /// when its fasl was compiled by another dotcl, once per action.</summary>
+    private static void InstallAsdfRecompileOnFaslMismatch()
+    {
+        const string form = @"
+(let ((pwr (find-symbol ""PERFORM-WITH-RESTARTS"" ""ASDF""))
+      (lop (find-symbol ""LOAD-OP"" ""ASDF""))
+      (src (find-symbol ""CL-SOURCE-FILE"" ""ASDF"")))
+  (when (and pwr lop src)
+    (eval `(defmethod ,pwr :around ((o ,lop) (c ,src))
+             (let ((retried nil))
+               (handler-bind ((dotcl:fasl-version-mismatch
+                                (lambda (e)
+                                  (let ((r (and (not retried)
+                                                (find-restart 'try-recompiling e))))
+                                    (when r
+                                      (setf retried t)
+                                      (invoke-restart r))))))
+                 (call-next-method)))))))";
+        try
+        {
+            var read = MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
+            Runtime.Eval(read);
+        }
+        catch { }
+    }
+
     /// <summary>A COMPILE-FILE that reports failure-p stops the ASDF build, as on
     /// SBCL (UIOP's default is :error only for SBCL and MKCL, :warn elsewhere).
     /// With :warn the build went on and the first error seen was a later one
@@ -1087,7 +1223,20 @@ public static partial class Runtime
   ;; Without a compiler the running ASDF cannot be replaced: keep it.
   (let ((up (find-symbol ""UPGRADE-ASDF"" ""ASDF"")))
     (when (and up (fboundp up))
-      (setf (fdefinition up) (lambda () nil)))))";
+      (setf (fdefinition up) (lambda () nil))))
+  ;; Systems that depend on ""asdf"" or ""uiop"" get the running ones, never
+  ;; an asdf.asd / uiop.asd from the registry.
+  (let ((sf (find-symbol ""*SYSTEM-DEFINITION-SEARCH-FUNCTIONS*"" ""ASDF""))
+        (reg (find-symbol ""REGISTERED-SYSTEM"" ""ASDF""))
+        (pre (find-symbol ""SYSDEF-PRELOADED-SYSTEM-SEARCH"" ""ASDF"")))
+    (when (and sf reg pre (boundp sf) (fboundp reg) (fboundp pre))
+      (let ((reg-fn (fdefinition reg)) (pre-fn (fdefinition pre)))
+        (setf (symbol-value sf)
+              (cons (lambda (name)
+                      (when (member name '(""asdf"" ""asdf-package-system"" ""uiop"")
+                                    :test #'equal)
+                        (or (funcall reg-fn name) (funcall pre-fn name))))
+                    (symbol-value sf)))))))";
         try
         {
             var read = MultipleValues.Primary(
@@ -1249,6 +1398,13 @@ public static partial class Runtime
         // Handle persisted .NET assembly: detect by PE header ("MZ"), not extension.
         // One open answers everything LOAD asks of the file before loading it: on
         // Windows the first open of a freshly written PE is a full antivirus scan.
+#if NET9_0_OR_GREATER
+        if (TakeCompiledFasl(filePath) is { } compiled)
+        {
+            try { return LoadFasl(filePath, null, filespec, isVerbose, isPrint, compiled); }
+            finally { WhitelistLoadedDefinitionsForCompileFile(); }
+        }
+#endif
         var peFile = ProbePeFile(filePath);
         if (peFile != null)
         {
@@ -1325,11 +1481,20 @@ public static partial class Runtime
                         else
                         {
                             // .lisp file: compile each top-level form
+                            var defNames = new List<DefinitionEntry>();
+                            var savedDefNames = s_flattenedDefinitionNames;
+                            var savedRunning = s_runningTopLevelForm;
+                            s_flattenedDefinitionNames = defNames;
+                            s_runningTopLevelForm = false;
+                            try
+                            {
                             foreach (var subForm in FlattenTopLevel(form))
                             {
 #if DOTCL_EMIT
                                 var instrList = CompileTopLevel(subForm);
-                                result = DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
+                                s_runningTopLevelForm = true;
+                                try { result = DotCL.Emitter.CilAssembler.AssembleAndRun(instrList); }
+                                finally { s_runningTopLevelForm = false; }
 #else
                                 // No Reflection.Emit in this build: the tree-walk
                                 // interpreter is the only evaluator, so a source file
@@ -1341,6 +1506,13 @@ public static partial class Runtime
                                 result = Eval(subForm);
 #endif
                             }
+                            }
+                            finally
+                            {
+                                s_flattenedDefinitionNames = savedDefNames;
+                                s_runningTopLevelForm = savedRunning;
+                            }
+                            RecordDefinitionNames(ExpandedDefinitionNames(form, defNames), filePath, formLine);
                         }
                     }
                     catch (Exception ex)
@@ -1457,7 +1629,14 @@ public static partial class Runtime
     private static void RunFaslModuleInit(System.Reflection.Assembly asm,
         string filePath, LispObject filespec)
     {
-        var moduleType = asm.GetType("CompiledModule")
+        Type? moduleType;
+        try { moduleType = asm.GetType("CompiledModule"); }
+        catch (IOException ioe) when (IsNewerRuntimeBindFailure(ioe))
+        {
+            SignalNewerRuntimeFasl(filePath, NeededRuntimeVersion(ioe), RunningRuntimeVersion());
+            throw;
+        }
+        moduleType = moduleType
             ?? throw FaslFileError(
                 $"LOAD: not a dotcl fasl (.NET assembly without a CompiledModule type): {filePath}",
                 filespec);
@@ -1471,7 +1650,14 @@ public static partial class Runtime
         }
         catch (System.Reflection.TargetInvocationException tie) when (tie.InnerException != null)
         {
+            if (IsNewerRuntimeBindFailure(tie.InnerException))
+                SignalNewerRuntimeFasl(filePath, NeededRuntimeVersion(tie.InnerException), RunningRuntimeVersion());
             throw tie.InnerException;
+        }
+        catch (IOException ioe) when (IsNewerRuntimeBindFailure(ioe))
+        {
+            SignalNewerRuntimeFasl(filePath, NeededRuntimeVersion(ioe), RunningRuntimeVersion());
+            throw;
         }
     }
 
@@ -1486,7 +1672,7 @@ public static partial class Runtime
     /// The cost is that the parts load from bytes, so they have no file Location.
     /// </summary>
     private static bool LoadFaslBundleParts(System.Reflection.Assembly asm,
-        string filePath, LispObject filespec)
+        string filePath, LispObject filespec, bool warnOnly)
     {
         var names = new List<string>();
         foreach (var n in asm.GetManifestResourceNames())
@@ -1524,7 +1710,7 @@ public static partial class Runtime
                 throw FaslFileError(
                     $"LOAD: bundle part {n} is not a .NET assembly: {filePath}", filespec);
             }
-            WarnOnStaleFaslGeneration(part, filePath);
+            CheckFaslGeneration(part, filePath, warnOnly);
             RunFaslModuleInit(part, $"{filePath} [{n}]", filespec);
         }
         return true;
@@ -1678,17 +1864,17 @@ public static partial class Runtime
     public static long R2rFaslsLoaded;
     public static long FaslsLoaded;
 
-    internal static string? PortableRidForLisp() => PortableRid();
-
-    private static string? PortableRid()
+    /// <summary>os-arch (linux-x64, osx-arm64, win-x64, ...): the name of the
+    /// R2R siblings. Never the distro-specific RuntimeIdentifier.</summary>
+    public static string? PortableRid()
     {
-        string os = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+        string? os = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
                         System.Runtime.InteropServices.OSPlatform.Windows) ? "win"
                   : System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
                         System.Runtime.InteropServices.OSPlatform.OSX) ? "osx"
                   : System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
                         System.Runtime.InteropServices.OSPlatform.Linux) ? "linux"
-                  : null!;
+                  : null;
         if (os == null) return null;
         string? arch = System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture switch
         {
@@ -1698,6 +1884,32 @@ public static partial class Runtime
             _ => null,
         };
         return arch == null ? null : $"{os}-{arch}";
+    }
+
+    static string? _packageRid;
+
+    /// <summary>The RID compiled packages are made and looked up for: PortableRid,
+    /// with linux-musl-ARCH on a musl libc.</summary>
+    internal static string? PackageRid()
+    {
+        if (_packageRid != null) return _packageRid;
+        string? maps = null;
+        var rid = PortableRid();
+        if (rid != null && rid.StartsWith("linux-", StringComparison.Ordinal))
+            try { maps = File.ReadAllText("/proc/self/maps"); } catch { }
+        return _packageRid = PackageRidFor(rid, Compat.RuntimeIdentifier, maps);
+    }
+
+    /// <summary>PORTABLE with linux- turned into linux-musl- when the runtime's own
+    /// RID or the libraries mapped into the process (MAPS) say musl.</summary>
+    internal static string? PackageRidFor(string? portable, string? runtimeRid, string? maps)
+    {
+        if (portable == null || !portable.StartsWith("linux-", StringComparison.Ordinal))
+            return portable;
+        bool musl = runtimeRid != null
+                    && (runtimeRid.Contains("-musl-") || runtimeRid.StartsWith("alpine", StringComparison.Ordinal))
+                 || maps != null && maps.Contains("/ld-musl-");
+        return musl ? "linux-musl-" + portable.Substring("linux-".Length) : portable;
     }
 
     /// <summary>The ahead-of-time sibling of a fasl, or null when there is none.
@@ -1877,9 +2089,83 @@ public static partial class Runtime
     }
 #endif
 
-    private static LispObject LoadFasl(string filePath, PeFile peFile, LispObject filespec,
-        bool isVerbose, bool isPrint)
+    /// <summary>How many fasls LOAD took from the module COMPILE-FILE emitted in
+    /// memory instead of reading the file.</summary>
+    public static long FaslsLoadedInMemory;
+
+#if NET9_0_OR_GREATER
+    /// <summary>The fasl COMPILE-FILE wrote last, and the same module emitted in
+    /// memory. On Windows, opening a freshly written PE waits for the
+    /// antivirus scan of the file, and loading one from bytes waits for AMSI;
+    /// a module emitted in memory goes through neither.</summary>
+    private sealed class CompiledFasl
     {
+        public string Path = "";
+        public long Length;
+        public DateTime WriteTimeUtc;
+        public System.Reflection.Assembly Assembly = null!;
+    }
+
+    private static CompiledFasl? s_compiledFasl;
+    private static readonly object s_compiledFaslLock = new();
+
+    /// <summary>Off by default; DOTCL_FASL_LOAD_IN_MEMORY=1 turns it on.</summary>
+    internal static bool FaslInMemoryLoadEnabled() =>
+        Environment.GetEnvironmentVariable("DOTCL_FASL_LOAD_IN_MEMORY") == "1";
+
+    private static bool SamePath(string a, string b) =>
+        string.Equals(a, b, OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+
+    internal static void RememberCompiledFasl(string path, System.Reflection.Assembly asm)
+    {
+        var full = Path.GetFullPath(path);
+        var fi = new FileInfo(full);
+        var entry = new CompiledFasl
+        {
+            Path = full, Length = fi.Length, WriteTimeUtc = fi.LastWriteTimeUtc, Assembly = asm,
+        };
+        lock (s_compiledFaslLock) s_compiledFasl = entry;
+    }
+
+    /// <summary>RENAME-FILE moved FROM to TO: ASDF compiles to a temporary name
+    /// and renames the fasl into place before loading it.</summary>
+    internal static void NoteFileRenamed(string from, string to)
+    {
+        lock (s_compiledFaslLock)
+        {
+            var e = s_compiledFasl;
+            if (e == null) return;
+            if (SamePath(e.Path, Path.GetFullPath(from))) e.Path = Path.GetFullPath(to);
+            else if (SamePath(e.Path, Path.GetFullPath(to))) s_compiledFasl = null;
+        }
+    }
+
+    /// <summary>The in-memory module for FILEPATH when it is the fasl COMPILE-FILE
+    /// wrote last and the file has not changed since; null otherwise. Used once.</summary>
+    private static System.Reflection.Assembly? TakeCompiledFasl(string filePath)
+    {
+        CompiledFasl? e;
+        var full = Path.GetFullPath(filePath);
+        lock (s_compiledFaslLock)
+        {
+            e = s_compiledFasl;
+            if (e == null || !SamePath(e.Path, full)) return null;
+            s_compiledFasl = null;
+        }
+        var fi = new FileInfo(full);
+        if (!fi.Exists || fi.Length != e.Length || fi.LastWriteTimeUtc != e.WriteTimeUtc
+            || TryFindR2rSibling(full) != null)
+            return null;
+        return e.Assembly;
+    }
+#endif
+
+    private static LispObject LoadFasl(string filePath, PeFile? peFile, LispObject filespec,
+        bool isVerbose, bool isPrint, System.Reflection.Assembly? compiled = null)
+    {
+        bool warnOnly = s_nextFaslMismatchWarnsOnly;
+        s_nextFaslMismatchWarnsOnly = false;
         var loadPathSym = Startup.Sym("*LOAD-PATHNAME*");
         var loadTrueSym = Startup.Sym("*LOAD-TRUENAME*");
         var packageSym = Startup.Sym("*PACKAGE*");
@@ -1919,13 +2205,18 @@ public static partial class Runtime
                 // whole filename, not into the stem: a sibling must not match a
                 // *.fasl glob, or every caller that walks fasls has to remember to
                 // exclude it (the Makefile and two csprojs each used to).
-                var r2rPath = TryFindR2rSibling(faslFull);
-                if (r2rPath != null)
+                var r2rPath = compiled == null ? TryFindR2rSibling(faslFull) : null;
+                if (compiled != null)
+                {
+                    asm = compiled;
+                    FaslsLoadedInMemory++;
+                }
+                else if (r2rPath != null)
                 {
                     asm = System.Reflection.Assembly.LoadFrom(r2rPath);
                     R2rFaslsLoaded++;
                 }
-                else if (peFile.ReadyToRun)
+                else if (peFile!.ReadyToRun)
                 {
                     // The fasl itself is the ahead-of-time image (a per-RID
                     // package ships asdf.fasl that way, under its own name).
@@ -1942,7 +2233,7 @@ public static partial class Runtime
                     // matching .pdb sits next to the fasl, hand it to the
                     // symbol-store overload, since an assembly loaded from bytes has
                     // no file Location for a debugger to find the pdb by.
-                    var faslBytes = peFile.Image!;
+                    var faslBytes = peFile!.Image!;
                     var pdbPath = Path.ChangeExtension(faslFull, ".pdb");
                     if (File.Exists(pdbPath))
                     {
@@ -1966,11 +2257,16 @@ public static partial class Runtime
                     $"LOAD: not a dotcl fasl (not a .NET assembly): {filePath}", filespec);
             }
             FaslsLoaded++;
-            WarnOnStaleFaslGeneration(asm, faslFull);
+            if (compiled != null)
+            {
+                RunFaslModuleInit(asm, filePath, filespec);
+                return T.Instance;
+            }
+            CheckFaslGeneration(asm, faslFull, warnOnly);
             // A bundle (uiop bundle-op / dotcl:combine-fasls) is an assembly with
             // no code whose parts ride along as resources. Run each part in the
             // order they were bundled; a later part may depend on an earlier one.
-            if (LoadFaslBundleParts(asm, filePath, filespec)) return T.Instance;
+            if (LoadFaslBundleParts(asm, filePath, filespec, warnOnly)) return T.Instance;
 
             // A PE file that is not a dotcl fasl: a plain .NET library, or another
             // implementation's fasl that happens to be an assembly. Report it as a
@@ -2017,6 +2313,8 @@ public static partial class Runtime
         // Defensive: if a reader macro or macro expander leaked MvReturn, take primary value.
         if (form is MvReturn mvr)
             form = mvr.PrimaryValue;
+        if (s_flattenedDefinitionNames is { } defNames && form is Cons definer)
+            DefinerEntries(definer, defNames);
         if (form is Cons c && c.Car is Symbol sym)
         {
             if (sym.Name == "EVAL-WHEN" && c.Cdr is Cons rest)
@@ -2279,6 +2577,10 @@ public static partial class Runtime
     // when the earlier one is a fasl's table resolved only at lookup (below).
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line, long Seq)>
         s_defSources = new();
+    // The same for the function kinds only (FUNCTION, GENERIC-FUNCTION, MACRO,
+    // METHOD): what a debugger frame or FUNCTION-SOURCE-LOCATION looks for.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line, long Seq)>
+        s_defFunctionSources = new();
     private static long s_defSeq;
 
     // Definition tables of loaded fasls not yet resolved to symbols, and the
@@ -2288,35 +2590,80 @@ public static partial class Runtime
     // definition, which is left to the first lookup of a location instead of
     // every load.
     private static readonly object s_faslSourcesLock = new();
-    private static List<(byte[] Data, long Seq)> s_pendingFaslSources = new();
-    private static List<(string Pkg, string Name, string File, int Line, long Seq)> s_unresolvedFaslSources = new();
+    private static List<(byte[] Data, long Seq, bool WithKinds)> s_pendingFaslSources = new();
+    private static List<FaslDefinitionSource> s_unresolvedFaslSources = new();
+    private readonly record struct FaslDefinitionSource(string Pkg, string Name, string File, int Line,
+        long Seq, string? Kind, string Detail);
 
-    // Top-level operators whose second element names a thing worth locating.
-    private static bool IsDefinerName(string name) => name switch
+    // One definition of one kind: KIND is FUNCTION, MACRO, METHOD, ... (SETF-
+    // in front for a (SETF name) function), DETAIL tells methods apart.
+    internal readonly record struct DefinitionEntry(Symbol Sym, string Kind, string Detail);
+
+    // Every kind of definition a name has, each with its own location.
+    // s_defSources keeps the most recent of them per name.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<DefinitionEntry, (string File, int Line, long Seq)>
+        s_defKindSources = new();
+    // Definitions of uninterned names (a macro's gensym DEFUN) read from a fasl,
+    // whose symbols exist only once the code runs: matched by name.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string Name, string Kind), (string File, int Line, long Seq)>
+        s_uninternedDefSources = new();
+
+    private static string? DefinerKind(Symbol head)
     {
-        "DEFUN" or "DEFMACRO" or "DEFGENERIC" or "DEFMETHOD" or "DEFINE-COMPILER-MACRO"
-        or "DEFVAR" or "DEFPARAMETER" or "DEFCONSTANT"
-        or "DEFCLASS" or "DEFSTRUCT" or "DEFINE-CONDITION"
-        or "DEFTYPE" or "DEFSETF" or "DEFINE-SETF-EXPANDER" or "DEFINE-SYMBOL-MACRO"
-        or "DEFINE-MODIFY-MACRO" => true,
-        _ => false
+        var home = head.HomePackage?.Name;
+        if (home == "COMMON-LISP") return DefinerKind(head.Name);
+        return head.Name == "DEFINE-PACKAGE" && home != null && home.StartsWith("UIOP", StringComparison.Ordinal)
+            ? "PACKAGE" : null;
+    }
+
+    private static string? DefinerKind(string head) => head switch
+    {
+        "DEFUN" => "FUNCTION",
+        "DEFMACRO" or "DEFINE-MODIFY-MACRO" => "MACRO",
+        "DEFGENERIC" => "GENERIC-FUNCTION",
+        "DEFMETHOD" => "METHOD",
+        "DEFINE-COMPILER-MACRO" => "COMPILER-MACRO",
+        "DEFVAR" or "DEFPARAMETER" => "VARIABLE",
+        "DEFCONSTANT" => "CONSTANT",
+        "DEFCLASS" => "CLASS",
+        "DEFSTRUCT" => "STRUCTURE",
+        "DEFINE-CONDITION" => "CONDITION",
+        "DEFTYPE" => "TYPE",
+        "DEFSETF" or "DEFINE-SETF-EXPANDER" => "SETF-EXPANDER",
+        "DEFINE-SYMBOL-MACRO" => "SYMBOL-MACRO",
+        "DEFPACKAGE" => "PACKAGE",
+        "DEFINE-METHOD-COMBINATION" => "METHOD-COMBINATION",
+        _ => null
     };
+
+    // The order of this table is the fasl encoding of a kind.
+    private static readonly string[] s_definitionKinds =
+    {
+        "FUNCTION", "SETF-FUNCTION", "MACRO", "GENERIC-FUNCTION", "SETF-GENERIC-FUNCTION",
+        "METHOD", "SETF-METHOD", "COMPILER-MACRO", "SETF-COMPILER-MACRO", "VARIABLE",
+        "CONSTANT", "CLASS", "STRUCTURE", "CONDITION", "TYPE", "SETF-EXPANDER", "SYMBOL-MACRO",
+        "PACKAGE", "METHOD-COMBINATION"
+    };
+
+    // A package's definition is keyed by a symbol standing for its name.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Symbol> s_packageKeys = new();
+    private static Symbol PackageKey(string name) => s_packageKeys.GetOrAdd(name, n => new Symbol(n));
+
+    internal static int DefinitionKindCode(string kind) => Array.IndexOf(s_definitionKinds, kind);
 
     /// <summary>Walk a raw (unexpanded) top-level form, descending PROGN/EVAL-WHEN
     /// like <see cref="FlattenTopLevel"/> but without macroexpanding, and record the
-    /// source location of each definition it names. Best-effort: names that only
-    /// appear after macroexpansion are not tracked (v1 = top-level form granularity).</summary>
+    /// source location of each definition it names.</summary>
     internal static void RecordDefinitionSources(LispObject form, string file, int line)
     {
-        var names = new List<Symbol>();
+        var names = new List<DefinitionEntry>();
         DefinitionNames(form, names);
-        foreach (var nameSym in names)
-            s_defSources[nameSym] = (file, line, System.Threading.Interlocked.Increment(ref s_defSeq));
+        RecordDefinitionNames(names, file, line);
     }
 
-    /// <summary>The names <see cref="RecordDefinitionSources"/> records for FORM,
+    /// <summary>The definitions <see cref="RecordDefinitionSources"/> records for FORM,
     /// added to NAMES in the order they appear.</summary>
-    internal static void DefinitionNames(LispObject form, List<Symbol> names)
+    internal static void DefinitionNames(LispObject form, List<DefinitionEntry> names)
     {
         if (form is not Cons c || c.Car is not Symbol head) return;
         switch (head.Name)
@@ -2331,16 +2678,355 @@ public static partial class Runtime
                         DefinitionNames(bc.Car, names);
                 return;
         }
-        if (!IsDefinerName(head.Name) || c.Cdr is not Cons nameCell) return;
-        // Name is a bare symbol, or (name options...) for defstruct/(setf name) etc.
-        var nameSym = nameCell.Car switch
+        DefinerEntries(c, names);
+    }
+
+    /// <summary>Add what a definer form defines to NAMES: its own entry, and
+    /// for a DEFGENERIC the methods of its :METHOD options.</summary>
+    private static void DefinerEntries(Cons c, List<DefinitionEntry> names)
+    {
+        if (DefinerEntry(c) is not { } entry) return;
+        names.Add(entry);
+        if (entry.Kind is not ("GENERIC-FUNCTION" or "SETF-GENERIC-FUNCTION") || c.Cdr is not Cons nameCell
+            || nameCell.Cdr is not Cons llCell)
+            return;
+        var methodKind = entry.Kind == "GENERIC-FUNCTION" ? "METHOD" : "SETF-METHOD";
+        for (var o = llCell.Cdr; o is Cons oc; o = oc.Cdr)
+            if (oc.Car is Cons opt && opt.Car is Symbol k && k.Name == "METHOD" && k.HomePackage?.Name == "KEYWORD")
+                names.Add(new DefinitionEntry(entry.Sym, methodKind, MethodDetailFromSource(opt.Cdr)));
+    }
+
+    /// <summary>What a definer form (DEFUN, DEFVAR, ...) defines, or null.</summary>
+    private static DefinitionEntry? DefinerEntry(Cons c)
+    {
+        if (c.Car is not Symbol head || DefinerKind(head) is not { } kind || c.Cdr is not Cons nameCell)
+            return null;
+        if (kind == "PACKAGE")
+            return nameCell.Car switch
+            {
+                Symbol ps => new DefinitionEntry(PackageKey(ps.Name), kind, ""),
+                LispString pstr => new DefinitionEntry(PackageKey(pstr.Value), kind, ""),
+                _ => null
+            };
+        Symbol sym;
+        switch (nameCell.Car)
         {
-            Symbol s => s,
-            Cons nc when nc.Car is Symbol s2 => s2, // (defstruct (name ...) ...)
-            _ => null
-        };
-        if (nameSym != null)
-            names.Add(nameSym);
+            case Symbol s:
+                sym = s;
+                break;
+            case Cons nc when nc.Car is Symbol setf && setf.Name == "SETF"
+                              && nc.Cdr is Cons nc2 && nc2.Car is Symbol fn && nc2.Cdr is Nil:
+                if (kind is not ("FUNCTION" or "GENERIC-FUNCTION" or "METHOD" or "COMPILER-MACRO"))
+                    return null;
+                sym = fn;
+                kind = "SETF-" + kind;
+                break;
+            case Cons nc when nc.Car is Symbol s2: // (defstruct (name ...) ...)
+                sym = s2;
+                break;
+            default:
+                return null;
+        }
+        var detail = kind.EndsWith("METHOD", StringComparison.Ordinal) && !kind.EndsWith("GENERIC-FUNCTION", StringComparison.Ordinal)
+            ? MethodDetailFromSource(nameCell.Cdr) : "";
+        return new DefinitionEntry(sym, kind, detail);
+    }
+
+    /// <summary>The qualifiers and specializers of the DEFMETHOD whose form
+    /// continues with REST, in the text <see cref="MethodDetail"/> gives a method.</summary>
+    private static string MethodDetailFromSource(LispObject rest)
+    {
+        var quals = new List<LispObject>();
+        var r = rest;
+        for (; r is Cons rc && rc.Car is not (Cons or Nil); r = rc.Cdr)
+            quals.Add(rc.Car);
+        var specs = new List<LispObject>();
+        if (r is Cons llc)
+            for (var p = llc.Car; p is Cons pc; p = pc.Cdr)
+            {
+                if (pc.Car is Symbol s && s.Name.StartsWith('&')) break;
+                if (pc.Car is Cons ac && ac.Cdr is Cons sc)
+                {
+                    var spec = sc.Car;
+                    if (spec is Cons ec && ec.Car is Symbol eql && eql.Name == "EQL" && ec.Cdr is Cons ef)
+                    {
+                        var v = ef.Car;
+                        if (v is Cons q && q.Car is Symbol qs && qs.Name == "QUOTE" && q.Cdr is Cons qv)
+                            v = qv.Car;
+                        else if (v is Symbol cs && cs.IsConstant && DynamicBindings.TryGet(cs, out var cv))
+                            v = cv;
+                        spec = List(Startup.Sym("EQL"), v);
+                    }
+                    specs.Add(spec);
+                }
+                else specs.Add(T.Instance);
+            }
+        return DetailText(quals, specs);
+    }
+
+    /// <summary>The text that tells METHOD apart from the other methods of its
+    /// generic function, as <see cref="MethodDetailFromSource"/> writes it.</summary>
+    private static string MethodDetail(LispMethod m)
+    {
+        var specs = new List<LispObject>();
+        foreach (var sp in m.Specializers)
+            specs.Add(sp switch
+            {
+                LispClass lc => lc.Name.Name == "T" && lc.Name.HomePackage?.Name == "COMMON-LISP" ? T.Instance : lc.Name,
+                EqlSpecializer es => List(Startup.Sym("EQL"), es.Object),
+                _ => sp
+            });
+        return DetailText(m.Qualifiers, specs);
+    }
+
+    private static string DetailText(IEnumerable<LispObject> quals, IEnumerable<LispObject> specs)
+    {
+        var sb = new System.Text.StringBuilder("((");
+        AppendItems(quals);
+        sb.Append(") (");
+        AppendItems(specs);
+        sb.Append("))");
+        return sb.ToString();
+
+        void AppendItems(IEnumerable<LispObject> items)
+        {
+            bool first = true;
+            foreach (var x in items)
+            {
+                if (!first) sb.Append(' ');
+                first = false;
+                Append(x);
+            }
+        }
+        void Append(LispObject x)
+        {
+            switch (x)
+            {
+                case T: sb.Append('T'); break;
+                case Nil: sb.Append("NIL"); break;
+                case Symbol s:
+                    if (s.HomePackage is Package p)
+                        sb.Append('|').Append(Escape(p.Name)).Append("|::|").Append(Escape(s.Name)).Append('|');
+                    else
+                        sb.Append("#:|").Append(Escape(s.Name)).Append('|');
+                    break;
+                case Cons c:
+                    sb.Append('(');
+                    bool first = true;
+                    for (LispObject e = c; e is Cons ec; e = ec.Cdr)
+                    {
+                        if (!first) sb.Append(' ');
+                        first = false;
+                        Append(ec.Car);
+                    }
+                    sb.Append(')');
+                    break;
+                default:
+                    sb.Append(FormatObjectNoDispatch(x));
+                    break;
+            }
+        }
+        static string Escape(string n) => n.Replace("\\", "\\\\").Replace("|", "\\|");
+    }
+
+    // While non-null, FlattenTopLevel adds every definer form it meets,
+    // including those that only appear after a top level macro expands, and the
+    // compiler adds every DEFUN it compiles, at any depth.
+    [ThreadStatic] private static List<DefinitionEntry>? s_flattenedDefinitionNames;
+    // True while LOAD runs a compiled top level form: a DEFUN compiled then
+    // (by an EVAL in it) does not belong to the form's source.
+    [ThreadStatic] private static bool s_runningTopLevelForm;
+
+    /// <summary>Of the definitions collected for FORM while it was processed,
+    /// keep those that <see cref="DefinitionNames"/> does not see in the raw
+    /// form: the definitions made through macro expansion or inside a body.</summary>
+    private static List<DefinitionEntry> ExpandedDefinitionNames(LispObject form, List<DefinitionEntry> seen)
+    {
+        if (seen.Count == 0) return seen;
+        var raw = new List<DefinitionEntry>();
+        DefinitionNames(form, raw);
+        var result = new List<DefinitionEntry>();
+        foreach (var e in seen)
+            if (!raw.Contains(e) && !result.Contains(e)) result.Add(e);
+        return result;
+    }
+
+    /// <summary>DOTCL::%NOTE-DEFINITION (kind name) or (form): the compiler reports a
+    /// definition it compiles, so one inside a body (a DEFUN a macro writes into
+    /// a function, a DEFMETHOD in a LET) is located at the top level form being
+    /// loaded or compiled.</summary>
+    public static LispObject NoteDefinition(LispObject[] args)
+    {
+        if (args.Length == 1)
+        {
+            if (s_flattenedDefinitionNames is { } formNames && !s_runningTopLevelForm && args[0] is Cons form)
+                DefinerEntries(form, formNames);
+            return Nil.Instance;
+        }
+        if (args.Length >= 2 && s_flattenedDefinitionNames is { } names && !s_runningTopLevelForm
+            && args[0] is Symbol kind && DefinitionKindCode(kind.Name) >= 0)
+        {
+            var name = args[1];
+            var k = kind.Name;
+            if (name is Cons nc && nc.Car is Symbol setf && setf.Name == "SETF" && nc.Cdr is Cons nc2)
+            {
+                name = nc2.Car;
+                k = "SETF-" + k;
+            }
+            if (name is Symbol sym && DefinitionKindCode(k) >= 0)
+                names.Add(new DefinitionEntry(sym, k, ""));
+        }
+        return Nil.Instance;
+    }
+
+    private static void RecordDefinitionNames(List<DefinitionEntry> names, string file, int line)
+    {
+        foreach (var e in names)
+            RecordDefinitionSource(e, file, line, System.Threading.Interlocked.Increment(ref s_defSeq));
+    }
+
+    // When a definition was removed (FMAKUNBOUND, REMOVE-METHOD): a record
+    // older than that, from a fasl table resolved only now, is not taken.
+    // A null detail stands for every method.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(Symbol Sym, string Kind, string? Detail), long>
+        s_defRemoved = new();
+
+    // Writers of the tables above take this lock; s_defEntriesByName (the
+    // entries of s_defKindSources by symbol name) is read under it too.
+    private static readonly object s_defRecordLock = new();
+    private static readonly Dictionary<string, List<DefinitionEntry>> s_defEntriesByName = new();
+
+    private static List<DefinitionEntry> EntriesNamed(string name)
+    {
+        lock (s_defRecordLock)
+            return s_defEntriesByName.TryGetValue(name, out var l) ? new List<DefinitionEntry>(l) : new();
+    }
+
+    private static void RemoveEntry(DefinitionEntry e)
+    {
+        s_defKindSources.TryRemove(e, out _);
+        if (s_defEntriesByName.TryGetValue(e.Sym.Name, out var l)) l.Remove(e);
+    }
+
+    private static bool RemovedSince(DefinitionEntry e, long seq)
+        => !s_defRemoved.IsEmpty
+           && ((s_defRemoved.TryGetValue((e.Sym, e.Kind, null), out var all) && all > seq)
+               || (e.Detail.Length > 0 && s_defRemoved.TryGetValue((e.Sym, e.Kind, e.Detail), out var one) && one > seq));
+
+    /// <summary>Drop the recorded definitions of SYM of the given KINDS (only
+    /// the method DETAIL when non-null), and point SYM's most recent location
+    /// at what is left.</summary>
+    private static void ForgetDefinitionSources(Symbol sym, string[] kinds, string? detail)
+    {
+        lock (s_defRecordLock)
+        {
+            var seq = System.Threading.Interlocked.Increment(ref s_defSeq);
+            foreach (var k in kinds) s_defRemoved[(sym, k, detail)] = seq;
+            if (!s_defEntriesByName.TryGetValue(sym.Name, out var named)) return;
+            var removedSeqs = new HashSet<long>();
+            foreach (var e in named.ToArray())
+                if (ReferenceEquals(e.Sym, sym) && Array.IndexOf(kinds, e.Kind) >= 0
+                    && (detail == null || e.Detail == detail)
+                    && s_defKindSources.TryGetValue(e, out var gone))
+                {
+                    RemoveEntry(e);
+                    removedSeqs.Add(gone.Seq);
+                }
+            if (removedSeqs.Count > 0) RepointLatest(sym, removedSeqs);
+        }
+    }
+
+    private static void RepointLatest(Symbol sym, HashSet<long> removedSeqs)
+    {
+        Repoint(s_defSources, kind => kind != "PACKAGE");
+        Repoint(s_defFunctionSources, IsFunctionKind);
+
+        void Repoint(System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line, long Seq)> latest,
+            Func<string, bool> counts)
+        {
+            if (!latest.TryGetValue(sym, out var cur) || !removedSeqs.Contains(cur.Seq)) return;
+            (string File, int Line, long Seq)? best = null;
+            if (s_defEntriesByName.TryGetValue(sym.Name, out var named))
+                foreach (var e in named)
+                    if (ReferenceEquals(e.Sym, sym) && !IsSetfKind(e.Kind) && counts(e.Kind)
+                        && s_defKindSources.TryGetValue(e, out var loc)
+                        && (best == null || loc.Seq > best.Value.Seq))
+                        best = loc;
+            if (best is { } b) latest[sym] = b;
+            else latest.TryRemove(sym, out _);
+        }
+    }
+
+    private static bool IsFunctionKind(string kind)
+        => kind is "FUNCTION" or "GENERIC-FUNCTION" or "MACRO" or "METHOD";
+
+    private static readonly string[] s_fmakunboundKinds =
+        { "FUNCTION", "MACRO", "GENERIC-FUNCTION", "METHOD", "COMPILER-MACRO" };
+    private static readonly string[] s_setfFmakunboundKinds =
+        { "SETF-FUNCTION", "SETF-GENERIC-FUNCTION", "SETF-METHOD" };
+
+    internal static void ForgetFunctionSources(Symbol sym, bool setf)
+        => ForgetDefinitionSources(sym, setf ? s_setfFmakunboundKinds : s_fmakunboundKinds, null);
+
+    internal static void ForgetMethodSource(GenericFunction gf, LispMethod m)
+    {
+        var name = PublicFunctionName(gf.Name);
+        if (name is Symbol s)
+            ForgetDefinitionSources(s, new[] { "METHOD" }, MethodDetail(m));
+        else if (name is Cons c && c.Cdr is Cons c2 && c2.Car is Symbol s2)
+            ForgetDefinitionSources(s2, new[] { "SETF-METHOD" }, MethodDetail(m));
+    }
+
+    /// <summary>DELETE-PACKAGE: drop the definitions of PKG's symbols, its
+    /// DEFPACKAGE, and the fasl rows still waiting for it.</summary>
+    internal static void ForgetPackageSources(Package pkg)
+    {
+        ResolveFaslDefinitionSources();
+        var names = new HashSet<string>(pkg.Nicknames) { pkg.Name };
+        lock (s_faslSourcesLock)
+            s_unresolvedFaslSources.RemoveAll(e => names.Contains(e.Pkg));
+        lock (s_defRecordLock)
+        {
+            foreach (var kv in s_defKindSources)
+                if (ReferenceEquals(kv.Key.Sym.HomePackage, pkg)
+                    || (kv.Key.Kind == "PACKAGE" && names.Contains(kv.Key.Sym.Name)))
+                    RemoveEntry(kv.Key);
+            foreach (var kv in s_defSources)
+                if (ReferenceEquals(kv.Key.HomePackage, pkg))
+                    s_defSources.TryRemove(kv.Key, out _);
+            foreach (var kv in s_defFunctionSources)
+                if (ReferenceEquals(kv.Key.HomePackage, pkg))
+                    s_defFunctionSources.TryRemove(kv.Key, out _);
+        }
+    }
+
+    private static void RecordDefinitionSource(DefinitionEntry e, string file, int line, long seq)
+    {
+        lock (s_defRecordLock)
+        {
+            if (RemovedSince(e, seq)) return;
+            if (s_defKindSources.TryGetValue(e, out var had))
+            {
+                if (had.Seq > seq) return;
+            }
+            else
+            {
+                if (!s_defEntriesByName.TryGetValue(e.Sym.Name, out var named))
+                    s_defEntriesByName[e.Sym.Name] = named = new List<DefinitionEntry>();
+                named.Add(e);
+            }
+            s_defKindSources[e] = (file, line, seq);
+            if (IsSetfKind(e.Kind) || e.Kind == "PACKAGE") return;
+            SetLatest(s_defSources, e.Sym, file, line, seq);
+            if (IsFunctionKind(e.Kind)) SetLatest(s_defFunctionSources, e.Sym, file, line, seq);
+        }
+    }
+
+    private static void SetLatest(System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line, long Seq)> latest,
+        Symbol sym, string file, int line, long seq)
+    {
+        if (latest.TryGetValue(sym, out var had) && had.Seq > seq) return;
+        latest[sym] = (file, line, seq);
     }
 
 #if DOTCL_EMIT
@@ -2350,8 +3036,14 @@ public static partial class Runtime
     private static void AddFaslDefinitionSources(DotCL.Emitter.FaslAssembler fasl,
         LispObject form, string inputPath, int line)
     {
-        var names = new List<Symbol>();
+        var names = new List<DefinitionEntry>();
         DefinitionNames(form, names);
+        AddFaslDefinitionNames(fasl, names, inputPath, line);
+    }
+
+    private static void AddFaslDefinitionNames(DotCL.Emitter.FaslAssembler fasl,
+        List<DefinitionEntry> names, string inputPath, int line)
+    {
         if (names.Count == 0) return;
         string file;
         var map = BuildDebugLineMap;
@@ -2366,22 +3058,31 @@ public static partial class Runtime
         else
             file = BuildDebugSourceOverride ?? inputPath;
         file = Path.GetFullPath(file);
-        foreach (var s in names)
-            if (s.HomePackage is Package p)
-                fasl.AddDefinitionSource(file, p.Name, s.Name, line);
+        foreach (var e in names)
+            fasl.AddDefinitionSource(file, e.Kind == "PACKAGE" ? null : (e.Sym.HomePackage as Package)?.Name, e.Sym.Name,
+                line, DefinitionKindCode(e.Kind), e.Detail);
     }
 #endif
 
     /// <summary>Called by a fasl's ModuleInit before its first definition runs:
-    /// DATA is the table COMPILE-FILE wrote (see FaslAssembler.AddDefinitionSource).
-    /// Only queued here; <see cref="ResolveFaslDefinitionSources"/> reads it.</summary>
+    /// DATA is the table of an older COMPILE-FILE, which named a symbol per
+    /// definition without its kind.</summary>
     public static void RegisterFaslDefinitionSources(byte[] data)
     {
         lock (s_faslSourcesLock)
-            s_pendingFaslSources.Add((data, System.Threading.Interlocked.Increment(ref s_defSeq)));
+            s_pendingFaslSources.Add((data, System.Threading.Interlocked.Increment(ref s_defSeq), false));
     }
 
-    /// <summary>Move the queued fasl tables into s_defSources. An entry keeps
+    /// <summary>Called by a fasl's ModuleInit before its first definition runs:
+    /// DATA is the table COMPILE-FILE wrote (see FaslAssembler.AddDefinitionSource).
+    /// Only queued here; <see cref="ResolveFaslDefinitionSources"/> reads it.</summary>
+    public static void RegisterFaslDefinitionKindSources(byte[] data)
+    {
+        lock (s_faslSourcesLock)
+            s_pendingFaslSources.Add((data, System.Threading.Interlocked.Increment(ref s_defSeq), true));
+    }
+
+    /// <summary>Move the queued fasl tables into s_defKindSources. An entry keeps
     /// the sequence number of its fasl's load, so a definition loaded later from
     /// source (or another fasl) is not replaced by it. An entry whose package or
     /// symbol does not exist yet is kept for the next call.</summary>
@@ -2396,8 +3097,8 @@ public static partial class Runtime
             s_pendingFaslSources = new();
             s_unresolvedFaslSources = new();
             foreach (var e in retry)
-                ResolveFaslDefinitionSource(e.Pkg, e.Name, e.File, e.Line, e.Seq);
-            foreach (var (data, seq) in pending)
+                ResolveFaslDefinitionSource(e);
+            foreach (var (data, seq, withKinds) in pending)
             {
                 int pos = 0;
                 var files = new string[(int)FaslData.ReadVarint(data, ref pos)];
@@ -2408,25 +3109,54 @@ public static partial class Runtime
                 for (int i = 0; i < n; i++)
                 {
                     var file = files[(int)FaslData.ReadVarint(data, ref pos)];
-                    var pkg = pkgs[(int)FaslData.ReadVarint(data, ref pos)];
+                    var pkgIdx = (int)FaslData.ReadVarint(data, ref pos);
                     var name = FaslData.ReadStr(data, ref pos);
                     int line = (int)FaslData.ReadVarint(data, ref pos);
-                    ResolveFaslDefinitionSource(pkg, name, file, line, seq);
+                    if (!withKinds)
+                    {
+                        ResolveFaslDefinitionSource(new(pkgs[pkgIdx], name, file, line, seq, null, ""));
+                        continue;
+                    }
+                    var kind = s_definitionKinds[(int)FaslData.ReadVarint(data, ref pos)];
+                    var detail = FaslData.ReadStr(data, ref pos);
+                    if (kind == "PACKAGE")
+                    {
+                        RecordDefinitionSource(new DefinitionEntry(PackageKey(name), kind, ""), file, line, seq);
+                        continue;
+                    }
+                    // Package index 0 is an uninterned name.
+                    if (pkgIdx == 0)
+                    {
+                        var key = (name, kind);
+                        if (!s_uninternedDefSources.TryGetValue(key, out var had) || had.Seq < seq)
+                            s_uninternedDefSources[key] = (file, line, seq);
+                        continue;
+                    }
+                    ResolveFaslDefinitionSource(new(pkgs[pkgIdx - 1], name, file, line, seq, kind, detail));
                 }
             }
         }
     }
 
-    private static void ResolveFaslDefinitionSource(string pkg, string name, string file, int line, long seq)
+    private static void ResolveFaslDefinitionSource(FaslDefinitionSource e)
     {
-        var sym = Package.FindPackage(pkg)?.FindSymbol(name).symbol;
+        var sym = Package.FindPackage(e.Pkg)?.FindSymbol(e.Name).symbol;
         if (sym == null)
         {
-            s_unresolvedFaslSources.Add((pkg, name, file, line, seq));
+            s_unresolvedFaslSources.Add(e);
             return;
         }
-        if (s_defSources.TryGetValue(sym, out var had) && had.Seq > seq) return;
-        s_defSources[sym] = (file, line, seq);
+        if (e.Kind == null)
+        {
+            // An older fasl's row does not say its kind.
+            lock (s_defRecordLock)
+            {
+                SetLatest(s_defSources, sym, e.File, e.Line, e.Seq);
+                SetLatest(s_defFunctionSources, sym, e.File, e.Line, e.Seq);
+            }
+            return;
+        }
+        RecordDefinitionSource(new DefinitionEntry(sym, e.Kind, e.Detail), e.File, e.Line, e.Seq);
     }
 
     // Active COMPILE-FILE "was fbound before" snapshots, innermost last.
@@ -2529,8 +3259,9 @@ public static partial class Runtime
 
     /// <summary>
     /// DOTCL:FUNCTION-SOURCE-LOCATION (name): where NAME (a symbol) was most
-    /// recently defined by a top-level definer (defun/defmethod/defclass/...) under
-    /// LOAD or COMPILE-FILE, as the plist (:FILE "path" :LINE n), or NIL if unknown.
+    /// recently defined as a function, generic function, method or macro under
+    /// LOAD or COMPILE-FILE (failing that, by any other definer: defclass,
+    /// defvar, ...), as the plist (:FILE "path" :LINE n), or NIL if unknown.
     /// Backs the swank/micros sldb frame-source-location and find-definitions so
     /// M-. and "jump to erroring frame" work (issue: rich backtrace, source tier).
     /// </summary>
@@ -2538,11 +3269,233 @@ public static partial class Runtime
     {
         if (args.Length < 1 || args[0] is not Symbol name) return Nil.Instance;
         ResolveFaslDefinitionSources();
-        if (!s_defSources.TryGetValue(name, out var loc)) return Nil.Instance;
+        if (!s_defFunctionSources.TryGetValue(name, out var loc) && !s_defSources.TryGetValue(name, out loc))
+            return Nil.Instance;
         return new Cons(Startup.Keyword("FILE"),
                new Cons(new LispString(loc.File),
                new Cons(Startup.Keyword("LINE"),
                new Cons(Fixnum.Make(loc.Line), Nil.Instance))));
+    }
+
+    /// <summary>
+    /// DOTCL:DEFINITION-SOURCES (name): every recorded definition of NAME (a
+    /// symbol or (SETF symbol); a string or package for its DEFPACKAGE), one plist each: (:KIND kind :FILE "path" :LINE n),
+    /// with :QUALIFIERS and :SPECIALIZERS for a method. KIND is one of :FUNCTION
+    /// :MACRO :COMPILER-MACRO :GENERIC-FUNCTION :METHOD :VARIABLE :CONSTANT :CLASS
+    /// :STRUCTURE :CONDITION :TYPE :SETF-EXPANDER :SYMBOL-MACRO :PACKAGE
+    /// :METHOD-COMBINATION.
+    /// </summary>
+    public static LispObject DefinitionSources(LispObject[] args)
+    {
+        if (args.Length < 1) return Nil.Instance;
+        Symbol? sym = null;
+        bool setf = false;
+        if (args[0] is LispString or Package)
+        {
+            var pname = args[0] is Package pk ? pk.Name : ((LispString)args[0]).Value;
+            ResolveFaslDefinitionSources();
+            var pe = new DefinitionEntry(PackageKey(pname), "PACKAGE", "");
+            return s_defKindSources.TryGetValue(pe, out var ploc)
+                ? new Cons(DefinitionPlist(pe, ploc.File, ploc.Line, null), Nil.Instance)
+                : Nil.Instance;
+        }
+        if (args[0] is Symbol s) sym = s;
+        else if (args[0] is Cons c && c.Car is Symbol h && h.Name == "SETF"
+                 && c.Cdr is Cons c2 && c2.Car is Symbol s2 && c2.Cdr is Nil)
+        {
+            sym = s2;
+            setf = true;
+        }
+        if (sym == null) return Nil.Instance;
+        ResolveFaslDefinitionSources();
+        var found = new List<(DefinitionEntry E, (string File, int Line, long Seq) Loc)>();
+        foreach (var e in EntriesNamed(sym.Name))
+            if (ReferenceEquals(e.Sym, sym) && IsSetfKind(e.Kind) == setf
+                && s_defKindSources.TryGetValue(e, out var loc))
+                found.Add((e, loc));
+        found.Sort((a, b) =>
+        {
+            int k = DefinitionKindCode(a.E.Kind).CompareTo(DefinitionKindCode(b.E.Kind));
+            if (k != 0) return k;
+            k = a.Loc.Seq.CompareTo(b.Loc.Seq);
+            if (k != 0) return k;
+            k = a.Loc.Line.CompareTo(b.Loc.Line);
+            return k != 0 ? k : string.CompareOrdinal(a.E.Detail, b.E.Detail);
+        });
+        LispObject result = Nil.Instance;
+        for (int i = found.Count - 1; i >= 0; i--)
+            result = new Cons(DefinitionPlist(found[i].E, found[i].Loc.File, found[i].Loc.Line, null), result);
+        return result;
+    }
+
+    private static bool IsSetfKind(string kind)
+        => kind.StartsWith("SETF-", StringComparison.Ordinal) && kind != "SETF-EXPANDER";
+
+    private static LispObject DefinitionPlist(DefinitionEntry e, string file, int line, LispObject? name)
+    {
+        var kind = IsSetfKind(e.Kind) ? e.Kind.Substring(5) : e.Kind;
+        var items = new List<LispObject>();
+        if (name != null) { items.Add(Startup.Keyword("NAME")); items.Add(name); }
+        items.Add(Startup.Keyword("KIND")); items.Add(Startup.Keyword(kind));
+        if (e.Detail.Length > 0)
+        {
+            int pos = 0;
+            if (ParseDetail(e.Detail, ref pos) is Cons dq && dq.Cdr is Cons ds)
+            {
+                items.Add(Startup.Keyword("QUALIFIERS")); items.Add(dq.Car);
+                items.Add(Startup.Keyword("SPECIALIZERS")); items.Add(ds.Car);
+            }
+        }
+        items.Add(Startup.Keyword("FILE")); items.Add(new LispString(file));
+        items.Add(Startup.Keyword("LINE")); items.Add(Fixnum.Make(line));
+        LispObject r = Nil.Instance;
+        for (int i = items.Count - 1; i >= 0; i--) r = new Cons(items[i], r);
+        return r;
+    }
+
+    /// <summary>Read back what <see cref="DetailText"/> wrote, without interning:
+    /// a symbol whose package or symbol is missing comes back uninterned.</summary>
+    private static LispObject? ParseDetail(string text, ref int pos)
+    {
+        while (pos < text.Length && text[pos] == ' ') pos++;
+        if (pos >= text.Length) return null;
+        char ch = text[pos];
+        if (ch == '(')
+        {
+            pos++;
+            var elems = new List<LispObject>();
+            while (true)
+            {
+                while (pos < text.Length && text[pos] == ' ') pos++;
+                if (pos >= text.Length) return null;
+                if (text[pos] == ')') { pos++; break; }
+                if (ParseDetail(text, ref pos) is not { } x) return null;
+                elems.Add(x);
+            }
+            LispObject list = Nil.Instance;
+            for (int i = elems.Count - 1; i >= 0; i--) list = new Cons(elems[i], list);
+            return list;
+        }
+        if (ch == '|' || text.AsSpan(pos).StartsWith("#:|".AsSpan()))
+        {
+            if (ch == '#')
+            {
+                pos += 2;
+                return BarName(text, ref pos) is { } un ? new Symbol(un) : null;
+            }
+            if (BarName(text, ref pos) is not { } pkgName || !text.AsSpan(pos).StartsWith("::".AsSpan())) return null;
+            pos += 2;
+            if (BarName(text, ref pos) is not { } symName) return null;
+            return Package.FindPackage(pkgName)?.FindSymbol(symName).symbol ?? new Symbol(symName);
+        }
+        int start = pos;
+        if (ch == '"')
+            for (pos++; pos < text.Length && text[pos] != '"'; pos++)
+                if (text[pos] == '\\') pos++;
+        while (pos < text.Length && text[pos] != ' ' && text[pos] != ')') pos++;
+        var token = text.Substring(start, pos - start);
+        if (token == "T") return T.Instance;
+        if (token == "NIL") return Nil.Instance;
+        try { return UnwrapMv(ReadFromString(new LispObject[] { new LispString(token) })); }
+        catch (Exception) { return new LispString(token); }
+
+        static string? BarName(string text, ref int pos)
+        {
+            if (pos >= text.Length || text[pos] != '|') return null;
+            var sb = new System.Text.StringBuilder();
+            for (pos++; pos < text.Length; pos++)
+            {
+                if (text[pos] == '|') { pos++; return sb.ToString(); }
+                if (text[pos] == '\\' && pos + 1 < text.Length) pos++;
+                sb.Append(text[pos]);
+            }
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// DOTCL:DEFINITION-SOURCE (object): where OBJECT -- a function, macro
+    /// function, compiler macro function, generic function, method, class or package --
+    /// was defined, as a plist like those of DOTCL:DEFINITION-SOURCES with :NAME
+    /// in front, or NIL if unknown.
+    /// </summary>
+    public static LispObject DefinitionSource(LispObject[] args)
+    {
+        if (args.Length < 1) return Nil.Instance;
+        ResolveFaslDefinitionSources();
+        switch (args[0])
+        {
+            case LispMethod m:
+                if (m.Owner is not GenericFunction mgf) return Nil.Instance;
+                return FindByName(PublicFunctionName(mgf.Name), "METHOD", MethodDetail(m)) ?? Nil.Instance;
+            case GenericFunction gf:
+                return FindByName(PublicFunctionName(gf.Name), "GENERIC-FUNCTION", "")
+                    ?? FindByName(PublicFunctionName(gf.Name), "FUNCTION", "")
+                    ?? Nil.Instance;
+            case LispClass lc:
+                return FindByName(lc.Name, "CLASS", "")
+                    ?? FindByName(lc.Name, "STRUCTURE", "")
+                    ?? FindByName(lc.Name, "CONDITION", "")
+                    ?? Nil.Instance;
+            case LispFunction fn:
+                return FunctionObjectSource(fn) ?? Nil.Instance;
+            case Package pkg:
+                var pe = new DefinitionEntry(PackageKey(pkg.Name), "PACKAGE", "");
+                return s_defKindSources.TryGetValue(pe, out var ploc)
+                    ? DefinitionPlist(pe, ploc.File, ploc.Line, new LispString(pkg.Name))
+                    : Nil.Instance;
+        }
+        return Nil.Instance;
+
+        static LispObject? FindByName(LispObject name, string kind, string detail)
+        {
+            Symbol? sym = name as Symbol;
+            if (name is Cons c && c.Cdr is Cons c2 && c2.Car is Symbol s2)
+            {
+                sym = s2;
+                kind = "SETF-" + kind;
+            }
+            if (sym == null) return null;
+            var e = new DefinitionEntry(sym, kind, detail);
+            return s_defKindSources.TryGetValue(e, out var loc) ? DefinitionPlist(e, loc.File, loc.Line, name) : null;
+        }
+    }
+
+    private static LispObject? FunctionObjectSource(LispFunction fn)
+    {
+        LispObject? Plist(DefinitionEntry e, (string File, int Line, long Seq) loc)
+            => DefinitionPlist(e, loc.File, loc.Line,
+                IsSetfKind(e.Kind) ? List(Startup.Sym("SETF"), e.Sym) : e.Sym);
+        LispObject? Find(Symbol sym, string kind)
+        {
+            var e = new DefinitionEntry(sym, kind, "");
+            return s_defKindSources.TryGetValue(e, out var loc) ? Plist(e, loc) : null;
+        }
+        if (fn.Name is { } fname)
+        {
+            bool setf = fname.StartsWith("(SETF ", StringComparison.Ordinal) && fname.EndsWith(")", StringComparison.Ordinal);
+            var simple = setf ? fname.Substring(6, fname.Length - 7) : fname;
+            foreach (var e in EntriesNamed(simple))
+                if (e.Kind == (setf ? "SETF-FUNCTION" : "FUNCTION")
+                    && ReferenceEquals(setf ? e.Sym.SetfFunction : e.Sym.Function, fn)
+                    && s_defKindSources.TryGetValue(e, out var loc))
+                    return Plist(e, loc);
+        }
+        if (MacroFunctionName(fn) is { } macroName && Find(macroName, "MACRO") is { } mp)
+            return mp;
+        foreach (var kv in _compilerMacroFunctions)
+            if (ReferenceEquals(kv.Value, fn) && Find(kv.Key, "COMPILER-MACRO") is { } cp)
+                return cp;
+        foreach (var kv in _setfCompilerMacros)
+            if (ReferenceEquals(kv.Value, fn) && Find(kv.Key, "SETF-COMPILER-MACRO") is { } scp)
+                return scp;
+        if (fn.Name is { } name && !name.StartsWith("(", StringComparison.Ordinal)
+            && s_uninternedDefSources.TryGetValue((name, "FUNCTION"), out var u))
+        {
+            var sym = new Symbol(name);
+            return DefinitionPlist(new DefinitionEntry(sym, "FUNCTION", ""), u.File, u.Line, sym);
+        }
+        return null;
     }
 
     /// <summary>
@@ -2557,7 +3510,7 @@ public static partial class Runtime
     {
         ResolveFaslDefinitionSources();
         var found = new List<(Symbol, string, int)>();
-        foreach (var kv in s_defSources)
+        foreach (var kv in s_defFunctionSources)
             if (kv.Key.Name == name && kv.Key.IsFBound)
                 found.Add((kv.Key, kv.Value.File, kv.Value.Line));
         if (found.Count > 1
@@ -3368,7 +4321,7 @@ public static partial class Runtime
     /// CERROR or WARN, "or a macro form which macroexpands into such a list",
     /// WITH-CONDITION-RESTARTS is used implicitly, so the restarts this
     /// RESTART-CASE establishes belong to the condition that form signals and are
-    /// invisible to any other condition. compile-restart-case (cil-forms.lisp)
+    /// invisible to any other condition. compile-restart-case (cil-forms-control.lisp)
     /// already does this for compiled code; the macro expansion did not, so an
     /// interpreted (restart-case (error ...) (foo () ...)) left its FOO
     /// unassociated. A handler that resignals then saw the *inner* FOO through
@@ -3474,6 +4427,28 @@ public static partial class Runtime
     /// debuggable. Null keeps the single-document path. Set by CompileProject.
     /// </summary>
     [ThreadStatic] internal static (int startLine, string path)[]? BuildDebugLineMap;
+
+    [ThreadStatic] private static List<LispCondition>? s_compilerResignal;
+
+    /// <summary>The WARNING handler of COMPILE-FILE and COMPILE, as SBCL's: the
+    /// warning goes to the outer handlers first, and only one none of them
+    /// muffled is counted (RECORD gets whether it is a full WARNING), printed
+    /// and muffled. An enclosing compilation's handler passes on a warning an
+    /// inner one is asking about, so it is counted by the innermost only.</summary>
+    private static LispFunction CompilerWarningHandler(Action<bool> record) => new(args =>
+    {
+        if (args[0] is not LispCondition c) return Nil.Instance;
+        var asking = s_compilerResignal ??= new();
+        foreach (var a in asking) if (ReferenceEquals(a, c)) return Nil.Instance;
+        asking.Add(c);
+        try { HandlerClusterStack.Signal(c); }
+        finally { asking.RemoveAt(asking.Count - 1); }
+        record(!IsTruthy(Typep(c, Startup.Sym("STYLE-WARNING"))));
+        var restart = RestartClusterStack.FindRestartByName("MUFFLE-WARNING", c);
+        if (restart == null || restart.IsBindRestart) return Nil.Instance;
+        ConditionSystem.PrintWarning(c);
+        throw new RestartInvocationException(restart.Tag, Array.Empty<LispObject>());
+    });
 
     public static LispObject CompileFile(LispObject[] args)
     {
@@ -3630,6 +4605,9 @@ public static partial class Runtime
         var compileFileModeSym = Startup.Sym("*COMPILE-FILE-MODE*");
         var oldCompileFileMode = DynamicBindings.Get(compileFileModeSym);
         DynamicBindings.Set(compileFileModeSym, Startup.Sym("T"));
+        var sameFileSym = Startup.Sym("*SAME-FILE-FUNCTIONS*");
+        var oldSameFile = DynamicBindings.TryGet(sameFileSym, out var osf) ? osf : Nil.Instance;
+        DynamicBindings.Set(sameFileSym, new LispHashTable("EQ"));
 
         // Snapshot *modules*. A compile-time (require "x") (e.g. eval-when
         // :compile-toplevel) loads a contrib whose defuns are reverted by the
@@ -3695,6 +4673,10 @@ public static partial class Runtime
         catch { /* should not throw, but guard defensively */ }
         if (moduleIdSym != null)
             DynamicBindings.Push(moduleIdSym, new LispString(faslModuleName));
+        // The compiler leaves out code the retargeted fasl could not load (Vector128).
+        var faslCorlibSym = Startup.Sym("*FASL-CORLIB*");
+        DynamicBindings.Push(faslCorlibSym,
+            corlibNameArg is LispString corlibStr && corlibStr.Value.Length > 0 ? corlibStr : Nil.Instance);
 
         try
         {
@@ -3722,16 +4704,10 @@ public static partial class Runtime
 
             bool warningsP = false;
             bool failureP = false;
-
-            // Install handler to detect warnings during compilation
-            var warningHandler = new LispFunction(args2 =>
+            var warningHandler = CompilerWarningHandler(full =>
             {
                 warningsP = true;
-                var cond = args2[0];
-                // failure-p is T for non-style-warning warnings (e.g., errors, serious warnings)
-                if (cond is LispCondition lc && !IsTruthy(Typep(lc, Startup.Sym("STYLE-WARNING"))))
-                    failureP = true;
-                return Nil.Instance;
+                if (full) failureP = true;
             });
             var handlerCluster = new HandlerBinding[] {
                 new HandlerBinding(Startup.Sym("WARNING"), warningHandler)
@@ -3748,6 +4724,9 @@ public static partial class Runtime
             // emits (:line N) markers.
             bool emitPdb = Environment.GetEnvironmentVariable("DOTCL_EMIT_PDB") != null
                            || BuildEmitPdb;
+#if NET9_0_OR_GREATER
+            if (!emitPdb && FaslInMemoryLoadEnabled()) faslAsm.AlsoBuildInMemory();
+#endif
             Symbol? emitLinesSym = null;
             LispObject? savedEmitLines = null;
             if (emitPdb)
@@ -3919,6 +4898,13 @@ public static partial class Runtime
                     AddFaslDefinitionSources(faslAsm, form, inputPath, formLine);
                     try
                     {
+                    var defNames = new List<DefinitionEntry>();
+                    var savedDefNames = s_flattenedDefinitionNames;
+                    var savedRunning = s_runningTopLevelForm;
+                    s_flattenedDefinitionNames = defNames;
+                    s_runningTopLevelForm = false;
+                    try
+                    {
                     foreach (var subForm in FlattenTopLevel(form))
                     {
                         ProcessTopLevelForm(subForm, false);
@@ -3930,6 +4916,15 @@ public static partial class Runtime
                             w.Flush();
                         }
                     }
+                    }
+                    finally
+                    {
+                        s_flattenedDefinitionNames = savedDefNames;
+                        s_runningTopLevelForm = savedRunning;
+                    }
+                    var expandedDefs = ExpandedDefinitionNames(form, defNames);
+                    RecordDefinitionNames(expandedDefs, inputPath, formLine);
+                    AddFaslDefinitionNames(faslAsm, expandedDefs, inputPath, formLine);
                     }
                     catch (LispSourceException) { throw; } // already located (nested load)
                     catch (Exception ex) when (EmitBuildSourceLocations
@@ -4033,12 +5028,14 @@ public static partial class Runtime
 
             // Restore *compile-file-mode* and dynamic bindings
             DynamicBindings.Set(compileFileModeSym, oldCompileFileMode);
+            DynamicBindings.Set(sameFileSym, oldSameFile);
             if (targetFeaturesArg != null && targetFeaturesArg is not Nil)
                 DynamicBindings.Set(featuresSym, oldFeatures);
             DynamicBindings.Set(cfpSym, oldCfp);
             DynamicBindings.Set(cftSym, oldCft);
             DynamicBindings.Set(packageSym, oldPackage);
             DynamicBindings.Set(readtableSym, oldReadtable);
+            DynamicBindings.Pop(faslCorlibSym);
             if (moduleIdSym != null)
                 DynamicBindings.Pop(moduleIdSym);
         }
@@ -5584,7 +6581,7 @@ public static partial class Runtime
         {
             var pkgArg = args[1];
             if (pkgArg is Package p2) pkg = p2;
-            else if (pkgArg is LispString pkgNameStr) pkg = Package.FindPackage(pkgNameStr.Value);
+            else if (StringValueOrNull(pkgArg) is string pkgNameStr) pkg = Package.FindPackage(pkgNameStr);
             else if (pkgArg is Symbol pkgSym) pkg = Package.FindPackage(pkgSym.Name);
             else if (pkgArg is LispChar pkgChar) pkg = Package.FindPackage(pkgChar.Value.ToString());
             else if (pkgArg is LispVector pkgVec && pkgVec.IsCharVector) pkg = Package.FindPackage(pkgVec.ToCharString());
@@ -5944,6 +6941,58 @@ public static partial class Runtime
 
     // Returns (gen0-count gen1-count gen2-count total-memory total-allocated-bytes)
     // Used by the TIME macro to compute GC deltas around a form.
+    private static int _exitHooksInstalled;
+    private static int _exitHooksRan;
+
+    /// <summary>Run the functions in the global value of HOOKS (dotcl:*exit-hooks*)
+    /// when the process exits. ProcessExit is raised both by Environment.Exit
+    /// (dotcl:quit) and when Main returns, on the exiting thread. The hooks run
+    /// once, in list order; an error in one is printed and the rest still run.
+    /// Standard output and error output are finished afterwards, so what a hook
+    /// prints is not lost.</summary>
+    internal static void InstallExitHooks(Symbol hooks)
+    {
+        if (System.Threading.Interlocked.Exchange(ref _exitHooksInstalled, 1) != 0) return;
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => RunExitHooks(hooks);
+    }
+
+    private static void RunExitHooks(Symbol hooks)
+    {
+        if (System.Threading.Interlocked.Exchange(ref _exitHooksRan, 1) != 0) return;
+        var list = hooks.Value;
+        if (list is not Cons) return;
+        for (var cur = list; cur is Cons c; cur = c.Cdr)
+        {
+            try
+            {
+                var fn = c.Car is Symbol fs ? fs.Function : c.Car;
+                if (fn is LispFunction lf) lf.Invoke();
+                else throw new LispErrorException(new LispTypeError(
+                    "*EXIT-HOOKS*: not a function", c.Car, Startup.Sym("FUNCTION")));
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    Console.Error.WriteLine($"dotcl: error in exit hook {c.Car}: {ex.Message}");
+                    Console.Error.Flush();
+                }
+                catch { }
+            }
+        }
+        foreach (var name in new[] { "*STANDARD-OUTPUT*", "*ERROR-OUTPUT*" })
+        {
+            try
+            {
+                var stream = Startup.Sym(name).Value;
+                if (stream != null && Startup.Sym("FINISH-OUTPUT").Function is LispFunction fo)
+                    fo.Invoke(stream);
+            }
+            catch { }
+        }
+        try { Console.Out.Flush(); } catch { }
+    }
+
     public static LispObject GcStats(LispObject[] args)
     {
         if (args.Length != 0)
@@ -5953,11 +7002,16 @@ public static partial class Runtime
         long gen2 = GC.CollectionCount(2);
         long totalMem = GC.GetTotalMemory(false);
         long allocated = Compat.GetTotalAllocatedBytes(false);
+        // Total GC pause time in internal time units (microseconds), as
+        // sb-ext:*gc-run-time* is; NIL where the runtime cannot tell.
+        var pause = Compat.GetTotalGcPauseDuration();
+        LispObject pauseTime = pause is TimeSpan p ? Fixnum.Make(p.Ticks / 10) : Nil.Instance;
         return new Cons(Fixnum.Make(gen0),
                new Cons(Fixnum.Make(gen1),
                new Cons(Fixnum.Make(gen2),
                new Cons(Fixnum.Make(totalMem),
-               new Cons(Fixnum.Make(allocated), Nil.Instance)))));
+               new Cons(Fixnum.Make(allocated),
+               new Cons(pauseTime, Nil.Instance))))));
     }
 
     // COMPILER-MACRO-FUNCTION body (shared by the args-array wrapper and the
@@ -6356,11 +7410,12 @@ public static partial class Runtime
             if (i > 0) traceWriter.Write(" ");
             traceWriter.Write(FormatObject(wrapArgs[i], true));
         }
-        traceWriter.WriteLine(")");
+        traceWriter.Write(")\n");
         traceWriter.Flush();
         var result = call(wrapArgs);
         traceWriter.Write("  => ");
-        traceWriter.WriteLine(FormatObject(result, true));
+        traceWriter.Write(FormatObject(result, true));
+        traceWriter.Write('\n');
         traceWriter.Flush();
         return result;
     }
@@ -6661,6 +7716,119 @@ public static partial class Runtime
     // *SYMBOL-MACRO-SHADOW-MARKER* object, looked up on first use.
     static LispObject? _symbolMacroShadowMarker;
 
+    // The expansions %MINI-MACROEXPAND-1-CACHED remembers, keyed by the form's
+    // cons. Weak: an entry goes away with the form. An entry is replaced as a
+    // whole, so a reader on another thread sees an old one or a new one.
+    sealed class MiniExpansion
+    {
+        public readonly MiniExpansionTokens Tokens;
+        public readonly bool EnvFree;
+        public readonly LispObject Expansion;
+        public MiniExpansion(MiniExpansionTokens tokens, bool envFree, LispObject expansion)
+        { Tokens = tokens; EnvFree = envFree; Expansion = expansion; }
+    }
+    sealed class MiniExpansionBox { public volatile MiniExpansion? Entry; }
+
+    // What a remembered expansion of a form with operator SYM was made from.
+    readonly struct MiniExpansionTokens
+    {
+        public readonly int Epoch;
+        public readonly long Tables;
+        public readonly LispObject? FunctionBinding;
+        public readonly LispHashTable? GsmTable;
+        public readonly int GsmVersion;
+        public bool Usable => Tables != -1;
+        // The compiler's table of global symbol macros has an entry: an expansion
+        // may then depend on the lexical variables in scope.
+        public bool GlobalSymbolMacros => GsmTable != null && GsmTable.Count > 0;
+        MiniExpansionTokens(int epoch, long tables, LispObject? fn, LispHashTable? gsm, int gsmVersion)
+        { Epoch = epoch; Tables = tables; FunctionBinding = fn; GsmTable = gsm; GsmVersion = gsmVersion; }
+        public static MiniExpansionTokens Current(Symbol sym)
+        {
+            var gsm = GlobalSymbolMacroTable();
+            return new MiniExpansionTokens(
+                System.Threading.Volatile.Read(ref MacroEpoch), Startup.MacroTablesVersion(),
+                sym.Function, gsm, gsm?.Version ?? 0);
+        }
+        public bool SameAs(in MiniExpansionTokens o)
+            => Epoch == o.Epoch && Tables == o.Tables
+               && ReferenceEquals(FunctionBinding, o.FunctionBinding)
+               && ReferenceEquals(GsmTable, o.GsmTable) && GsmVersion == o.GsmVersion;
+    }
+
+    static readonly LispObject MiniExpansionMiss = new Cons(Nil.Instance, Nil.Instance);
+
+    // The compiler's *GLOBAL-SYMBOL-MACROS* table (DEFINE-SYMBOL-MACRO as the
+    // compiler records it), or null before the compiler is loaded.
+    static Symbol? _gsmTableSym;
+    static LispHashTable? GlobalSymbolMacroTable()
+    {
+        var sym = _gsmTableSym;
+        if (sym == null)
+        {
+            var pkg = Package.FindPackage("DOTCL-INTERNAL");
+            if (pkg == null) return null;
+            var (found, status) = pkg.FindSymbol("*GLOBAL-SYMBOL-MACROS*");
+            if (found == null || status == SymbolStatus.None) return null;
+            _gsmTableSym = sym = found;
+        }
+        return sym.Value as LispHashTable;
+    }
+
+    // True when TREE contains a symbol naming a global symbol macro, in the
+    // compiler's table or the runtime's. A tree too large to walk (or circular)
+    // counts as mentioning one.
+    static bool MentionsGlobalSymbolMacro(LispObject tree, LispHashTable? gsm)
+    {
+        var names = gsm == null ? null : GsmNameSet(gsm);
+        var stack = _mentionsStack ??= new Stack<LispObject>();
+        stack.Clear();
+        stack.Push(tree);
+        int budget = 5000;
+        while (stack.Count > 0)
+        {
+            if (--budget < 0) return true;
+            var x = stack.Pop();
+            while (x is Cons c)
+            {
+                if (--budget < 0) return true;
+                if (c.Car is Cons) stack.Push(c.Car);
+                else if (c.Car is Symbol s1 && IsGlobalSymbolMacroName(s1, names)) return true;
+                x = c.Cdr;
+            }
+            if (x is Symbol s2 && IsGlobalSymbolMacroName(s2, names)) return true;
+        }
+        return false;
+    }
+
+    [ThreadStatic] static Stack<LispObject>? _mentionsStack;
+
+    static bool IsGlobalSymbolMacroName(Symbol sym, HashSet<Symbol>? names)
+        => (names != null && names.Contains(sym)) || TryGetGlobalSymbolMacro(sym, out _);
+
+    // The symbol keys of the compiler's global symbol-macro table, copied once
+    // per table version so the walk above does not take the table's lock per node.
+    sealed class GsmNames
+    {
+        public readonly LispHashTable Table; public readonly int Version; public readonly HashSet<Symbol> Names;
+        public GsmNames(LispHashTable t, int v, HashSet<Symbol> n) { Table = t; Version = v; Names = n; }
+    }
+    static volatile GsmNames? _gsmNames;
+    static HashSet<Symbol> GsmNameSet(LispHashTable gsm)
+    {
+        int v = gsm.Version;
+        var c = _gsmNames;
+        if (c != null && ReferenceEquals(c.Table, gsm) && c.Version == v) return c.Names;
+        var set = new HashSet<Symbol>(SymbolIdentityComparer.Instance);
+        foreach (var kv in gsm.Entries)
+            if (kv.Key is Symbol k) set.Add(k);
+        _gsmNames = new GsmNames(gsm, v, set);
+        return set;
+    }
+
+    static readonly ConditionalWeakTable<Cons, MiniExpansionBox> _miniExpansions = new();
+    static readonly ConditionalWeakTable<LispObject, StrongBox<LispObject?>> _miniMemo = new();
+
     internal static void RegisterMiscBuiltins()
     {
         // ERROR (format version), SIGNAL, WARN
@@ -6713,7 +7881,8 @@ public static partial class Runtime
         // VALUES (variadic)
         Emitter.CilAssembler.RegisterFunction("VALUES",
             new LispFunction(args => Runtime.Values(args), "VALUES", -1));
-        Startup.RegisterUnary("VALUES-LIST", Runtime.ValuesList);
+        Startup.RegisterUnary("VALUES-LIST", Runtime.ValuesListTakingMode);
+        Emitter.CilAssembler.GetFunction("VALUES-LIST").MarkMvModeEntry(1);
 
         // GENSYM, GENTEMP
         Emitter.CilAssembler.RegisterFunction("GENSYM",
@@ -6783,6 +7952,13 @@ public static partial class Runtime
                 Runtime.CheckArityExact("%FN-INTERP-INFO", args, 1);
                 return args[0] is LispFunction fn ? fn.InterpInfo ?? Nil.Instance : Nil.Instance;
             }, "%FN-INTERP-INFO", 1));
+        Emitter.CilAssembler.RegisterFunction("%MINI-TAIL-FRAME",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%MINI-TAIL-FRAME", args, 3);
+                return args[0] is LispFunction owner && args[1] is LispFunction callee
+                    ? (LispObject?)LispFunction.InterpTailFrame(owner, callee, args[2]) ?? Nil.Instance
+                    : Nil.Instance;
+            }, "%MINI-TAIL-FRAME", 3));
 
         // %SET-FUNCTION-LAMBDA-LIST fn ll -> fn
         // Development information, not part of calling: see
@@ -7076,6 +8252,105 @@ public static partial class Runtime
                 return MacroexpandOnceOrSelf(args[0], args.Length > 1 ? args[1] : Nil.Instance);
             }, "%MACROEXPAND-1-OR-SELF", -1));
 
+        // The tree-walk evaluator's memo of what it works out once per list: a
+        // lambda list's shape, a HANDLER-CASE form's rewrite (see %MINI-SHAPE in
+        // cil-forms-interp.lisp). Keyed weakly by the list itself. Read on every
+        // interpreted call, from any thread, without a lock. NIL when absent.
+        Emitter.CilAssembler.RegisterFunction("%MINI-MEMO",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%MINI-MEMO", args, 1);
+                return _miniMemo.TryGetValue(args[0], out var box) && box.Value != null
+                    ? box.Value : Nil.Instance;
+            }, "%MINI-MEMO", 1));
+        Emitter.CilAssembler.RegisterFunction("%SET-MINI-MEMO",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%SET-MINI-MEMO", args, 2);
+                _miniMemo.GetValue(args[0], _ => new StrongBox<LispObject?>()).Value = args[1];
+                return args[1];
+            }, "%SET-MINI-MEMO", 2));
+
+        // One macroexpansion step of FORM for the tree-walk evaluator, remembered
+        // per form. The evaluator expanded a macro form every time it evaluated
+        // it, so a macro inside a loop or a function body was expanded again on
+        // every iteration and every call: a LOOP inside a function called 40,000
+        // times was expanded 40,000 times. The evaluator calls this only where no
+        // MACROLET or SYMBOL-MACROLET is in scope, so the expansion depends on the
+        // global definitions alone, and, once a global symbol macro exists, on
+        // whether the lexical variables in scope shadow one: an expansion is only
+        // kept for every scope when neither the form nor its expansion mentions a
+        // global symbol macro's name (%MINI-STORE-EXPANSION).
+        //
+        // A form that is not a macro form is remembered as such too: finding that
+        // out reads the compiler's macro table under its lock, which every thread
+        // evaluating a form waited on. A remembered answer is used while nothing
+        // it was made from has changed: no global macro or symbol macro defined
+        // or removed (MacroEpoch, and the compiler's symbol-macro table), no
+        // change to the compiler's macro tables (MacroTablesVersion), and the
+        // operator's function binding the same object (a function of that name
+        // hides a compiler-table macro). A non-default *MACROEXPAND-HOOK* is
+        // called every time, as before.
+        //
+        // Returns the expansion, FORM itself when it is not a macro form, or
+        // MiniExpansionMiss when a global symbol macro exists and the expansion
+        // has to be made in the caller's environment; the caller then makes it
+        // and hands it to %MINI-STORE-EXPANSION.
+        Emitter.CilAssembler.RegisterFunction("%MINI-MACROEXPAND-1-CACHED",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%MINI-MACROEXPAND-1-CACHED", args, 1);
+                var form = args[0];
+                if (form is not Cons cons || cons.Car is not Symbol sym
+                    || !Compat.TryEnsureSufficientExecutionStack()
+                    || NonDefaultMacroexpandHook() != null)
+                    return MiniExpandUncached(form);
+                var tokens = MiniExpansionTokens.Current(sym);
+                if (tokens.Usable && _miniExpansions.TryGetValue(cons, out var box))
+                {
+                    var e = box.Entry;
+                    if (e != null && e.Tokens.SameAs(tokens) && e.EnvFree)
+                        return e.Expansion;
+                }
+                var expander = Runtime.MacroFunction(sym) as LispFunction
+                               ?? Startup.LookupCompilerMacroAsMacro(sym);
+                if (expander != null && tokens.GlobalSymbolMacros)
+                    return MiniExpansionMiss;
+                var expanded = expander == null ? form : MacroexpandOnceOrSelf(form, new Cons(Nil.Instance, Nil.Instance));
+                if (tokens.Usable)
+                    _miniExpansions.GetValue(cons, _ => new MiniExpansionBox()).Entry
+                        = new MiniExpansion(tokens, true, expanded);
+                return expanded;
+            }, "%MINI-MACROEXPAND-1-CACHED", 1));
+
+        // (%MINI-STORE-EXPANSION form expansion): remember EXPANSION, made in the
+        // caller's environment after %MINI-MACROEXPAND-1-CACHED answered
+        // MiniExpansionMiss, and return it. It serves every later evaluation of
+        // FORM only when neither FORM nor EXPANSION mentions a global symbol
+        // macro; otherwise the next evaluation expands again, as every one did.
+        Emitter.CilAssembler.RegisterFunction("%MINI-STORE-EXPANSION",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%MINI-STORE-EXPANSION", args, 2);
+                var expanded = args[1];
+                if (args[0] is Cons cons && cons.Car is Symbol sym)
+                {
+                    var tokens = MiniExpansionTokens.Current(sym);
+                    if (tokens.Usable)
+                    {
+                        bool envFree = !MentionsGlobalSymbolMacro(cons, tokens.GsmTable)
+                                       && !MentionsGlobalSymbolMacro(expanded, tokens.GsmTable);
+                        _miniExpansions.GetValue(cons, _ => new MiniExpansionBox()).Entry
+                            = new MiniExpansion(tokens, envFree, expanded);
+                    }
+                }
+                return expanded;
+            }, "%MINI-STORE-EXPANSION", 2));
+
+        Emitter.CilAssembler.RegisterFunction("%MINI-EXPANSION-MISS",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%MINI-EXPANSION-MISS", args, 0);
+                return MiniExpansionMiss;
+            }, "%MINI-EXPANSION-MISS", 0));
+
+        static LispObject MiniExpandUncached(LispObject form) => MacroexpandOnceOrSelf(form, new Cons(Nil.Instance, Nil.Instance));
+
         // The symbol-macro table of an environment object: SYMBOL-MACROLET
         // bindings keyed by the symbol itself (a same-named symbol of another
         // package, or a keyword, is a different name). A lexical variable that
@@ -7345,13 +8620,10 @@ public static partial class Runtime
                     // handler only records it and declines, so the warning is still
                     // reported as before.
                     bool warningsP = false, failureP = false;
-                    var warningHandler = new LispFunction(hargs =>
+                    var warningHandler = CompilerWarningHandler(full =>
                     {
                         warningsP = true;
-                        if (hargs[0] is LispCondition wc
-                            && !IsTruthy(Typep(wc, Startup.Sym("STYLE-WARNING"))))
-                            failureP = true;
-                        return Nil.Instance;
+                        if (full) failureP = true;
                     });
                     LispObject fn;
                     HandlerClusterStack.PushCluster(new HandlerBinding[] {
@@ -7768,18 +9040,18 @@ public static partial class Runtime
         Startup.RegisterUnary("SLEEP", obj => {
             double secs = Arithmetic.ToDouble(Runtime.AsNumber(obj));
             if (secs < 0) throw new LispErrorException(new LispTypeError("SLEEP: negative argument", obj));
+            bool interrupted = false;
+            var self = Runtime.EnterInterruptibleWait();
             try
             {
                 System.Threading.Thread.Sleep((int)(secs * 1000));
             }
-            catch (System.Threading.ThreadInterruptedException)
-            {
-                // INTERRUPT-THREAD reached us. Run what it queued (which usually
-                // exits non-locally, e.g. a timeout) and cut the sleep short.
-                // Nothing queued means this was DESTROY-THREAD (or a stray
-                // interrupt): let it propagate and end the thread, as before.
-                if (!Runtime.RunPendingInterrupts()) throw;
-            }
+            catch (System.Threading.ThreadInterruptedException) { interrupted = true; }
+            finally { Runtime.LeaveInterruptibleWait(self); }
+            // INTERRUPT-THREAD reached us: run what it queued and cut the sleep
+            // short. Nothing queued means DESTROY-THREAD: end the thread.
+            if (interrupted && !Runtime.RunPendingInterrupts())
+                throw new System.Threading.ThreadInterruptedException();
             return Nil.Instance;
         });
         Emitter.CilAssembler.RegisterFunction("DECODE-UNIVERSAL-TIME", new LispFunction(args => {
@@ -7934,16 +9206,19 @@ public static partial class Runtime
             }));
 
         // Stack space check: returns T if sufficient execution stack remains, NIL otherwise.
-        // Used by find-free-vars-expr to bail out before .NET StackOverflowException.
+        // Used by the analysis walks to bail out before .NET StackOverflowException,
+        // and by COMPILE-FORM to signal a Lisp error instead. The padded probe is
+        // used so that a caller that sees NIL still has room to signal: the
+        // runtime's own probe leaves only enough stack to throw.
         // The args-array wrapper ignores its arguments entirely, so the 0-arg
         // direct delegate is the identical code path (extra-arg calls still fall
         // back to the wrapper, which also ignores them: unchanged).
         var stackSpaceFn = new LispFunction(_ =>
-            Compat.TryEnsureSufficientExecutionStack()
+            Compat.TryEnsureSufficientExecutionStackWithMargin()
                 ? (LispObject)T.Instance : Nil.Instance,
             "%STACK-SPACE-AVAILABLE-P", 0);
         stackSpaceFn.SetDirectDelegate((Func<LispObject>)(() =>
-            Compat.TryEnsureSufficientExecutionStack()
+            Compat.TryEnsureSufficientExecutionStackWithMargin()
                 ? (LispObject)T.Instance : Nil.Instance));
         Emitter.CilAssembler.RegisterFunction("%STACK-SPACE-AVAILABLE-P", stackSpaceFn);
     }

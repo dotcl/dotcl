@@ -22,7 +22,11 @@
            #:*dotcl-dist-url*
            #:*offer-dotcl-dist*
            #:dotcl-dist
-           #:install-dotcl-dist))
+           #:install-dotcl-dist
+           #:*use-dist-packages*
+           #:*dist-package-source*
+           #:dist-package-for
+           #:dist-package-searcher))
 
 (in-package #:ql-setup)
 

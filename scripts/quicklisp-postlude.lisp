@@ -125,6 +125,133 @@ later session picks the patched releases without asking."
              ;; Run (ql-setup:install-dotcl-dist) for the dotcl-patched libraries,~@
              ;; or (setf ql-setup:*offer-dotcl-dist* nil) to stop seeing this.~%"))
 
+;;; Prebuilt packages for dist releases
+;;;
+;;; A dist may name, in a file its distinfo points to (dotcl-packages-url), NuGet
+;;; packages made by `dotcl pack --library' from its releases, one line each:
+;;;
+;;;   <release> <dotcl version> <rid> <package id> <package version> <system>...
+;;;
+;;; Under QL:QUICKLOAD, a system listed for this dotcl and RID, in the release the
+;;; client would pick, is loaded from the package instead of being compiled.
+
+(defvar *use-dist-packages* t
+  "When true, a system that a dist offers as a prebuilt package for this dotcl
+and platform is loaded from the package.")
+
+(defvar *dist-package-source* nil
+  "Where to get dist packages from: a NuGet feed (URL or directory), or the URL
+of one .nupkg with {id} and {version} in it, fetched into the dist's
+dotcl-packages/ directory, which is then the feed. NIL uses the dist's
+dotcl-package-source, or NuGet's configured feeds when it has none.")
+
+(defvar *quickloading* nil)
+(defvar *dist-package-indexes* (make-hash-table :test 'equal))
+(defvar *dist-packages-tried* (make-hash-table :test 'equal))
+(defvar *in-dist-package-search* nil)
+
+(defun %words (line)
+  (loop with start = 0
+        for end = (position #\Space line :start start)
+        for word = (subseq line start end)
+        when (plusp (length word)) collect word
+        while end do (setf start (1+ end))))
+
+(defun %read-dist-package-index (file)
+  (with-open-file (in file)
+    (loop for line = (read-line in nil) while line
+          for words = (%words line)
+          when (and (>= (length words) 6) (char/= #\# (char (first words) 0)))
+            collect words)))
+
+(defun %dist-package-index (dist)
+  "(source . entries) for DIST, or NIL when it offers no packages."
+  (let* ((distinfo (ql-dist::relative-to dist "distinfo.txt"))
+         (file (ql-dist::relative-to dist "dotcl-packages.txt"))
+         (info-date (file-write-date distinfo))
+         (cached (gethash (namestring distinfo) *dist-package-indexes*))
+         (info (if (eql (first cached) info-date)
+                   (second cached)
+                   (ql-dist::config-file-initargs distinfo)))
+         (url (getf info :dotcl-packages-url))
+         (date (and url (probe-file file) (file-write-date file))))
+    (when (and url *quickloading* (not (and date (>= date info-date))))
+      (handler-case (progn (ql-http:fetch url file :quietly t)
+                           (setf date (file-write-date file)))
+        (error (c)
+          (format *error-output* "~&; quicklisp: could not fetch ~A: ~A~%" url c))))
+    (let ((index (cond ((not (and date (>= date info-date))) nil)
+                       ((and (eql (first cached) info-date) (eql (third cached) date))
+                        (fourth cached))
+                       (t (cons (getf info :dotcl-package-source)
+                                (%read-dist-package-index file))))))
+      (setf (gethash (namestring distinfo) *dist-package-indexes*)
+            (list info-date info date index))
+      index)))
+
+(defun dist-package-for (name)
+  "The prebuilt package the dists offer for system NAME on this dotcl and
+platform, as (id version source release), or NIL."
+  (let ((rid nil))
+    (dolist (dist (ql-dist:enabled-dists))
+      (destructuring-bind (&optional source &rest entries) (%dist-package-index dist)
+        (dolist (e entries)
+          (destructuring-bind (release dotcl rid* id version &rest systems) e
+            (when (and (member name systems :test #'string=)
+                       (string= dotcl (lisp-implementation-version))
+                       (equal rid* (or rid (setf rid (dotcl:package-rid)))))
+              (let ((system (ql-dist:find-system name)))
+                (when (and system
+                           (string= (ql-dist:name (ql-dist:dist system)) (ql-dist:name dist))
+                           (string= (ql-dist:name (ql-dist:release system)) release))
+                  (return-from dist-package-for
+                    (list id version (or *dist-package-source* source) release)))))))))))
+
+(defun %replace-all (string old new)
+  (with-output-to-string (out)
+    (loop with start = 0
+          for hit = (search old string :start2 start)
+          do (write-string string out :start start :end hit)
+          while hit
+          do (write-string new out)
+             (setf start (+ hit (length old))))))
+
+(defun %package-feed (source name id version)
+  "SOURCE as a feed NUGET:REQUIRE takes. A URL template is fetched into a
+directory of the dist that offers NAME."
+  (if (not (and (stringp source) (search "{id}" source)))
+      source
+      (let* ((dir (ql-dist::relative-to (ql-dist:dist (ql-dist:find-system name))
+                                        "dotcl-packages/"))
+             (file (merge-pathnames (format nil "~a.~a.nupkg" id version) dir)))
+        (unless (probe-file file)
+          (ensure-directories-exist file)
+          (ql-http:fetch (%replace-all (%replace-all source "{id}" id) "{version}" version)
+                         file :quietly t))
+        (namestring dir))))
+
+(defun dist-package-searcher (name)
+  "An ASDF system search function, active during QL:QUICKLOAD: puts the prebuilt
+package of NAME's release, if a dist offers one, where ASDF's central registry
+finds it. Returns NIL."
+  (when (and *use-dist-packages* *quickloading* (not *in-dist-package-search*))
+    (let* ((*in-dist-package-search* t)
+           (hit (dist-package-for name)))
+      (when (and hit (not (gethash (first hit) *dist-packages-tried*)))
+        (setf (gethash (first hit) *dist-packages-tried*) t)
+        (destructuring-bind (id version source release) hit
+          (format *error-output* "~&; quicklisp: ~A from the package ~A ~A~%" release id version)
+          (handler-case
+              (progn (require "asdf-nuget")
+                     (funcall (find-symbol "REQUIRE" "NUGET") id :version version
+                              :source (%package-feed source name id version)))
+            (error (c)
+              (format *error-output* "~&; quicklisp: could not use ~A ~A, so ~A is compiled: ~A~%"
+                      id version release c)))))))
+  nil)
+
+(pushnew 'dist-package-searcher asdf:*system-definition-search-functions*)
+
 ;;; (ql:setup): where the overlay gets installed
 ;;;
 ;;; SETUP is the point where the user has asked for the network: on a fresh home
@@ -188,7 +315,8 @@ turning that into a failed SETUP would strand the user with no dist at all."
     ;; The overlay wrapper, not the client's SETUP: a home initialized by
     ;; quickload should end up with the same dists as one initialized by hand.
     (quicklisp:setup))
-  (apply *client-quickload* args))
+  (let ((*quickloading* t))
+    (apply *client-quickload* args)))
 
 (setf (fdefinition 'quicklisp:quickload) #'%quickload-initializing-home)
 

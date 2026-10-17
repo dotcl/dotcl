@@ -34,15 +34,14 @@
 #   LIBRARY_STATUS_CONFIG    Release (default) or Debug: which build of the
 #                            runtime measures (see runtime.sh); every entry
 #                            records it as "runtime"
+#   LIBRARY_STATUS_LISP=sbcl measure on SBCL (see runtime.sh); the output
+#                            defaults to results-sbcl.json
 set -eu
 
 root="${1:-.}"
 # Note filters (scrub_note), shared with the other stage.
 . "$(dirname "$0")/scrub.sh"
 . "$(dirname "$0")/dists.sh"
-targets="${LIBRARY_STATUS_TARGETS:-$root/bench/library-status/targets.txt}"
-out="${LIBRARY_STATUS_JSON:-$root/bench/library-status/results.json}"
-logdir="${LIBRARY_STATUS_LOGDIR:-/tmp/library-status-logs}"
 per="${LIBRARY_STATUS_TIMEOUT:-300}"
 retry="${LIBRARY_STATUS_RETRY:-900}"
 limit="${LIMIT:-0}"
@@ -52,6 +51,10 @@ resume="${LIBRARY_STATUS_RESUME:-0}"
 # runtime.sh.
 . "$(dirname "$0")/runtime.sh"
 select_runtime run-quickload
+sfx=""; [ "$lisp" = sbcl ] && sfx="-$lisp"
+targets="${LIBRARY_STATUS_TARGETS:-$root/bench/library-status/targets.txt}"
+out="${LIBRARY_STATUS_JSON:-$root/bench/library-status/results$sfx.json}"
+logdir="${LIBRARY_STATUS_LOGDIR:-/tmp/library-status-logs$sfx}"
 # GNU timeout bounds each run. macOS has none by default; Homebrew coreutils
 # installs it as gtimeout. Without either, every run would fail with 127 and
 # be recorded as a library failure, so stop here instead.
@@ -65,6 +68,7 @@ check_dists run-quickload
 checked=$(date +%Y-%m-%d)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+write_launcher "$work"
 mkdir -p "$logdir"
 
 # One JSON string: the few characters that would break it are removed rather
@@ -125,7 +129,7 @@ for sys in $(grep -v '^#' "$targets" | grep -v '^[[:space:]]*$'); do
   # definition wanted -- "quickload signaled and nothing handled it" is what a
   # batch load failure is.
   cat > "$work/drv.lisp" <<DRVEOF
-(require "quicklisp")
+$(driver_prelude)
 ;; Which dists this home has, and in what order. A row measured in a home
 ;; without the dotcl overlay looks like a library failure (swank did).
 (format t "~&LIBSTATUS-DISTS ~{~a~^ ~}~%"
@@ -135,7 +139,7 @@ for sys in $(grep -v '^#' "$targets" | grep -v '^[[:space:]]*$'); do
   (error (e)
     (format t "~&LIBSTATUS-FAIL ~a~%" e)
     (finish-output)
-    (dotcl:quit 1)))
+    (libstatus-quit 1)))
 ;; Which dist answered decides load-only vs patched: the dotcl overlay carries
 ;; patched releases for the libraries that need a change to run here. PREFIX is
 ;; the versioned release name ("alexandria-20241012-git"); NAME is the project.
@@ -147,14 +151,14 @@ for sys in $(grep -v '^#' "$targets" | grep -v '^[[:space:]]*$'); do
           (if r (ql-dist:name (ql-dist:dist r)) "?")))
 (format t "~&LIBSTATUS-OK~%")
 (finish-output)
-(dotcl:quit 0)
+(libstatus-quit 0)
 DRVEOF
 
   # A slash in a system name ("foo/test") is not a directory here.
   log="$logdir/$(printf '%s' "$sys" | tr / _).txt"
-  t0=$(date +%s)
+  t0=$(now_seconds)
   set +e
-  "$timeout" "$per" "$exe" --core "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
+  "$timeout" "$per" "$work/lisp" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
   code=$?
   set -e
   retried=""
@@ -166,12 +170,12 @@ DRVEOF
   if [ "$code" -eq 124 ]; then
     retried=" (retried)"
     set +e
-    "$timeout" "$retry" "$exe" --core "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
+    "$timeout" "$retry" "$work/lisp" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
     code=$?
     set -e
   fi
-  t1=$(date +%s)
-  elapsed=$((t1 - t0))
+  t1=$(now_seconds)
+  elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')
 
   release=$(sed -n 's/^LIBSTATUS-RELEASE //p' "$log" | tail -1)
   dist=$(sed -n 's/^LIBSTATUS-DIST //p' "$log" | tail -1)
@@ -215,12 +219,12 @@ DRVEOF
   release_json=null
   [ -n "$release" ] && [ "$release" != "?" ] && release_json="\"$(jstr "$release")\""
 
-  printf '  {"system": "%s", "release": %s, "status": "%s", "issue": null, "checked": "%s", "note": "%s", "dists": "%s", "runtime": "%s", "seconds": %d}\n' \
+  printf '  {"system": "%s", "release": %s, "status": "%s", "issue": null, "checked": "%s", "note": "%s", "dists": "%s", "runtime": "%s", "seconds": %s}\n' \
     "$sys" "$release_json" "$status" "$checked" "$(jstr "${note:-}")" "$dists_desc" "$runtime_desc" "$elapsed" >> "$work/entries"
   write_json
   ran=$((ran + 1))
 
-  printf '%3d %-34s %-10s %3ds %s\n' "$ran" "$sys" "$status" "$elapsed" "$(jstr "${note:-}")"
+  printf '%3d %-34s %-10s %5ss %s\n' "$ran" "$sys" "$status" "$elapsed" "$(jstr "${note:-}")"
 done
 
 finished=$(date +%s)

@@ -1060,12 +1060,12 @@ public static class DotclHost
     public static void SetThrowingDebuggerHook(bool typed)
     {
         var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
-        var hook = new LispFunction(a =>
+        var hook = ConditionSystem.ReportingDebuggerHook(new LispFunction(a =>
         {
             var cond = a.Length > 0 ? a[0] : Nil.Instance;
             if (typed) throw new DotclConditionException(cond);
             throw new InvalidOperationException(ConditionText.Line(cond));
-        }, "*NON-INTERACTIVE-DEBUGGER-HOOK*", 2);
+        }, "*NON-INTERACTIVE-DEBUGGER-HOOK*", 2));
         _typedThrowingHook = typed ? hook : null;
         DynamicBindings.Set(hookSym, hook);
     }
@@ -1107,12 +1107,17 @@ public static class DotclHost
         // the first pass of exception dispatch, before the finally blocks of any
         // nested entry have restored the counter.
         int depth = ++t_hostEntryDepth;
+        if (depth == 1) Runtime.DropPendingDestroy();
         try { return body(); }
         catch (LispErrorException e) when (depth == 1 && ConvertsRuntimeErrors())
         {
             throw new DotclConditionException(e.Condition, e);
         }
-        finally { t_hostEntryDepth--; }
+        finally
+        {
+            t_hostEntryDepth--;
+            if (depth == 1) Runtime.DropPendingDestroy();
+        }
     }
 
     private static void HostEntry(Action body) => HostEntry<object?>(() => { body(); return null; });

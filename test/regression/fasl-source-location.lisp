@@ -31,9 +31,11 @@
       (setf *fasl-sl-src* (namestring (truename src))
             *fasl-sl-fasl* fasl)))
   ;; Forget what COMPILE-FILE recorded, then load the fasl.
-  (dolist (name '("SL-FN" "SL-MAC" "SL-GF" "SL-CLASS" "*SL-VAR*" "SL-STRUCT" "SL-IN-PROGN"))
-    (dotcl:record-definition-sources
-     (list 'defun (intern name "FASL-SL")) "elsewhere.lisp" 999))
+  (loop for (definer name) in '((defun "SL-FN") (defmacro "SL-MAC") (defgeneric "SL-GF")
+                                 (defclass "SL-CLASS") (defvar "*SL-VAR*")
+                                 (defstruct "SL-STRUCT") (defun "SL-IN-PROGN"))
+        do (dotcl:record-definition-sources
+            (list definer (intern name "FASL-SL")) "elsewhere.lisp" 999))
   (load *fasl-sl-fasl*)
   t)
 

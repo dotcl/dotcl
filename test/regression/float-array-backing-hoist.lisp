@@ -69,11 +69,11 @@
   (let ((v (make-array 1000 :element-type 'double-float :initial-element 1.5d0))
         (f (make-array 1000 :element-type 'single-float :initial-element 0.5)))
     (%fab-dsum v) (%fab-fsum f) (%fab-dscale v 1d0) (%fab-fscale f 1.0)
-    (let ((a0 (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread")))
-      (dotimes (r 100)
-        (%fab-dsum v) (%fab-fsum f) (%fab-dscale v 1d0) (%fab-fscale f 1.0))
-      (< (- (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread") a0)
-         20000)))
+    (< (min-allocated-bytes
+        (lambda ()
+          (dotimes (r 100)
+            (%fab-dsum v) (%fab-fsum f) (%fab-dscale v 1d0) (%fab-fscale f 1.0))))
+       20000))
   t)
 
 (deftest float-array-backing-hoist.values
@@ -98,14 +98,13 @@
           (%fab-dsum-unsafe adj)))
   (:type-error 6d0))
 
-;; A vector of another element type under the declaration is read through the
-;; per-element helper, as it was before the buffer was hoisted.
+;; A vector of another element type under the declaration is a TYPE-ERROR.
 (deftest float-array-backing-hoist.other-element-type-reads-through-the-helper
-  (list (%fab-dsum (%fab-fv 1.5))
-        (%fab-dsum (vector 1d0 2d0))
+  (list (handler-case (%fab-dsum (%fab-fv 1.5)) (type-error () :type-error))
+        (handler-case (%fab-dsum (vector 1d0 2d0)) (type-error () :type-error))
         (handler-case (progn (%fab-dsum '(1d0)) :no-error)
           (type-error () :type-error)))
-  (1.5d0 3d0 :type-error))
+  (:type-error :type-error :type-error))
 
 (deftest float-array-backing-hoist.subscript-out-of-range
   (handler-case (progn (%fab-set-value (%fab-dv) 1d0) :no-error)

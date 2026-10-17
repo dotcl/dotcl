@@ -1162,6 +1162,7 @@ collected result will be returned as the value of the LOOP."
 	 (unless (symbolp name)
 	   (loop-error "Bad variable ~S somewhere in LOOP." name))
 	 (loop-declare-variable name dtype)
+	 (push `(ignorable ,name) *loop-declarations*)
 	 ;; We use ASSOC on this list to check for duplications (above),
 	 ;; so don't optimize out this list:
 	 (push (list name (or initialization (loop-typed-init dtype)))

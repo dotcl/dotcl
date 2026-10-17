@@ -57,7 +57,8 @@
     (values (sort names #'string<) nuspec)))
 
 ;;; Only the system and the output directory are needed; the version comes from
-;;; the .asd as on the tool path.
+;;; the .asd as on the tool path. ReadyToRun images for the six desktop RIDs are
+;;; added by default.
 (deftest-emitting-only pack-library.writes-the-package
   (let* ((r (plb-pack "--system" "plb-lib" "-o" (concatenate 'string *plb-dir* "out/")))
          (path (concatenate 'string *plb-dir* "out/plb-lib.2.0.1.nupkg")))
@@ -73,16 +74,55 @@
    ;; the output directory, inside the system's, is not carried
    ("README.md" "dotcl/plb-lib.systems" "dotcl/plb-lib/README.md"
     "dotcl/plb-lib/dotcl-build.sexp" "dotcl/plb-lib/plb-lib.asd" "dotcl/plb-lib/plb.lisp"
-    "dotcl/plb-lib/plb.lisp.fasl" "plb-lib.nuspec")
+    "dotcl/plb-lib/plb.lisp.fasl"
+    "dotcl/plb-lib/plb.lisp.fasl.r2r-linux-arm64" "dotcl/plb-lib/plb.lisp.fasl.r2r-linux-x64"
+    "dotcl/plb-lib/plb.lisp.fasl.r2r-osx-arm64" "dotcl/plb-lib/plb.lisp.fasl.r2r-osx-x64"
+    "dotcl/plb-lib/plb.lisp.fasl.r2r-win-arm64" "dotcl/plb-lib/plb.lisp.fasl.r2r-win-x64"
+    "plb-lib.nuspec")
    t t t))
+
+(defun plb-r2r-entries (out)
+  (let ((path (concatenate 'string *plb-dir* out "plb-lib.2.0.1.nupkg")))
+    (and (probe-file path)
+         (count-if (lambda (n) (search ".r2r-" n)) (plb-entries-and-nuspec path)))))
+
+(deftest-emitting-only pack-library.no-r2r
+  (let ((r (plb-pack "--system" "plb-lib" "--no-r2r" "-o" (concatenate 'string *plb-dir* "out-no-r2r/"))))
+    (list (first r) (plb-r2r-entries "out-no-r2r/")))
+  (0 0))
+
+;;; No crossgen2 in the NuGet package folder and no dotnet to restore it with.
+(defun plb-pack-without-crossgen2 (&rest args)
+  (let ((pkgs (concatenate 'string *plb-dir* "empty-packages/"))
+        (path (concatenate 'string *plb-dir* "empty-path/"))
+        (saved-pkgs (dotcl:getenv "NUGET_PACKAGES"))
+        (saved-path (dotcl:getenv "PATH")))
+    (ensure-directories-exist pkgs)
+    (ensure-directories-exist path)
+    (unwind-protect
+         (progn (dotcl:setenv "NUGET_PACKAGES" pkgs)
+                (dotcl:setenv "PATH" path)
+                (apply #'plb-pack args))
+      (if saved-pkgs (dotcl:setenv "NUGET_PACKAGES" saved-pkgs) (dotcl:unsetenv "NUGET_PACKAGES"))
+      (dotcl:setenv "PATH" (or saved-path "")))))
+
+(deftest-emitting-only pack-library.without-crossgen2-warns
+  (let ((r (plb-pack-without-crossgen2 "--system" "plb-lib" "-o"
+                                       (concatenate 'string *plb-dir* "out-no-cg/"))))
+    (list (first r) (plb-says r "pack: warning: crossgen2") (plb-r2r-entries "out-no-cg/")))
+  (0 t 0))
+
+(deftest-emitting-only pack-library.r2r-without-crossgen2-fails
+  (let ((r (plb-pack-without-crossgen2 "--system" "plb-lib" "--r2r" "-o"
+                                       (concatenate 'string *plb-dir* "out-r2r-no-cg/"))))
+    (list (first r) (plb-says r "pack: --r2r: crossgen2")))
+  (1 t))
 
 (deftest-emitting-only pack-library.needs-an-output
   (let ((r (plb-pack "--system" "plb-lib")))
     (list (first r) (plb-says r "missing required option(s): -o/--output")))
   (2 t))
 
-;;; --r2r compiles against the runtime images in the dotcl packages, so it needs
-;;; --from, as on the tool path.
 (deftest-emitting-only pack-library.needs-a-system
   (let ((r (plb-pack "-o" (concatenate 'string *plb-dir* "out/"))))
     (list (first r) (plb-says r "missing required option(s): --system")))

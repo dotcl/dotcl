@@ -71,6 +71,6 @@
     (floor x 3)))
 (deftest-emitting-only mvbp-portable-is-snapshot-bind
   (let ((sil (%flat-text (dotcl:function-sil #'mvbp-portable-sil))))
-    (list (and (search "CaptureForBind" sil) t)
+    (list (and (or (search "CaptureForBind" sil) (search "CapturePair" sil)) t)
           (and (search "MultipleValuesList" sil) t)))
   (t nil))

@@ -41,7 +41,7 @@ cd "$ROOT"
 OUT="$ROOT/build/fasl-shape"
 mkdir -p "$OUT"
 
-TOOL="dotnet run $ROOT/bench/fasl-il.cs --"
+TOOL="dotnet run $ROOT/scripts/fasl-il.cs --"
 
 echo "=== Generating the shape fixture and a fresh core ==="
 dotnet run --project "$ROOT/runtime/runtime.csproj" -- \

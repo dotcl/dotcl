@@ -30,10 +30,9 @@
 ;;; names only its own mode ever defines: sharing names would let a stale
 ;;; compiled definition answer for the interpreted case.
 ;;;
-;;; Where a compiled half calls one DEFUN from another, it does so as
-;;; (VALUES (f)), which is not a tail call: compiled code hands the caller's
-;;; frame to the callee of a tail call, as SBCL does, and the tree-walk
-;;; evaluator only does that for a call back into the same function.
+;;; Where one DEFUN calls another, it does so as (VALUES (f)), which is not a
+;;; tail call: both evaluators hand the caller's frame to the callee of a tail
+;;; call, as SBCL does (interp-tail-calls.lisp).
 
 ;;; The -COMPILE halves are DEFTEST-COMPILED-ONLY: an emit-free build has no
 ;;; compiler, so :COMPILE there is the tree-walk evaluator under another name and
@@ -58,7 +57,7 @@
 
 (deftest interp-backtrace.defun-chain-interpret
   (%ibt :interpret '(progn (defun %ibt-i-leaf () (dotcl:backtrace))
-                           (defun %ibt-i-mid () (%ibt-i-leaf))
+                           (defun %ibt-i-mid () (values (%ibt-i-leaf)))
                            (%ibt-i-mid)))
   ("%IBT-I-LEAF" "%IBT-I-MID"))
 
@@ -84,7 +83,7 @@
 
 (defparameter %ibt-args-i
   '(progn (defun %ibt-i-al (a b) (declare (ignore a b)) (dotcl:backtrace-with-args))
-          (defun %ibt-i-am (q) (%ibt-i-al q 9))
+          (defun %ibt-i-am (q) (values (%ibt-i-al q 9)))
           (%ibt-i-am 5)))
 
 (deftest-compiled-only interp-backtrace.with-args-compile
@@ -137,7 +136,7 @@
 ;;; papered over, since suppressing it would mean hiding a call that happened.
 (deftest interp-backtrace.apply-interpret
   (%ibt :interpret '(progn (defun %ibt-i-ap (x) (declare (ignore x)) (dotcl:backtrace))
-                           (defun %ibt-i-apc (n) (apply #'%ibt-i-ap (list n)))
+                           (defun %ibt-i-apc (n) (values (apply #'%ibt-i-ap (list n))))
                            (%ibt-i-apc 1)))
   ("%IBT-I-AP" "APPLY" "%IBT-I-APC"))
 

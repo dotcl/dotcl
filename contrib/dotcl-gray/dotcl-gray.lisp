@@ -185,21 +185,21 @@ of the first element not updated (i.e. START + number of elements read)."))
 ;;; format's ~T through it. The Gray protocol says an unknown column is NIL,
 ;;; and callers already read NIL as "unknown"; only the missing method turned
 ;;; that into an error.
-(defmethod stream-line-column ((stream fundamental-output-stream))
+(defmethod stream-line-column ((stream fundamental-character-output-stream))
   nil)
 
-(defmethod stream-start-line-p ((stream fundamental-output-stream))
+(defmethod stream-start-line-p ((stream fundamental-character-output-stream))
   (eql (stream-line-column stream) 0))
 
-(defmethod stream-terpri ((stream fundamental-output-stream))
+(defmethod stream-terpri ((stream fundamental-character-output-stream))
   (stream-write-char stream #\newline))
 
-(defmethod stream-fresh-line ((stream fundamental-output-stream))
+(defmethod stream-fresh-line ((stream fundamental-character-output-stream))
   (unless (stream-start-line-p stream)
     (stream-terpri stream)
     t))
 
-(defmethod stream-write-string ((stream fundamental-output-stream) string
+(defmethod stream-write-string ((stream fundamental-character-output-stream) string
                                 &optional (start 0) (end (length string)))
   (loop for i from start below end
         do (stream-write-char stream (char string i)))
@@ -214,15 +214,12 @@ of the first element not updated (i.e. START + number of elements read)."))
 (defmethod stream-clear-output ((stream fundamental-output-stream))
   nil)
 
-(defmethod stream-advance-to-column ((stream fundamental-output-stream) column)
+(defmethod stream-advance-to-column ((stream fundamental-character-output-stream) column)
   (let ((col (stream-line-column stream)))
     (when col
       (loop while (< col column)
             do (stream-write-char stream #\space)
                (incf col)))))
-
-(defmethod stream-listen ((stream fundamental-input-stream))
-  nil)
 
 ;;; A character stream listens by reading a character without waiting and
 ;;; putting it back (the Gray protocol's default, as on SBCL).
@@ -232,7 +229,7 @@ of the first element not updated (i.e. START + number of elements read)."))
          (not (eq char :eof))
          (progn (stream-unread-char stream char) t))))
 
-(defmethod stream-read-char-no-hang ((stream fundamental-input-stream))
+(defmethod stream-read-char-no-hang ((stream fundamental-character-input-stream))
   (stream-read-char stream))
 
 ;;; Default stream-peek-char: read a character and put it back. Requires the
@@ -243,6 +240,14 @@ of the first element not updated (i.e. START + number of elements read)."))
     (unless (eq c :eof)
       (stream-unread-char stream c))
     c))
+
+(defmethod stream-read-line ((stream fundamental-character-input-stream))
+  (let ((line (make-array 80 :element-type 'character :fill-pointer 0 :adjustable t)))
+    (loop
+      (let ((c (stream-read-char stream)))
+        (cond ((eq c :eof) (return (values (coerce line 'simple-string) t)))
+              ((char= c #\newline) (return (values (coerce line 'simple-string) nil)))
+              (t (vector-push-extend c line)))))))
 
 ;;; Default stream-file-position: return NIL (position unknown).
 (defmethod stream-file-position ((stream fundamental-stream))

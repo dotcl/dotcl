@@ -26,8 +26,11 @@ namespace DotCL.Emitter;
 /// </summary>
 public partial class CilAssembler
 {
-    // Fewer locals than this and sharing buys nothing measurable.
-    private const int LocalSlotShareMinLocals = 64;
+    // Fewer locals than this and sharing buys nothing: every local still has a
+    // one-byte LDLOC.S / STLOC.S, and the JIT tracks the first 1,024 for
+    // register allocation. Planning the methods of 64 to 255 locals was most of
+    // what this pass cost.
+    private const int LocalSlotShareMinLocals = 256;
 
     private int _assembleDepth;
     private bool _localSlotsPlanned;
@@ -82,8 +85,15 @@ public partial class CilAssembler
         if (_seqPoints != null || _localVars != null) return;
 
         var ins = new List<LispObject>();
-        for (var cur = instructions; cur is Cons c; cur = c.Cdr) ins.Add(c.Car);
+        int topDeclares = 0;
+        for (var cur = instructions; cur is Cons c; cur = c.Cdr)
+        {
+            ins.Add(c.Car);
+            if (IsOp(c.Car, out var op0) && op0 == "DECLARE-LOCAL") topDeclares++;
+        }
         int n = ins.Count;
+        // Too few locals to share, decided before pass 1 walks every operand.
+        if (topDeclares < LocalSlotShareMinLocals) return;
 
         // Pass 1: top-level declarations, label positions, bail-outs.
         var declType = new Dictionary<string, string>();

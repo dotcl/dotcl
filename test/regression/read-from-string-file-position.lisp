@@ -1,6 +1,6 @@
 ;;; A reader macro called by READ-FROM-STRING gets a string input stream, on
-;;; which FILE-POSITION answers the index in the string (counting from the start
-;;; of the string, not of :START), as on a stream from MAKE-STRING-INPUT-STREAM.
+;;; which FILE-POSITION answers the position counted from :START, as on a
+;;; stream from MAKE-STRING-INPUT-STREAM (SBCL and CLISP agree).
 ;;; It answered NIL, and Coalton's reader, which takes the source span of a
 ;;; form from it, failed with "Not a number: NIL" on (read-from-string "(...)").
 
@@ -13,7 +13,7 @@
 (deftest read-from-string-file-position.in-reader-macro
   (list (%rfsfp-read "  !x")
         (%rfsfp-read "xx !" t nil :start 2))
-  (((3 t) 3) ((4 t) 4)))
+  (((3 t) 3) ((2 t) 4)))
 
 (deftest read-from-string-file-position.index-unchanged
   (list (multiple-value-list (read-from-string "(a b) c"))

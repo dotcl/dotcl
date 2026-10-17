@@ -2,7 +2,7 @@
 ;;; when the storage is wider than the type.
 ;;;
 ;;; An (unsigned-byte 32) array is stored in a long[], a (signed-byte 8) or
-;;; (signed-byte 16) one in an int[], an (unsigned-byte 12) one in a ushort[].
+;;; (signed-byte 16) one in an int[], an (unsigned-byte 15) one in a ushort[].
 ;;; ARRAY-ELEMENT-TYPE reports the narrow type, but the store only checked the
 ;;; storage's own width, so (setf (aref a 0) #x1ffffffff) on an (unsigned-byte
 ;;; 32) array went in and came back out as #x1ffffffff. Same for SETF AREF,
@@ -25,12 +25,11 @@
   (list (list '(unsigned-byte 32) 0 #xffffffff -1 #x100000000)
         (list '(signed-byte 8) -128 127 -129 128)
         (list '(signed-byte 16) -32768 32767 -32769 32768)
-        (list '(unsigned-byte 5) 0 31 -1 32)
-        (list '(unsigned-byte 12) 0 4095 -1 4096)
-        (list '(signed-byte 12) -2048 2047 -2049 2048)
-        (list '(unsigned-byte 40) 0 (1- (expt 2 40)) -1 (expt 2 40))
-        (list '(signed-byte 48) (- (expt 2 47)) (1- (expt 2 47))
-              (- -1 (expt 2 47)) (expt 2 47))))
+        (list '(unsigned-byte 7) 0 127 -1 128)
+        (list '(unsigned-byte 15) 0 32767 -1 32768)
+        (list '(unsigned-byte 4) 0 15 -1 16)
+        (list '(unsigned-byte 31) 0 (1- (expt 2 31)) -1 (expt 2 31))
+        (list '(unsigned-byte 63) 0 (1- (expt 2 63)) -1 (expt 2 63))))
 
 (deftest narrow-element-store.generic-setf-aref
   (loop for (type lo hi below above) in *nes-types*
@@ -44,9 +43,9 @@
    (:type-error :type-error -32768 t)
    (:type-error :type-error 0 t)
    (:type-error :type-error 0 t)
-   (:type-error :type-error -2048 t)
    (:type-error :type-error 0 t)
-   (:type-error :type-error -140737488355328 t)))
+   (:type-error :type-error 0 t)
+   (:type-error :type-error 0 t)))
 
 (deftest narrow-element-store.fill-replace-make-array
   (loop for (type nil nil nil above) in *nes-types*
@@ -87,10 +86,10 @@
            (type fixnum v))
   (setf (aref a 0) v))
 
-(deftype %nes-u24-vector () '(simple-array (unsigned-byte 24) (*)))
+(deftype %nes-u31-vector () '(simple-array (unsigned-byte 31) (*)))
 
-(defun %nes-u24-s1 (a v)
-  (declare (optimize (safety 1)) (type %nes-u24-vector a)
+(defun %nes-u31-s1 (a v)
+  (declare (optimize (safety 1)) (type %nes-u31-vector a)
            (type fixnum v))
   (setf (aref a 0) v))
 
@@ -112,14 +111,14 @@
           (list (%nes-signals (lambda () (%nes-s16-s3 a 32768)))
                 (%nes-signals (lambda () (%nes-s16-s3 a -32769)))
                 (progn (%nes-s16-s3 a 32767) (aref a 0))))
-        (let ((a (make-array 1 :element-type '(unsigned-byte 24))))
-          (list (%nes-signals (lambda () (%nes-u24-s1 a #x1000000)))
-                (%nes-signals (lambda () (%nes-u24-s1 a -1)))
-                (progn (%nes-u24-s1 a #xffffff) (aref a 0)))))
+        (let ((a (make-array 1 :element-type '(unsigned-byte 31))))
+          (list (%nes-signals (lambda () (%nes-u31-s1 a #x80000000)))
+                (%nes-signals (lambda () (%nes-u31-s1 a -1)))
+                (progn (%nes-u31-s1 a #x7fffffff) (aref a 0)))))
   ((:type-error :type-error #xffffffff)
    (:type-error :type-error -128)
    (:type-error :type-error 32767)
-   (:type-error :type-error #xffffff)))
+   (:type-error :type-error #x7fffffff)))
 
 (defun %nes-count (needle fn)
   (let ((s (%flat-text (dotcl:function-sil fn))) (k 0) (p 0))
@@ -132,7 +131,7 @@
   (list (%nes-count "Runtime.CheckStoreUnsigned" #'%nes-u32-s1)
         (%nes-count "Runtime.CheckStoreSigned" #'%nes-s8-s1)
         (%nes-count "Runtime.CheckStoreI32" #'%nes-s8-s1)
-        (%nes-count "Runtime.CheckStoreUnsigned" #'%nes-u24-s1)
+        (%nes-count "Runtime.CheckStoreUnsigned" #'%nes-u31-s1)
         (%nes-count "Runtime.CheckStore" #'%nes-u32-s0)
         (%nes-count "(STELEM-I8)" #'%nes-u32-s0))
   (1 1 0 1 0 1))

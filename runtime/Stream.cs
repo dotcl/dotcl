@@ -680,6 +680,8 @@ public class LispStringInputStream : LispInputStream
 {
     /// <summary>The starting offset from the original string (for :start parameter).</summary>
     public int StartOffset { get; set; }
+    /// <summary>The :start the stream was made with. FILE-POSITION counts from here.</summary>
+    public int Origin { get; }
     /// <summary>The position-tracking wrapper for this stream's reader.</summary>
     public PositionTrackingReader? TrackingReader { get; private set; }
     /// <summary>The full original string (before any slicing). Used for repositioning.</summary>
@@ -694,7 +696,7 @@ public class LispStringInputStream : LispInputStream
     public LispStringInputStream(StringReader reader, int startOffset, string? fullString = null, int endOffset = 0)
         : base(new PositionTrackingReader(reader))
     {
-        StartOffset = startOffset;
+        StartOffset = Origin = startOffset;
         TrackingReader = (PositionTrackingReader)Reader;
         _fullString = fullString;
         _endOffset = endOffset;
@@ -702,7 +704,7 @@ public class LispStringInputStream : LispInputStream
     public LispStringInputStream(PositionTrackingReader trackingReader, int startOffset = 0, string? fullString = null, int endOffset = 0)
         : base(trackingReader)
     {
-        StartOffset = startOffset;
+        StartOffset = Origin = startOffset;
         TrackingReader = trackingReader;
         _fullString = fullString;
         _endOffset = endOffset;
@@ -719,7 +721,7 @@ public class LispStringInputStream : LispInputStream
         // Allow seeking to the end (== _endOffset), the valid EOF position:
         // (file-position s (length s)) leaves the stream at end-of-input. A
         // position past the end is still rejected.
-        if (absolutePosition < 0 || absolutePosition > _endOffset) return false;
+        if (absolutePosition < Origin || absolutePosition > _endOffset) return false;
         var sub = _fullString.Substring(absolutePosition, _endOffset - absolutePosition);
         var newReader = new PositionTrackingReader(new StringReader(sub));
         Reader = newReader;
@@ -1051,10 +1053,10 @@ public sealed class BivalentStreamReader : System.IO.TextReader
     {
         if (_pbCount > 0) return true;
         if (Partner is { HasPending: true } w) w.Flush();
-        if (_s is System.Net.Sockets.NetworkStream ns)
+#if !NETSTANDARD2_0
+        if (_s is InterruptibleSocketStream ns)
         {
             if (ns.DataAvailable) return true;
-#if !NETSTANDARD2_0
             // Readable with nothing buffered means the peer has closed: Peek then
             // answers end of file at once, so let it.
             try
@@ -1062,9 +1064,12 @@ public sealed class BivalentStreamReader : System.IO.TextReader
                 if (ns.Socket.Poll(0, System.Net.Sockets.SelectMode.SelectRead)) return null;
             }
             catch (System.ObjectDisposedException) { return null; }
-#endif
             return false;
         }
+#else
+        if (_s is System.Net.Sockets.NetworkStream ns)
+            return ns.DataAvailable;
+#endif
         return null;
     }
 }
@@ -1160,3 +1165,177 @@ public sealed class BivalentStreamWriter : System.IO.TextWriter
         base.Dispose(disposing);
     }
 }
+
+/// <summary>Buffers the output of a binary stream from DOTNET:TO-STREAM, as
+/// SBCL's socket streams do: bytes go out on FINISH-OUTPUT / FORCE-OUTPUT /
+/// CLOSE, when the buffer fills, or before a read on the same stream.</summary>
+public sealed class WriteBufferedStream : System.IO.Stream
+{
+    private readonly System.IO.Stream _s;
+    private readonly byte[] _buf = new byte[8192];
+    private int _len;
+    private readonly object _lock = new();
+
+    public WriteBufferedStream(System.IO.Stream s) => _s = s;
+
+    public override bool CanRead => _s.CanRead;
+    public override bool CanWrite => _s.CanWrite;
+    public override bool CanSeek => false;
+    public override long Length => throw new System.NotSupportedException();
+    public override long Position
+    {
+        get => throw new System.NotSupportedException();
+        set => throw new System.NotSupportedException();
+    }
+    public override long Seek(long offset, System.IO.SeekOrigin origin) => throw new System.NotSupportedException();
+    public override void SetLength(long value) => throw new System.NotSupportedException();
+
+    // Callers hold _lock.
+    private void FlushBuffer()
+    {
+        if (_len == 0) return;
+        int n = _len;
+        _len = 0;
+        _s.Write(_buf, 0, n);
+    }
+
+    private void FlushPending()
+    {
+        if (System.Threading.Volatile.Read(ref _len) == 0) return;
+        lock (_lock) FlushBuffer();
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        FlushPending();
+        return _s.Read(buffer, offset, count);
+    }
+
+    public override int ReadByte()
+    {
+        FlushPending();
+        return _s.ReadByte();
+    }
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        lock (_lock)
+        {
+            if (count > _buf.Length - _len)
+            {
+                FlushBuffer();
+                if (count > _buf.Length) { _s.Write(buffer, offset, count); return; }
+            }
+            System.Buffer.BlockCopy(buffer, offset, _buf, _len, count);
+            _len += count;
+        }
+    }
+
+    public override void WriteByte(byte value)
+    {
+        lock (_lock)
+        {
+            if (_len == _buf.Length) FlushBuffer();
+            _buf[_len++] = value;
+        }
+    }
+
+    public override void Flush()
+    {
+        lock (_lock)
+        {
+            FlushBuffer();
+            _s.Flush();
+        }
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            try { Flush(); } catch (System.IO.IOException) { } catch (System.ObjectDisposedException) { }
+            _s.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+}
+
+#if !NETSTANDARD2_0
+/// <summary>Reads wait in Socket.Poll slices and run queued INTERRUPT-THREAD
+/// functions in between: a blocking Socket.Receive never sees Thread.Interrupt.</summary>
+public sealed class InterruptibleSocketStream : System.IO.Stream
+{
+    private const int SliceMicroseconds = 100_000;
+    private readonly System.Net.Sockets.NetworkStream _s;
+
+    public InterruptibleSocketStream(System.Net.Sockets.NetworkStream s) => _s = s;
+    public System.Net.Sockets.Socket Socket => _s.Socket;
+    public bool DataAvailable => _s.DataAvailable;
+
+    public override bool CanRead => _s.CanRead;
+    public override bool CanWrite => _s.CanWrite;
+    public override bool CanSeek => false;
+    public override long Length => throw new System.NotSupportedException();
+    public override long Position
+    {
+        get => throw new System.NotSupportedException();
+        set => throw new System.NotSupportedException();
+    }
+    public override long Seek(long offset, System.IO.SeekOrigin origin) => throw new System.NotSupportedException();
+    public override void SetLength(long value) => throw new System.NotSupportedException();
+
+    private void WaitReadable()
+    {
+        var sock = _s.Socket;
+        if (sock.Available > 0) return;
+        int timeoutMs = sock.ReceiveTimeout;
+        long deadline = timeoutMs > 0 ? System.Environment.TickCount64 + timeoutMs : long.MaxValue;
+        while (true)
+        {
+            if (System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0)
+            {
+                int mvCount = CallTls.MvCount;
+                Runtime.RunPendingInterruptsAtSafepoint();
+                CallTls.MvCount = mvCount;
+            }
+            long left = deadline - System.Environment.TickCount64;
+            if (left <= 0)
+                throw new System.IO.IOException("Unable to read data from the transport connection: timed out.",
+                    new System.Net.Sockets.SocketException((int)System.Net.Sockets.SocketError.TimedOut));
+            int slice = left >= SliceMicroseconds / 1000 ? SliceMicroseconds : (int)left * 1000;
+            if (sock.Poll(slice, System.Net.Sockets.SelectMode.SelectRead)) return;
+        }
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        if (count == 0) return 0;
+        WaitReadable();
+        return _s.Read(buffer, offset, count);
+    }
+
+    public override int Read(System.Span<byte> buffer)
+    {
+        if (buffer.Length == 0) return 0;
+        WaitReadable();
+        return _s.Read(buffer);
+    }
+
+    public override int ReadByte()
+    {
+        WaitReadable();
+        return _s.ReadByte();
+    }
+
+    public override void Write(byte[] buffer, int offset, int count) => _s.Write(buffer, offset, count);
+    public override void Write(System.ReadOnlySpan<byte> buffer) => _s.Write(buffer);
+    public override void WriteByte(byte value) => _s.WriteByte(value);
+    public override void Flush() => _s.Flush();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) _s.Dispose();
+        base.Dispose(disposing);
+    }
+}
+#endif

@@ -166,7 +166,7 @@ public static class JitProfile
 
     public static LispObject JitProfileEntries(LispObject[] args)
     {
-        var root = args.Length > 0 && args[0] is LispString s ? s.Value : Root();
+        var root = (args.Length > 0 ? Runtime.StringValueOrNull(args[0]) : null) ?? Root();
         LispObject result = Nil.Instance;
         var names = Entries(root);
         for (int i = names.Count - 1; i >= 0; i--)
@@ -175,5 +175,5 @@ public static class JitProfile
     }
 
     private static string? Arg(LispObject[] args, int i)
-        => args.Length > i && args[i] is LispString s ? s.Value : null;
+        => args.Length > i ? Runtime.StringValueOrNull(args[i]) : null;
 }

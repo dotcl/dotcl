@@ -23,9 +23,14 @@
 
 ;;; ---- inferred ----
 
+;; Passing X to a function keeps it a vector (see raw-local-array.lisp).
+(declaim (notinline %malb-keep))
+(defun %malb-keep (x) x)
+
 (defun %malb-u32 (n)
   (declare (fixnum n))
   (let ((x (make-array 16 :element-type '(unsigned-byte 32))))
+    (%malb-keep x)
     (dotimes (i 16) (setf (aref x i) (+ i n)))
     (aref x 3)))
 
@@ -54,6 +59,7 @@
   (declare (fixnum n))
   (let ((x (make-array 16 :element-type '(unsigned-byte 32))))
     (declare (type (simple-array (unsigned-byte 32) (16)) x))
+    (%malb-keep x)
     (dotimes (i 16) (setf (aref x i) (+ i n)))
     (aref x 3)))
 

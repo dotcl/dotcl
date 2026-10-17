@@ -146,6 +146,17 @@ a .NET project, and that name belongs to its own restore."
   origin       ; :declared (a system definition) or :imperative (NUGET:REQUIRE)
   (resolved nil))
 
+(defun %absolute-source (source &optional base)
+  "SOURCE with a relative local path made absolute against BASE (default: the
+current directory). Restore runs in a scratch directory, where a relative path
+would name nothing."
+  (if (or (null source) (search "://" source)
+          (dotnet:static "System.IO.Path" "IsPathRooted" source))
+      source
+      (dotnet:static "System.IO.Path" "GetFullPath"
+                     (%combine (or base (dotnet:static "System.IO.Directory" "GetCurrentDirectory"))
+                               source))))
+
 (defun %spec (version prerelease)
   ;; A PackageReference requires a version; the SDK errors (NU1604) on a bare Include.
   (or version (if prerelease "*-*" "*")))
@@ -617,11 +628,12 @@ or NIL when the package ships none or its sources are to be compiled instead."
                                 (dotnet:static "System.IO.File" "ReadAllBytes" path))))
 
 (defun %remove-placed (target)
-  "Delete TARGET and its R2R siblings."
+  "Delete TARGET and its R2R siblings. DELETE-FILE, not File.Delete: on Windows
+a fasl this process loaded can only be moved aside."
   (dolist (sib (%siblings target))
-    (dotnet:static "System.IO.File" "Delete" sib))
+    (delete-file sib))
   (when (dotnet:static "System.IO.File" "Exists" target)
-    (dotnet:static "System.IO.File" "Delete" target))
+    (delete-file target))
   (remhash target *placed-fasls*))
 
 (defun %unplace-fasls (dir record cfp)
@@ -899,7 +911,7 @@ A package is identified by several axes besides its name, so they are keywords:
 Unlike REQUIRE this asks NuGet again even when this image already resolved the
 package, so a floating version is looked up afresh. Whatever this image already
 registered keeps its version; a resolution that would move one is an error."
-  (let ((dir (%ensure (list (make-req package (%spec version prerelease) source :imperative))
+  (let ((dir (%ensure (list (make-req package (%spec version prerelease) (%absolute-source source) :imperative))
                       :mode :imperative :rid rid :tfm tfm :fresh t)))
     (multiple-value-bind (managed native) (%register-output dir "proj")
       (values managed native dir))))
@@ -912,7 +924,7 @@ Asking twice for the same package in one image does the work once. This is the
 by-hand entry point: a floating version is resolved as asked, and the project's
 lock file is neither read nor written -- that file is for what a system
 definition declares, see NUGET:RESTORE."
-  (%ensure (list (make-req package (%spec version prerelease) source :imperative))
+  (%ensure (list (make-req package (%spec version prerelease) (%absolute-source source) :imperative))
            :mode :imperative :rid rid :tfm tfm)
   t)
 

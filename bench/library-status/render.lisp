@@ -60,10 +60,12 @@
 ;;;;   LIBRARY_STATUS_ANNOTATIONS  the why column     (default annotations.json)
 ;;;;   LIBRARY_STATUS_TESTS_JSON   test verdicts      (default tests.json)
 ;;;;   LIBRARY_STATUS_FORKS_JSON   runs with forks    (default forks.json)
+;;;;   LIBRARY_STATUS_SBCL_JSON    loads on SBCL      (default results-sbcl.json)
+;;;;   LIBRARY_STATUS_SBCL_TESTS_JSON  tests on SBCL  (default tests-sbcl.json)
 ;;;;   LIBRARY_STATUS_OUT          markdown to write  (default ../../docs/library-status.md)
 ;;;;   DOTCL_VERSION               version that was measured (default "unknown")
 ;;;;
-;;;; MAIN takes the same seven as keyword arguments, for calling it by hand.
+;;;; MAIN takes the same as keyword arguments, for calling it by hand.
 ;;;;
 ;;;; The table is published, so the "issue" field must name an issue in the
 ;;;; public dotcl/dotcl repository, and an annotation sentence is published
@@ -391,6 +393,51 @@ measure: one that is ok with the dists alone, or whose tree reaches no fork."
 (defun %loads-p (row)
   (member (%field row "status") '("load-only" "patched") :test #'equal))
 
+(defvar *sbcl-results* (make-hash-table :test #'equal)
+  "The same rows loaded on SBCL (run-quickload.sh with LIBRARY_STATUS_LISP=sbcl).")
+(defvar *sbcl-tests* (make-hash-table :test #'equal)
+  "The same suites run on SBCL.")
+
+(defun %seconds (entry)
+  "The \"seconds\" of ENTRY as a real, or NIL."
+  (let ((v (and entry (%field entry "seconds"))))
+    (cond ((realp v) v)
+          ((stringp v)
+           (let ((*read-default-float-format* 'double-float)
+                 (*read-eval* nil))
+             (let ((x (ignore-errors (read-from-string v))))
+               (and (realp x) x))))
+          (t nil))))
+
+(defun %row-seconds (row tests)
+  "(DOTCL-LOAD SBCL-LOAD DOTCL-TESTS SBCL-TESTS) for ROW, each a real or NIL.
+"
+  (let* ((system (%field row "system"))
+         (dt (gethash system tests))
+         (st (gethash system *sbcl-tests*)))
+    (list (%seconds row)
+          (%seconds (gethash system *sbcl-results*))
+          (and (%loads-p row) (%seconds dt))
+          (%seconds st))))
+
+(defun %seconds-cell (row tests)
+  (destructuring-bind (dl sl dt st) (%row-seconds row tests)
+    (flet ((pair (label a b)
+             (and (or a b)
+                  (format nil "~A ~:[-~;~:*~,1F~] / ~:[-~;~:*~,1F~]" label a b))))
+      (format nil "~{~A~^; ~}"
+              (remove nil (list (pair "load" dl sl) (pair "tests" dt st)))))))
+
+(defun %seconds-totals (rows tests)
+  "One line summing the seconds over the rows measured on both."
+  (let ((dl 0) (sl 0) (nl 0) (dt 0) (st 0) (nt 0))
+    (dolist (row rows)
+      (destructuring-bind (a b c d) (%row-seconds row tests)
+        (when (and a b) (incf dl a) (incf sl b) (incf nl))
+        (when (and c d) (incf dt c) (incf st d) (incf nt))))
+    (format nil "load ~D s / ~D s (~D rows), tests ~D s / ~D s (~D rows)"
+            (round dl) (round sl) nl (round dt) (round st) nt)))
+
 (defun %status-for (row tests)
   "The status to show. Only a row that loads and whose suite passed becomes
 ok; the stored status is shown unchanged otherwise."
@@ -438,15 +485,16 @@ redone independently."
             (cons "status" "not checked"))))
 
 (defun %write-rows (out rows annotations tests)
-  (format out "~%| system | status | tests | with forks | issue | checked | why | note |~%")
-  (format out "| --- | --- | --- | --- | --- | --- | --- | --- |~%")
+  (format out "~%| system | status | tests | with forks | seconds, dotcl / SBCL | issue | checked | why | note |~%")
+  (format out "| --- | --- | --- | --- | --- | --- | --- | --- | --- |~%")
   (dolist (row rows)
     (let ((system (or (%field row "system") "?")))
-      (format out "| ~A | `~A` | ~A | ~A | ~A | ~A | ~A | ~A |~%"
+      (format out "| ~A | `~A` | ~A | ~A | ~A | ~A | ~A | ~A | ~A |~%"
               (%escape-cell system)
               (%status-for row tests)
               (%escape-cell (%tests-cell row tests))
               (%escape-cell (%forks-cell row))
+              (%seconds-cell row tests)
               (%issue-cell (%field row "issue"))
               (%escape-cell (or (%field row "checked") ""))
               ;; Prose a person wrote, so it is rendered as prose; only the cell
@@ -537,7 +585,7 @@ measurement says so."
 
 (defun %write-markdown (path rows dist dotcl-version extra annotations tests
                         &optional hand-picked-rows measured-dists cut-off
-                          measured-runtime)
+                          measured-runtime sbcl-runtime)
   (with-open-file (out path :direction :output :if-exists :supersede
                             :if-does-not-exist :create :external-format :utf-8)
     (format out "# Library status~%~%")
@@ -548,6 +596,9 @@ measurement says so."
     (format out "- Dists measured with: ~A~%" (or measured-dists "not recorded"))
     (format out "- Runtime build measured with: ~A~%" (or measured-runtime "not recorded"))
     (format out "- dotcl: ~A~%" dotcl-version)
+    (format out "- Compared with: ~A~%" (or sbcl-runtime "not measured"))
+    (format out "- Seconds, dotcl / SBCL, summed over the rows measured on both: ~A~%"
+            (%seconds-totals (append rows extra hand-picked-rows) tests))
     (format out "- Rows: ~D~%~%" (+ (length rows) (length extra) (length hand-picked-rows)))
     (format out "Order is how many other Quicklisp projects are built on a~%")
     (format out "project, directly or through others, not counting dependencies~%")
@@ -578,6 +629,12 @@ measurement says so."
     (format out "| with forks | meaning |~%| --- | --- |~%")
     (loop for (value . meaning) in *forks-legend*
           do (format out "| ~A | ~A |~%" value meaning))
+    (format out "~%The seconds column is the wall-clock time of the process that~%")
+    (format out "loaded the row, and of the one that ran its test suite, on dotcl~%")
+    (format out "and on SBCL from the same dists. Both measure the rows in this~%")
+    (format out "order from an empty compile cache, so a row's time includes~%")
+    (format out "compiling the dependencies it is the first to need. dotcl's~%")
+    (format out "times include its start-up, about a second per process.~%")
     (%write-rows out (append rows extra) annotations tests)
     (when hand-picked-rows
       (format out "~%## Hand-picked~%~%")
@@ -587,7 +644,8 @@ measurement says so."
       (format out "ranks nowhere. The order in this table means nothing.~%")
       (%write-rows out hand-picked-rows annotations tests))))
 
-(defun main (&key json targets out dotcl-version annotations tests forks)
+(defun main (&key json targets out dotcl-version annotations tests forks
+                   sbcl-json sbcl-tests)
   (let* ((here (directory-namestring
                 (or *load-truename* *default-pathname-defaults*)))
          (json (or json (%env "LIBRARY_STATUS_JSON"
@@ -601,6 +659,12 @@ measurement says so."
          (forks (or forks
                     (%env "LIBRARY_STATUS_FORKS_JSON"
                           (namestring (merge-pathnames "forks.json" here)))))
+         (sbcl-json (or sbcl-json
+                        (%env "LIBRARY_STATUS_SBCL_JSON"
+                              (namestring (merge-pathnames "results-sbcl.json" here)))))
+         (sbcl-tests (or sbcl-tests
+                         (%env "LIBRARY_STATUS_SBCL_TESTS_JSON"
+                               (namestring (merge-pathnames "tests-sbcl.json" here)))))
          (targets (or targets (%env "LIBRARY_STATUS_TARGETS"
                                     (namestring (merge-pathnames "targets.txt" here)))))
          (out (or out (%env "LIBRARY_STATUS_OUT"
@@ -612,6 +676,8 @@ measurement says so."
             (annotations (%read-annotations annotations))
             (tests (%read-tests tests))
             (*forks* (%read-tests forks))
+            (*sbcl-results* (%read-tests sbcl-json))
+            (*sbcl-tests* (%read-tests sbcl-tests))
             (by-system (make-hash-table :test #'equal)))
         (dolist (result results)
           (let ((system (%field result "system")))
@@ -634,7 +700,11 @@ measurement says so."
                            hand-picked-rows
                            (%field-measured all tests *forks* "dists" #'%dists-words)
                            cut-off
-                           (%field-measured all tests *forks* "runtime"))
+                           (%field-measured all tests *forks* "runtime")
+                           (let ((seen '()))
+                             (loop for e being the hash-values of *sbcl-results*
+                                   do (pushnew (%field e "runtime") seen :test #'equal))
+                             (and seen (format nil "~{~A~^, ~}" (remove nil seen)))))
           (format t "~&wrote ~A~%" out)
           (format t "~D ranked rows (~D measured), ~D hand-picked, ~D extra, ~D annotated~%"
                   (length rows)

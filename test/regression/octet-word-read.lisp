@@ -174,13 +174,14 @@
 (defun %owr-read-sil (v o)
   (declare (type %owr-octets v) (type %owr-index o))
   (+ (%owr-32le v o) (%owr-16be v o)))
+;; A DOTIMES body is compiled twice: with and without the bounds checks.
 (deftest-emitting-only octet-word-read.wide-loads
   (loop for fn in (list #'%owr-xor-sil #'%owr-read-sil)
         collect (let ((s (%owr-sil fn)))
                   (list (%owr-count s "LDELEM-U1") (%owr-count s "Runtime.ReadU")
                         (%owr-count s "BoxU64") (%owr-count s "Logior2")
                         (%owr-count s "Logxor2") (%owr-count s "Runtime.Ash"))))
-  ((0 2 0 0 0 0) (0 2 0 0 0 0)))
+  ((0 4 0 0 0 0) (0 2 0 0 0 0)))
 (setf dotcl:*save-sil* nil)
 
 (deftest octet-word-read.xor-values

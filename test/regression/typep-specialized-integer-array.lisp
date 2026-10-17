@@ -16,7 +16,7 @@
 (deftest typep-specialized-integer-array.typecase
   (mapcar (lambda (et) (%tsia-kind (make-array 3 :element-type et)))
           '(fixnum (unsigned-byte 8) (signed-byte 32) (unsigned-byte 16) (signed-byte 64) t))
-  (:fixnum :u8 :s32 :other :other :other))
+  (:fixnum :u8 :s32 :other :fixnum :other))
 
 (deftest typep-specialized-integer-array.typep
   (let ((fx (make-array 3 :element-type 'fixnum))

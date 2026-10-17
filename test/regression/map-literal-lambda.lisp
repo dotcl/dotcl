@@ -118,6 +118,26 @@
         (some (lambda (a b) (and (> (+ a b) 20) (+ a b))) (list 1 2) (vector 10 20)))
   (20 20 :b nil t nil t t nil t nil nil 22))
 
+;;; The opened loop where its value is used in different ways: as a function's
+;;; value, as a test, under MULTIPLE-VALUE-LIST, discarded, and nested in
+;;; another opened loop's lambda.
+(defun %mll-tail (l k) (mapcar (lambda (x) (+ x k)) l))
+
+(deftest mll.value-contexts
+  (let ((k 1) (log nil))
+    (list (%mll-tail (list 1 2) 10)
+          (if (some (lambda (x) (> x k)) (vector 0 1 2)) :yes :no)
+          (if (every (lambda (x) (> x k)) (list 2 0)) :yes :no)
+          (multiple-value-list (some (lambda (x) (values x :extra)) (list nil 3)))
+          (multiple-value-list (notevery (lambda (x) (values x :extra)) (vector 1 nil)))
+          (progn (mapc (lambda (x) (push x log)) (list 1 2)) log)
+          (mapcar (lambda (row) (mapcar (lambda (x) (* x k 2)) row))
+                  (list (list 1 2) (list 3)))
+          (mapcan (lambda (row) (remove-if-not (lambda (x) (some (lambda (y) (= x y)) row))
+                                               (list 1 2 3)))
+                  (list (list 2) (list 3 1)))))
+  ((11 12) :yes :no (3) (t) (2 1) ((2 4) (6)) (2 1 3)))
+
 ;;; NOTINLINE keeps the ordinary call.
 (deftest mll.notinline
   (locally (declare (notinline mapcar))
@@ -158,3 +178,24 @@
         (<= (%mll-per-call %mll-some (some (lambda (x) (and (eql x 99) y)) *mll-l*)) 50000)
         (<= (%mll-per-call %mll-every (every (lambda (x) (or (eql x 99) y)) *mll-l*)) 50000))
   (t t t))
+
+;;; RETURN-FROM / RETURN / GO out of the lambda body is a jump, not a thrown exit.
+(defgeneric %mll-gf-exit (xs))
+(defmethod %mll-gf-exit ((xs list))
+  (mapcar (lambda (x) (when (null x) (return-from %mll-gf-exit :none)) (car x)) xs))
+
+(deftest mll.exit-from-method-and-optional
+  (list (%mll-gf-exit (list '(1) '(2)))
+        (%mll-gf-exit (list '(1) nil '(2)))
+        (block b (mapcar (lambda (x &optional (y 10)) (if (> x 1) (return-from b (+ x y)) x))
+                         (list 1 2 3)))
+        (block b (mapc (lambda (x) (mapc (lambda (z) (when (= z x 2) (return-from b z))) (list 2)))
+                       (list 1 2)))
+        (funcall (block b (mapcar (lambda (x) (when (= x 3) (return-from b (lambda () x))) x) (list 1 3)))))
+  ((1 2) :none 12 2 3))
+
+(deftest-compiled-only mll.exit-allocates-no-exception
+  (<= (%mll-per-call %mll-exit
+        (block b (mapcar (lambda (x) (if (eql x 2) (return-from b y) x)) *mll-l*)))
+      (* 50000 40))
+  t)

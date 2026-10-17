@@ -133,6 +133,14 @@
   `(when (emitting-mode-p)
      (deftest ,name ,form ,@expected)))
 
+(defun min-allocated-bytes (thunk &optional (n 5))
+  (let ((best nil))
+    (dotimes (i n best)
+      (let ((a0 (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread")))
+        (funcall thunk)
+        (let ((d (- (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread") a0)))
+          (when (or (null best) (< d best)) (setq best d)))))))
+
 
 ;;; A test whose subject is a runtime (C#) function and whose cost is large.
 ;;;
@@ -473,3 +481,14 @@ A name that does not parse is treated as alive, so it is never deleted."
                'FULL-TIER-FILES-SKIPPED *full-tier-skipped-files*
                'DEFTESTS-IN-SOURCE *full-tier-skipped-source-tests*))
   t)
+
+(defmacro with-fasl-load-in-memory ((setting) &body body)
+  "Run BODY with DOTCL_FASL_LOAD_IN_MEMORY set to SETTING: \"1\", LOAD builds the
+fasl COMPILE-FILE just wrote in memory; \"0\", LOAD reads it from the file."
+  `(let ((old (dotnet:static "System.Environment" "GetEnvironmentVariable"
+                             "DOTCL_FASL_LOAD_IN_MEMORY")))
+     (dotnet:static "System.Environment" "SetEnvironmentVariable"
+                    "DOTCL_FASL_LOAD_IN_MEMORY" ,setting)
+     (unwind-protect (progn ,@body)
+       (dotnet:static "System.Environment" "SetEnvironmentVariable"
+                      "DOTCL_FASL_LOAD_IN_MEMORY" old))))

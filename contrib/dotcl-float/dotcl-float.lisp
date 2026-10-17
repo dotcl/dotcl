@@ -6,7 +6,8 @@
 ;;;   dotcl-float:single-float-bits, double-float-bits,
 ;;;   bits-single-float, bits-double-float,
 ;;;   dotcl-float:+single-float-positive-infinity+, dotcl-float:+single-float-nan+,
-;;;   dotcl-float:+double-float-positive-infinity+, dotcl-float:+double-float-nan+
+;;;   dotcl-float:+double-float-positive-infinity+, dotcl-float:+double-float-nan+,
+;;;   dotcl-float:float-nan-p, dotcl-float:float-infinity-p
 
 (defpackage :dotcl-float
   (:use :cl)
@@ -15,7 +16,8 @@
            #:+single-float-positive-infinity+ #:+single-float-negative-infinity+
            #:+single-float-nan+
            #:+double-float-positive-infinity+ #:+double-float-negative-infinity+
-           #:+double-float-nan+))
+           #:+double-float-nan+
+           #:float-nan-p #:float-infinity-p))
 
 (in-package :dotcl-float)
 
@@ -41,6 +43,29 @@
 (defun bits-double-float (bits)
   (dotnet:static "System.BitConverter" "Int64BitsToDouble"
                  (ldb (byte 64 0) bits)))
+
+;; As sb-ext:float-nan-p and sb-ext:float-infinity-p: read the exponent and
+;; the fraction from the bits, so no comparison (which a NaN never satisfies)
+;; and no float trap is involved.
+(defun float-nan-p (x)
+  "True if the float X is a NaN, quiet or signalling."
+  (etypecase x
+    (double-float (let ((bits (double-float-bits x)))
+                    (and (= (ldb (byte 11 52) bits) #x7FF)
+                         (/= 0 (ldb (byte 52 0) bits)))))
+    (single-float (let ((bits (single-float-bits x)))
+                    (and (= (ldb (byte 8 23) bits) #xFF)
+                         (/= 0 (ldb (byte 23 0) bits)))))))
+
+(defun float-infinity-p (x)
+  "True if the float X is positive or negative infinity."
+  (etypecase x
+    (double-float (let ((bits (double-float-bits x)))
+                    (and (= (ldb (byte 11 52) bits) #x7FF)
+                         (= 0 (ldb (byte 52 0) bits)))))
+    (single-float (let ((bits (single-float-bits x)))
+                    (and (= (ldb (byte 8 23) bits) #xFF)
+                         (= 0 (ldb (byte 23 0) bits)))))))
 
 (defconstant +single-float-positive-infinity+ (bits-single-float #x7F800000))
 (defconstant +single-float-negative-infinity+ (bits-single-float #xFF800000))

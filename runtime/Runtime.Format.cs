@@ -87,7 +87,7 @@ public static partial class Runtime
         // start of the control string is a fresh line on it as on any stream.
         // Only asked when the control string can contain ~&.
         bool atLineStart = resolved is LispStream ls2 ? ls2.AtLineStart
-            : resolved is LispInstance gsl && IsGrayOutputStream(gsl) ? (formatString.IndexOf('&') < 0 || GrayStartLineP(gsl))
+            : resolved is LispInstance gsl && IsGrayStream(gsl) ? (formatString.IndexOf('&') < 0 || GrayStartLineP(gsl))
             : true;
 
         bool savedToPretty2 = _fmtToPretty;
@@ -104,7 +104,7 @@ public static partial class Runtime
         try
         {
             result2 = FormatStringTop(formatString, formatArgs2, atLineStart,
-                                      StreamInitialColumn(resolved));
+                                      PendingFormatColumn(resolved));
         }
         finally { PprintResume(suspended2); _fmtToPretty = savedToPretty2; }
 
@@ -121,7 +121,7 @@ public static partial class Runtime
             // the same trampoline the explicit-stream path uses, so
             // (format t ...) reaches it instead of leaking to the console.
             else if (resolvedStream is LispStream
-                     || (resolvedStream is LispInstance gi && (IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi))))
+                     || (resolvedStream is LispInstance gi && IsGrayStream(gi)))
             {
                 GetTextWriter(resolvedStream).Write(result2);
                 if (_pprintActive) PprintTrackWrite(result2);
@@ -139,7 +139,7 @@ public static partial class Runtime
         // LispStream): GetTextWriter trampolines the latter through
         // GrayStreamTextWriter -> stream-write-string / stream-write-char, the same
         // path write-string uses, so (format gray-stream ...) works.
-        else if (dest is LispStream || (dest is LispInstance gdi && (IsGrayOutputStream(gdi) || IsGrayBinaryOutputStream(gdi))))
+        else if (dest is LispStream || (dest is LispInstance gdi && IsGrayStream(gdi)))
         {
             GetTextWriter(dest).Write(result2);
             if (_pprintActive) PprintTrackWrite(result2);
@@ -1267,7 +1267,7 @@ public static partial class Runtime
                     foreach (var c in bc.Streams)
                         if (StreamColumn(c) is int bcol) return bcol;
                     return null;
-                case LispInstance gi when IsGrayOutputStream(gi):
+                case LispInstance gi when IsGrayStream(gi):
                     return GrayLineColumn(gi);
                 default: return null;
             }
@@ -1327,7 +1327,7 @@ public static partial class Runtime
         // start of the control string is a fresh line on it as on any stream.
         // Only asked when the control string can contain ~&.
         bool atLineStart = resolved is LispStream ls2 ? ls2.AtLineStart
-            : resolved is LispInstance gsl && IsGrayOutputStream(gsl) ? (template.IndexOf('&') < 0 || GrayStartLineP(gsl))
+            : resolved is LispInstance gsl && IsGrayStream(gsl) ? (template.IndexOf('&') < 0 || GrayStartLineP(gsl))
             : true;
 
         int argIdx = 0;
@@ -1337,7 +1337,7 @@ public static partial class Runtime
         try
         {
             result = FormatString(template, args, ref argIdx, atLineStart,
-                                  StreamInitialColumn(resolved));
+                                  PendingFormatColumn(resolved));
         }
         catch (FormatUpAndOutException ex)
         {
@@ -1358,7 +1358,7 @@ public static partial class Runtime
             // through GetTextWriter like the explicit-stream path so
             // (format t ...) reaches it instead of the console.
             else if (resolvedStream is LispStream
-                     || (resolvedStream is LispInstance gi && (IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi))))
+                     || (resolvedStream is LispInstance gi && IsGrayStream(gi)))
             {
                 GetTextWriter(resolvedStream).Write(result);
                 if (_pprintActive) PprintTrackWrite(result);
@@ -1375,7 +1375,7 @@ public static partial class Runtime
         // A built-in stream, OR a Gray output stream (a CLOS instance, not a
         // LispStream): GetTextWriter trampolines the latter through
         // GrayStreamTextWriter so (format gray-stream ...) works.
-        else if (dest is LispStream || (dest is LispInstance gdi && (IsGrayOutputStream(gdi) || IsGrayBinaryOutputStream(gdi))))
+        else if (dest is LispStream || (dest is LispInstance gdi && IsGrayStream(gdi)))
         {
             GetTextWriter(dest).Write(result);
             if (_pprintActive) PprintTrackWrite(result);
@@ -1424,6 +1424,25 @@ public static partial class Runtime
         (_pprintStaged ??= new()).Add((sb, _pprintStream));
     }
 
+    /// <summary>True when output to STREAM goes into the logical block being
+    /// printed: the block's own stream, or the stream a PRINT-OBJECT method or
+    /// a report called from inside it was handed.</summary>
+    public static bool IsPrettyStream(LispObject stream)
+    {
+        if (!_pprintActive || _pprintStream == null) return false;
+        TextWriter w;
+        try { w = GetOutputWriter(stream); }
+        catch (LispErrorException) { return false; }
+        if (ReferenceEquals(w, _pprintStream)) return true;
+        if (w is System.IO.StringWriter sw && _pprintStaged != null)
+        {
+            var sb = sw.GetStringBuilder();
+            foreach (var (staged, _) in _pprintStaged)
+                if (ReferenceEquals(staged, sb)) return true;
+        }
+        return false;
+    }
+
     private static void PprintPopStaged(System.Text.StringBuilder sb)
     {
         var st = _pprintStaged;
@@ -1450,12 +1469,15 @@ public static partial class Runtime
     {
         if (!_pprintActive || _pprintStream == null)
         {
-            int startCol = FormatObjectStartColumn(sb);
-            if (startCol < 0) return FormatAesthetic(obj);
+            if (_fmtCoreDepth != 1 || _pprintActive) return FormatAesthetic(obj);
             int saved = _printStartColumn;
-            _printStartColumn = startCol;
+            var savedDest = _printStartDest;
+            var savedSb = _printStartFormatSb;
+            _printStartColumn = PrintStartColumnPending;
+            _printStartDest = null;
+            _printStartFormatSb = sb;
             try { return FormatAesthetic(obj); }
-            finally { _printStartColumn = saved; }
+            finally { _printStartColumn = saved; _printStartDest = savedDest; _printStartFormatSb = savedSb; }
         }
         PprintPushStaged(sb);
         try { return FormatAesthetic(obj); }
@@ -1466,12 +1488,15 @@ public static partial class Runtime
     {
         if (!_pprintActive || _pprintStream == null)
         {
-            int startCol = FormatObjectStartColumn(sb);
-            if (startCol < 0) return FormatTop(obj, escape);
+            if (_fmtCoreDepth != 1 || _pprintActive) return FormatTop(obj, escape);
             int saved = _printStartColumn;
-            _printStartColumn = startCol;
+            var savedDest = _printStartDest;
+            var savedSb = _printStartFormatSb;
+            _printStartColumn = PrintStartColumnPending;
+            _printStartDest = null;
+            _printStartFormatSb = sb;
             try { return FormatTop(obj, escape); }
-            finally { _printStartColumn = saved; }
+            finally { _printStartColumn = saved; _printStartDest = savedDest; _printStartFormatSb = savedSb; }
         }
         PprintPushStaged(sb);
         try { return FormatTop(obj, escape); }
@@ -1632,16 +1657,35 @@ public static partial class Runtime
     // a logical block) builds text of its own, so only the outermost one answers.
     [ThreadStatic] private static int _fmtCoreDepth;
     [ThreadStatic] private static int _fmtCoreInitialColumn;
+    // The stream whose column a pending (-2) initial column is.
+    [ThreadStatic] private static LispObject? _fmtCoreColumnDest;
+    [ThreadStatic] private static LispObject? _fmtPendingColumnDest;
+
+    private static int PendingFormatColumn(LispObject resolved)
+    {
+        _fmtPendingColumnDest = resolved;
+        return PrintStartColumnPending;
+    }
+
+    private static int FmtCoreInitialColumn()
+    {
+        if (_fmtCoreInitialColumn == PrintStartColumnPending)
+            _fmtCoreInitialColumn = _fmtCoreColumnDest == null ? 0 : StreamInitialColumn(_fmtCoreColumnDest);
+        return _fmtCoreInitialColumn;
+    }
 
     private static string FormatStringCore(string template, LispObject[] args, ref int argIdx,
                                            System.Text.StringBuilder sb, bool streamAtLineStart = true,
                                            int initialColumn = 0)
     {
         int savedDepth = _fmtCoreDepth, savedInitCol = _fmtCoreInitialColumn;
+        var savedColumnDest = _fmtCoreColumnDest;
         _fmtCoreDepth = savedDepth + 1;
         _fmtCoreInitialColumn = initialColumn;
-        try { return FormatStringCoreBody(template, args, ref argIdx, sb, streamAtLineStart, initialColumn); }
-        finally { _fmtCoreDepth = savedDepth; _fmtCoreInitialColumn = savedInitCol; }
+        _fmtCoreColumnDest = initialColumn == PrintStartColumnPending ? _fmtPendingColumnDest : null;
+        _fmtPendingColumnDest = null;
+        try { return FormatStringCoreBody(template, args, ref argIdx, sb, streamAtLineStart); }
+        finally { _fmtCoreDepth = savedDepth; _fmtCoreInitialColumn = savedInitCol; _fmtCoreColumnDest = savedColumnDest; }
     }
 
     /// <summary>The start column to tell a top-level object printed next into SB,
@@ -1651,12 +1695,11 @@ public static partial class Runtime
         if (_fmtCoreDepth != 1 || _pprintActive) return -1;
         int count = 0;
         if (TailAfterNewline(sb, ref count)) return count;
-        return _fmtCoreInitialColumn + count;
+        return FmtCoreInitialColumn() + count;
     }
 
     private static string FormatStringCoreBody(string template, LispObject[] args, ref int argIdx,
-                                           System.Text.StringBuilder sb, bool streamAtLineStart,
-                                           int initialColumn)
+                                           System.Text.StringBuilder sb, bool streamAtLineStart)
     {
         int i = 0;
         while (i < template.Length)
@@ -2796,7 +2839,7 @@ public static partial class Runtime
                         if (!TryPrettyColumn(sb, out col))
                         {
                             int lastNl = sb.ToString().LastIndexOf('\n');
-                            col = lastNl < 0 ? initialColumn + sb.Length : sb.Length - lastNl - 1;
+                            col = lastNl < 0 ? FmtCoreInitialColumn() + sb.Length : sb.Length - lastNl - 1;
                         }
                         if (atMod)
                         {
@@ -3062,7 +3105,7 @@ public static partial class Runtime
                                         // the destination before this FORMAT: the block starts
                                         // after that text, and its continuation lines line up
                                         // there.
-                                        if (!outerNewline && !_pprintActive) outerCol += initialColumn;
+                                        if (!outerNewline && !_pprintActive) outerCol += FmtCoreInitialColumn();
                                         // Where the block's writer content starts, for ~T in its body.
                                         // Inside an enclosing FORMAT block, count what that one has
                                         // printed and staged too.

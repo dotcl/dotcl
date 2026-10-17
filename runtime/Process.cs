@@ -16,14 +16,14 @@ public sealed class ProcessStreamReader : System.IO.TextReader
 
     private int _pending;
 
-    public ProcessStreamReader(System.IO.TextReader inner, System.Diagnostics.Process proc)
+    public ProcessStreamReader(System.IO.TextReader inner, ChildProcess proc)
         : this(proc, inner) { }
 
     /// <summary>Drain one or more child readers into a single shared buffer. Passing
     /// both stdout and stderr merges them into one stream (uiop's
     /// :error-output :output: send stderr to the same place as stdout). True EOF is
     /// reported only once every producer has drained to end.</summary>
-    public ProcessStreamReader(System.Diagnostics.Process proc, params System.IO.TextReader[] inners)
+    public ProcessStreamReader(ChildProcess proc, params System.IO.TextReader[] inners)
     {
         _pending = inners.Length;
         int i = 0;
@@ -103,7 +103,7 @@ public sealed class ProcessStreamReader : System.IO.TextReader
 /// branch stay a small clause, like the other implementations'.</summary>
 public sealed class LispProcess : LispObject
 {
-    public System.Diagnostics.Process Process { get; }
+    public ChildProcess Process { get; }
     /// <summary>Writable stream to the child's stdin when input is :stream, else NIL.</summary>
     public LispObject InputStream { get; }
     /// <summary>Readable stream from the child's stdout when output is :stream, else NIL.</summary>
@@ -111,25 +111,57 @@ public sealed class LispProcess : LispObject
     /// <summary>Readable stream from the child's stderr when error is :stream, else NIL.</summary>
     public LispObject ErrorStream { get; }
     private readonly System.Collections.Generic.List<System.Threading.Thread> _helpers;
+    private readonly CopyFailure _copyFailure;
 
-    private LispProcess(System.Diagnostics.Process process,
+    private LispProcess(ChildProcess process,
                         LispObject input, LispObject output, LispObject error,
-                        System.Collections.Generic.List<System.Threading.Thread> helpers)
+                        System.Collections.Generic.List<System.Threading.Thread> helpers,
+                        CopyFailure copyFailure)
     {
         Process = process;
         InputStream = input;
         OutputStream = output;
         ErrorStream = error;
         _helpers = helpers;
+        _copyFailure = copyFailure;
+    }
+
+    /// <summary>The first error that stopped a copy between a pipe and a Lisp
+    /// stream (other than the child closing its standard input). PROCESS-WAIT
+    /// signals it once, after the process and every copy have finished.</summary>
+    private sealed class CopyFailure
+    {
+        private System.Exception? _first;
+        private bool _reported;
+        public void Record(System.Exception ex)
+        {
+            lock (this) { _first ??= ex; }
+        }
+        public System.Exception? TakeUnreported()
+        {
+            lock (this)
+            {
+                if (_first == null || _reported) return null;
+                _reported = true;
+                return _first;
+            }
+        }
     }
 
     /// <summary>Block until the child exits AND every redirection helper thread has
     /// finished copying, so a file output target is fully written before the caller
-    /// reads it back. Returns the exit code.</summary>
+    /// reads it back. Returns the exit code. An error that stopped a copy to or
+    /// from a Lisp stream is signalled here.</summary>
     public int Wait()
     {
         Process.WaitForExit();
         foreach (var h in _helpers) { try { h.Join(); } catch { } }
+        if (_copyFailure.TakeUnreported() is System.Exception ex)
+        {
+            if (ex is LispErrorException) throw ex;
+            throw new LispErrorException(new LispError(
+                $"LAUNCH-PROCESS: copying between the process and a Lisp stream failed: {ex.Message}"));
+        }
         return Process.ExitCode;
     }
 
@@ -257,8 +289,7 @@ public sealed class LispProcess : LispObject
     /// %normalize-io-specifier turns string specs into pathnames, so both arrive here.
     /// Returns null for non-file specs (:stream, nil, t, a stream).</summary>
     private static string? FilePath(LispObject spec) =>
-        spec is LispString s ? s.Value :
-        spec is LispPathname p ? p.ToNamestring() : null;
+        spec is LispPathname p ? p.ToNamestring() : Runtime.StringValueOrNull(spec);
 
     private static System.Threading.Thread Spawn(string name, System.Action body)
     {
@@ -288,6 +319,12 @@ public sealed class LispProcess : LispObject
         System.Collections.Generic.List<string>? environment = null,
         System.Text.Encoding? encoding = null, bool binary = false)
     {
+        // A synonym stream (*standard-output*, ...) is looked up here, in the
+        // caller's thread: the threads that copy to and from it do not see the
+        // caller's dynamic bindings.
+        input = ResolveSynonym(input);
+        output = ResolveSynonym(output);
+        error = ResolveSynonym(error);
         // uiop normalizes :error-output :output to the :output keyword: send the
         // child's stderr to the same destination as its stdout (like shell 2>&1).
         bool mergeErr = IsKw(error, "OUTPUT");
@@ -305,10 +342,19 @@ public sealed class LispProcess : LispObject
         bool outDirect = unixDirect && IsFdTarget(output);
         bool errDirect = unixDirect && (mergeErr ? outDirect : IsFdTarget(error));
 
-        var psi = (inDirect || outDirect || errDirect)
-            ? UnixDirectStartInfo(program, arguments, directory, environment,
-                                  input, output, error, mergeErr, ifOutputExists, ifErrorOutputExists)
-            : MakeStartInfo(program, arguments);
+        // As SBCL does, the child gets a process group of its own unless it shares
+        // the caller's standard input.
+        bool ownGroup = unixDirect && !IsInherit(input);
+        string fileName = program;
+        System.Collections.Generic.IList<string> argList = arguments;
+        bool viaShell = inDirect || outDirect || errDirect;
+        if (viaShell)
+        {
+            fileName = "/bin/sh";
+            argList = UnixDirectArgs(program, arguments, directory, environment,
+                                     input, output, error, mergeErr, ifOutputExists, ifErrorOutputExists);
+        }
+        var psi = MakeStartInfo(fileName, argList);
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
         psi.RedirectStandardInput = !IsInherit(input) && !inDirect;
@@ -336,8 +382,18 @@ public sealed class LispProcess : LispObject
             }
         }
 
-        var proc = System.Diagnostics.Process.Start(psi)!;
+        ChildProcess? spawned = null;
+        if (ownGroup)
+        {
+            var argv = new System.Collections.Generic.List<string> { fileName };
+            argv.AddRange(argList);
+            spawned = SpawnedChildProcess.TryStart(
+                viaShell ? fileName : System.IO.Path.GetFullPath(ResolveProgram(program, directory)),
+                argv, psi);
+        }
+        var proc = spawned ?? new DotnetChildProcess(System.Diagnostics.Process.Start(psi)!);
         var helpers = new System.Collections.Generic.List<System.Threading.Thread>();
+        var failure = new CopyFailure();
         LispObject inStream = Nil.Instance, outStream = Nil.Instance, errStream = Nil.Instance;
 
         // --- stdin ---
@@ -349,6 +405,8 @@ public sealed class LispProcess : LispObject
             inStream = new LispOutputStream(encoding == null ? proc.StandardInput
                 : new System.IO.StreamWriter(proc.StandardInput.BaseStream, encoding) { AutoFlush = true });
         else if (inDirect) { }
+        else if (Runtime.IsStreamArg(input))
+            helpers.Add(FeedFromLispStream(input, proc, encoding, binary, failure));
         else if (FilePath(input) is string inPath)
             helpers.Add(Spawn("dotcl-feed-stdin", () => {
                 // Copy the file's bytes as they are, as SBCL does when it hands the
@@ -374,25 +432,32 @@ public sealed class LispProcess : LispObject
             // inherited too (neither redirected), so there is nothing to wire.
             if (!outInherit && !outDirect)
                 outStream = WireMergedOutput(output, ifOutputExists, encoding, proc, helpers,
-                                             () => proc.StandardOutput, () => proc.StandardError);
+                                             () => proc.StandardOutput, () => proc.StandardError,
+                                             binary, failure);
         }
         else
         {
             // --- stdout ---
-            if (!outDirect)
+            if (Runtime.IsStreamArg(output))
+                helpers.Add(CopyToLispStream("dotcl-copy-stdout", output, binary, failure,
+                    () => proc.StandardOutput, () => proc.StandardOutput.BaseStream, null));
+            else if (!outDirect)
                 outStream = binary && IsKw(output, "STREAM")
                     ? new LispBinaryStream(proc.StandardOutput.BaseStream)
                     : WireOutput(output, ifOutputExists, encoding, "dotcl-drain-stdout",
                                  () => proc.StandardOutput, proc, helpers);
             // --- stderr ---
-            if (!errDirect)
+            if (Runtime.IsStreamArg(error))
+                helpers.Add(CopyToLispStream("dotcl-copy-stderr", error, binary, failure,
+                    () => proc.StandardError, () => proc.StandardError.BaseStream, null));
+            else if (!errDirect)
                 errStream = binary && IsKw(error, "STREAM")
                     ? new LispBinaryStream(proc.StandardError.BaseStream)
                     : WireOutput(error, ifErrorOutputExists, encoding, "dotcl-drain-stderr",
                                  () => proc.StandardError, proc, helpers);
         }
 
-        return new LispProcess(proc, inStream, outStream, errStream, helpers);
+        return new LispProcess(proc, inStream, outStream, errStream, helpers, failure);
     }
 
     /// <summary>A file or null (discard / no input) target, which on Unix the
@@ -417,7 +482,7 @@ public sealed class LispProcess : LispObject
     ///   so a file that cannot be opened signals as before.
     /// The program is named to the shell as it was given (so argv[0] is kept)
     /// whenever the shell's PATH search finds the same file, else by full path.</summary>
-    private static System.Diagnostics.ProcessStartInfo UnixDirectStartInfo(
+    private static System.Collections.Generic.List<string> UnixDirectArgs(
         string program, System.Collections.Generic.IList<string> arguments,
         string? directory, System.Collections.Generic.List<string>? environment,
         LispObject input, LispObject output, LispObject error, bool mergeErr,
@@ -467,7 +532,7 @@ public sealed class LispProcess : LispObject
         shArgs.AddRange(files);
         shArgs.Add(execName);
         shArgs.AddRange(arguments);
-        return MakeStartInfo("/bin/sh", shArgs);
+        return shArgs;
     }
 
     [System.Runtime.InteropServices.DllImport("libc", SetLastError = true, EntryPoint = "access")]
@@ -494,12 +559,10 @@ public sealed class LispProcess : LispObject
         return null;
     }
 
-    /// <summary>The name to hand the shell's exec for PROGRAM, after resolving it
-    /// the way Process.Start does on Unix (as given if rooted; else next to the
-    /// running executable, then in the current directory, then on PATH) and
-    /// failing the way it fails when execve would.</summary>
-    private static string ResolveForExec(string program, string? directory,
-                                         System.Collections.Generic.List<string>? environment)
+    /// <summary>PROGRAM resolved the way Process.Start does on Unix (as given if
+    /// rooted; else next to the running executable, then in the current directory,
+    /// then on PATH), failing the way it fails when execve would.</summary>
+    private static string ResolveProgram(string program, string? directory)
     {
         var cwd = directory ?? System.IO.Directory.GetCurrentDirectory();
         System.Exception Fail(int errno) => new System.ComponentModel.Win32Exception(errno,
@@ -534,6 +597,17 @@ public sealed class LispProcess : LispObject
         if (!System.IO.File.Exists(resolved)) throw Fail(ENOENT);
         if (!IsExecutableFile(resolved)) throw Fail(EACCES);
 
+        return resolved;
+    }
+
+    /// <summary>The name to hand the shell's exec for PROGRAM: as given when the
+    /// shell's PATH search finds the file ResolveProgram does, else its full path.</summary>
+    private static string ResolveForExec(string program, string? directory,
+                                         System.Collections.Generic.List<string>? environment)
+    {
+        var resolved = ResolveProgram(program, directory);
+        var cwd = directory ?? System.IO.Directory.GetCurrentDirectory();
+
         // Does the shell's own lookup land on the same file?
         string? shFinds;
         if (System.IO.Path.IsPathRooted(program)) shFinds = program;
@@ -558,7 +632,7 @@ public sealed class LispProcess : LispObject
 
     private static LispObject WireOutput(
         LispObject spec, LispObject ifExists, System.Text.Encoding? encoding, string threadName,
-        System.Func<System.IO.TextReader> source, System.Diagnostics.Process proc,
+        System.Func<System.IO.TextReader> source, ChildProcess proc,
         System.Collections.Generic.List<System.Threading.Thread> helpers)
     {
         if (IsKw(spec, "STREAM"))
@@ -578,10 +652,21 @@ public sealed class LispProcess : LispObject
     /// pipes appended under a lock; nil drains both to null. Caller guarantees the
     /// destination (stdout spec) is redirected (not inherited).</summary>
     private static LispObject WireMergedOutput(
-        LispObject spec, LispObject ifExists, System.Text.Encoding? encoding, System.Diagnostics.Process proc,
+        LispObject spec, LispObject ifExists, System.Text.Encoding? encoding, ChildProcess proc,
         System.Collections.Generic.List<System.Threading.Thread> helpers,
-        System.Func<System.IO.TextReader> stdoutSrc, System.Func<System.IO.TextReader> stderrSrc)
+        System.Func<System.IO.TextReader> stdoutSrc, System.Func<System.IO.TextReader> stderrSrc,
+        bool binary, CopyFailure failure)
     {
+        if (Runtime.IsStreamArg(spec))
+        {
+            // Both pipes into one Lisp stream, a chunk at a time under one lock.
+            var wlock = new object();
+            helpers.Add(CopyToLispStream("dotcl-copy-stdout", spec, binary, failure,
+                stdoutSrc, () => proc.StandardOutput.BaseStream, wlock));
+            helpers.Add(CopyToLispStream("dotcl-copy-stderr-merged", spec, binary, failure,
+                stderrSrc, () => proc.StandardError.BaseStream, wlock));
+            return Nil.Instance;
+        }
         if (IsKw(spec, "STREAM"))
             return new LispInputStream(new ProcessStreamReader(proc, stdoutSrc(), stderrSrc()));
         if (FilePath(spec) is string path)
@@ -602,6 +687,131 @@ public sealed class LispProcess : LispObject
         helpers.Add(Spawn("dotcl-drain-stdout", () => Copy(stdoutSrc(), System.IO.TextWriter.Null)));
         helpers.Add(Spawn("dotcl-drain-stderr-merged", () => Copy(stderrSrc(), System.IO.TextWriter.Null)));
         return Nil.Instance;
+    }
+
+    /// <summary>SPEC with any synonym streams replaced by the stream they stand
+    /// for in the calling thread.</summary>
+    private static LispObject ResolveSynonym(LispObject spec)
+    {
+        for (int depth = 0; spec is LispSynonymStream syn && depth < 64; depth++)
+            spec = DynamicBindings.Get(syn.Symbol);
+        return spec;
+    }
+
+    private static LispObject CallCl(string name, params LispObject[] args)
+        => ((LispFunction)Startup.Sym(name).Function!).Invoke(args);
+
+    /// <summary>Whether a copy to or from the Lisp stream STREAM moves octets:
+    /// :element-type (unsigned-byte 8) was given, or the stream's own element
+    /// type is not a character type.</summary>
+    private static bool CopiesOctets(LispObject stream, bool binary)
+    {
+        if (binary) return true;
+        var et = CallCl("STREAM-ELEMENT-TYPE", stream);
+        return et is Cons c && c.Car is Symbol head
+            && (head.Name == "UNSIGNED-BYTE" || head.Name == "SIGNED-BYTE");
+    }
+
+    /// <summary>A thread that copies the Lisp input stream SOURCE to the child's
+    /// standard input until SOURCE ends, then closes the pipe so the child sees
+    /// end of file. Characters go a line at a time, so an interactive stream is
+    /// passed on as it is typed. A write that fails because the child stopped
+    /// reading ends the copy quietly; an error reading SOURCE is kept for
+    /// PROCESS-WAIT.</summary>
+    private static System.Threading.Thread FeedFromLispStream(
+        LispObject source, ChildProcess proc, System.Text.Encoding? encoding,
+        bool binary, CopyFailure failure)
+    {
+        bool octets = CopiesOctets(source, binary);
+        return Spawn("dotcl-feed-stdin", () => {
+            try
+            {
+                if (octets)
+                {
+                    var sink = proc.StandardInput.BaseStream;
+                    var buf = Runtime.MakeOctetVector(4096);
+                    while (true)
+                    {
+                        int n = (int)((Fixnum)Runtime.ReadSequence(new LispObject[] { buf, source })).Value;
+                        if (n == 0) break;
+                        try { sink.Write(Runtime.OctetVectorBytes(buf), 0, n); sink.Flush(); }
+                        catch (System.IO.IOException) { return; }
+                        if (n < buf.Length) break;
+                    }
+                }
+                else
+                {
+                    System.IO.TextWriter sink = encoding == null ? proc.StandardInput
+                        : new System.IO.StreamWriter(proc.StandardInput.BaseStream, encoding);
+                    var eof = new LispString("eof");
+                    while (true)
+                    {
+                        var line = CallCl("READ-LINE", source, Nil.Instance, eof);
+                        if (ReferenceEquals(line, eof)) break;
+                        var mv = MultipleValues.Get();
+                        bool missingNewline = mv.Length > 1 && mv[1] is not Nil;
+                        try
+                        {
+                            sink.Write(((LispString)line).Value);
+                            if (!missingNewline) sink.Write('\n');
+                            sink.Flush();
+                        }
+                        catch (System.IO.IOException) { return; }
+                        if (missingNewline) break;
+                    }
+                }
+            }
+            catch (System.Exception ex) { failure.Record(ex); }
+            finally { try { proc.StandardInput.Close(); } catch { } }
+        });
+    }
+
+    /// <summary>A thread that copies one of the child's output pipes to the Lisp
+    /// output stream TARGET, a chunk at a time, forcing the output after each
+    /// chunk, until the pipe ends. With WLOCK, writes to TARGET are made under
+    /// it (two pipes into one stream). An error writing TARGET is kept for
+    /// PROCESS-WAIT, and the pipe is still drained so the child never blocks on
+    /// it.</summary>
+    private static System.Threading.Thread CopyToLispStream(
+        string threadName, LispObject target, bool binary, CopyFailure failure,
+        System.Func<System.IO.TextReader> textSource, System.Func<System.IO.Stream> byteSource,
+        object? wlock)
+    {
+        bool octets = CopiesOctets(target, binary);
+        return Spawn(threadName, () => {
+            bool failed = false;
+            void Deliver(LispObject chunk)
+            {
+                if (failed) return;
+                try
+                {
+                    if (wlock == null) Write(chunk);
+                    else lock (wlock) Write(chunk);
+                }
+                catch (System.Exception ex) { failed = true; failure.Record(ex); }
+            }
+            void Write(LispObject chunk)
+            {
+                CallCl(octets ? "WRITE-SEQUENCE" : "WRITE-STRING", chunk, target);
+                CallCl("FORCE-OUTPUT", target);
+            }
+            if (octets)
+            {
+                var src = byteSource();
+                var buf = new byte[4096];
+                int n;
+                while ((n = src.Read(buf, 0, buf.Length)) > 0)
+                    Deliver(Runtime.MakeOctetVector(buf, 0, n));
+            }
+            else
+            {
+                var src = textSource();
+                var buf = new char[4096];
+                int n;
+                while ((n = src.Read(buf, 0, buf.Length)) > 0)
+                    Deliver(new LispString(new string(buf, 0, n)));
+            }
+        });
     }
 
     /// <summary>The file a child's output is redirected to. The pipe was decoded

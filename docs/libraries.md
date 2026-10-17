@@ -20,11 +20,11 @@ Neither needs a build step: both work from a running image.
 (require "asdf-nuget")       ; NuGet packages in a system definition; check a library's fasls
 (require "dotnet-class")     ; dotnet:define-class: subclass a .NET type
 (require "dotnet-ffi")       ; P/Invoke to native libraries
-(require "dotcl-socket")     ; sockets
+(require "dotcl-socket")     ; TCP sockets as streams
 (require "dotcl-thread")     ; threads (bordeaux-threads style)
 (require "dotcl-gray")       ; Gray streams
 (require "dotcl-repl")       ; a nicer REPL, with TAB completion and ,commands
-(require "dotcl-lsp-api")    ; completion candidates for an editor to ask for
+(require "dotcl-code-info")  ; completion candidates for an editor to ask for
 (require "dotcl-advice")     ; function advice
 (require "dotcl-clrmd")      ; inspect a .NET heap (ClrMD)
 (require "dotcl-decompiler") ; decompile .NET methods
@@ -32,8 +32,8 @@ Neither needs a build step: both work from a running image.
 (require "dotcl-float")      ; float utilities
 ```
 
-Editor integration is not in that list: the SLIME / SLY backend is `micros`, and
-it comes from Quicklisp: `(ql:quickload "micros")` after the setup below.
+Editor integration is not in that list: SLIME and SLY run their servers (swank
+and slynk) from Quicklisp; see [Editors](editors.md).
 
 The argument hints those editors show come from `dotcl:function-lambda-list`,
 which is the entry point a swank or slynk backend has to call for them; the
@@ -86,6 +86,35 @@ preference, so `quickload` takes the patched release for those names and the
 stock release for everything else. It shrinks as patches land upstream; an empty
 overlay is the goal. For a stock-only home, `(setf ql-setup:*offer-dotcl-dist*
 nil)` before the first `quickload` (or before `ql:setup`).
+
+A dist can also offer releases as prebuilt library packages (made with
+[`dotcl pack --library`](dotcl-pack.md#packaging-a-library---library)). Its
+`distinfo.txt` names a list with `dotcl-packages-url:`, one package per line:
+
+```
+<release> <dotcl version> <rid> <package id> <package version> <system>...
+```
+
+and may name the feed with `dotcl-package-source:`. When `quickload` needs one
+of the listed systems, the release is the one Quicklisp would use, and the line
+is for the running dotcl (`(lisp-implementation-version)`) and RID (`(dotcl:package-rid)`:
+one of `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64`, `win-x64`, `win-arm64`,
+not the distribution-specific RID, and `linux-musl-<arch>` on musl), the package
+is resolved with `dotnet restore` and its fasls are loaded instead of compiling
+the release. Otherwise, or if the package cannot be resolved, the release is
+compiled from source as usual. `(setf ql-setup:*use-dist-packages* nil)` turns
+this off, and `ql-setup:*dist-package-source*` names a feed (URL or directory)
+in place of the dist's. Either source may instead be the URL of one package with
+`{id}` and `{version}` in it (for packages kept as release assets rather than on
+a feed): the `.nupkg` is fetched once into the dist's `dotcl-packages/`
+directory, which is then the feed.
+
+`scripts/dist-package.sh <system> <out-dir>` builds such a package for the
+running dotcl and platform from fixed dist versions (`--dist <distinfo-url>`,
+repeatable), and appends its line to `<out-dir>/dotcl-packages.txt`. The package
+id is `dotcl-dist.<project>.<rid>` and its version `<dotcl version>-<release>`,
+e.g. `dotcl-dist.ironclad.osx-arm64` `0.1.33-20261001.aff135e`. Only the dotcl
+that built it uses it, so a package for users is built with a released dotcl.
 
 The Quicklisp home is dotcl's own; `%APPDATA%\dotcl\quicklisp\` on Windows,
 `$XDG_DATA_HOME/dotcl/quicklisp/` (i.e. under `~/.local/share`) elsewhere, so

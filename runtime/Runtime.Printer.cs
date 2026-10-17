@@ -608,11 +608,9 @@ public static partial class Runtime
             case LispRestart restart:
                 return escape ? restart.ToString() : restart.Report();
             case LispRandomState rs:
-            {
-                if (GetPrintReadably() || escape)
-                    return rs.ToReadableString();
-                return "#<RANDOM-STATE>";
-            }
+                return RandomStateForm(rs);
+            case LispSimdPack simd:
+                return SimdInfo.Print(simd);
             case LispWeakPointer:
                 return "#<WEAK-POINTER>";
             default:
@@ -842,6 +840,32 @@ public static partial class Runtime
     /// With read-eval off the value cannot be printed readably at all: emit the
     /// unreadable #&lt;...&gt; form, or signal PRINT-NOT-READABLE if the caller asked for
     /// readable output. This is the behaviour SBCL has.</summary>
+    /// <summary>SBCL's form: #S(RANDOM-STATE :STATE #.(MAKE-ARRAY 627 ...)), which
+    /// the #S reader turns back into a random state.</summary>
+    private static string RandomStateForm(LispRandomState rs)
+    {
+        if (GetPrintReadably() && !GetReadEval())
+        {
+            var err = new LispError("cannot print a RANDOM-STATE readably with *READ-EVAL* NIL");
+            err.ConditionTypeName = "PRINT-NOT-READABLE";
+            err.PrintNotReadableObjectRef = rs;
+            throw new LispErrorException(err);
+        }
+        LispObject contents = Nil.Instance;
+        var words = rs.StateWords();
+        for (int i = words.Length - 1; i >= 0; i--)
+            contents = new Cons(Fixnum.Make(words[i]), contents);
+        var quote = Startup.Sym("QUOTE");
+        var make = Runtime.List(Startup.Sym("MAKE-ARRAY"), Fixnum.Make(words.Length),
+            Startup.Keyword("ELEMENT-TYPE"),
+            Runtime.List(quote, Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(32))),
+            Startup.Keyword("INITIAL-CONTENTS"),
+            Runtime.List(quote, contents));
+        return "#S(" + FormatObject(Startup.Sym("RANDOM-STATE"), true) + " "
+            + FormatObject(Startup.Keyword("STATE"), true) + " #."
+            + FormatObject(make, true) + ")";
+    }
+
     private static string NonFiniteFloatForm(LispObject value, string constantName)
     {
         if (GetReadEval()) return $"#.DOTCL:{constantName}";
@@ -1195,7 +1219,7 @@ public static partial class Runtime
         if (table.Standard && !_pprintActive
             && (_formatConsDepth == 0 || _formatConsDepth == _printObjectTopDepth)
             && IsStdPprintObject(obj))
-            return StdPprintTop(obj, escape, (_printStartColumn >= 0 ? _printStartColumn : 0) + colBias, table);
+            return StdPprintTop(obj, escape, Math.Max(PrintStartColumn(), 0) + colBias, table);
         return null;
     }
 
@@ -1691,6 +1715,21 @@ public static partial class Runtime
     // tracks the column itself).
     [System.ThreadStatic] private static int _printStartColumn = -1;
 
+    // -2: not computed yet; the column of _printStartDest, or of the next
+    // object FORMAT prints into _printStartFormatSb.
+    private const int PrintStartColumnPending = -2;
+    [System.ThreadStatic] private static LispObject? _printStartDest;
+    [System.ThreadStatic] private static System.Text.StringBuilder? _printStartFormatSb;
+
+    private static int PrintStartColumn()
+    {
+        if (_printStartColumn == PrintStartColumnPending)
+            _printStartColumn = _printStartFormatSb != null
+                ? FormatObjectStartColumn(_printStartFormatSb)
+                : DestinationColumn(_printStartDest ?? Nil.Instance);
+        return _printStartColumn;
+    }
+
     // The printing depth (_formatConsDepth) inside the PRINT-OBJECT method of an
     // object printed on its own, while that method runs; -1 otherwise.
     [System.ThreadStatic] private static int _printObjectTopDepth = -1;
@@ -1711,9 +1750,13 @@ public static partial class Runtime
             finally { PprintResume(suspended); }
         }
         int saved = _printStartColumn;
-        _printStartColumn = DestinationColumn(dest);
+        var savedDest = _printStartDest;
+        var savedSb = _printStartFormatSb;
+        _printStartColumn = PrintStartColumnPending;
+        _printStartDest = dest;
+        _printStartFormatSb = null;
         try { return FormatTop(obj, escape); }
-        finally { _printStartColumn = saved; }
+        finally { _printStartColumn = saved; _printStartDest = savedDest; _printStartFormatSb = savedSb; }
     }
 
     /// <summary>The current column of output stream designator DEST, as FORMAT
@@ -1751,7 +1794,7 @@ public static partial class Runtime
             var stream = new LispStringOutputStream(sw);
             // The object printed at top level starts where the destination's line
             // is: a logical block the method opens there lines up with it.
-            if (_printStartColumn >= 0 && _formatConsDepth <= 1)
+            if (_formatConsDepth <= 1 && PrintStartColumn() >= 0)
                 stream.StartColumn = _printStartColumn;
             // For an object printed on its own, the method's stream knows its
             // column, so what the method prints there directly (a list under ~S
@@ -2490,7 +2533,7 @@ public static partial class Runtime
                 case LispSynonymStream syn: s = DynamicBindings.Get(syn.Symbol); continue;
                 case LispTwoWayStream tw: s = tw.OutputStream; continue;
                 case LispEchoStream es: s = es.OutputStream; continue;
-                case LispInstance gi when IsGrayOutputStream(gi): return gi;
+                case LispInstance gi when IsGrayStream(gi): return gi;
                 default: return null;
             }
         }

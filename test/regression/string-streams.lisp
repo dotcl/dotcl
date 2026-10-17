@@ -62,3 +62,24 @@
       (file-position s 7)
       (list form (read-preserving-whitespace s nil :eof nil))))
   ((+ 1 2) 42))
+
+;; A stream made with :START counts FILE-POSITION from :START (SBCL, CLISP).
+(deftest string-stream-file-position-from-start
+  (list (with-input-from-string (s "abcdef" :start 2)
+          (read-char s)
+          (file-position s))
+        (let ((s (make-string-input-stream "abcdef" 2 5)))
+          (list (file-position s)
+                (progn (read-char s) (read-char s) (file-position s))
+                (and (file-position s 1) t)
+                (read-char s)
+                (and (file-position s 3) t)
+                (read-char s nil :eof))))
+  (1 (0 2 t #\d t :eof)))
+
+(deftest string-stream-index-counts-from-string-start
+  (let (i)
+    (with-input-from-string (s "abcdef" :start 2 :index i)
+      (read-char s))
+    i)
+  3)

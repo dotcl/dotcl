@@ -1536,20 +1536,20 @@
           (dotnet:invoke (dotnet:new "DotclTest.OverloadCtorA" 42) "get_N")))
   (0 42))
 
-;;; char-backed LispVector strings (BASE-STRING) marshal to System.String.
+;;; char-backed LispVector strings marshal to System.String.
 ;;; CL strings have two runtime reprs (LispString and fill-pointered/adjustable
-;;; char LispVector); both report type-of SIMPLE-BASE-STRING / BASE-STRING. Only
+;;; char LispVector). Only
 ;;; LispString marshaled to System.String, so a char-vector string passed to a
 ;;; .NET method (e.g. Graphics.DrawString, here StringBuilder.Append) failed
 ;;; overload resolution with "Method not found". Repro'd via McCLIM
 ;;; replay-output-record, where text records store the string as a char vector.
 
 ;;; A fill-pointered char vector is NOT a LispString.
-(deftest d1125-char-vector-is-base-string
+(deftest d1125-char-vector-is-string
   (let ((cv (make-array 5 :element-type 'character :fill-pointer 0 :adjustable t)))
     (loop for c across "Hello" do (vector-push-extend c cv))
-    (type-of cv))
-  base-string)
+    (list (type-of cv) (typep cv 'string)))
+  ((vector character 5) t))
 
 ;;; Passing that char-vector string to a .NET method binds the (string,...)
 ;;; overload and round-trips its characters.

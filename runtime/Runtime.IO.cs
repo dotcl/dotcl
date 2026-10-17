@@ -940,17 +940,18 @@ public static partial class Runtime
     // agree with the stream protocol instead of testing the C# LispStream type.
     internal static bool IsInputStreamArg(LispObject o)
         => (o is LispStream s && s.IsInput)
-           || (o is LispInstance gi && (IsGrayInputStream(gi) || IsGrayBinaryInputStream(gi)));
+           || (o is LispInstance gi && IsGrayStream(gi)
+               && IsTruthy(Funcall(Startup.Sym("INPUT-STREAM-P").Function!, gi)));
 
     internal static bool IsOutputStreamArg(LispObject o)
         => (o is LispStream s && s.IsOutput)
-           || (o is LispInstance gi && (IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi)));
+           || (o is LispInstance gi && IsGrayStream(gi)
+               && IsTruthy(Funcall(Startup.Sym("OUTPUT-STREAM-P").Function!, gi)));
 
     // STREAMP: any native or Gray stream (used only to shape the type-error report).
     internal static bool IsStreamArg(LispObject o)
         => o is LispStream
-           || (o is LispInstance gi && (IsGrayInputStream(gi) || IsGrayOutputStream(gi)
-                                        || IsGrayBinaryInputStream(gi) || IsGrayBinaryOutputStream(gi)));
+           || (o is LispInstance gi && IsGrayStream(gi));
 
     /// <summary>Run a stream I/O operation, converting a CLR I/O failure into a
     /// STREAM-ERROR carrying the stream (CLHS: an I/O failure on a stream is a
@@ -1045,6 +1046,106 @@ public static partial class Runtime
     /// turned off so a character is never silently replaced by a look-alike.
     /// Encodings are fetched by code page rather than the Encoding.Latin1 property so
     /// the netstandard2.0 target builds too.</summary>
+    // dotcl:string-to-octets / dotcl:octets-to-string, as in sb-ext: encode a
+    // string to a fresh (simple-array (unsigned-byte 8) (*)) and back, in any
+    // external format OPEN accepts (UTF-8 when omitted, NIL or :DEFAULT). An
+    // unencodable character or a malformed byte sequence becomes the format's
+    // replacement (? or U+FFFD), as .NET's encoders do.
+
+    /// <summary>The value of keyword KEY in the plist ARGS[FROM..], or null.
+    /// Signals on an odd plist or an unknown keyword, naming WHO.</summary>
+    private static LispObject? OctetsKeyArg(LispObject[] args, int from, string key, string who,
+                                            string[] allowed)
+    {
+        if ((args.Length - from) % 2 != 0)
+            throw new LispErrorException(new LispProgramError($"{who}: odd number of keyword arguments"));
+        LispObject? found = null;
+        for (int i = from; i < args.Length; i += 2)
+        {
+            if (args[i] is not Symbol k || k.HomePackage != Startup.KeywordPkg
+                || Array.IndexOf(allowed, k.Name) < 0)
+                throw new LispErrorException(new LispProgramError($"{who}: unknown keyword argument {args[i]}"));
+            if (found == null && k.Name == key) found = args[i + 1];
+        }
+        return found;
+    }
+
+    private static System.Text.Encoding OctetsEncoding(LispObject? spec, string who)
+        => (spec == null || spec is Nil ? null : ParseExternalFormat(spec, who))
+           ?? new System.Text.UTF8Encoding(false);
+
+    private static (int start, int end) OctetsBounds(LispObject? startArg, LispObject? endArg,
+                                                     int length, string who)
+    {
+        int start = startArg is Fixnum sf ? (int)sf.Value
+            : startArg == null || startArg is Nil ? 0
+            : throw new LispErrorException(new LispTypeError($"{who}: :START is not an index", startArg, Startup.Sym("FIXNUM")));
+        int end = endArg is Fixnum ef ? (int)ef.Value
+            : endArg == null || endArg is Nil ? length
+            : throw new LispErrorException(new LispTypeError($"{who}: :END is not an index", endArg, Startup.Sym("FIXNUM")));
+        if (start < 0 || end > length || start > end)
+            throw new LispErrorException(new LispError(
+                $"{who}: bounds :START {start} :END {end} are not valid for a sequence of length {length}"));
+        return (start, end);
+    }
+
+    private static readonly string[] StringToOctetsKeys = { "EXTERNAL-FORMAT", "START", "END", "NULL-TERMINATE" };
+    private static readonly string[] OctetsToStringKeys = { "EXTERNAL-FORMAT", "START", "END" };
+
+    /// <summary>(dotcl:string-to-octets string &amp;key external-format start end null-terminate)</summary>
+    public static LispObject StringToOctets(LispObject[] args)
+    {
+        const string who = "STRING-TO-OCTETS";
+        if (args.Length < 1)
+            throw new LispErrorException(new LispProgramError($"{who}: requires a string"));
+        string text = args[0] switch
+        {
+            LispString ls => ls.Value,
+            LispVector v when v.IsCharVector => v.ToCharString(),
+            _ => throw new LispErrorException(new LispTypeError($"{who}: not a string", args[0], Startup.Sym("STRING")))
+        };
+        var enc = OctetsEncoding(OctetsKeyArg(args, 1, "EXTERNAL-FORMAT", who, StringToOctetsKeys), who);
+        var (start, end) = OctetsBounds(OctetsKeyArg(args, 1, "START", who, StringToOctetsKeys),
+                                        OctetsKeyArg(args, 1, "END", who, StringToOctetsKeys), text.Length, who);
+        var nt = OctetsKeyArg(args, 1, "NULL-TERMINATE", who, StringToOctetsKeys);
+        byte[] bytes = enc.GetBytes(text.ToCharArray(start, end - start));
+        // NULL-TERMINATE appends the encoding of a NUL character (one byte in
+        // UTF-8, two in UTF-16), as SBCL does.
+        byte[] nul = nt != null && nt is not Nil ? enc.GetBytes("\0") : Array.Empty<byte>();
+        var result = MakeOctetVector(bytes.Length + nul.Length);
+        var raw = OctetVectorBytes(result);
+        Buffer.BlockCopy(bytes, 0, raw, 0, bytes.Length);
+        Buffer.BlockCopy(nul, 0, raw, bytes.Length, nul.Length);
+        return result;
+    }
+
+    /// <summary>(dotcl:octets-to-string vector &amp;key external-format start end)</summary>
+    public static LispObject OctetsToString(LispObject[] args)
+    {
+        const string who = "OCTETS-TO-STRING";
+        if (args.Length < 1)
+            throw new LispErrorException(new LispProgramError($"{who}: requires a vector of octets"));
+        var octetType = Runtime.List(Startup.Sym("VECTOR"),
+                                     Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(8)));
+        if (args[0] is not LispVector vec || vec.Rank != 1)
+            throw new LispErrorException(new LispTypeError($"{who}: not a vector of octets", args[0], octetType));
+        var enc = OctetsEncoding(OctetsKeyArg(args, 1, "EXTERNAL-FORMAT", who, OctetsToStringKeys), who);
+        var (start, end) = OctetsBounds(OctetsKeyArg(args, 1, "START", who, OctetsToStringKeys),
+                                        OctetsKeyArg(args, 1, "END", who, OctetsToStringKeys), vec.Length, who);
+        if (vec._numKind == 1 && vec._displacedTo == null && vec._numData is byte[] raw)
+            return new LispString(enc.GetString(raw, start, end - start));
+        var bytes = new byte[end - start];
+        for (int i = start; i < end; i++)
+        {
+            var e = vec.GetElement(i);
+            if (e is not Fixnum f || f.Value < 0 || f.Value > 255)
+                throw new LispErrorException(new LispTypeError($"{who}: not an octet", e,
+                    Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(8))));
+            bytes[i - start] = (byte)f.Value;
+        }
+        return new LispString(enc.GetString(bytes));
+    }
+
     internal static System.Text.Encoding? ParseExternalFormat(LispObject spec, string who = "OPEN")
     {
         var enc = ParseExternalFormat(spec, out var newline, who);
@@ -1494,7 +1595,7 @@ public static partial class Runtime
                     // would then truncate what it wrote. Open appending, creating.
                     System.IO.Stream netFsOut = ifExists == "APPEND"
                         ? OpenForAppend(filePath, create: true)
-                        : new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+                        : CreateForOutput(filePath);
                     var writer = MakeWriter(netFsOut, encoding, newline);
                     var fs = new LispFileStream(writer, filePath);
                     fs.ElementType = elementType;
@@ -1523,8 +1624,7 @@ public static partial class Runtime
                         case "RENAME":
                         case "RENAME-AND-DELETE":
                         {
-                            // Truncate instead of delete+recreate to avoid file lock issues on Windows
-                            var netFsTrunc = new FileStream(filePath, FileMode.Truncate, FileAccess.ReadWrite, FileShare.ReadWrite);
+                            var netFsTrunc = CreateForOutput(filePath, FileAccess.ReadWrite);
                             var readerTrunc = MakeReader(netFsTrunc, encoding, binaryElement, newline);
                             var writerTrunc = MakeWriter(netFsTrunc, encoding, newline); writerTrunc.AutoFlush = true;
                             var fsTrunc = new LispFileStream(readerTrunc, writerTrunc, filePath);
@@ -1636,6 +1736,7 @@ public static partial class Runtime
             return T.Instance;
         }
         if (stream is LispStream ls2) ls2.IsClosed = true;
+        else if (stream is LispInstance gi && IsGrayStream(gi)) MarkGrayClosed(gi);
         return T.Instance;
     }
 
@@ -1643,11 +1744,8 @@ public static partial class Runtime
     {
         if (stream is LispStream ls)
             return ls.IsClosed ? Nil.Instance : T.Instance;
-        // Gray Streams: an instance for which streamp returns T is treated as open
-        // (dotcl keeps no closed flag on gray streams, so they are always open).
-        if (stream is LispInstance gi && (IsGrayOutputStream(gi) || IsGrayInputStream(gi)
-                                          || IsGrayBinaryOutputStream(gi) || IsGrayBinaryInputStream(gi)))
-            return T.Instance;
+        if (stream is LispInstance gi && GrayKinds(gi.Class) != 0)
+            return IsGrayClosed(gi) ? Nil.Instance : T.Instance;
         throw new LispErrorException(new LispTypeError("OPEN-STREAM-P: not a stream", stream, Startup.Sym("STREAM")));
     }
 
@@ -1660,7 +1758,7 @@ public static partial class Runtime
         // A Gray stream answers through STREAM-READ-CHAR-NO-HANG: a character,
         // NIL when none is ready, :EOF at the end. ResolveLispStream would read
         // standard input instead.
-        if (streamObj is LispInstance grIn && IsGrayAnyInputStream(grIn))
+        if (streamObj is LispInstance grIn && IsGrayStream(grIn))
         {
             var fn = GrayStreamLookup.GrayOrCl("STREAM-READ-CHAR-NO-HANG")
                 ?? throw new LispErrorException(new LispError("Gray stream: STREAM-READ-CHAR-NO-HANG not defined"));
@@ -1728,10 +1826,7 @@ public static partial class Runtime
                     stream = input ? es.InputStream : es.OutputStream;
                     continue;
                 case LispInstance gi:
-                    if (input ? (IsGrayInputStream(gi) || IsGrayBinaryInputStream(gi))
-                              : (IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi)))
-                        return gi;
-                    return null;
+                    return IsGrayStream(gi) ? gi : null;
                 default:
                     return null;
             }
@@ -1841,13 +1936,13 @@ public static partial class Runtime
     {
         // Gray binary output stream: dispatch to the stream-write-byte generic,
         // also when it is the output side of a two-way, echo or synonym stream.
-        if (GrayComponent(stream, false) is LispInstance gbo && IsGrayBinaryOutputStream(gbo))
+        if (GrayComponent(stream, false) is LispInstance gbo && IsGrayStream(gbo))
         {
             if (byteObj is not (Fixnum or Bignum))
                 throw new LispErrorException(new LispTypeError("WRITE-BYTE: not an integer", byteObj));
-            var fn = GrayStreamLookup.GrayOrCl("STREAM-WRITE-BYTE")
+            var fn = GrayStreamLookup.StreamWriteByte.Get()
                 ?? throw new LispErrorException(new LispError("Gray stream: STREAM-WRITE-BYTE not defined"));
-            fn.Invoke(new LispObject[] { gbo, byteObj });
+            fn.Invoke2(gbo, byteObj);
             return byteObj;
         }
 
@@ -1870,11 +1965,11 @@ public static partial class Runtime
         var eofValue = args.Length >= 3 ? args[2] : Nil.Instance;
 
         // Gray binary input stream: dispatch to the stream-read-byte generic.
-        if (stream is LispInstance gbi && IsGrayBinaryInputStream(gbi))
+        if (stream is LispInstance gbi && IsGrayStream(gbi))
         {
-            var fn = GrayStreamLookup.GrayOrCl("STREAM-READ-BYTE")
+            var fn = GrayStreamLookup.StreamReadByte.Get()
                 ?? throw new LispErrorException(new LispError("Gray stream: STREAM-READ-BYTE not defined"));
-            var r = fn.Invoke(new LispObject[] { gbi });
+            var r = fn.Invoke1(gbi);
             if (r is Symbol es && es.Name == "EOF")
             {
                 if (eofErrorP) throw new LispErrorException(MakeEndOfFileError(stream));
@@ -1963,7 +2058,7 @@ public static partial class Runtime
         }
         // Gray binary stream (CLOS instance): read/write-byte dispatch one byte
         // at a time through the stream-read-byte/stream-write-byte generics.
-        if (stream is LispInstance gi && (IsGrayBinaryInputStream(gi) || IsGrayBinaryOutputStream(gi)))
+        if (stream is LispInstance gi && IsGrayStream(gi))
             return true;
         return false;
     }
@@ -1971,7 +2066,7 @@ public static partial class Runtime
     /// <summary>Read a byte from a stream's underlying byte stream. Returns -1 on EOF.</summary>
     private static int ReadStreamByte(LispObject stream)
     {
-        if (stream is LispInstance gi && IsGrayBinaryInputStream(gi))
+        if (stream is LispInstance gi && IsGrayStream(gi))
         {
             var fn = GrayStreamLookup.GrayOrCl("STREAM-READ-BYTE")
                 ?? throw new LispErrorException(new LispError("Gray stream: STREAM-READ-BYTE not defined"));
@@ -2013,7 +2108,7 @@ public static partial class Runtime
     /// <summary>Write a byte to a stream's underlying byte stream.</summary>
     private static void WriteStreamByte(LispObject stream, int b)
     {
-        if (stream is LispInstance gi && IsGrayBinaryOutputStream(gi))
+        if (stream is LispInstance gi && IsGrayStream(gi))
         {
             var fn = GrayStreamLookup.GrayOrCl("STREAM-WRITE-BYTE")
                 ?? throw new LispErrorException(new LispError("Gray stream: STREAM-WRITE-BYTE not defined"));
@@ -2049,10 +2144,8 @@ public static partial class Runtime
 
     /// <summary>Bulk path of WRITE-SEQUENCE for an octet vector going to a
     /// one-byte-per-element native stream: one Stream.Write for the whole range
-    /// instead of WriteStreamByte per element, which on a file stream also
-    /// flushed the FileStream (one write syscall) per byte. The file stream still
-    /// gets a single Flush at the end, so what reaches the OS by the time
-    /// WRITE-SEQUENCE returns is unchanged. Returns false when the vector or the
+    /// instead of WriteStreamByte per element. Like WRITE-BYTE it leaves the
+    /// bytes in the FileStream buffer. Returns false when the vector or the
     /// stream is not one this handles; the caller then takes the per-element loop.</summary>
     private static bool TryWriteRawBytes(LispObject stream, LispVector vec, int start, int end)
     {
@@ -2061,7 +2154,6 @@ public static partial class Runtime
         if (stream is LispFileStream fs && fs.OutputWriter is StreamWriter sw)
         {
             sw.BaseStream.Write(raw, start, end - start);
-            sw.BaseStream.Flush();
             return true;
         }
         if (stream is LispBinaryStream bin)
@@ -2241,7 +2333,7 @@ public static partial class Runtime
         // decoding a whole octet buffer). The dotcl-gray default method loops
         // stream-read-char / stream-read-byte, matching the per-element behavior
         // used for streams that only implement the single-element generics.
-        if (stream is LispInstance grIn && (IsGrayInputStream(grIn) || IsGrayBinaryInputStream(grIn)))
+        if (stream is LispInstance grIn && IsGrayStream(grIn))
         {
             var rsFn = GrayStreamLookup.GrayOrCl("STREAM-READ-SEQUENCE");
             if (rsFn != null)
@@ -2389,7 +2481,7 @@ public static partial class Runtime
         // Gray stream (Gray protocol): dispatch to the stream-write-sequence
         // generic so a subclass can bulk-encode (e.g. flexi-streams). The
         // dotcl-gray default method loops stream-write-char / stream-write-byte.
-        if (stream is LispInstance grOut && (IsGrayOutputStream(grOut) || IsGrayBinaryOutputStream(grOut)))
+        if (stream is LispInstance grOut && IsGrayStream(grOut))
         {
             var wsFn = GrayStreamLookup.GrayOrCl("STREAM-WRITE-SEQUENCE");
             if (wsFn != null)
@@ -2544,6 +2636,22 @@ public static partial class Runtime
 
     private static LispObject ReadLineUnguarded(LispObject stream, LispObject eofErrorP, LispObject eofValue)
     {
+        if (stream is LispInstance gli && IsGrayStream(gli)
+            && GrayStreamLookup.GrayOrCl("STREAM-READ-LINE") is LispFunction rlFn)
+        {
+            var vals = MultipleValuesList1(rlFn.Invoke(new LispObject[] { gli }));
+            var line = vals is Cons v0 ? v0.Car : Nil.Instance;
+            var missing = vals is Cons { Cdr: Cons v1 } && IsTruthy(v1.Car);
+            if (missing && Length(line) is Fixnum { Value: 0 })
+            {
+                if (IsTruthy(eofErrorP))
+                    throw new LispErrorException(MakeEndOfFileError(stream));
+                MultipleValues.SetPair(eofValue, T.Instance);
+                return eofValue;
+            }
+            MultipleValues.SetPair(line, missing ? T.Instance : Nil.Instance);
+            return line;
+        }
         var echoStream = FindEchoStream(stream);
         TextWriter? echoWriter = echoStream != null ? GetTextWriter(echoStream.OutputStream) : null;
 
@@ -2666,7 +2774,7 @@ public static partial class Runtime
         // A binary Gray stream too: SBCL sends READ-CHAR to STREAM-READ-CHAR
         // whatever the class, and a bivalent stream defines it there
         // (circular-streams).
-        if (streamObj is LispInstance grIn && IsGrayAnyInputStream(grIn))
+        if (streamObj is LispInstance grIn && IsGrayStream(grIn))
         {
             var rcFn = GrayStreamLookup.GrayOrCl("STREAM-READ-CHAR");
             if (rcFn != null)
@@ -2781,7 +2889,7 @@ public static partial class Runtime
         // stream-read-char generics (ResolveLispStream would drop the instance
         // to *standard-input*, and the LispStream path below assumes a
         // resolvable stream with an UnreadCharValue slot).
-        if (streamObj is LispInstance grIn && IsGrayAnyInputStream(grIn))
+        if (streamObj is LispInstance grIn && IsGrayStream(grIn))
             return PeekCharGray(peekType, grIn, eofErrorP, eofValue);
 
         var echoStream = FindEchoStream(streamObj);
@@ -2866,7 +2974,7 @@ public static partial class Runtime
         // generic. ResolveLispStream would otherwise drop the CLOS instance to
         // *standard-input* (its default: branch), silently unreading onto stdin
         // while the gray stream lost the character.
-        if (streamObj is LispInstance grIn && IsGrayAnyInputStream(grIn))
+        if (streamObj is LispInstance grIn && IsGrayStream(grIn))
         {
             var fn = GrayStreamLookup.GrayOrCl("STREAM-UNREAD-CHAR");
             if (fn != null)
@@ -2911,12 +3019,14 @@ public static partial class Runtime
                 // Eclector's whitespace skipping, for one -- reports where a form
                 // began.
                 var at = sis.Position - (sis.UnreadCharValue != -1 ? 1 : 0);
-                return Fixnum.Make(sis.ReportsFileBytes ? sis.FileByteOf(at) : at);
+                return Fixnum.Make(sis.ReportsFileBytes ? sis.FileByteOf(at) : at - sis.Origin);
             }
             // Setf position: reposition the underlying StringReader
             if (args[1] is Fixnum pos)
             {
-                long target = pos.Value;
+                if (pos.Value < 0) return Nil.Instance;
+                long target = pos.Value + sis.Origin;
+                if (target > int.MaxValue) return Nil.Instance;
                 if (sis.ReportsFileBytes)
                 {
                     target = sis.CharAtFileByte(pos.Value);
@@ -2939,8 +3049,7 @@ public static partial class Runtime
             return Nil.Instance;
         }
         // Gray stream: dispatch to stream-file-position / (setf stream-file-position)
-        if (args[0] is LispInstance gi && (IsGrayInputStream(gi) || IsGrayOutputStream(gi)
-                                        || IsGrayBinaryInputStream(gi) || IsGrayBinaryOutputStream(gi)))
+        if (args[0] is LispInstance gi && IsGrayStream(gi))
         {
             Symbol? fpSym = null;
             var grayPkg = Package.FindPackage("DOTCL-GRAY");
@@ -3155,7 +3264,7 @@ public static partial class Runtime
     // actually runs in output-heavy code, and routing it through the args-array
     // form costs a LispObject[] per call for nothing -- the compiler emits a
     // direct call to these instead (see the WRITE-STRING/WRITE-LINE entries in
-    // cil-forms.lisp).
+    // cil-forms-dispatch.lisp).
     public static LispObject WriteString2(LispObject str, LispObject stream)
         => GuardStreamIO(stream, str, stream, static (t, st) => WriteStringSimple(t, st, false));
 
@@ -3539,8 +3648,8 @@ public static partial class Runtime
 
         // Convert string to pathname to check for logical/wild
         LispPathname? pn = null;
-        if (path is LispString str && IsLogicalPathnameString(str.Value))
-            pn = LispLogicalPathname.FromLogicalString(str.Value);
+        if (StringValueOrNull(path) is string str && IsLogicalPathnameString(str))
+            pn = LispLogicalPathname.FromLogicalString(str);
         else if (path is LispPathname pp)
             pn = pp;
 
@@ -3595,8 +3704,8 @@ public static partial class Runtime
 
         // Convert string to pathname to check for logical/wild
         LispPathname? pn = null;
-        if (path is LispString str && IsLogicalPathnameString(str.Value))
-            pn = LispLogicalPathname.FromLogicalString(str.Value);
+        if (StringValueOrNull(path) is string str && IsLogicalPathnameString(str))
+            pn = LispLogicalPathname.FromLogicalString(str);
         else if (path is LispPathname pp)
             pn = pp;
 
@@ -3820,6 +3929,24 @@ public static partial class Runtime
         return LispPathname.FromString(dirPath + Path.DirectorySeparatorChar);
     }
 
+    /// <summary>A new file at FILEPATH for :IF-EXISTS :SUPERSEDE and the like. A
+    /// fasl may be mapped by a loaded assembly, so it is never truncated in place:
+    /// on Windows that is refused and the old file is moved aside; elsewhere it
+    /// would corrupt the mapped code, so the old file is unlinked first.</summary>
+    static FileStream CreateForOutput(string filePath, FileAccess access = FileAccess.Write)
+    {
+        if (!Compat.IsWindows() && File.Exists(filePath) && Compat.MayMoveAside(filePath))
+            File.Delete(filePath);
+        try { return new FileStream(filePath, FileMode.Create, access, FileShare.ReadWrite); }
+        catch (Exception e) when (Compat.IsWindows()
+                                  && (e is IOException || e is UnauthorizedAccessException)
+                                  && Compat.MayMoveAside(filePath))
+        {
+            Compat.MoveAside(filePath);
+            return new FileStream(filePath, FileMode.CreateNew, access, FileShare.ReadWrite);
+        }
+    }
+
     public static LispObject DeleteFile(LispObject path)
     {
         string filePath = ResolvePhysicalPath(path);
@@ -3836,12 +3963,20 @@ public static partial class Runtime
         {
             try { File.Delete(filePath); }
             catch (Exception e) when (Compat.IsWindows()
-                                      && (e is IOException || e is UnauthorizedAccessException))
+                                      && (e is IOException || e is UnauthorizedAccessException)
+                                      && Compat.MayMoveAside(filePath))
             {
                 // A fasl this process loaded by path: Windows refuses to delete
                 // the file while it is mapped, but lets it be renamed, which frees
                 // the name the way a delete would.
                 Compat.MoveAside(filePath);
+            }
+            catch (Exception e) when (e is IOException || e is UnauthorizedAccessException)
+            {
+                var ferr = new LispError($"DELETE-FILE: could not delete {filePath}: {e.Message}");
+                ferr.ConditionTypeName = "FILE-ERROR";
+                ferr.FileErrorPathnameRef = path is LispPathname ? path : (LispObject)LispPathname.FromString(filePath);
+                throw new LispErrorException(ferr);
             }
             return T.Instance;
         }
@@ -3982,6 +4117,9 @@ public static partial class Runtime
         // rename onto the final path) depends on this: without overwrite the
         // second build of any system throws "file already exists" from load-asd.
         Compat.MoveFile(oldFile, targetFile, overwrite: true);
+#if NET9_0_OR_GREATER
+        NoteFileRenamed(oldFile, targetFile);
+#endif
 
         // Return 3 values: defaulted-new-name, old-truename, new-truename
         var newTruename = LispPathname.FromString(Path.GetFullPath(targetFile));
@@ -4385,8 +4523,7 @@ public static partial class Runtime
         Startup.RegisterUnary("OPEN-STREAM-P", Runtime.OpenStreamP);
         Startup.RegisterUnary("STREAMP", obj => {
             if (obj is LispStream) return T.Instance;
-            if (obj is LispInstance gi && (Runtime.IsGrayOutputStream(gi) || Runtime.IsGrayInputStream(gi)
-                                           || Runtime.IsGrayBinaryOutputStream(gi) || Runtime.IsGrayBinaryInputStream(gi)))
+            if (obj is LispInstance gi && Runtime.IsGrayStream(gi))
                 return T.Instance;
             return Nil.Instance;
         });
@@ -4428,7 +4565,7 @@ public static partial class Runtime
             if (obj is LispStream ls) return ls.ElementType ?? Startup.Sym("CHARACTER");
             // Gray streams: no stream-element-type generic, so report the protocol
             // default: CHARACTER for character streams, (unsigned-byte 8) for binary.
-            if (obj is LispInstance gc && (Runtime.IsGrayInputStream(gc) || Runtime.IsGrayOutputStream(gc)))
+            if (obj is LispInstance gc && (Runtime.GrayKinds(gc.Class) & (Runtime.GrayChar | Runtime.GrayCharIn | Runtime.GrayCharOut)) != 0)
                 return Startup.Sym("CHARACTER");
             if (obj is LispInstance gb && (Runtime.IsGrayBinaryInputStream(gb) || Runtime.IsGrayBinaryOutputStream(gb)))
                 return Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(8));
@@ -4436,8 +4573,7 @@ public static partial class Runtime
         });
         Startup.RegisterUnary("STREAM-EXTERNAL-FORMAT", obj => {
             // Accept Gray streams (streamp=T); they carry no format, so :default.
-            if (obj is not LispStream && !(obj is LispInstance ei && (Runtime.IsGrayInputStream(ei) || Runtime.IsGrayOutputStream(ei)
-                                                                      || Runtime.IsGrayBinaryInputStream(ei) || Runtime.IsGrayBinaryOutputStream(ei))))
+            if (obj is not LispStream && !(obj is LispInstance ei && Runtime.IsGrayStream(ei)))
                 throw new LispErrorException(new LispTypeError("STREAM-EXTERNAL-FORMAT: not a stream", obj, Startup.Sym("STREAM")));
             // Report what the stream was opened with; :default when unspecified.
             if (obj is LispStream fsx && fsx.ExternalFormat is LispObject ef) return ef;
@@ -4860,7 +4996,7 @@ public static partial class Runtime
             bidi.Writer.Flush();
         }
         else if (stream is LispInstance gi
-                 && (IsGrayOutputStream(gi) || IsGrayBinaryOutputStream(gi)))
+                 && IsGrayStream(gi))
         {
             // Reached through a synonym, two-way, echo or broadcast stream whose
             // output side is a gray stream: an explicit FORCE-OUTPUT has to reach

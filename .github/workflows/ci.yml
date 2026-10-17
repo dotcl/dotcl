@@ -82,10 +82,8 @@ jobs:
     #
     # Since 2026-09-29 the push set is about 12 min and the full run (below) is
     # the old nightly with nothing taken out, ~65-70 min. The ceiling is set by
-    # the full run. It was 90; the full run has grown past that as the
-    # compiler does more work (the compiled regression suite went from about
-    # 12 to 16 min), so it is 120 until the suite is brought back down.
-    timeout-minutes: 120
+    # the full run.
+    timeout-minutes: 90
     # RUN_FULL selects the full run: the scheduled run, a run started by hand,
     # and a push to the public mirror (which moves only at releases, so a push
     # there IS the release gate). A push or pull request run is the push set:
@@ -504,7 +502,7 @@ jobs:
           name: random-forms-outputs
           path: out/random-forms/
 
-      # A tree without bench/run.lisp gives this step no inputs, and it used to
+      # A tree without bench/cl-bench-runner/run.lisp gives this step no inputs, and it used to
       # run anyway on RUN_FULL alone and fail every time, kept green by the
       # `|| true`: a step that could never succeed, wearing a passing face.
       # Gate on the file instead, so it runs exactly where it can work and is
@@ -516,15 +514,15 @@ jobs:
       # (EPYC 7763, 9V74, 9V45 seen within a week), so a baseline recorded on
       # one cannot judge another: the gate either misses real regressions or
       # fails on the luck of the draw. The baselines in
-      # bench/ratio-baseline.json each belong to one fixed machine.
+      # bench/gate/ratio-baseline.json each belong to one fixed machine.
       - name: Benchmarks
-        if: env.RUN_FULL == 'true' && hashFiles('bench/run.lisp') != '' && runner.environment != 'github-hosted'
+        if: env.RUN_FULL == 'true' && hashFiles('bench/cl-bench-runner/run.lisp') != '' && runner.environment != 'github-hosted'
         run: make bench-state || true
 
       # Unlike the step above, this one is a gate and has no `|| true`. It can
       # be: it compares dotcl against a C# program in this repository, so there
       # is no external toolchain to be missing, and the check itself is a
-      # comparison against recorded ratios in bench/ratio-baseline.json rather
+      # comparison against recorded ratios in bench/gate/ratio-baseline.json rather
       # than against absolute times.
       #
       # It runs after `make bench-state` on purpose. bench-parity merges into
@@ -538,7 +536,7 @@ jobs:
       # When any measurement it took had no baseline, check-ratios.sh says
       # UNJUDGED and exits 3 rather than ok. All 9 linux-x64 measurements (8 parity kernels
       # plus the cl-bench median) now have a baseline in
-      # bench/ratio-baseline.json, so this gate judges every measurement it
+      # bench/gate/ratio-baseline.json, so this gate judges every measurement it
       # produces and CHECK_RATIOS_ALLOW_UNJUDGED is not needed here. If a new
       # kernel is added to bench/csharp-parity/kernels.lisp without a matching
       # linux-x64 entry, this step goes back to failing (exit 3) until one is
@@ -664,6 +662,75 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY" 2>&1
           exit 0
+
+  # -- browser-wasm playground, full run only ---------------------------------
+  # `dotnet publish` of a browser-wasm app succeeds while the page hangs or
+  # dies at boot, so only a browser tells. Builds dotcl/playground against this
+  # checkout and requires its probe to report `status: ready`.
+  playground:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push')
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Roswell
+        run: |
+          if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
+            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          fi
+          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
+
+      - name: Build the core
+        run: make cross-compile compiler/dotcl.core
+
+      - name: Install the wasm workloads
+        run: dotnet workload install wasm-tools wasm-experimental
+
+      - name: Publish the playground against this checkout
+        run: |
+          git clone --depth 1 https://github.com/dotcl/playground "$RUNNER_TEMP/playground"
+          dotnet publish "$RUNNER_TEMP/playground/src/Playground.csproj" -c Release \
+            -p:DotclSource="$GITHUB_WORKSPACE/runtime/DotCL.Runtime.csproj" -p:WasmEnableSIMD=false
+
+      # Installed once on a runner that lacks it (the deb pulls in the libraries
+      # headless Chrome needs); GitHub-hosted images already have it.
+      - name: Install Chrome
+        run: |
+          if ! command -v google-chrome >/dev/null; then
+            curl -fsSL -o "$RUNNER_TEMP/chrome.deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo -n apt-get install -y "$RUNNER_TEMP/chrome.deb"
+          fi
+          google-chrome --version
+          printf '#!/bin/sh\nexec google-chrome --no-sandbox "$@"\n' > "$RUNNER_TEMP/chrome-wrapper"
+          chmod +x "$RUNNER_TEMP/chrome-wrapper"
+
+      - name: Boot the playground in headless Chrome
+        run: |
+          bundle=$(find "$RUNNER_TEMP/playground/src/bin/Release" -type d -name AppBundle | head -n 1)
+          test -n "$bundle"
+          python3 -m http.server 8080 --bind 127.0.0.1 --directory "$bundle" > "$RUNNER_TEMP/http.log" 2>&1 &
+          server=$!
+          trap 'kill $server' EXIT
+          sleep 2
+          CHROME="$RUNNER_TEMP/chrome-wrapper" node "$RUNNER_TEMP/playground/tools/probe-page.mjs" \
+            http://127.0.0.1:8080/playground.html '(lisp-implementation-version)' | tee "$RUNNER_TEMP/probe.txt"
+          grep -qx 'status   : ready' "$RUNNER_TEMP/probe.txt"
+          grep -q '^output   : ' "$RUNNER_TEMP/probe.txt"
+          ! grep -q 'TIMED OUT' "$RUNNER_TEMP/probe.txt"
 
   # -- macOS, public full run only -------------------------------------------
   # macOS has had no CI at all, while release.yml packs osx-x64 and osx-arm64 on

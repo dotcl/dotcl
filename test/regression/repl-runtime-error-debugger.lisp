@@ -139,12 +139,13 @@
       (error "cannot locate this process's executable")))
 
 (defun rred-image ()
-  "This process's --core, if it was started with one (see repl-history-variables)."
+  "This process's --core, else compiler/dotcl.core (see repl-history-variables)."
   (let* ((args (dotnet:static "System.Environment" "GetCommandLineArgs"))
          (count (dotnet:invoke args "Length")))
-    (loop for i below (1- count)
-          when (equal (dotnet:invoke args "GetValue" i) "--core")
-            return (list "--core" (dotnet:invoke args "GetValue" (1+ i))))))
+    (or (loop for i below (1- count)
+              when (equal (dotnet:invoke args "GetValue" i) "--core")
+                return (list "--core" (dotnet:invoke args "GetValue" (1+ i))))
+        (list "--core" (regression-child-core)))))
 
 (defun rred-repl (lines)
   "Feed LINES to a REPL in another process; return its output and error output

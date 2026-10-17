@@ -18,8 +18,7 @@
 ;;;
 ;;; The depth tests are DEFTEST-EMITTING-ONLY: the definitions here are compiled
 ;;; whenever the image has a compiler (LOAD compiles even under :INTERPRET), and
-;;; on an emit-free build they are interpreted, where only a call back into the
-;;; same function is a tail call (interp-tail-calls.lisp).
+;;; on an emit-free build they are interpreted (interp-tail-calls.lisp).
 
 (defconstant +tc-depth+ 1000000)
 
@@ -201,11 +200,11 @@
                      :test #'string=)
           collect f))
 
-(deftest-compiled-only tail-calls.backtrace-shows-the-callee-in-place-of-the-caller
+(deftest tail-calls.backtrace-shows-the-callee-in-place-of-the-caller
   (%tc-frame-names (%tc-bt-mid 5))
   (("%TC-BT-LEAF" (5))))
 
-(deftest-compiled-only tail-calls.debug-3-keeps-the-caller
+(deftest tail-calls.debug-3-keeps-the-caller
   (%tc-frame-names (%tc-bt-mid-debug-3 5))
   (("%TC-BT-LEAF" (5)) ("%TC-BT-MID-DEBUG-3" 5)))
 
@@ -214,7 +213,7 @@
 (defun %tc-bt-via-lambda (x)
   (funcall (lambda (y) (%tc-bt-leaf y)) (list x)))
 
-(deftest-compiled-only tail-calls.lambda-passes-the-frame-on
+(deftest tail-calls.lambda-passes-the-frame-on
   (%tc-frame-names (%tc-bt-via-lambda 6))
   (("%TC-BT-LEAF" (6))))
 
@@ -222,10 +221,69 @@
 (defun %tc-err-leaf (x) (car x))
 (defun %tc-err-mid (x) (%tc-err-leaf x))
 
-(deftest-compiled-only tail-calls.error-backtrace-starts-at-the-callee
+(deftest tail-calls.error-backtrace-starts-at-the-callee
   (block nil
     (handler-bind ((type-error
                      (lambda (c) (declare (ignore c))
                        (return (car (member "%TC-ERR-LEAF" (dotcl:backtrace) :test #'string=))))))
       (%tc-err-mid 1)))
   "%TC-ERR-LEAF")
+
+;;; --- five to eight arguments ---------------------------------------------
+
+(defun %tc-bt-leaf6 (a b c d e f)
+  (declare (ignore a b c d e f))
+  (dotcl:backtrace-with-args))
+(defun %tc-bt-leaf5 (a b c d e)
+  (declare (ignore a b c d e))
+  (dotcl:backtrace-with-args))
+(defun %tc-bt-six-to-five (a b c d e f) (%tc-bt-leaf5 f e d c (list a b)))
+(defun %tc-bt-one-to-six (x) (%tc-bt-leaf6 x 2 3 4 5 6))
+(defun %tc-bt-one-to-six-to-six (x) (%tc-bt-six-to-six x 2 3 4 5 6))
+(defun %tc-bt-six-to-six (a b c d e f) (%tc-bt-leaf6 f e d c b a))
+(defun %tc-bt-one-to-six-to-two (x) (%tc-bt-six-to-two x 2 3 4 5 6))
+(defun %tc-bt-six-to-two (a b c d e f) (declare (ignore c d e)) (%tc-bt-two-to-six a (+ b f)))
+(defun %tc-bt-two-to-six (a b) (%tc-bt-leaf6 b a 9 9 9 a))
+
+(defun %tc-frame-names-6 (bt)
+  (loop for f in bt
+        when (member (car f) '("%TC-BT-LEAF5" "%TC-BT-LEAF6") :test #'string=)
+          collect f))
+
+(deftest-compiled-only tail-calls.backtrace-arguments-past-the-fourth
+  (list (%tc-frame-names-6 (%tc-bt-six-to-five 1 2 3 4 5 6))
+        (%tc-frame-names-6 (%tc-bt-one-to-six 1))
+        (%tc-frame-names-6 (%tc-bt-one-to-six-to-six 1))
+        (%tc-frame-names-6 (%tc-bt-one-to-six-to-two 1)))
+  ((("%TC-BT-LEAF5" 6 5 4 3 (1 2)))
+   (("%TC-BT-LEAF6" 1 2 3 4 5 6))
+   (("%TC-BT-LEAF6" 6 5 4 3 2 1))
+   (("%TC-BT-LEAF6" 8 1 9 9 9 1))))
+
+;;; A tail call with five or more arguments allocates nothing: the frame keeps
+;;; arguments past the fourth only when it is handed to the callee, and then in
+;;; the slots of the call that pushed it.
+
+(defun %tc-bytes () (nth 4 (dotcl:gc-stats)))
+
+(defun %tc-per-call (f arg)
+  (dotimes (i 2000) (funcall f arg))
+  (let ((best nil))
+    (dotimes (r 5 best)
+      (let ((before (%tc-bytes)))
+        (dotimes (i 100000) (funcall f arg))
+        (let ((used (floor (- (%tc-bytes) before) 100000)))
+          (when (or (null best) (< used best)) (setq best used)))))))
+
+(defun %tc-five (a b c d e) (declare (ignore b c d e)) a)
+(defun %tc-eight (a b c d e f g h) (declare (ignore b c d e f g h)) a)
+(defun %tc-six-to-five (a b c d e f) (if (eql a -1) nil (%tc-five a b c d f)))
+
+(deftest-compiled-only tail-calls.five-or-more-arguments-allocate-nothing
+  (list (%tc-per-call (let ((k 1)) (lambda (x) (%tc-five x k k k k))) 1)
+        (%tc-per-call (let ((k 1)) (lambda (x) (%tc-eight x k k k k k k k))) 1)
+        (%tc-per-call (let ((p "zz") (s "aaaaaaaa"))
+                        (lambda (x) (search p s :start2 x :end2 8 :test #'char=)))
+                      0)
+        (%tc-per-call (lambda (x) (values (%tc-six-to-five x 2 3 4 5 6))) 1))
+  (0 0 0 0))

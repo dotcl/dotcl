@@ -277,7 +277,7 @@ or on a pipe. Shell lines are not kept in the history.
 
 ### TAB
 
-TAB completes command names always. For symbols it asks `dotcl-lsp-api`, which
+TAB completes command names always. For symbols it asks `dotcl-code-info`, which
 is loaded if it is available and left out if it is not, so TAB is inert for
 symbols in a build without it. `dotcl-repl:*completer*` is the hook, and
 setting it replaces both.
@@ -450,6 +450,65 @@ usually belongs to a library rather than to your program, and taking it would
 let a failed script resume at the next form and still exit 0. A REPL whose
 standard input is not a terminal counts as not interactive: `echo ... | dotcl
 repl` reports the error, skips the rest of the input and exits 1.
+
+## A terminal other than the console
+
+The line editor, its menus and the debugger's menus read keys from, write to
+and ask the size of `dotcl-repl:*terminal*`, which is System.Console unless
+something binds it. A host with no console (a page running dotcl in a browser,
+a window in an application) supplies its own:
+
+```lisp
+(dotcl-repl:make-terminal
+  :read-key (lambda () ...)          ; wait for a key: a System.ConsoleKeyInfo, NIL for end of input
+  :write (lambda (string) ...)       ; show STRING, escape sequences and all
+  :width (lambda () 100)             ; columns, or NIL when not known
+  :height (lambda () 30)             ; rows, or NIL when not known
+  :key-available-p (lambda () ...)   ; optional: would READ-KEY return at once?
+  :term nil)                         ; optional: what TERM would say; "dumb" turns editing off
+```
+
+Keys are `System.ConsoleKeyInfo` values, as `Console.ReadKey` returns them:
+an arrow key is one key (`ConsoleKey.UpArrow`), not the escape sequence a
+terminal emulator sends for it, so a host that receives bytes from a terminal
+emulator turns its sequences into keys before handing them over. Ctrl+C while
+the editor waits for a key is a key too (`ConsoleKey.C` with Control), and drops
+the line as it does at the console. `KEY-AVAILABLE-P` matters only to a host that
+hands over the parts of an escape sequence (bracketed paste) one character at a
+time; without it, Escape is always read as Escape on its own.
+
+To run the whole REPL there, call `dotcl-repl:run-repl` on a thread of its own:
+
+```lisp
+(dotcl-repl:run-repl :terminal terminal      ; default: *terminal*
+                     :output stream          ; default: *standard-output*
+                     :error-output stream    ; default: OUTPUT
+                     :input stream           ; default: *standard-input*
+                     :color :auto            ; T, NIL, or :auto (off under NO_COLOR or TERM=dumb)
+                     :history-file nil)      ; where to keep the history; default: nowhere
+```
+
+It prompts, reads with the line editor on TERMINAL, evaluates and prints until
+the end of input (READ-KEY returning NIL, Ctrl+D on an empty line, or `,quit`),
+then returns NIL. The banner, the values, error messages and the debugger go to
+OUTPUT and ERROR-OUTPUT, and so does what the evaluated code prints:
+`*standard-output*` and `*error-output*` are those streams while it runs, and
+`*terminal-io*`, `*query-io*` and `*debug-io*` join INPUT and OUTPUT. When the
+streams and the terminal show on one screen, the editor finishes the output of
+the two streams before it writes the next prompt. A terminal whose TERM is
+`"dumb"` cannot run it, and RUN-REPL signals an error.
+
+Everything RUN-REPL sets up is for its own thread: a console REPL in the same
+process keeps its line editor, colour and history as they were, during and
+after. When the terminal fails (READ-KEY signals an error), that REPL ends and
+RUN-REPL returns.
+
+There is no signal to interrupt an evaluation with. `(dotcl-repl:interrupt-repl)`,
+from any thread, interrupts the form the REPL is evaluating as Ctrl+C does at
+the console, and returns T. It returns NIL, and does nothing, when no REPL is
+running or the REPL is waiting for a key: there, hand Ctrl+C to the terminal as
+a key instead. An interrupt that arrives once the REPL is waiting for a key
+again, or has returned, does nothing.
 
 ## Not there yet
 

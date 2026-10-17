@@ -50,22 +50,23 @@ public static partial class Runtime
     };
 
     public static LispObject LispErrorFormat(LispObject[] args)
+        => throw ConditionSystem.ErrorExit(ErrorCondition(args));
+
+    /// <summary>The condition (ERROR datum . arguments) signals.</summary>
+    private static LispCondition ErrorCondition(LispObject[] args)
     {
         if (args.Length == 0)
-            return ConditionSystem.Error(new LispError("Unknown error"));
+            return new LispError("Unknown error");
         // (error condition-object): pass through
         if (args[0] is LispCondition cond)
-            return ConditionSystem.Error(cond);
+            return cond;
         if (args[0] is LispInstance errInst)
-            return ConditionSystem.Error(new LispInstanceCondition(errInst));
+            return new LispInstanceCondition(errInst);
         // (error 'condition-type) or (error 'condition-type :initarg val ...); create condition instance
         if (args[0] is Symbol sym)
         {
             var initargs = args.SubArray(1);
-            var condObj = MakeConditionFromType(sym, initargs);
-            if (condObj is LispInstanceCondition lic)
-                return ConditionSystem.Error(lic);
-            return ConditionSystem.Error(condObj);
+            return MakeConditionFromType(sym, initargs);
         }
         // (error function &rest args): function is a format control (e.g. from formatter)
         if (args[0] is LispFunction fn)
@@ -87,10 +88,10 @@ public static partial class Runtime
             simpleErr.ConditionTypeName = "SIMPLE-ERROR";
             simpleErr.FormatControl = args[0];
             simpleErr.FormatArguments = args.Length > 1 ? Runtime.List(args.SubArray(1)) : Nil.Instance;
-            return ConditionSystem.Error(simpleErr);
+            return simpleErr;
         }
         if (FormatControlText(args[0]) is not string fmtText)
-            return ConditionSystem.Error(new LispError(args[0].ToString()));
+            return new LispError(args[0].ToString());
         string message;
         try { message = ((LispString)Format(Nil.Instance, args)).Value; }
         catch { message = fmtText; }
@@ -98,7 +99,7 @@ public static partial class Runtime
         err.ConditionTypeName = "SIMPLE-ERROR";
         err.FormatControl = args[0];
         err.FormatArguments = Runtime.List(args.SubArray(1));
-        return ConditionSystem.Error(err);
+        return err;
     }
 
     /// <summary>Signal the SIMPLE-ERROR of METHOD-COMBINATION-ERROR / INVALID-METHOD-ERROR:

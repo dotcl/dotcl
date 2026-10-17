@@ -103,12 +103,14 @@ public static class Arithmetic
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Number Multiply(Number a, Number b)
     {
-        // Fixnum fast path: use checked to detect overflow
         if (a is Fixnum fa && b is Fixnum fb)
         {
-            try { return Fixnum.Make(checked(fa.Value * fb.Value)); }
-            catch (OverflowException) { return new Bignum((BigInteger)fa.Value * fb.Value); }
+            long hi = Compat.BigMul(fa.Value, fb.Value, out long lo);
+            if (hi == (lo >> 63)) return Fixnum.Make(lo);
+            return new Bignum((BigInteger)fa.Value * fb.Value);
         }
+        if (a is Bignum or Fixnum && b is Bignum or Fixnum)
+            return MultiplyIntegers(a, b);
 
         // SingleFloat fast path
         if (a is SingleFloat sfa && b is SingleFloat sfb)
@@ -150,17 +152,211 @@ public static class Arithmetic
         if (a is SingleFloat || b is SingleFloat)
             return new SingleFloat(ToSingle(a) * ToSingle(b));
 
-        // Integer by integer: multiply directly. The rational form below would
-        // build two (numerator, denominator) pairs and then reduce by a GCD that
-        // is always 1 -- the reduction alone was 43% of the FACTORIAL benchmark.
-        if (a is Bignum or Fixnum && b is Bignum or Fixnum)
-            return Bignum.MakeInteger(IntValue(a) * IntValue(b));
-
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
         if (BothExact(a, b)) return RationalMultiply(an, ad, bn, bd);
         return (Number)Ratio.Make(an * bn, ad * bd);
     }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static Number AddIntegers(LispObject a, LispObject b) =>
+        Bignum.MakeInteger(IntValue(a) + IntValue(b));
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static Number SubtractIntegers(LispObject a, LispObject b) =>
+        Bignum.MakeInteger(IntValue(a) - IntValue(b));
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static Number MultiplyIntegers(LispObject a, LispObject b) =>
+        Bignum.MakeInteger(MultiplyBig(IntValue(a), IntValue(b)));
+
+    internal static BigInteger MultiplyBig(BigInteger x, BigInteger y)
+    {
+#if !NETSTANDARD2_0
+        var mx = BigInteger.Abs(x);
+        var my = BigInteger.Abs(y);
+        long lx = mx.GetBitLength(), ly = my.GetBitLength();
+        long words = ((lx + 31) >> 5) * ((ly + 31) >> 5);
+        if (lx <= MulWordsMax * 64 && ly <= MulWordsMax * 64 && words >= 9)
+        {
+            BigInteger r;
+            if (lx <= 128 && ly <= 128) r = Multiply128(mx, my);
+            else if (words >= 20 && lx > 32 && ly > 32) r = MultiplyWords(mx, my, lx, ly);
+            else return x * y;
+            return (x.Sign ^ y.Sign) < 0 ? -r : r;
+        }
+#endif
+        return x * y;
+    }
+
+#if !NETSTANDARD2_0
+    // BigInteger multiplies in 32-bit limbs. With 64-bit limbs a product of up
+    // to 4 x 4 limbs is faster, once the 32-bit limb products number 9 or more
+    // (two-limb operands) or 20 or more (wider ones).
+    [SkipLocalsInit]
+    private static BigInteger Multiply128(BigInteger x, BigInteger y)
+    {
+        UInt128 a = (UInt128)x, b = (UInt128)y;
+        ulong a0 = (ulong)a, a1 = (ulong)(a >> 64), b0 = (ulong)b, b1 = (ulong)(b >> 64);
+        UInt128 p00 = (UInt128)a0 * b0, p01 = (UInt128)a0 * b1, p10 = (UInt128)a1 * b0;
+        UInt128 mid = (p00 >> 64) + (ulong)p01 + (ulong)p10;
+        UInt128 hi = (mid >> 64) + (p01 >> 64) + (p10 >> 64) + (UInt128)a1 * b1;
+        Span<ulong> r = stackalloc ulong[4];
+        r[0] = (ulong)p00;
+        r[1] = (ulong)mid;
+        r[2] = (ulong)hi;
+        r[3] = (ulong)(hi >> 64);
+        return new BigInteger(System.Runtime.InteropServices.MemoryMarshal.AsBytes(r), isUnsigned: true);
+    }
+
+    private const int MulWordsMax = 32;
+
+    [SkipLocalsInit]
+    private static BigInteger MultiplyWords(BigInteger x, BigInteger y, long lx, long ly)
+    {
+        Span<ulong> a = stackalloc ulong[MulWordsMax];
+        Span<ulong> b = stackalloc ulong[MulWordsMax];
+        Span<ulong> r = stackalloc ulong[2 * MulWordsMax];
+        int na = (int)((lx + 63) >> 6), nb = (int)((ly + 63) >> 6);
+        a.Clear(); b.Clear(); r.Slice(0, na + nb).Clear();
+        x.TryWriteBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(a), out _, isUnsigned: true);
+        y.TryWriteBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(b), out _, isUnsigned: true);
+        for (int i = 0; i < na; i++)
+        {
+            ulong carry = 0, ai = a[i];
+            for (int j = 0; j < nb; j++)
+            {
+                ulong hi = Math.BigMul(ai, b[j], out ulong lo);
+                lo += carry;
+                hi += lo < carry ? 1UL : 0UL;
+                ulong t = r[i + j] + lo;
+                hi += t < lo ? 1UL : 0UL;
+                r[i + j] = t;
+                carry = hi;
+            }
+            r[i + nb] = carry;
+        }
+        return new BigInteger(System.Runtime.InteropServices.MemoryMarshal.AsBytes(r.Slice(0, na + nb)), isUnsigned: true);
+    }
+#endif
+
+#if !NETSTANDARD2_0
+    private const int RemWordsMax = 32;
+
+    /// <summary>x % y (the sign of x), with 64-bit limbs when |y| has 2 to 32
+    /// limbs and |x| at least 2 more and at most 64: Knuth's algorithm D, each
+    /// quotient limb estimated with a precomputed reciprocal of the divisor's top
+    /// limb. A quotient of one or two limbs is left to BigInteger, which needs no
+    /// reciprocal.</summary>
+    internal static BigInteger RemainderBig(BigInteger x, BigInteger y)
+    {
+        if (y.IsZero) return x % y;
+        var mx = BigInteger.Abs(x);
+        var my = BigInteger.Abs(y);
+        long lx = mx.GetBitLength(), ly = my.GetBitLength();
+        int m = (int)((lx + 63) >> 6), n = (int)((ly + 63) >> 6);
+        if (n < 2 || n > RemWordsMax || m > 2 * RemWordsMax || m - n < 2)
+            return x % y;
+        var r = RemainderWords(mx, my, m, n);
+        return x.Sign < 0 ? -r : r;
+    }
+
+    [SkipLocalsInit]
+    private static BigInteger RemainderWords(BigInteger x, BigInteger y, int m, int n)
+    {
+        Span<ulong> u = stackalloc ulong[2 * RemWordsMax + 1];
+        Span<ulong> v = stackalloc ulong[RemWordsMax];
+        u.Slice(0, m + 1).Clear(); v.Slice(0, n).Clear();
+        x.TryWriteBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(u.Slice(0, m)), out _, isUnsigned: true);
+        y.TryWriteBytes(System.Runtime.InteropServices.MemoryMarshal.AsBytes(v.Slice(0, n)), out _, isUnsigned: true);
+        int s = System.Numerics.BitOperations.LeadingZeroCount(v[n - 1]);
+        if (s != 0)
+        {
+            for (int i = n - 1; i > 0; i--) v[i] = (v[i] << s) | (v[i - 1] >> (64 - s));
+            v[0] <<= s;
+            u[m] = u[m - 1] >> (64 - s);
+            for (int i = m - 1; i > 0; i--) u[i] = (u[i] << s) | (u[i - 1] >> (64 - s));
+            u[0] <<= s;
+        }
+        ulong d = v[n - 1], d2 = v[n - 2];
+        ulong inv = (ulong)(UInt128.MaxValue / d);
+        for (int j = m - n; j >= 0; j--)
+        {
+            ulong uh = u[j + n], ul = u[j + n - 1];
+            ulong qhat, rhat;
+            bool rbig = false;
+            if (uh >= d)
+            {
+                qhat = ulong.MaxValue;
+                rhat = ul + d;
+                rbig = rhat < ul;
+            }
+            else
+            {
+                qhat = Div2By1(uh, ul, d, inv, out rhat);
+            }
+            while (!rbig)
+            {
+                UInt128 lhs = (UInt128)qhat * d2;
+                UInt128 rhs = ((UInt128)rhat << 64) | u[j + n - 2];
+                if (lhs <= rhs) break;
+                qhat--;
+                ulong r2 = rhat + d;
+                rbig = r2 < rhat;
+                rhat = r2;
+            }
+            ulong carry = 0;
+            for (int i = 0; i < n; i++)
+            {
+                UInt128 p = (UInt128)qhat * v[i] + carry;
+                ulong plo = (ulong)p;
+                carry = (ulong)(p >> 64);
+                ulong t = u[i + j] - plo;
+                carry += t > u[i + j] ? 1UL : 0UL;
+                u[i + j] = t;
+            }
+            ulong top = u[j + n];
+            u[j + n] = top - carry;
+            if (carry > top)
+            {
+                ulong c = 0;
+                for (int i = 0; i < n; i++)
+                {
+                    ulong a = u[i + j], b = v[i];
+                    ulong t = a + b;
+                    ulong c1 = t < a ? 1UL : 0UL;
+                    ulong t2 = t + c;
+                    ulong c2 = t2 < t ? 1UL : 0UL;
+                    u[i + j] = t2;
+                    c = c1 + c2;
+                }
+                u[j + n] += c;
+            }
+        }
+        if (s != 0)
+        {
+            for (int i = 0; i < n - 1; i++) u[i] = (u[i] >> s) | (u[i + 1] << (64 - s));
+            u[n - 1] >>= s;
+        }
+        return new BigInteger(System.Runtime.InteropServices.MemoryMarshal.AsBytes(u.Slice(0, n)), isUnsigned: true);
+    }
+
+    /// <summary>(uh:ul) / d for a normalized d and uh &lt; d, with inv = floor((2^128 - 1) / d) mod 2^64
+    /// (Moller and Granlund, "Improved division by invariant integers", algorithm 4).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ulong Div2By1(ulong uh, ulong ul, ulong d, ulong inv, out ulong rem)
+    {
+        UInt128 q = (UInt128)inv * uh + (((UInt128)uh << 64) | ul);
+        ulong q1 = (ulong)(q >> 64) + 1, q0 = (ulong)q;
+        ulong r = ul - q1 * d;
+        if (r > q0) { q1--; r += d; }
+        if (r >= d) { q1++; r -= d; }
+        rem = r;
+        return q1;
+    }
+#else
+    internal static BigInteger RemainderBig(BigInteger x, BigInteger y) => x % y;
+#endif
 
     // --- Division ---
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -280,6 +476,7 @@ public static class Arithmetic
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
+            if (bv == 0) throw Runtime.QuotientByZero(av);
             if (bv == -1) return Fixnum.Make(0);
             long r = av % bv;
             // CL mod: result has same sign as divisor
@@ -289,6 +486,7 @@ public static class Arithmetic
         // A fixnum by a bignum: the bignum's magnitude is larger than any fixnum's,
         // so the quotient's floor is 0 (same signs, or a = 0) or -1. No BigInteger
         // division: (mod x (expt 2 64)) is how code keeps a value in 64 bits.
+        if (b is Fixnum { Value: 0 }) throw Runtime.QuotientByZero(a, b);
         if (a is Fixnum sa && b is Bignum sb && OutsideLong(sb.Value))
         {
             long av = sa.Value;
@@ -305,7 +503,7 @@ public static class Arithmetic
             return Floor(a, b).remainder;
         var (an, _) = AsRational(a);
         var (bn, _) = AsRational(b);
-        var iresult = an % bn;
+        var iresult = RemainderBig(an, bn);
         // CL mod: result has same sign as divisor
         if (iresult != 0 && (iresult < 0) != (bn < 0))
             iresult += bn;
@@ -316,12 +514,13 @@ public static class Arithmetic
     {
         // A float operand: REM is the second value of TRUNCATE.
         // A fixnum by a bignum: |a| < |b|, so the truncated quotient is 0.
+        if (b is Fixnum { Value: 0 }) throw Runtime.QuotientByZero(a, b);
         if (a is Fixnum && b is Bignum rb && OutsideLong(rb.Value)) return a;
         if (IsFloatNum(a) || IsFloatNum(b) || a is Ratio || b is Ratio)
             return Truncate(a, b).remainder;
         var (an, _) = AsRational(a);
         var (bn, _) = AsRational(b);
-        return (Number)Bignum.MakeInteger(an % bn);
+        return (Number)Bignum.MakeInteger(RemainderBig(an, bn));
     }
 
     // IEEE 754 double has an 11-bit exponent field with bias 1023, giving a
@@ -716,7 +915,7 @@ public static class Arithmetic
     };
 
     // The exact integer an integral float stands for.
-    private static Number FloatToInteger(double q)
+    internal static Number FloatToInteger(double q)
     {
         if (q > -9.2e18 && q < 9.2e18) return Fixnum.Make((long)q);
         return (Number)Bignum.MakeInteger(new BigInteger(q));
@@ -728,6 +927,7 @@ public static class Arithmetic
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
+            if (bv == 0) throw Runtime.QuotientByZero(av);
             // A divisor of -1 divides exactly; negate instead, since
             // most-negative-fixnum / -1 overflows the int64 division.
             if (bv == -1) return (Negate(fa), Fixnum.Make(0));
@@ -736,6 +936,7 @@ public static class Arithmetic
             if (r != 0 && ((r ^ bv) < 0)) { q--; r += bv; }
             return (Fixnum.Make(q), Fixnum.Make(r));
         }
+        if (b is Fixnum { Value: 0 }) throw Runtime.QuotientByZero(a, b);
         if ((IsFloatNum(a) || IsFloatNum(b)) && FloatRound(a, b, RoundMode.Floor, false, out var fr))
             return fr;
         var (an, ad) = AsRationalAny(a);
@@ -762,12 +963,14 @@ public static class Arithmetic
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
+            if (bv == 0) throw Runtime.QuotientByZero(av);
             // A divisor of -1 divides exactly; negate instead, since
             // most-negative-fixnum / -1 overflows the int64 division.
             if (bv == -1) return (Negate(fa), Fixnum.Make(0));
             long q = Math.DivRem(av, bv, out long r);
             return (Fixnum.Make(q), Fixnum.Make(r));
         }
+        if (b is Fixnum { Value: 0 }) throw Runtime.QuotientByZero(a, b);
         if ((IsFloatNum(a) || IsFloatNum(b)) && FloatRound(a, b, RoundMode.Truncate, false, out var fr))
             return fr;
         var (an, ad) = AsRationalAny(a);
@@ -791,6 +994,7 @@ public static class Arithmetic
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
+            if (bv == 0) throw Runtime.QuotientByZero(av);
             // A divisor of -1 divides exactly; negate instead, since
             // most-negative-fixnum / -1 overflows the int64 division.
             if (bv == -1) return (Negate(fa), Fixnum.Make(0));
@@ -799,6 +1003,7 @@ public static class Arithmetic
             if (r != 0 && ((r ^ bv) >= 0)) { q++; r -= bv; }
             return (Fixnum.Make(q), Fixnum.Make(r));
         }
+        if (b is Fixnum { Value: 0 }) throw Runtime.QuotientByZero(a, b);
         if ((IsFloatNum(a) || IsFloatNum(b)) && FloatRound(a, b, RoundMode.Ceiling, false, out var fr))
             return fr;
         var (an, ad) = AsRationalAny(a);
@@ -819,6 +1024,7 @@ public static class Arithmetic
 
     public static (Number quotient, Number remainder) Round(Number a, Number b)
     {
+        if (b is Fixnum { Value: 0 }) throw Runtime.QuotientByZero(a, b);
         if ((IsFloatNum(a) || IsFloatNum(b)) && FloatRound(a, b, RoundMode.Round, false, out var fr))
             return fr;
         var (an, ad) = AsRationalAny(a);
@@ -969,7 +1175,7 @@ public static class Arithmetic
     /// <summary>The exact integer value of a FIXNUM or BIGNUM. Used by the
     /// integer fast paths in Add/Subtract/Multiply, which exist so an operation on
     /// integers does not build a rational and reduce it.</summary>
-    private static BigInteger IntValue(Number n) =>
+    private static BigInteger IntValue(LispObject n) =>
         n is Fixnum f ? f.Value : ((Bignum)n).Value;
 
     // --- Exact rational arithmetic (Knuth 4.5.1) ---

@@ -137,6 +137,12 @@ make install              # builds and installs the local nupkg as `dotcl`
 After the first cross-compile, dotcl can build itself:
 `DOTCL_LISP=dotcl make cross-compile` rebuilds the compiler with dotcl.
 
+The test targets (`make test-regression` and the others) run the runtime's
+Debug configuration through `dotnet run`. Debug compiles the runtime's C# with
+optimization on, like Release; it differs in defining `DEBUG` (test-only code)
+and keeping its pdbs. To step through the runtime's C# in a debugger, build it
+unoptimized: `dotnet build runtime/runtime.csproj -p:Optimize=false`.
+
 On Windows:
 
 - **`make`**: the build needs GNU Make. Git Bash (bundled with

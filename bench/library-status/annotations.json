@@ -15,20 +15,18 @@
 
   "spatial-trees": "The result varies from run to run: the suites build their trees from `random` rectangles and points, and of four runs with the same dotcl and dists, one failed 3 of 18 checks and three passed all of theirs (the run shown is one of these).",
 
-  "hu.dwim.logger": "Stops in its dependency hu.dwim.util, for hu.dwim.util's reason.",
 
   "april": "The Quicklisp dist's april release ships cape/cape.asd in its tarball but does not index it, so `(ql:quickload \"april\")` fails with `System \"cape\" not found` on SBCL as well. Loaded from the unpacked release tree instead, `(april (test))` passes 1140 of 1140 here.",
 
-  "hu.dwim.util": "`source/place.lisp` warns at read time (`#.(warn ...)`) that `symbol-global-value` has no implementation outside SBCL, and dotcl stops an ASDF build when a file's compilation reports failure, as SBCL does.",
+  "hu.dwim.util": "Loads; `source/place.lisp` warns at read time (`#.(warn ...)`) that `symbol-global-value` has no implementation outside SBCL and falls back to `symbol-value`.",
 
-  "hu.dwim.walker": "Stops in its dependency hu.dwim.util, for hu.dwim.util's reason.",
-
-  "hu.dwim.serializer": "Stops in its dependency hu.dwim.util, for hu.dwim.util's reason.",
+  "hu.dwim.walker": "Loads. Its test system needs iolib, which has no branch for dotcl's Gray streams, and, as on SBCL, the C library libfixposix, which the measuring machine does not have.",
 
 
-  "clx": "`dependent.lisp` warns at compile time that `buffer-input-wait-default` falls back to polling on an implementation it has no code for; dotcl stops an ASDF build when a file's compilation reports failure, as SBCL does.",
 
-  "magicl": "`with-array-pointers` signals an error while expanding on an implementation it does not know, so the BLAS bindings of `magicl/ext-blas` fail to compile (and would signal it when called); dotcl stops an ASDF build when a file's compilation reports failure, as SBCL does.",
+  "clx": "Loads. Its tests connect to an X server, and the measuring machine has none (`DISPLAY` is not set); SBCL fails the same four. `dependent.lisp` still warns at compile time that `buffer-input-wait-default` falls back to polling on an implementation it has no code for.",
 
-  "coalton": "The released Coalton implements its hashing only for SBCL, Allegro and CCL and stops with `#.(error ...)` elsewhere, so it does not load. The dotcl fork loads in about 90 seconds, but building its test system takes about 1,100 seconds on dotcl (SBCL 2.6.8 on the same machine: about 130), over half of it in `tests/seq-tests.lisp` (650 seconds; SBCL: 63), so the test run hits the 900-second bound before any test runs."
+  "magicl": "Loads, but `with-array-pointers` signals an error while expanding on an implementation it does not know, so the tests stop at the first BLAS call. With a dotcl branch there the tests get as far as on SBCL, which stops in the LAPACK examples on `zuncsd_`, a routine the measuring machine's LAPACK does not export.",
+
+  "coalton": "The released Coalton (2026-01-01) implements its hashing only for SBCL, Allegro and CCL and stops with `#.(error ...)` elsewhere, so it does not load. Coalton's upstream main supports dotcl, and the with forks column is measured from it: it loads in 51 seconds and its suite passes (698 checks), but building the test system takes 201 seconds and running the suite 481 (SBCL 2.6.8 on the same machine: 20, 70 and 53 seconds, with 757 checks including the thread tests dotcl does not run)."
 }

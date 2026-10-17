@@ -42,54 +42,19 @@ static class PackR2r
     public static string? Compile(string faslPath, string targetRid, string ridNupkg,
                                   string workRoot, out string why)
     {
-        why = "";
-        var hostRid = HostRid();
-        if (hostRid == null) { why = "unrecognized host platform"; return null; }
-        if (!TargetParts(targetRid, out var targetOs, out var targetArch))
-        {
-            why = $"unsupported target rid {targetRid}";
+        if (!Tools(targetRid, out var crossgen2, out var refDir, out var targetOs, out var targetArch, out why))
             return null;
-        }
-
-        var crossgen2 = FindCrossgen2(hostRid);
-        if (crossgen2 == null)
-        {
-            Prime(hostRid);
-            crossgen2 = FindCrossgen2(hostRid);
-        }
-        if (crossgen2 == null)
-        {
-            why = $"crossgen2 for the packing host ({hostRid}) is not restored, and "
-                + $"`dotnet publish -r {hostRid} -p:PublishReadyToRun=true` did not bring it in";
-            return null;
-        }
-
-        var refDir = FindRuntimeRefDir(targetRid);
-        if (refDir == null)
-        {
-            Prime(targetRid);
-            refDir = FindRuntimeRefDir(targetRid);
-        }
-        if (refDir == null)
-        {
-            why = $"the .NET runtime reference pack for {targetRid} is not restored, and "
-                + $"`dotnet publish -r {targetRid} -p:PublishReadyToRun=true` did not bring it in";
-            return null;
-        }
 
         var work = Path.Combine(workRoot, "r2r-" + targetRid);
         Directory.CreateDirectory(work);
 
-        // crossgen2 wants a .dll extension on its input, and dotcl.core is a .NET
-        // assembly under a name crossgen2 will not read as one either.
-        var input = Path.Combine(work, "in.dll");
-        File.Copy(faslPath, input, true);
         var payload = Path.Combine(work, "payload");
         Directory.CreateDirectory(payload);
         var wanted = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["runtime.dll"] = "runtime.dll",
             ["DotCL.Runtime.dll"] = "DotCL.Runtime.dll",
+            // crossgen2 will not read an assembly without a .dll name.
             ["dotcl.core"] = "dotcl.core.dll",
         };
         // Extracted every time, overwriting: a second pack into the same output
@@ -112,6 +77,81 @@ static class PackR2r
             why = $"{Path.GetFileName(ridNupkg)} does not carry " + string.Join(", ", absent);
             return null;
         }
+        return Run(crossgen2, refDir, Path.Combine(payload, "*.dll"), faslPath, targetRid,
+                   targetOs, targetArch, work, out why);
+    }
+
+    /// <summary>
+    /// Like Compile, against the runtime images of the running dotcl instead of
+    /// a dotcl package: for fasls this process compiled, whose DotCL.Runtime is
+    /// the one they were compiled against.
+    /// </summary>
+    public static string? CompileAgainstRunning(string faslPath, string targetRid,
+                                                string workRoot, out string why)
+    {
+        if (!Tools(targetRid, out var crossgen2, out var refDir, out var targetOs, out var targetArch, out why))
+            return null;
+        var work = Path.Combine(workRoot, "r2r-" + targetRid);
+        Directory.CreateDirectory(work);
+        return Run(crossgen2, refDir, Path.Combine(AppContext.BaseDirectory, "*.dll"), faslPath,
+                   targetRid, targetOs, targetArch, work, out why);
+    }
+
+    /// <summary>The host crossgen2 and TARGETRID's runtime reference pack,
+    /// restoring either when missing. False with WHY when one is unavailable.</summary>
+    public static bool CanCompile(string targetRid, out string why) =>
+        Tools(targetRid, out _, out _, out _, out _, out why);
+
+    static bool Tools(string targetRid, out string crossgen2, out string refDir,
+                      out string targetOs, out string targetArch, out string why)
+    {
+        crossgen2 = refDir = targetOs = targetArch = why = "";
+        var hostRid = Runtime.PortableRid();
+        if (hostRid == null) { why = "unrecognized host platform"; return false; }
+        if (!TargetParts(targetRid, out targetOs, out targetArch))
+        {
+            why = $"unsupported target rid {targetRid}";
+            return false;
+        }
+
+        var cg = FindCrossgen2(hostRid);
+        if (cg == null)
+        {
+            Prime(hostRid);
+            cg = FindCrossgen2(hostRid);
+        }
+        if (cg == null)
+        {
+            why = $"crossgen2 for the packing host ({hostRid}) is not restored, and "
+                + $"`dotnet publish -r {hostRid} -p:PublishReadyToRun=true` did not bring it in";
+            return false;
+        }
+
+        var rd = FindRuntimeRefDir(targetRid);
+        if (rd == null)
+        {
+            Prime(targetRid);
+            rd = FindRuntimeRefDir(targetRid);
+        }
+        if (rd == null)
+        {
+            why = $"the .NET runtime reference pack for {targetRid} is not restored, and "
+                + $"`dotnet publish -r {targetRid} -p:PublishReadyToRun=true` did not bring it in";
+            return false;
+        }
+        crossgen2 = cg;
+        refDir = rd;
+        return true;
+    }
+
+    static string? Run(string crossgen2, string refDir, string payloadRefs, string faslPath,
+                       string targetRid, string targetOs, string targetArch, string work,
+                       out string why)
+    {
+        why = "";
+        // crossgen2 wants a .dll extension on its input.
+        var input = Path.Combine(work, "in.dll");
+        File.Copy(faslPath, input, true);
 
         // Written under a temporary name: an output truncated by a crossgen2 that
         // died midway would be NEWER than the fasl, so the loader would take it.
@@ -126,7 +166,7 @@ static class PackR2r
         psi.ArgumentList.Add("-r");
         psi.ArgumentList.Add(Path.Combine(refDir, "*.dll"));
         psi.ArgumentList.Add("-r");
-        psi.ArgumentList.Add(Path.Combine(payload, "*.dll"));
+        psi.ArgumentList.Add(payloadRefs);
         psi.ArgumentList.Add("--targetos");
         psi.ArgumentList.Add(targetOs);
         psi.ArgumentList.Add("--targetarch");
@@ -219,7 +259,7 @@ static class PackR2r
     /// ReadyToRun images should not quietly come out without them.</summary>
     internal static string? EnsureHostCrossgen2()
     {
-        var host = HostRid();
+        var host = Runtime.PortableRid();
         if (host == null) return null;
         var cg = FindCrossgen2(host);
         if (cg != null) return cg;
@@ -270,23 +310,6 @@ static class PackR2r
             if (best == null || (v != null && (bestV == null || v > bestV))) { best = candidate; bestV = v; }
         }
         return best;
-    }
-
-    internal static string? HostRid()
-    {
-        var os = OperatingSystem.IsWindows() ? "win"
-               : OperatingSystem.IsMacOS() ? "osx"
-               : OperatingSystem.IsLinux() ? "linux"
-               : null;
-        if (os == null) return null;
-        var arch = System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture switch
-        {
-            System.Runtime.InteropServices.Architecture.X64 => "x64",
-            System.Runtime.InteropServices.Architecture.Arm64 => "arm64",
-            System.Runtime.InteropServices.Architecture.X86 => "x86",
-            _ => null,
-        };
-        return arch == null ? null : $"{os}-{arch}";
     }
 
     static bool TargetParts(string rid, out string os, out string arch)

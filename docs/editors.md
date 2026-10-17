@@ -84,3 +84,26 @@ Then `M-x package-refresh-contents` and `M-x package-install RET sly RET`.
 ### Connecting
 
 `M-x sly-connect`, host `127.0.0.1`, port `4006`.
+
+## What to expect
+
+These work with both SLIME and SLY: evaluation and the REPL, symbol
+completion, compiling a form or a file from a buffer, and the argument list of
+functions you define. The argument list of built-in functions such as `mapcar`
+is not shown, and `M-.` does not find definitions, not even for functions
+loaded from a file.
+
+## Known limitations
+
+- The debugger shows no frames. An error opens the SLIME or SLY debugger with
+  `[No backtrace]`; the restarts are listed and work. To see the frames, run
+  the code in `dotcl repl`, whose debugger lists them with `:bt` (see
+  [REPL](repl.md)).
+- With SLY, the first request after connecting can rarely get no answer. If
+  the REPL does not respond, `M-x sly-disconnect` and connect again.
+
+## Other editors
+
+Other editors, such as lem and VS Code, are not covered here. They have not
+been checked with dotcl, and dotcl has no VS Code extension or language server
+yet.

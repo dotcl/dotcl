@@ -48,17 +48,20 @@ bench-state.json
 !scripts/fasl-shape-check.sh
 !scripts/build-quicklisp.sh
 !scripts/contrib-resolve.sh
+!scripts/check-host-defs.sh
+!scripts/dist-package.sh
 !ci/d-number.sh
 !ci/mirror-scrub-workflows.sh
 !test/ansi-failures.sh
 !test/ansi-gate.sh
-!bench/make-state.sh
-!bench/check-ratios.sh
+!bench/cl-bench-runner/make-state.sh
+!bench/gate/check-ratios.sh
 !bench/il-parity/check-counts.sh
 !bench/sil-shapes/count-sil.sh
 !bench/csharp-parity/make-parity-state.sh
-!bench/process-modes.sh
-!bench/test-modes.sh
+!bench/gate/process-modes.sh
+!bench/gate/regression-time.sh
+!bench/gate/test-modes.sh
 !bench/library-status/run-quickload.sh
 !bench/library-status/run-tests.sh
 !bench/library-status/scrub.sh
@@ -102,6 +105,8 @@ scratch.txt
 # are on the list at all.
 !bench/library-status/hand-picked.txt
 *.fasl
+# A fasl a released dotcl wrote, loaded by the regression suite as it is.
+!test/regression/legacy-fasl/*.fasl
 # Ahead-of-time siblings (<name>.fasl.r2r-<rid>, dotcl.core.r2r-<rid>). The
 # marker sits after the whole filename so that *.fasl globs do not match one,
 # which also means this rule has to name them itself.

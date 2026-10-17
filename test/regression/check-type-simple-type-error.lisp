@@ -28,3 +28,27 @@
       (check-type (car (progn (incf reads) cell)) string))
     (list (car cell) (<= reads 4)))
   ("ok" t))
+
+;; A CHECK-TYPE that passes costs no allocation: the place is not captured by
+;; the restart's closures, which would put it in a heap cell on entry.
+(defun %ct-pass (x y) (check-type x integer) (check-type y (or null cons)) x)
+(defun %ct-pass-loop (n)
+  (declare (fixnum n))
+  (let ((r 0))
+    (dotimes (i n r) (setq r (%ct-pass 5 nil)))))
+
+(deftest-compiled-only check-type-simple-type-error.pass-no-alloc
+  (< (bytes-per-op #'%ct-pass-loop) 8)
+  t)
+
+;; The STORE-VALUE restart's report and the stored value through a variable.
+(deftest check-type-simple-type-error.store-value-report
+  (let ((x 'bah) (report nil))
+    (handler-bind ((type-error
+                     (lambda (c)
+                       (let ((r (find-restart 'store-value c)))
+                         (setq report (princ-to-string r))
+                         (invoke-restart r 42)))))
+      (check-type x integer "a count"))
+    (list x report))
+  (42 "Supply a new value of type a count."))

@@ -173,9 +173,10 @@
           (%oww-error #'%oww-w64 v 0 #x10000000000000000)))
   (:type-error :type-error))
 
-;;; A narrower one is not checked (no integer binding is): the octet stores
-;;; take its low bits, and the SETF returns the value given.
-(deftest octet-word-write.narrow-values
+;;; A narrower one is not checked in the inline expansion (no integer binding
+;;; is): the octet stores take its low bits, and the SETF returns the value
+;;; given. The emit-free interpreter calls the function, which checks it.
+(deftest-emitting-only octet-word-write.narrow-values
   (let ((v (%oww-octets 6)))
     (declare (type %oww-octets v))
     (list (%oww-w32 v 0 #x1ffffffff) (%oww-w16 v 4 -2)

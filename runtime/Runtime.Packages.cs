@@ -778,6 +778,7 @@ public static partial class Runtime
         }
 
         // 3-8. Perform the actual deletion
+        ForgetPackageSources(pkg);
         pkg.PerformDelete();
         // A deleted package neither has local nicknames nor is one.
         pkg.ClearLocalNicknames();

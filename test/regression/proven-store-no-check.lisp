@@ -56,12 +56,13 @@
   (setf (aref c 0) (logxor (aref a 0) 1))
   c)
 
+;; A DOTIMES body is compiled twice: with and without the bounds checks.
 (deftest-emitting-only proven-store-no-check.sil
   (mapcar (lambda (f) (%psc-count "Runtime.CheckStore" f))
           (list #'%psc-xor-s0 #'%psc-xor-s1 #'%psc-xor-s3 #'%psc-ior-and-s1
                 #'%psc-mask-s1 #'%psc-sum-s1 #'%psc-sum-s0
                 #'%psc-var-s1 #'%psc-var-s0 #'%psc-wide-s1))
-  (0 0 0 0 0 1 1 1 0 1))
+  (0 0 0 0 0 2 2 1 0 1))
 
 (defun %psc-signals (thunk)
   (handler-case (progn (funcall thunk) :no-error)

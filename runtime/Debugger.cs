@@ -16,10 +16,31 @@ public class DebuggerDeclinedException : LispErrorException
     public DebuggerDeclinedException(LispCondition condition) : base(condition, default(NoSignal)) { }
 }
 
+/// <summary>An error reached the debugger while a line editor's hook was
+/// reading for it: the hook failed.</summary>
+internal sealed class ReadHookFailedException : Exception
+{
+    public ReadHookFailedException(string message) : base(message) { }
+}
+
 public static class Debugger
 {
     [ThreadStatic]
     private static int _nestLevel;
+
+    [ThreadStatic]
+    private static bool t_inReadHook;
+
+    /// <summary>Call a read hook on the debugger's behalf. An error inside it
+    /// does not enter the debugger again (which would call the same hook) but
+    /// fails the call.</summary>
+    internal static LispObject InvokeReadHook(LispFunction hook, LispObject[] args)
+    {
+        var saved = t_inReadHook;
+        t_inReadHook = true;
+        try { return hook.Invoke(args); }
+        finally { t_inReadHook = saved; }
+    }
 
     /// <summary>
     /// True once a REPL reading from a terminal is driving this process. Only
@@ -29,6 +50,9 @@ public static class Debugger
     /// debugger must report and unwind rather than pick a restart on its own.
     /// </summary>
     public static volatile bool InteractiveRepl;
+
+    /// <summary><see cref="InteractiveRepl"/>, or this thread runs a hosted REPL.</summary>
+    static bool Interactive => InteractiveRepl || ReplLoop.Hosted;
 
     /// <summary>
     /// Where the debugger reads its lines when there is no line editor: the
@@ -41,7 +65,12 @@ public static class Debugger
     /// </summary>
     public static System.IO.TextReader? Input;
 
-    static string? ReadPlainLine() => (Input ?? Console.In).ReadLine();
+    static string? ReadPlainLine(string prompt)
+    {
+        if (ReplLoop.Hosted) return ReplLoop.HostReadLine(prompt);
+        ReplLoop.Out.Write(prompt);
+        return (Input ?? Console.In).ReadLine();
+    }
 
     /// <summary>
     /// Enter the interactive debugger. Never returns normally;
@@ -50,17 +79,18 @@ public static class Debugger
     public static LispObject Enter(LispObject condition)
     {
         var condMsg = ConditionText.Report(condition);
+        if (t_inReadHook) throw new ReadHookFailedException(condMsg);
         var condType = ConditionText.TypeName(condition);
 
-        Console.Error.WriteLine(ReplColor.ForErr("ERROR", $"; Debugger entered on {condType}:"));
-        Console.Error.WriteLine(ReplColor.ForErr("ERROR", $";   {condMsg}"));
-        Console.Error.WriteLine(";");
+        ReplLoop.Err.WriteLine(ReplColor.ForErr("ERROR", $"; Debugger entered on {condType}:"));
+        ReplLoop.Err.WriteLine(ReplColor.ForErr("ERROR", $";   {condMsg}"));
+        ReplLoop.Err.WriteLine(";");
 
         var restarts = CollectRestarts(condition);
         // With the line editor on, the restarts are offered as a menu under
         // the prompt instead (see ReadWithHook); without it, or when no menu
         // can be drawn, they are listed here and chosen by number.
-        bool menu = InteractiveRepl && Startup.DebuggerReadHook != null && restarts.Count > 0;
+        bool menu = Interactive && ReplLoop.DebuggerReadHook != null && restarts.Count > 0;
         if (!menu) PrintRestarts(restarts);
 
         // Nobody is here to answer the prompt. Choosing a restart on the
@@ -68,7 +98,7 @@ public static class Debugger
         // belongs to a library (ASDF establishes one per system it loads), so
         // the script resumes at the next form as if the error had been handled
         // and the process still exits 0.
-        if (!InteractiveRepl)
+        if (!Interactive)
         {
             throw new DebuggerDeclinedException(new LispError(
                 $"Debugger: non-interactive session; {condType}: {condMsg}"));
@@ -93,7 +123,7 @@ public static class Debugger
                     frameMenu = false;
                     if (!ReadFrameMenu(prompt, ref frame, out line)) continue;
                 }
-                else if (Startup.DebuggerReadHook is { } hook)
+                else if (ReplLoop.DebuggerReadHook is { } hook)
                 {
                     var answer = ReadWithHook(hook, prompt,
                         menu ? RestartLabels(restarts) : null, 0, false, out line);
@@ -113,14 +143,12 @@ public static class Debugger
                     {
                         menu = false;
                         PrintRestarts(restarts);
-                        Console.Write(prompt);
-                        line = ReadPlainLine();
+                        line = ReadPlainLine(prompt);
                     }
                 }
                 else
                 {
-                    Console.Write(prompt);
-                    line = ReadPlainLine();
+                    line = ReadPlainLine(prompt);
                 }
                 if (line == null)
                 {
@@ -173,7 +201,7 @@ public static class Debugger
                         else if (int.TryParse(cmdArg, out int wanted))
                             SelectFrame(wanted, ref frame);
                         else
-                            Console.Error.WriteLine("; :frame expects a frame number.");
+                            ReplLoop.Err.WriteLine("; :frame expects a frame number.");
                         continue;
                     case ":frames":
                     case ":fr":
@@ -207,7 +235,7 @@ public static class Debugger
                     case ":r":
                         // Where there is a menu, bring it back under the next
                         // prompt rather than print the list.
-                        if (InteractiveRepl && Startup.DebuggerReadHook != null && restarts.Count > 0)
+                        if (Interactive && ReplLoop.DebuggerReadHook != null && restarts.Count > 0)
                             menu = true;
                         else
                             PrintRestarts(restarts);
@@ -226,12 +254,12 @@ public static class Debugger
                         ReplHistory.BeforeEval(expr);
                         var result = Runtime.Eval(expr);
                         ReplHistory.AfterEval(result);
-                        Console.WriteLine(ReplColor.ForOut("RESULT", Runtime.FormatTop(result, true)));
+                        ReplLoop.Out.WriteLine(ReplColor.ForOut("RESULT", Runtime.FormatTop(result, true)));
                     }
                 }
                 catch (Exception ex)
                 {
-                    Console.Error.WriteLine(ReplColor.ForErr("ERROR", $"; Error: {ex.Message}"));
+                    ReplLoop.Err.WriteLine(ReplColor.ForErr("ERROR", $"; Error: {ex.Message}"));
                 }
             }
         }
@@ -264,9 +292,9 @@ public static class Debugger
         try
         {
             result = frames
-                ? hook.Invoke(new LispObject[] { new LispString(prompt), labelList,
-                                                 Fixnum.Make(selected), Startup.Keyword("FRAMES") })
-                : hook.Invoke(new LispObject[] { new LispString(prompt), labelList });
+                ? InvokeReadHook(hook, new LispObject[] { new LispString(prompt), labelList,
+                                                          Fixnum.Make(selected), Startup.Keyword("FRAMES") })
+                : InvokeReadHook(hook, new LispObject[] { new LispString(prompt), labelList });
         }
         // Transfers of control are not the editor failing.
         catch (RestartInvocationException) { throw; }
@@ -277,8 +305,8 @@ public static class Debugger
         catch (LispErrorException ex) when (ex.Condition is LispInteractiveInterrupt) { throw; }
         catch (Exception ex)
         {
-            Startup.DebuggerReadHook = null;
-            Console.Error.WriteLine($"; line editor failed in the debugger ({ex.Message}); using basic line input");
+            ReplLoop.DropDebuggerReadHook();
+            ReplLoop.Err.WriteLine($"; line editor failed in the debugger ({ex.Message}); using basic line input");
             return HookAnswer.Failed;
         }
         if (result is MvReturn mv) result = mv.PrimaryValue;
@@ -315,10 +343,10 @@ public static class Debugger
         var forms = LispFunction.GetCallStackForms();
         if (forms.Length == 0)
         {
-            Console.Error.WriteLine("; (no Lisp frames)");
+            ReplLoop.Err.WriteLine("; (no Lisp frames)");
             return false;
         }
-        if (Startup.DebuggerReadHook is not { } hook)
+        if (ReplLoop.DebuggerReadHook is not { } hook)
         {
             PrintBacktrace(frame);
             return false;
@@ -403,7 +431,7 @@ public static class Debugger
         var restart = RestartClusterStack.FindRestartByName("ABORT", condition);
         if (restart == null)
         {
-            Console.Error.WriteLine("; No ABORT restart available.");
+            ReplLoop.Err.WriteLine("; No ABORT restart available.");
             return;
         }
         if (restart.IsBindRestart)
@@ -417,7 +445,7 @@ public static class Debugger
         var restart = RestartClusterStack.FindRestartByName("CONTINUE", condition);
         if (restart == null)
         {
-            Console.Error.WriteLine("; No CONTINUE restart available.");
+            ReplLoop.Err.WriteLine("; No CONTINUE restart available.");
             return;
         }
         if (restart.IsBindRestart)
@@ -431,11 +459,11 @@ public static class Debugger
         var frames = LispFunction.GetCallStackForms();
         if (frames.Length == 0)
         {
-            Console.Error.WriteLine("; (no Lisp frames)");
+            ReplLoop.Err.WriteLine("; (no Lisp frames)");
             return;
         }
         for (int i = 0; i < frames.Length; i++)
-            Console.Error.WriteLine($"; {(i == current ? "-->" : "   ")} {i,2}: {frames[i]}");
+            ReplLoop.Err.WriteLine($"; {(i == current ? "-->" : "   ")} {i,2}: {frames[i]}");
     }
 
     /// <summary>Print the selected frame's call form and its locals: what :frame,
@@ -445,10 +473,10 @@ public static class Debugger
         var frames = LispFunction.GetCallStackForms();
         if (idx < 0 || idx >= frames.Length)
         {
-            Console.Error.WriteLine("; (no such frame)");
+            ReplLoop.Err.WriteLine("; (no such frame)");
             return;
         }
-        Console.Error.WriteLine($";  {idx,2}: {frames[idx]}");
+        ReplLoop.Err.WriteLine($";  {idx,2}: {frames[idx]}");
         PrintFrameLocation(idx);
         PrintFrameLocals(idx);
     }
@@ -489,7 +517,7 @@ public static class Debugger
         var names = LispFunction.GetCallStack();
         if (idx < 0 || idx >= names.Length) return;
         foreach (var l in SourceLines(names[idx], true, 0))
-            Console.Error.WriteLine(l);
+            ReplLoop.Err.WriteLine(l);
     }
 
     /// <summary>:source. Where the selected frame's function was defined and the
@@ -499,11 +527,11 @@ public static class Debugger
         var names = LispFunction.GetCallStack();
         if (idx < 0 || idx >= names.Length)
         {
-            Console.Error.WriteLine(names.Length == 0 ? "; (no Lisp frames)" : "; (no such frame)");
+            ReplLoop.Err.WriteLine(names.Length == 0 ? "; (no Lisp frames)" : "; (no such frame)");
             return;
         }
         foreach (var l in SourceLines(names[idx], false, SourceWidth()))
-            Console.Error.WriteLine(l);
+            ReplLoop.Err.WriteLine(l);
     }
 
     /// <summary>
@@ -589,7 +617,7 @@ public static class Debugger
     {
         try
         {
-            if (Console.IsErrorRedirected) return 0;
+            if (ReplLoop.Hosted || Console.IsErrorRedirected) return 0;
             int w = Console.WindowWidth;
             return w >= 20 ? w : 0;
         }
@@ -601,12 +629,12 @@ public static class Debugger
         int count = LispFunction.GetCallStack().Length;
         if (count == 0)
         {
-            Console.Error.WriteLine("; (no Lisp frames)");
+            ReplLoop.Err.WriteLine("; (no Lisp frames)");
             return;
         }
         if (wanted < 0 || wanted >= count)
         {
-            Console.Error.WriteLine($"; (no frame {wanted}; frames are 0..{count - 1})");
+            ReplLoop.Err.WriteLine($"; (no frame {wanted}; frames are 0..{count - 1})");
             return;
         }
         current = wanted;
@@ -621,12 +649,12 @@ public static class Debugger
         var lines = DebugFrames.FormatLocals(idx);
         if (lines.Length == 0)
         {
-            Console.Error.WriteLine("; (no locals recorded for this frame; compile with");
-            Console.Error.WriteLine(";  dotcl:*emit-frame-locals* true to record them)");
+            ReplLoop.Err.WriteLine("; (no locals recorded for this frame; compile with");
+            ReplLoop.Err.WriteLine(";  dotcl:*emit-frame-locals* true to record them)");
             return;
         }
         foreach (var line in lines)
-            Console.Error.WriteLine($";      {line}");
+            ReplLoop.Err.WriteLine($";      {line}");
     }
 
     /// <summary>Print the special-variable bindings in effect, marking with * the
@@ -637,39 +665,39 @@ public static class Debugger
         var lines = DebugFrames.FormatSpecials(idx);
         if (lines.Length == 0)
         {
-            Console.Error.WriteLine("; (no special bindings in effect)");
+            ReplLoop.Err.WriteLine("; (no special bindings in effect)");
             return;
         }
-        Console.Error.WriteLine(";      (* = bound by this frame or its callees)");
+        ReplLoop.Err.WriteLine(";      (* = bound by this frame or its callees)");
         foreach (var line in lines)
-            Console.Error.WriteLine($";      {line}");
+            ReplLoop.Err.WriteLine($";      {line}");
     }
 
     private static void PrintHelp()
     {
-        Console.Error.WriteLine("; Debugger commands:");
-        Console.Error.WriteLine(";   <number>     Invoke restart by index");
-        Console.Error.WriteLine(";   Up/Down, Enter  Choose from the restart menu (line editor on)");
-        Console.Error.WriteLine(";   :abort, :q   Invoke ABORT restart");
-        Console.Error.WriteLine(";   :continue    Invoke CONTINUE restart (if available)");
-        Console.Error.WriteLine(";   :bt          Show backtrace (--> marks the selected frame)");
-        Console.Error.WriteLine(";   :frame [N], :f  Show frame N (no N: the selected one) and select it");
-        Console.Error.WriteLine(";   :frames, :fr Choose the frame from a menu (line editor on; else as :bt)");
-        Console.Error.WriteLine(";   :up, :u      Select the calling frame");
-        Console.Error.WriteLine(";   :down, :d    Select the called frame");
-        Console.Error.WriteLine(";   :locals, :l  Show the selected frame's lexical variables");
-        Console.Error.WriteLine(";   :specials, :s Show the special (dynamic) bindings in effect");
-        Console.Error.WriteLine(";   :source, :src Show where the selected frame's function is defined");
-        Console.Error.WriteLine(";   :restarts, :r Show available restarts");
-        Console.Error.WriteLine(";   :help, :h    Show this help");
-        Console.Error.WriteLine(";   <expr>       Evaluate a Lisp expression");
+        ReplLoop.Err.WriteLine("; Debugger commands:");
+        ReplLoop.Err.WriteLine(";   <number>     Invoke restart by index");
+        ReplLoop.Err.WriteLine(";   Up/Down, Enter  Choose from the restart menu (line editor on)");
+        ReplLoop.Err.WriteLine(";   :abort, :q   Invoke ABORT restart");
+        ReplLoop.Err.WriteLine(";   :continue    Invoke CONTINUE restart (if available)");
+        ReplLoop.Err.WriteLine(";   :bt          Show backtrace (--> marks the selected frame)");
+        ReplLoop.Err.WriteLine(";   :frame [N], :f  Show frame N (no N: the selected one) and select it");
+        ReplLoop.Err.WriteLine(";   :frames, :fr Choose the frame from a menu (line editor on; else as :bt)");
+        ReplLoop.Err.WriteLine(";   :up, :u      Select the calling frame");
+        ReplLoop.Err.WriteLine(";   :down, :d    Select the called frame");
+        ReplLoop.Err.WriteLine(";   :locals, :l  Show the selected frame's lexical variables");
+        ReplLoop.Err.WriteLine(";   :specials, :s Show the special (dynamic) bindings in effect");
+        ReplLoop.Err.WriteLine(";   :source, :src Show where the selected frame's function is defined");
+        ReplLoop.Err.WriteLine(";   :restarts, :r Show available restarts");
+        ReplLoop.Err.WriteLine(";   :help, :h    Show this help");
+        ReplLoop.Err.WriteLine(";   <expr>       Evaluate a Lisp expression");
     }
 
     private static void PrintRestarts(List<LispRestart> restarts)
     {
-        Console.Error.WriteLine("; Available restarts:");
+        ReplLoop.Err.WriteLine("; Available restarts:");
         for (int i = 0; i < restarts.Count; i++)
-            Console.Error.WriteLine($";   {RestartLabel(restarts, i)}");
-        Console.Error.WriteLine(";");
+            ReplLoop.Err.WriteLine($";   {RestartLabel(restarts, i)}");
+        ReplLoop.Err.WriteLine(";");
     }
 }

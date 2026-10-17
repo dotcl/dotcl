@@ -304,9 +304,10 @@
 (defmacro d618-inner-macro () 42)
 
 (deftest d618-macro-function-with-env
-  ;; macro-function with non-nil env should find locally-visible macros
+  ;; macro-function with non-nil env should find locally-visible macros. The
+  ;; compiler passes an environment at top level too, as SBCL does.
   (d618-macro-expanding-with-env d618-inner-macro)
-  not-macro)
+  macro)
 
 ;;; macrolet expander can call surrounding flet functions at expansion time
 (deftest d623-macrolet-calls-flet-at-expansion-time
@@ -342,10 +343,12 @@
 
 ;;; dotcl:gc-stats returns 5 fixnums, time preserves values
 (deftest d651-gc-stats-shape
+  ;; Five counts, then the GC pause time (NIL where the runtime cannot tell).
   (let ((s (dotcl:gc-stats)))
     (and (listp s)
-         (= (length s) 5)
-         (every #'integerp s)))
+         (= (length s) 6)
+         (every #'integerp (subseq s 0 5))
+         (typep (nth 5 s) '(or null (integer 0)))))
   t)
 
 (deftest d651-time-returns-values
@@ -2184,9 +2187,9 @@
 
 (deftest i338-information-never-errors-at-nil-env
   (list (multiple-value-list (dotcl-cltl2:variable-information 'x nil))
-        (multiple-value-list (dotcl-cltl2:function-information 'car nil))
-        (dotcl-cltl2:augment-environment nil :variable '(x)))
-  ((nil nil nil) (nil nil nil) nil))
+        (values (dotcl-cltl2:function-information 'car nil))
+        (and (dotcl-cltl2:augment-environment nil :variable '(x)) t))
+  ((nil nil nil) :function t))
 
 ;;; compile-file-pathname of a LOGICAL pathname must stay logical (keep its host),
 ;;; so the default output is translated through the host's translations. Returning
@@ -3272,10 +3275,9 @@
   (t 3))
 
 (deftest native-condition-slot-boundp-unbound
-  ;; (truncate 1 0) signals division-by-zero without capturing operands -> unbound
-  ;; slot, reported as NIL (not an error), so cl-store skips it cleanly. (/ now
-  ;; captures them; see division-by-zero-operands.lisp.)
-  (handler-case (truncate 1 0)
+  ;; A float division by zero signals division-by-zero without operands -> unbound
+  ;; slot, reported as NIL (not an error), so cl-store skips it cleanly.
+  (handler-case (truncate 1.5 (read-from-string "0"))
     (division-by-zero (c) (slot-boundp c 'operands)))
   nil)
 
@@ -4616,6 +4618,11 @@
 ;; compile-progn now splits an oversized *non-toplevel* progn body into
 ;; immediately-called closure chunks, so a form that just bundles many independent
 ;; statements (a data-driven test suite, generated code) compiles and runs.
+;; The four chunking tests below use 1000 statements: well past the 256-form
+;; threshold (*PROGN-CHUNK-THRESHOLD*), so the body is split into 16 chunks.
+;; The local slot sharing in the assembler now keeps even an unchunked body of
+;; 4000 of these statements under the method size limit, so a larger count
+;; only adds compile time.
 (defvar %big488-acc 0)
 (defun %big488-heavy (i target)
   ;; A statement that emits a lot of CIL. TARGET names the accumulator to mutate.
@@ -4631,7 +4638,7 @@
      ,@(loop for i below n collect (%big488-heavy i '%big488-acc))
      %big488-acc))
 (deftest huge-chunkable-form-compiles
-  (let ((r (eval (%big488-chunkable 4000))))
+  (let ((r (eval (%big488-chunkable 1000))))
     (and (integerp r) (> r 0)))
   t)
 ;; A body mutating the LET's own lexical variable used to be unchunkable: by the
@@ -4654,7 +4661,7 @@
                    (length (format nil "~a-~a" i i)))))
     acc))
 (deftest huge-lexical-mutation-form-chunks-and-matches
-  (= (eval (%big488-lexical 4000)) (%big488-expected 4000))
+  (= (eval (%big488-lexical 1000)) (%big488-expected 1000))
   t)
 ;; A macro that expands AT TOP LEVEL into thousands of forms (April's test suite:
 ;; (with-april-context ... <2672 forms>) expands to a PROGN) cannot be chunked
@@ -4666,17 +4673,17 @@
           ,@(loop for i below n collect (%big488-heavy i '%big488-acc))
           (values %big488-acc :done)))
 (deftest huge-toplevel-macro-progn-evals
-  (multiple-value-bind (acc tag) (eval '(%big488-toplevel-progn 4000))
-    (list (= acc (%big488-expected 4000)) tag))
+  (multiple-value-bind (acc tag) (eval '(%big488-toplevel-progn 1000))
+    (list (= acc (%big488-expected 1000)) tag))
   (t :done))
 (deftest huge-toplevel-macrolet-progn-evals
   (let ((r (multiple-value-list
             (eval '(macrolet ((m () `(progn (setf %big488-acc 0)
-                                           ,@(loop for i below 4000
+                                           ,@(loop for i below 1000
                                                    collect (%big488-heavy i '%big488-acc))
                                            (values 1 %big488-acc))))
                      (m))))))
-    (list (first r) (= (second r) (%big488-expected 4000))))
+    (list (first r) (= (second r) (%big488-expected 1000))))
   (1 t))
 ;; The clear-error fallback still holds where chunking is genuinely unsafe: a raw
 ;; native slot (here a declared fixnum) cannot be captured by a closure without
@@ -4689,11 +4696,14 @@
 ;; The body sits inside a HANDLER-CASE: the assembler shares IL local slots
 ;; between locals that are never live at once, but not in a method with an
 ;; exception block, so this one keeps a local per temporary and stays too large.
+;; This test and the next use the same 2500 statements. Without slot sharing
+;; the limit falls between 1750 and 2000 of them, so while this one signals,
+;; the next one is a body that is over the limit without sharing.
 (deftest-compiled-only huge-unchunkable-form-signals-clear-error
   (handler-case
       (progn (eval `(let ((acc 0))
                       (declare (type fixnum acc))
-                      (handler-case (progn ,@(loop for i below 4000
+                      (handler-case (progn ,@(loop for i below 2500
                                                    collect (%big488-heavy i 'acc)))
                         (error () nil))
                       acc))
@@ -4708,10 +4718,10 @@
   (handler-case
       (= (eval `(let ((acc 0))
                   (declare (type fixnum acc))
-                  ,@(loop for i below 4000 collect (%big488-heavy i 'acc))
+                  ,@(loop for i below 2500 collect (%big488-heavy i 'acc))
                   acc))
          (let ((acc 0))
-           (dotimes (i 4000 acc)
+           (dotimes (i 2500 acc)
              (incf acc (+ (- i 1) (* 2 (+ i i)) (length (format nil "~a-~a" i i)))))))
     (error () :error))
   t)

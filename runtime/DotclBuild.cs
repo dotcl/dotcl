@@ -571,12 +571,12 @@ public static class DotclBuild
         // source-location wrap + MSBuild-canonical formatter (dotcl/dotcl#48).
         var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
         var oldHook = DynamicBindings.Get(hookSym);
-        DynamicBindings.Set(hookSym, new LispFunction(hookArgs =>
+        DynamicBindings.Set(hookSym, ConditionSystem.ReportingDebuggerHook(new LispFunction(hookArgs =>
         {
             var cond = hookArgs[0];
             throw new LispErrorException(
                 cond is LispCondition lc ? lc : new LispError(cond.ToString()));
-        }, "*BUILD-DEBUGGER-HOOK*", 2));
+        }, "*BUILD-DEBUGGER-HOOK*", 2)));
 
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));
@@ -868,12 +868,12 @@ public static class DotclBuild
         // debugger on closed stdin (same rationale as CompileProject).
         var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
         var oldHook = DynamicBindings.Get(hookSym);
-        DynamicBindings.Set(hookSym, new LispFunction(hookArgs =>
+        DynamicBindings.Set(hookSym, ConditionSystem.ReportingDebuggerHook(new LispFunction(hookArgs =>
         {
             var cond = hookArgs[0];
             throw new LispErrorException(
                 cond is LispCondition lc ? lc : new LispError(cond.ToString()));
-        }, "*PACK-DEBUGGER-HOOK*", 2));
+        }, "*PACK-DEBUGGER-HOOK*", 2)));
 
         Runtime.Eval(MultipleValues.Primary(
             Runtime.ReadFromString(new LispObject[] { new LispString("(require \"asdf\")") })));

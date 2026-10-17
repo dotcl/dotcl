@@ -1212,6 +1212,9 @@ public class Reader
         if (typeName is not Symbol typeSymbol)
             throw MakeReaderError("#S requires a symbol as structure type name");
 
+        if (typeSymbol == Startup.Sym("RANDOM-STATE"))
+            return ReadRandomStateLiteral(firstCons.Cdr);
+
         // Look up the class to get slot names
         var cls = Runtime.FindClassOrNil(typeSymbol) as LispClass;
         if (cls == null || !cls.IsStructureClass || cls.StructSlotNames == null)
@@ -1266,6 +1269,38 @@ public class Reader
         }
 
         return new LispStruct(typeSymbol, slots);
+    }
+
+    /// <summary>#S(RANDOM-STATE :STATE words), the form SBCL and dotcl print: the
+    /// 627 (unsigned-byte 32) words of the state as a vector or a list.</summary>
+    private LispObject ReadRandomStateLiteral(LispObject plist)
+    {
+        LispObject? state = null;
+        for (var rest = plist; rest is Cons pair; )
+        {
+            if (pair.Cdr is not Cons valueCons)
+                throw MakeReaderError("#S: odd number of arguments after type name");
+            if (state == null && pair.Car is Symbol key && key.Name == "STATE")
+                state = valueCons.Car;
+            rest = valueCons.Cdr;
+        }
+        var words = new List<LispObject>();
+        if (state is LispVector vec)
+            for (int i = 0; i < vec.Length; i++) words.Add(vec[i]);
+        else
+            for (var cur = state; cur is Cons c; cur = c.Cdr) words.Add(c.Car);
+        if (words.Count != LispRandomState.StateLength)
+            throw MakeReaderError($"#S(RANDOM-STATE): :STATE must be {LispRandomState.StateLength} (unsigned-byte 32) words");
+        var arr = new uint[words.Count];
+        for (int i = 0; i < arr.Length; i++)
+        {
+            if (words[i] is not Fixnum f || f.Value < 0 || f.Value > uint.MaxValue)
+                throw MakeReaderError($"#S(RANDOM-STATE): :STATE word {i} is not an (unsigned-byte 32)");
+            arr[i] = (uint)f.Value;
+        }
+        if (arr[2] > 624)
+            throw MakeReaderError("#S(RANDOM-STATE): the index word of :STATE is above 624");
+        return LispRandomState.FromState(arr);
     }
 
     private static void ComputeArrayDims(LispObject contents, int[] dims, int level, int rank)

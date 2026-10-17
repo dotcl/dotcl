@@ -19,13 +19,23 @@ metaobject protocol, static-vectors for pinned vectors.
 | `dotnet` | built in | Calling .NET: objects, types, delegates, tasks, assemblies, native libraries. [Calling .NET from Lisp](dotnet-package.md) |
 | `dotcl` | built in | The rest of the runtime's extensions: the process, threads, memory, packages, introspection, delivery |
 | `dotcl-mop` | built in | The metaobject protocol (AMOP): class, slot, generic function and method metaobjects |
-| `dotcl-cltl2` | built in | The CLtL2 environment functions, minimal: there is no lexical environment to inspect, so `variable-information` and its siblings report little. `macroexpand-all` works |
+| `dotcl-cltl2` | built in | The CLtL2 environment functions: `variable-information`, `function-information` and `declaration-information` report the proclamations and, given the `&environment` of a macro expanded by the compiler, the lexical bindings and declarations around the call; `augment-environment`, `parse-macro`, `enclose`, `macroexpand-all`. The interpreter's environments carry no declarations |
 
 ## Modules
 
 `require` loads a module that ships with dotcl; nothing is downloaded. Each
-module's directory under `contrib/` has a README with more. They come in four
-kinds.
+module dotcl itself provides has a directory under `contrib/` with a README.
+The first four groups below are libraries for your programs. The last one,
+development tools, is for looking inside a running process from the REPL
+rather than for code you ship.
+
+### Systems and libraries
+
+- `asdf`: ASDF, for loading systems defined in `.asd` files.
+  `(require "asdf")`. [Using libraries](libraries.md#common-lisp-libraries)
+- `quicklisp`: the Quicklisp client. `(require "quicklisp")` loads it without
+  touching the network; the first `ql:quickload` installs a dist.
+  [Using libraries](libraries.md#common-lisp-libraries)
 
 ### Common Lisp compatibility
 
@@ -36,19 +46,28 @@ What other implementations provide and portable libraries build on.
   `(dotcl-thread:make-thread (lambda () ...))`.
 - `dotcl-socket`: TCP sockets as bidirectional Lisp streams.
   `dotcl-socket:socket-connect`, or `make-server-socket` and `socket-accept`;
-  then read and write the `socket-stream`.
+  then read and write the `socket-stream`. For UDP, socket options and
+  timeouts, use a portable library such as usocket.
 - `dotcl-gray`: Gray streams. Subclass `dotcl-gray:fundamental-character-input-stream`
   and its siblings, and define the `stream-*` generic functions.
 - `dotcl-float`: the IEEE bit patterns of floats (`dotcl-float:double-float-bits`,
-  `bits-double-float`), and the infinities and NaNs as constants.
+  `bits-double-float`), the infinities and NaNs as constants, and
+  `dotcl-float:float-nan-p` and `float-infinity-p` (as in `sb-ext`).
+- `dotcl-rotate-byte`: `dotcl-rotate-byte:rotate-byte`, as in sb-rotate-byte.
+  A rotate of a whole `(unsigned-byte 32)` or `(unsigned-byte 64)` word
+  (`(byte 32 0)`, `(byte 64 0)`) compiles to one rotate instruction.
+- `dotcl-simd`: 128-bit SIMD values and operations with the names of sb-simd
+  (`dotcl-simd:f64.2`, `f64.2+`, `u8.16-aref` ...). [dotcl-simd](dotcl-simd.md)
 
 ### The REPL and editors
 
 - `dotcl-repl`: the REPL's line editor, history, completion and comma commands.
   The REPL loads it; elsewhere, `(dotcl-repl:readline "> ")` reads a line with
-  it. [The REPL](repl.md)
-- `dotcl-lsp-api`: what an editor asks a live image about the code at a point:
-  `dotcl-lsp-api:completions`, `documentation-url` and `describe-at`, each given
+  it. `dotcl-repl:*terminal*` and `make-terminal` put a host's own key source
+  and output in place of System.Console, and `run-repl` / `interrupt-repl` run
+  the whole REPL there. [The REPL](repl.md)
+- `dotcl-code-info`: what an editor asks a live image about the code at a point:
+  `dotcl-code-info:completions`, `documentation-url` and `describe-at`, each given
   the text and an offset into it.
 
 ### .NET
@@ -72,8 +91,8 @@ What other implementations provide and portable libraries build on.
 
 ### Development tools
 
-For looking inside the running process. The first three resolve their NuGet
-package on first use.
+For looking inside the running process while you develop. The first three
+resolve their NuGet package on first use.
 
 - `dotcl-advice`: watch, patch or time any .NET method in the running process
   (HarmonyX): `advice:watch`, `advice:patch`, `advice:trace`.
@@ -84,6 +103,14 @@ package on first use.
 - `dotcl-jitdisasm`: makes `dotcl:jit-disassemble` print the native code the JIT
   produced for a function. Not part of a packaged dotcl: build it from a source
   tree with `make contrib-dotcl-jitdisasm`.
+
+### Lower layers
+
+Not meant to be used directly.
+
+- `dotcl-bsd-sockets`: TCP and UDP over System.Net.Sockets in the shape of
+  SBCL's sb-bsd-sockets. The layer under the dotcl backends of socket
+  libraries such as usocket; use those.
 
 ## Reader syntax
 
@@ -164,7 +191,10 @@ Scripts and the process:
 - `dotcl:script-arguments`: the arguments a script was given. [Writing scripts](scripting.md#arguments)
 - `dotcl:command-line-arguments`: the command line, in the shape UIOP expects. [Writing scripts](scripting.md#arguments)
 - `dotcl:quit`: exit the process with a code. [Writing scripts](scripting.md#exit-code)
+- `dotcl:*exit-hooks*`: functions of no arguments called, in order, when the process exits through `dotcl:quit` or at the end of the program, as `sb-ext:*exit-hooks*`. An error in one is printed and the rest still run.
 - `dotcl:getenv`, `dotcl:setenv`, `dotcl:unsetenv`: environment variables.
+- `dotcl:posix-environ`: the whole environment as a list of `"NAME=VALUE"` strings, as `sb-ext:posix-environ`; the form `dotcl:launch-process` takes for `:environment`.
+- `dotcl:getpid`: the process id, as `sb-posix:getpid`.
 - `dotcl:getcwd`, `dotcl:chdir`: the process's current directory.
 - `dotcl:native-namestring`, `dotcl:parse-native-namestring`: convert between a pathname and the operating system's spelling of it.
 - `dotcl:delete-directory`: delete a directory; `:recursive t` deletes its contents too.
@@ -175,7 +205,7 @@ Scripts and the process:
 External processes:
 
 - `dotcl:run-process`: run a program to completion; returns the exit code, standard output and standard error.
-- `dotcl:launch-process`: start a program with its standard streams as Lisp streams, or redirected to files.
+- `dotcl:launch-process`: start a program with its standard streams as Lisp streams, or redirected to files. As with `sb-ext:run-program`, `:input`, `:output` and `:error` also take any Lisp stream (a string stream, `*standard-output*`, a Gray stream), copied in a thread until the pipe ends, and `:error :output` sends the error output where the output goes. `dotcl:process-wait` returns once the copies are done, and signals an error that stopped one. On Unix the child leads a process group of its own unless `:input` is `t` (as with SBCL), so killing its group does not reach the caller.
 - `dotcl:process-input`, `dotcl:process-output`, `dotcl:process-error`: those streams.
 - `dotcl:process-wait`, `dotcl:process-alive-p`, `dotcl:process-exit-code`, `dotcl:process-pid`, `dotcl:process-kill`: wait for, query and stop a launched process.
 
@@ -199,7 +229,7 @@ Asynchronous code:
 Memory:
 
 - `dotcl:gc`: run a full collection, then the pending finalizers.
-- `dotcl:gc-stats`: collection counts per generation, heap size and bytes allocated.
+- `dotcl:gc-stats`: collection counts per generation, heap size, bytes allocated, and the total time the collector has paused the process in internal time units (as `sb-ext:*gc-run-time*`).
 - `dotcl:make-weak-pointer`, `dotcl:weak-pointer-value`, `dotcl:weak-pointer-p`: weak pointers.
 - `make-hash-table :weakness` and `dotcl:hash-table-weakness`: weak hash tables (`:key`, `:value`, `:key-and-value`, `:key-or-value`).
 - `dotcl:finalize`, `dotcl:cancel-finalization`, `dotcl:run-finalizers`: run a function after an object is collected.
@@ -216,11 +246,14 @@ Introspection and debugging:
 
 - `dotcl:function-lambda-list`: the lambda list of a function or macro. [Using libraries](libraries.md#what-ships-with-dotcl)
 - `dotcl:function-source-location`: the file and line where a name was last defined.
+- `dotcl:definition-sources`: every recorded definition of a name (function, macro, compiler macro, generic function and each method, variable, class, type, method combination, ...; a package's `defpackage` given its name), each with its kind, file and line.
+- `dotcl:definition-source`: the file and line where a function, macro function, generic function, method, class or package object was defined.
 - `dotcl:record-definition-sources`: attribute the definitions in a form to a file and line, for a tool that compiles one form at a time.
 - `dotcl:who-calls`, `dotcl:who-is-called-by`: cross references between functions.
 - `dotcl:typexpand-1`, `dotcl:typexpand`: expand a `deftype`.
 - `dotcl:symbol-global-value`: the global value of a symbol, ignoring dynamic bindings; a place.
 - `dotcl:charpos`: the column an output stream is at.
+- `dotcl:pretty-stream-p`: true for the stream of a logical block being pretty printed, including the stream a `print-object` method or a condition report is handed inside one; as `sb-pretty:pretty-stream-p`.
 - `dotcl:backtrace`, `dotcl:backtrace-with-args`, `dotcl:print-backtrace`: the Lisp call stack.
 - `dotcl:frame-locals`, `dotcl:print-frame-locals`, `dotcl:frame-specials`: a frame's lexical variables (when compiled with `dotcl:*emit-frame-locals*` true) and the dynamic bindings in effect. [The REPL](repl.md#when-a-form-signals)
 - `dotcl:*debug-stacktrace*`: print the .NET stack trace with an unhandled error.
@@ -231,9 +264,15 @@ Compiling and shipping:
 
 - `dotcl:save-application`: bundle sources into a FASL or an executable. [Packaging an app](dotcl-pack.md)
 - `dotcl:combine-fasls`: one FASL that loads several; what `uiop:combine-fasls` calls.
+- `dotcl:fasl-version-mismatch`, `dotcl:fasl-version-mismatch-pathname`, `dotcl:fasl-version-mismatch-built-by`, `dotcl:load-as-is`: the error LOAD signals for a FASL another dotcl compiled; the restart `dotcl:load-as-is` (or `continue`) loads it anyway, except when it needs a newer `DotCL.Runtime`. ASDF's `load-op` compiles such a file again instead.
 - `dotcl:*compile-r2r*`, `dotcl:*load-r2r*`, `dotcl:write-r2r-sibling`, `dotcl:r2r-stats`: ahead-of-time compiled siblings of FASLs. [ReadyToRun](readytorun.md)
+- `dotcl:package-rid`: the portable RID (`linux-x64`, `osx-arm64`, `linux-musl-x64`, ...) that compiled packages are made and looked up for. [Libraries](libraries.md)
 - `dotcl:precompiled-only`: refuse to generate code at run time, so only precompiled code runs. [Embedding dotcl](embedding.md#without-run-time-code-generation)
 - `dotcl:register-assembly-path`, `dotcl:register-native-path`: tell the assembly resolver where a managed or native library is.
+
+Text and octets:
+
+- `dotcl:string-to-octets`, `dotcl:octets-to-string`: encode a string to a `(simple-array (unsigned-byte 8) (*))` and back, as in `sb-ext`. `:external-format` takes what `open` takes and defaults to UTF-8; `:start`, `:end`, and `:null-terminate` for encoding. A character that cannot be encoded, or bytes that are not valid in the format, become the format's replacement character.
 
 Numbers:
 

@@ -1664,7 +1664,7 @@ public static partial class Runtime
         if (args.Length >= 3)
             for (var cur = args[2]; cur is Cons cc; cur = cc.Cdr)
             {
-                if (cc.Car is LispString ps) paramTypeNames.Add(ps.Value);
+                if (StringValueOrNull(cc.Car) is string ps) paramTypeNames.Add(ps);
                 else return Nil.Instance;
             }
 
@@ -2974,7 +2974,7 @@ public static partial class Runtime
                 var pt = ps[i].ParameterType;
                 if (lispArgs[i] is Fixnum) { if (pt == typeof(int) || pt == typeof(long)) score += 10; }
                 else if (lispArgs[i] is DoubleFloat || lispArgs[i] is SingleFloat) { if (pt == typeof(double)) score += 10; }
-                else if (lispArgs[i] is LispString) { if (pt == typeof(string)) score += 10; }
+                else if (StringValueOrNull(lispArgs[i]) != null) { if (pt == typeof(string)) score += 10; }
                 else if (lispArgs[i] is LispDotNetObject dno)
                 {
                     // A wrapped .NET instance (value-type struct or reference type):
@@ -4201,8 +4201,13 @@ public static partial class Runtime
             }
         }
 
+#if !NETSTANDARD2_0
+        if (netStream is System.Net.Sockets.NetworkStream socketStream)
+            netStream = new InterruptibleSocketStream(socketStream);
+#endif
+
         if (binary)
-            return new LispBinaryStream(netStream);
+            return new LispBinaryStream(netStream.CanWrite ? new WriteBufferedStream(netStream) : netStream);
 
         // Bivalent: a character stream that also serves read-byte/write-byte over the
         // same NetworkStream (SBCL-style), so byte-oriented protocol code (cl-rpc HTTP/WS)

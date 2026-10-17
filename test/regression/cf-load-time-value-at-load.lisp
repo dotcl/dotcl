@@ -44,3 +44,18 @@
     (load fasl)
     (funcall 'cfltv-g))
   42)
+
+;;; Each load has its own value: a function from an earlier load keeps the
+;;; value of that load, and a NIL value is not evaluated again.
+(deftest-emitting-only cf-load-time-value-at-load.per-load-value
+  (let ((fasl (%cfltv-compile
+               "cfltv3"
+               '("(defun cfltv-h () (load-time-value (incf *cfltv-count*)))"
+                 "(defun cfltv-n () (load-time-value (progn (incf *cfltv-count* 10) nil)))"))))
+    (setf *cfltv-count* 0)
+    (load fasl)
+    (let ((old (fdefinition 'cfltv-h))
+          (a (list (funcall 'cfltv-h) (funcall 'cfltv-h) (funcall 'cfltv-n) (funcall 'cfltv-n))))
+      (load fasl)
+      (list a (funcall 'cfltv-h) (funcall old) (funcall 'cfltv-n) *cfltv-count*)))
+  ((1 1 nil nil) 12 1 nil 22))

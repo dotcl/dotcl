@@ -17,9 +17,9 @@ internal static class DotNetNuGet
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:REQUIRE: expected 1 or 2 arguments"));
 
-        string packageId = args[0] is LispString s0 ? s0.Value : args[0].ToString()!;
+        string packageId = Runtime.StringValueOrNull(args[0]) ?? args[0].ToString()!;
         string? version = args.Length > 1
-            ? (args[1] is LispString s1 ? s1.Value : args[1].ToString())
+            ? (Runtime.StringValueOrNull(args[1]) ?? args[1].ToString())
             : null;
 
         return RequireAsync(packageId, version).GetAwaiter().GetResult();

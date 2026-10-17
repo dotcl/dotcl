@@ -50,11 +50,10 @@
   (let ((s (make-ssf)))
     (%ssf-incf s 100)
     (%ssf-hoisted s 100)
-    (let ((a0 (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread")))
-      (%ssf-incf s 100000)
-      (%ssf-hoisted s 100000)
-      (< (- (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread") a0)
-         10000)))
+    (< (min-allocated-bytes (lambda ()
+                              (%ssf-incf s 100000)
+                              (%ssf-hoisted s 100000)))
+       10000))
   t)
 
 (deftest struct-single-float-slot.values

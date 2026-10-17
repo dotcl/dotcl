@@ -68,10 +68,14 @@ construction; their *exclusive* time is the real per-call overhead.
 
 ## Build the code you are measuring in Release
 
-A Debug build of the runtime is not just slower; it is differently shaped, and
-it will send you after the wrong thing. Diagnostic counters that a Release build
-folds away entirely still show up in a Debug profile, and the dynamic-method
-teardown that a Debug run does can dominate the whole trace.
+Release is the configuration that ships. The runtime's Debug configuration,
+the one the test targets run, compiles its C# with optimization on as well, but
+it carries test-only code and is not what users get. An unoptimized build
+(`-p:Optimize=false`, what you want for stepping through the C# in a debugger)
+is not just slower; it is differently shaped, and it will send you after the
+wrong thing. Diagnostic counters that an optimized build folds away entirely
+still show up in its profile, and the dynamic-method teardown it does can
+dominate the whole trace.
 
 ```
 dotnet build runtime/runtime.csproj -c Release
@@ -148,7 +152,7 @@ a matched pair, `bench/csharp-parity/kernels.lisp` against a plain Release
 build of `bench/csharp-parity/Parity.csproj`, over the same input sizes. Each
 kernel's dotcl/C# time ratio is written into `bench-state.json` as
 `parity/<name>`, and the same target then checks every ratio against the one
-recorded for this platform in `bench/ratio-baseline.json`: a ratio above
+recorded for this platform in `bench/gate/ratio-baseline.json`: a ratio above
 **1.2x** its recorded value fails the build, and so does the median of the
 cl-bench dotcl/SBCL ratios once a baseline for it exists. Ratios are keyed by
 platform because they are only reproducible on the machine they were measured
@@ -173,7 +177,7 @@ tree: `make bench-parity` merges into the `bench-state.json` that left. To
 refresh the recorded numbers after a change that is genuinely meant to move
 them, run `make bench-state` and then `make bench-parity`, three times on a
 quiet machine, take the median per kernel and of the three cl-bench medians,
-and edit `bench/ratio-baseline.json`, updating the matching `recorded` entry
+and edit `bench/gate/ratio-baseline.json`, updating the matching `recorded` entry
 with the date and the machine. Do not refresh it to turn a red
 build green without first establishing which of the two the number describes:
 the code got slower, or the baseline was measured somewhere else.
@@ -196,7 +200,7 @@ bigger than twice the CV is real" cannot see anything.
 
 So `make bench-parity` runs each half in `PARITY_PASSES` processes (5 by
 default) and checks every kernel's per-process values for a split, with the
-rule in `bench/modes.awk`: sort them, take the widest gap between neighbours
+rule in `bench/gate/modes.awk`: sort them, take the widest gap between neighbours
 that leaves at least two values above it, and call the values split when that
 gap is at least 10% of the fast group's median and at least 3 times the wider
 group's own range. One slow process alone is not a group: interference only
@@ -213,7 +217,7 @@ or a larger `PARITY_PASSES`, before it is believed. When recording a baseline
 for such a kernel, take it from a run that shows the split, so the recorded
 number is the fast group's.
 
-`bench/test-modes.sh` holds the rule to the values it was written against
+`bench/gate/test-modes.sh` holds the rule to the values it was written against
 (three split cases and three noisy one-group cases from that machine) and runs
 first in `make bench-parity`.
 
@@ -261,7 +265,7 @@ Then look at each side's per-process values before comparing anything.
 Concatenate each side's outputs into one file (one `name<TAB>ms` line per
 kernel per process, as `kernels.lisp` and the C# half print them) and run
 
-    bench/process-modes.sh base=base.txt variant=variant.txt
+    bench/gate/process-modes.sh base=base.txt variant=variant.txt
 
 It prints each side's count, minimum, median and whether it is split. For a
 kernel that is one group on both sides it sets the medians and minimums side

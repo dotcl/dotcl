@@ -189,12 +189,13 @@ HANDLER-BIND around it was given, oldest first."
       (error "cannot locate this process's executable")))
 
 (defun rdh-image ()
-  "This process's --core, if it was started with one."
+  "This process's --core, else compiler/dotcl.core (REGRESSION-CHILD-CORE)."
   (let* ((args (dotnet:static "System.Environment" "GetCommandLineArgs"))
          (count (dotnet:invoke args "Length")))
-    (loop for i below (1- count)
-          when (equal (dotnet:invoke args "GetValue" i) "--core")
-            return (list "--core" (dotnet:invoke args "GetValue" (1+ i))))))
+    (or (loop for i below (1- count)
+              when (equal (dotnet:invoke args "GetValue" i) "--core")
+                return (list "--core" (dotnet:invoke args "GetValue" (1+ i))))
+        (list "--core" (regression-child-core)))))
 
 (defun rdh-run-script (forms)
   "Run FORMS as a script in another process with an empty standard input;

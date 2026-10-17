@@ -17,6 +17,12 @@ public class LispThread : LispObject
     public System.Collections.Concurrent.ConcurrentQueue<LispObject> PendingInterrupts { get; }
         = new System.Collections.Concurrent.ConcurrentQueue<LispObject>();
 
+    /// <summary>0: not in a Lisp blocking wait, 1: in one, 2: INTERRUPT-THREAD
+    /// is poking it. See Runtime.EnterInterruptibleWait.</summary>
+    internal int WaitState;
+
+    internal bool MadeByLisp;
+
     public LispThread(Thread thread, string name)
     {
         Thread = thread;
@@ -204,7 +210,7 @@ public partial class Runtime
         for (int i = 1; i + 1 < args.Length; i += 2)
         {
             if (args[i] is Symbol s && s.Name == "NAME")
-                name = args[i + 1] is LispString ls ? ls.Value : args[i + 1].ToString();
+                name = StringValueOrNull(args[i + 1]) ?? args[i + 1].ToString();
         }
 
         LispThread? lispThread = null;
@@ -270,7 +276,7 @@ public partial class Runtime
             IsBackground = true
         };
 
-        lispThread = new LispThread(thread, name);
+        lispThread = new LispThread(thread, name) { MadeByLisp = true };
         _threadRegistry[thread.ManagedThreadId] = lispThread;
         thread.Start();
         return lispThread;
@@ -353,19 +359,50 @@ public partial class Runtime
         if (!lt.Thread.IsAlive) return Nil.Instance;
         lt.PendingInterrupts.Enqueue(fn);
         // Tier 2: computing threads see the enqueue at their next safepoint
-        // (loop back-edge poll / periodic call check). The counter is the
-        // cheap process-wide gate those hot paths read before touching any
-        // per-thread state.
+        // (loop back-edge poll / periodic call check).
         Interlocked.Increment(ref SafepointInterruptsPending);
-        lt.Thread.Interrupt();
+        ConditionSystem.RaisePollGate();
+        // Poke only a thread in a Lisp blocking wait: a pending Thread.Interrupt
+        // fires in the next wait of any kind, including a lock inside the
+        // runtime, and there it ends the thread instead of running FN.
+        if (Interlocked.CompareExchange(ref lt.WaitState, 2, 1) == 1)
+        {
+            try { lt.Thread.Interrupt(); }
+            finally { Volatile.Write(ref lt.WaitState, 1); }
+        }
         return T.Instance;
     }
 
+    private static LispThread? SelfLispThread()
+        => _currentLispThread
+           ?? (_threadRegistry.TryGetValue(Thread.CurrentThread.ManagedThreadId, out var reg)
+               ? reg : null);
+
+    /// <summary>Around the wait of a blocking primitive that handles
+    /// ThreadInterruptedException by running the queued functions.</summary>
+    internal static LispThread? EnterInterruptibleWait()
+    {
+        var self = SelfLispThread();
+        if (self == null) return null;
+        Interlocked.Exchange(ref self.WaitState, 1);
+        if (!self.PendingInterrupts.IsEmpty) Thread.CurrentThread.Interrupt();
+        return self;
+    }
+
+    /// <summary>Ends the window and absorbs a poke that arrived after the
+    /// wait returned; what it queued stays queued for the next safepoint.</summary>
+    internal static void LeaveInterruptibleWait(LispThread? self)
+    {
+        if (self == null) return;
+        while (Interlocked.CompareExchange(ref self.WaitState, 0, 1) != 1)
+            Thread.SpinWait(20);
+        try { Thread.Sleep(0); }
+        catch (ThreadInterruptedException) { }
+    }
+
     /// <summary>Process-wide count of INTERRUPT-THREAD functions enqueued but
-    /// not yet run. Safepoints (ConditionSystem.PollInterrupt / CheckInterrupt)
-    /// read this with Volatile.Read as their fast-path gate: zero means no
-    /// thread anywhere has a pending interrupt, so the common case costs one
-    /// static read.</summary>
+    /// not yet run. Zero means no thread anywhere has a pending interrupt.
+    /// Loop polls read ConditionSystem.PollGate instead.</summary>
     internal static int SafepointInterruptsPending;
 
     /// <summary>
@@ -374,38 +411,18 @@ public partial class Runtime
     /// that is computing rather than waiting (Tier 2): the blocking
     /// primitives deliver via RunPendingInterrupts when their wait is cut
     /// short, but a compute loop never waits.
-    ///
-    /// The Thread.Interrupt() poke that accompanied the enqueue has NOT fired
-    /// here (this thread was computing), so after draining we absorb it;
-    /// otherwise the thread's next legitimate wait dies with a spurious
-    /// interrupt that RunPendingInterrupts cannot claim (the DESTROY-THREAD
-    /// contract makes the blocking primitives rethrow "not ours"). The absorb
-    /// races with a concurrent fresh enqueue's poke; if anything is queued
-    /// again afterwards, self-interrupt to restore the pending poke so a wait
-    /// entered before the next safepoint still wakes (Tier 1 preserved).
     /// </summary>
     internal static void RunPendingInterruptsAtSafepoint()
     {
-        var self = _currentLispThread
-                   ?? (_threadRegistry.TryGetValue(Thread.CurrentThread.ManagedThreadId, out var reg)
-                       ? reg : null);
+        var self = SelfLispThread();
         if (self == null || self.PendingInterrupts.IsEmpty) return;
-        try
+        while (self.PendingInterrupts.TryDequeue(out var fn))
         {
-            while (self.PendingInterrupts.TryDequeue(out var fn))
-            {
-                Interlocked.Decrement(ref SafepointInterruptsPending);
-                if (ReferenceEquals(fn, s_destroyRequest))
-                    throw new ThreadInterruptedException("destroy-thread");
-                if (fn is LispFunction lfn) lfn.Invoke();
-                else if (fn is Symbol sym && sym.Function is LispFunction sfn) sfn.Invoke();
-            }
-        }
-        finally
-        {
-            try { Thread.Sleep(0); }
-            catch (ThreadInterruptedException) { }
-            if (!self.PendingInterrupts.IsEmpty) Thread.CurrentThread.Interrupt();
+            Interlocked.Decrement(ref SafepointInterruptsPending);
+            if (ReferenceEquals(fn, s_destroyRequest))
+                throw new ThreadInterruptedException("destroy-thread");
+            if (fn is LispFunction lfn) lfn.Invoke();
+            else if (fn is Symbol sym && sym.Function is LispFunction sfn) sfn.Invoke();
         }
     }
 
@@ -426,9 +443,7 @@ public partial class Runtime
         // The main thread has no LispThread until someone asks for one, and
         // INTERRUPT-THREAD can only have been handed one that exists: so look
         // it up rather than creating a fresh (empty) one here.
-        var self = _currentLispThread
-                   ?? (_threadRegistry.TryGetValue(Thread.CurrentThread.ManagedThreadId, out var reg)
-                       ? reg : null);
+        var self = SelfLispThread();
         if (self == null) return false;
         bool ran = false;
         while (self.PendingInterrupts.TryDequeue(out var fn))
@@ -465,8 +480,34 @@ public partial class Runtime
         if (!lt.Thread.IsAlive) return T.Instance;
         lt.PendingInterrupts.Enqueue(s_destroyRequest);
         Interlocked.Increment(ref SafepointInterruptsPending);
-        lt.Thread.Interrupt();
+        ConditionSystem.RaisePollGate();
+        if (lt.MadeByLisp)
+            lt.Thread.Interrupt();
+        else if (Interlocked.CompareExchange(ref lt.WaitState, 2, 1) == 1)
+        {
+            // A host thread outlives the destroy and goes back to host code,
+            // where a leftover Thread.Interrupt would fire in its next wait.
+            try { lt.Thread.Interrupt(); }
+            finally { Volatile.Write(ref lt.WaitState, 1); }
+        }
         return T.Instance;
+    }
+
+    /// <summary>Around the outermost host call: a destroy that did not land
+    /// while the host thread ran Lisp must not fire in a later call.</summary>
+    internal static void DropPendingDestroy()
+    {
+        if (Volatile.Read(ref SafepointInterruptsPending) == 0) return;
+        var self = SelfLispThread();
+        if (self == null || self.MadeByLisp || self.PendingInterrupts.IsEmpty) return;
+        int n = self.PendingInterrupts.Count;
+        for (int i = 0; i < n && self.PendingInterrupts.TryDequeue(out var fn); i++)
+        {
+            if (ReferenceEquals(fn, s_destroyRequest))
+                Interlocked.Decrement(ref SafepointInterruptsPending);
+            else
+                self.PendingInterrupts.Enqueue(fn);
+        }
     }
 
     /// <summary>(bt:thread-name thread) -> string</summary>
@@ -487,7 +528,7 @@ public partial class Runtime
     /// <summary>(bt:make-lock &optional name) -> lock</summary>
     public static LispObject MakeLock(LispObject[] args)
     {
-        string name = args.Length > 0 && args[0] is LispString ls ? ls.Value : "anonymous";
+        string name = (args.Length > 0 ? StringValueOrNull(args[0]) : null) ?? "anonymous";
         return new LispLock(name);
     }
 
@@ -558,13 +599,55 @@ public partial class Runtime
         return T.Instance;
     }
 
+    // (%CAS-SYMBOL-VALUE lock symbol old new): DOTCL:COMPARE-AND-SWAP on a
+    // globally special variable. The same read-compare-write the general
+    // expansion makes under LOCK (the global CAS lock), with the read and the
+    // write done here. The general expansion holds the lock across the Lisp code
+    // that reads and writes the place, which in interpreted code is many
+    // evaluation steps; every thread waiting on the lock waits for all of them.
+    // Returns the value read, as COMPARE-AND-SWAP does.
+    public static LispObject CasSymbolValue(LispObject[] args)
+    {
+        if (args.Length != 4 || args[0] is not LispLock lk || args[1] is not Symbol sym)
+            throw new LispErrorException(new LispProgramError("%CAS-SYMBOL-VALUE: requires a lock, a symbol, old and new"));
+        lock (lk.Monitor)
+        {
+            var cur = DynamicBindings.Get(sym);
+            if (IsTrueEql(cur, args[2]))
+                DynamicBindings.SetChecked(sym, args[3]);
+            return cur;
+        }
+    }
+
+    // (%ATOMIC-DELTA-SYMBOL-VALUE lock symbol delta subtract-p): DOTCL:ATOMIC-INCF
+    // (or ATOMIC-DECF when SUBTRACT-P) on a globally special variable, under LOCK,
+    // for the reason CasSymbolValue gives. Returns the new value.
+    public static LispObject AtomicDeltaSymbolValue(LispObject[] args)
+    {
+        if (args.Length != 4 || args[0] is not LispLock lk || args[1] is not Symbol sym)
+            throw new LispErrorException(new LispProgramError("%ATOMIC-DELTA-SYMBOL-VALUE: requires a lock, a symbol, a delta and a flag"));
+        lock (lk.Monitor)
+        {
+            var cur = DynamicBindings.Get(sym);
+            var r = args[3] is Nil ? Add(cur, args[2]) : Subtract(cur, args[2]);
+            DynamicBindings.SetChecked(sym, r);
+            return r;
+        }
+    }
+
     /// <summary>(bt:thread-join thread) -> thread's return value</summary>
     public static LispObject ThreadJoin(LispObject[] args)
     {
         if (args.Length < 1 || args[0] is not LispThread lt)
             throw new LispErrorException(new LispProgramError("THREAD-JOIN: requires a thread"));
+        if (lt.Thread == Thread.CurrentThread)
+            throw new LispErrorException(new LispError($"THREAD-JOIN: {lt} cannot join itself"));
+        bool interrupted = false;
+        var self = EnterInterruptibleWait();
         try { lt.Thread.Join(); }
-        catch (System.Threading.ThreadInterruptedException) { if (!RunPendingInterrupts()) throw; }
+        catch (System.Threading.ThreadInterruptedException) { interrupted = true; }
+        finally { LeaveInterruptibleWait(self); }
+        if (interrupted && !RunPendingInterrupts()) throw new System.Threading.ThreadInterruptedException();
         return lt.ReturnValue ?? Nil.Instance;
     }
 
@@ -578,7 +661,7 @@ public partial class Runtime
     /// <summary>(bt:make-recursive-lock &optional name) -> lock (re-entrant)</summary>
     public static LispObject MakeRecursiveLock(LispObject[] args)
     {
-        string name = args.Length > 0 && args[0] is LispString ls ? ls.Value : "anonymous";
+        string name = (args.Length > 0 ? StringValueOrNull(args[0]) : null) ?? "anonymous";
         return new LispLock(name, recursive: true);
     }
 
@@ -591,7 +674,7 @@ public partial class Runtime
         for (int i = 0; i + 1 < args.Length; i += 2)
         {
             if (args[i] is Symbol s && s.Name == "NAME")
-                name = args[i + 1] is LispString ls ? ls.Value : args[i + 1].ToString()!;
+                name = StringValueOrNull(args[i + 1]) ?? args[i + 1].ToString()!;
         }
         return new LispConditionVariable(name);
     }
@@ -629,9 +712,11 @@ public partial class Runtime
         System.Threading.Monitor.Enter(cv.SyncObj);
         bool signaled = true;
         bool interrupted = false;
+        LispThread? self = null;
         try
         {
             System.Threading.Monitor.Exit(lk.Monitor);
+            self = EnterInterruptibleWait();
             if (timeoutSec.HasValue)
                 signaled = System.Threading.Monitor.Wait(cv.SyncObj,
                     TimeSpan.FromSeconds(timeoutSec.Value));
@@ -647,6 +732,7 @@ public partial class Runtime
         }
         finally
         {
+            LeaveInterruptibleWait(self);
             System.Threading.Monitor.Exit(cv.SyncObj);
             System.Threading.Monitor.Enter(lk.Monitor);
         }
@@ -693,7 +779,7 @@ public partial class Runtime
             if (args[i] is Symbol s)
             {
                 if (s.Name == "NAME")
-                    name = args[i + 1] is LispString ls ? ls.Value : args[i + 1].ToString()!;
+                    name = StringValueOrNull(args[i + 1]) ?? args[i + 1].ToString()!;
                 else if (s.Name == "COUNT" && args[i + 1] is Fixnum f)
                     count = (int)f.Value;
             }
@@ -735,21 +821,23 @@ public partial class Runtime
                 };
             }
         }
+        bool got = true, interrupted = false;
+        var self = EnterInterruptibleWait();
         try
         {
             if (timeoutSec.HasValue)
-            {
-                bool got = sem.Sem.Wait(TimeSpan.FromSeconds(timeoutSec.Value));
-                return got ? T.Instance : Nil.Instance;
-            }
-            sem.Sem.Wait();
+                got = sem.Sem.Wait(TimeSpan.FromSeconds(timeoutSec.Value));
+            else
+                sem.Sem.Wait();
         }
-        catch (System.Threading.ThreadInterruptedException)
+        catch (System.Threading.ThreadInterruptedException) { interrupted = true; }
+        finally { LeaveInterruptibleWait(self); }
+        if (interrupted)
         {
-            if (!RunPendingInterrupts()) throw;
+            if (!RunPendingInterrupts()) throw new System.Threading.ThreadInterruptedException();
             return Nil.Instance;   // woke without acquiring
         }
-        return T.Instance;
+        return got ? T.Instance : Nil.Instance;
     }
 
     /// <summary>(dotcl:all-threads) -> list of all live LispThread objects</summary>
@@ -804,6 +892,10 @@ public partial class Runtime
         var pctRelease = new LispFunction(Runtime.ReleaseLock, "%RELEASE-LOCK");
         pctRelease.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.ReleaseLock1);
         Emitter.CilAssembler.RegisterFunction("%RELEASE-LOCK", pctRelease);
+        Emitter.CilAssembler.RegisterFunction("%CAS-SYMBOL-VALUE",
+            new LispFunction(Runtime.CasSymbolValue, "%CAS-SYMBOL-VALUE", 4));
+        Emitter.CilAssembler.RegisterFunction("%ATOMIC-DELTA-SYMBOL-VALUE",
+            new LispFunction(Runtime.AtomicDeltaSymbolValue, "%ATOMIC-DELTA-SYMBOL-VALUE", 4));
         Emitter.CilAssembler.RegisterFunction("%THREAD-JOIN",
             new LispFunction(Runtime.ThreadJoin, "%THREAD-JOIN"));
         Emitter.CilAssembler.RegisterFunction("%THREAD-YIELD",

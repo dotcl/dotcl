@@ -3,4 +3,5 @@
 (defsystem "dotcl-advice"
   :description "Interactive advice (watch / patch) on live .NET methods from Lisp, via Lib.Harmony."
   :version "0.1"
+  :depends-on ("dotnet-nuget" "dotnet-class")
   :class require-system)

@@ -298,8 +298,8 @@
     (coerce a 'list))
   (6.0d0 7.0d0 8.0d0))
 
-;; a caller passing a NON-float-backed array to a float-typed param must not
-;; corrupt: the runtime fast path re-checks kind and coerces via the boxed path.
+;; a caller passing a NON-float-backed array to a float-typed param is a
+;; TYPE-ERROR at (safety 1): the declaration is checked on entry.
 (defun %naf-param-read (a i)
   (declare (type (simple-array double-float (*)) a) (fixnum i))
   (aref a i))
@@ -309,7 +309,7 @@
   ;; misses (_numKind 0), falls back to boxed coerce.
   (let ((v (make-array 2 :initial-element 0)))
     (setf (aref v 1) 3.5d0)
-    (%naf-param-read v 1))
-  3.5d0)
+    (handler-case (%naf-param-read v 1) (type-error () :type-error)))
+  :type-error)
 
 (setf dotcl:*save-sil* nil)

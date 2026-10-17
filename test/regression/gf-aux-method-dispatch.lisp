@@ -4,7 +4,7 @@
 ;;; The loose-argument dispatch path (DISPATCHGF1/2/3) ran only the
 ;;; "one primary, nothing else" shape and handed every other cache hit to the
 ;;; array path. One :after method therefore cost 32 B on EVERY call to that
-;;; generic function -- measured with bench/micro-gf-dispatch.lisp's method:
+;;; generic function -- measured with bench/probes/micro-gf-dispatch.lisp's method:
 ;;; 16.1 B/op baseline, 16.1 with a plain primary, 48.2 with an :after added.
 ;;;
 ;;; :before and :after methods run for effect on the same arguments the primary

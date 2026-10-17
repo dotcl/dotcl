@@ -7,17 +7,28 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: test-random-forms test-random-type-prop il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-coverage test-ansi-all test-ansi-gate library-status library-status-tests test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree refresh-quicklisp-contrib test-pack-nuspec test-pack-library-e2e test-pack-library-previous test-save-class-lib test-project-compose test-project-core-build test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotnet-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: regression-time test-random-forms test-random-type-prop il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-coverage test-ansi-all test-ansi-gate library-status library-status-tests test-library-status-dists test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree refresh-quicklisp-contrib test-pack-nuspec test-pack-library-e2e test-pack-library-previous test-dist-package-e2e test-save-class-lib test-project-compose test-project-core-build test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotnet-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
 CIL_SOURCES := \
   $(DOTCL_ROOT)compiler/cil-compiler.lisp \
+  $(DOTCL_ROOT)compiler/cil-compiler-ranges.lisp \
+  $(DOTCL_ROOT)compiler/cil-compiler-fixnum.lisp \
+  $(DOTCL_ROOT)compiler/cil-compiler-float.lisp \
+  $(DOTCL_ROOT)compiler/cil-compiler-call.lisp \
   $(DOTCL_ROOT)compiler/cil-stdlib.lisp \
   $(DOTCL_ROOT)compiler/cil-macros.lisp \
   $(DOTCL_ROOT)compiler/loop.lisp \
   $(DOTCL_ROOT)compiler/cil-analysis.lisp \
   $(DOTCL_ROOT)compiler/cil-forms.lisp \
+  $(DOTCL_ROOT)compiler/cil-forms-defun.lisp \
+  $(DOTCL_ROOT)compiler/cil-forms-let.lisp \
+  $(DOTCL_ROOT)compiler/cil-forms-lambda.lisp \
+  $(DOTCL_ROOT)compiler/cil-forms-interp.lisp \
+  $(DOTCL_ROOT)compiler/cil-forms-flet.lisp \
+  $(DOTCL_ROOT)compiler/cil-forms-control.lisp \
+  $(DOTCL_ROOT)compiler/cil-forms-dispatch.lisp \
   $(DOTCL_ROOT)compiler/cl-docstrings.lisp
 
 # Runtime (C#) sources. A compiled .fasl carries the code generation of the
@@ -112,8 +123,10 @@ define TREE_STAMP
 	@git -C $(DOTCL_ROOT). status --porcelain --untracked-files=no | sed "s/^/=== dirty: /"
 endef
 
-# compiler/dotcl.core: the command-line, pack and build tests start child
-# processes from the FASL core (REGRESSION-CHILD-CORE in test/framework.lisp).
+# compiler/dotcl.core: the tests that start child processes (command line,
+# pack, build, the REPL on a pipe, RUN-PROGRAM) start them from the FASL core
+# (REGRESSION-CHILD-CORE in test/framework.lisp). Some of them also load under
+# the interpreter, so test-regression-interp needs it too.
 test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)compiler/dotcl.core $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl) refresh-quicklisp-contrib
 	@echo "=== Running dotcl regression tests ==="
 	$(TREE_STAMP)
@@ -130,7 +143,7 @@ test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)compiler/d
 # only: LOAD still compiles top-level forms. This exercises the interpreter
 # wherever a test reaches it through EVAL, which is far better than nothing but
 # is not the same as running the suite ON an emit-free build.
-test-regression-interp: build $(DOTCL_ROOT)compiler/cil-out.sil $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl) refresh-quicklisp-contrib
+test-regression-interp: build $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)compiler/dotcl.core $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl) refresh-quicklisp-contrib
 	@echo "=== Running dotcl regression tests (tree-walk interpreter) ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(setq dotcl:*evaluator-mode* :interpret)' $(DOTCL_ROOT)test/regression/run.lisp
 
@@ -181,11 +194,19 @@ test-pack-library-e2e: build $(DOTCL_ROOT)compiler/dotcl.core
 # The same, with the library packed by a released dotcl (installed from nuget.org)
 # and loaded by this one: the old fasls have to load and run here as they are.
 # Pinned like the seed; move it to the newest release when one ships.
-PREVIOUS_DOTCL_VERSION ?= 0.1.32
+PREVIOUS_DOTCL_VERSION ?= 0.1.33
 
 test-pack-library-previous: build $(DOTCL_ROOT)compiler/dotcl.core
 	@echo "=== Running library package check (packed by dotcl $(PREVIOUS_DOTCL_VERSION)) ==="
 	PRODUCER_VERSION=$(PREVIOUS_DOTCL_VERSION) sh $(DOTCL_ROOT)test/pack-library-e2e/check.sh $(DOTCL_ROOT)
+
+# A dist release (ironclad) built into a package with scripts/dist-package.sh
+# onto a local feed, then quickloaded from a fresh Quicklisp home: from the
+# package with nothing compiled, and from source when the index line names
+# another dotcl. Needs the network for the dists (about 80 s on an M1).
+test-dist-package-e2e: build $(DOTCL_ROOT)compiler/dotcl.core
+	@echo "=== Running dist package end-to-end check ==="
+	sh $(DOTCL_ROOT)test/dist-package-e2e/check.sh $(DOTCL_ROOT)
 
 # Asserts dotcl can emit a .NET DLL that a separate C# app references at compile
 # time (save-class-library stage 1). Round-trips via dotnet build; needs .NET 9+.
@@ -200,7 +221,7 @@ test-save-class-lib: build
 # the package layout the targets resolve against and builds a project twice: once
 # with a dependency that cannot be found (the message has to name the remedy) and
 # once with DotclAsdSearchPath set (it has to build).
-test-project-core-build: build $(DOTCL_ROOT)compiler/dotcl.core
+test-project-core-build: build $(DOTCL_ROOT)compiler/dotcl.core compile-contrib-fasls
 	@echo "=== Running project-core MSBuild task checks ==="
 	sh $(DOTCL_ROOT)test/project-core-build/check.sh $(DOTCL_ROOT)
 
@@ -476,6 +497,11 @@ library-status-tests: bench-build $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT
 	@DOTCL_VERSION="$$(git -C $(DOTCL_ROOT). describe --tags --always)" \
 	  $(DOTCL_LISP) --load $(DOTCL_ROOT)bench/library-status/render.lisp
 	@sh $(DOTCL_ROOT)bench/library-status/check-scrub.sh $(DOTCL_ROOT).
+
+# The dist check of the library-status scripts: they measure only against the
+# published dotcl dist. Needs no network and no build.
+test-library-status-dists:
+	sh $(DOTCL_ROOT)test/library-status-dists/check.sh $(DOTCL_ROOT)
 
 # The gate over an ANSI run: the set of failing test names must be the set
 # ansi-state.json records. Runs against the outputs test-ansi-all left behind,
@@ -769,14 +795,14 @@ bench-build:
 # instead of failing partway through on a missing file. The check is a
 # parse-time $(wildcard) rather than a `test -d` guard in the recipe, because
 # each recipe line is its own shell: an `exit 0` on the first line would not
-# stop the remaining ones. It is also safe to glob at parse time: bench/run.lisp
+# stop the remaining ones. It is also safe to glob at parse time: bench/cl-bench-runner/run.lisp
 # is a checked-in file, not something an earlier recipe line produces. Relative
 # path: this make always runs in the repo root, and a native make would not
 # resolve the POSIX form of $(DOTCL_ROOT).
-ifeq ($(wildcard bench/run.lisp),)
+ifeq ($(wildcard bench/cl-bench-runner/run.lisp),)
 
 bench bench-state bench-survey:
-	@echo "$@: bench/run.lisp not found; the benchmark harness is not present in this tree."
+	@echo "$@: bench/cl-bench-runner/run.lisp not found; the benchmark harness is not present in this tree."
 
 else
 
@@ -784,7 +810,7 @@ bench: setup-cl-bench bench-build
 	@EVAL_ARGS=""; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="--eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp; \
+	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/cl-bench-runner/run.lisp; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 
 # Generate bench-state.json with dotcl and SBCL results side by side
@@ -794,15 +820,15 @@ bench-state: setup-cl-bench bench-build
 	@EVAL_ARGS=""; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="--eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>$(BENCH_TMP)/bench-dotcl.txt; \
+	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/cl-bench-runner/run.lisp 2>$(BENCH_TMP)/bench-dotcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; dotcl TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 	@echo "=== Running benchmarks on SBCL ==="
 	@EVAL_ARGS=""; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="--eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval timeout $(BENCH_TIMEOUT) $(SBCL_RUN) $$EVAL_ARGS --load $(DOTCL_ROOT)bench/run.lisp --eval "'(quit)'" 2>$(BENCH_TMP)/bench-sbcl.txt; \
+	eval timeout $(BENCH_TIMEOUT) $(SBCL_RUN) $$EVAL_ARGS --load $(DOTCL_ROOT)bench/cl-bench-runner/run.lisp --eval "'(quit)'" 2>$(BENCH_TMP)/bench-sbcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; SBCL TIMEOUT after $(BENCH_TIMEOUT)s"; fi
-	@bash $(DOTCL_ROOT)bench/make-state.sh $(BENCH_TMP)/bench-dotcl.txt $(BENCH_TMP)/bench-sbcl.txt $(DOTCL_ROOT)bench-state.json > $(BENCH_TMP)/bench-state-new.json && mv $(BENCH_TMP)/bench-state-new.json $(DOTCL_ROOT)bench-state.json
+	@bash $(DOTCL_ROOT)bench/cl-bench-runner/make-state.sh $(BENCH_TMP)/bench-dotcl.txt $(BENCH_TMP)/bench-sbcl.txt $(DOTCL_ROOT)bench-state.json > $(BENCH_TMP)/bench-state-new.json && mv $(BENCH_TMP)/bench-state-new.json $(DOTCL_ROOT)bench-state.json
 	@echo "Updated bench-state.json"
 	@cat $(DOTCL_ROOT)bench-state.json
 
@@ -823,20 +849,20 @@ bench-survey: setup-cl-bench bench-build
 	@EVAL_ARGS="--eval '(setq *bench-runs* $(RUNS))' --eval '(setq *bench-warmup* $(WARMUP))'"; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/run.lisp 2>$(BENCH_TMP)/bench-survey-dotcl.txt; \
+	eval DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $$EVAL_ARGS $(DOTCL_ROOT)bench/cl-bench-runner/run.lisp 2>$(BENCH_TMP)/bench-survey-dotcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; dotcl TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 	@echo "=== Survey SBCL (runs=$(RUNS) warmup=$(WARMUP)) ==="
 	@EVAL_ARGS="--eval '(setq *bench-runs* $(RUNS))' --eval '(setq *bench-warmup* $(WARMUP))'"; \
 	if [ -n "$(SUITE)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-suite* :$(SUITE))'"; fi; \
 	if [ -n "$(BENCH)" ]; then EVAL_ARGS="$$EVAL_ARGS --eval '(setq *bench-name* \"$(BENCH)\")'"; fi; \
-	eval timeout $(BENCH_TIMEOUT) $(SBCL_RUN) $$EVAL_ARGS --load $(DOTCL_ROOT)bench/run.lisp --eval "'(quit)'" 2>$(BENCH_TMP)/bench-survey-sbcl.txt; \
+	eval timeout $(BENCH_TIMEOUT) $(SBCL_RUN) $$EVAL_ARGS --load $(DOTCL_ROOT)bench/cl-bench-runner/run.lisp --eval "'(quit)'" 2>$(BENCH_TMP)/bench-survey-sbcl.txt; \
 	rc=$$?; if [ $$rc -eq 124 ]; then echo ";; SBCL TIMEOUT after $(BENCH_TIMEOUT)s"; fi
 	@# The aggregation runs on dotcl itself, so the public bench path needs no
 	@# python3. -v:q keeps MSBuild's build output off stdout, which is the state
 	@# file here; a build failure still stops the mv because the exit code is
 	@# non-zero. (--nologo is not a `dotnet run` flag; it would be forwarded to
 	@# the app and displace --asm from argv[0].)
-	@$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -v:q -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)bench/make-survey-state.lisp $(BENCH_TMP)/bench-survey-dotcl.txt $(BENCH_TMP)/bench-survey-sbcl.txt $(DOTCL_ROOT)bench-state.json > $(BENCH_TMP)/bench-state-new.json && mv $(BENCH_TMP)/bench-state-new.json $(DOTCL_ROOT)bench-state.json
+	@$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -v:q -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)bench/cl-bench-runner/make-survey-state.lisp $(BENCH_TMP)/bench-survey-dotcl.txt $(BENCH_TMP)/bench-survey-sbcl.txt $(DOTCL_ROOT)bench-state.json > $(BENCH_TMP)/bench-state-new.json && mv $(BENCH_TMP)/bench-state-new.json $(DOTCL_ROOT)bench-state.json
 	@echo "Updated bench-state.json"
 
 endif
@@ -863,14 +889,14 @@ PARITY_EXE      = $(PARITY_DIR)/bin/Release/net10.0/$(PARITY_EXE_NAME)
 # processes, which is more than the CI threshold is trying to detect.
 #
 # Five, not two, because some kernels run at two distinct speeds depending on
-# the process (code placement; bench/modes.awk), and the minimum only reports
+# the process (code placement; bench/gate/modes.awk), and the minimum only reports
 # the fast one if some process drew it. In one recorded case 10 of 14 processes
 # drew the slow group: two processes then miss the fast group about half the
 # time, five about a fifth. Five is also enough for the split itself to be
 # detected and printed, which needs three. Raise it to study one kernel.
 PARITY_PASSES  ?= 5
 
-# The key bench/check-ratios.sh looks the baselines up under. A ratio belongs to
+# The key bench/gate/check-ratios.sh looks the baselines up under. A ratio belongs to
 # one machine, not to a platform: the self-hosted CI runners and the Linux
 # laptop used for A/B timing are both linux-x64 and differ by more than the
 # gate's threshold on the same commit (fib 3.7 against 4.5, fixnum-loop 1.0
@@ -879,7 +905,7 @@ PARITY_PASSES  ?= 5
 # of the platform falls back to the plain "<rid>" entries. Set BENCH_PLATFORM to
 # judge against some other machine's numbers on purpose.
 BENCH_CPU := $(shell (sed -n 's/^model name[^:]*: *//p' /proc/cpuinfo 2>/dev/null; sysctl -n machdep.cpu.brand_string 2>/dev/null) | head -1 | tr 'A-Z' 'a-z' | sed -e 's/([a-z]*)//g' -e 's/[^a-z0-9][^a-z0-9]*/-/g' -e 's/^-//' -e 's/-$$//')
-BENCH_PLATFORM ?= $(if $(and $(BENCH_CPU),$(shell grep -F '"$(HOST_RID)@$(BENCH_CPU)/' $(DOTCL_ROOT)bench/ratio-baseline.json 2>/dev/null)),$(HOST_RID)@$(BENCH_CPU),$(HOST_RID))
+BENCH_PLATFORM ?= $(if $(and $(BENCH_CPU),$(shell grep -F '"$(HOST_RID)@$(BENCH_CPU)/' $(DOTCL_ROOT)bench/gate/ratio-baseline.json 2>/dev/null)),$(HOST_RID)@$(BENCH_CPU),$(HOST_RID))
 
 .PHONY: bench-parity
 
@@ -896,7 +922,7 @@ else
 bench-parity: cross-compile bench-build
 	@mkdir -p $(BENCH_TMP)
 	@echo "=== Building the C# side ==="
-	@bash $(DOTCL_ROOT)bench/test-modes.sh
+	@bash $(DOTCL_ROOT)bench/gate/test-modes.sh
 	@dotnet build $(PARITY_DIR)/Parity.csproj -c Release -v:q --nologo
 	@rm -f $(BENCH_TMP)/parity-csharp.txt $(BENCH_TMP)/parity-dotcl.txt
 	@for pass in $$(seq 1 $(PARITY_PASSES)); do \
@@ -906,12 +932,23 @@ bench-parity: cross-compile bench-build
 	    DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $(PARITY_DIR)/kernels.lisp < /dev/null | tee -a $(BENCH_TMP)/parity-dotcl.txt; \
 	done
 	@echo "=== per-process distribution ==="
-	@bash $(DOTCL_ROOT)bench/process-modes.sh --no-compare dotcl=$(BENCH_TMP)/parity-dotcl.txt csharp=$(BENCH_TMP)/parity-csharp.txt
+	@bash $(DOTCL_ROOT)bench/gate/process-modes.sh --no-compare dotcl=$(BENCH_TMP)/parity-dotcl.txt csharp=$(BENCH_TMP)/parity-csharp.txt
 	@bash $(PARITY_DIR)/make-parity-state.sh $(BENCH_TMP)/parity-csharp.txt $(BENCH_TMP)/parity-dotcl.txt $(DOTCL_ROOT)bench-state.json > $(BENCH_TMP)/parity-state-new.json && mv $(BENCH_TMP)/parity-state-new.json $(DOTCL_ROOT)bench-state.json
 	@echo "Updated bench-state.json"
-	@bash $(DOTCL_ROOT)bench/check-ratios.sh $(DOTCL_ROOT)bench-state.json $(DOTCL_ROOT)bench/ratio-baseline.json $(BENCH_PLATFORM)
+	@bash $(DOTCL_ROOT)bench/gate/check-ratios.sh $(DOTCL_ROOT)bench-state.json $(DOTCL_ROOT)bench/gate/ratio-baseline.json $(BENCH_PLATFORM)
 
 endif
+
+# The wall time of the compiled regression suite, recorded in bench-state.json
+# as "regression/compiled" and judged against
+# "<platform>/regression/compiled-seconds" in bench/gate/ratio-baseline.json. The
+# suite is mostly compile time (thousands of small forms, compiled and run), so
+# this is the number that shows a compiler change making compilation slower.
+# Seconds, not a ratio: only comparable on the machine the baseline came from.
+regression-time: build $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)compiler/dotcl.core $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl) refresh-quicklisp-contrib
+	@mkdir -p $(BENCH_TMP)
+	$(TREE_STAMP)
+	@bash $(DOTCL_ROOT)bench/gate/regression-time.sh $(DOTCL_ROOT). $(DOTCL_ROOT)bench-state.json $(DOTCL_ROOT)bench/gate/ratio-baseline.json $(BENCH_PLATFORM) $(BENCH_TMP)/regression-time.txt
 
 
 ## --- IL parity (bench/il-parity) ------------------------------------------
@@ -963,8 +1000,9 @@ setup-cl-bench:
 	fi
 
 # cil-out.sil is the actual artifact; cross-compile is a phony alias kept
-# for backward compatibility. Dependencies on $(CIL_SOURCES) and
-# cil-compile.lisp let make skip rebuilds when no source has changed.
+# for backward compatibility. Dependencies on $(CIL_SOURCES), cil-compile.lisp
+# and cil-host.lisp (what the host stands in for, loaded by cil-compile.lisp)
+# let make skip rebuilds when no source has changed.
 # The exit status of the Lisp half is not evidence that this rule ran. A read or
 # compile error puts the host in the debugger, the closed stdin hands it EOF, and
 # it exits 0 -- so make records the rule as succeeded, cil-out.sil keeps whatever
@@ -978,7 +1016,12 @@ setup-cl-bench:
 # rebuild: make only runs this recipe when the target is already out of date
 # against these same inputs, so reaching here means it was supposed to be
 # rewritten.
-$(DOTCL_ROOT)compiler/cil-out.sil: $(CIL_SOURCES) $(DOTCL_ROOT)compiler/cil-compile.lisp
+#
+# Last, scripts/check-host-defs.sh: the sources are read with the host's
+# features, so a definition under #-dotcl would be compiled into the core and
+# replace the runtime builtin of the same name. A failure removes the artifact
+# so the next make does not take it as up to date.
+$(DOTCL_ROOT)compiler/cil-out.sil: $(CIL_SOURCES) $(DOTCL_ROOT)compiler/cil-compile.lisp $(DOTCL_ROOT)compiler/cil-host.lisp
 	DOTCL_INPUTS="$(CIL_SOURCES)" DOTCL_OUTPUT="$@" $(DOTCL_LISP) --load $(DOTCL_ROOT)compiler/cil-compile.lisp
 	@if [ ! -f "$@" ]; then \
 	  echo "cross-compile: $@ was not produced." >&2; \
@@ -995,6 +1038,8 @@ $(DOTCL_ROOT)compiler/cil-out.sil: $(CIL_SOURCES) $(DOTCL_ROOT)compiler/cil-comp
 	    exit 1; \
 	  fi; \
 	done
+	@sh $(DOTCL_ROOT)scripts/check-host-defs.sh "$@" $(DOTCL_ROOT)compiler/cil-host.lisp $(CIL_SOURCES) \
+	  || { rm -f "$@"; exit 1; }
 
 cross-compile: $(DOTCL_ROOT)compiler/cil-out.sil
 

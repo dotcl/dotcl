@@ -292,11 +292,12 @@ CLOS は ASCII 圏で完結するため当面問題なし)。
 **主要なファイル**:
 - `compiler/cil-compile.lisp` (184 行) — クロスコンパイル時のドライバ。
   ファイル読み込み、`eval-when` の `:compile-toplevel` 処理、SIL 出力
-- `compiler/cil-compiler.lisp` (3450 行) — `compile-toplevel` /
+- `compiler/cil-compiler.lisp` と `cil-compiler-*.lisp` — `compile-toplevel` /
   `compile-toplevel-eval` のエントリポイント、コンパイル状態
   (`*CSTATE*` パック、下記) と大域環境 (`*macros*` / `*specials*` 等)
-  の管理、inline 展開・compiler macro のフック
-- `compiler/cil-forms.lisp` (7388 行) — 250 ほどの special form ハンドラ
+  の管理、inline 展開・compiler macro のフック、型付きの演算 (fixnum / u64 /
+  float) と呼び出し
+- `compiler/cil-forms.lisp` と `cil-forms-*.lisp` — 250 ほどの special form ハンドラ
   を `*compile-form-handlers*` ハッシュ (O(1) ディスパッチ) に登録。
   `quote` / `if` / `let` / `lambda` / `block` / `tagbody` /
   `handler-case` / `unwind-protect` 等
@@ -629,7 +630,8 @@ condition と .NET 例外は同じ機構に乗っているので、境界を越�
 | --- | --- |
 | Lisp → .NET 呼び出しで .NET 例外 | `handler-case` が raw 例外をそのまま捕まえる。`dotnet:new` は `TargetInvocationException` の inner を剥がす。socket I/O のように意味が対応するものは `STREAM-ERROR` 等へ寄せてある |
 | .NET → Lisp コールバックから condition が脱出 | `LispErrorException` として C# 側へ透過する。境界でハンドラクラスタを積むので、対話デバッガに落ちることはない。`storage-condition` だけは境界で封じ込める |
-| REPL のトップレベル | `error` / `break` / `invoke-debugger` に加え、ランタイムが signal する condition (型違い・未定義関数・添字はみ出し・ゼロ割・.NET 例外の包み) も、誰も handle しなければデバッガに入る。入口は `LispErrorException` のコンストラクタ (ハンドラを走らせた直後、まだ何も巻き戻っていない時点) で、REPL が 1 フォームの評価と印字の間だけ立てるスレッドごとのスイッチ `ConditionSystem.UnhandledErrorsEnterDebugger` で有効になる。スクリプト・ライブラリの C# 側 `catch`・REPL の reader (未完のフォームは END-OF-FILE で続きを待つ) には効かない。デバッガ/`*debugger-hook*` の実行中はスイッチを切るので入れ子にならない |
+| REPL のトップレベル | `error` / `break` / `invoke-debugger` に加え、ランタイムが signal する condition (型違い・未定義関数・添字はみ出し・ゼロ割・.NET 例外の包み) も、誰も handle しなければデバッガに入る。入口は `LispErrorException` のコンストラクタ (ハンドラを走らせた直後、まだ何も巻き戻っていない時点) で、REPL が 1 フォームの評価と印字の間だけ立てるスレッドごとのスイッチ `ConditionSystem.UnhandledErrorsEnterDebugger` で有効になる。ライブラリの C# 側 `catch`・REPL の reader (未完のフォームは END-OF-FILE で続きを待つ) には効かない。デバッガ/`*debugger-hook*` の実行中はスイッチを切るので入れ子にならない |
+| スクリプト・`--load`・`--eval`・ホスト | ランタイムが signal する condition も、誰も handle せず `*debugger-hook*` が利用者のもの (NIL でも、スクリプト・pack / build・`SetThrowingDebuggerHook` が入れる報告用のものでもない) なら、`error` と同じく `INVOKE-DEBUGGER` を通って hook を呼ぶ (SBCL と同じ)。報告用の hook は `ConditionSystem.ReportingDebuggerHook` で登録したもので、NIL と同じ扱い。そのときはローダまで巻き戻って `file:line: message` で終わる |
 | Lisp が main の実行ファイル | 利用者が `handler-case` を書く。既定のトップレベルハンドラは置いていない |
 | 深い再帰・スタック枯渇 | 上記のとおり `storage-condition` 化 |
 | スレッド | ハンドラクラスタもリスタートもスレッドごと。ワーカースレッドには abort リスタートが無い |
@@ -936,7 +938,7 @@ netstandard2.0 では常に false = 解釈経路だけになる。net10 ビル�
 
 ```
 dotcl/
-  compiler/    Lisp 製 CIL コンパイラ (cil-compiler.lisp / cil-forms.lisp /
+  compiler/    Lisp 製 CIL コンパイラ (cil-compiler*.lisp / cil-forms*.lisp /
                cil-stdlib.lisp / cil-analysis.lisp / cil-macros.lisp /
                cil-compile.lisp / loop.lisp)。cross-compile が
                cil-out.sil (S 式 IL) を生成し、ランタイム起動時に
@@ -945,9 +947,10 @@ dotcl/
                assembler (Emitter/CilAssembler.cs と FaslAssembler.cs)、
                組み込み関数。機能別に Runtime.*.cs と LispObject 由来
                クラスに分割
-  contrib/     同梱モジュール 15 本 (dotnet-nuget / asdf-nuget /
-               dotnet-class / dotnet-ffi / dotcl-thread / dotcl-socket /
-               dotcl-gray / dotcl-repl / dotcl-lsp-api /
+  contrib/     同梱モジュール 16 本 (dotnet-nuget / asdf-nuget /
+               dotnet-class / dotnet-ffi /
+               dotcl-thread / dotcl-socket / dotcl-bsd-sockets /
+               dotcl-gray / dotcl-repl / dotcl-code-info /
                dotcl-advice / dotcl-clrmd / dotcl-decompiler / dotnet-cs /
                dotcl-float / dotcl-jitdisasm)。1 ディレクトリ 1 モジュールで、
                それぞれに README.md がある。`.asd` は require-system の
@@ -1006,7 +1009,7 @@ dotcl/
   backtrace / frame-locals / source-location / eval-in-frame / arglist
   などの中核は実装済みで、xref 呼出グラフや stepping は未実装。
   SLIME 本家の swank 側は未対応。プロトコルに依らない側は contrib
-  `dotcl-lsp-api` に寄せてあり (カーソル位置の補完候補・リファレンス
+  `dotcl-code-info` に寄せてあり (カーソル位置の補完候補・リファレンス
   URL・その名前が何か)、同梱 REPL の TAB 補完も同じ口を使う
 - **Step 10 (進行中)**: emit 無しで動く構成 (3.17)。netstandard2.0 /
   AOT 向けに、解釈経路とプリコンパイル済み FASL だけで CL を回す

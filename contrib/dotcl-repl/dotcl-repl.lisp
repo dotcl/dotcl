@@ -4,7 +4,8 @@
 ;;;        (dotcl-repl:readline "CL-USER> ")
 ;;;
 ;;; Features:
-;;;   - Character-by-character raw terminal input via System.Console
+;;;   - Character-by-character raw terminal input via System.Console, or
+;;;     through a terminal the host supplies (*terminal*, make-terminal)
 ;;;   - Left/right/home/end cursor movement
 ;;;   - Backspace, Delete
 ;;;   - Up/down arrow history, kept between sessions in a file
@@ -39,7 +40,11 @@
            #:split-command
            #:quit-repl
            #:*commands*
-           #:*command-list*))
+           #:*command-list*
+           #:*terminal*
+           #:make-terminal
+           #:run-repl
+           #:interrupt-repl))
 
 (in-package :dotcl-repl)
 
@@ -54,7 +59,7 @@
 ;;;   (:start N :end M :items ((:label "Append" :detail "(String) => ...") ...))
 ;;;
 ;;; where START and END delimit the text to replace. This is the shape
-;;; dotcl-lsp-api:completions returns, and the same shape an editor needs, so a
+;;; dotcl-code-info:completions returns, and the same shape an editor needs, so a
 ;;; completer written for one serves the other. It replaces an older contract
 ;;; that took a prefix string: a prefix cannot say where a candidate starts,
 ;;; which breaks as soon as the token is a string literal (a .NET member name).
@@ -141,32 +146,18 @@ named keep their colour. Whether to paint at all is not changed."
         (funcall fn role text target)
         text)))
 
-;;; -- System.Console wrappers -------------------------------------------------
+;;; -- The terminal --------------------------------------------------------------
+;;;
+;;; Everything the editor asks of the terminal goes through *TERMINAL*: a key,
+;;; whether one is waiting, writing, the window's size, and whether input and
+;;; output are a terminal at all. The default is System.Console. A host without
+;;; one (a page in a browser) makes its own with MAKE-TERMINAL.
 
-(defun console-read-key ()
-  "Read a ConsoleKeyInfo without echo. Returns the .NET object."
-  (dotnet:static "System.Console" "ReadKey" t))
-
-(defun console-read-key-interruptable ()
-  "Read a ConsoleKeyInfo without echo, with a busy wait so the
-   thread can be interrupted. Returns the .NET object, or nil
-   if the thread was interrupted."
-  (handler-case
-      ;; Busy-wait loop: Check Console.KeyAvailable periodically,
-      ;; sleeping for 50ms at a time if no key is available.
-      ;; This allows System.Threading.ThreadInterruptedException to be
-      ;; thrown during Thread.Sleep when the REPL thread is interrupted,
-      ;; which we can then catch and handle.
-      (loop
-        (if (dotnet:static "System.Console" "get_KeyAvailable")
-            ;; A key is ready; read it without echoing it to the console.
-            (return (dotnet:static "System.Console" "ReadKey" t))
-            ;; No key is available; sleep for 50ms to yield execution time.
-            (dotnet:static "System.Threading.Thread" "Sleep" 50)))
-    ;; Catch any .NET System.Exception (which gets wrapped by the runtime
-    ;; as a Lisp LispProgramError/error). In case of a ThreadInterruptedException,
-    ;; we return nil to notify the caller that reading was interrupted.
-    (error () nil)))
+(defstruct (terminal (:conc-name %terminal-)
+                     (:constructor %make-terminal)
+                     (:copier nil))
+  read-key key-available-p write width height
+  term input-terminal-p output-terminal-p check ctrl-c-as-input)
 
 ;;; On a Windows console, Ctrl+C is normally not a key at all: the console
 ;;; raises CTRL_C_EVENT for every process attached to it. The REPL's own
@@ -181,13 +172,86 @@ named keep their colour. Whether to paint at all is not changed."
 ;;; that into "drop this form" while it waits for input, and nothing else
 ;;; sees the signal.
 
-(defun ctrl-c-as-input (on)
-  "Set Console.TreatControlCAsInput on a Windows console; return the old value.
-Does nothing, and returns NIL, anywhere else."
+(defun console-ctrl-c-as-input (on)
   (when (member :windows *features*)
     (ignore-errors
      (prog1 (dotnet:static "System.Console" "TreatControlCAsInput")
        (setf (dotnet:static "System.Console" "TreatControlCAsInput") on)))))
+
+(defun make-console-terminal ()
+  "The terminal System.Console is."
+  (%make-terminal
+   ;; Waits in short sleeps rather than in ReadKey, so that the thread can be
+   ;; interrupted while it waits.
+   :read-key (lambda ()
+               (loop
+                 (if (dotnet:static "System.Console" "get_KeyAvailable")
+                     (return (dotnet:static "System.Console" "ReadKey" t))
+                     (dotnet:static "System.Threading.Thread" "Sleep" 50))))
+   :key-available-p (lambda () (dotnet:static "System.Console" "get_KeyAvailable"))
+   :write (lambda (s) (dotnet:static "System.Console" "Write" s))
+   :width (lambda () (ignore-errors (dotnet:static "System.Console" "get_WindowWidth")))
+   :height (lambda () (ignore-errors (dotnet:static "System.Console" "get_WindowHeight")))
+   :term (lambda () (dotnet:static "System.Environment" "GetEnvironmentVariable" "TERM"))
+   :input-terminal-p (lambda () (not (dotnet:static "System.Console" "get_IsInputRedirected")))
+   :output-terminal-p (lambda () (not (dotnet:static "System.Console" "get_IsOutputRedirected")))
+   ;; Both throw where there is no console. The width is asked here because
+   ;; TERMINAL-WIDTH falls back to a default instead.
+   :check (lambda ()
+            (dotnet:static "System.Console" "get_KeyAvailable")
+            (dotnet:static "System.Console" "get_WindowWidth"))
+   :ctrl-c-as-input #'console-ctrl-c-as-input))
+
+(defun make-terminal (&key read-key write (key-available-p (constantly nil))
+                           (width (constantly nil)) (height (constantly nil))
+                           term)
+  "A terminal for *TERMINAL* made of functions the host supplies.
+
+READ-KEY, of no arguments, waits for a key and returns it as a
+System.ConsoleKeyInfo, or NIL for the end of input. WRITE takes a string, escape
+sequences and all, and shows it. KEY-AVAILABLE-P answers whether READ-KEY would
+return at once; it matters only to a host that hands over the escape sequence
+of a key one character at a time. WIDTH and HEIGHT return the size in
+characters, or NIL when it is not known (then COLUMNS and LINES, else 80 x 24).
+TERM is what the TERM variable would say; \"dumb\" means no cursor movement, and
+so no line editor."
+  (unless (and read-key write)
+    (error "MAKE-TERMINAL needs :READ-KEY and :WRITE"))
+  (%make-terminal :read-key read-key :write write
+                  :key-available-p key-available-p
+                  :width width :height height
+                  :term (constantly term)
+                  :input-terminal-p (constantly t)
+                  :output-terminal-p (constantly t)
+                  :check (constantly t)
+                  :ctrl-c-as-input (constantly nil)))
+
+(defvar *terminal* (make-console-terminal)
+  "The terminal the line editor, its menus and the debugger's menus use.")
+
+(defvar *key-wait* nil
+  "In a REPL RUN-REPL runs, a cons whose car is true while the editor waits for
+a key and whose cdr is true while that REPL runs. Bound per REPL; INTERRUPT-REPL
+reads it from another thread.")
+
+(defun console-read-key ()
+  "Wait for a key and return it as a ConsoleKeyInfo, without echo."
+  (let ((wait *key-wait*))
+    (if wait
+        (progn (setf (car wait) t)
+               (unwind-protect (funcall (%terminal-read-key *terminal*))
+                 (setf (car wait) nil)))
+        (funcall (%terminal-read-key *terminal*)))))
+
+(defun console-read-key-interruptable ()
+  "CONSOLE-READ-KEY, or NIL when the wait was interrupted or failed."
+  (handler-case (console-read-key)
+    (error () nil)))
+
+(defun ctrl-c-as-input (on)
+  "Set Console.TreatControlCAsInput on a Windows console; return the old value.
+Does nothing, and returns NIL, anywhere else."
+  (funcall (%terminal-ctrl-c-as-input *terminal*) on))
 
 (defun key-char (ki)
   (dotnet:invoke ki "KeyChar"))
@@ -219,13 +283,13 @@ Does nothing, and returns NIL, anywhere else."
 
 (defun key-waiting-p ()
   "True when a key can be read without waiting for one to be pressed."
-  (and (dotnet:static "System.Console" "get_KeyAvailable") t))
+  (and (funcall (%terminal-key-available-p *terminal*)) t))
 
 (defun write-str (s)
-  (dotnet:static "System.Console" "Write" s))
+  (funcall (%terminal-write *terminal*) s))
 
 (defun write-ch (ch)
-  (dotnet:static "System.Console" "Write" ch))
+  (funcall (%terminal-write *terminal*) (string ch)))
 
 ;;; -- Display helpers ---------------------------------------------------------
 
@@ -237,7 +301,7 @@ Does nothing, and returns NIL, anywhere else."
 ;;; 80 x 24, so that code which only lays text out does not fail for want of a
 ;;; window. Whether there is a console to edit on is ENSURE-CONSOLE's question.
 (defun terminal-dimension (getter variable default)
-  (let ((n (ignore-errors (dotnet:static "System.Console" getter))))
+  (let ((n (ignore-errors (funcall getter))))
     (if (and (integerp n) (> n 0))
         n
         (let* ((env (ignore-errors
@@ -248,13 +312,13 @@ Does nothing, and returns NIL, anywhere else."
           (if (and (integerp v) (> v 0)) v default)))))
 
 (defun terminal-width ()
-  (terminal-dimension "get_WindowWidth" "COLUMNS" 80))
+  (terminal-dimension (%terminal-width *terminal*) "COLUMNS" 80))
 
 ;;; Only the redraw of a multi-line input needs this, and only to find out that
 ;;; it cannot be done. A host that answers zero is treated as one that does not
 ;;; know, because zero would mean every input is already too tall.
 (defun terminal-height ()
-  (terminal-dimension "get_WindowHeight" "LINES" 24))
+  (terminal-dimension (%terminal-height *terminal*) "LINES" 24))
 
 ;;; Everything below draws with RELATIVE cursor movement only.
 ;;;
@@ -1458,10 +1522,7 @@ Returns the exit status, or NIL when nothing ran."
 ;;; interruption and answers NIL, which is the silent ending this avoids.
 (defun ensure-console ()
   "Signal an error unless there is a console to edit on."
-  (dotnet:static "System.Console" "get_KeyAvailable")
-  ;; An unusable output handle throws out of the width query. TERMINAL-WIDTH
-  ;; falls back to a default instead, so the console is asked directly here.
-  (dotnet:static "System.Console" "get_WindowWidth")
+  (funcall (%terminal-check *terminal*))
   t)
 
 (defun read-line-edited (prompt &optional (commands t) (initial ""))
@@ -1483,6 +1544,10 @@ Returns the exit status, or NIL when nothing ran."
    READLINE, further down, is the entry point the read loop calls: it is this
    function plus the comma commands."
   (ensure-console)
+  ;; What was evaluated went to the Lisp streams, the editor writes to the
+  ;; terminal: where the two end up on one screen, the first must be out first.
+  (ignore-errors (finish-output *standard-output*))
+  (ignore-errors (finish-output *error-output*))
   (write-str *bracketed-paste-on*)
   (write-str prompt)
   (let ((prompt-width (prompt-display-width prompt))
@@ -2350,12 +2415,11 @@ NUMBERED lets digits choose by number (see MENU-STEP)."
 ;;; That is the runtime's decision about the line editor, asked without
 ;;; --readline, so a menu is never drawn where the editor would not be.
 
-(defun menu-usable-p (&key (term (dotnet:static "System.Environment"
-                                                 "GetEnvironmentVariable" "TERM"))
+(defun menu-usable-p (&key (term (funcall (%terminal-term *terminal*)))
                            (output-redirected
-                            (dotnet:static "System.Console" "get_IsOutputRedirected"))
+                            (not (funcall (%terminal-output-terminal-p *terminal*))))
                            (input-redirected
-                            (dotnet:static "System.Console" "get_IsInputRedirected")))
+                            (not (funcall (%terminal-input-terminal-p *terminal*)))))
   "True when a menu can be drawn: input and output are a terminal, and it is
 not one that says it cannot move the cursor."
   (let ((decide (find-symbol "%REPL-LINE-EDITING-DECISION" "DOTCL")))
@@ -2799,11 +2863,11 @@ car describes CAR. Any other form is evaluated and its value described, so
 
 (define-command ("args") (argument "<symbol>")
   "Print how a function is called.
-Answered by dotcl-lsp-api, which is where an editor asks the same question, so
+Answered by dotcl-code-info, which is where an editor asks the same question, so
 the prompt and the editor cannot come to disagree about a lambda list."
   (let* ((text (require-argument ",args" argument))
-         (description (funcall (contrib-function "dotcl-lsp-api"
-                                                 "DOTCL-LSP-API" "DESCRIBE-AT")
+         (description (funcall (contrib-function "dotcl-code-info"
+                                                 "DOTCL-CODE-INFO" "DESCRIBE-AT")
                                text (length text)))
          (signatures (getf description :signatures)))
     (cond ((null description)
@@ -3036,16 +3100,94 @@ unwinding through the place that normally turns it off."
   (dotcl::%set-debugger-read-hook nil)
   (dotcl::%set-repl-readline-hook nil))
 
+;;; -- The REPL on a host's terminal ---------------------------------------------
+
+(defvar *repl* nil
+  "The REPL RUN-REPL runs, as (thread . key-wait), while it runs.")
+
+(defun run-repl (&key (terminal *terminal*) (output *standard-output*)
+                      (error-output output) (input *standard-input*) (color :auto)
+                      (history-file nil))
+  "Run the REPL on this thread, on TERMINAL, until the end of input.
+
+The line editor and the debugger's menus use TERMINAL. What the REPL prints (the
+banner, values, errors, the debugger) and what evaluated code prints go to
+OUTPUT and ERROR-OUTPUT, which are *STANDARD-OUTPUT* and *ERROR-OUTPUT* for the
+duration, *TERMINAL-IO*, *QUERY-IO* and *DEBUG-IO* joining INPUT and OUTPUT.
+COLOR is T, NIL, or :AUTO for colour unless NO_COLOR is set or TERMINAL's term
+is \"dumb\". HISTORY-FILE is where this REPL keeps its history between
+sessions, NIL (the default) for nowhere; the history is this REPL's own either way.
+
+The line editor reads for this REPL only: a console REPL in the same process
+goes on reading as it did.
+
+For a host without a console: make a terminal with MAKE-TERMINAL and streams
+that reach the same screen, and call this on a thread of its own, where no
+handler of the caller's can take an error away from the REPL's debugger."
+  (let* ((*terminal* terminal)
+         (io (make-two-way-stream input output))
+         (*standard-input* input)
+         (*standard-output* output)
+         (*error-output* error-output)
+         (*trace-output* output)
+         (*terminal-io* io)
+         (*query-io* io)
+         (*debug-io* io)
+         (*debugger-hook* nil)
+         (*history* '())
+         (*history-loaded* nil)
+         (*history-file* history-file)
+         (*key-wait* (cons nil t))
+         (repl (cons (dotcl:current-thread) *key-wait*))
+         (term (funcall (%terminal-term terminal))))
+    (unless (menu-usable-p)
+      (error "the line editor cannot run on this terminal (TERM=~A)" term))
+    (load-history)
+    (setf *repl* repl)
+    (unwind-protect
+         (dotcl::%repl-run output error-output
+                           (if (eq color :auto)
+                               (dotcl::%repl-color-decision
+                                "auto"
+                                (dotnet:static "System.Environment"
+                                               "GetEnvironmentVariable" "NO_COLOR")
+                                term t)
+                               color)
+                           #'readline #'debugger-read)
+      (setf (cdr *key-wait*) nil)
+      (when (eq *repl* repl) (setf *repl* nil)))
+    nil))
+
+(defun interrupt-repl ()
+  "Interrupt the evaluation in the REPL RUN-REPL runs, as Ctrl+C does at the
+console. Returns T when the interrupt was sent, and NIL when there is no such
+REPL or it is waiting for a key, where Ctrl+C is a key to hand to the terminal.
+An interrupt that arrives after the REPL has started waiting for a key, or has
+ended, does nothing."
+  (let* ((repl *repl*)
+         (wait (cdr repl)))
+    (when (and repl (cdr wait) (not (car wait)))
+      (dotcl:interrupt-thread (car repl) (repl-interrupter wait))
+      t)))
+
+(defun repl-interrupter (wait)
+  "What INTERRUPT-REPL runs on the REPL's thread, where WAIT (*KEY-WAIT*) no
+longer changes underfoot: interrupt unless the REPL has since started waiting
+for a key or has ended."
+  (lambda ()
+    (when (and (cdr wait) (not (car wait)))
+      (dotcl::%interactive-interrupt))))
+
 ;;; -- Default completer -------------------------------------------------------
 ;;;
 ;;; TAB is worth nothing without a completer, and requiring every reader to
-;;; write one is a poor trade for a bundled REPL. dotcl-lsp-api answers exactly
+;;; write one is a poor trade for a bundled REPL. dotcl-code-info answers exactly
 ;;; the shape *completer* wants, so wire it here when it is available and leave
 ;;; TAB inert when it is not.
 ;;;
 ;;; Command names are answered here instead of being delegated, since a command
 ;;; line is not Lisp and no Lisp completer can say anything useful about one.
-;;; Everything else is passed straight on, so installing dotcl-lsp-api still
+;;; Everything else is passed straight on, so installing dotcl-code-info still
 ;;; gets the whole of what it knows.
 
 (defvar *base-completer* nil
@@ -3078,10 +3220,10 @@ not inside one."
       (and *base-completer* (funcall *base-completer* text offset))))
 
 (defun install-default-completer ()
-  "Set *COMPLETER*, and return T when dotcl-lsp-api is behind it."
+  "Set *COMPLETER*, and return T when dotcl-code-info is behind it."
   (when (null *completer*)
-    (ignore-errors (require "dotcl-lsp-api"))
-    (let* ((package (find-package "DOTCL-LSP-API"))
+    (ignore-errors (require "dotcl-code-info"))
+    (let* ((package (find-package "DOTCL-CODE-INFO"))
            (symbol (and package (find-symbol "COMPLETIONS" package))))
       (when (and symbol (fboundp symbol))
         (setf *base-completer* (symbol-function symbol))))

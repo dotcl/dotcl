@@ -277,7 +277,7 @@ public partial class LispFunction : LispObject
         }
     }
 
-    internal unsafe struct Frame
+    public unsafe struct Frame
     {
         internal Frame* Prev;
         internal int Depth;   // 1 for the outermost frame on this thread
@@ -287,13 +287,16 @@ public partial class LispFunction : LispObject
         // frame to a callee that records no frame of its own (see TailPrepCore).
         // Kept in the same word so the frame does not grow for it.
         internal int _argc;
-        public int Argc => _argc & ~(LentBit | TypedArgsBit);
+        public int Argc => _argc & ~(LentBit | TypedArgsBit | TailRestBit);
         internal bool Lent => (_argc & LentBit) != 0;
         internal const int LentBit = 1 << 30;
         // Set when the arguments are raw values held by the typed call that
         // pushed the frame (_ext then points at its TypedFrameArgs). Every
         // writer of the argument count clears it.
         internal const int TypedArgsBit = 1 << 29;
+        // Set when _rest was allocated by Retarget, so the next Retarget of the
+        // same length may overwrite it.
+        internal const int TailRestBit = 1 << 28;
         public string Name;
         internal LispObject? _a0, _a1, _a2, _a3;
         internal LispObject[]? _rest; // non-null when args came as an array
@@ -328,9 +331,9 @@ public partial class LispFunction : LispObject
         /// <summary>Make this frame stand for the function a tail call is about
         /// to run in place of the one that pushed it. The frame stays where it
         /// is (the Invoke that pushed it still unlinks it), so only its contents
-        /// change. Arguments past the fourth go to an array: a FrameExt lives in
-        /// the native frame of an Invoke5-8 call, and the body making the tail
-        /// call is about to give its own native frame up.
+        /// change. Arguments past the fourth go to the FrameExt of the Invoke5-8
+        /// that pushed the frame, or else to an array the frame keeps for the
+        /// next Retarget of the same length.
         ///
         /// Only the slots below ARGC are written. Arg never reads past Argc, and
         /// each reference stored through the frame pointer costs a checked write
@@ -338,15 +341,39 @@ public partial class LispFunction : LispObject
         /// only keeps an earlier argument alive until the frame is unlinked.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal void Retarget(string name, int argc, LispObject? a0, LispObject? a1,
-                               LispObject? a2, LispObject? a3, LispObject[]? rest)
+                               LispObject? a2, LispObject? a3, LispObject? a4, LispObject? a5,
+                               LispObject? a6, LispObject? a7)
         {
-            Name = name; _argc = argc; _ext = null;
-            if (rest != null || _rest != null) _rest = rest;
-            if (rest != null) return;
+            Name = name;
+            if ((_argc & TypedArgsBit) != 0) _ext = null;
+            if (argc > 4 && _ext != null)
+            {
+                _ext->A4 = a4;
+                if (argc > 5) _ext->A5 = a5;
+                if (argc > 6) _ext->A6 = a6;
+                if (argc > 7) _ext->A7 = a7;
+            }
+            else if (argc > 4)
+            {
+                var r = (_argc & TailRestBit) != 0 && _rest!.Length == argc ? _rest : new LispObject[argc];
+                r[0] = a0!; r[1] = a1!; r[2] = a2!; r[3] = a3!; r[4] = a4!;
+                if (argc > 5) r[5] = a5!;
+                if (argc > 6) r[6] = a6!;
+                if (argc > 7) r[7] = a7!;
+                _rest = r; _argc = argc | TailRestBit;
+                return;
+            }
+            _argc = argc;
+            if (_rest != null) _rest = null;
             if (argc > 0) _a0 = a0;
             if (argc > 1) _a1 = a1;
             if (argc > 2) _a2 = a2;
             if (argc > 3) _a3 = a3;
+        }
+
+        internal void Retarget(string name, LispObject[] all)
+        {
+            Name = name; _ext = null; _rest = all; _argc = all.Length | TailRestBit;
         }
 
         public Frame(string name)
@@ -381,12 +408,13 @@ public partial class LispFunction : LispObject
     }
 
     /// <summary>Arguments 5-8 of a frame pushed by Invoke5-8.</summary>
-    internal struct FrameExt
+    public struct FrameExt
     {
         internal LispObject? A4, A5, A6, A7;
     }
 
-    [ThreadStatic] private static unsafe Frame* s_top;
+    // Lives in CallTls (see there): read and written on every framed call.
+    private static unsafe ref Frame* s_top => ref CallTls.Top;
 
     /// <summary>Make F the innermost frame. The caller restores the previous head
     /// (F->Prev) in a finally.</summary>
@@ -481,7 +509,7 @@ public partial class LispFunction : LispObject
 
     // Backward compat: existing Generated.cs uses Invoke(params)
     // Includes stack overflow guard for C#-implemented functions that can recurse via Lisp dispatch
-    [ThreadStatic] private static int _stackCheckCounter;
+    private static ref int _stackCheckCounter => ref CallTls.StackCheck;
     public unsafe LispObject Invoke(params LispObject[] args)
     {
         if (++_stackCheckCounter % 256 == 0)
@@ -499,7 +527,7 @@ public partial class LispFunction : LispObject
         // listed.
         var f = _func;
         var n = _frameName;
-        if (n == null) { if (RetainUnit == null) return f != null ? f(args) : CallDirectWithArray(args); if (s_top == null) return UnderKeeperArgs(args); var r = f != null ? f(args) : CallDirectWithArray(args); GC.KeepAlive(this); return r; }
+        if (n == null || _selfFramed) { var saved = s_top; try { if (RetainUnit == null) return f != null ? f(args) : CallDirectWithArray(args); if (s_top == null && !_selfFramed) return UnderKeeperArgs(args); var r = f != null ? f(args) : CallDirectWithArray(args); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
         return f != null ? CallFramed(f, n, args) : CallDirectFramed(n, args);
     }
 
@@ -527,13 +555,33 @@ public partial class LispFunction : LispObject
     /// *DEBUGGER-HOOK* runs at the depth of the frame that signalled, so the hook
     /// appearing as frame 0 would shift every index the user reads and hide the
     /// signalling frame's variables behind its own.</summary>
-    public LispObject InvokeNoFrame(params LispObject[] args)
+    public unsafe LispObject InvokeNoFrame(params LispObject[] args)
     {
         PeriodicStackCheck();
         var f = _func;
-        var r = f != null ? f(args) : CallDirectWithArray(args);
-        GC.KeepAlive(this);
-        return r;
+        var saved = s_top;
+        try
+        {
+            if (_sfMask != 0 && NoFrameDirect(args) is { } d) return d;
+            var r = f != null ? f(args) : CallDirectWithArray(args);
+            GC.KeepAlive(this);
+            return r;
+        }
+        finally { s_top = saved; }
+    }
+
+    // Borrow 2 is set past the arity check, right before the body is entered.
+    private LispObject? NoFrameDirect(LispObject[] args)
+    {
+        switch (args.Length)
+        {
+            case 0: if ((_sfMask & 1) != 0 && _func0 is { } f0) { CallTls.Borrow = 2; return f0(); } break;
+            case 1: if ((_sfMask & 2) != 0 && _func1 is { } f1) { CallTls.Borrow = 2; return f1(args[0]); } break;
+            case 2: if ((_sfMask & 4) != 0 && _func2 is { } f2) { CallTls.Borrow = 2; return f2(args[0], args[1]); } break;
+            case 3: if ((_sfMask & 8) != 0 && _func3 is { } f3) { CallTls.Borrow = 2; return f3(args[0], args[1], args[2]); } break;
+            case 4: if ((_sfMask & 16) != 0 && _func4 is { } f4) { CallTls.Borrow = 2; return f4(args[0], args[1], args[2], args[3]); } break;
+        }
+        return null;
     }
 
     // Direct-param invoke: avoids array allocation when _funcN is set.
@@ -615,9 +663,65 @@ public partial class LispFunction : LispObject
     //     its try/finally stays out of the InvokeN fast paths.
     public unsafe LispObject Invoke0()
     {
+        if (_entryKey == 1)
+        {
+            var saved = s_top;
+            try { var r = ((delegate*<LispFunction, LispObject>)_entry)(this); GC.KeepAlive(this); return r; }
+            finally { s_top = saved; }
+        }
         var f0 = _func0;
         if (f0 != null)
         {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null || (_sfMask & 1) != 0) { var saved = s_top; try { if (RetainUnit == null) return f0(); if (s_top == null && (_sfMask & 1) == 0) return UnderKeeper0(); var r = f0(); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
+            var fr = new Frame(n); Link(&fr); fr._unit = RetainUnit;
+            try { return f0(); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject> c0)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { var saved = s_top; try { if (RetainUnit == null) return c0(Environment!); if (s_top == null) return UnderKeeper0(); var r = c0(Environment!); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
+            var fr = new Frame(n); Link(&fr); fr._unit = RetainUnit;
+            try { return c0(Environment!); } finally { s_top = fr.Prev; }
+        }
+        return InvokeSlow(Array.Empty<LispObject>());
+    }
+
+    /// <summary>InvokeN for ARGC of the loose arguments, with the delegate called in
+    /// place when this function records no frame and holds no unit.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal LispObject InvokeArgc(int argc, LispObject a, LispObject? b, LispObject? c, LispObject? d)
+    {
+        if (_frameName == null && RetainUnit == null && (_sfMask & (1 << argc)) == 0)
+        {
+            switch (argc)
+            {
+                case 1: if (_func1 is { } f1) { PeriodicStackCheck(); return f1(a); } break;
+                case 2: if (_func2 is { } f2) { PeriodicStackCheck(); return f2(a, b!); } break;
+                case 3: if (_func3 is { } f3) { PeriodicStackCheck(); return f3(a, b!, c!); } break;
+                default: if (_func4 is { } f4) { PeriodicStackCheck(); return f4(a, b!, c!, d!); } break;
+            }
+        }
+        return argc switch
+        {
+            1 => Invoke1(a),
+            2 => Invoke2(a, b!),
+            3 => Invoke3(a, b!, c!),
+            _ => Invoke4(a, b!, c!, d!)
+        };
+    }
+
+
+    // InvokeN for compiled callers (CallN), without the filter: they repair the
+    // frame list in their own handlers, and the filter costs the tail call.
+    public unsafe LispObject InvokeFast0()
+    {
+        var f0 = _func0;
+        if (f0 != null)
+        {
+            if ((_sfMask & 1) != 0) { if (RetainUnit == null) return f0(); var r = f0(); GC.KeepAlive(this); return r; }
             PeriodicStackCheck();
             var n = _frameName;
             if (n == null) { if (RetainUnit == null) return f0(); if (s_top == null) return UnderKeeper0(); var r = f0(); GC.KeepAlive(this); return r; }
@@ -635,18 +739,12 @@ public partial class LispFunction : LispObject
         return InvokeSlow(Array.Empty<LispObject>());
     }
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private unsafe LispObject UnderKeeper0()
-    {
-        var kf = new Frame(UnitKeeperName); Link(&kf); kf.Depth = 0;
-        try { return Invoke0(); } finally { s_top = kf.Prev; }
-    }
-
-    public unsafe LispObject Invoke1(LispObject a)
+    public unsafe LispObject InvokeFast1(LispObject a)
     {
         var f1 = _func1;
         if (f1 != null)
         {
+            if ((_sfMask & 2) != 0) { if (RetainUnit == null) return f1(a); var r = f1(a); GC.KeepAlive(this); return r; }
             PeriodicStackCheck();
             var n = _frameName;
             if (n == null) { if (RetainUnit == null) return f1(a); if (s_top == null) return UnderKeeper1(a); var r = f1(a); GC.KeepAlive(this); return r; }
@@ -664,18 +762,12 @@ public partial class LispFunction : LispObject
         return InvokeSlow(new[] { a });
     }
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private unsafe LispObject UnderKeeper1(LispObject a)
-    {
-        var kf = new Frame(UnitKeeperName); Link(&kf); kf.Depth = 0;
-        try { return Invoke1(a); } finally { s_top = kf.Prev; }
-    }
-
-    public unsafe LispObject Invoke2(LispObject a, LispObject b)
+    public unsafe LispObject InvokeFast2(LispObject a, LispObject b)
     {
         var f2 = _func2;
         if (f2 != null)
         {
+            if ((_sfMask & 4) != 0) { if (RetainUnit == null) return f2(a, b); var r = f2(a, b); GC.KeepAlive(this); return r; }
             PeriodicStackCheck();
             var n = _frameName;
             if (n == null) { if (RetainUnit == null) return f2(a, b); if (s_top == null) return UnderKeeper2(a, b); var r = f2(a, b); GC.KeepAlive(this); return r; }
@@ -693,18 +785,12 @@ public partial class LispFunction : LispObject
         return InvokeSlow(new[] { a, b });
     }
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private unsafe LispObject UnderKeeper2(LispObject a, LispObject b)
-    {
-        var kf = new Frame(UnitKeeperName); Link(&kf); kf.Depth = 0;
-        try { return Invoke2(a, b); } finally { s_top = kf.Prev; }
-    }
-
-    public unsafe LispObject Invoke3(LispObject a, LispObject b, LispObject c)
+    public unsafe LispObject InvokeFast3(LispObject a, LispObject b, LispObject c)
     {
         var f3 = _func3;
         if (f3 != null)
         {
+            if ((_sfMask & 8) != 0) { if (RetainUnit == null) return f3(a, b, c); var r = f3(a, b, c); GC.KeepAlive(this); return r; }
             PeriodicStackCheck();
             var n = _frameName;
             if (n == null) { if (RetainUnit == null) return f3(a, b, c); if (s_top == null) return UnderKeeper3(a, b, c); var r = f3(a, b, c); GC.KeepAlive(this); return r; }
@@ -722,18 +808,12 @@ public partial class LispFunction : LispObject
         return InvokeSlow(new[] { a, b, c });
     }
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private unsafe LispObject UnderKeeper3(LispObject a, LispObject b, LispObject c)
-    {
-        var kf = new Frame(UnitKeeperName); Link(&kf); kf.Depth = 0;
-        try { return Invoke3(a, b, c); } finally { s_top = kf.Prev; }
-    }
-
-    public unsafe LispObject Invoke4(LispObject a, LispObject b, LispObject c, LispObject d)
+    public unsafe LispObject InvokeFast4(LispObject a, LispObject b, LispObject c, LispObject d)
     {
         var f4 = _func4;
         if (f4 != null)
         {
+            if ((_sfMask & 16) != 0) { if (RetainUnit == null) return f4(a, b, c, d); var r = f4(a, b, c, d); GC.KeepAlive(this); return r; }
             PeriodicStackCheck();
             var n = _frameName;
             if (n == null) { if (RetainUnit == null) return f4(a, b, c, d); if (s_top == null) return UnderKeeper4(a, b, c, d); var r = f4(a, b, c, d); GC.KeepAlive(this); return r; }
@@ -745,6 +825,261 @@ public partial class LispFunction : LispObject
             PeriodicStackCheck();
             var n = _frameName;
             if (n == null) { if (RetainUnit == null) return c4(Environment!, a, b, c, d); if (s_top == null) return UnderKeeper4(a, b, c, d); var r = c4(Environment!, a, b, c, d); GC.KeepAlive(this); return r; }
+            var fr = new Frame(n, a, b, c, d); Link(&fr); fr._unit = RetainUnit;
+            try { return c4(Environment!, a, b, c, d); } finally { s_top = fr.Prev; }
+        }
+        return InvokeSlow(new[] { a, b, c, d });
+    }
+
+    public unsafe LispObject InvokeFast0M(int mode)
+    {
+        var f0 = _func0;
+        if (f0 != null)
+        {
+            if ((_sfMask & 1) != 0) { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f0(); var r = f0(); GC.KeepAlive(this); return r; }
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f0(); if (s_top == null) return UnderKeeper0M(mode); var r = f0(); GC.KeepAlive(this); return r; }
+            var fr = new Frame(n); Link(&fr); fr._unit = RetainUnit;
+            try { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); return f0(); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject> c0)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c0(Environment!); if (s_top == null) return UnderKeeper0M(mode); var r = c0(Environment!); GC.KeepAlive(this); return r; }
+            var fr = new Frame(n); Link(&fr); fr._unit = RetainUnit;
+            try { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); return c0(Environment!); } finally { s_top = fr.Prev; }
+        }
+        return Invoke0();
+    }
+
+    public unsafe LispObject InvokeFast1M(LispObject a, int mode)
+    {
+        var f1 = _func1;
+        if (f1 != null)
+        {
+            if ((_sfMask & 2) != 0) { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f1(a); var r = f1(a); GC.KeepAlive(this); return r; }
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f1(a); if (s_top == null) return UnderKeeper1M(a, mode); var r = f1(a); GC.KeepAlive(this); return r; }
+            var fr = new Frame(n, a); Link(&fr); fr._unit = RetainUnit;
+            try { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); return f1(a); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject> c1)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c1(Environment!, a); if (s_top == null) return UnderKeeper1M(a, mode); var r = c1(Environment!, a); GC.KeepAlive(this); return r; }
+            var fr = new Frame(n, a); Link(&fr); fr._unit = RetainUnit;
+            try { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); return c1(Environment!, a); } finally { s_top = fr.Prev; }
+        }
+        return Invoke1(a);
+    }
+
+    public unsafe LispObject InvokeFast2M(LispObject a, LispObject b, int mode)
+    {
+        var f2 = _func2;
+        if (f2 != null)
+        {
+            if ((_sfMask & 4) != 0) { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f2(a, b); var r = f2(a, b); GC.KeepAlive(this); return r; }
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f2(a, b); if (s_top == null) return UnderKeeper2M(a, b, mode); var r = f2(a, b); GC.KeepAlive(this); return r; }
+            var fr = new Frame(n, a, b); Link(&fr); fr._unit = RetainUnit;
+            try { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); return f2(a, b); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject> c2)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c2(Environment!, a, b); if (s_top == null) return UnderKeeper2M(a, b, mode); var r = c2(Environment!, a, b); GC.KeepAlive(this); return r; }
+            var fr = new Frame(n, a, b); Link(&fr); fr._unit = RetainUnit;
+            try { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); return c2(Environment!, a, b); } finally { s_top = fr.Prev; }
+        }
+        return Invoke2(a, b);
+    }
+
+    public unsafe LispObject InvokeFast3M(LispObject a, LispObject b, LispObject c, int mode)
+    {
+        var f3 = _func3;
+        if (f3 != null)
+        {
+            if ((_sfMask & 8) != 0) { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f3(a, b, c); var r = f3(a, b, c); GC.KeepAlive(this); return r; }
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f3(a, b, c); if (s_top == null) return UnderKeeper3M(a, b, c, mode); var r = f3(a, b, c); GC.KeepAlive(this); return r; }
+            var fr = new Frame(n, a, b, c); Link(&fr); fr._unit = RetainUnit;
+            try { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); return f3(a, b, c); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject, LispObject> c3)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c3(Environment!, a, b, c); if (s_top == null) return UnderKeeper3M(a, b, c, mode); var r = c3(Environment!, a, b, c); GC.KeepAlive(this); return r; }
+            var fr = new Frame(n, a, b, c); Link(&fr); fr._unit = RetainUnit;
+            try { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); return c3(Environment!, a, b, c); } finally { s_top = fr.Prev; }
+        }
+        return Invoke3(a, b, c);
+    }
+
+    public unsafe LispObject InvokeFast4M(LispObject a, LispObject b, LispObject c, LispObject d, int mode)
+    {
+        var f4 = _func4;
+        if (f4 != null)
+        {
+            if ((_sfMask & 16) != 0) { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f4(a, b, c, d); var r = f4(a, b, c, d); GC.KeepAlive(this); return r; }
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f4(a, b, c, d); if (s_top == null) return UnderKeeper4M(a, b, c, d, mode); var r = f4(a, b, c, d); GC.KeepAlive(this); return r; }
+            var fr = new Frame(n, a, b, c, d); Link(&fr); fr._unit = RetainUnit;
+            try { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); return f4(a, b, c, d); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject> c4)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c4(Environment!, a, b, c, d); if (s_top == null) return UnderKeeper4M(a, b, c, d, mode); var r = c4(Environment!, a, b, c, d); GC.KeepAlive(this); return r; }
+            var fr = new Frame(n, a, b, c, d); Link(&fr); fr._unit = RetainUnit;
+            try { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); return c4(Environment!, a, b, c, d); } finally { s_top = fr.Prev; }
+        }
+        return Invoke4(a, b, c, d);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private unsafe LispObject UnderKeeper0()
+    {
+        var kf = new Frame(UnitKeeperName); Link(&kf); kf.Depth = 0;
+        try { return Invoke0(); } finally { s_top = kf.Prev; }
+    }
+
+    public unsafe LispObject Invoke1(LispObject a)
+    {
+        if (_entryKey == 2)
+        {
+            var saved = s_top;
+            try { var r = ((delegate*<LispFunction, LispObject, LispObject>)_entry)(this, a); GC.KeepAlive(this); return r; }
+            finally { s_top = saved; }
+        }
+        var f1 = _func1;
+        if (f1 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null || (_sfMask & 2) != 0) { var saved = s_top; try { if (RetainUnit == null) return f1(a); if (s_top == null && (_sfMask & 2) == 0) return UnderKeeper1(a); var r = f1(a); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
+            var fr = new Frame(n, a); Link(&fr); fr._unit = RetainUnit;
+            try { return f1(a); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject> c1)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { var saved = s_top; try { if (RetainUnit == null) return c1(Environment!, a); if (s_top == null) return UnderKeeper1(a); var r = c1(Environment!, a); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
+            var fr = new Frame(n, a); Link(&fr); fr._unit = RetainUnit;
+            try { return c1(Environment!, a); } finally { s_top = fr.Prev; }
+        }
+        return InvokeSlow(new[] { a });
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private unsafe LispObject UnderKeeper1(LispObject a)
+    {
+        var kf = new Frame(UnitKeeperName); Link(&kf); kf.Depth = 0;
+        try { return Invoke1(a); } finally { s_top = kf.Prev; }
+    }
+
+    public unsafe LispObject Invoke2(LispObject a, LispObject b)
+    {
+        if (_entryKey == 3)
+        {
+            var saved = s_top;
+            try { var r = ((delegate*<LispFunction, LispObject, LispObject, LispObject>)_entry)(this, a, b); GC.KeepAlive(this); return r; }
+            finally { s_top = saved; }
+        }
+        var f2 = _func2;
+        if (f2 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null || (_sfMask & 4) != 0) { var saved = s_top; try { if (RetainUnit == null) return f2(a, b); if (s_top == null && (_sfMask & 4) == 0) return UnderKeeper2(a, b); var r = f2(a, b); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
+            var fr = new Frame(n, a, b); Link(&fr); fr._unit = RetainUnit;
+            try { return f2(a, b); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject> c2)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { var saved = s_top; try { if (RetainUnit == null) return c2(Environment!, a, b); if (s_top == null) return UnderKeeper2(a, b); var r = c2(Environment!, a, b); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
+            var fr = new Frame(n, a, b); Link(&fr); fr._unit = RetainUnit;
+            try { return c2(Environment!, a, b); } finally { s_top = fr.Prev; }
+        }
+        return InvokeSlow(new[] { a, b });
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private unsafe LispObject UnderKeeper2(LispObject a, LispObject b)
+    {
+        var kf = new Frame(UnitKeeperName); Link(&kf); kf.Depth = 0;
+        try { return Invoke2(a, b); } finally { s_top = kf.Prev; }
+    }
+
+    public unsafe LispObject Invoke3(LispObject a, LispObject b, LispObject c)
+    {
+        if (_entryKey == 4)
+        {
+            var saved = s_top;
+            try { var r = ((delegate*<LispFunction, LispObject, LispObject, LispObject, LispObject>)_entry)(this, a, b, c); GC.KeepAlive(this); return r; }
+            finally { s_top = saved; }
+        }
+        var f3 = _func3;
+        if (f3 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null || (_sfMask & 8) != 0) { var saved = s_top; try { if (RetainUnit == null) return f3(a, b, c); if (s_top == null && (_sfMask & 8) == 0) return UnderKeeper3(a, b, c); var r = f3(a, b, c); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
+            var fr = new Frame(n, a, b, c); Link(&fr); fr._unit = RetainUnit;
+            try { return f3(a, b, c); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject, LispObject> c3)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { var saved = s_top; try { if (RetainUnit == null) return c3(Environment!, a, b, c); if (s_top == null) return UnderKeeper3(a, b, c); var r = c3(Environment!, a, b, c); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
+            var fr = new Frame(n, a, b, c); Link(&fr); fr._unit = RetainUnit;
+            try { return c3(Environment!, a, b, c); } finally { s_top = fr.Prev; }
+        }
+        return InvokeSlow(new[] { a, b, c });
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private unsafe LispObject UnderKeeper3(LispObject a, LispObject b, LispObject c)
+    {
+        var kf = new Frame(UnitKeeperName); Link(&kf); kf.Depth = 0;
+        try { return Invoke3(a, b, c); } finally { s_top = kf.Prev; }
+    }
+
+    public unsafe LispObject Invoke4(LispObject a, LispObject b, LispObject c, LispObject d)
+    {
+        if (_entryKey == 5)
+        {
+            var saved = s_top;
+            try { var r = ((delegate*<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject>)_entry)(this, a, b, c, d); GC.KeepAlive(this); return r; }
+            finally { s_top = saved; }
+        }
+        var f4 = _func4;
+        if (f4 != null)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null || (_sfMask & 16) != 0) { var saved = s_top; try { if (RetainUnit == null) return f4(a, b, c, d); if (s_top == null && (_sfMask & 16) == 0) return UnderKeeper4(a, b, c, d); var r = f4(a, b, c, d); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
+            var fr = new Frame(n, a, b, c, d); Link(&fr); fr._unit = RetainUnit;
+            try { return f4(a, b, c, d); } finally { s_top = fr.Prev; }
+        }
+        if (_directDel is Func<object[], LispObject, LispObject, LispObject, LispObject, LispObject> c4)
+        {
+            PeriodicStackCheck();
+            var n = _frameName;
+            if (n == null) { var saved = s_top; try { if (RetainUnit == null) return c4(Environment!, a, b, c, d); if (s_top == null) return UnderKeeper4(a, b, c, d); var r = c4(Environment!, a, b, c, d); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             var fr = new Frame(n, a, b, c, d); Link(&fr); fr._unit = RetainUnit;
             try { return c4(Environment!, a, b, c, d); } finally { s_top = fr.Prev; }
         }
@@ -765,7 +1100,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if (RetainUnit == null) return f5(a, b, c, d, e); if (s_top == null) return UnderKeeper5(a, b, c, d, e); var r = f5(a, b, c, d, e); GC.KeepAlive(this); return r; }
+            if (n == null || (_sfMask & 32) != 0) { var saved = s_top; try { if (RetainUnit == null) return f5(a, b, c, d, e); if (s_top == null && (_sfMask & 32) == 0) return UnderKeeper5(a, b, c, d, e); var r = f5(a, b, c, d, e); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             FrameExt x = default; x.A4 = e;
             var fr = new Frame(n, 5, a, b, c, d, &x); Link(&fr); fr._unit = RetainUnit;
             try { return f5(a, b, c, d, e); } finally { s_top = fr.Prev; }
@@ -787,7 +1122,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if (RetainUnit == null) return f6(a, b, c, d, e, f); if (s_top == null) return UnderKeeper6(a, b, c, d, e, f); var r = f6(a, b, c, d, e, f); GC.KeepAlive(this); return r; }
+            if (n == null || (_sfMask & 64) != 0) { var saved = s_top; try { if (RetainUnit == null) return f6(a, b, c, d, e, f); if (s_top == null && (_sfMask & 64) == 0) return UnderKeeper6(a, b, c, d, e, f); var r = f6(a, b, c, d, e, f); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             FrameExt x = default; x.A4 = e; x.A5 = f;
             var fr = new Frame(n, 6, a, b, c, d, &x); Link(&fr); fr._unit = RetainUnit;
             try { return f6(a, b, c, d, e, f); } finally { s_top = fr.Prev; }
@@ -809,7 +1144,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if (RetainUnit == null) return f7(a, b, c, d, e, f, g); if (s_top == null) return UnderKeeper7(a, b, c, d, e, f, g); var r = f7(a, b, c, d, e, f, g); GC.KeepAlive(this); return r; }
+            if (n == null || (_sfMask & 128) != 0) { var saved = s_top; try { if (RetainUnit == null) return f7(a, b, c, d, e, f, g); if (s_top == null && (_sfMask & 128) == 0) return UnderKeeper7(a, b, c, d, e, f, g); var r = f7(a, b, c, d, e, f, g); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             FrameExt x = default; x.A4 = e; x.A5 = f; x.A6 = g;
             var fr = new Frame(n, 7, a, b, c, d, &x); Link(&fr); fr._unit = RetainUnit;
             try { return f7(a, b, c, d, e, f, g); } finally { s_top = fr.Prev; }
@@ -831,7 +1166,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if (RetainUnit == null) return f8(a, b, c, d, e, f, g, h); if (s_top == null) return UnderKeeper8(a, b, c, d, e, f, g, h); var r = f8(a, b, c, d, e, f, g, h); GC.KeepAlive(this); return r; }
+            if (n == null || (_sfMask & 256) != 0) { var saved = s_top; try { if (RetainUnit == null) return f8(a, b, c, d, e, f, g, h); if (s_top == null && (_sfMask & 256) == 0) return UnderKeeper8(a, b, c, d, e, f, g, h); var r = f8(a, b, c, d, e, f, g, h); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             FrameExt x = default; x.A4 = e; x.A5 = f; x.A6 = g; x.A7 = h;
             var fr = new Frame(n, 8, a, b, c, d, &x); Link(&fr); fr._unit = RetainUnit;
             try { return f8(a, b, c, d, e, f, g, h); } finally { s_top = fr.Prev; }
@@ -956,7 +1291,7 @@ public partial class LispFunction : LispObject
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe int TailPrep0(LispFunction callee, int mode, string? self)
     {
-        if (callee._func0 != null)
+        if (callee._func0 != null && (callee._sfMask & 1) == 0)
         {
             var top = s_top;
             var name = callee._frameName;
@@ -965,7 +1300,7 @@ public partial class LispFunction : LispObject
             // yet goes the long way (TailPrepCore keeps it there).
             var unit = callee.RetainUnit;
             if (unit != null && (top == null || !ReferenceEquals(top->_unit, unit)))
-                return callee.TailPrepCore(0, mode, self, null, null, null, null, null);
+                return callee.TailPrepCore(0, mode, self, null, null, null, null);
             if (name == null)
             {
                 if (mine) top->_argc |= Frame.LentBit;
@@ -975,18 +1310,18 @@ public partial class LispFunction : LispObject
                 top->Name = name; top->_argc = 0; top->_ext = null;
                 if (top->_rest != null) top->_rest = null;
             }
-            else return callee.TailPrepCore(0, mode, self, null, null, null, null, null);
+            else return callee.TailPrepCore(0, mode, self, null, null, null, null);
             if (mode >= 0 && (callee._mvModeMask & 1) != 0) MultipleValues.SetMode(mode);
             ConditionSystem.PollInterrupt();
             return TailKindDirect;
         }
-        return callee.TailPrepCore(0, mode, self, null, null, null, null, null);
+        return callee.TailPrepCore(0, mode, self, null, null, null, null);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe int TailPrep1(LispFunction callee, int mode, string? self, LispObject a0)
     {
-        if (callee._func1 != null)
+        if (callee._func1 != null && (callee._sfMask & 2) == 0)
         {
             var top = s_top;
             var name = callee._frameName;
@@ -995,7 +1330,7 @@ public partial class LispFunction : LispObject
             // yet goes the long way (TailPrepCore keeps it there).
             var unit = callee.RetainUnit;
             if (unit != null && (top == null || !ReferenceEquals(top->_unit, unit)))
-                return callee.TailPrepCore(1, mode, self, a0, null, null, null, null);
+                return callee.TailPrepCore(1, mode, self, a0, null, null, null);
             if (name == null)
             {
                 if (mine) top->_argc |= Frame.LentBit;
@@ -1005,18 +1340,18 @@ public partial class LispFunction : LispObject
                 top->Name = name; top->_argc = 1; top->_ext = null;
                 if (top->_rest != null) top->_rest = null; top->_a0 = a0;
             }
-            else return callee.TailPrepCore(1, mode, self, a0, null, null, null, null);
+            else return callee.TailPrepCore(1, mode, self, a0, null, null, null);
             if (mode >= 0 && (callee._mvModeMask & 2) != 0) MultipleValues.SetMode(mode);
             ConditionSystem.PollInterrupt();
             return TailKindDirect;
         }
-        return callee.TailPrepCore(1, mode, self, a0, null, null, null, null);
+        return callee.TailPrepCore(1, mode, self, a0, null, null, null);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe int TailPrep2(LispFunction callee, int mode, string? self, LispObject a0, LispObject a1)
     {
-        if (callee._func2 != null)
+        if (callee._func2 != null && (callee._sfMask & 4) == 0)
         {
             var top = s_top;
             var name = callee._frameName;
@@ -1025,7 +1360,7 @@ public partial class LispFunction : LispObject
             // yet goes the long way (TailPrepCore keeps it there).
             var unit = callee.RetainUnit;
             if (unit != null && (top == null || !ReferenceEquals(top->_unit, unit)))
-                return callee.TailPrepCore(2, mode, self, a0, a1, null, null, null);
+                return callee.TailPrepCore(2, mode, self, a0, a1, null, null);
             if (name == null)
             {
                 if (mine) top->_argc |= Frame.LentBit;
@@ -1035,18 +1370,18 @@ public partial class LispFunction : LispObject
                 top->Name = name; top->_argc = 2; top->_ext = null;
                 if (top->_rest != null) top->_rest = null; top->_a0 = a0; top->_a1 = a1;
             }
-            else return callee.TailPrepCore(2, mode, self, a0, a1, null, null, null);
+            else return callee.TailPrepCore(2, mode, self, a0, a1, null, null);
             if (mode >= 0 && (callee._mvModeMask & 4) != 0) MultipleValues.SetMode(mode);
             ConditionSystem.PollInterrupt();
             return TailKindDirect;
         }
-        return callee.TailPrepCore(2, mode, self, a0, a1, null, null, null);
+        return callee.TailPrepCore(2, mode, self, a0, a1, null, null);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe int TailPrep3(LispFunction callee, int mode, string? self, LispObject a0, LispObject a1, LispObject a2)
     {
-        if (callee._func3 != null)
+        if (callee._func3 != null && (callee._sfMask & 8) == 0)
         {
             var top = s_top;
             var name = callee._frameName;
@@ -1055,7 +1390,7 @@ public partial class LispFunction : LispObject
             // yet goes the long way (TailPrepCore keeps it there).
             var unit = callee.RetainUnit;
             if (unit != null && (top == null || !ReferenceEquals(top->_unit, unit)))
-                return callee.TailPrepCore(3, mode, self, a0, a1, a2, null, null);
+                return callee.TailPrepCore(3, mode, self, a0, a1, a2, null);
             if (name == null)
             {
                 if (mine) top->_argc |= Frame.LentBit;
@@ -1065,18 +1400,18 @@ public partial class LispFunction : LispObject
                 top->Name = name; top->_argc = 3; top->_ext = null;
                 if (top->_rest != null) top->_rest = null; top->_a0 = a0; top->_a1 = a1; top->_a2 = a2;
             }
-            else return callee.TailPrepCore(3, mode, self, a0, a1, a2, null, null);
+            else return callee.TailPrepCore(3, mode, self, a0, a1, a2, null);
             if (mode >= 0 && (callee._mvModeMask & 8) != 0) MultipleValues.SetMode(mode);
             ConditionSystem.PollInterrupt();
             return TailKindDirect;
         }
-        return callee.TailPrepCore(3, mode, self, a0, a1, a2, null, null);
+        return callee.TailPrepCore(3, mode, self, a0, a1, a2, null);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe int TailPrep4(LispFunction callee, int mode, string? self, LispObject a0, LispObject a1, LispObject a2, LispObject a3)
     {
-        if (callee._func4 != null)
+        if (callee._func4 != null && (callee._sfMask & 16) == 0)
         {
             var top = s_top;
             var name = callee._frameName;
@@ -1085,7 +1420,7 @@ public partial class LispFunction : LispObject
             // yet goes the long way (TailPrepCore keeps it there).
             var unit = callee.RetainUnit;
             if (unit != null && (top == null || !ReferenceEquals(top->_unit, unit)))
-                return callee.TailPrepCore(4, mode, self, a0, a1, a2, a3, null);
+                return callee.TailPrepCore(4, mode, self, a0, a1, a2, a3);
             if (name == null)
             {
                 if (mine) top->_argc |= Frame.LentBit;
@@ -1095,30 +1430,58 @@ public partial class LispFunction : LispObject
                 top->Name = name; top->_argc = 4; top->_ext = null;
                 if (top->_rest != null) top->_rest = null; top->_a0 = a0; top->_a1 = a1; top->_a2 = a2; top->_a3 = a3;
             }
-            else return callee.TailPrepCore(4, mode, self, a0, a1, a2, a3, null);
+            else return callee.TailPrepCore(4, mode, self, a0, a1, a2, a3);
             if (mode >= 0 && (callee._mvModeMask & 16) != 0) MultipleValues.SetMode(mode);
             ConditionSystem.PollInterrupt();
             return TailKindDirect;
         }
-        return callee.TailPrepCore(4, mode, self, a0, a1, a2, a3, null);
+        return callee.TailPrepCore(4, mode, self, a0, a1, a2, a3);
     }
 
     /// <summary>TailPrep for 5 to 8 arguments.</summary>
     public static int TailPrep8(LispFunction callee, int arity, int mode, string? self,
                                 LispObject? a0, LispObject? a1, LispObject? a2, LispObject? a3,
                                 LispObject? a4, LispObject? a5, LispObject? a6, LispObject? a7)
+        => callee.TailPrepCore(arity, mode, self, a0, a1, a2, a3, a4, a5, a6, a7);
+
+    /// <summary>The tree-walk evaluator's trampoline is about to run CALLEE's
+    /// body in place of OWNER's, OWNER being the function whose frame the chain
+    /// runs under. Returns the function the innermost frame stands for afterwards,
+    /// or null when CALLEE needs a frame and the innermost one is not OWNER's to
+    /// give, so the call has to be an ordinary one.</summary>
+    internal static unsafe LispFunction? InterpTailFrame(LispFunction owner, LispFunction callee, LispObject args)
     {
-        if (callee.TailKind(arity) == TailKindInvoke) return TailKindInvoke;
-        // The frame keeps arguments past the fourth in an array (see Retarget).
-        var all = new LispObject[arity];
-        var given = new[] { a0, a1, a2, a3, a4, a5, a6, a7 };
-        for (int i = 0; i < arity; i++) all[i] = given[i]!;
-        return callee.TailPrepCore(arity, mode, self, null, null, null, null, all);
+        ConditionSystem.PollInterrupt();
+        var name = callee._frameName;
+        if (name == null) return owner;
+        var top = s_top;
+        var mine = owner._frameName;
+        if (top == null || mine == null || !ReferenceEquals(top->Name, mine)) return null;
+        int argc = 0;
+        for (var a = args; a is Cons c; a = c.Cdr) argc++;
+        if (argc > 4)
+        {
+            var all = new LispObject[argc];
+            int i = 0;
+            for (var a = args; a is Cons c; a = c.Cdr) all[i++] = c.Car;
+            top->Retarget(name, all);
+        }
+        else
+        {
+            LispObject? a0 = null, a1 = null, a2 = null, a3 = null;
+            if (args is Cons c0) { a0 = c0.Car;
+                if (c0.Cdr is Cons c1) { a1 = c1.Car;
+                    if (c1.Cdr is Cons c2) { a2 = c2.Car;
+                        if (c2.Cdr is Cons c3) a3 = c3.Car; } } }
+            top->Retarget(name, argc, a0, a1, a2, a3, null, null, null, null);
+        }
+        return callee;
     }
 
     private unsafe int TailPrepCore(int arity, int mode, string? self,
                                     LispObject? a0, LispObject? a1, LispObject? a2, LispObject? a3,
-                                    LispObject[]? rest)
+                                    LispObject? a4 = null, LispObject? a5 = null,
+                                    LispObject? a6 = null, LispObject? a7 = null)
     {
         int kind = TailKind(arity);
         if (kind == TailKindInvoke) return kind;
@@ -1127,12 +1490,18 @@ public partial class LispFunction : LispObject
         var callee = _frameName;
         bool owned = self != null && top != null
             && (self.Length == 0 ? top->Lent : string.Equals(top->Name, self));
+        if ((_sfMask & (1 << arity)) != 0)
+        {
+            if (mode >= 0 && (_mvModeMask & (1 << arity)) != 0) MultipleValues.SetMode(mode);
+            if (owned) CallTls.Borrow = 1;
+            return kind;
+        }
         var unit = RetainUnit;
         if (unit != null && top == null) return TailKindInvoke;
         if (callee != null)
         {
             if (!owned) return TailKindInvoke;
-            top->Retarget(callee, arity, a0, a1, a2, a3, rest);
+            top->Retarget(callee, arity, a0, a1, a2, a3, a4, a5, a6, a7);
         }
         else if (owned)
             top->Lend();
@@ -1169,7 +1538,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f0(); if (s_top == null) return UnderKeeper0M(mode); var r = f0(); GC.KeepAlive(this); return r; }
+            if (n == null || (_sfMask & 1) != 0) { var saved = s_top; try { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f0(); if (s_top == null && (_sfMask & 1) == 0) return UnderKeeper0M(mode); var r = f0(); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             var fr = new Frame(n); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); return f0(); } finally { s_top = fr.Prev; }
         }
@@ -1177,7 +1546,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c0(Environment!); if (s_top == null) return UnderKeeper0M(mode); var r = c0(Environment!); GC.KeepAlive(this); return r; }
+            if (n == null) { var saved = s_top; try { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c0(Environment!); if (s_top == null) return UnderKeeper0M(mode); var r = c0(Environment!); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             var fr = new Frame(n); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 1) != 0) MultipleValues.SetMode(mode); return c0(Environment!); } finally { s_top = fr.Prev; }
         }
@@ -1198,7 +1567,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f1(a); if (s_top == null) return UnderKeeper1M(a, mode); var r = f1(a); GC.KeepAlive(this); return r; }
+            if (n == null || (_sfMask & 2) != 0) { var saved = s_top; try { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f1(a); if (s_top == null && (_sfMask & 2) == 0) return UnderKeeper1M(a, mode); var r = f1(a); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             var fr = new Frame(n, a); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); return f1(a); } finally { s_top = fr.Prev; }
         }
@@ -1206,7 +1575,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c1(Environment!, a); if (s_top == null) return UnderKeeper1M(a, mode); var r = c1(Environment!, a); GC.KeepAlive(this); return r; }
+            if (n == null) { var saved = s_top; try { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c1(Environment!, a); if (s_top == null) return UnderKeeper1M(a, mode); var r = c1(Environment!, a); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             var fr = new Frame(n, a); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 2) != 0) MultipleValues.SetMode(mode); return c1(Environment!, a); } finally { s_top = fr.Prev; }
         }
@@ -1227,7 +1596,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f2(a, b); if (s_top == null) return UnderKeeper2M(a, b, mode); var r = f2(a, b); GC.KeepAlive(this); return r; }
+            if (n == null || (_sfMask & 4) != 0) { var saved = s_top; try { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f2(a, b); if (s_top == null && (_sfMask & 4) == 0) return UnderKeeper2M(a, b, mode); var r = f2(a, b); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             var fr = new Frame(n, a, b); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); return f2(a, b); } finally { s_top = fr.Prev; }
         }
@@ -1235,7 +1604,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c2(Environment!, a, b); if (s_top == null) return UnderKeeper2M(a, b, mode); var r = c2(Environment!, a, b); GC.KeepAlive(this); return r; }
+            if (n == null) { var saved = s_top; try { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c2(Environment!, a, b); if (s_top == null) return UnderKeeper2M(a, b, mode); var r = c2(Environment!, a, b); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             var fr = new Frame(n, a, b); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 4) != 0) MultipleValues.SetMode(mode); return c2(Environment!, a, b); } finally { s_top = fr.Prev; }
         }
@@ -1256,7 +1625,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f3(a, b, c); if (s_top == null) return UnderKeeper3M(a, b, c, mode); var r = f3(a, b, c); GC.KeepAlive(this); return r; }
+            if (n == null || (_sfMask & 8) != 0) { var saved = s_top; try { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f3(a, b, c); if (s_top == null && (_sfMask & 8) == 0) return UnderKeeper3M(a, b, c, mode); var r = f3(a, b, c); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             var fr = new Frame(n, a, b, c); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); return f3(a, b, c); } finally { s_top = fr.Prev; }
         }
@@ -1264,7 +1633,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c3(Environment!, a, b, c); if (s_top == null) return UnderKeeper3M(a, b, c, mode); var r = c3(Environment!, a, b, c); GC.KeepAlive(this); return r; }
+            if (n == null) { var saved = s_top; try { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c3(Environment!, a, b, c); if (s_top == null) return UnderKeeper3M(a, b, c, mode); var r = c3(Environment!, a, b, c); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             var fr = new Frame(n, a, b, c); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 8) != 0) MultipleValues.SetMode(mode); return c3(Environment!, a, b, c); } finally { s_top = fr.Prev; }
         }
@@ -1285,7 +1654,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f4(a, b, c, d); if (s_top == null) return UnderKeeper4M(a, b, c, d, mode); var r = f4(a, b, c, d); GC.KeepAlive(this); return r; }
+            if (n == null || (_sfMask & 16) != 0) { var saved = s_top; try { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f4(a, b, c, d); if (s_top == null && (_sfMask & 16) == 0) return UnderKeeper4M(a, b, c, d, mode); var r = f4(a, b, c, d); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             var fr = new Frame(n, a, b, c, d); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); return f4(a, b, c, d); } finally { s_top = fr.Prev; }
         }
@@ -1293,7 +1662,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c4(Environment!, a, b, c, d); if (s_top == null) return UnderKeeper4M(a, b, c, d, mode); var r = c4(Environment!, a, b, c, d); GC.KeepAlive(this); return r; }
+            if (n == null) { var saved = s_top; try { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c4(Environment!, a, b, c, d); if (s_top == null) return UnderKeeper4M(a, b, c, d, mode); var r = c4(Environment!, a, b, c, d); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             var fr = new Frame(n, a, b, c, d); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 16) != 0) MultipleValues.SetMode(mode); return c4(Environment!, a, b, c, d); } finally { s_top = fr.Prev; }
         }
@@ -1314,7 +1683,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 32) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f5(a, b, c, d, e); if (s_top == null) return UnderKeeper5M(a, b, c, d, e, mode); var r = f5(a, b, c, d, e); GC.KeepAlive(this); return r; }
+            if (n == null || (_sfMask & 32) != 0) { var saved = s_top; try { if ((_mvModeMask & 32) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f5(a, b, c, d, e); if (s_top == null && (_sfMask & 32) == 0) return UnderKeeper5M(a, b, c, d, e, mode); var r = f5(a, b, c, d, e); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             FrameExt x = default; x.A4 = e; var fr = new Frame(n, 5, a, b, c, d, &x); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 32) != 0) MultipleValues.SetMode(mode); return f5(a, b, c, d, e); } finally { s_top = fr.Prev; }
         }
@@ -1322,7 +1691,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 32) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c5(Environment!, a, b, c, d, e); if (s_top == null) return UnderKeeper5M(a, b, c, d, e, mode); var r = c5(Environment!, a, b, c, d, e); GC.KeepAlive(this); return r; }
+            if (n == null) { var saved = s_top; try { if ((_mvModeMask & 32) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c5(Environment!, a, b, c, d, e); if (s_top == null) return UnderKeeper5M(a, b, c, d, e, mode); var r = c5(Environment!, a, b, c, d, e); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             FrameExt x = default; x.A4 = e; var fr = new Frame(n, 5, a, b, c, d, &x); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 32) != 0) MultipleValues.SetMode(mode); return c5(Environment!, a, b, c, d, e); } finally { s_top = fr.Prev; }
         }
@@ -1343,7 +1712,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 64) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f6(a, b, c, d, e, f); if (s_top == null) return UnderKeeper6M(a, b, c, d, e, f, mode); var r = f6(a, b, c, d, e, f); GC.KeepAlive(this); return r; }
+            if (n == null || (_sfMask & 64) != 0) { var saved = s_top; try { if ((_mvModeMask & 64) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return f6(a, b, c, d, e, f); if (s_top == null && (_sfMask & 64) == 0) return UnderKeeper6M(a, b, c, d, e, f, mode); var r = f6(a, b, c, d, e, f); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             FrameExt x = default; x.A4 = e; x.A5 = f; var fr = new Frame(n, 6, a, b, c, d, &x); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 64) != 0) MultipleValues.SetMode(mode); return f6(a, b, c, d, e, f); } finally { s_top = fr.Prev; }
         }
@@ -1351,7 +1720,7 @@ public partial class LispFunction : LispObject
         {
             PeriodicStackCheck();
             var n = _frameName;
-            if (n == null) { if ((_mvModeMask & 64) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c6(Environment!, a, b, c, d, e, f); if (s_top == null) return UnderKeeper6M(a, b, c, d, e, f, mode); var r = c6(Environment!, a, b, c, d, e, f); GC.KeepAlive(this); return r; }
+            if (n == null) { var saved = s_top; try { if ((_mvModeMask & 64) != 0) MultipleValues.SetMode(mode); if (RetainUnit == null) return c6(Environment!, a, b, c, d, e, f); if (s_top == null) return UnderKeeper6M(a, b, c, d, e, f, mode); var r = c6(Environment!, a, b, c, d, e, f); GC.KeepAlive(this); return r; } finally { s_top = saved; } }
             FrameExt x = default; x.A4 = e; x.A5 = f; var fr = new Frame(n, 6, a, b, c, d, &x); Link(&fr); fr._unit = RetainUnit;
             try { if ((_mvModeMask & 64) != 0) MultipleValues.SetMode(mode); return c6(Environment!, a, b, c, d, e, f); } finally { s_top = fr.Prev; }
         }
@@ -1535,7 +1904,7 @@ public partial class LispFunction : LispObject
         return list;
     }
 
-    private LispObject InvokeSlow(LispObject[] args)
+    private unsafe LispObject InvokeSlow(LispObject[] args)
     {
         if (CollectInvokeStats)
             s_invokeSlowStats.AddOrUpdate((Name ?? StatsName ?? AnonOriginTag(), args.Length), 1,
@@ -1543,11 +1912,16 @@ public partial class LispFunction : LispObject
         PeriodicStackCheck();
         var f = _func;
         var frameName = _frameName;
-        if (frameName == null)
+        if (frameName == null || _selfFramed)
         {
-            var r = f != null ? f(args) : CallDirectWithArray(args);
-            GC.KeepAlive(this);
-            return r;
+            var saved = s_top;
+            try
+            {
+                var r = f != null ? f(args) : CallDirectWithArray(args);
+                GC.KeepAlive(this);
+                return r;
+            }
+            finally { s_top = saved; }
         }
         return f != null ? CallFramed(f, frameName, args) : CallDirectFramed(frameName, args);
     }

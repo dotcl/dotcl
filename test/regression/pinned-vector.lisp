@@ -85,14 +85,14 @@
   (4000000000 4000000000 0 -100 -100 -30000 t (1 2 3) (-100 0) :type-error))
 
 (deftest pinned-vector.unsupported-element-types-signal
-  ;; T and FIXNUM have no raw fixed-width storage: refuse rather than hand
-  ;; out an address with the wrong layout. (unsigned-byte 64) is kept as its
-  ;; bits, 8 bytes each, like (signed-byte 64).
+  ;; T has no raw fixed-width storage: refuse rather than hand out an address
+  ;; with the wrong layout. (unsigned-byte 64) is kept as its bits, 8 bytes
+  ;; each, like (signed-byte 64), which FIXNUM is.
   (mapcar (lambda (et)
             (handler-case (progn (dotcl:make-pinned-vector 3 et) :made)
               (error () :error)))
           '((unsigned-byte 64) t fixnum (unsigned-byte 8)))
-  (:made :error :error :made))
+  (:made :error :made :made))
 
 (deftest pinned-vector.pinned-vector-p
   ;; A pinned vector is simple, so ADJUST-ARRAY gives back a fresh vector

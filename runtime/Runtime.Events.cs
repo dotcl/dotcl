@@ -25,7 +25,7 @@ internal static class DotNetEvents
             : throw new LispErrorException(new LispProgramError(
                 "DOTNET:ADD-EVENT: first argument must be a .NET object"));
 
-        string eventName = args[1] is LispString ls ? ls.Value : args[1].ToString()!;
+        string eventName = Runtime.StringValueOrNull(args[1]) ?? args[1].ToString()!;
         LispObject handler = args[2];
 
         var ev = target.GetType().GetEvent(eventName)
@@ -51,7 +51,7 @@ internal static class DotNetEvents
             : throw new LispErrorException(new LispProgramError(
                 "DOTNET:REMOVE-EVENT: first argument must be a .NET object"));
 
-        string eventName = args[1] is LispString ls ? ls.Value : args[1].ToString()!;
+        string eventName = Runtime.StringValueOrNull(args[1]) ?? args[1].ToString()!;
         LispObject handler = args[2];
 
         var ev = target.GetType().GetEvent(eventName)

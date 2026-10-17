@@ -76,13 +76,62 @@
    test (see %BACKING-ARM-FOR). An alias of a tested buffer shares its symbol
    and so counts as tested.")
 
+(defvar *raw-array-plan* '()
+  "Entries (KEY BACKING KIND N NAME) for the LET bindings in scope whose
+   MAKE-ARRAY is held only as the bare .NET array in BACKING (%RAW-ARRAY-PLAN).")
+
+(defvar *raw-array-backings* '()
+  "The BACKING symbols of *RAW-ARRAY-PLAN*. Such a buffer is never null.")
+
+(defvar *bounded-index* '()
+  "Entries (KEY . REFS): in the body of a counting loop, the variable whose
+   binding is slot KEY is a valid subscript of every buffer in REFS, a list of
+   (BACKING-SYMBOL REF-LOCAL M): REF-LOCAL holds a reference to the buffer's
+   first element, and M elements from the subscript on are in the buffer. The
+   loop compared its limit with their lengths before it started.")
+
+(defvar *bounded-loop-candidate* nil
+  "(TAGBODY-FORM VAR LIMIT INCLUSIVE DELTA START) for the counting loop the
+   enclosing LET is compiling (see %COMPILE-BOUNDED-LOOP). START is VAR's initial
+   value when it is a known integer, else NIL.")
+
+(defun %bounded-backing-ref (entry idxs &optional (span 1))
+  "The element reference local for an (AREF V I) through ENTRY that
+   *BOUNDED-INDEX* proves in range, SPAN elements from I on, or NIL."
+  (and *bounded-index*
+       (null (backing-entry-dims entry))
+       (consp idxs) (null (cdr idxs))
+       (let ((i (car idxs)))
+         (and i (symbolp i)
+              (not (boxed-var-p i))
+              (not (nth-value 1 (lookup-symbol-macro i)))
+              (let ((key (lookup-local i)))
+                (and key
+                     (loop for b in *bounded-index*
+                           thereis (and (eq (car b) key)
+                                        (let ((r (assoc (third entry) (cdr b) :test #'eq)))
+                                          (and r (>= (third r) span) (second r)))))))))))
+
+(defun %backing-ref-suffix (kind)
+  (ecase kind (1 "U8") (2 "U16") (3 "I32") ((4 :u64) "I64") (:f64 "F64") (:f32 "F32")))
+
+(defun %backing-ref-type (kind)
+  (ecase kind (1 "Byte&") (2 "UInt16&") (3 "Int32&") ((4 :u64) "Int64&") (:f64 "Double&") (:f32 "Single&")))
+
 (defun %backing-arm-for (entry)
   "The arm an access through ENTRY's buffer emits: *BACKING-ARM*, except that
-   :FAST becomes :BOTH for a buffer that was not among those tested."
-  (if (and (eq *backing-arm* :fast)
-           (not (member (third entry) *array-backing-tested* :test #'eq)))
-      :both
-      *backing-arm*))
+   :FAST becomes :BOTH for a buffer that was not among those tested. The fetch
+   of a rank 2 or 3 buffer never declines (it signals instead), so its accesses
+   are always :FAST, as are those of a raw array (never null)."
+  (cond ((backing-entry-dims entry) :fast)
+        ((member (third entry) *raw-array-backings* :test #'eq) :fast)
+        ((and (eq *backing-arm* :fast)
+              (not (member (third entry) *array-backing-tested* :test #'eq)))
+         :both)
+        (t *backing-arm*)))
+
+(defun %raw-array-entry-p (entry)
+  (and entry (member (third entry) *raw-array-backings* :test #'eq) t))
 
 (defvar *struct-backing-known* '()
   "Structure backing entries (see STRUCT-BACKING-ENTRY) whose raw slot array the
@@ -98,6 +147,11 @@
 (defvar *compile-file-mode* nil
   "T when compiling via compile-file. Controls eval-when behavior per CLHS 3.2.3.1:
    :compile-toplevel -> eval at compile time, :load-toplevel -> emit CIL for load.")
+
+(defvar *same-file-functions* nil
+  "While COMPILE-FILE compiles one file: the DEFUNs compiled so far from it
+   whose body a call can enter directly while the name still holds the function
+   the file defined (name -> number of arguments).")
 
 (defvar *concatenate-build* nil
   "T only while compile-file'ing a project-core CONCATENATED build (the single
@@ -272,8 +326,8 @@
 ;; race (lost update), but this is benign: the generated names are only ever
 ;; method-scoped locals/labels, and each concurrent compile emits an independent
 ;; method, so a duplicated V_n / L_n in two different methods never collides.
-;; intern is idempotent and the package table is concurrency-safe, so no shared
-;; state is corrupted. Left as plain incf to avoid per-gensym atomic overhead on
+;; The symbols themselves are uninterned (MAKE-SYMBOL), so no shared state is
+;; touched at all. Left as plain incf to avoid per-gensym atomic overhead on
 ;; the hot compile path.
 (defvar *var-counter* 0)
 
@@ -484,6 +538,115 @@
 (defconstant +jit-optimize-max-il-instructions+ 20000
   "IL instructions past which RyuJIT stops optimizing a method.")
 
+(defconstant +jit-optimize-max-il-bytes+ 60000)
+(defconstant +jit-optimize-max-local-refs+ 8000)
+(defconstant +jit-optimize-max-basic-blocks+ 2000)
+
+(defun %sil-stack-temp-effect (op)
+  "(POPS . PUSHES) of OP for the assembler's single-use temporary pass
+   (CilAssembler.StackTemps.cs), or NIL where that pass stops."
+  (case op
+    ((:declare-local :line) '(0 . 0))
+    ((:not :neg :conv-i :conv-i4 :conv-i8 :conv-u :conv-u1 :conv-u2 :conv-u4 :conv-u8
+      :conv-i1 :conv-i2 :conv-r8 :conv-r4 :conv-r-un :castclass :isinst :ldlen)
+     '(1 . 1))
+    ((:ldloc :ldarg :ldc-i8 :ldc-i4 :ldc-r8 :ldc-r4 :ldnull
+      :load-sym :load-sym-pkg :load-sym-keyword :load-const)
+     '(0 . 1))
+    (:dup '(1 . 2))
+    ((:stloc :pop) '(1 . 0))
+    ((:add :sub :mul :div :rem :div-un :rem-un :and :or :xor :shl :shr :shr-un
+      :ceq :cgt :clt :cgt-un :clt-un :ldelem-i8 :ldelem-i4 :ldelem-u1 :ldelem-ref
+      :ldelem-r8 :ldelem-r4 :ldelem-i1 :ldelem-i2 :ldelem-u2 :ldelem-u4 :ldelem-i)
+     '(2 . 1))
+    (t nil)))
+
+(defun %sil-stack-temp-pairs (instrs)
+  "How many STLOC / LDLOC pairs the assembler's single-use temporary pass would
+   drop from INSTRS: the same rules, on this list instead of the whole method."
+  (let* ((ins (coerce instrs 'vector))
+         (n (length ins))
+         (declared (make-hash-table :test #'eq))
+         (loads (make-hash-table :test #'eq))
+         (stores (make-hash-table :test #'eq))
+         (spoiled (make-hash-table :test #'eq)))
+    (loop for i across ins
+          when (and (consp i) (eq (car i) :declare-local))
+            do (setf (gethash (cadr i) declared) t))
+    (labels ((spoil (x)
+               (cond ((consp x) (spoil (car x)) (spoil (cdr x)))
+                     ((and x (symbolp x) (gethash x declared))
+                      (setf (gethash x spoiled) t)))))
+      (dotimes (k n)
+        (let ((i (aref ins k)))
+          (when (and (consp i) (not (eq (car i) :declare-local)))
+            (if (and (member (car i) '(:ldloc :stloc)) (consp (cdr i)) (null (cddr i))
+                     (gethash (cadr i) declared))
+                (let ((tab (if (eq (car i) :ldloc) loads stores)))
+                  (if (gethash (cadr i) tab)
+                      (setf (gethash (cadr i) spoiled) t)
+                      (setf (gethash (cadr i) tab) k)))
+                (unless (eq (car i) :load-const) (spoil (cdr i))))))))
+    (let ((cands '()) (removed (make-array n :initial-element nil)) (pairs 0))
+      (maphash (lambda (nm st)
+                 (let ((ld (gethash nm loads)))
+                   (when (and ld (not (gethash nm spoiled)) (< st ld) (<= (- ld st) 96))
+                     (push (cons st ld) cands))))
+               stores)
+      (setf cands (sort cands #'< :key #'car))
+      (loop repeat 8
+            for changed = nil
+            do (dolist (c cands)
+                 (unless (aref removed (car c))
+                   (let ((depth 0) (ok t))
+                     (loop for k from (1+ (car c)) below (cdr c)
+                           unless (aref removed k)
+                             do (let ((e (let ((i (aref ins k)))
+                                           (and (consp i) (%sil-stack-temp-effect (car i))))))
+                                  (when (or (null e) (< depth (car e)))
+                                    (setf ok nil) (return))
+                                  (incf depth (- (cdr e) (car e)))))
+                     (when (and ok (= depth 0))
+                       (setf (aref removed (car c)) t (aref removed (cdr c)) t
+                             changed t)
+                       (incf pairs)))))
+               (unless changed (return)))
+      pairs)))
+
+(defun %sil-past-jit-limits-p (instrs)
+  "True when the method code INSTRS would be past one of the JIT's limits, by an
+   estimate from the SIL. The bodies of nested functions, methods of their own,
+   are not counted."
+  (let ((n 0) (bytes 0) (blocks 0) (refs 0))
+    (labels ((walk (list)
+               (dolist (i list)
+                 (when (and (consp i) (keywordp (car i)))
+                   (case (car i)
+                     ((:declare-local))
+                     (:label (incf blocks))
+                     ((:make-function :make-function-direct :make-closure)
+                      (incf n) (incf bytes 5))
+                     (t
+                      (incf n)
+                      (incf bytes
+                            (case (car i)
+                              (:ldc-i8 9)
+                              ((:ldloc :stloc :ldarg :starg) (incf refs) 2)
+                              ((:call :callvirt :newobj :br :brtrue :brfalse :leave
+                                :ldc-i4 :ldstr :ldsfld :stsfld :ldfld :stfld :castclass :isinst)
+                               5)
+                              (:unbox-fixnum (incf n) 10)
+                              (t 1)))
+                      (dolist (a (cdr i))
+                        (when (and (consp a) (consp (car a)) (keywordp (caar a)))
+                          (walk a)))))))))
+      (walk instrs))
+    (let ((pairs (%sil-stack-temp-pairs instrs)))
+      (or (> (- n (* 2 pairs)) +jit-optimize-max-il-instructions+)
+          (> (- refs (* 2 pairs)) +jit-optimize-max-local-refs+)
+          (> (- bytes (* 4 pairs)) +jit-optimize-max-il-bytes+)
+          (> blocks +jit-optimize-max-basic-blocks+)))))
+
 (defvar *unswitch-body-limit* (floor +jit-optimize-max-il-instructions+ 8)
   "Most instructions UNSWITCH-ARRAY-BACKING copies regardless of size. The
    unswitch emits a body twice; a body this large is not the tight loop the copy
@@ -532,12 +695,13 @@
 
 (defvar *compile-form-handlers* (make-hash-table :test #'eq :size 400)
   "Hash table: operator symbol -> (lambda (expr) ...) handler.
-   Populated at the bottom of cil-forms.lisp after all compile-* helpers are defined.
+   Populated in cil-forms-dispatch.lisp after all compile-* helpers are defined.
    Provides O(1) dispatch for ~250+ common operators in compile-form.")
 
 (defvar *macroexpand-cache* nil
-  "Hash table (form -> ((scope . expansion) ...)) for memoizing macro expansions
-   within one top-level compile.  Keyed by eq (cons-cell identity) on the form so
+  "A cons whose car is the hash table (form -> ((scope . expansion) ...)) for
+   memoizing macro expansions within one top-level compile, made on first use.
+   Keyed by eq (cons-cell identity) on the form so
    that the same source form object is never expanded twice even when it appears
    in both the analysis pass and the code-gen pass.  NIL outside a compile-toplevel
    call, which disables caching (eval-time macro calls are not cached).")
@@ -574,6 +738,16 @@
    An FLET name is only entered when it hides a macro (%FLET-MACRO-SHADOWS): an
    entry for any other name would change no expansion, and keeping the list
    empty keeps the environment NIL in the common case.")
+
+(defvar *lexical-decl-frames* '()
+  "The binding and declaration scopes around the current position, innermost
+   first, for the CLtL2 environment queries. Each is (KIND NAMES . BODY): KIND
+   tells how to read the names NAMES binds, and BODY is the scope's body as
+   written, whose declarations are parsed only when a query asks.")
+
+(defun %push-decl-frame (kind names body)
+  "*LEXICAL-DECL-FRAMES* with the frame (KIND NAMES . BODY) added, to bind it to."
+  (cons (list* kind names body) *lexical-decl-frames*))
 
 (defun %flet-macro-shadows (fn-defs)
   "The names among the FLET / LABELS definitions FN-DEFS that are macros or
@@ -766,7 +940,7 @@
    or :NONE. LOOKUP-SYMBOL-MACRO resolves names against it there.")
 
 ;; Proclaimed special here for LOOKUP-SYMBOL-MACRO; the value is given where the
-;; interpreter defines it (cil-forms.lisp).
+;; interpreter defines it (cil-forms-interp.lisp).
 (defvar *%mini-symbol-macro-marker*)
 
 (defvar *sm-global-hits* nil
@@ -795,6 +969,40 @@
        (funcall *phase-time-fn* ,name (lambda () ,@body))
        (progn ,@body)))
 
+(defvar *type-env-epoch* 0
+  "Counts the points where the compilation environment the integer-type
+   predicates read may have changed: every COMPILE-FORM and COMPILE-EXPR-RAW,
+   and every macro expander run. *INT-TYPE-SPAN* drops its answers when this
+   moves.")
+
+(defvar *int-type-span* nil
+  "Answers of the integer-type predicates kept across the queries of one
+   stretch of native int64 compilation: a vector (EPOCH INT-TYPE-MEMO
+   LONG-DECL-MEMO), bound by the outermost COMPILE-LONG-BINOP /
+   COMPILE-LONG-BINOP-SPILLED. Compiling (+ 1 (+ 1 ...)) asks at every level
+   about the whole operand below it, and each of those was a query of its own
+   that walked the tree again, so N levels cost N^2.
+   An answer depends on the form, *FIXNUM-WRAP-LICENSED* (part of the key) and
+   the compilation environment: declarations, local functions and macros,
+   native slots, proclamations. None of that changes while the operands of a
+   native chain are compiled without going through COMPILE-FORM: whatever binds
+   or proclaims anything runs inside COMPILE-FORM. So COMPILE-FORM binds this
+   to NIL for its extent, and the epoch (*TYPE-ENV-EPOCH*) empties the tables
+   once anything has been compiled or expanded since they were filled.")
+
+(defun %int-type-span-table (index)
+  "Table INDEX (1: INT-TYPE-MEMO, 2: LONG-DECL-MEMO) of *INT-TYPE-SPAN*, made
+   on first use and made anew when the environment may have changed since it
+   was filled; NIL outside a span."
+  (let ((s *int-type-span*))
+    (when s
+      (unless (eql (svref s 0) *type-env-epoch*)
+        (setf (svref s 0) *type-env-epoch*
+              (svref s 1) nil
+              (svref s 2) nil))
+      (or (svref s index)
+          (setf (svref s index) (make-hash-table :test 'eq))))))
+
 (defun cached-macroexpand (form expander)
   "Expand FORM using EXPANDER, memoizing the result per (FORM, *macroexpand-scope*)
    in *macroexpand-cache*.  If the cache is NIL (outside a compile-toplevel) falls
@@ -802,7 +1010,8 @@
    An expansion kept under *EXPANSION-SM-DEPENDENT* is reused only where the
    visible symbol macro names resolve as they did when it was made."
   (if *macroexpand-cache*
-      (let ((by-scope (gethash form *macroexpand-cache* '()))
+      (let ((by-scope (let ((table (car *macroexpand-cache*)))
+                        (if table (gethash form table '()) '())))
             (sig :unset))
         (dolist (c by-scope)
           (when (%macroexpand-scope= (car c) *macroexpand-scope*)
@@ -818,6 +1027,7 @@
           (let ((*expansion-uncacheable* nil)
                 (*expansion-unreusable* nil)
                 (*expansion-sm-dependent* nil))
+            (incf *type-env-epoch*)
             (setf result (with-phase "macroexpand" (funcall expander form))
                   uncacheable *expansion-uncacheable*
                   unreusable *expansion-unreusable*
@@ -828,7 +1038,9 @@
           (when unreusable (setf *expansion-unreusable* t))
           (when dependent (setf *expansion-sm-dependent* t))
           (unless (or uncacheable unreusable)
-            (setf (gethash form *macroexpand-cache*)
+            (setf (gethash form (or (car *macroexpand-cache*)
+                                    (setf (car *macroexpand-cache*)
+                                          (make-hash-table :test #'eq))))
                   (cons (cons *macroexpand-scope*
                               (if dependent
                                   (list* *sm-dependent-marker* result
@@ -836,7 +1048,8 @@
                                   result))
                         by-scope)))
           result))
-      (funcall expander form)))
+      (progn (incf *type-env-epoch*)
+             (funcall expander form))))
 
 ;;; A macro whose expander signals an ERROR while a form is compiled does not
 ;;; stop the compilation. As SBCL does, the error is reported and the macro form
@@ -955,6 +1168,10 @@
 (defun %mv-tail-function-p (name)
   (and (symbolp name) (gethash name *mv-tail-functions*)))
 
+(defun %note-mv-tail-function (name)
+  (when (symbolp name)
+    (setf (gethash name *mv-tail-functions*) t)))
+
 (defun %mv-mode-local ()
   "The value mode of the code being compiled in a tail position, or NIL: the
    Int32 local of a body that took its caller's mode, or a constant mode where
@@ -1052,9 +1269,10 @@
 (defparameter +cs-tco-key-shared+ 27)
 (defparameter +cs-u64-locals+ 28)
 (defparameter +cs-typed-self+ 29)
+(defparameter +cs-simd-locals+ 30)
 (defparameter +cstate-empty+
   (vector '() '() '() '() '() '() '() nil nil nil nil nil nil nil nil nil nil nil
-          '() '() '() '() '() nil '() '() '() nil '() nil))
+          '() '() '() '() '() nil '() '() '() nil '() nil '()))
 
 (defvar *cstate* +cstate-empty+
   "The key-verified table pack; see the section comment above. Participates
@@ -1316,6 +1534,11 @@
   "Like *fixnum-locals* but for double-float declarations. Enables native
    r8 arithmetic on (declare (double-float x)) locals and references.")
 
+(defvar *single-assumed* nil
+  "Alist (VAR . SINGLE-P) of the variables of the forms SINGLE-FLOAT-TYPED-P is
+   looking inside (a LET's bindings, a substituted local function's
+   parameters), innermost first.")
+
 (defvar *single-float-locals* '()
   "Like *double-float-locals* but for single-float declarations. Enables native
    r4 arithmetic on (declare (single-float x)) locals and references.")
@@ -1452,6 +1675,20 @@
    Runtime.BoxU64 where the value crosses into generic code."
   (svref *cstate* +cs-u64-locals+))
 
+(defun cstate-simd-locals ()
+  "Alist (SLOT-KEY . KIND) of locals whose slots hold a raw Vector128 of the
+   DOTCL-SIMD pack type KIND (a +SIMD-KINDS+ entry) instead of a boxed pack."
+  (svref *cstate* +cs-simd-locals+))
+
+(defun simd-native-local (sym)
+  "(SLOT-KEY . KIND) when SYM's slot holds a raw Vector128, else NIL."
+  (and (boundp '*cstate*)
+       (symbolp sym)
+       (cstate-simd-locals)
+       (not (boxed-var-p sym))
+       (let ((key (lookup-local sym)))
+         (and key (assoc key (cstate-simd-locals))))))
+
 (defun u64-native-local-p (sym)
   "The slot key when SYM's slot holds (unsigned-byte 64) bits, else NIL."
   (and (boundp '*cstate*)
@@ -1531,14 +1768,66 @@
 ;;; ============================================================
 
 (defun gen-local (prefix)
-  "Generate a unique local variable symbol in the compiler package.
+  "Generate a fresh local variable symbol named PREFIX_N.
+   The symbol is uninterned: interning it put every temporary of every form
+   ever compiled into DOTCL.CIL-COMPILER for good, so a long-running image grew
+   without bound. Nothing looks one up by name in a package: the compiler keeps
+   the symbol itself, and the assembler keys locals by SYMBOL-NAME, which the
+   counter keeps unique within a method.
    PREFIX is required (every call site passes one) so the lambda list stays
    required-only and the compiler routes calls through the direct-delegate
    fast path instead of the args-array entry."
-  (intern (format nil "~a_~d" prefix (incf *var-counter*)) "DOTCL.CIL-COMPILER"))
+  (let ((sym (make-symbol (format nil "~a_~d" prefix (incf *var-counter*)))))
+    sym))
+
+(defvar *compiler-name-package* (find-package "DOTCL.CIL-COMPILER"))
+
+(defvar *compiler-name-syms* nil
+  "A cons whose car is a table, made on first use, of name string -> symbol for
+   the names COMPILER-NAME-SYM makes up while one top-level form is compiled.
+   Bound by the outermost COMPILE-TOPLEVEL /
+   COMPILE-TOPLEVEL-EVAL on the compiling thread and shared by compiles nested
+   in it, so within one compile a name always gives the same symbol, and two
+   threads never share a table. NIL outside a compile.")
+
+(defvar *make-unregistered-symbol*
+  ;; A runtime primitive, absent on the SBCL cross-compile host; resolved by name
+  ;; at load time for the same reason as *UNINTERNED-VAR-COUNTER* below. The
+  ;; host keeps NIL and interns, which costs nothing in a one-shot build.
+  (let ((s (and (find-package "DOTCL-INTERNAL")
+                (find-symbol "%MAKE-UNREGISTERED-SYMBOL" "DOTCL-INTERNAL"))))
+    (and s (fboundp s) (symbol-function s))))
+
+(defun compiler-name-sym (name)
+  "The symbol for NAME, a name the compiler builds to stand for a binding of its
+   own (a LABELS function's box, a block tag or tagbody id), as it would be if
+   interned in DOTCL.CIL-COMPILER: an existing symbol of that name there is
+   returned as it is, and otherwise the symbol's home package is
+   DOTCL.CIL-COMPILER, which the name-matching of LOCAL-ENTRY relies on. But a
+   new name is not added to the package: inside a compile it comes from
+   *COMPILER-NAME-SYMS*, so names built from gensyms do not pile up in the
+   package for as long as the image runs."
+  (multiple-value-bind (sym status) (find-symbol name *compiler-name-package*)
+    (cond (status sym)
+          ((and *compiler-name-syms* *make-unregistered-symbol*)
+           (let ((table (or (car *compiler-name-syms*)
+                            (setf (car *compiler-name-syms*)
+                                  (make-hash-table :test #'equal)))))
+             (or (gethash name table)
+                 (setf (gethash name table)
+                       (funcall *make-unregistered-symbol* name *compiler-name-package*)))))
+          (t (intern name *compiler-name-package*)))))
+
 
 (defvar *uninterned-var-names* (make-hash-table :test #'eq :synchronized t)
-  "Uninterned variable symbol -> unique effective-name string.")
+  "Uninterned variable symbol -> unique effective-name string. The outermost
+   COMPILE-TOPLEVEL / COMPILE-TOPLEVEL-EVAL binds a cons whose car is the table
+   for its compile, made on first use
+   (shared by compiles nested in it, like *COMPILER-NAME-SYMS*): a variable's
+   name only has to be the same wherever its scope reaches, which is inside one
+   top-level form. A global table kept every gensym any macro ever made, and the
+   name string made for it, alive for as long as the image ran. The global
+   value, synchronized, serves calls made outside a compile.")
 (defvar *uninterned-var-counter*
   ;; ATOMIC-LONG on dotcl so (set-parallel-eval t) workers can bump it lock-free:
   ;; a plain (incf) on a special var is a non-atomic read-modify-write and two
@@ -1577,10 +1866,14 @@
    capture."
   (if (symbol-package sym)
       (symbol-name sym)
-      (or (gethash sym *uninterned-var-names*)
-          (setf (gethash sym *uninterned-var-names*)
-                (format nil "~a#:~d" (symbol-name sym)
-                        (uninterned-var-counter-next))))))
+      (let ((table (if (consp *uninterned-var-names*)
+                       (or (car *uninterned-var-names*)
+                           (setf (car *uninterned-var-names*) (make-hash-table :test #'eq)))
+                       *uninterned-var-names*)))
+        (or (gethash sym table)
+            (setf (gethash sym table)
+                  (format nil "~a#:~d" (symbol-name sym)
+                          (uninterned-var-counter-next)))))))
 
 (defun local-function-entry (name)
   "The *LOCAL-FUNCTIONS* entry (NAME-STRING KEY BOXED-P CAPS TAG INLINE-PLAN NAME)
@@ -1615,10 +1908,11 @@
       (throw (cdr hit) :labels-demote-aborted))))
 
 (defun gen-label (prefix)
-  "Generate a unique label symbol in the compiler package.
+  "Generate a fresh, uninterned label symbol named PREFIX_N (see GEN-LOCAL).
    PREFIX is required (every call site passes one) so the lambda list stays
    required-only and calls take the direct-delegate fast path (see GEN-LOCAL)."
-  (intern (format nil "~a_~d" prefix (incf *label-counter*)) "DOTCL.CIL-COMPILER"))
+  (let ((sym (make-symbol (format nil "~a_~d" prefix (incf *label-counter*)))))
+    sym))
 
 ;;; Precomputed "LispFunction.InvokeN" / "InvokeNativeN" method-name strings.
 ;;; Every compiled function call emits one of these; building it with (format nil
@@ -1677,14 +1971,20 @@ through to compile-sym-lookup."
          `((:load-sym-fn ,(symbol-name sym) ,(package-name (symbol-package sym)))))
         (t (compile-sym-lookup sym))))
 
+(defvar *%symbol-special-p-fn* nil
+  "DOTCL-INTERNAL::%SYMBOL-SPECIAL-P once %RUNTIME-SPECIAL-P has found it.")
+
 (defun %runtime-special-p (sym)
   "Check if the runtime marks SYM as special (via IsSpecial flag).
-   Returns NIL during cross-compilation or if %SYMBOL-SPECIAL-P is unavailable."
+   Returns NIL during cross-compilation or if %SYMBOL-SPECIAL-P is unavailable.
+   The function is looked up once: FIND-SYMBOL reads the package registry under
+   its lock, and the tree-walk evaluator asks this for every variable it binds."
   (when (not *cross-compiling*)
-    (let ((fn (multiple-value-bind (s status)
-                 (find-symbol "%SYMBOL-SPECIAL-P" "DOTCL-INTERNAL")
-               (when (and s status (fboundp s))
-                 (symbol-function s)))))
+    (let ((fn (or *%symbol-special-p-fn*
+                  (multiple-value-bind (s status)
+                      (find-symbol "%SYMBOL-SPECIAL-P" "DOTCL-INTERNAL")
+                    (when (and s status (fboundp s))
+                      (setq *%symbol-special-p-fn* (symbol-function s)))))))
       (when fn (funcall fn sym)))))
 
 (defun %standard-special-p (sym)
@@ -2266,6 +2566,8 @@ the literal and the next compilation inherits it."
                   ;; they are (a Bignum at or above 2^63).
                   ((u64-native-local-p sym)
                    `((:ldloc ,key) (:call "Runtime.BoxU64")))
+                  ((simd-native-local sym)
+                   `((:ldloc ,key) ,(%simd-call "Box" (cdr (simd-native-local sym)))))
                   (t `((:ldloc ,key))))))
         ;; No local binding: check symbol-macro (let/let* shadow these too)
         (multiple-value-bind (sm-exp found) (lookup-symbol-macro sym)
@@ -2273,7 +2575,16 @@ the literal and the next compilation inherits it."
               (compile-expr sm-exp)
               ;; No lexical binding: check special (includes locally declared specials)
               `(,@(compile-sym-lookup sym)
-                (:castclass "Symbol") (:call "DynamicBindings.Get")))))))
+                (:castclass "Symbol")
+                (:call ,(if (%global-constant-symbol-p sym)
+                            "DynamicBindings.GetConstant"
+                            "DynamicBindings.Get"))))))))
+
+(defun %global-constant-symbol-p (sym)
+  "A constant variable cannot be bound, so its value is the global one."
+  (and sym (symbolp sym) (not (eq sym t)) (not (keywordp sym))
+       (not *cross-compiling*)
+       (constantp sym)))
 
 ;;; ============================================================
 ;;; Main expression compiler
@@ -2302,6 +2613,7 @@ the literal and the next compilation inherits it."
             (:pop)))))))
 (defun compile-expr-raw (expr)
   "Compile expression without MvReturn unwrapping."
+  (incf *type-env-epoch*)
   ;; SBCL cross-compile: expand SB-INT:QUASIQUOTE at compile time
   #+sbcl
   (when (and (consp expr)
@@ -2353,7 +2665,8 @@ the literal and the next compilation inherits it."
                           *mv-expect-args*)))
                 (compile-expr-raw expr))))
     (let ((c2 (if (or *in-mv-context* *in-tail-position* (single-value-form-p expr)
-                      (struct-slot-read-emitted-p expr code))
+                      (struct-slot-read-emitted-p expr code)
+                      (code-ends-unwrapped-p code))
                   code
                   `(,@code (:call "Runtime.UnwrapMv")))))
       ;; Debug info: prepend a source-span marker for literally-written cons forms
@@ -2372,7 +2685,8 @@ the literal and the next compilation inherits it."
       (compile-expr-raw expr)
       (let ((code (let ((*mv-expect-args* (if (consp expr) (cons (cdr expr) :primary) nil)))
                     (compile-expr-raw expr))))
-        (if (struct-slot-read-emitted-p expr code)
+        (if (or (struct-slot-read-emitted-p expr code)
+                (code-ends-unwrapped-p code))
             code
             `(,@code (:call "Runtime.UnwrapMv"))))))
 
@@ -2381,6 +2695,19 @@ the literal and the next compilation inherits it."
 ;;; ============================================================
 
 (defvar *compile-depth* 0)
+
+;; Nesting of forms COMPILE-FORM follows before it reports a runaway macro
+;; expansion. It counts every nested form, each expansion included, so it is a
+;; bound on the depth of the source as well as on expansion chains. The value is
+;; well below what the 256MB Lisp thread stack holds for the deepest-framed
+;; shapes measured (nested LET / WHEN / LAMBDA), and a runaway expansion still
+;; stops within a couple of seconds. Generated code that nests a few thousand
+;; forms deep (one statement per element of a literal sequence) is legitimate.
+;; Running out of stack before this is reached is reported separately, by the
+;; stack probe in COMPILE-FORM, so a smaller thread stack gets an error rather
+;; than a process-killing overflow. *MACRO-EXPAND-DEPTH-LIMIT* in
+;; cil-analysis.lisp starts from this value and must not be smaller.
+(defvar *compile-depth-limit* 10000)
 
 
 (defun %symbol-macro-name-p (sym)
@@ -2540,14 +2867,31 @@ the literal and the next compilation inherits it."
    (top-level / the common case), so a macro's (if env ...) still reads a null
    environment there."
   (let ((shadows (%symbol-macro-shadows)))
-    (when (or *symbol-macros* *lexical-operators* shadows)
+    (when (or *symbol-macros* *lexical-operators* shadows (%lexinfo-wanted-p))
       (%lexical-macro-environment shadows))))
+
+(defvar *lexenv-marker* (list '#:lexenv)
+  "The key of the entry an environment's operator alist starts with when it
+   carries the compiler's lexical state for the CLtL2 queries:
+   (MARKER FRAMES . CSTATE). Not a symbol, so no operator lookup matches it.")
+
+(defun %lexinfo-wanted-p ()
+  "True while a form is being compiled (*MACROEXPAND-CACHE* is bound then), also
+   at top level and in the analysis walks: a query there marks the expansion
+   unreusable, so it is made again where the form is compiled."
+  (and (not *cross-compiling*)
+       (or *macroexpand-cache* *lexical-decl-frames* (cstate-locals))
+       t))
 
 (defun %lexical-macro-environment (&optional (shadows (%symbol-macro-shadows)))
   "The (lexical-operators . symbol-macros-ht) environment for the current
    position, even when both are empty. The CAR is *LEXICAL-OPERATORS*, which
-   MACROEXPAND-1 searches before the global macro tables."
-  (cons *lexical-operators*
+   MACROEXPAND-1 searches before the global macro tables, headed by the
+   *LEXENV-MARKER* entry when there is lexical state to report."
+  (cons (if (%lexinfo-wanted-p)
+            (cons (list* *lexenv-marker* *lexical-decl-frames* *cstate*)
+                  *lexical-operators*)
+            *lexical-operators*)
         (when (or *symbol-macros* shadows)
           ;; Shadowing variables first: %SYMBOL-MACRO-SHADOWS only returns a
           ;; variable that is the innermost binding of its name.
@@ -2773,7 +3117,9 @@ the literal and the next compilation inherits it."
    answers its own range, so arithmetic around the call can be proven to stay in
    int64. A local function of the same name is a different function."
   (and (consp expr) (car expr) (symbolp (car expr))
-       (not (local-function-entry (car expr)))
+       (if (local-function-entry (car expr))
+           (return-from call-int-return-range (%local-inline-call-range expr))
+           t)
        (let ((ty (function-return-type (car expr))))
          (if ty
              (let ((r (if (eq ty 'fixnum)
@@ -2812,6 +3158,309 @@ the literal and the next compilation inherits it."
 ;;; whose PROCLAIM does not do that ignores these declarations, so such a fasl
 ;;; still loads there; it only lacks the information, as before.
 
+(defvar *proclaimed-variable-types* (make-hash-table :test #'eq :synchronized t)
+  "Variable name -> the type a (DECLAIM (TYPE ...)) proclaimed for it.")
+
+(defvar *proclaimed-policy* '()
+  "Alist (QUALITY . VALUE) of the OPTIMIZE qualities proclaimed so far.")
+
+(defun %type-declaration-spec-p (spec)
+  "True when SPEC is (TYPE ty var...) or the (ty var...) shorthand."
+  (and (consp spec)
+       (let ((head (car spec)))
+         (or (eq head 'type)
+             (consp head)
+             (and head (symbolp head)
+                  (not (member head '(special ftype inline notinline optimize declaration
+                                      ignore ignorable dynamic-extent values)))
+                  *known-type-name-p-fn*
+                  (funcall *known-type-name-p-fn* head)
+                  (not (and *declaration-name-p-fn*
+                            (funcall *declaration-name-p-fn* head))))))))
+
+(defun %note-global-proclamation (spec)
+  "Record the TYPE and OPTIMIZE proclamations the CLtL2 queries report."
+  (cond ((not (consp spec)) nil)
+        ((eq (car spec) 'optimize)
+         (dolist (q (cdr spec))
+           (multiple-value-bind (quality value)
+               (if (consp q) (values (car q) (cadr q)) (values q 3))
+             (when (and (symbolp quality) (integerp value))
+               (setq *proclaimed-policy*
+                     (acons quality value
+                            (remove quality *proclaimed-policy* :key #'car)))))))
+        ((%type-declaration-spec-p spec)
+         (multiple-value-bind (type vars)
+             (if (eq (car spec) 'type)
+                 (values (cadr spec) (cddr spec))
+                 (values (car spec) (cdr spec)))
+           (dolist (v vars)
+             (when (and v (symbolp v))
+               (setf (gethash v *proclaimed-variable-types*) type)))))))
+
+;;; The DOTCL-CLTL2 environment queries. The runtime's wrappers (Cltl2.cs) call
+;;; these by name.
+
+(defun %cltl2-global-variable-decls (name)
+  (multiple-value-bind (type found) (gethash name *proclaimed-variable-types*)
+    (and found (list (cons 'type type)))))
+
+(defun %cltl2-global-function-decls (name)
+  (let ((decls '()))
+    (when (symbolp name)
+      (cond ((%global-notinline-p name) (push '(inline . notinline) decls))
+            ((%global-inline-p name) (push '(inline . inline) decls)))
+      (multiple-value-bind (args found) (gethash name *function-arg-types*)
+        (when (and found
+                   (not (nth-value 1 (gethash name *inferred-return-type-names*))))
+          (multiple-value-bind (ret rfound) (gethash name *function-return-types*)
+            (when rfound
+              (setq decls (append decls `((ftype function ,args ,ret)))))))))
+    decls))
+
+(defun %cltl2-global-function-kind (name)
+  (cond ((and (symbolp name) (special-operator-p name)) :special-form)
+        ((and (symbolp name) (macro-function name)) :macro)
+        ((fboundp name) :function)
+        ((and (symbolp name) (nth-value 1 (gethash name *function-arg-types*)))
+         :function)))
+
+;;; An environment from %LEXICAL-MACRO-ENVIRONMENT or AUGMENT-ENVIRONMENT
+;;; carries the frames of *LEXICAL-DECL-FRAMES* and the *CSTATE* of its
+;;; position. A query walks the frames innermost first, collecting what their
+;;; declarations say about the name, up to the frame that binds it.
+
+(defun %env-lexinfo (env)
+  "(FRAMES . CSTATE) carried by ENV, or NIL."
+  (and (consp env)
+       (let ((ops (car env)))
+         (and (consp ops) (consp (car ops))
+              (eq (caar ops) *lexenv-marker*)
+              (cdar ops)))))
+
+(defun %lambda-list-variables (ll)
+  (let ((out '()) (section '&required))
+    (loop
+      (cond ((null ll) (return out))
+            ((atom ll) (return (cons ll out)))
+            (t
+             (let ((x (pop ll)))
+               (cond ((member x lambda-list-keywords) (setq section x))
+                     ((symbolp x) (push x out))
+                     ((not (consp x)))
+                     ((eq section '&required)
+                      (setq out (append (%lambda-list-variables x) out)))
+                     (t
+                      (let ((v (car x)))
+                        (cond ((symbolp v) (push v out))
+                              ((and (eq section '&key) (consp v))
+                               (if (symbolp (cadr v))
+                                   (push (cadr v) out)
+                                   (setq out (append (%lambda-list-variables (cadr v)) out))))
+                              ((consp v)
+                               (setq out (append (%lambda-list-variables v) out))))
+                        (when (and (consp (cdr x)) (consp (cddr x)) (symbolp (caddr x)))
+                          (push (caddr x) out)))))))))))
+
+(defun %frame-variables (frame)
+  (let ((names (cadr frame)))
+    (case (car frame)
+      ((:let :symbol-macrolet) (mapcar #'car names))
+      (:lambda (%lambda-list-variables names))
+      (:augment (append (first names) (mapcar #'car (second names)))))))
+
+(defun %frame-functions (frame)
+  (let ((names (cadr frame)))
+    (case (car frame)
+      ((:flet :macrolet) (mapcar #'car names))
+      (:augment (append (third names) (mapcar #'car (fourth names)))))))
+
+(defun %body-declaration-specs (body)
+  "The declaration specifiers of BODY's leading DECLAREs, also when BODY is a
+   single BLOCK holding them."
+  (let ((specs '()))
+    (loop
+      (cond ((and (consp body) (stringp (car body)) (consp (cdr body)))
+             (pop body))
+            ((and (consp body) (consp (car body)) (eq (caar body) 'declare))
+             (setq specs (append specs (cdar body)))
+             (pop body))
+            ((and (null specs) (consp body) (null (cdr body))
+                  (consp (car body)) (eq (caar body) 'block) (consp (cdar body)))
+             (setq body (cddar body)))
+            (t (return specs))))))
+
+(defun %variable-decl-entry (spec name)
+  "What SPEC says about the variable NAME: :SPECIAL, an alist entry, or NIL."
+  (when (consp spec)
+    (case (car spec)
+      (special (and (member name (cdr spec)) :special))
+      (ignore (and (member name (cdr spec)) '(ignore . t)))
+      (dynamic-extent (and (member name (cdr spec)) '(dynamic-extent . t)))
+      (type (and (member name (cddr spec)) (cons 'type (cadr spec))))
+      (t (and (%type-declaration-spec-p spec)
+              (member name (cdr spec))
+              (cons 'type (car spec)))))))
+
+(defun %function-decl-entry (spec name)
+  (when (consp spec)
+    (case (car spec)
+      (ftype (and (member name (cddr spec) :test #'equal) (cons 'ftype (cadr spec))))
+      (inline (and (member name (cdr spec) :test #'equal) '(inline . inline)))
+      (notinline (and (member name (cdr spec) :test #'equal) '(inline . notinline))))))
+
+(defun %merge-decls (local global)
+  (append local (remove-if (lambda (e) (assoc (car e) local)) global)))
+
+(defun %cltl2-variable-information (name env global-kind)
+  (let ((lexinfo (%env-lexinfo env)))
+    (unless lexinfo
+      (return-from %cltl2-variable-information
+        (values global-kind nil (%cltl2-global-variable-decls name))))
+    ;; The answer depends on where the macro is expanded; see *EXPANSION-UNREUSABLE*.
+    (setf *expansion-unreusable* t)
+    (let ((decls '()) (special nil) (binder nil))
+      (dolist (frame (car lexinfo))
+        (dolist (spec (%body-declaration-specs (cddr frame)))
+          (let ((e (%variable-decl-entry spec name)))
+            (cond ((eq e :special) (setq special t))
+                  ((and e (not (assoc (car e) decls)))
+                   (setq decls (append decls (list e)))))))
+        (when (member name (%frame-variables frame))
+          (setq binder frame)
+          (return)))
+      (cond ((and binder
+                  (or (eq (car binder) :symbol-macrolet)
+                      (and (eq (car binder) :augment)
+                           (assoc name (second (cadr binder))))))
+             (values :symbol-macro t nil))
+            ((or special (eq global-kind :special))
+             (values :special nil (%cltl2-global-variable-decls name)))
+            ((or binder
+                 (let ((*cstate* (cdr lexinfo))) (lookup-local name)))
+             (values :lexical t decls))
+            (t (values global-kind nil
+                       (%merge-decls decls (%cltl2-global-variable-decls name))))))))
+
+(defun %cltl2-function-information (name env)
+  (let ((lexinfo (%env-lexinfo env)))
+    (unless lexinfo
+      (return-from %cltl2-function-information
+        (values (%cltl2-global-function-kind name) nil
+                (%cltl2-global-function-decls name))))
+    (setf *expansion-unreusable* t)
+    (let ((decls '()) (binder nil))
+      (dolist (frame (car lexinfo))
+        (dolist (spec (%body-declaration-specs (cddr frame)))
+          (let ((e (%function-decl-entry spec name)))
+            (when (and e (not (assoc (car e) decls)))
+              (setq decls (append decls (list e))))))
+        (when (member name (%frame-functions frame) :test #'equal)
+          (setq binder frame)
+          (return)))
+      (cond ((and binder
+                  (or (eq (car binder) :macrolet)
+                      (and (eq (car binder) :augment)
+                           (assoc name (fourth (cadr binder)) :test #'equal))))
+             (values :macro t nil))
+            ((or binder
+                 (let ((*cstate* (cdr lexinfo))) (local-function-entry name)))
+             (values :function t decls))
+            (t (values (%cltl2-global-function-kind name) nil
+                       (%merge-decls decls (%cltl2-global-function-decls name))))))))
+
+(defun %cltl2-policy (specs)
+  "The OPTIMIZE alist CLtL2 reports: each standard quality from the innermost
+   of SPECS (OPTIMIZE declaration specifiers, innermost first) that sets it,
+   else from the proclamations, else 1."
+  (flet ((declared (quality)
+           (dolist (spec specs nil)
+             (dolist (q (cdr spec))
+               (cond ((eq q quality) (return-from declared 3))
+                     ((and (consp q) (eq (car q) quality) (integerp (cadr q)))
+                      (return-from declared (cadr q))))))))
+    (mapcar (lambda (quality)
+              (list quality
+                    (or (declared quality)
+                        (cdr (assoc quality *proclaimed-policy*))
+                        1)))
+            '(speed space safety debug compilation-speed))))
+
+(defun %cltl2-declaration-information (decl-name env)
+  (case decl-name
+    (optimize
+     (let ((lexinfo (%env-lexinfo env)))
+       (when lexinfo (setf *expansion-unreusable* t))
+       (%cltl2-policy
+        (loop for frame in (car lexinfo)
+              append (remove-if-not (lambda (spec)
+                                      (and (consp spec) (eq (car spec) 'optimize)))
+                                    (%body-declaration-specs (cddr frame)))))))
+    (declaration
+     (let ((names '()))
+       (when *declaration-name-p-fn*
+         (do-all-symbols (s)
+           (when (funcall *declaration-name-p-fn* s)
+             (pushnew s names))))
+       names))
+    (t nil)))
+
+;;; AUGMENT-ENVIRONMENT adds a frame for the new bindings, and puts the macros
+;;; and symbol macros where MACROEXPAND-1 looks: the operator alist and the
+;;; symbol-macro table.
+(defun %cltl2-augment-environment (env variable symbol-macro function macro declare)
+  (let* ((lexinfo (or (%env-lexinfo env) (cons '() +cstate-empty+)))
+         (ops (if (consp env) (car env) '()))
+         (ops (if (and (consp ops) (consp (car ops)) (eq (caar ops) *lexenv-marker*))
+                  (cdr ops)
+                  ops))
+         (old-sm (and (consp env) (hash-table-p (cdr env)) (cdr env)))
+         (sm (and (or old-sm symbol-macro variable) (make-hash-table :test #'equal)))
+         (frame (list* :augment (list variable symbol-macro function macro)
+                       (list (cons 'declare declare)))))
+    (when old-sm
+      (maphash (lambda (k v) (setf (gethash k sm) v)) old-sm))
+    (dolist (v variable)
+      (setf (gethash v sm) (cons *symbol-macro-shadow-marker* v)))
+    (dolist (b symbol-macro)
+      (setf (gethash (car b) sm) (cadr b)))
+    (dolist (f (reverse function))
+      (push (list f) ops))
+    (dolist (m (reverse macro))
+      (push (cons (car m) (cadr m)) ops))
+    (cons (cons (list* *lexenv-marker* (cons frame (car lexinfo)) (cdr lexinfo)) ops)
+          sm)))
+
+(defun %cltl2-parse-macro (name lambda-list body)
+  (let ((decls '()))
+    (loop while (or (and (stringp (car body)) (cdr body))
+                    (and (consp (car body)) (eq (caar body) 'declare)))
+          do (let ((f (pop body)))
+               (unless (stringp f) (push f decls))))
+    (%macrolet-expander-form
+     lambda-list
+     `(,@(nreverse decls) (block ,(if (consp name) (cadr name) name) ,@body)))))
+
+(defun %cltl2-enclose (lambda-expression env)
+  "LAMBDA-EXPRESSION as a function closed in the macros and symbol macros of ENV."
+  (let ((macros '()) (symbol-macros '()))
+    (when (consp env)
+      (dolist (e (reverse (car env)))
+        (when (and (consp e) (symbolp (car e)) (functionp (cdr e)))
+          (let ((w (gensym "WHOLE")) (en (gensym "ENV")) (r (gensym "REST")))
+            (push `(,(car e) (&whole ,w &environment ,en &rest ,r)
+                    (declare (ignore ,r))
+                    (funcall ',(cdr e) ,w ,en))
+                  macros))))
+      (when (hash-table-p (cdr env))
+        (maphash (lambda (k v)
+                   (when (and (symbolp k) (not (%symbol-macro-shadow-entry-p v)))
+                     (push (list k v) symbol-macros)))
+                 (cdr env))))
+    (eval `(macrolet ,macros
+             (symbol-macrolet ,symbol-macros
+               (function ,lambda-expression))))))
+
 (defun %proclaim-compiler-info (spec)
   "Record the compiler side of the proclamation SPEC. Called by PROCLAIM for
    every declaration the runtime does not handle itself.
@@ -2825,6 +3474,7 @@ the literal and the next compilation inherits it."
    %STRUCT-ACCESSORS-PROCLAMATION.
    Anything else is ignored."
   (when (consp spec)
+    (%note-global-proclamation spec)
     (case (car spec)
       (ftype
        (let ((fty (cadr spec)))
@@ -3157,9 +3807,17 @@ the literal and the next compilation inherits it."
    is a few hundred conses.")
 
 (defvar *local-inline-call-limit* 4
-  "How many call sites one local function binding may be substituted into. The
-   body is copied at each one, so N sites cost N copies of it; the declaration
-   asks for the substitution but says nothing about how much code it is worth.")
+  "How many call sites one local function binding is substituted into when the
+   FLET's body, substituted at every call, would be past the JIT's limits
+   (%SIL-PAST-JIT-LIMITS-P).")
+
+(defvar *local-inline-probe* nil
+  "True while MAYBE-EXPAND-LOCAL-INLINE is asked whether a call would be
+   substituted, without counting it.")
+
+(defvar *local-inline-capped* nil
+  "True while an FLET body is compiled again with each local function
+   substituted at no more than *LOCAL-INLINE-CALL-LIMIT* call sites.")
 
 (defun %local-inline-bindings (sym)
   "Everything SYM could name in the current scope: variable, local function,
@@ -3169,7 +3827,8 @@ the literal and the next compilation inherits it."
         (local-function-entry sym)
         (assoc sym (cstate-block-tags))
         (assoc sym (cstate-go-tags))
-        (assoc sym *symbol-macros*)))
+        (assoc sym *symbol-macros*)
+        (gethash sym *macros*)))
 
 (defvar *local-inline-snapshot-limit* 20000
   "How many conses %LOCAL-INLINE-SNAPSHOT walks, macro expansions included,
@@ -3262,24 +3921,24 @@ the literal and the next compilation inherits it."
    body still means here what it meant where it was written, return the call
    EXPR rewritten as a LET over that body; else NIL.
 
-   Refused when the argument count does not match, when the budget of call sites
-   is spent, when a MACROLET scope is active that was not active at the
-   definition, when OP is NOTINLINE here, when OP is already being substituted,
-   and -- the one that does the work -- when any name the body mentions resolves
-   to a different binding at this call site. Every refusal leaves an ordinary
-   call, so none of them can be wrong, only slower."
+   Refused when the argument count does not match, when the FLET is compiled
+   capped (*LOCAL-INLINE-CAPPED*) and OP has used its call sites, when OP is
+   NOTINLINE here, when OP is already being substituted, and -- the one that
+   does the work -- when any name the body mentions resolves to a different
+   binding at this call site. A MACROLET between the definition and the call is
+   one more way to rebind a name (as a macro), checked the same way. Every
+   refusal leaves an ordinary call, so none of them can be wrong, only slower."
   (let ((plan (nth 5 (local-function-entry op))))
     (when (and plan
                (not (member op *inlining-stack*))
                (not (member op *notinline-functions*)))
-      (destructuring-bind (name params decls body blockp snapshot scope budget) plan
-        (let ((args (cdr expr))
-              (ok nil))
-          (when (and (= (length args) (length params))
-                     (plusp (car budget))
-                     (eq scope *macroexpand-scope*)
-                     (setq ok (%local-inline-env-matches-p snapshot)))
-            (decf (car budget)))
+      (destructuring-bind (name params decls body blockp snapshot count) plan
+        (let* ((args (cdr expr))
+               (ok (and (= (length args) (length params))
+                        (or (not *local-inline-capped*)
+                            (< (car count) *local-inline-call-limit*))
+                        (%local-inline-env-matches-p snapshot))))
+          (when (and ok (not *local-inline-probe*)) (incf (car count)))
           (%local-inline-note op ok snapshot)
           (when ok
             ;; NAME, not OP: entries are matched by mangled name, so the call
@@ -3330,23 +3989,40 @@ the literal and the next compilation inherits it."
                     expr))))
           (unless (eq expansion expr) expansion))))))
 
+;; A definer compiled anywhere in a form LOAD or COMPILE-FILE is processing
+;; is located at that top level form.
+(defun %maybe-note-definition (op expr)
+  (let ((n (symbol-name op)))
+    (when (and (> (length n) 5)
+               (char= (char n 0) #\D) (char= (char n 1) #\E) (char= (char n 2) #\F))
+      (let ((note (find-symbol "%NOTE-DEFINITION" "DOTCL")))
+        (when (and note (fboundp note))
+          (funcall note expr))))))
+
 (defun compile-form (expr)
   "Compile a list form (op args...).
    Dispatch: quote fast-path -> flet-override check -> hash table (O(1), ~250 ops)
    -> cons-op cases -> string=-based ops -> macro expansion -> named-call."
-  ;; Guard to catch runaway macro expansion loops. Raised to 500 from
-  ;; the original 200 because legitimate large literal quasiquote forms
-  ;; (e.g. cl-durian's 63-entry entity-map alist) can exceed 200 naturally,
-  ;; while real infinite expansion loops still trip well before 500.
-  ;; With the 256MB runtime stack (Program.Main) this is safe.
-  (when (> *compile-depth* 500)
+  ;; Guard to catch runaway macro expansion loops (see *COMPILE-DEPTH-LIMIT*),
+  ;; and, on a thread whose stack runs out first, to report that as a Lisp
+  ;; error while there is still room to signal one.
+  (when (> *compile-depth* *compile-depth-limit*)
     (error (format nil "Compile depth limit exceeded at depth ~D, form head: ~S"
                    *compile-depth* (if (consp expr) (car expr) expr))))
+  (unless (%stack-space-available-p)
+    (error (format nil "Compile stack exhausted at depth ~D, form head: ~S"
+                   *compile-depth* (if (consp expr) (car expr) expr))))
+  (incf *type-env-epoch*)
   (let ((*compile-depth* (1+ *compile-depth*))
+        (*int-type-span* nil)
         (op (car expr))
         (*compile-was-toplevel* *at-toplevel*)
         (*at-toplevel* nil))
     (when *dotnet-type-references* (%note-dotnet-type-references expr))
+    (when (and (symbolp op) (not *cross-compiling*))
+      (%maybe-note-definition op expr))
+    (when (and *compile-was-toplevel* (not *cross-compiling*))
+      (maybe-note-unused-variables expr))
     ;; in a project-core CONCATENATED build, a toplevel module/package
     ;; setup form must take effect at COMPILE time so later components in the
     ;; same concatenated unit see the macros / package use-list it establishes
@@ -3480,6 +4156,11 @@ the literal and the next compilation inherits it."
                 (let ((*print-length* 6) (*print-level* 3))
                   (format nil "Illegal function call: ~S" expr))))
 
+              ((%simd-node expr) (compile-simd-root expr))
+              ((%rotate-byte-32-long-p expr)
+               `(,@(compile-as-long expr) (:call "Fixnum.Make")))
+              ((and (eql (%rotate-byte-width expr) 64) (try-compile-u64 expr)))
+              ((eq op '%simd-store) (compile-simd-store-form expr))
               ;; String=-based dispatch for ops that may arrive from different packages.
               ;; These are rare (internal/cross-package ops): not in the eq hash table.
               ((string= (symbol-name op) "TRY-EVAL") (compile-unary-call (cdr expr) "Runtime.TryEval"))
@@ -3593,5516 +4274,4 @@ the literal and the next compilation inherits it."
 
 
 ;;; REMOVED: The ~250 (eq op 'foo) cond branches that previously followed here
-;;; have been moved to *compile-form-handlers* hash table in cil-forms.lisp.
-;;; See the handler registration block at the bottom of cil-forms.lisp.
-
-;;; ============================================================
-;;; Arithmetic
-;;; ============================================================
-
-;;; ============================================================
-;;; Fixnum-typed expression detection & unboxed long arithmetic
-;;;
-;;; When the compiler can statically prove an expression produces a fixnum
-;;; (via (the fixnum E) wrappers or recursive fixnum ops), it emits native
-;;; int64 arithmetic instead of Runtime.Add / Runtime.Subtract method calls.
-;;; Result is boxed via Fixnum.Make only at the outermost boundary, so
-;;; intermediate values stay on the evaluation stack as raw longs.
-;;;
-;;; Trigger: fixnum-typed-p => all operands statically fixnum => long path.
-;;; Overflow safety: the raw int64 path is only taken when a static value-range
-;;; analysis (expr-int-range) proves every intermediate +/-/*/1+/1- result fits
-;;; in int64. dotcl's fixnum is full int64 (most-positive-fixnum = 2^63-1) with no
-;;; tag headroom, so bare (declare (fixnum ...)) operands have the full int64 range
-;;; and nested arithmetic over them is NOT provably safe: it falls back to the
-;;; boxed promoting path (Runtime.Add/Subtract/Multiply) which yields a bignum on
-;;; overflow. Tightly-declared operands ((the (integer lo hi) ...)) keep the fast
-;;; unboxed path when their composed range stays in int64.
-;;; ============================================================
-
-;;; int64 bounds, as exact host integers.
-(defconstant +int64-min+ -9223372036854775808)
-(defconstant +int64-max+ +9223372036854775807)
-
-(defun range-fits-int64-p (r)
-  "True if range R = (lo . hi) lies entirely within int64."
-  (and r (<= +int64-min+ (car r)) (<= (cdr r) +int64-max+)))
-
-(defun small-int-local-range (expr)
-  "If EXPR is a reference to a small-int local (see CSTATE-SMALL-INT-LOCALS) that is a
-   plain non-captured slot, return its proven (LO . HI) range; else NIL. These
-   slots hold a boxed Fixnum, so compile-as-long can unbox them inline."
-  (and (symbolp expr)
-       (boundp '*cstate*)
-       (not (boxed-var-p expr))
-       (let ((key (lookup-local expr)))
-         (and key
-              ;; Slot-keyed, like the native tables: the proven range belongs to
-              ;; the binding, so an inner binding of the same name resolves to a
-              ;; different slot and never inherits it. (It used to be name-keyed,
-              ;; and an inner (let ((f 3))) handed its integer range to an outer
-              ;; F holding a native double: native multiply on an r8 slot.)
-              (cdr (assoc key (cstate-small-int-locals) :test #'equal))))))
-
-;;; ------------------------------------------------------------
-;;; Numeric-backed array locals: let bindings whose init is a make-array
-;;; with a statically-known rank and a bounded-integer :element-type that
-;;; the runtime stores unboxed (byte[]/ushort[]/int[]/long[]). aref on such
-;;; a local can read/write the element as a raw int64 (Runtime.ArefNum*L),
-;;; and the element's storage range feeds expr-int-range so surrounding
-;;; arithmetic can prove int64-safety and stay native.
-;;; ------------------------------------------------------------
-
-(defun %numeric-storage-range (spec)
-  "Storage range (LO . HI) of the unboxed backing the runtime picks for
-   element-type SPEC, or NIL when SPEC gets no numeric backing. Must mirror
-   the runtime upgrade (ParseElementTypeName + NumKindForElementType):
-   [0,1] upgrades to bit-packed BIT (not numeric), [0,255]->u8,
-   [0,65535]->u16, int32->i32, int64->i64, wider (e.g. (unsigned-byte 64))
-   stays boxed."
-  (if (eq spec 'fixnum)
-      (cons +int64-min+ +int64-max+)
-      (let ((r (integer-type-range spec)))
-        (and r
-             (let ((lo (car r)) (hi (cdr r)))
-               (cond
-                 ((and (<= 0 lo) (<= hi 1)) nil)
-                 ((and (<= 0 lo) (<= hi 255)) (cons 0 255))
-                 ((and (<= 0 lo) (<= hi 65535)) (cons 0 65535))
-                 ((and (<= -2147483648 lo) (<= hi 2147483647))
-                  (cons -2147483648 2147483647))
-                 ((range-fits-int64-p r) (cons +int64-min+ +int64-max+))
-                 (t nil)))))))
-
-(defun %float-storage-kind (spec)
-  "Float backing kind keyword for element-type SPEC, mirroring the runtime
-   NumKindForElementType (single/short-float->float[]=:single,
-   double/long-float->double[]=:double), or NIL when SPEC is not a float type."
-  (cond ((member spec '(single-float short-float)) :single)
-        ((member spec '(double-float long-float)) :double)
-        (t nil)))
-
-(defun %u64-storage-p (spec)
-  "T when element-type SPEC gets the runtime's (unsigned-byte 64) storage, the
-   values' bits in a ulong[]: a non-negative integer range that needs the 64th
-   bit. Must mirror the runtime upgrade (ParseElementTypeName): narrower ranges
-   get the storage %NUMERIC-STORAGE-RANGE describes."
-  (let ((r (integer-type-range spec)))
-    (and r
-         (>= (car r) 0)
-         (<= (cdr r) #xFFFFFFFFFFFFFFFF)
-         (> (cdr r) +int64-max+))))
-
-(defun %expand-array-type (type)
-  "TYPE with a user DEFTYPE expanded when TYPE is not already written as a
-   SIMPLE-ARRAY / ARRAY / VECTOR specifier. A DEFTYPE name is the same type as
-   its expansion, so (deftype s-box () '(simple-array (unsigned-byte 32) (1024)))
-   declares exactly what the expansion does; without this a declaration through
-   a type name chose the generic per-element path. Anything that does not
-   expand comes back unchanged."
-  (if (or (and (symbolp type) type)
-          (and (consp type) (symbolp (car type))
-               (not (member (car type) '(simple-array array vector)))))
-      (%typexpand-for-range type)
-      type))
-
-(defun %simple-array-backing-kind (type)
-  "Element-buffer kind for a (SIMPLE-ARRAY <integer type> (DIM)) specifier of
-   rank 1 -- 1 = byte[], 2 = ushort[], 3 = int[], 4 = long[], mirroring the
-   runtime's _numKind, :U64 for (unsigned-byte 64) -- or :F64 / :F32 for a
-   DOUBLE-FLOAT / SINGLE-FLOAT element type, or NIL when TYPE is none of these.
-
-   Only SIMPLE-ARRAY qualifies, and that is the whole safety argument for
-   hoisting the buffer out of a loop: CLHS 1.4.4 says a simple array is neither
-   displaced nor adjustable nor fill-pointered, so its element storage cannot be
-   replaced while the binding lives (ADJUST-ARRAY on a simple array returns a
-   fresh array rather than rewriting this one). ARRAY and VECTOR specifiers
-   promise none of that and keep the per-element helper."
-  (setf type (%expand-array-type type))
-  (and (consp type)
-       (eq (car type) 'simple-array)
-       (consp (cdr type))
-       (consp (cddr type))
-       (let ((dims (caddr type)))
-         (and (consp dims) (null (cdr dims))
-              (or (eq (car dims) '*) (integerp (car dims)))))
-       (let ((r (%numeric-storage-range (cadr type))))
-         (cond
-           ((member (cadr type) '(double-float long-float)) :f64)
-           ((member (cadr type) '(single-float short-float)) :f32)
-           ((%u64-storage-p (cadr type))
-             :u64)
-           (t
-         (and r
-              (cond ((and (eql (car r) 0) (eql (cdr r) 255)) 1)
-                    ((and (eql (car r) 0) (eql (cdr r) 65535)) 2)
-                    ((eql (car r) -2147483648) 3)
-                    (t 4))))))))
-
-(defun %backing-slot-type (kind)
-  "CIL local type for a KIND element buffer. The (unsigned-byte 64) buffer is
-   a ulong[] held as an Int64[] (Runtime.BackingU64): its elements are read and
-   written as bits."
-  (ecase kind (1 "Byte[]") (2 "UInt16[]") (3 "Int32[]") (4 "Int64[]")
-         (:u64 "Int64[]") (:char "Char[]") (:f64 "Double[]") (:f32 "Single[]")))
-
-(defun %backing-fetch-call (kind)
-  "Runtime entry that checks the declaration once and returns the buffer.
-
-   Above (safety 0) the *Checked entry: it signals a TYPE-ERROR where the plain
-   one answers null for a non-simple array (adjustable, fill-pointered,
-   displaced), which a SIMPLE-* declaration says the value is not. At (safety 0)
-   the declaration is trusted, and the null sends each access to the
-   per-element helper, which reads the right values. The branch is on the path
-   the plain fetch takes when it declines, so a true declaration pays nothing."
-  (if (compiling-at-safety-0-p)
-      (ecase kind
-        (1 "Runtime.BackingU8") (2 "Runtime.BackingU16")
-        (3 "Runtime.BackingI32") (4 "Runtime.BackingI64")
-        (:u64 "Runtime.BackingU64")
-        (:char "Runtime.BackingChars")
-        (:f64 "Runtime.BackingF64") (:f32 "Runtime.BackingF32"))
-      (ecase kind
-        (1 "Runtime.BackingU8Checked") (2 "Runtime.BackingU16Checked")
-        (3 "Runtime.BackingI32Checked") (4 "Runtime.BackingI64Checked")
-        (:u64 "Runtime.BackingU64Checked")
-        (:char "Runtime.BackingCharsChecked")
-        (:f64 "Runtime.BackingF64Checked") (:f32 "Runtime.BackingF32Checked"))))
-
-(defun %backing-ldelem (kind)
-  "Element load leaving a raw int64, or a raw r8 for the float kinds."
-  (ecase kind (1 :ldelem-u1) (2 :ldelem-u2) (3 :ldelem-i4) (4 :ldelem-i8)
-         (:u64 :ldelem-i8) (:char :ldelem-u2) (:f64 :ldelem-r8) (:f32 :ldelem-r4)))
-
-(defun %backing-stelem (kind)
-  "Element store taking a raw int64, or a raw r8 for the float kinds (the
-   narrowing conv is in the opcode)."
-  (ecase kind (1 :stelem-u1) (2 :stelem-u2) (3 :stelem-i4) (4 :stelem-i8)
-         (:u64 :stelem-i8) (:char :stelem-u2) (:f64 :stelem-r8) (:f32 :stelem-r4)))
-
-;; DOTCL:TYPEXPAND-1, looked up by name at load time: the SBCL cross-compile
-;; host has no DOTCL package (see *TYPEXPAND-FN*).
-(defvar *typexpand-1-fn*
-  (ignore-errors
-   (let ((sym (find-symbol "TYPEXPAND-1" "DOTCL")))
-     (and sym (fboundp sym) (symbol-function sym)))))
-
-(defun %range-element-width (spec)
-  "+N when element type SPEC is an (INTEGER LO HI) / (MOD N) / (EQL N) range
-   the runtime upgrades to (UNSIGNED-BYTE N), -N for (SIGNED-BYTE N), else NIL
-   (BIT, a bound outside int64, or not such a range). Mirrors the runtime's
-   ParseRequestedElementTypeName."
-  (when (consp spec)
-    (let ((lo nil) (hi nil))
-      (case (car spec)
-        (eql (when (and (consp (cdr spec)) (null (cddr spec)))
-               (setf lo (cadr spec) hi (cadr spec))))
-        (mod (when (and (consp (cdr spec)) (null (cddr spec))
-                        (integerp (cadr spec)) (plusp (cadr spec)))
-               (setf lo 0 hi (1- (cadr spec)))))
-        (integer (when (and (consp (cdr spec)) (consp (cddr spec)) (null (cdddr spec)))
-                   (setf lo (cadr spec) hi (caddr spec))
-                   (when (and (consp lo) (integerp (car lo))) (setf lo (1+ (car lo))))
-                   (when (and (consp hi) (integerp (car hi))) (setf hi (1- (car hi)))))))
-      (and (typep lo '(signed-byte 64)) (typep hi '(signed-byte 64)) (<= lo hi)
-           (not (and (>= lo 0) (<= hi 1)))
-           (if (>= lo 0)
-               (integer-length hi)
-               ;; At least 2 bits: (signed-byte 1) upgrades to (signed-byte 2).
-               (- (max 2 (1+ (max (integer-length lo) (integer-length hi))))))))))
-
-(defun %element-narrow-width (spec)
-  "The runtime's narrow width for element type SPEC (LispVector._numNarrow): +N
-   for (UNSIGNED-BYTE N) and -N for (SIGNED-BYTE N) whose storage is wider than
-   the type ((unsigned-byte 32) in a long[], (signed-byte 8) in an int[]), else
-   NIL. An (INTEGER LO HI), (MOD N) or (EQL N) range upgrades as the runtime
-   does (ParseRequestedElementTypeName): to the (UNSIGNED-BYTE N) / (SIGNED-BYTE
-   N) of its INTEGER-LENGTH, so it gets that width."
-  ;; Expanded a step at a time, as the runtime does: a full expansion turns
-  ;; (UNSIGNED-BYTE 32) itself into an INTEGER range.
-  (loop repeat 16
-        do (let ((w (%range-element-width spec)))
-             (when w
-               (setf spec (if (plusp w)
-                              (list 'unsigned-byte w)
-                              (list 'signed-byte (- w))))))
-           (when (and (consp spec) (member (car spec) '(unsigned-byte signed-byte)))
-             (return
-               (and (consp (cdr spec)) (null (cddr spec)) (integerp (cadr spec))
-                    (let ((n (cadr spec)))
-                      (if (eq (car spec) 'unsigned-byte)
-                          (and (<= 1 n 63) (/= n 8) (/= n 16) n)
-                          (and (<= 1 n 63) (/= n 32) (- (max n 2))))))))
-           (unless (and *typexpand-1-fn*
-                        (or (and (symbolp spec) spec)
-                            (and (consp spec) (symbolp (car spec)))))
-             (return nil))
-           (multiple-value-bind (e expanded)
-               (ignore-errors (funcall *typexpand-1-fn* spec))
-             (unless expanded (return nil))
-             (setf spec e))))
-
-(defun %simple-array-store-narrow (type)
-  "%ELEMENT-NARROW-WIDTH of the element type of the SIMPLE-ARRAY specifier TYPE
-   (one %SIMPLE-ARRAY-BACKING-KIND accepted)."
-  (setf type (%expand-array-type type))
-  (and (consp type) (consp (cdr type)) (%element-narrow-width (cadr type))))
-
-(defun %backing-store-check-instrs (kind narrow &optional val)
-  "Instructions that take the raw int64 about to be stored into a KIND buffer
-   and leave it, signalling first when it is not an element of the array's type.
-   NARROW is the element type's width when it is narrower than the buffer (see
-   %ELEMENT-NARROW-WIDTH): above (safety 0) the value is checked against that
-   width, as the per-element path does, and not just against the buffer's.
-   At (safety 0) only the buffer's own width is checked.
-
-   VAL is the form whose value is stored. When its range is proven inside the
-   range the check would enforce (the XOR of two octets stored as an octet),
-   the check could never signal and nothing is emitted, at any safety."
-  (let ((narrow (and narrow (not (compiling-at-safety-0-p)) narrow)))
-    (if (%store-value-in-range-p val (%store-check-range kind narrow))
-        nil
-        (if narrow
-            `((:ldc-i4 ,(abs narrow))
-              (:call ,(if (plusp narrow) "Runtime.CheckStoreUnsigned" "Runtime.CheckStoreSigned")))
-            (let ((chk (%backing-store-check kind)))
-              (and chk `((:call ,chk))))))))
-
-(defun %store-check-range (kind narrow)
-  "(LO . HI), the values the store check for a KIND buffer accepts: the element
-   type's when NARROW (see %ELEMENT-NARROW-WIDTH) is given, else the buffer's
-   own width. NIL for the kinds that have no check."
-  (cond (narrow (if (plusp narrow)
-                    (cons 0 (1- (ash 1 narrow)))
-                    (let ((h (ash 1 (1- (- narrow))))) (cons (- h) (1- h)))))
-        ((eql kind 1) (cons 0 255))
-        ((eql kind 2) (cons 0 65535))
-        ((eql kind 3) (cons (- (ash 1 31)) (1- (ash 1 31))))
-        (t nil)))
-
-(defun %store-value-in-range-p (val range)
-  "True when VAL's value is proven to lie in RANGE (LO . HI).
-   At (safety 0) the proof is EXPR-INT-RANGE, which takes the declared types
-   of variables and THE forms at their word. Above it the check is what
-   reports a value outside the element type, and nothing checks a variable
-   against its declaration on the way in, so only a proof from what is
-   actually stored counts there: see %STORE-VALUE-RANGE."
-  (and val range
-       (let ((r (if (compiling-at-safety-0-p)
-                    (expr-int-range val)
-                    (%store-value-range val))))
-         (and r (<= (car range) (car r)) (<= (cdr r) (cdr range))))))
-
-(defvar *store-range-env* nil
-  "Alist (VAR . (LO . HI)) of the variables bound by the LET forms
-   %STORE-VALUE-RANGE is looking inside, innermost first.")
-
-(defun %store-value-range (val)
-  "(LO . HI) for VAL built only from what is actually stored and computed,
-   else NIL:
-   - integer literals
-   - elements of integer arrays: the element type's range for an array made
-     by the binding's own MAKE-ARRAY, or declared and matched by its fetch,
-     with an element type narrower than its storage (an (UNSIGNED-BYTE 32)
-     array in an Int64[]; every store into such an array is checked against
-     the element type above (safety 0)), else the range of the storage
-     (%ELEMENT-STORE-RANGE)
-   - LOGAND / LOGIOR / LOGXOR of those. LOGAND with a non-negative operand is
-     at most that operand; LOGIOR and LOGXOR of two non-negative operands have
-     no bit above the higher one's top bit. (LDB (BYTE S P) X) is seen as the
-     LOGAND it means (FOLD-TYPED-OPERAND), so it is in [0, 2^S - 1] whatever X is
-   - (ASH X N) with X non-negative and N in [-64, 64]: the shifted bounds
-   - (+ A B) and (- A B): the bounds' sums and differences
-   - a call to a function proclaimed INLINE that is substituted here: the range
-     of the substituted LET, so a ROL32 written as shifts and masks counts
-   - (LET / LET* ((VAR INIT) ...) FORM) and (BLOCK NAME FORM), one body form,
-     no SPECIAL binding: FORM's range with each VAR at its INIT's range. Every
-     INIT has to have a range itself, so no code but these pure operators runs
-     between a binding and its use, and a declared type of VAR is not used
-     (nothing checks it when VAR is bound)."
-  (let ((val (fold-nary-arith val)))
-    (cond
-      ((integerp val) (cons val val))
-      ((and (symbolp val) val (assoc val *store-range-env* :test #'eq))
-       (cdr (assoc val *store-range-env* :test #'eq)))
-      ((%element-store-range val))
-      ((and (consp val) (= (length val) 3)
-            (member (car val) '(logand logior logxor))
-            (not (local-function-entry (car val))))
-       (let ((ra (%store-value-range (cadr val)))
-             (rb (%store-value-range (caddr val))))
-         (if (eq (car val) 'logand)
-             (let ((nonneg (remove-if-not (lambda (r) (and r (>= (car r) 0)))
-                                          (list ra rb))))
-               (and nonneg (cons 0 (reduce #'min (mapcar #'cdr nonneg)))))
-             (and ra rb (>= (car ra) 0) (>= (car rb) 0)
-                  (cons 0 (1- (ash 1 (integer-length (max (cdr ra) (cdr rb))))))))))
-      ((and (consp val) (= (length val) 3) (eq (car val) 'ash)
-            (not (local-function-entry 'ash)))
-       (let ((rx (%store-value-range (cadr val)))
-             (rn (%store-value-range (caddr val))))
-         ;; ASH of a non-negative integer grows with both arguments.
-         (and rx rn (>= (car rx) 0) (<= -64 (car rn)) (<= (cdr rn) 64)
-              (cons (ash (car rx) (car rn)) (ash (cdr rx) (cdr rn))))))
-      ((and (consp val) (= (length val) 3) (member (car val) '(+ -))
-            (not (local-function-entry (car val))))
-       (let ((ra (%store-value-range (cadr val)))
-             (rb (%store-value-range (caddr val))))
-         (and ra rb
-              (if (eq (car val) '+)
-                  (cons (+ (car ra) (car rb)) (+ (cdr ra) (cdr rb)))
-                  (cons (- (car ra) (cdr rb)) (- (cdr ra) (car rb)))))))
-      ;; The BLOCK of a substituted INLINE body carries the recursion guard
-      ;; for its body, as where it is compiled: a call of the same function in
-      ;; there is not substituted again.
-      ((and (consp val) (eq (car val) 'block) (= (length val) 3))
-       (let ((*inlining-stack* (inline-guard-stack (cadr val))))
-         (%store-value-range (caddr val))))
-      ((and (consp val) (member (car val) '(let let*)) (consp (cdr val)))
-       (%store-let-range val))
-      ((and (consp val) (symbolp (car val)))
-       (let ((e (%substituted-inline-call val)))
-         (and e (%store-value-range e))))
-      (t nil))))
-
-(defun %element-store-range (val)
-  "For %STORE-VALUE-RANGE: the range of the element (AREF V I) reads, when V is
-   an integer array local. The element type's range when that element type is
-   narrower than the storage (its NARROW) and is known: V is bound to the array
-   its own MAKE-ARRAY made (the backing entry is :MADE), or V's declared element
-   type was matched against the vector's own when the buffer was fetched (the
-   entry is :CHECKED, above (safety 0)). Else the storage's
-   (NUMERIC-ARRAY-AREF-INFO): a declaration whose fetch matched only the buffer
-   lets a FIXNUM vector through as an (UNSIGNED-BYTE 32) one."
-  (let ((info (numeric-array-aref-info val)))
-    (and info
-         (let* ((e (array-backing-entry val))
-                (narrow (and e (member (sixth e) '(:made :checked)) (fifth e))))
-           (cond ((and (integerp narrow) (plusp narrow))
-                  (cons 0 (1- (ash 1 narrow))))
-                 ((and (integerp narrow) (minusp narrow))
-                  (let ((h (ash 1 (1- (- narrow))))) (cons (- h) (1- h))))
-                 (t (cdr info)))))))
-
-(defun %store-let-range (val)
-  "%STORE-VALUE-RANGE of (LET / LET* BINDINGS DECL... FORM)."
-  (let ((bindings (cadr val))
-        (body (cddr val))
-        (decls '()))
-    (loop while (and (consp body) (consp (car body)) (eq (caar body) 'declare))
-          do (push (pop body) decls))
-    (and (listp bindings)
-         (consp body) (null (cdr body))
-         (notany (lambda (d)
-                   (some (lambda (spec) (and (consp spec) (eq (car spec) 'special)))
-                         (cdr d)))
-                 decls)
-         (let ((env *store-range-env*)
-               (new '()))
-           (dolist (b bindings
-                      (let ((*store-range-env* (if (eq (car val) 'let)
-                                                   (append new env)
-                                                   env)))
-                        (%store-value-range (car body))))
-             (let ((var (if (consp b) (car b) b))
-                   (init (and (consp b) (cdr b) (cadr b))))
-               (unless (and var (symbolp var) (not (constantp var))
-                            (not (global-special-p var)))
-                 (return nil))
-               (let ((r (let ((*store-range-env* (if (eq (car val) 'let) *store-range-env* env)))
-                          (%store-value-range init))))
-                 (unless r (return nil))
-                 (if (eq (car val) 'let)
-                     (push (cons var r) new)
-                     (push (cons var r) env)))))))))
-
-(defun %substituted-inline-call (expr)
-  "The LET MAYBE-EXPAND-INLINE substitutes for EXPR, a call to a function
-   proclaimed INLINE, when the call is compiled as that substitution (the
-   conditions COMPILE-FORM goes through before it inlines); else NIL."
-  (let ((op (car expr)))
-    (and (symbolp op) op
-         (gethash op *inline-defs*)
-         (not (special-operator-name-p op))
-         (not (gethash op *compile-form-handlers*))
-         (not (local-function-entry op))
-         (not (macrolet-shadowed-p op))
-         (not (find-macro-expander op))
-         (not (maybe-expand-compiler-macro op expr))
-         (maybe-expand-inline op expr))))
-
-(defun %backing-store-check (kind)
-  "Runtime entry that signals the element-type violation an out-of-width store
-   would otherwise commit silently, or NIL for the full-width kind. The boxed
-   store path (LispVector.NumSet) raises the same error; narrowing in the
-   opcode without this would wrap the value instead."
-  (ecase kind
-    (1 "Runtime.CheckStoreU8") (2 "Runtime.CheckStoreU16")
-    (3 "Runtime.CheckStoreI32") (4 nil) (:u64 nil) (:char nil) (:f64 nil) (:f32 nil)))
-
-
-(defun %simple-string-backing-kind (type)
-  "The :CHAR backing kind for a SIMPLE-STRING type specifier of rank 1, else NIL.
-
-   Accepts the names CL gives the same thing -- SIMPLE-STRING and
-   SIMPLE-BASE-STRING -- and the spelled-out (SIMPLE-ARRAY CHARACTER (*)) with
-   its BASE-CHAR and STANDARD-CHAR variants.
-
-   Unlike %SIMPLE-ARRAY-BACKING-KIND this carries no safety argument of its own,
-   because the declaration is not one here: a plain (MAKE-ARRAY n
-   :element-type 'CHARACTER) is a simple string under CLHS while being a
-   LispVector rather than a LispString, and programs pass adjustable and
-   displaced character vectors under the declaration (SIMPLE-STRING-P used to
-   accept them). The soundness lives entirely in Runtime.BackingChars, which
-   takes the char[] of a LispString or of a simple rank-1 character LispVector
-   and answers null for everything it cannot pin, and in the null arm every access
-   carries. Above (safety 0) the fetch is BackingCharsChecked, which signals for
-   the one case that is certainly a false declaration, a non-simple array, and
-   still answers null for the rest."
-  (labels ((char-elt-p (e)
-             (and (symbolp e)
-                  (member (symbol-name e) '("CHARACTER" "BASE-CHAR" "STANDARD-CHAR")
-                          :test #'string=))))
-    (and (or (and (symbolp type)
-                  (member (symbol-name type) '("SIMPLE-STRING" "SIMPLE-BASE-STRING")
-                          :test #'string=))
-             (and (consp type)
-                  (symbolp (car type))
-                  (string= (symbol-name (car type)) "SIMPLE-ARRAY")
-                  (consp (cdr type))
-                  (char-elt-p (cadr type))
-                  (let ((dims (and (cddr type) (caddr type))))
-                    (and (consp dims) (null (cdr dims))
-                         (or (eq (car dims) '*) (integerp (car dims)))))))
-         :char)))
-
-;;; Checking a SIMPLE-* array declaration where the variable is bound.
-;;;
-;;; Above (safety 0) a binding declared SIMPLE-ARRAY / SIMPLE-STRING /
-;;; SIMPLE-BASE-STRING / SIMPLE-VECTOR / SIMPLE-BIT-VECTOR (the name or a
-;;; compound spec headed by it) signals a TYPE-ERROR when the value is an array
-;;; that is not simple: adjustable, fill-pointered or displaced. That is the one
-;;; way such a declaration can be false that the declaration-driven fast paths
-;;; would otherwise absorb silently, by falling back to the per-element helper.
-;;;
-;;; Where the element storage is hoisted, the prologue's fetch already tells a
-;;; non-simple array apart (see %BACKING-FETCH-CALL), so the check costs
-;;; nothing there and %CHECK-SIMPLE-DECL compiles to nothing. Everywhere else
-;;; it is one inlined type test per binding.
-;;;
-;;; Only the non-simple case is checked. A value that is not an array at all is
-;;; left to the operations that use it, as for every other declaration here.
-
-(defparameter +simple-array-type-names+
-  '("SIMPLE-ARRAY" "SIMPLE-STRING" "SIMPLE-BASE-STRING" "SIMPLE-VECTOR"
-    "SIMPLE-BIT-VECTOR"))
-
-(defun %simple-array-decl-spec-p (spec)
-  "T when SPEC names a type every member of which is a simple array: one of
-   +SIMPLE-ARRAY-TYPE-NAMES+ or a compound spec headed by one. Matched by
-   SYMBOL-NAME, like the backing kinds, across the cross-compile package split."
-  (let ((head (if (consp spec) (car spec) spec)))
-    (and head
-         (symbolp head)
-         (member (symbol-name head) +simple-array-type-names+ :test #'string=)
-         t)))
-
-(defun simple-array-declared-vars (decl-forms names)
-  "(VAR . SPEC) for each variable among NAMES (VAR-NAME strings) that the
-   DECLARE forms at the head of DECL-FORMS declare with a SIMPLE-* array type,
-   first declaration wins. A variable also declared IGNORE is left out, since
-   checking it would read it."
-  (let ((result '()) (ignored '()))
-    (dolist (form decl-forms)
-      (unless (and (consp form) (eq (car form) 'declare)) (return))
-      (dolist (decl (cdr form))
-        (when (consp decl)
-          (cond
-            ((and (symbolp (car decl))
-                  (member (symbol-name (car decl)) '("IGNORE" "IGNORABLE")
-                          :test #'string=))
-             (dolist (v (cdr decl))
-               (when (symbolp v) (push (var-name v) ignored))))
-            (t
-             (let* ((typed (and (symbolp (car decl))
-                                (string= (symbol-name (car decl)) "TYPE")))
-                    (spec (if typed (cadr decl) (car decl)))
-                    (vars (if typed (cddr decl) (cdr decl))))
-               (when (%simple-array-decl-spec-p spec)
-                 (dolist (v vars)
-                   (when (and (symbolp v) v
-                              (member (var-name v) names :test #'string=)
-                              (not (assoc (var-name v) result :test #'string=)))
-                     (push (list (var-name v) v spec) result))))))))))
-    (loop for (name v spec) in (nreverse result)
-          unless (member name ignored :test #'string=)
-            collect (cons v spec))))
-
-(defun simple-decl-check-forms (decl-forms names)
-  "The (%CHECK-SIMPLE-DECL VAR 'SPEC) statements for SIMPLE-ARRAY-DECLARED-VARS."
-  (loop for (v . spec) in (simple-array-declared-vars decl-forms names)
-        collect `(%check-simple-decl ,v (quote ,spec))))
-
-(defun insert-simple-decl-checks (body names)
-  "BODY with its SIMPLE-* declaration checks inserted right after its leading
-   DECLARE forms, for the variables among NAMES (symbols or VAR-NAME strings)
-   the form being compiled binds. BODY itself, EQ, when there is none."
-  (let* ((names (mapcar (lambda (n) (if (stringp n) n (var-name n))) names))
-         (checks (and names (simple-decl-check-forms body names))))
-    (if (null checks)
-        body
-        (let ((decls '()) (rest body))
-          (loop while (and rest (consp (car rest)) (eq (caar rest) 'declare))
-                do (push (pop rest) decls))
-          (append (nreverse decls) checks rest)))))
-
-(defun %hoisted-backing-entry-p (var)
-  "T when VAR's element storage is hoisted in the current scope (any kind), so
-   the prologue's fetch has already checked its declaration."
-  (and (symbolp var)
-       var
-       (boundp '*cstate*)
-       (let ((e (assoc (var-name var) (cstate-array-backing-locals)
-                       :test #'string=)))
-         (and e
-              (eq (lookup-local var) (second e))
-              (not (boxed-var-p var))
-              t))))
-
-(defun string-backing-entry (var)
-  "VAR's hoisted char[] entry, or NIL. Keyed and re-checked the way
-   ARRAY-BACKING-ENTRY is, so a shadow or a closure re-key self-invalidates."
-  (and (symbolp var)
-       var
-       (boundp '*cstate*)
-       (let ((e (assoc (var-name var) (cstate-array-backing-locals)
-                       :test #'string=)))
-         (and e
-              (eq (fourth e) :char)
-              (eq (lookup-local var) (second e))
-              (not (boxed-var-p var))
-              e))))
-
-(defun array-backing-entry (expr)
-  "For (AREF V IDX) on a rank-1 local with a hoisted element buffer, its
-   CSTATE-ARRAY-BACKING-LOCALS entry; else NIL. Re-checks the binding key and
-   the boxed flag exactly as NUMERIC-ARRAY-AREF-ENTRY does, so a shadow or a
-   closure re-key self-invalidates."
-  (and (consp expr)
-       (eq (car expr) 'aref)
-       (not (local-function-entry 'aref))
-       (consp (cdr expr))
-       (symbolp (cadr expr))
-       (= (length (cddr expr)) 1)
-       (boundp '*cstate*)
-       (let ((e (assoc (var-name (cadr expr)) (cstate-array-backing-locals)
-                       :test #'string=)))
-         (and e
-              (not (eq (fourth e) :char))
-              (eq (lookup-local (cadr expr)) (second e))
-              (not (boxed-var-p (cadr expr)))
-              e))))
-
-(defun struct-backing-slot (entry)
-  "The Int64[] slot holding ENTRY's hoisted raw slot array."
-  (third entry))
-
-(defun struct-backing-type (entry)
-  "The structure name ENTRY's binding was declared to hold. The fetch compares
-   it against the instance's own, because a position is read out of the
-   DECLARED structure's layout and another structure maps the same slot index
-   elsewhere."
-  (fourth entry))
-
-(defun struct-backing-version (entry)
-  "The structure layout version ENTRY's binding was compiled against. The fetch
-   compares it against the instance's, so a caller holding positions from an
-   older definition gets null and falls back rather than reading the wrong
-   slot -- the same thing the packed per-access constant does, asked once."
-  (fifth entry))
-
-(defun struct-backing-entry (obj packed)
-  "For a raw slot read or write at the constant PACKED index on the local
-   variable OBJ, (BACKING-ENTRY RAW-POSITION . KIND) when OBJ's raw slot array
-   was hoisted and the slot PACKED names is a raw one; else NIL.
-
-   Re-checks the binding key and the boxed flag exactly as ARRAY-BACKING-ENTRY
-   does, so a shadowing binding or a closure re-key self-invalidates.
-
-   PACKED carries the layout version the ACCESS was compiled against, and it
-   must be the version the BINDING was compiled against, or the position taken
-   from the binding's layout would describe a different definition. In one
-   image they always agree; the test is what keeps that from being an
-   assumption. When they disagree, or the slot is boxed, the access compiles
-   the way it does today, which is also what reports a stale layout."
-  (and (symbolp obj)
-       obj
-       (integerp packed)
-       (boundp '*cstate*)
-       (let ((e (assoc (var-name obj) (cstate-struct-backing-locals)
-                       :test #'string=)))
-         (and e
-              (eq (lookup-local obj) (second e))
-              (not (boxed-var-p obj))
-              (= (ash packed (- +slot-version-shift+)) (struct-backing-version e))
-              (let ((cell (nth (logand packed (1- (ash 1 +slot-version-shift+)))
-                               (cdr (cddddr e)))))
-                (and cell (>= (car cell) 0) (cons e cell)))))))
-
-(defun %array-type-numeric-info (type)
-  "For an array type specifier (simple-array ELT DIMS) / (array ELT DIMS) /
-   (vector ELT ...) whose ELT gets an unboxed backing and whose rank is
-   statically known to be 1-3, return the *numeric-array-locals* info tail:
-   (RANK . :single/:double) for float backing, (RANK LO . HI) for integer
-   backing; else NIL. DIMS must be a list of integers/* (its length is the
-   rank); an unspecified rank (* or missing) is rejected.
-
-   This is what lets an aref on an array-typed PARAMETER ride the unboxed path
-   without a make-array in sight: (simple-array single-float (1025)) reads raw
-   r8, (simple-array fixnum (*)) reads raw int64 (Runtime.ArefNum*L). The
-   runtime fast paths re-check _numKind and fall back to the boxed path when
-   the array is not actually backed that way, so a wrong declaration loses the
-   speed rather than the data."
-  (setf type (%expand-array-type type))
-  (and (consp type)
-       (let* ((head (car type))
-              (elt (cadr type))
-              (info (or (%float-storage-kind elt) (%numeric-storage-range elt)
-                        (and (%u64-storage-p elt) :u64))))
-         (and info
-              (cond
-                ((member head '(simple-array array))
-                 (let ((dims (and (cddr type) (caddr type))))
-                   (and (consp dims)
-                        (every (lambda (d) (or (eq d '*) (integerp d))) dims)
-                        (<= 1 (length dims) 3)
-                        (cons (length dims) info))))
-                ((eq head 'vector) (cons 1 info))
-                (t nil))))))
-
-(defun %make-array-static-rank (dims)
-  "Statically-known rank of a make-array DIMS argument form, or NIL.
-   A bare fixnum-typed variable is rank 1 (an integer dimension), a (list ...)
-   or quoted literal list gives its length; anything else is unknown (the
-   variable could hold a dimension LIST at runtime)."
-  (cond ((integerp dims) 1)
-        ((and (symbolp dims) (fixnum-typed-p dims)) 1)
-        ((and (consp dims) (eq (car dims) 'list)) (length (cdr dims)))
-        ((and (consp dims) (eq (car dims) 'quote))
-         (let ((d (cadr dims)))
-           (cond ((integerp d) 1)
-                 ((and (consp d) (every #'integerp d)) (length d))
-                 (t nil))))
-        (t nil)))
-
-(defun %make-array-numeric-info (init)
-  "If INIT is a (make-array DIMS ...) call with static rank 1-3, a constant
-   quoted :element-type that upgrades to a numeric backing, and no
-   :displaced-to, return (RANK LO . HI); else NIL."
-  (and (consp init)
-       (eq (car init) 'make-array)
-       (not (local-function-entry 'make-array))
-       (consp (cdr init))
-       (let ((rank (%make-array-static-rank (cadr init)))
-             (spec nil)
-             (ok t))
-         (let ((tail (cddr init)))
-           (loop while (and ok tail)
-                 do (let ((k (car tail)))
-                      (cond
-                        ((not (and (symbolp k) (consp (cdr tail))))
-                         (setf ok nil))
-                        ((string= (symbol-name k) "DISPLACED-TO")
-                         (setf ok nil))
-                        ((string= (symbol-name k) "ELEMENT-TYPE")
-                         (let ((f (cadr tail)))
-                           (if (and (consp f) (eq (car f) 'quote))
-                               (setf spec (cadr f))
-                               (setf ok nil)))))
-                      (setf tail (cddr tail)))))
-         (and ok rank (<= 1 rank 3) spec
-              (let ((fk (or (%float-storage-kind spec)
-                            (and (%u64-storage-p spec) :u64))))
-                (if fk
-                    ;; Float backing: info tail is (RANK . :single/:double): an
-                    ;; atom cdr distinguishes it from the integer (RANK LO . HI).
-                    (cons rank fk)
-                    (let ((r (%numeric-storage-range spec)))
-                      (and r (cons rank r)))))))))
-
-(defun infer-numeric-array-bindings (binding-info mutated outer)
-  "Numeric-array environment for a let/let* body: start from OUTER, drop
-   every name this let binds (shadowing), then add (NAME KEY RANK LO . HI)
-   (or (NAME KEY RANK . :single/:double) for float backing) for each plain
-   lexical, non-mutated binding whose init is a recognizable numeric make-array,
-   OR whose init is a bare reference to an array local already proven numeric
-   (copy propagation, e.g. the Gabriel fft's (prog ((ar areal)) ...) that
-   aliases a (simple-array single-float (1025)) parameter). KEY pins the
-   binding: a consumer only trusts the entry while (lookup-local NAME) still
-   resolves to it (a closure body re-keys its captured vars, so stale entries
-   self-invalidate). Mutated bindings are excluded; a setq could install an
-   array with different backing; a mutated SOURCE alias is likewise not
-   propagated."
-  (let* ((bound-names (mapcar (lambda (b) (var-name (first b))) binding-info))
-         (result (remove-if (lambda (e) (member (car e) bound-names :test #'string=))
-                            outer)))
-    (dolist (b binding-info)
-      (let ((var (first b)) (init (second b)) (is-special (third b)) (key (fourth b)))
-        (when (and (not is-special)
-                   init
-                   (not (member (var-name var) mutated :test #'string=)))
-          (let ((info (or (%make-array-numeric-info init)
-                          ;; copy propagation: init is a plain var already known
-                          ;; numeric-backed and itself not mutated -> same backing.
-                          (and (symbolp init)
-                               (not (member (var-name init) mutated :test #'string=))
-                               (let ((src (assoc (var-name init) result :test #'string=)))
-                                 (and src (cddr src)))))))
-            (when info
-              (push (list* (var-name var) key info) result))))))
-    result))
-
-(defun struct-accessor-array-info (expr)
-  "For (ACCESSOR OBJ) where ACCESSOR reads a structure slot declared to hold an
-   array whose element type gets an unboxed backing, the *numeric-array-locals*
-   info tail of that declaration -- (RANK LO . HI) or (RANK . :single/:double);
-   else NIL.
-
-   A slot read has no binding to hang a declaration on, so the slot's own :TYPE
-   is the only evidence there is. It is the same evidence FIXNUM-TYPED-P already
-   acts on for a slot declared to hold an integer, and it buys the same thing
-   here: without it, an array reached through its accessor rather than through a
-   declared local went down the generic per-element path even though the
-   declaration said exactly which backing it has.
-
-   Only the element read is decided here. The buffer is NOT hoisted (that is
-   ARRAY-BACKING-ENTRY, which requires a plain local), so a slot whose contents
-   contradict the declaration still falls back to the boxed path in the runtime
-   rather than being rejected -- the declaration stays a hint, as it is for a
-   parameter."
-  (and (consp expr)
-       (= (length expr) 2)
-       (symbolp (car expr))
-       (not (local-function-entry (car expr)))
-       (boundp '*struct-accessor-types*)
-       (let ((ty (gethash (car expr) *struct-accessor-types*)))
-         (and ty (%array-type-numeric-info ty)))))
-
-(defun numeric-array-aref-entry (expr)
-  "If EXPR is (aref V IDX...) on a proven numeric-backed local with matching
-   rank, return the info tail: (RANK LO . HI) for integer backing, or
-   (RANK . :single/:double) for float backing; else NIL.
-   numeric-array-aref-info / -float-kind split this by backing.
-
-   V may also be a structure accessor call whose slot is declared to hold such
-   an array (STRUCT-ACCESSOR-ARRAY-INFO), which is what puts
-   (AREF (ACC X) I) on the same element path as (AREF A I) on a declared local.
-
-   The subscripts are not required to be statically fixnum-typed: what this
-   answers is how the ELEMENT is stored, which does not depend on them
-   (COMPILE-INDEX-TO-LONG lowers a subscript of any shape). Requiring it cost
-   the whole unboxed path whenever a loop counter carried no declaration;
-   fft's inner loops are (DO ((I J (+ I LE))) ...), and every element they
-   touched was boxed.
-
-   (ROW-MAJOR-AREF V I) is answered too, but only when V is rank 1: there the
-   row-major index IS the subscript (CLHS ROW-MAJOR-AREF), so the form reads
-   exactly the element (AREF V I) does and every consumer of this answer, which
-   takes the array and subscripts from (CADR EXPR) / (CDDR EXPR), compiles it
-   unchanged. It is admitted with exactly one subscript, so the rank check
-   below accepts only a rank-1 array. A higher rank would need a flat-index
-   entry the runtime helpers do not have, so it stays on the generic call.
-
-   A declaration the contents contradict fails as it does for AREF: the
-   helper's fallback subscripts the actual array with one index, which signals
-   for an array of another rank rather than reading a wrong element."
-  (and (consp expr)
-       (or (and (eq (car expr) 'aref)
-                (not (local-function-entry 'aref)))
-           (and (eq (car expr) 'row-major-aref)
-                (not (local-function-entry 'row-major-aref))
-                (consp (cdr expr))
-                (consp (cddr expr))
-                (null (cdddr expr))))
-       (consp (cdr expr))
-       (boundp '*cstate*)
-       (let ((v (cadr expr))
-             (idxs (cddr expr)))
-         (if (symbolp v)
-             (let ((entry (assoc (var-name v) (cstate-numeric-array-locals)
-                                 :test #'string=)))
-               (and entry
-                    (eq (lookup-local v) (second entry))
-                    (not (boxed-var-p v))
-                    (= (length idxs) (third entry))
-                    (cddr entry)))
-             (let ((info (struct-accessor-array-info v)))
-               (and info
-                    (= (length idxs) (car info))
-                    info))))))
-
-(defun numeric-array-aref-info (expr)
-  "Integer-backed aref only: (RANK LO . HI), else NIL. The (cdr info) is a
-   (LO . HI) cons for integer backing but a keyword for float backing, so
-   gating on a cons cdr excludes float arrays (which must not read raw longs)."
-  (let ((info (numeric-array-aref-entry expr)))
-    (and info (consp (cdr info)) info)))
-
-(defun numeric-array-aref-float-kind (expr)
-  "Float-backed aref only: :single / :double storage kind, else NIL."
-  (let ((info (numeric-array-aref-entry expr)))
-    (and info (member (cdr info) '(:single :double)) (cdr info))))
-
-(defun numeric-array-aref-u64-p (expr)
-  "T when EXPR is (AREF V IDX) on a rank-1 array known to hold (unsigned-byte
-   64), whose elements are kept as their bits (COMPILE-U64-AREF-BITS)."
-  (let ((info (numeric-array-aref-entry expr)))
-    (and info (eq (cdr info) :u64) (eql (car info) 1))))
-
-;; DOTCL:TYPEXPAND, looked up by name at load time: the SBCL cross-compile host
-;; has no DOTCL package (same shape as *KNOWN-TYPE-NAME-P-FN*).
-(defvar *typexpand-fn*
-  (ignore-errors
-   (let ((sym (find-symbol "TYPEXPAND" "DOTCL")))
-     (and sym (fboundp sym) (symbol-function sym)))))
-
-(defun %typexpand-for-range (type)
-  "TYPE with user DEFTYPEs expanded, or TYPE itself when nothing can be
-   expanded (or on the cross-compile host). Any error in an expander is
-   treated as 'not expandable': this only feeds an optimization."
-  (if (and *typexpand-fn* (or (symbolp type) (and (consp type) (symbolp (car type)))))
-      (let ((e (ignore-errors (funcall *typexpand-fn* type))))
-        (if e e type))
-      type))
-
-(defun %integer-type-bounds (type depth)
-  "Bounds of the integers TYPE admits, as (LO . HI) where NIL means unbounded
-   on that side; :NONE when TYPE is not known to be a subtype of INTEGER.
-   AND intersects the bounds of the components known to be integer types and
-   ignores the others: an AND is a subtype of each of its components, so any
-   one integer component bounds it. FIXNUM is this runtime's fixnum, int64."
-  (cond
-    ((> depth 8) :none)
-    ((eq type 'bit) (cons 0 1))
-    ((eq type 'fixnum) (cons +int64-min+ +int64-max+))
-    ((eq type 'unsigned-byte) (cons 0 nil))
-    ((member type '(integer signed-byte)) (cons nil nil))
-    ((and (consp type) (eq (car type) 'signed-byte) (integerp (cadr type)) (> (cadr type) 0))
-     (let ((n (cadr type)))
-       (cons (- (ash 1 (1- n))) (1- (ash 1 (1- n))))))
-    ((and (consp type) (eq (car type) 'unsigned-byte) (integerp (cadr type)) (> (cadr type) 0))
-     (cons 0 (1- (ash 1 (cadr type)))))
-    ((and (consp type) (eq (car type) 'mod) (integerp (cadr type)) (> (cadr type) 0))
-     (cons 0 (1- (cadr type))))
-    ((and (consp type) (eq (car type) 'integer))
-     (flet ((bound (b inc)
-              (cond ((integerp b) b)
-                    ((and (consp b) (integerp (car b)) (null (cdr b))) (+ (car b) inc))
-                    (t nil))))
-       (cons (bound (cadr type) 1)
-             (and (cddr type) (bound (caddr type) -1)))))
-    ((and (consp type) (eq (car type) 'and))
-     (let ((lo nil) (hi nil) (known nil))
-       (dolist (sub (cdr type))
-         (let ((b (%integer-type-bounds sub (1+ depth))))
-           (unless (eq b :none)
-             (setf known t)
-             (when (and (car b) (or (null lo) (> (car b) lo))) (setf lo (car b)))
-             (when (and (cdr b) (or (null hi) (< (cdr b) hi))) (setf hi (cdr b))))))
-       (if known (cons lo hi) :none)))
-    ((or (symbolp type) (and (consp type) (symbolp (car type))
-                             (not (member (car type) '(or not satisfies member eql)))))
-     (let ((e (%typexpand-for-range type)))
-       (if (equal e type) :none (%integer-type-bounds e (1+ depth)))))
-    (t :none)))
-
-(defun integer-type-range (type)
-  "Inclusive (LO . HI) for a bounded integer TYPE specifier, or NIL if TYPE is
-   not a bounded integer type. Recognizes bit, (signed-byte N), (unsigned-byte N),
-   and (integer LO HI) with constant bounds. The caller gates on range-fits-int64-p,
-   so e.g. (unsigned-byte 64) (whose HI exceeds int64) is rejected downstream.
-   Storage decisions (raw structure slots, numeric array backing) use this one:
-   they must agree with the runtime, which does not expand DEFTYPEs."
-  (cond
-    ((eq type 'bit) (cons 0 1))
-    ((and (consp type) (eq (car type) 'signed-byte) (integerp (cadr type)))
-     (let ((n (cadr type)))
-       (cons (- (ash 1 (1- n))) (1- (ash 1 (1- n))))))
-    ((and (consp type) (eq (car type) 'unsigned-byte) (integerp (cadr type)))
-     (cons 0 (1- (ash 1 (cadr type)))))
-    ((and (consp type) (eq (car type) 'integer)
-          (integerp (cadr type)) (integerp (caddr type)))
-     (cons (cadr type) (caddr type)))
-    (t nil)))
-
-(defun declared-integer-range (type)
-  "Inclusive (LO . HI) for a TYPE declared on a variable or asserted by THE, or
-   NIL. On top of INTEGER-TYPE-RANGE it understands (mod N), exclusive and
-   half-open (integer ...) bounds, AND of an integer type with other types (e.g.
-   (AND FIXNUM UNSIGNED-BYTE)), and DEFTYPEs expanding to these. A bare FIXNUM
-   is left to the fixnum-locals path and answers NIL here. Only for values, never
-   for storage: see INTEGER-TYPE-RANGE."
-  (if (eq type 'fixnum)
-      nil
-      (let ((b (%integer-type-bounds type 0)))
-        (and (consp b) (car b) (cdr b) (<= (car b) (cdr b)) b))))
-
-(defun range-arith (op ra rb)
-  "Interval arithmetic for OP over ranges RA=(lo . hi) and RB. Host bignums keep
-   the bounds exact; the caller checks whether the result still fits int64."
-  (let ((alo (car ra)) (ahi (cdr ra)) (blo (car rb)) (bhi (cdr rb)))
-    (ecase op
-      (+ (cons (+ alo blo) (+ ahi bhi)))
-      (- (cons (- alo bhi) (- ahi blo)))
-      (* (let ((c1 (* alo blo)) (c2 (* alo bhi)) (c3 (* ahi blo)) (c4 (* ahi bhi)))
-           (cons (min c1 c2 c3 c4) (max c1 c2 c3 c4)))))))
-
-(defun fixnum-leaf-range (expr)
-  "Range (lo . hi) for a non-arithmetic fixnum-typed leaf, or NIL if EXPR is not
-   such a leaf. Locals / calls / bitwise results take the full fixnum (int64) range;
-   (the (integer lo hi) ...) contributes its declared bounds."
-  (cond
-    ;; Local with a proven bounded int64 range -> its TIGHT range (checked before
-    ;; the full-range fixnum/long clauses so a tighter bound wins). This is what
-    ;; lets e.g. (* rmdr 2) on a (signed-byte 56) prove int64-safety.
-    ((small-int-local-range expr))
-    ;; aref on a numeric-backed array local -> the element STORAGE range. Tight
-    ;; enough to prove e.g. (+ (aref a i j) (aref b i j)) of two u16 arrays
-    ;; stays in int64, keeping the whole store expression native.
-    ((let ((info (numeric-array-aref-info expr)))
-       (and info (cdr info))))
-    ;; A structure slot declared to hold a bounded integer -> the DECLARED
-    ;; range. FIXNUM-TYPED-P has taken this leaf since the slot storage became
-    ;; raw, and COMPILE-AS-LONG has the matching STRUCT-SLOT-REF clause, but
-    ;; the third of the three places that decide raw int64 did not, so
-    ;; EXPR-INT-RANGE answered NIL and four downstream proofs failed together:
-    ;; 1+ / 1- stayed on Runtime.Increment, FIXNUM-BINOP-NATIVE-P refused the
-    ;; whole arithmetic expression, a subscript did not reach the raw element
-    ;; path, and a LET bound from a slot got no Int64 slot.
-    ;;
-    ;; The declared type, not the full fixnum range: a slot declared
-    ;; (SIGNED-BYTE 32) proves things a FIXNUM one cannot, and this is the
-    ;; only place that knows which it was.
-    ((and (consp expr) (= (length expr) 2) (symbolp (car expr))
-          (not (local-function-entry (car expr)))
-          (boundp '*struct-accessor-types*)
-          (let ((ty (gethash (car expr) *struct-accessor-types*)))
-            (and ty
-                 (let ((r (if (eq ty 'fixnum)
-                              (cons +int64-min+ +int64-max+)
-                              (integer-type-range ty))))
-                   (and r (range-fits-int64-p r) r))))))
-    ;; (char-code (schar s i)) -> [0, 65535]. FIXNUM-TYPED-P has taken this
-    ;; composition since COMPILE-AS-LONG grew the Runtime.CharCodeAtL lowering
-    ;; for it, but FIXNUM-LEAF-RANGE did not, so the range was NIL and the
-    ;; arithmetic around a string scan stayed generic even though the character
-    ;; code itself was already arriving as a raw int64.
-    ;;
-    ;; The bound is entirely an argument from the type, with no step that holds
-    ;; only on this machine. Every return of Runtime.CharCodeAtL is a C# char
-    ;; widened to long: the two string backings, the char[] of a LispVector,
-    ;; and Runtime.CharCode of a LispChar, whose Value is declared char. A
-    ;; System.Char is 16 bits unsigned, so [0, 65535] holds for the same reason
-    ;; the runtime type-checks, and CHAR-CODE-LIMIT is 65536 to match.
-    ((string-char-code-ref expr)
-     (cons 0 65535))
-    ;; A word of 2 or 4 adjacent octets (OCTET-WORD-REF-INFO).
-    ((let ((ow (octet-word-ref-info expr)))
-       (and ow (< (fourth ow) 8) (cons 0 (1- (ash 1 (* 8 (fourth ow))))))))
-    ;; (mod X N) / (rem X N) with a constant integer divisor -> the range the
-    ;; divisor forces. Unlike the three leaves above, the lowering here was
-    ;; ALREADY reachable: Runtime.ModFixnumL is emitted today for a mod whose
-    ;; operands are fixnum-typed. What was not reachable is the arithmetic
-    ;; AROUND it -- (* 3 (mod i 10)) lowered the mod natively and then called
-    ;; the generic multiply, because EXPR-INT-RANGE had nothing to say about
-    ;; the mod's result and so could not prove the product fits.
-    ;;
-    ;; Which is why this one has to be the TIGHT range and a conservative full
-    ;; int64 range would be worth nothing: [int64min, int64max] times [3,3]
-    ;; does not fit, so the enclosing proof fails exactly as it did before.
-    ;;
-    ;; The bounds are CLHS 12.1.3.1's sign rules and not a guess about
-    ;; magnitude. MOD takes the sign of the DIVISOR, so a positive N gives
-    ;; [0, N-1] and a negative one [N+1, 0]. REM takes the sign of the NUMBER,
-    ;; so either way it is [-(|N|-1), |N|-1]. A zero divisor is excluded
-    ;; because it has no result to bound, and the dividend must be
-    ;; fixnum-typed: (mod 5.5 2) is 1.5, and a float result has no integer
-    ;; range at all.
-    ((and (consp expr) (= (length expr) 3)
-          (member (car expr) '(mod rem))
-          (not (local-function-entry (car expr)))
-          (integerp (caddr expr))
-          (not (zerop (caddr expr)))
-          (fixnum-typed-p (cadr expr))
-          (let* ((d (caddr expr))
-                 (m (1- (abs d)))
-                 (r (if (eq (car expr) 'mod)
-                        (if (plusp d) (cons 0 m) (cons (- m) 0))
-                        (cons (- m) m))))
-            (and (range-fits-int64-p r) r))))
-    ;; (length x) -> [0, 2^31-1]. The other half of the same omission the slot
-    ;; clause above fixes: FIXNUM-TYPED-P has long taken LENGTH as an integer
-    ;; leaf, but FIXNUM-LEAF-RANGE never did, so EXPR-INT-RANGE answered NIL
-    ;; for it. COMPILE-AS-LONG has no LENGTH clause at all -- the generic
-    ;; call is correct and stays -- so everything this buys is downstream of
-    ;; the range: 1+ / 1- go native, FIXNUM-BINOP-NATIVE-P admits the whole
-    ;; expression, and a LET bound from a length earns an Int64 slot.
-    ;;
-    ;; Two arguments hold the bound up and they are not the same kind.
-    ;;
-    ;; From the type: all four returns of Runtime.Length are Fixnum.Make of a
-    ;; C# int -- 0 for NIL, the counter for a list, s.Length, v.Length -- and
-    ;; every one is non-negative. That is what gives [0, int32max], and it
-    ;; holds for the same reason the code type-checks.
-    ;;
-    ;; From the machine: the list arm counts into an int, so a list of more
-    ;; than 2^31 conses would overflow it. No such list exists -- 2^31 conses
-    ;; is 32 GB and the counting loop would not finish -- but that is an
-    ;; argument about this machine, not about the type. Anyone widening this
-    ;; bound, or reusing it where the count does not come from memory the
-    ;; process holds, is leaning on the second argument and should know it.
-    ((and (consp expr) (= (length expr) 2)
-          (eq (car expr) 'length)
-          (not (local-function-entry 'length)))
-     (cons 0 (1- (ash 1 31))))
-    ;; Raw int64 local (native body) or declared-fixnum local -> full int64 range.
-    ((and (symbolp expr)
-          (boundp '*cstate*)
-          (native-slot-p expr (cstate-long-locals)))
-     (cons +int64-min+ +int64-max+))
-    ((and (symbolp expr)
-          (boundp '*fixnum-locals*)
-          (member (var-name expr) *fixnum-locals* :test #'string=)
-          (not (boxed-var-p expr))
-          (lookup-local expr))
-     (cons +int64-min+ +int64-max+))
-    ;; (the (integer lo hi) E) / (the (signed-byte N) E) etc. with constant
-    ;; bounds -> declared bounds (only when they fit int64); otherwise
-    ;; (the fixnum E) / (the (integer lo *) E) -> full fixnum range.
-    ((and (consp expr) (eq (car expr) 'the))
-     (let ((ty (cadr expr)))
-       (cond
-         ((let ((r (declared-integer-range ty))) (and r (range-fits-int64-p r) r)))
-         ((or (eq ty 'fixnum) (and (consp ty) (eq (car ty) 'integer)))
-          (cons +int64-min+ +int64-max+))
-         (t nil))))
-    ;; %dotimes-1+ asserts (from loop structure: counter < limit <= int64-max
-    ;; at the increment site) that the incremented result fits int64, so it is
-    ;; a leaf with the full int64 range: no +1 widening that would defeat the
-    ;; range proof for a plain (1+ counter) on a full-range fixnum counter.
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) '%dotimes-1+)
-          (fixnum-typed-p (cadr expr)))
-     (cons +int64-min+ +int64-max+))
-    ;; %dotimes-limit / %loop-limit-floor: a loop limit clamped into int64.
-    ((and (consp expr) (= (length expr) 2)
-          (member (car expr) '(%dotimes-limit %loop-limit-floor)))
-     (cons +int64-min+ +int64-max+))
-    ;; (logand X M) with M non-negative: [0, max M], and exact even when X is
-    ;; only right modulo 2^64 (see FIXNUM-TYPED-P).
-    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'logand)
-          (let ((m (%logand-nonneg-operand (cadr expr) (caddr expr))))
-            (and m
-                 (fixnum-wrap-typed-p (if (eq m (cadr expr)) (caddr expr) (cadr expr)))
-                 (cons 0 (cdr (expr-int-range m)))))))
-    ;; (logior A B) / (logxor A B) with both operands proved non-negative: the
-    ;; result has no bit above the higher operand's top bit, so it is below the
-    ;; next power of two. Two octets put together into a word stay a word.
-    ((and (consp expr) (= (length expr) 3)
-          (member (car expr) '(logior logxor))
-          (not (local-function-entry (car expr)))
-          (let ((ra (expr-int-range (cadr expr))))
-            (and ra (>= (car ra) 0)
-                 (let ((rb (expr-int-range (caddr expr))))
-                   (and rb (>= (car rb) 0)
-                        (cons 0 (1- (ash 1 (integer-length (max (cdr ra) (cdr rb))))))))))))
-    ;; Bitwise results stay within int64 (conservatively the full range).
-    ((and (consp expr) (= (length expr) 3)
-          (member (car expr) '(logand logior logxor))
-          (fixnum-typed-p (cadr expr)) (fixnum-typed-p (caddr expr)))
-     (cons +int64-min+ +int64-max+))
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) 'lognot)
-          (fixnum-typed-p (cadr expr)))
-     (cons +int64-min+ +int64-max+))
-    ;; ash with a constant shift is admitted by fixnum-typed-p only when it stays
-    ;; in int64; mirror that here as the full range.
-    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'ash)
-          (fixnum-typed-p expr))
-     (cons +int64-min+ +int64-max+))
-    ;; A call to a function whose return type is declared (or inferred) as an
-    ;; integer type within int64 -> that type's range: FIXNUM gives the full
-    ;; int64 range, (UNSIGNED-BYTE 8) gives [0, 255].
-    ((call-int-return-range expr))
-    (t nil)))
-
-(defun fold-nary-arith (expr)
-  "(+ a b c) as (+ (+ a b) c), and the same for -, * and the associative LOGAND,
-   LOGIOR and LOGXOR; anything else unchanged.
-   The three places that decide whether an integer expression can be computed in
-   raw int64, FIXNUM-TYPED-P, EXPR-INT-RANGE and COMPILE-AS-LONG, each match a
-   two-argument call, so a three-argument one fell off the native path entirely.
-   The cost was not the arithmetic but what it disqualified: an index like
-   (- n i 1) made the whole AREF take the generic path, so reading from a
-   specialized array boxed its element (24 B a read, e.g. every element copy in
-   the fft benchmark). Left-associating is what the n-ary call means (CLHS 12.2),
-   and evaluation stays left to right."
-  (if (and (consp expr) (member (car expr) '(+ - * logand logior logxor)) (> (length expr) 3))
-      (let ((op (car expr)))
-        (reduce (lambda (a b) (list op a b)) (cdr expr)))
-      (fold-typed-operand expr)))
-
-(defun foldable-constant-symbol-p (expr)
-  "True when EXPR is a symbol naming a constant variable whose value is a number
-   or a character, so a reference to it may be compiled as that literal.
-   CLHS 3.2.2.3 lets a reference to a constant variable be replaced by its
-   value, and DEFCONSTANT requires the value to be available at compile time
-   and to stay the same (a non-EQL redefinition has undefined consequences).
-   Only numbers and characters are folded: their identity is EQL, so a fresh
-   literal cannot be told apart from the value the symbol holds. A list or
-   string constant keeps its single object and stays a variable read.
-   Nothing is folded while cross-compiling: there the values come from the
-   host Lisp, whose constants are not the target's (MOST-POSITIVE-FIXNUM,
-   CHAR-CODE-LIMIT and friends differ between SBCL and dotcl)."
-  (and (symbolp expr)
-       expr
-       (not (eq expr t))
-       (not (keywordp expr))
-       (not *cross-compiling*)
-       (constantp expr)
-       (boundp expr)
-       (not (lookup-local expr))
-       (not (nth-value 1 (lookup-symbol-macro expr)))
-       (typep (symbol-value expr) '(or number character))))
-
-(defun %ltv-constant-symbol-p (expr)
-  "True when EXPR, the form of a LOAD-TIME-VALUE, is a symbol naming a constant
-   variable that is defined here, so its value is the one load time would see."
-  (and (symbolp expr)
-       expr
-       (not (eq expr t))
-       (not (keywordp expr))
-       (not *cross-compiling*)
-       (constantp expr)
-       (boundp expr)
-       (not (lookup-local expr))
-       (not (nth-value 1 (lookup-symbol-macro expr)))))
-
-(defun %constant-array-symbol-p (expr)
-  "True when EXPR is a symbol naming a constant variable whose value, known at
-   compile time, is an array. Same conditions as FOLDABLE-CONSTANT-SYMBOL-P but
-   for the value's type."
-  (and (symbolp expr)
-       expr
-       (not (eq expr t))
-       (not (keywordp expr))
-       (not *cross-compiling*)
-       (constantp expr)
-       (boundp expr)
-       (not (lookup-local expr))
-       (not (nth-value 1 (lookup-symbol-macro expr)))
-       (arrayp (symbol-value expr))))
-
-(defun %literal-index-value (expr)
-  "The integer EXPR stands for when it is an integer literal, a foldable
-   constant, or a symbol macro expanding to an integer (the variable of an
-   unrolled loop, ironclad's DOTIMES-UNROLLED); else NIL."
-  (let ((expr (if (foldable-constant-symbol-p expr) (symbol-value expr) expr)))
-    (cond ((integerp expr) expr)
-          ((and (symbolp expr) expr (not (lookup-local expr)))
-           (multiple-value-bind (expansion found) (lookup-symbol-macro expr)
-             (and found (integerp expansion) expansion)))
-          (t nil))))
-
-(defun %fold-constant-aref (expr)
-  "The element (AREF C I...) reads, when C names a constant array
-   (%CONSTANT-ARRAY-SYMBOL-P), every I is a literal index in bounds and the
-   element is a number or a character; else NIL. CLHS 3.2.2.3 lets the reference
-   to C be replaced by C's value, which is then a literal object that may not be
-   modified (CLHS 3.7.1), so its element is the same every time. SBCL folds the
-   same reads. ironclad indexes its constant tables this way inside unrolled
-   rounds (BLAKE2's (AREF +BLAKE2-SIGMA+ I 0)), each read a dynamic lookup of
-   the table and a generic AREF."
-  (when (and (consp expr) (eq (car expr) 'aref) (consp (cdr expr))
-             (not (local-function-entry 'aref))
-             (not (macrolet-shadowed-p 'aref))
-             (%constant-array-symbol-p (cadr expr)))
-    (let ((array (symbol-value (cadr expr)))
-          (indices (mapcar #'%literal-index-value (cddr expr))))
-      (when (and (every #'integerp indices)
-                 (= (length indices) (array-rank array))
-                 (apply #'array-in-bounds-p array indices))
-        (let ((v (apply #'aref array indices)))
-          (and (typep v '(or number character)) v))))))
-
-(defun fold-constant-symbol (expr)
-  "EXPR with a reference to a foldable constant (FOLDABLE-CONSTANT-SYMBOL-P)
-   replaced by its value, and a read of a constant array at literal indices
-   (%FOLD-CONSTANT-AREF) by the element; anything else unchanged. Applied where
-   the typed paths look at a form before compiling it, so a constant is seen as
-   the literal it stands for: (setf (aref a i) +k+) then takes the same raw store
-   as (setf (aref a i) 1) instead of reading the symbol through the dynamic
-   binding lookup and falling to the generic store."
-  (cond ((foldable-constant-symbol-p expr) (symbol-value expr))
-        ((%fold-constant-aref expr))
-        (t expr)))
-
-(defun %literal-dpb-form-p (expr)
-  "True when EXPR is (DPB V (BYTE SIZE POS) X) with literal SIZE and POS, the
-   shape the DPB compiler entry open-codes as masks, a shift and a LOGIOR."
-  (and (consp expr) (eq (car expr) 'dpb)
-       (consp (cdr expr)) (consp (cddr expr)) (consp (cdddr expr))
-       (null (cddddr expr))
-       (let ((spec (caddr expr)))
-         (and (consp spec) (eq (car spec) 'byte)
-              (consp (cdr spec)) (consp (cddr spec)) (null (cdddr spec))
-              (typep (cadr spec) '(integer 0 1024))
-              (typep (caddr spec) '(integer 0 1024))))
-       (not (local-function-entry 'dpb))
-       (not (local-function-entry 'byte))
-       (not (macrolet-shadowed-p 'dpb))
-       (not (macrolet-shadowed-p 'byte))))
-
-(defun %literal-dpb-as-logior (expr)
-  "(DPB V (BYTE SIZE POS) X) as the LOGIOR form it means, the same form the DPB
-   compiler entry compiles. The typed paths see the masks through
-   FOLD-TYPED-OPERAND: a byte deposited into a known integer is a known
-   integer, which is how ironclad's UB16REF/LE builds a word out of two octets."
-  (let* ((spec (caddr expr))
-         (size (cadr spec)) (pos (caddr spec))
-         (mask (1- (ash 1 size)))
-         (v (cadr expr)) (x (cadddr expr)))
-    `(logior ,(if (zerop pos)
-                  `(logand ,v ,mask)
-                  `(ash (logand ,v ,mask) ,pos))
-             (logand ,x ,(lognot (ash mask pos))))))
-
-(defun fold-typed-operand (expr)
-  "FOLD-CONSTANT-SYMBOL, and (LDB (BYTE SIZE POS) X) with literal SIZE and POS
-   rewritten to the LOGAND / ASH form the LDB compiler entry open-codes (and
-   (DPB V (BYTE SIZE POS) X) to the DPB entry's LOGIOR form). For the
-   typed-path predicates and COMPILE-AS-LONG only, which look at a form before
-   it is compiled. A call to a MACROLET-bound macro, or to a global macro, is
-   looked at through its expansion (%EXPAND-LOCAL-MACRO-OPERAND)."
-  (let ((expr (%expand-local-macro-operand expr)))
-    (let ((a (%typed-vector-struct-read expr)))
-      (when a (setf expr a)))
-    (cond ((%literal-ldb-form-p expr) (%literal-ldb-as-logand expr))
-          ((%literal-dpb-form-p expr) (%literal-dpb-as-logior expr))
-          (t (fold-constant-symbol expr)))))
-
-(defun %typed-vector-struct-read (expr)
-  "For EXPR a call (ACC X) to the reader of a (:TYPE VECTOR) structure
-   (*TYPED-VECTOR-STRUCT-ACCESSORS*), the (AREF X IDX) its DEFUN computes; else
-   NIL. Not when ACC is a local function or is NOTINLINE."
-  (and (consp expr)
-       (symbolp (car expr)) (car expr)
-       (consp (cdr expr)) (null (cddr expr))
-       (let ((idx (gethash (car expr) *typed-vector-struct-accessors*)))
-         (and idx
-              (not (local-function-entry (car expr)))
-              (not (macrolet-shadowed-p (car expr)))
-              (not (member (car expr) *notinline-functions*))
-              (not (%global-notinline-p (car expr)))
-              (not (local-function-entry 'aref))
-              `(aref ,(cadr expr) ,idx)))))
-
-(defun %expand-local-macro-operand (expr)
-  "EXPR, or when EXPR is a call to a macro bound by an enclosing MACROLET (or
-   to a global macro, %GLOBAL-MACRO-OPERAND-EXPANDER), its expansion
-   (repeated while the expansion is again such a call). A local macro
-   is how a library names an array element or a word of state inside a hot
-   function -- (macrolet ((ref (i) `(aref x ,i))) ...) -- and the typed-path
-   predicates only see the form they are given, so (logxor (ref 0) ...) was not
-   known to be an integer even when (aref x 0) is. The expansion goes through
-   CACHED-MACROEXPAND, so where the form is then compiled it is the same
-   expansion. An expander that signals leaves EXPR as it is: compiling the form
-   reports the error where it always did."
-  (loop repeat 16
-        while (and (consp expr) (symbolp (car expr)))
-        do (let ((expander (if (macrolet-shadowed-p (car expr))
-                               (gethash (car expr) *macros*)
-                               (%global-macro-operand-expander (car expr)))))
-             (unless expander (return))
-             (let ((e (handler-case (cached-macroexpand expr expander)
-                        (error () (return)))))
-               (when (eq e expr) (return))
-               (setf expr e))))
-  expr)
-
-(defun %global-macro-operand-expander (op)
-  "The expander COMPILE-FORM would use for a call to the global macro OP, or
-   NIL when COMPILE-FORM would do anything else with the call: a form with a
-   handler of its own, a local function of that name, or one of the internal
-   heads it matches by name. Not for COMMON-LISP operators: the typed paths
-   know the ones that compute a number, and expanding the others (LOOP,
-   DOTIMES, ...) wherever an operand is looked at only costs compile time.
-   Only inside a top-level compile, where CACHED-MACROEXPAND memoizes: the
-   typed-path predicates look at the same operand many times, and the form
-   compiled later must be the same expansion. A macro written as an arithmetic
-   helper -- (defmacro p+ (a b) `(ldb (byte 62 0) (+ ,a ,b))) -- is then seen as
-   the integer expression it is, like the same form written out."
-  (and *macroexpand-cache*
-       (not (gethash op *compile-form-handlers*))
-       (not (local-function-entry op))
-       (let ((expander (find-macro-expander op)))
-         (and expander
-              (let ((pkg (symbol-package op)))
-                (not (and pkg (string= (package-name pkg) "COMMON-LISP"))))
-              (not (member (symbol-name op)
-                           '("TRY-EVAL" "%SET-CHAR" "%SET-ELT" "%SET-SUBSEQ"
-                             "%PUTF" "INTERN" "DEFMACRO" "%DOTNET-CALL-DIRECT")
-                           :test #'string=))
-              expander))))
-
-(defun %literal-ldb-form-p (expr)
-  "True when EXPR is (LDB (BYTE SIZE POS) X) with literal SIZE and POS, the
-   shape the LDB compiler entry open-codes as a shift and a mask."
-  (and (consp expr) (eq (car expr) 'ldb)
-       (consp (cdr expr)) (consp (cddr expr)) (null (cdddr expr))
-       (let ((spec (cadr expr)))
-         (and (consp spec) (eq (car spec) 'byte)
-              (consp (cdr spec)) (consp (cddr spec)) (null (cdddr spec))
-              (typep (cadr spec) '(integer 0 1024))
-              (typep (caddr spec) '(integer 0 1024))))
-       (not (local-function-entry 'ldb))
-       (not (local-function-entry 'byte))
-       (not (macrolet-shadowed-p 'ldb))
-       (not (macrolet-shadowed-p 'byte))))
-
-(defun %literal-ldb-as-logand (expr)
-  "(LDB (BYTE SIZE POS) X) as the LOGAND / ASH form it means. The typed paths
-   look at a form through FOLD-TYPED-OPERAND, so they see the mask: without
-   this, (logior (ldb (byte 32 0) (ash x 7)) ...) was not known to be an
-   integer at all and every operator around it took the boxed generic path."
-  (let* ((spec (cadr expr))
-         (size (cadr spec)) (pos (caddr spec))
-         (mask (1- (ash 1 size)))
-         (x (caddr expr)))
-    (if (zerop pos)
-        `(logand ,x ,mask)
-        `(logand (ash ,x ,(- pos)) ,mask))))
-
-(defvar *int-type-memo* nil
-  "EQ table of answers of FIXNUM-TYPED-P and EXPR-INT-RANGE, bound for the
-   duration of one outermost query. The two recurse into each other on the same
-   operands (a LOGAND asks both whether its left operand is a fixnum and what
-   its range is), so without the table a left-associated chain of N operands
-   costs 2^N: a 30-operand LOGAND took minutes to compile. Within one query the
-   compilation state they read does not change, so an answer can be reused.
-   Each form maps to a list of (TAG *FIXNUM-WRAP-LICENSED* . ANSWER), the
-   license being the one variable they rebind.
-   Keyed by identity, not EQUAL: the recursion visits the operand conses
-   themselves, so EQ finds them. An EQUAL hash looks only a few levels into a
-   list, so in a deeply nested (+ 1 (+ 1 ...)) every operand had the same hash
-   and each lookup compared whole trees: compiling N levels took N^3.")
-
-(defun %int-type-memoized (tag expr fn)
-  (if (atom expr)
-      (funcall fn expr)
-      (flet ((lookup ()
-               (let* ((license *fixnum-wrap-licensed*)
-                      (hit (find-if (lambda (e) (and (eq (car e) tag)
-                                                     (eq (cadr e) license)))
-                                    (gethash expr *int-type-memo*))))
-                 (if hit
-                     (cddr hit)
-                     (let ((v (funcall fn expr)))
-                       (push (list* tag license v) (gethash expr *int-type-memo*))
-                       v)))))
-        (if *int-type-memo*
-            (lookup)
-            (let ((*int-type-memo* (make-hash-table :test 'eq)))
-              (lookup))))))
-
-(defun expr-int-range (expr)
-  "Provable inclusive integer range (lo . hi) for EXPR computed entirely within
-   int64, or NIL if unknown or any intermediate +/-/*/1+/1- result could exceed
-   int64. Used to gate the raw unboxed arithmetic path."
-  (%int-type-memoized :range expr #'%expr-int-range))
-
-(defun %expr-int-range (expr)
-  "Provable inclusive integer range (lo . hi) for EXPR computed entirely within
-   int64, or NIL if unknown or any intermediate +/-/*/1+/1- result could exceed
-   int64. Used to gate the raw unboxed arithmetic path."
-  (let ((expr (fold-nary-arith expr))
-        (*fixnum-wrap-licensed* nil))
-  (cond
-    ((integerp expr) (cons expr expr))
-    ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
-     (let ((ra (expr-int-range (cadr expr)))
-           (rb (expr-int-range (caddr expr))))
-       (and ra rb
-            (let ((r (range-arith (car expr) ra rb)))
-              (and (range-fits-int64-p r) r)))))
-    ((and (consp expr) (= (length expr) 2) (member (car expr) '(1+ 1-)))
-     (let ((ra (expr-int-range (cadr expr))))
-       (and ra
-            (let ((r (range-arith (if (eq (car expr) '1+) '+ '-) ra '(1 . 1))))
-              (and (range-fits-int64-p r) r)))))
-    ;; (if c a b): the value is one arm or the other, so its range is the
-    ;; union of theirs. Both arms are needed: a two-armed IF answers NIL when
-    ;; the test fails. FIXNUM-TYPED-P and COMPILE-AS-LONG already take this
-    ;; shape (raw int64 on each path); without the union here every consumer
-    ;; that asks for a proof -- 1+ / 1-, the binop fast path, an Int64 slot's
-    ;; init -- saw no range and compiled the IF boxed, arms included.
-    ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4))
-     (let ((ra (expr-int-range (caddr expr))))
-       (and ra
-            (let ((rb (expr-int-range (cadddr expr))))
-              (and rb
-                   (cons (min (car ra) (car rb)) (max (cdr ra) (cdr rb))))))))
-    ;; (ash X n), constant n: ASH is monotonic in X, so the range is the shifted
-    ;; bounds. A left shift qualifies only when those fit int64, which is what
-    ;; makes FIXNUM-TYPED-P accept it as exact.
-    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'ash)
-          (integerp (caddr expr)) (<= -63 (caddr expr) 63)
-          (not (local-function-entry 'ash)))
-     (let ((ra (expr-int-range (cadr expr)))
-           (n (caddr expr)))
-       (and ra (fixnum-exact-p (cadr expr))
-            (let ((r (cons (ash (car ra) n) (ash (cdr ra) n))))
-              (and (range-fits-int64-p r) r)))))
-    ;; (floor X d) / (truncate X d), constant nonzero d: the quotient is
-    ;; monotonic in X (non-decreasing for a positive d, non-increasing for a
-    ;; negative one), so its range is the quotients of X's bounds. Only the
-    ;; first value is described; a caller that wants both values does not ask
-    ;; for a range. (floor (length v) 8) as a loop count is the usual shape.
-    ((%const-divisor-quotient-p expr)
-     (let ((ra (expr-int-range (cadr expr)))
-           (d (caddr expr)))
-       (and ra
-            ;; A divisor of -1 is negation: FLOOR of the most negative int64
-            ;; by -1 is not computed here, so this does not depend on the host
-            ;; getting that one quotient right.
-            (let* ((fn (if (eq (car expr) 'floor) #'floor #'truncate))
-                   (q1 (if (eql d -1) (- (car ra)) (funcall fn (car ra) d)))
-                   (q2 (if (eql d -1) (- (cdr ra)) (funcall fn (cdr ra) d)))
-                   (r (cons (min q1 q2) (max q1 q2))))
-              (and (range-fits-int64-p r) r)))))
-    (t (fixnum-leaf-range expr)))))
-
-(defun %const-divisor-quotient-p (expr)
-  "True when EXPR is (FLOOR X D) or (TRUNCATE X D) with D a nonzero integer
-   constant and X an exact fixnum expression (FIXNUM-EXACT-P): the quotient of
-   the true X, not of a wrapped one."
-  (and (consp expr) (= (length expr) 3)
-       (member (car expr) '(floor truncate))
-       (not (local-function-entry (car expr)))
-       (integerp (caddr expr))
-       (not (zerop (caddr expr)))
-       (<= +int64-min+ (caddr expr) +int64-max+)
-       (fixnum-exact-p (cadr expr))))
-
-(defun fixnum-binop-native-p (op args)
-  "True when (OP A B) may be computed by COMPILE-FIXNUM-BINOP -- both operands
-   pushed as raw int64 and the operation done by Runtime.{Add,Subtract,Multiply}Fixnum,
-   which promotes to a bignum on int64 overflow and boxes the result.
-
-   Two ways to qualify. The first is the value-range proof, which covers nested
-   arithmetic: every intermediate is shown to fit int64, so COMPILE-AS-LONG may
-   compute the operands raw.
-
-   The second covers the shape the proof can never accept: operands that are
-   already raw int64. A FIXNUM-declared parameter of a natively-entered function
-   lives in an Int64 slot, so its range is the whole of int64 and (- N 1) is not
-   provably in range -- yet N needs no computing at all, and the subtraction
-   itself is what the promoting helper handles. Without this clause the operand
-   was boxed back into a Fixnum only for the generic path to take it apart again,
-   which is why declaring an FTYPE made a function slower than not declaring it.
-   Only leaves qualify (a literal, an Int64 slot, a slot with a proven range):
-   an arithmetic operand would reintroduce exactly the intermediate the range
-   proof exists to check."
-  (and (fixnum-typed-p (first args))
-       (fixnum-typed-p (second args))
-       (or (fixnum-arith-unboxed-safe-p (cons op args))
-           (every (lambda (a)
-                    (or (and (integerp a) (<= +int64-min+ a +int64-max+))
-                        (and (symbolp a)
-                             (boundp '*cstate*)
-                             (or (native-slot-p a (cstate-long-locals))
-                                 (small-int-local-range a)))))
-                  args))))
-
-(defun fixnum-arith-unboxed-safe-p (expr)
-  "True when the BOXED fixnum fast path may compute EXPR with raw int64 ops and box
-   the result. Safe only when a static value-range proof shows every intermediate
-   +/-/*/1+/1- result fits int64; otherwise the caller must use the generic
-   promoting path (Runtime.Add/Subtract/Multiply) so overflow yields a bignum.
-   (The unsafe raw long path inside native bodies is gated separately by
-   compile-as-long / fixnum-typed-p and is NOT routed through here.)"
-  (and (expr-int-range expr) t))
-
-(defun string-char-code-ref (expr)
-  "(STRING . INDEX) when EXPR is (char-code (schar S I)) or (char-code (char S I)),
-   NIL otherwise. That composition is how a string scan is written, and it has a
-   typed entry (Runtime.CharCodeAtL) that produces the code directly -- reading
-   the character first means a boxed index going in and a character object coming
-   out, per iteration. A local flet/labels shadowing either name means the form
-   is not this composition at all."
-  (and (consp expr) (eq (car expr) 'char-code) (= (length expr) 2)
-       (not (local-function-entry 'char-code))
-       (let ((inner (cadr expr)))
-         (and (consp inner) (member (car inner) '(schar char))
-              (= (length inner) 3)
-              (not (local-function-entry (car inner)))
-              (cons (cadr inner) (caddr inner))))))
-
-;;; ------------------------------------------------------------
-;;; A word read from adjacent octets.
-;;;
-;;; (dpb (aref v (1+ i)) (byte 8 8) (aref v i)) reads a 16-bit little-endian
-;;; word, and a library writing portable code builds its 32- and 64-bit words
-;;; from that one through INLINE functions: ironclad's UB32REF/LE is two
-;;; UB16REF/LE deposited into one word, UB64REF/LE two UB32REF/LE. Substituted,
-;;; a 64-bit word is 8 octet loads, each with its own range check, and the
-;;; shifts and ORs that put them together; the JIT does not merge adjacent
-;;; loads. A call to an INLINE function whose body is such a word (of 2, 4 or 8
-;;; octets, little- or big-endian, at a constant distance from its index
-;;; parameter) is compiled instead as one range check and one wide load
-;;; (Runtime.ReadU32LE and the like). The 64-bit word is an operand of the
-;;; (unsigned-byte 64) lane as its bits; the narrower ones are fixnums.
-;;; ------------------------------------------------------------
-
-(defvar *octet-word-templates* (make-hash-table :test #'equal :synchronized t)
-  "Inline function name -> (DEF . SUMMARY): what %OCTET-WORD-TEMPLATE found
-   for the recorded definition DEF (the one in *INLINE-DEFS*). A redefinition
-   records a new DEF, which is analysed again.")
-
-(defun %ow-word (bytes)
-  (list :word bytes (if bytes (+ 8 (reduce #'max (mapcar #'fourth bytes))) 0)))
-
-(defun %ow-shift (word n)
-  (%ow-word (mapcar (lambda (b) (list (first b) (second b) (third b) (+ (fourth b) n)))
-                    (second word))))
-
-(defun %ow-index (a)
-  "A (:IDX PARAM OFFSET) for the abstract value A used as an index, or NIL."
-  (case (car a)
-    (:param (list :idx (second a) 0))
-    (:idx a)
-    (t nil)))
-
-(defun %ow-eval (form env depth)
-  "The abstract value of FORM, part of an inline function's body, with ENV
-   giving its parameters' abstract values: (:CONST N), (:PARAM P) for the
-   argument in position P itself, (:IDX P C) for that argument plus C, or
-   (:WORD BYTES WIDTH), the sum of octets (VEC-PARAM IDX-PARAM C SHIFT) each
-   read from element IDX + C of vector VEC and shifted left by SHIFT. NIL when
-   FORM is anything else."
-  (cond
-    ((integerp form) (list :const form))
-    ((and (symbolp form) form (not (eq form t)))
-     (cdr (assoc form env)))
-    ((or (not (consp form)) (not (symbolp (car form))) (not (listp (cdr form))))
-     nil)
-    (t
-     (let ((op (car form)) (args (cdr form)))
-       (flet ((ev (x) (%ow-eval x env depth)))
-         (case op
-           ((+)
-            (case (length args)
-              (1 (ev (first args)))
-              (2 (let ((a (ev (first args))) (b (ev (second args))))
-                   (cond ((and (eq (car a) :const) (eq (car b) :const))
-                          (list :const (+ (second a) (second b))))
-                         ((and (eq (car b) :const) (%ow-index a))
-                          (let ((i (%ow-index a)))
-                            (list :idx (second i) (+ (third i) (second b)))))
-                         ((and (eq (car a) :const) (%ow-index b))
-                          (let ((i (%ow-index b)))
-                            (list :idx (second i) (+ (third i) (second a)))))
-                         (t nil))))
-              (t nil)))
-           ((1+ 1-)
-            (and (= (length args) 1)
-                 (let ((i (%ow-index (ev (first args)))))
-                   (and i (list :idx (second i)
-                                (+ (third i) (if (eq op '1+) 1 -1)))))))
-           ((-)
-            (and (= (length args) 2)
-                 (let ((i (%ow-index (ev (first args))))
-                       (c (ev (second args))))
-                   (and i (eq (car c) :const)
-                        (list :idx (second i) (- (third i) (second c)))))))
-           ((aref)
-            (and (= (length args) 2)
-                 (let ((v (ev (first args)))
-                       (i (%ow-index (ev (second args)))))
-                   (and (eq (car v) :param) i
-                        (%ow-word (list (list (second v) (second i) (third i) 0)))))))
-           ((dpb)
-            ;; (dpb A (byte S P) B) is B with A in its bits P..P+S-1: B's own
-            ;; bits there must be zero, and A must fit in S bits.
-            (and (= (length args) 3)
-                 (let ((bs (second args)))
-                   (and (consp bs) (eq (car bs) 'byte) (= (length bs) 3)
-                        (integerp (second bs)) (integerp (third bs))
-                        (<= 0 (second bs)) (<= 0 (third bs))
-                        (let ((a (ev (first args))) (b (ev (third args))))
-                          (and (eq (car a) :word) (<= (third a) (second bs))
-                               (or (and (eq (car b) :const) (eql (second b) 0))
-                                   (and (eq (car b) :word) (<= (third b) (third bs))))
-                               (%ow-word (append (and (eq (car b) :word) (second b))
-                                                 (second (%ow-shift a (third bs)))))))))))
-           ((logior)
-            (and args
-                 (let ((bytes '()))
-                   (dolist (x args (%ow-word bytes))
-                     (let ((a (ev x)))
-                       (unless (eq (car a) :word) (return nil))
-                       (setf bytes (append bytes (second a))))))))
-           ((ash)
-            (and (= (length args) 2) (integerp (second args)) (<= 0 (second args) 64)
-                 (let ((a (ev (first args))))
-                   (and (eq (car a) :word) (%ow-shift a (second args))))))
-           ((block)
-            (and (consp args) (symbolp (first args))
-                 (consp (cdr args)) (null (cddr args))
-                 (not (%block-returns-to-p (first args) (cdr args)))
-                 (ev (second args))))
-           ((progn)
-            (and (= (length args) 1) (ev (first args))))
-           (t
-            ;; A call to another INLINE function: its body, with its parameters
-            ;; standing for the abstract values of the arguments.
-            (let ((def (and (< depth 8) (gethash op *inline-defs*))))
-              (and def
-                   (= (length (car def)) (length args))
-                   (every (lambda (p) (and (symbolp p) p
-                                           (not (member p lambda-list-keywords))))
-                          (car def))
-                   (let ((body (%ow-body-form (cdr def))))
-                     (and body
-                          (let ((inner (loop for p in (car def)
-                                             for a in args
-                                             for v = (ev a)
-                                             unless v do (return :fail)
-                                             collect (cons p v))))
-                            (and (listp inner)
-                                 (%ow-eval body inner (1+ depth)))))))))))))))
-
-(defun %ow-body-form (body)
-  "The single form of a recorded inline BODY after its docstring and
-   declarations, or NIL."
-  (let ((rest body))
-    (when (and (stringp (car rest)) (cdr rest))
-      (pop rest))
-    (loop while (and (consp rest) (consp (car rest)) (eq (caar rest) 'declare))
-          do (pop rest))
-    (and (consp rest) (null (cdr rest)) (car rest))))
-
-(defun %octet-word-analyze (def)
-  "For DEF, (PARAMS . BODY) of an INLINE function of two parameters, whose
-   value is a word of 2, 4 or 8 octets of its first argument starting at its
-   second argument plus a constant: (START WIDTH BIG-ENDIAN-P). Else NIL."
-  (let ((params (car def)))
-    (and (= (length params) 2)
-         (every (lambda (p) (and (symbolp p) p (not (member p lambda-list-keywords))))
-                params)
-         (not (eq (first params) (second params)))
-         (let* ((body (%ow-body-form (cdr def)))
-                (w (and body
-                        (%ow-eval body (list (cons (first params) (list :param 0))
-                                             (cons (second params) (list :param 1)))
-                                  0))))
-           (and (eq (car w) :word)
-                (let* ((bytes (second w))
-                       (k (length bytes)))
-                  (and (member k '(2 4 8))
-                       (every (lambda (b) (and (eql (first b) 0) (eql (second b) 1)))
-                              bytes)
-                       (let* ((start (reduce #'min (mapcar #'third bytes)))
-                              (offs (sort (mapcar (lambda (b) (- (third b) start)) bytes) #'<)))
-                         (and (equal offs (loop for j below k collect j))
-                              (cond ((every (lambda (b) (= (fourth b) (* 8 (- (third b) start))))
-                                            bytes)
-                                     (list start k nil))
-                                    ((every (lambda (b) (= (fourth b)
-                                                           (* 8 (- (+ start k -1) (third b)))))
-                                            bytes)
-                                     (list start k t))
-                                    (t nil)))))))))))
-
-(defun %octet-word-template (name)
-  (let ((def (gethash name *inline-defs*)))
-    (and def
-         (let ((hit (gethash name *octet-word-templates*)))
-           (if (and hit (eq (car hit) def))
-               (cdr hit)
-               (let ((summary (%octet-word-analyze def)))
-                 (setf (gethash name *octet-word-templates*) (cons def summary))
-                 summary))))))
-
-(defun octet-word-ref-info (expr)
-  "(VECTOR INDEX START WIDTH BIG-ENDIAN-P) when EXPR is a call to an INLINE
-   function that reads a word of WIDTH octets of VECTOR at INDEX + START (see
-   %OCTET-WORD-ANALYZE) and would be substituted here; else NIL."
-  (and (consp expr)
-       (let ((op (car expr)))
-         (and (symbolp op) op
-              (not *cross-compiling*)
-              (consp (cdr expr)) (consp (cddr expr)) (null (cdddr expr))
-              (gethash op *inline-defs*)
-              (let ((tmpl (%octet-word-template op)))
-                (and tmpl
-                     (not (special-operator-name-p op))
-                     (not (gethash op *compile-form-handlers*))
-                     (not (local-function-entry op))
-                     (not (macrolet-shadowed-p op))
-                     (not (find-macro-expander op))
-                     (not (maybe-expand-compiler-macro op expr))
-                     (maybe-expand-inline op expr)
-                     (list* (cadr expr) (caddr expr) tmpl)))))))
-
-(defun compile-octet-word-bits (info)
-  "Instructions leaving the word INFO (from OCTET-WORD-REF-INFO) describes as an
-   int64: the value for 2 and 4 octets, the bits of the (unsigned-byte 64) for
-   8. The vector, then the index, are evaluated once, in that order.
-
-   Through VECTOR's hoisted octet buffer when it has one: one wide read
-   (Runtime.ReadU32LE ...), which checks the whole range once. Otherwise, and in
-   the arm for a buffer the fetch declined, Runtime.OctetWordRef, which reads
-   the vector it is given (above safety 0 the *Checked entry signals for a
-   non-simple one, as the declaration of the octet reads does)."
-  (destructuring-bind (vec idx start width be) info
-    (let* ((*in-tail-position* nil) (*in-mv-context* nil)
-           (entry (and (symbolp vec) vec
-                       (let ((e (array-backing-entry (list 'aref vec 0))))
-                         (and e (eql (fourth e) 1) e))))
-           (ti (gen-local "OWI"))
-           (idx-code `((:declare-local ,ti "Int64")
-                       ,@(compile-index-to-long idx)
-                       ,@(unless (zerop start) `((:ldc-i8 ,start) (:add)))
-                       (:stloc ,ti)))
-           (generic (lambda (vec-code)
-                      `(,@vec-code
-                        (:ldloc ,ti)
-                        (:ldc-i4 ,width)
-                        (:ldc-i4 ,(if be 1 0))
-                        (:call ,(if (compiling-at-safety-0-p)
-                                    "Runtime.OctetWordRef"
-                                    "Runtime.OctetWordRefChecked"))))))
-      (if entry
-          (let* ((back (third entry))
-                 (fast `((:ldloc ,back)
-                         (:ldloc ,ti)
-                         (:call ,(format nil "Runtime.ReadU~D~A" (* 8 width) (if be "BE" "LE")))))
-                 (fall (funcall generic (compile-expr vec)))
-                 (lfall (gen-label "OWFALL"))
-                 (ldone (gen-label "OWDONE")))
-            `(,@idx-code
-              ,@(ecase (%backing-arm-for entry)
-                  (:fast fast)
-                  (:helper fall)
-                  (:both `((:ldloc ,back)
-                           (:brfalse ,lfall)
-                           ,@fast
-                           (:br ,ldone)
-                           (:label ,lfall)
-                           ,@fall
-                           (:label ,ldone))))))
-          (let ((tv (gen-local "OWV")))
-            `((:declare-local ,tv "LispObject")
-              ,@(compile-expr vec)
-              (:stloc ,tv)
-              ,@idx-code
-              ,@(funcall generic `((:ldloc ,tv)))))))))
-
-(defun compile-octet-word-boxed (info)
-  "The word INFO describes as a Lisp integer."
-  `(,@(compile-octet-word-bits info)
-    (:call ,(if (= (fourth info) 8) "Runtime.BoxU64" "Fixnum.Make"))))
-
-;;; The store of such a word, through the INLINE (SETF F) function of the same
-;;; shape: (setf (aref v o) (logand value #xff) (aref v (1+ o)) (ldb (byte 8 8) value))
-;;; and the wider ones as two (SETF F) calls of the narrower one with the halves
-;;; of the value. Compiled as one range check and one wide store.
-
-(defvar *octet-word-store-templates* (make-hash-table :test #'equal :synchronized t)
-  "(SETF F) -> (DEF . SUMMARY), as *OCTET-WORD-TEMPLATES* for the readers.")
-
-(defun %ow-value-eval (form env)
-  "The abstract value of FORM as part of a value being stored: (:VBITS LO W),
-   bits LO .. LO+W-1 of the value parameter (W NIL: all from LO up). NIL when
-   FORM is anything else."
-  (cond
-    ((and (symbolp form) form (not (eq form t)))
-     (let ((a (cdr (assoc form env))))
-       (and (eq (car a) :vbits) a)))
-    ((not (consp form)) nil)
-    ((and (eq (car form) 'logand) (= (length form) 3))
-     (let* ((m (if (integerp (second form)) (second form) (third form)))
-            (x (if (integerp (second form)) (third form) (second form)))
-            (a (and (integerp m) (plusp m) (= (logcount (1+ m)) 1)
-                    (%ow-value-eval x env))))
-       (and a
-            (let ((n (integer-length m)))
-              (list :vbits (second a) (if (third a) (min (third a) n) n))))))
-    ((and (eq (car form) 'ldb) (= (length form) 3))
-     (let ((bs (second form)))
-       (and (consp bs) (eq (car bs) 'byte) (= (length bs) 3)
-            (integerp (second bs)) (integerp (third bs))
-            (<= 0 (second bs)) (<= 0 (third bs))
-            (let ((a (%ow-value-eval (third form) env)))
-              (and a
-                   (let ((s (second bs)) (q (third bs)))
-                     (list :vbits (+ (second a) q)
-                           (if (third a) (max 0 (min s (- (third a) q))) s))))))))
-    (t nil)))
-
-(defun %ow-declared-type (body name)
-  "The type BODY's leading declarations give NAME, or NIL."
-  (let ((rest body))
-    (when (and (stringp (car rest)) (cdr rest)) (pop rest))
-    (loop while (and (consp rest) (consp (car rest)) (eq (caar rest) 'declare))
-          do (dolist (d (cdr (pop rest)))
-               (when (consp d)
-                 (cond ((and (eq (car d) 'type) (consp (cdr d)) (member name (cddr d)))
-                        (return-from %ow-declared-type (cadr d)))
-                       ((and (consp (car d)) (member (caar d) '(unsigned-byte signed-byte integer))
-                             (member name (cdr d)))
-                        (return-from %ow-declared-type (car d)))))))
-    nil))
-
-(defun %ow-body-forms (body)
-  (let ((rest body))
-    (when (and (stringp (car rest)) (cdr rest)) (pop rest))
-    (loop while (and (consp rest) (consp (car rest)) (eq (caar rest) 'declare))
-          do (pop rest))
-    rest))
-
-(defun %ow-stores (def env depth)
-  "The octets the (SETF F) definition DEF stores, as (VEC IDX C LO) entries:
-   bits LO .. LO+7 of the value into element IDX + C of VEC, with ENV giving
-   its parameters' abstract values. :FAIL when its body is anything other than
-   such stores followed by its value parameter."
-  (let* ((params (car def))
-         (forms (%ow-body-forms (cdr def)))
-         (stores '()))
-    (unless (and (= (length params) 3)
-                 (every (lambda (p) (and (symbolp p) p (not (member p lambda-list-keywords))))
-                        params)
-                 forms
-                 (eq (car (last forms)) (first params)))
-      (return-from %ow-stores :fail))
-    (dolist (f (butlast forms) (nreverse stores))
-      (unless (and (consp f) (eq (car f) 'setf) (evenp (length (cdr f))))
-        (return-from %ow-stores :fail))
-      (loop for (place val) on (cdr f) by #'cddr
-            do (let ((v (%ow-value-eval val env)))
-                 (unless (and v (third v) (consp place))
-                   (return-from %ow-stores :fail))
-                 (cond
-                   ((and (eq (car place) 'aref) (= (length place) 3))
-                    (let ((vec (%ow-eval (second place) env depth))
-                          (i (%ow-index (%ow-eval (third place) env depth))))
-                      (unless (and (eq (car vec) :param) i (= (third v) 8))
-                        (return-from %ow-stores :fail))
-                      (push (list (second vec) (second i) (third i) (second v)) stores)))
-                   ((and (symbolp (car place)) (= (length place) 3) (< depth 8))
-                    (let* ((name (list 'setf (car place)))
-                           (idef (gethash name *inline-defs*)))
-                      (unless idef (return-from %ow-stores :fail))
-                      (let* ((ip (car idef))
-                             (inner (and (= (length ip) 3)
-                                         (%ow-stores
-                                          idef
-                                          (list (cons (first ip) (list :vbits (second v) (third v)))
-                                                (cons (second ip) (%ow-eval (second place) env depth))
-                                                (cons (third ip) (%ow-eval (third place) env depth)))
-                                          (1+ depth)))))
-                        ;; The inner value is exactly as wide as what it stores:
-                        ;; its own declaration then holds.
-                        (unless (and (listp inner) inner
-                                     (= (third v) (* 8 (length inner))))
-                          (return-from %ow-stores :fail))
-                        (setf stores (append (reverse inner) stores)))))
-                   (t (return-from %ow-stores :fail))))))))
-
-(defun %octet-word-store-analyze (def)
-  "For DEF, (PARAMS . BODY) of an INLINE (SETF F) of (VALUE VECTOR INDEX) that
-   stores VALUE, declared (UNSIGNED-BYTE 8K), as a word of K = 2, 4 or 8 octets
-   of VECTOR at INDEX plus a constant and returns VALUE: (START K BIG-ENDIAN-P).
-   Else NIL."
-  (let ((params (car def)))
-    (and (= (length params) 3)
-         (= (length (remove-duplicates params)) 3)
-         (let ((stores (%ow-stores def
-                                   (list (cons (first params) (list :vbits 0 nil))
-                                         (cons (second params) (list :param 1))
-                                         (cons (third params) (list :param 2)))
-                                   0)))
-           (and (listp stores)
-                (let ((k (length stores)))
-                  (and (member k '(2 4 8))
-                       (equal (%ow-declared-type (cdr def) (first params))
-                              (list 'unsigned-byte (* 8 k)))
-                       (every (lambda (s) (and (eql (first s) 1) (eql (second s) 2))) stores)
-                       (let* ((start (reduce #'min (mapcar #'third stores)))
-                              (offs (sort (mapcar (lambda (s) (- (third s) start)) stores) #'<)))
-                         (and (equal offs (loop for j below k collect j))
-                              (cond ((every (lambda (s) (= (fourth s) (* 8 (- (third s) start))))
-                                            stores)
-                                     (list start k nil))
-                                    ((every (lambda (s) (= (fourth s)
-                                                           (* 8 (- (+ start k -1) (third s)))))
-                                            stores)
-                                     (list start k t))
-                                    (t nil)))))))))))
-
-(defun %octet-word-store-template (name)
-  (let ((def (gethash name *inline-defs*)))
-    (and def
-         (let ((hit (gethash name *octet-word-store-templates*)))
-           (if (and hit (eq (car hit) def))
-               (cdr hit)
-               (let ((summary (%octet-word-store-analyze def)))
-                 (setf (gethash name *octet-word-store-templates*) (cons def summary))
-                 summary))))))
-
-(defun octet-word-store-info (form)
-  "(VALUE VECTOR INDEX START WIDTH BIG-ENDIAN-P) when FORM is
-   (FUNCALL #'(SETF F) VALUE VECTOR INDEX), what SETF of (F VECTOR INDEX)
-   expands to, for an INLINE (SETF F) that stores a word of WIDTH octets (see
-   %OCTET-WORD-STORE-ANALYZE) and would be substituted here; else NIL."
-  (and (consp form) (eq (car form) 'funcall)
-       (not *cross-compiling*)
-       (not (local-function-entry 'funcall))
-       (= (length form) 5)
-       (let ((fe (second form)))
-         (and (consp fe) (eq (car fe) 'function)
-              (consp (cdr fe)) (null (cddr fe))
-              (%setf-function-name-p (cadr fe))
-              (let* ((name (cadr fe))
-                     (tmpl (and (gethash name *inline-defs*)
-                                (%octet-word-store-template name))))
-                (and tmpl
-                     (maybe-expand-inline name (cons name (cddr form)))
-                     (list* (third form) (fourth form) (fifth form) tmpl)))))))
-
-(defun compile-octet-word-store (info want-value)
-  "Instructions storing the word INFO (from OCTET-WORD-STORE-INFO) describes,
-   leaving the value of the SETF (the new value) when WANT-VALUE, else nothing.
-   The value, the vector and the index are evaluated once, in that order.
-
-   The value is taken as the octet stores take it. A 64-bit one goes through
-   COMPILE-AS-U64-BITS, which checks it is an (UNSIGNED-BYTE 64), as the
-   binding of the (SETF F) parameter so declared does. A narrower one is not
-   checked against its declaration (no integer binding is): the octet stores
-   take the low bits of any integer, LOGAND and LDB being two's complement,
-   and the new value returned is the object given."
-  (destructuring-bind (val vec idx start width be) info
-    (let* ((*in-tail-position* nil) (*in-mv-context* nil)
-           (tv (gen-local "OWS"))
-           (ti (gen-local "OWI"))
-           (to (and want-value (< width 8) (not (fixnum-exact-p val))
-                    (gen-local "OWSO")))
-           (val-code
-             `((:declare-local ,tv "Int64")
-               ,@(cond ((= width 8) (compile-as-u64-bits val))
-                       ((fixnum-exact-p val) (compile-as-long val))
-                       (to `((:declare-local ,to "LispObject")
-                             ,@(compile-expr val)
-                             (:dup)
-                             (:stloc ,to)
-                             (:call "Runtime.Low64")))
-                       (t `(,@(compile-expr val)
-                            (:call "Runtime.Low64"))))
-               (:stloc ,tv)))
-           (entry (and (symbolp vec) vec
-                       (let ((e (array-backing-entry (list 'aref vec 0))))
-                         (and e (eql (fourth e) 1) e))))
-           (idx-code `((:declare-local ,ti "Int64")
-                       ,@(compile-index-to-long idx)
-                       ,@(unless (zerop start) `((:ldc-i8 ,start) (:add)))
-                       (:stloc ,ti)))
-           (generic (lambda (vec-code)
-                      `(,@vec-code
-                        (:ldloc ,ti)
-                        (:ldloc ,tv)
-                        (:ldc-i4 ,width)
-                        (:ldc-i4 ,(if be 1 0))
-                        (:call ,(if (compiling-at-safety-0-p)
-                                    "Runtime.OctetWordSet"
-                                    "Runtime.OctetWordSetChecked")))))
-           (store
-             (if entry
-                 (let* ((back (third entry))
-                        (fast `((:ldloc ,back)
-                                (:ldloc ,ti)
-                                (:ldloc ,tv)
-                                (:call ,(format nil "Runtime.WriteU~D~A" (* 8 width)
-                                                (if be "BE" "LE")))))
-                        (fall (funcall generic (compile-expr vec)))
-                        (lfall (gen-label "OWSFALL"))
-                        (ldone (gen-label "OWSDONE")))
-                   `(,@val-code
-                     ,@idx-code
-                     ,@(ecase (%backing-arm-for entry)
-                         (:fast fast)
-                         (:helper fall)
-                         (:both `((:ldloc ,back)
-                                  (:brfalse ,lfall)
-                                  ,@fast
-                                  (:br ,ldone)
-                                  (:label ,lfall)
-                                  ,@fall
-                                  (:label ,ldone))))))
-                 (let ((tvec (gen-local "OWSV")))
-                   `(,@val-code
-                     (:declare-local ,tvec "LispObject")
-                     ,@(compile-expr vec)
-                     (:stloc ,tvec)
-                     ,@idx-code
-                     ,@(funcall generic `((:ldloc ,tvec))))))))
-      (cond ((not want-value) store)
-            (to `(,@store (:ldloc ,to)))
-            (t `(,@store
-                 (:ldloc ,tv)
-                 (:call ,(if (= width 8) "Runtime.BoxU64" "Fixnum.Make"))))))))
-
-(defun fixnum-exact-p (expr)
-  "True when COMPILE-AS-LONG of EXPR yields EXPR's exact value, not just its low
-   64 bits: FIXNUM-TYPED-P with *FIXNUM-WRAP-LICENSED* NIL. Callers that may
-   themselves run under the license (the fixnum-typed-p clauses for MOD, REM,
-   ASH) use this for the operands whose high bits they read."
-  (let ((*fixnum-wrap-licensed* nil))
-    (fixnum-typed-p expr)))
-
-(defun fixnum-wrap-typed-p (expr)
-  "FIXNUM-TYPED-P under *FIXNUM-WRAP-LICENSED*: COMPILE-AS-LONG of EXPR is
-   EXPR's value modulo 2^64. Only for a result that lands in a place declared
-   FIXNUM; see *FIXNUM-WRAP-LICENSED*."
-  (let ((*fixnum-wrap-licensed* t))
-    (fixnum-typed-p expr)))
-
-(defun %logand-nonneg-operand (a b)
-  "For (LOGAND A B), the operand whose exact value is known non-negative, or
-   NIL. LOGAND with a non-negative int64 keeps only bits below 63, and those
-   are the same in the wrapped and the true value of the other operand, so the
-   other one needs only FIXNUM-TYPED-P under the license."
-  (flet ((nonneg (x) (let ((r (expr-int-range x)))
-                       (and r (>= (car r) 0) (range-fits-int64-p r)
-                            (fixnum-exact-p x)))))
-    (cond ((nonneg b) b)
-          ((nonneg a) a)
-          (t nil))))
-
-(defun %ash-count-range-within (count lo hi)
-  "True when COUNT, an ASH shift count, is an exact integer expression whose
-   proven range lies inside [LO, HI]."
-  (let ((r (expr-int-range count)))
-    (and r (<= lo (car r)) (<= (cdr r) hi)
-         (fixnum-exact-p count))))
-
-(defun fixnum-typed-p (expr)
-  "Return T if EXPR is statically known to produce a Fixnum value; see
-   %FIXNUM-TYPED-P."
-  (%int-type-memoized :fixnum expr #'%fixnum-typed-p))
-
-(defun %fixnum-typed-p (expr)
-  "Return T if EXPR is statically known to produce a Fixnum value.
-   Recognizes: literal integers in fixnum range, (the fixnum E),
-   references to lexical locals declared fixnum (via *fixnum-locals*),
-   calls to functions declared (declaim (ftype (function (...) fixnum) NAME)),
-   and fixnum-typed arithmetic (+, -, *, 1+, 1-) whose operands are
-   themselves fixnum-typed and whose result a range proof keeps in int64.
-   The int64 COMPILE-AS-LONG leaves for such an EXPR is its exact value; under
-   *FIXNUM-WRAP-LICENSED* only its value modulo 2^64."
-  (setf expr (fold-typed-operand expr))
-  (cond
-    ((integerp expr) (<= +int64-min+ expr +int64-max+))
-    ;; Direct Int64 local in native function body: already long, no unbox needed
-    ((and (symbolp expr)
-          (boundp '*cstate*)
-          (native-slot-p expr (cstate-long-locals)))
-     t)
-    ;; Local var declared fixnum: must be a non-captured simple local
-    ((and (symbolp expr)
-          (boundp '*fixnum-locals*)
-          (member (var-name expr) *fixnum-locals* :test #'string=)
-          ;; Boxed (captured) vars need indirection: stick with generic path
-          (not (boxed-var-p expr))
-          (lookup-local expr))
-     t)
-    ;; Local with a proven bounded int64 range (signed-byte/unsigned-byte/bit
-    ;; declaration or let-init inference). Slot holds a boxed Fixnum.
-    ((small-int-local-range expr) t)
-    ;; aref on a proven numeric-backed array local: elements are integers
-    ;; within the storage range (stores are range-checked by the runtime).
-    ((numeric-array-aref-info expr) t)
-    ;; (char-code (schar s i)): a character code is a non-negative integer below
-    ;; CHAR-CODE-LIMIT, so it is a fixnum whatever the string holds.
-    ((string-char-code-ref expr) t)
-    ;; A word of 2 or 4 adjacent octets (OCTET-WORD-REF-INFO).
-    ;; A 64-bit one only where its low 64 bits will do: its bits are those.
-    ((let ((ow (octet-word-ref-info expr)))
-       (and ow (or (< (fourth ow) 8) *fixnum-wrap-licensed*)))
-     t)
-    ;; (if c a b) with both arms fixnum-typed. Needs the else arm: a two-armed
-    ;; IF yields NIL when the test fails, which is not a fixnum. Without this
-    ;; the whole branch falls to the boxed path, and since a recursive function
-    ;; is usually shaped (if base recur), that is where the boxing survives.
-    ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4)
-          (fixnum-typed-p (caddr expr))
-          (fixnum-typed-p (cadddr expr)))
-     t)
-    ((and (consp expr) (eq (car expr) 'the)
-          (let ((ty (cadr expr)))
-            (or (eq ty 'fixnum)
-                (and (consp ty) (eq (car ty) 'integer))
-                ;; (the (signed-byte N) E) etc.: only int64-fitting widths.
-                ;; A wide type like (signed-byte 100) can hold a bignum at
-                ;; runtime; bitwise/compare ops skip the overflow gate, so a
-                ;; bare unbox-fixnum there would corrupt the value.
-                (let ((r (declared-integer-range ty)))
-                  (and r (range-fits-int64-p r))))))
-     t)
-    ;; +, -, *: fixnum-typed operands are not enough. COMPILE-AS-LONG computes
-    ;; them with the raw int64 op, which wraps, so the result is exact only
-    ;; where a range proof says it fits -- or where the license says the low
-    ;; 64 bits are all the destination keeps.
-    ((and (consp expr) (= (length expr) 3)
-          (member (car expr) '(+ - *))
-          (fixnum-typed-p (cadr expr))
-          (fixnum-typed-p (caddr expr))
-          (or *fixnum-wrap-licensed* (expr-int-range expr)))
-     t)
-    ;; Three or more arguments: the same question about the left-associated form
-    ;; the call stands for. Without this an index like (- n i 1) is not fixnum-
-    ;; typed, which disqualifies the whole AREF from the native path.
-    ((and (consp expr) (member (car expr) '(+ - * logand logior logxor)) (> (length expr) 3))
-     (fixnum-typed-p (fold-nary-arith expr)))
-    ((and (consp expr) (= (length expr) 2)
-          (member (car expr) '(1+ 1-))
-          (fixnum-typed-p (cadr expr))
-          (or *fixnum-wrap-licensed* (expr-int-range expr)))
-     t)
-    ;; %dotimes-1+: dotimes-emitted increment whose result is asserted to fit
-    ;; int64 (counter < limit at the increment site), fixnum-typed like 1+.
-    ((and (consp expr) (= (length expr) 2)
-          (eq (car expr) '%dotimes-1+)
-          (fixnum-typed-p (cadr expr)))
-     t)
-    ;; %dotimes-limit / %loop-limit-floor: a loop limit clamped into int64.
-    ((and (consp expr) (= (length expr) 2)
-          (member (car expr) '(%dotimes-limit %loop-limit-floor)))
-     t)
-    ;; logand/logior/logxor with fixnum operands -> fixnum result. Each bit of
-    ;; the result depends on the same bit of the operands only, so exact
-    ;; operands give an exact result and wrapped ones a wrapped one.
-    ((and (consp expr) (= (length expr) 3)
-          (member (car expr) '(logand logior logxor))
-          (fixnum-typed-p (cadr expr))
-          (fixnum-typed-p (caddr expr)))
-     t)
-    ;; (logand X M) with M exact and non-negative is exact even when X is
-    ;; wrapped: only bits below 63 survive, and wrapping keeps those.
-    ;; (logand (+ a b) #xFFFFFFFF) is how 32-bit modular arithmetic is written.
-    ((and (consp expr) (= (length expr) 3)
-          (eq (car expr) 'logand)
-          (not *fixnum-wrap-licensed*)
-          (let ((m (%logand-nonneg-operand (cadr expr) (caddr expr))))
-            (and m
-                 (fixnum-wrap-typed-p (if (eq m (cadr expr)) (caddr expr) (cadr expr))))))
-     t)
-    ;; mod/rem of fixnums -> fixnum result (|r| < |divisor|, so no promotion).
-    ;; The operands must be exact: the remainder of a wrapped value is not the
-    ;; remainder of the true one.
-    ((and (consp expr) (= (length expr) 3)
-          (member (car expr) '(mod rem))
-          (fixnum-exact-p (cadr expr))
-          (fixnum-exact-p (caddr expr)))
-     t)
-    ;; (floor X d) / (truncate X d) with a constant divisor whose quotient the
-    ;; range proof keeps in int64: the first value, computed raw (COMPILE-AS-
-    ;; LONG). The FLOOR handler still builds both values where both are wanted.
-    ((and (%const-divisor-quotient-p expr)
-          (expr-int-range expr))
-     t)
-    ;; lognot with fixnum operand -> fixnum result
-    ((and (consp expr) (= (length expr) 2)
-          (eq (car expr) 'lognot)
-          (fixnum-typed-p (cadr expr)))
-     t)
-    ;; ash with fixnum value and constant shift -> fixnum result.
-    ;; A non-negative shift can overflow int64 (and a raw CIL shl masks the count
-    ;; mod 64), so it is only safe to treat as a raw long when both operands are
-    ;; constants and the folded result fits in int64. Negative shifts (right
-    ;; shift) always shrink and stay in range.
-    ;; The shifted value must be EXACT (FIXNUM-EXACT-P), not merely
-    ;; fixnum-typed: a right shift exposes the high bits, which a wrapped
-    ;; product or sum has lost.
-    ((and (consp expr) (= (length expr) 3)
-          (eq (car expr) 'ash)
-          (fixnum-exact-p (cadr expr))
-          (integerp (caddr expr))
-          (let ((n (caddr expr)))
-            (or (< n 0)
-                (and (integerp (cadr expr))
-                     (typep (ash (cadr expr) n) '(signed-byte 64))))))
-     t)
-    ;; A left shift the range proof keeps in int64 is exact: SHL of a value
-    ;; below 2^(63-n) in magnitude loses no bit. (ash sum 7) of a 32-bit sum.
-    ((and (consp expr) (= (length expr) 3)
-          (eq (car expr) 'ash)
-          (integerp (caddr expr))
-          (<= 0 (caddr expr) 63)
-          (expr-int-range expr))
-     t)
-    ;; Under the license only the low 64 bits are wanted, and SHL by a count
-    ;; below 64 computes exactly those from the low 64 bits of the operand:
-    ;; (logand (ash x 7) #xFFFFFFFF) is how a 32-bit rotate is written. The count
-    ;; may be a variable here, as long as its range is inside [0, 63] (CIL SHL
-    ;; takes the count mod 64).
-    ((and (consp expr) (= (length expr) 3)
-          (eq (car expr) 'ash)
-          *fixnum-wrap-licensed*
-          (fixnum-typed-p (cadr expr))
-          (%ash-count-range-within (caddr expr) 0 63))
-     t)
-    ;; A right shift by a variable count whose range is inside [-63, 0]: SHR by
-    ;; the negated count, exact for an exact operand (see the constant case).
-    ((and (consp expr) (= (length expr) 3)
-          (eq (car expr) 'ash)
-          (not (integerp (caddr expr)))
-          (fixnum-exact-p (cadr expr))
-          (%ash-count-range-within (caddr expr) -63 0))
-     t)
-    ;; A structure slot declared to hold an integer that fits an int64. The
-    ;; declaration is the only evidence -- a slot has no value to inspect at
-    ;; compile time -- and it is now recorded and checked on every store, so it
-    ;; is evidence worth acting on.
-    ;;
-    ;; What this decides is the READ. The slot's storage is raw, so a read that
-    ;; is not known to be a fixnum goes through the generic path and boxes the
-    ;; value on the way out -- on EVERY read, where the old boxed storage boxed
-    ;; once and shared it. Raw storage without this clause is a pessimization,
-    ;; not an optimization.
-    ((and (consp expr) (= (length expr) 2) (symbolp (car expr))
-          (not (local-function-entry (car expr)))
-          (boundp '*struct-accessor-types*)
-          (let ((ty (gethash (car expr) *struct-accessor-types*)))
-            (and ty
-                 (let ((r (if (eq ty 'fixnum)
-                              (cons +int64-min+ +int64-max+)
-                              (integer-type-range ty))))
-                   (and r (range-fits-int64-p r))))))
-     t)
-    ;; (length x): a sequence length is a count of elements held in memory, so
-    ;; it is a fixnum for any argument LENGTH accepts -- CLHS bounds a vector's
-    ;; by ARRAY-TOTAL-SIZE-LIMIT, and a list's by what will fit. Here the bound
-    ;; is tighter and exact: Runtime.Length counts into a C# int and every
-    ;; return is Fixnum.Make of one, so the value cannot leave int32 range.
-    ;;
-    ;; What this buys is the loop bound. (let ((n (length arr))) (declare
-    ;; (fixnum n)) ...) only earns an Int64 slot when its init is fixnum-typed,
-    ;; so without this N sat in a boxed slot and every trip round the loop
-    ;; unboxed it again to compare against the counter.
-    ((and (consp expr) (= (length expr) 2)
-          (eq (car expr) 'length)
-          (not (local-function-entry 'length)))
-     t)
-    ;; A call to a function whose ftype promises an integer result that fits
-    ;; int64: FIXNUM, or a narrower integer type such as (UNSIGNED-BYTE 32).
-    ((call-int-return-range expr) t)
-    (t nil)))
-
-(defvar *long-simple-memo* nil
-  "EQ set of the forms %LONG-OPERAND-SIMPLE-P has accepted on their shape alone,
-   bound by the outermost COMPILE-LONG-BINOP / COMPILE-LONG-BINOP-SPILLED.
-   Compiling (+ 1 (+ 1 ...)) asks the question at every level about the whole
-   operand below it, so without the set N levels cost N^2 (most of the time
-   to compile 2,000 levels). A form containing a two-operand LOGAND / LOGIOR /
-   LOGXOR is not entered: its answer depends on the declarations in scope.")
-
-(defun %long-operand-simple-p (expr)
-  "True when EXPR compiles to a straight-line push with no branches, labels or
-   exception regions; the only shape that is safe to leave half-evaluated on the
-   CIL stack while the other operand is compiled.
-   One *INT-TYPE-MEMO* serves the whole walk: each two-operand LOGAND / LOGIOR /
-   LOGXOR in the tree asks FIXNUM-WRAP-TYPED-P about its operands, and as
-   separate queries those re-walked the operand trees (N^3 for a nest of N).
-   Nothing is compiled during the walk, so the answers stay valid throughout."
-  (cond ((atom expr) (and (%long-operand-simple-1 expr) t))
-        (*int-type-memo* (and (%long-operand-simple-1 expr) t))
-        (t (let ((*int-type-memo* (make-hash-table :test 'eq)))
-             (and (%long-operand-simple-1 expr) t)))))
-
-(defun %long-operand-simple-1 (expr)
-  "%LONG-OPERAND-SIMPLE-P, answering :SHAPE when the answer does not depend on
-   the declarations in scope (and so may be kept in *LONG-SIMPLE-MEMO*)."
-  (cond
-    ((or (integerp expr) (symbolp expr)) :shape)
-    ((not (consp expr)) nil)
-    ((and *long-simple-memo* (gethash expr *long-simple-memo*)) :shape)
-    ((not (member (car expr) '(the + - * 1+ 1- logand logior logxor lognot ash
-                               %dotimes-1+)))
-     nil)
-    (t
-     (let ((answer :shape))
-       ;; A bitwise op with an operand not known to be a fixnum branches
-       ;; (COMPILE-GUARDED-LONG-BITOP).
-       (when (and (member (car expr) '(logand logior logxor))
-                  (= (length expr) 3))
-         (unless (every #'fixnum-wrap-typed-p (cdr expr))
-           (return-from %long-operand-simple-1 nil))
-         (setf answer t))
-       (dolist (arg (cdr expr))
-         (let ((a (%long-operand-simple-1 arg)))
-           (cond ((null a) (return-from %long-operand-simple-1 nil))
-                 ((not (eq a :shape)) (setf answer t)))))
-       (when (and (eq answer :shape) *long-simple-memo*)
-         (setf (gethash expr *long-simple-memo*) t))
-       answer))))
-
-(defmacro with-long-simple-memo (&body body)
-  `(if *long-simple-memo*
-       (progn ,@body)
-       (let ((*long-simple-memo* (make-hash-table :test 'eq)))
-         ,@body)))
-
-(defun compile-long-binop-spilled (a b)
-  "Push both operands as int64, evaluating a non-straight-line operand into its
-   own Int64 temp first. Same reason as COMPILE-LONG-BINOP: an operand whose code
-   contains branches or a join label cannot run with the other operand pending on
-   the CIL stack."
-  (with-long-simple-memo
-  (if (and (%long-operand-simple-p a) (%long-operand-simple-p b))
-      `(,@(compile-as-long a)
-        ,@(compile-as-long b))
-      (let ((ta (gen-local "LSA")) (tb (gen-local "LSB")))
-        `((:declare-local ,ta "Int64")
-          (:declare-local ,tb "Int64")
-          ,@(compile-as-long a)
-          (:stloc ,ta)
-          ,@(compile-as-long b)
-          (:stloc ,tb)
-          (:ldloc ,ta)
-          (:ldloc ,tb))))))
-
-;; Operands of a bitwise op one of which is not known to be a fixnum, in a
-;; place that wants an int64 result (the result is asserted, not the operands).
-;; The unknown operands are computed boxed; when they are all fixnums the op runs
-;; on raw int64 values as for typed operands, otherwise the generic boxed op runs
-;; and its result is unboxed (a declaration that lied still fails there).
-;; An operand known to be a fixnum stays an int64 on both paths; one only known
-;; modulo 2^64 is computed boxed, since the slow path needs its exact value.
-;;; ------------------------------------------------------------
-;;; 64-bit modular lane: integer expressions whose value is known to lie in
-;;; [0, 2^64) and is made of operations that are exact modulo 2^64.
-;;;
-;;; An (unsigned-byte 64) at or above 2^63 is a bignum, so code written for
-;;; 64-bit words -- (ldb (byte 64 0) (+ a b)), (logand x #xFFFFFFFFFFFFFFFF),
-;;; a 64-bit rotate -- went through the generic bignum operations and
-;;; allocated at every step. Here such an expression is computed in an int64
-;;; holding the value's bits and boxed once at the end (Runtime.BoxU64).
-;;;
-;;; +, -, *, LOGAND, LOGIOR, LOGXOR, LOGNOT and a left shift are exact modulo
-;;; 2^64 on any integers, so an operand under them only needs its low 64 bits
-;;; (Runtime.Low64), whatever its declared type: a declaration that does not
-;;; hold changes nothing. A right shift reads the high bits, so its operand has
-;;; to be known to be in [0, 2^64): a mask, a proven range, or a value checked
-;;; at run time (Runtime.IsU64), with the expression computed on the generic
-;;; path from the same operand values when the check fails.
-;;; ------------------------------------------------------------
-
-(defparameter +u64-mask+ (1- (expt 2 64)))
-
-(defvar *u64-leaves* nil
-  "Operands of the expression being planned, in evaluation order: entries
-   (LOCAL KIND EXPR GUARD [CODE]), KIND :long (computed as an exact int64), :bits
-   (an element of an (unsigned-byte 64) array or local read as its bits, or an
-   inline call whose CODE leaves its bits) or :obj
-   (computed boxed). GUARD is true for an :obj operand that has to be checked
-   to lie in [0, 2^64).")
-
-(defun %u64-op-p (expr op)
-  (and (consp expr) (eq (car expr) op)
-       (not (local-function-entry op))
-       (not (macrolet-shadowed-p op))))
-
-(defvar *u64-subst* nil
-  "Parameters of the inline expansions being planned through, innermost first:
-   entries (NAME PLAN EXACT-P). A reference to NAME in the expansion's body
-   stands for PLAN, the plan of its argument; EXACT-P is true when that value
-   is known to lie in [0, 2^64), not only its low 64 bits.")
-
-(defvar *u64-in-inline-body* nil
-  "True while planning the body of an inline expansion. No operand may be taken
-   out of it: an operand is evaluated before the whole expression, outside the
-   BLOCK and the parameter bindings the body is written against.")
-
-(defun %u64-leaf (expr kind guard)
-  (unless *u64-in-inline-body*
-    (let ((l (gen-local (if (eq kind :long) "U64L" "U64O"))))
-      (push (list l kind expr guard) *u64-leaves*)
-      (list :leaf l kind))))
-
-(defvar *u64-structured-probing* nil
-  "True while COMPILE-AS-U64-STRUCTURED is finding out whether an expansion's
-   last form is exact in the lane. The code compiled for that is dropped.")
-
-(defvar *u64-structured-nontail* nil
-  "True while a probe compiles the parts of an expansion before its last form.
-   Whether the probe succeeds depends only on the last form, so the operands
-   inside those parts are not tried as structured ones there: each such try
-   compiles its own expansion once more, which doubles the work at every
-   level of nested inline calls.")
-
-(defvar *u64-structured-skipped* nil
-  "Set when a probe passed over an operand as described for
-   *U64-STRUCTURED-NONTAIL*. A probe that passed over none compiled what the
-   real compile would, and its code is kept.")
-
-(defvar *u64-plan-root* nil
-  "The expression a U64-PLAN-COMPOUND caller asked about. That caller rejects a
-   plan that is a single operand, so the root is not compiled as a structured
-   operand: whatever that gave, the plan would be one operand.")
-
-(defun u64-plan-compound (expr need)
-  "U64-PLAN for a caller that only uses a plan doing something to its operands
-   (one that is not a single :LEAF)."
-  (let ((*u64-plan-root* expr))
-    (u64-plan expr need)))
-
-(defun %u64-structured-leaf (expr)
-  "A :bits operand for EXPR, an inline call compiled by
-   COMPILE-AS-U64-STRUCTURED, or NIL."
-  (when (and *u64-structured-nontail* (not *u64-in-inline-body*))
-    (setf *u64-structured-skipped* t))
-  (unless (or *u64-in-inline-body* *u64-structured-nontail*)
-    (let ((code (compile-as-u64-structured expr)))
-      (when code
-        (let ((l (gen-local "U64O")))
-          (push (list l :bits expr nil code) *u64-leaves*)
-          (list :leaf l :bits))))))
-
-(defun %u64-const-value (expr)
-  "The integer EXPR stands for when it is a literal, a constant, a parameter
-   bound to one, or a sum or difference of those; else NIL."
-  (let ((expr (fold-constant-symbol expr)))
-    (cond ((integerp expr) expr)
-          ((and (symbolp expr) expr)
-           (let ((e (assoc expr *u64-subst*)))
-             (and e (eq (car (second e)) :const) (second (second e)))))
-          ((and (consp expr) (member (car expr) '(+ -))
-                (not (local-function-entry (car expr)))
-                (not (macrolet-shadowed-p (car expr)))
-                (<= 2 (length expr) 3))
-           (let ((vals (mapcar #'%u64-const-value (cdr expr))))
-             (and (every #'integerp vals) (apply (car expr) vals))))
-          (t nil))))
-
-(defun %u64-inline-expansion (expr)
-  "The expansion (LET ((param arg) ...) decls... (BLOCK name body)) of EXPR, a
-   call to a function proclaimed INLINE, as (BINDINGS NAME BODY), when it can be
-   planned through: one body form, no RETURN-FROM to the BLOCK, no SPECIAL
-   binding. Else NIL."
-  (let ((op (and (consp expr) (car expr))))
-    (when (and (symbolp op) op
-               (gethash op *inline-defs*)
-               (not (special-operator-name-p op))
-               (not (gethash op *compile-form-handlers*))
-               (not (local-function-entry op))
-               (not (macrolet-shadowed-p op))
-               (not (find-macro-expander op))
-               (not (maybe-expand-compiler-macro op expr)))
-      (let ((inl (maybe-expand-inline op expr)))
-        (when (and (consp inl) (eq (car inl) 'let) (listp (cadr inl)))
-          (let* ((bindings (cadr inl))
-                 (forms (cddr inl))
-                 (blk (car (last forms))))
-            (when (and (%boolean-branchable-let-p bindings forms)
-                       (every (lambda (b) (and (consp b) (consp (cdr b)) (null (cddr b))))
-                              bindings)
-                       (every (lambda (f) (and (consp f) (eq (car f) 'declare)))
-                              (butlast forms))
-                       (consp blk) (eq (car blk) 'block)
-                       (consp (cdr blk)) (symbolp (cadr blk))
-                       (consp (cddr blk)) (null (cdddr blk))
-                       (not (%block-returns-to-p (cadr blk) (cddr blk))))
-              (list bindings (cadr blk) (caddr blk)))))))))
-
-(defun u64-plan-inline (expansion need)
-  "Plan an inline call through its EXPANSION (from %U64-INLINE-EXPANSION). Each
-   argument is planned where it is, in order (so its operands are taken out
-   like any other), and a reference to the parameter in the body stands for
-   that plan. The body is pure arithmetic in the lane or the whole plan fails:
-   it is then compiled as the call it is. A parameter used twice computes its
-   argument's arithmetic twice, from the same operand values.
-
-   An argument that is only an object computed boxed (a call, a variable that
-   is not a word) is first taken by its low 64 bits, which is all a body of
-   modular arithmetic (LDB (BYTE 64 0) (+ A B)) reads of it: that holds for any
-   integer, so no check and no generic copy of the expression is needed. Only
-   when the body needs the exact value of such a parameter is the body planned
-   again with the argument checked to be an (unsigned-byte 64). The arguments
-   are not planned again: planning one can compile its code
-   (%U64-STRUCTURED-LEAF), and a body planned in the lane takes no operand."
-  (destructuring-bind (bindings name body) expansion
-    (let ((saved *u64-leaves*)
-          (entries nil)
-          (low-bits '()))
-      (dolist (b bindings)
-        (let* ((init (second b))
-               (c (%u64-const-value init)))
-          (push (cond
-                  (c (list (car b) (list :const c) (<= 0 c +u64-mask+)))
-                  (t (let ((p (let ((s *u64-leaves*))
-                                (or (u64-plan init :exact)
-                                    (progn (setf *u64-leaves* s) nil)))))
-                       (cond
-                         ((and p (eq (car p) :leaf) (eq (third p) :obj)
-                               (fourth (assoc (second p) *u64-leaves*)))
-                          (let ((leaf (assoc (second p) *u64-leaves*))
-                                (entry (list (car b) p nil)))
-                            (setf (fourth leaf) nil)
-                            (push (cons entry leaf) low-bits)
-                            entry))
-                         (p (list (car b) p t))
-                         (t
-                          (let ((p (u64-plan init :mod)))
-                            (unless p
-                              (setf *u64-leaves* saved)
-                              (return-from u64-plan-inline nil))
-                            (list (car b) p nil)))))))
-                entries)))
-      (setf entries (nreverse entries))
-      (flet ((plan-body ()
-               (let ((*u64-subst* (append entries *u64-subst*))
-                     (*u64-in-inline-body* t)
-                     (*inlining-stack* (inline-guard-stack name)))
-                 (u64-plan body need))))
-        (or (plan-body)
-            (and low-bits
-                 (progn
-                   ;; The body reads the exact value: check those arguments.
-                   (loop for (entry . leaf) in low-bits
-                         do (setf (third entry) t
-                                  (fourth leaf) t))
-                   (plan-body)))
-            (progn (setf *u64-leaves* saved) nil))))))
-
-(defun u64-plan (expr need)
-  "A plan for computing EXPR in the 64-bit lane, or NIL. NEED is :exact (the
-   value itself must lie in [0, 2^64)) or :mod (its low 64 bits will do).
-   Records the operands in *U64-LEAVES*."
-  (let ((expr (fold-nary-arith expr))
-        (inl nil))
-    (cond
-      ((integerp expr)
-       (and (or (eq need :mod) (<= 0 expr +u64-mask+))
-            (list :const expr)))
-      ((and (symbolp expr) expr (assoc expr *u64-subst*))
-       (let ((e (assoc expr *u64-subst*)))
-         (and (or (eq need :mod) (third e))
-              (second e))))
-      ;; An element of an (unsigned-byte 64) array, or a local whose slot holds
-      ;; one: its bits, already exact.
-      ((and (consp expr) (not *u64-in-inline-body*) (numeric-array-aref-u64-p expr))
-       (%u64-leaf expr :bits nil))
-      ((and (symbolp expr) expr (not *u64-in-inline-body*) (u64-native-local-p expr))
-       (%u64-leaf expr :bits nil))
-      ;; A 64-bit word of adjacent octets: its bits, from one wide read.
-      ((and (consp expr) (not *u64-in-inline-body*)
-            (let ((ow (octet-word-ref-info expr))) (and ow (= (fourth ow) 8))))
-       (%u64-leaf expr :bits nil))
-      ((and (consp expr) (not *u64-in-inline-body*) (fixnum-exact-p expr))
-       (let ((r (expr-int-range expr)))
-         (and (or (eq need :mod) (and r (>= (car r) 0)))
-              (%u64-leaf expr :long nil))))
-      ((and (symbolp expr) expr (not (keywordp expr)) (fixnum-exact-p expr))
-       (let ((r (expr-int-range expr)))
-         (and (or (eq need :mod) (and r (>= (car r) 0)))
-              (%u64-leaf expr :long nil))))
-      ;; (LOGANDC1 A B) is (LOGAND (LOGNOT A) B), and LOGANDC2 the mirror image:
-      ;; exact when the operand that is not complemented is. Written that way
-      ;; only for the plan; when it fails, the call itself is the operand.
-      ((and (or (%u64-op-p expr 'logandc1) (%u64-op-p expr 'logandc2))
-            (= (length expr) 3)
-            (not (local-function-entry 'logand)) (not (macrolet-shadowed-p 'logand))
-            (not (local-function-entry 'lognot)) (not (macrolet-shadowed-p 'lognot)))
-       (let* ((saved *u64-leaves*)
-              (p (u64-plan (if (eq (car expr) 'logandc1)
-                               `(logand (lognot ,(cadr expr)) ,(caddr expr))
-                               `(logand ,(cadr expr) (lognot ,(caddr expr))))
-                           need)))
-         (or p
-             (progn (setf *u64-leaves* saved)
-                    (%u64-leaf expr :obj (eq need :exact))))))
-      ((or (%u64-op-p expr 'logand) (%u64-op-p expr 'logior) (%u64-op-p expr 'logxor))
-       (and (= (length expr) 3)
-            (let* ((op (car expr)) (a (cadr expr)) (b (caddr expr))
-                   (mask-b (and (integerp b) (<= 0 b +u64-mask+))))
-              (u64-plan-binary op a b
-                               (cond ((eq need :mod) '(:mod :mod))
-                                     ((not (eq op 'logand)) '(:exact :exact))
-                                     (mask-b '(:mod :exact))
-                                     ;; LOGAND of anything with a value in
-                                     ;; [0, 2^64) stays in it.
-                                     (t '(:mod :exact :or :exact :mod)))))))
-      ((and (eq need :mod)
-            (or (%u64-op-p expr '+) (%u64-op-p expr '-) (%u64-op-p expr '*))
-            (= (length expr) 3))
-       (u64-plan-binary (car expr) (cadr expr) (caddr expr) '(:mod :mod)))
-      ((and (eq need :mod) (or (%u64-op-p expr '1+) (%u64-op-p expr '1-))
-            (= (length expr) 2))
-       (let ((a (u64-plan (cadr expr) :mod)))
-         (and a (list (if (eq (car expr) '1+) :add :sub) a (list :const 1)))))
-      ((and (eq need :mod) (%u64-op-p expr 'lognot) (= (length expr) 2))
-       (let ((a (u64-plan (cadr expr) :mod)))
-         (and a (list :not a))))
-      ((and (%u64-op-p expr 'ash) (= (length expr) 3))
-       (let ((x (cadr expr)) (k (or (%u64-const-value (caddr expr)) (caddr expr))))
-         (cond
-           ((and (integerp k) (<= 0 k 63) (eq need :mod))
-            (let ((a (u64-plan x :mod))) (and a (list :shl a k))))
-           ;; A left shift is exact when its operand is known to stay below
-           ;; 2^(64-K): (ash (logand hi #xffffffff) 32), the high half of a
-           ;; word assembled from two 32-bit ones.
-           ((and (integerp k) (<= 0 k 63))
-            (let* ((saved *u64-leaves*)
-                   (a (u64-plan x :exact))
-                   (b (and a (%u64-plan-bound a))))
-              (if (and b (<= (ash b k) +u64-mask+))
-                  (list :shl a k)
-                  (progn (setf *u64-leaves* saved) nil))))
-           ((and (integerp k) (< k 0))
-            ;; The node keeps the real count: only the 64-bit path may cap it
-            ;; (anything from 64 up gives 0 there). The generic path, taken when
-            ;; X is outside [0, 2^64), shifts the bignum by the count as written.
-            (let ((a (u64-plan x :exact))) (and a (list :shr a (- k)))))
-           ((integerp k) nil)
-           (*u64-in-inline-body* nil)
-           ((%ash-count-range-within k 0 64)
-            (and (eq need :mod)
-                 (let ((a (u64-plan x :mod)))
-                   (and a (list :shlv a (%u64-leaf k :long nil))))))
-           ((%ash-count-range-within k -64 0)
-            (let ((a (u64-plan x :exact)))
-              (and a (list :shrv a (%u64-leaf k :long nil)))))
-           (t nil))))
-      ;; A call to an INLINE function whose body is arithmetic in the lane:
-      ;; planned through, so a chain of such calls is one expression boxed once
-      ;; instead of one box per call.
-      ;; One that cannot (its body reads an array through its own bindings)
-      ;; is still an exact operand when its expansion computes the word in the
-      ;; lane: its bits, compiled now in the body's own scope.
-      ((and (consp expr) (setq inl (%u64-inline-expansion expr)))
-       (or (u64-plan-inline inl need)
-           (and (not (eq expr *u64-plan-root*))
-                (%u64-structured-leaf expr))
-           (%u64-leaf expr :obj (eq need :exact))))
-      ;; Any other operand is computed as it is and taken apart here.
-      ((%literal-ldb-form-p expr) nil)
-      ((and (symbolp expr) (or (null expr) (eq expr t) (keywordp expr))) nil)
-      (t (%u64-leaf expr :obj (eq need :exact))))))
-
-(defun %u64-plan-bound (node)
-  "An upper bound on the value of NODE, a plan asked for :exact, known to lie
-   in [0, bound]; NIL when none is known beyond [0, 2^64)."
-  (ecase (car node)
-    (:const (and (<= 0 (second node) +u64-mask+) (second node)))
-    (:leaf (let ((e (assoc (second node) *u64-leaves*)))
-             (and e (eq (second e) :long)
-                  (let ((r (expr-int-range (third e))))
-                    (and r (>= (car r) 0) (cdr r))))))
-    (:and (let ((ba (%u64-plan-bound (second node)))
-                (bb (%u64-plan-bound (third node))))
-            ;; LOGAND with a value in [0, B] stays in [0, B], whatever the
-            ;; other operand is.
-            (cond ((and ba bb) (min ba bb)) (t (or ba bb)))))
-    ((:or :xor) (let ((ba (%u64-plan-bound (second node)))
-                      (bb (%u64-plan-bound (third node))))
-                  (and ba bb
-                       (1- (ash 1 (max (integer-length ba) (integer-length bb)))))))
-    (:shl (let ((ba (%u64-plan-bound (second node))))
-            (and ba (ash ba (third node)))))
-    (:shr (ash (or (%u64-plan-bound (second node)) +u64-mask+)
-               (- (min 64 (third node)))))
-    ((:add :sub :mul :not :shlv :shrv) nil)))
-
-(defun u64-plan-binary (op a b needs)
-  "Plan (OP A B) with A and B asked for (FIRST NEEDS) and (SECOND NEEDS); when
-   NEEDS has a second pair after :OR, that is tried if the first fails."
-  (let ((saved *u64-leaves*))
-    (or (let ((pa (u64-plan a (first needs))))
-          (and pa
-               (let ((pb (u64-plan b (second needs))))
-                 (and pb (list (ecase op
-                                 (logand :and) (logior :or) (logxor :xor)
-                                 (+ :add) (- :sub) (* :mul))
-                               pa pb)))))
-        (progn (setf *u64-leaves* saved)
-               (and (eq (third needs) :or)
-                    (u64-plan-binary op a b (cdddr needs)))))))
-
-(defun %u64-plan-worth-p (plan)
-  "True when PLAN reads an (unsigned-byte 64) array element or local, or does
-   something the generic path would do
-   in bignums: arithmetic, a shift, or a 64-bit wide constant. LOGAND / LOGIOR /
-   LOGXOR of boxed fixnums with narrow constants are cheaper on the generic
-   entries (inlined fixnum cases) than unpacking and checking each operand."
-  (labels ((wide-p (node)
-             (case (car node)
-               (:const (> (abs (second node)) most-positive-fixnum))
-               (:leaf nil)
-               ((:add :sub :mul :shl :shlv :shr :shrv) t)
-               (t (some #'wide-p (cdr node))))))
-    (and (consp plan) (not (eq (car plan) :leaf)) (not (eq (car plan) :const))
-         ;; An element of an (unsigned-byte 64) array or local is boxed (a
-         ;; bignum at or above 2^63) on the generic path, whatever is done
-         ;; with it. Otherwise the plan has to do something that may leave
-         ;; the fixnum range (a word assembled from two 32-bit halves): the
-         ;; generic path computes it in bignums.
-         (or (some (lambda (l) (eq (second l) :bits)) *u64-leaves*)
-             (wide-p plan)))))
-
-(defun %u64-all-ones-p (node)
-  "True when NODE is the constant with all 64 bits set, which LOGAND with an
-   int64 leaves unchanged."
-  (and (eq (car node) :const) (= (ldb (byte 64 0) (second node)) +u64-mask+)))
-
-(defun %u64-fast (node)
-  (ecase (car node)
-    (:const (let ((v (ldb (byte 64 0) (second node))))
-              `((:ldc-i8 ,(if (logbitp 63 v) (- v (expt 2 64)) v)))))
-    ;; (logand x #xFFFFFFFFFFFFFFFF), the mask of every 64-bit modular sum, is
-    ;; x itself in the 64-bit lane.
-    (:and (cond ((%u64-all-ones-p (third node)) (%u64-fast (second node)))
-                ((%u64-all-ones-p (second node)) (%u64-fast (third node)))
-                (t `(,@(%u64-fast (second node)) ,@(%u64-fast (third node)) (:and)))))
-    (:leaf (if (member (third node) '(:long :bits))
-               `((:ldloc ,(second node)))
-               `((:ldloc ,(second node)) (:call "Runtime.Low64"))))
-    ((:or :xor :add :sub :mul)
-     `(,@(%u64-fast (second node)) ,@(%u64-fast (third node)) (,(car node))))
-    (:not `(,@(%u64-fast (second node)) (:not)))
-    (:shl `(,@(%u64-fast (second node)) (:ldc-i4 ,(third node)) (:shl)))
-    (:shlv `(,@(%u64-fast (second node)) (:ldloc ,(second (third node))) (:call "Runtime.ShlU64")))
-    (:shr `(,@(%u64-fast (second node)) (:ldc-i8 ,(min 64 (third node))) (:call "Runtime.ShrU64")))
-    (:shrv `(,@(%u64-fast (second node)) (:ldloc ,(second (third node))) (:neg)
-             (:call "Runtime.ShrU64")))))
-
-(defun %u64-generic (node)
-  "NODE computed on the generic path from the same operand values."
-  (ecase (car node)
-    (:const (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (second node))))
-    (:leaf (case (third node)
-             (:long `((:ldloc ,(second node)) (:call "Fixnum.Make")))
-             (:bits `((:ldloc ,(second node)) (:call "Runtime.BoxU64")))
-             (t `((:ldloc ,(second node))))))
-    ((:and :or :xor :add :sub :mul)
-     `(,@(%u64-generic (second node)) ,@(%u64-generic (third node))
-       (:call ,(ecase (car node)
-                 (:and "Runtime.Logand2") (:or "Runtime.Logior2") (:xor "Runtime.Logxor2")
-                 (:add "Runtime.Add") (:sub "Runtime.Subtract") (:mul "Runtime.Multiply")))))
-    (:not `(,@(%u64-generic (second node)) (:call "Runtime.Lognot")))
-    (:shl `(,@(%u64-generic (second node)) (:ldc-i8 ,(third node)) (:call "Fixnum.Make")
-            (:call "Runtime.Ash")))
-    (:shlv `(,@(%u64-generic (second node)) (:ldloc ,(second (third node))) (:call "Fixnum.Make")
-             (:call "Runtime.Ash")))
-    (:shr `(,@(%u64-generic (second node))
-            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                (compile-expr (- (third node))))
-            (:call "Runtime.Ash")))
-    (:shrv `(,@(%u64-generic (second node)) (:ldloc ,(second (third node))) (:call "Fixnum.Make")
-             (:call "Runtime.Ash")))))
-
-(defun %u64-pure-leaf-p (leaf)
-  "True when evaluating LEAF's operand cannot assign a variable: a variable that
-   is not a symbol macro, an integer, or an AREF whose operands are those."
-  (destructuring-bind (l kind x &optional guard code) leaf
-    (declare (ignore l kind guard))
-    (flet ((simple-p (y)
-             (or (integerp y)
-                 (and (symbolp y) y
-                      (not (nth-value 1 (lookup-symbol-macro y)))))))
-      (and (null code)
-           (or (simple-p x)
-               (and (consp x) (eq (car x) 'aref)
-                    (not (local-function-entry 'aref))
-                    (not (macrolet-shadowed-p 'aref))
-                    (every #'simple-p (cdr x))))))))
-
-(defun %u64-alias-leaf-copies (code leaves)
-  "CODE, which begins with (%U64-LEAF-CODE LEAVES), without the copy of an
-   (unsigned-byte 64) local into a :bits operand's own local: the operand's
-   reads read the variable's slot instead. The copy keeps the value an operand
-   had when it was evaluated, which only matters when a later operand assigns
-   the variable; so it goes only when every operand is a plain read
-   (%U64-PURE-LEAF-P). Each copy costs an IL local and two local references,
-   and an unrolled 64-bit body (ironclad's THREEFISH1024) had 3,114 of them,
-   past the JIT's 8,000 references."
-  (if (notevery #'%u64-pure-leaf-p leaves)
-      code
-      (let ((alias '()))
-        (dolist (leaf leaves)
-          (destructuring-bind (l kind x &optional guard leaf-code) leaf
-            (declare (ignore guard))
-            (when (and (eq kind :bits) (null leaf-code) (symbolp x))
-              (let ((v (u64-native-local-p x)))
-                (when v (push (cons l v) alias))))))
-        (if (null alias)
-            code
-            (labels ((copy-p (i next)
-                       ;; (:declare-local L ..) / (:ldloc V) / (:stloc L) of an alias
-                       (declare (ignore next))
-                       (and (consp i) (eq (car i) :declare-local)
-                            (assoc (cadr i) alias)))
-                     (subst-ldloc (i)
-                       (cond ((and (consp i) (eq (car i) :ldloc) (assoc (cadr i) alias))
-                              (list :ldloc (cdr (assoc (cadr i) alias))))
-                             (t i))))
-              (let ((out '()))
-                (loop while code
-                      do (let ((i (pop code)))
-                           (if (and (copy-p i nil)
-                                    (equal (first code) (list :ldloc (cdr (assoc (cadr i) alias))))
-                                    (equal (second code) (list :stloc (cadr i))))
-                               (setf code (cddr code))
-                               (push (subst-ldloc i) out))))
-                (nreverse out)))))))
-
-(defun %u64-leaf-code (leaves)
-  "Evaluate the operands LEAVES (in order) into their locals: an int64 for a
-   :long operand, the bits of the array element or local for a :bits one, the
-   object otherwise."
-  (loop for (l kind x nil code) in leaves
-        append (ecase kind
-                 (:long
-                  `((:declare-local ,l "Int64")
-                    ,@(compile-as-long x)
-                    (:stloc ,l)))
-                 (:bits
-                  `((:declare-local ,l "Int64")
-                    ,@(cond (code code)
-                            ((symbolp x)
-                             `((:ldloc ,(u64-native-local-p x))))
-                            ((octet-word-ref-info x)
-                             (compile-octet-word-bits (octet-word-ref-info x)))
-                            (t (compile-u64-aref-bits (cadr x) (caddr x))))
-                    (:stloc ,l)))
-                 (:obj
-                  `((:declare-local ,l "LispObject")
-                    ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                        (compile-expr x))
-                    (:stloc ,l))))))
-
-(defun try-compile-u64 (expr)
-  "EXPR compiled in the 64-bit lane, leaving the boxed value, or NIL."
-  (let* ((*u64-leaves* nil)
-         (plan (u64-plan-compound expr :exact)))
-    (when (and plan (%u64-plan-worth-p plan))
-      (let* ((leaves (reverse *u64-leaves*))
-             (slow (gen-label "U64SLOW"))
-             (done (gen-label "U64DONE"))
-             (guards (remove-if-not #'fourth leaves)))
-        (%u64-alias-leaf-copies
-         `(,@(%u64-leaf-code leaves)
-           ,@(loop for (l) in guards
-                   append `((:ldloc ,l) (:call "Runtime.IsU64") (:brfalse ,slow)))
-           ,@(%u64-fast plan)
-           (:call "Runtime.BoxU64")
-           ,@(when guards
-               `((:br ,done)
-                 (:label ,slow)
-                 ,@(%u64-generic plan)
-                 (:label ,done))))
-         leaves)))))
-
-(defun compile-guarded-long-bitop (fn a b)
-  (let ((op (ecase fn (logand :and) (logior :or) (logxor :xor)))
-        (method (ecase fn (logand "Runtime.Logand2") (logior "Runtime.Logior2")
-                  (logxor "Runtime.Logxor2")))
-        (slow (gen-label "BITSLOW"))
-        (done (gen-label "BITDONE"))
-        (parts nil))
-    ;; PARTS: (LONG-P . LOCAL) per operand, in evaluation order.
-    (let ((code
-            (loop for x in (list a b)
-                  append (if (fixnum-exact-p x)
-                             (let ((l (gen-local "BITL")))
-                               (push (cons t l) parts)
-                               `((:declare-local ,l "Int64")
-                                 ,@(compile-as-long x)
-                                 (:stloc ,l)))
-                             (let ((o (gen-local "BITO")))
-                               (push (cons nil o) parts)
-                               `((:declare-local ,o "LispObject")
-                                 ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                                     (compile-expr x))
-                                 (:stloc ,o)))))))
-      (setf parts (nreverse parts))
-      `(,@code
-        ,@(loop for (long-p . l) in parts
-                unless long-p
-                  append `((:ldloc ,l) (:call "Runtime.IsFixnumObject") (:brfalse ,slow)))
-        ,@(loop for (long-p . l) in parts
-                append (if long-p `((:ldloc ,l)) `((:ldloc ,l) (:unbox-fixnum))))
-        (,op)
-        (:br ,done)
-        (:label ,slow)
-        ,@(loop for (long-p . l) in parts
-                append (if long-p `((:ldloc ,l) (:call "Fixnum.Make")) `((:ldloc ,l))))
-        (:call ,method)
-        (:unbox-fixnum)
-        (:label ,done)))))
-
-(defun compile-long-binop (op a b)
-  "Emit a native int64 binop. Each operand that is not straight-line code is
-   evaluated into its own Int64 temp FIRST, so nothing of this expression is
-   pending on the CIL stack while that operand's code runs.
-
-   Leaving operand 1 on the stack across operand 2 is only valid if operand 2 is
-   branch-free. It is not, for instance, when operand 2 is a call to a function
-   proclaimed INLINE whose body is a COND: MAYBE-EXPAND-INLINE rewrites the call
-   to (LET (...) (BLOCK f body)), the block's arms jump to a join label, and the
-   pending operand makes the stack depth at that label disagree between paths.
-   The result was IL the JIT rejects outright; real libraries hit it (fset's
-   CHAMP nodes, where every accessor is an inlined COND used inside fixnum
-   arithmetic), and the failure surfaces only when the method is first CALLED,
-   because JIT is lazy."
-  (with-long-simple-memo
-  (if (and (%long-operand-simple-p a) (%long-operand-simple-p b))
-      `(,@(compile-as-long a)
-        ,@(compile-as-long b)
-        (,op))
-      (let ((ta (gen-local "LBA")) (tb (gen-local "LBB")))
-        `((:declare-local ,ta "Int64")
-          (:declare-local ,tb "Int64")
-          ,@(compile-as-long a)
-          (:stloc ,ta)
-          ,@(compile-as-long b)
-          (:stloc ,tb)
-          (:ldloc ,ta)
-          (:ldloc ,tb)
-          (,op))))))
-
-(defun compile-as-long (expr)
-  "Compile EXPR leaving an int64 on the stack. Caller must have verified
-   fixnum-typed-p; this routine assumes the invariant."
-  (setf expr (fold-typed-operand expr))
-  (cond
-    ((integerp expr)
-     `((:ldc-i8 ,expr)))
-    ;; Direct Int64 local in native body: already long, no unbox
-    ((and (symbolp expr)
-          (boundp '*cstate*)
-          (native-slot-p expr (cstate-long-locals)))
-     `((:ldloc ,(lookup-local expr))))
-    ;; An (unsigned-byte 64) local holds the value's bits as a raw Int64, not a
-    ;; boxed Fixnum, even when it is also known to be a fixnum (a FIXNUM
-    ;; declaration, or a range inferred from its init). The caller has proven
-    ;; the value lies in the fixnum range, where the bits are the value. Checked
-    ;; before the boxed-local clauses below, which would unbox the raw slot.
-    ((and (symbolp expr) (u64-native-local-p expr))
-     `((:ldloc ,(u64-native-local-p expr))))
-    ;; A call from a typed body to itself whose result is an integer: the raw
-    ;; result of the body method, nothing boxed either way.
-    ((and (typed-self-call-p expr)
-          (eq (car (third (cstate-typed-self))) :long))
-     (compile-typed-self-call expr))
-    ;; Native self-call: long args avoid boxing; InvokeNativeN returns LispObject,
-    ;; so unbox-fixnum extracts the long back for the caller.
-    ((and (consp expr) (symbolp (car expr))
-          (boundp '*cstate*) (cstate-native-self-name)
-          (cstate-self-fn-local)
-          (string= (mangle-name (car expr)) (cstate-native-self-name))
-          (not (local-function-entry (car expr)))
-          (let ((n (length (cdr expr)))) (and (>= n 1) (<= n 4)))
-          ;; The parameters of a native self are all declared FIXNUM.
-          (every #'fixnum-wrap-typed-p (cdr expr)))
-     (let ((n-args (length (cdr expr))))
-       `(,(if (eq (cstate-self-fn-local) :arg0) '(:ldarg 0)
-              `(:ldloc ,(cstate-self-fn-local)))
-         ;; APPEND, not MAPCAN. A backquoted instruction list whose tail is all
-         ;; constant folds to one literal for that tail, so COMPILE-AS-LONG can
-         ;; hand back a list whose last cons is a literal shared by every call
-         ;; that took the same branch. MAPCAN would NCONC the next argument's
-         ;; instructions onto it, and they would still be there the next time
-         ;; that branch is taken -- carrying a local from a function compiled
-         ;; earlier into a body that never declared it.
-         ,@(loop for arg in (cdr expr)
-                 append (let ((*in-tail-position* nil) (*in-mv-context* nil))
-                          (compile-as-long arg)))
-         (:callvirt ,(invoke-native-name n-args))
-         (:unbox-fixnum))))
-    ;; Declared-fixnum local: load slot (LispObject) then unbox.
-    ;; A captured+mutated (boxed) local's slot holds the LispObject[1] cell,
-    ;; not the Fixnum: unboxing it directly would castclass the cell array.
-    ;; Boxed vars fall through to the fallback, whose compile-expr dereferences
-    ;; the cell before the unbox.
-    ((and (symbolp expr)
-          (boundp '*fixnum-locals*)
-          (member (var-name expr) *fixnum-locals* :test #'string=)
-          (not (boxed-var-p expr))
-          (lookup-local expr))
-     `((:ldloc ,(lookup-local expr))
-       (:unbox-fixnum)))
-    ;; Small-int local (bounded range): slot holds a boxed Fixnum: load + unbox.
-    ((small-int-local-range expr)
-     `((:ldloc ,(lookup-local expr))
-       (:unbox-fixnum)))
-    ;; aref on a numeric-backed array local: raw long element read, no box.
-    ((numeric-array-aref-info expr)
-     (compile-numeric-aref-as-long
-      (cadr expr) (cddr expr) (car (numeric-array-aref-info expr))))
-    ;; (char-code (schar s i)): one typed call, no boxed index, no character.
-    ((string-char-code-ref expr)
-     (let ((ref (string-char-code-ref expr)))
-       (compile-string-char-code-as-long (car ref) (cdr ref))))
-    ;; A word of adjacent octets: one wide read. A 64-bit one is here only
-    ;; under *FIXNUM-WRAP-LICENSED*, which asks for its low 64 bits.
-    ((octet-word-ref-info expr)
-     (compile-octet-word-bits (octet-word-ref-info expr)))
-    ;; A structure slot read in a fixnum context: raw long out of the slot,
-    ;; instead of the slot's LispObject through UnwrapMv and an unbox.
-    ((struct-slot-ref expr)
-     (let ((ref (struct-slot-ref expr)))
-       (compile-struct-slot-as-long (car ref) (cdr ref))))
-    ;; (if c a b), both arms fixnum-typed: branch with a raw int64 on each path
-    ;; instead of boxing at the merge. The condition goes through the same
-    ;; compile-boolean-branch the ordinary IF uses, so fused comparisons and
-    ;; and/or/not chains behave identically here.
-    ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4)
-          (fixnum-typed-p (caddr expr))
-          (fixnum-typed-p (cadddr expr)))
-     (let ((else-label (gen-label "LONGELSE"))
-           (end-label (gen-label "LONGEND")))
-       `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-             (compile-boolean-branch (cadr expr) else-label nil))
-         ,@(compile-as-long (caddr expr))
-         (:br ,end-label)
-         (:label ,else-label)
-         ,@(compile-as-long (cadddr expr))
-         (:label ,end-label))))
-    ((and (consp expr) (eq (car expr) 'the))
-     ;; (the fixnum E): the declaration asserts E is a fixnum, so lower E
-     ;; natively via compile-as-long: it handles +/-/*/1+/1-/locals as raw
-     ;; int64 and falls back to compile-expr+unbox for forms it doesn't know.
-     ;; Previously this always took compile-expr+unbox, forcing e.g.
-     ;; (the fixnum (1- x)) through a box->Runtime.Decrement->unbox round-trip
-     ;; (a method call) in hot fixnum loops like tak/stak.
-     (compile-as-long (caddr expr)))
-    ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
-     (let ((op (ecase (car expr) (+ :add) (- :sub) (* :mul))))
-       (compile-long-binop op (cadr expr) (caddr expr))))
-    ;; Three or more arguments: emit the left-associated form the call stands for
-    ;; (FIXNUM-TYPED-P accepts it on the same reading).
-    ((and (consp expr) (member (car expr) '(+ - * logand logior logxor)) (> (length expr) 3))
-     (compile-as-long (fold-nary-arith expr)))
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) '1+))
-     `(,@(compile-as-long (cadr expr))
-       (:ldc-i8 1)
-       (:add)))
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) '1-))
-     `(,@(compile-as-long (cadr expr))
-       (:ldc-i8 1)
-       (:sub)))
-    ;; %dotimes-1+: raw add: the emitting macro asserts the result fits int64
-    ;; (the increment site is only reached while counter < limit <= int64-max).
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) '%dotimes-1+))
-     `(,@(compile-as-long (cadr expr))
-       (:ldc-i8 1)
-       (:add)))
-    ;; %dotimes-limit / %loop-limit-floor: a loop limit clamped into int64 by
-    ;; the runtime (ceiling / floor of a non-integer). A limit already known
-    ;; to be a fixnum is itself.
-    ((and (consp expr) (= (length expr) 2)
-          (member (car expr) '(%dotimes-limit %loop-limit-floor)))
-     (if (fixnum-typed-p (cadr expr))
-         (compile-as-long (cadr expr))
-         `(,@(compile-value-arg (cadr expr))
-           (:call ,(if (eq (car expr) '%dotimes-limit)
-                       "Runtime.DotimesLimit"
-                       "Runtime.LoopLimitFloor")))))
-    ;; mod/rem: leaves int64 on stack. The helpers carry CL's sign rules
-    ;; (MOD follows the divisor, REM truncates); a raw CIL :rem would give REM's
-    ;; answer for both.
-    ;; The operands are re-checked for exactness because this can be reached
-    ;; under THE or under the license, where nobody asked about them; a wrapped
-    ;; operand takes the generic path through the fallback below.
-    ;; (floor X d) / (truncate X d), constant d, first value. A positive power
-    ;; of two is an arithmetic shift for FLOOR (it rounds toward -inf, as SHR
-    ;; does) and for TRUNCATE of an X proven non-negative; otherwise the int64
-    ;; helper. FIXNUM-TYPED-P admitted the form only with the quotient in
-    ;; int64, so the helper's one overflow (most-negative / -1) cannot occur.
-    ((%const-divisor-quotient-p expr)
-     (let* ((x (cadr expr))
-            (d (caddr expr))
-            (k (and (> d 0) (= (logcount d) 1) (1- (integer-length d)))))
-       (cond
-         ((eql d 1) (compile-as-long x))
-         ((and k (or (eq (car expr) 'floor)
-                     (let ((r (expr-int-range x))) (and r (>= (car r) 0)))))
-          `(,@(compile-as-long x)
-            (:ldc-i4 ,k)
-            (:shr)))
-         (t
-          `(,@(compile-long-binop-spilled x d)
-            (:call ,(if (eq (car expr) 'floor)
-                        "Runtime.FloorFixnumL" "Runtime.TruncateFixnumL")))))))
-    ((and (consp expr) (= (length expr) 3) (member (car expr) '(mod rem))
-          (fixnum-exact-p (cadr expr)) (fixnum-exact-p (caddr expr)))
-     `(,@(compile-long-binop-spilled (cadr expr) (caddr expr))
-       (:call ,(if (eq (car expr) 'mod) "Runtime.ModFixnumL" "Runtime.RemFixnumL"))))
-    ;; Bitwise ops: leaves int64 on stack (callers box if needed).
-    ;; Each operand has to be one COMPILE-AS-LONG can produce (its value, or
-    ;; that modulo 2^64). Under (THE FIXNUM (LOGAND X #x3F)) only the result is
-    ;; asserted: X may well be a bignum, and unboxing it unconditionally failed
-    ;; with a .NET cast error. Such a form takes COMPILE-GUARDED-LONG-BITOP.
-    ((and (consp expr) (= (length expr) 3) (member (car expr) '(logand logior logxor))
-          (fixnum-wrap-typed-p (cadr expr)) (fixnum-wrap-typed-p (caddr expr)))
-     (let ((op (ecase (car expr) (logand :and) (logior :or) (logxor :xor))))
-       (compile-long-binop op (cadr expr) (caddr expr))))
-    ((and (consp expr) (= (length expr) 3) (member (car expr) '(logand logior logxor)))
-     (compile-guarded-long-bitop (car expr) (cadr expr) (caddr expr)))
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) 'lognot))
-     `(,@(compile-as-long (cadr expr))
-       (:not)))
-    ;; ash with a variable count, admitted by FIXNUM-TYPED-P only with the
-    ;; count's range inside [0, 63] (left) or [-63, 0] (right).
-    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'ash)
-          (not (integerp (caddr expr)))
-          (%ash-count-range-within (caddr expr) -63 0))
-     `(,@(compile-long-binop-spilled (cadr expr) (caddr expr))
-       (:neg)
-       (:conv-i4)
-       (:shr)))
-    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'ash)
-          (not (integerp (caddr expr)))
-          (%ash-count-range-within (caddr expr) 0 63))
-     `(,@(compile-long-binop-spilled (cadr expr) (caddr expr))
-       (:conv-i4)
-       (:shl)))
-    ;; ash with constant shift. fixnum-typed-p guarantees we only get here for a
-    ;; negative shift (right shift, always safe) or a constant base whose folded
-    ;; result fits int64: fold that to a literal so no overflowing SHL is emitted.
-    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'ash) (integerp (caddr expr))
-          (or (>= (caddr expr) 0) (fixnum-exact-p (cadr expr))))
-     (let ((n (caddr expr)) (x (cadr expr)))
-       (cond
-         ((< n 0)
-          ;; Count capped at 63: CIL SHR takes it mod 64 (see COMPILE-ASH-FAST).
-          `(,@(compile-as-long x)
-            (:ldc-i4 ,(min 63 (- n)))
-            (:shr)))
-         ((integerp x)
-          ;; Folded modulo 2^64: under the wrap license a constant may be
-          ;; shifted past int64, and only the low 64 bits are asked for.
-          (let ((v (ldb (byte 64 0) (ash x n))))
-            `((:ldc-i8 ,(if (logbitp 63 v) (- v (ash 1 64)) v)))))
-         (t
-          ;; A left shift FIXNUM-TYPED-P admitted: exact by the range proof, or
-          ;; wanted modulo 2^64 under the license. The count is below 64.
-          `(,@(compile-as-long x)
-            (:ldc-i4 ,n)
-            (:shl))))))
-    ;; A call to an inline function (or a binding form) whose value is an
-    ;; integer the caller wants raw: its last form is compiled as an int64
-    ;; instead of being boxed and unboxed again.
-    ((compile-as-long-structured expr))
-    (t
-     ;; Fallback: compile as LispObject and unbox. Shouldn't hit this
-     ;; if fixnum-typed-p was checked first.
-     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-           (compile-expr expr))
-       (:unbox-fixnum)))))
-
-(defun checked-long-arith-p (expr)
-  "True for +/-/* (two operands after folding) or 1+/1- whose operands can all be
-   produced as raw int64. Such an expression can be computed natively with an
-   overflow CHECK even when no range proof exists; the destination is an Int64
-   slot, so a result that overflows has nowhere to go and must signal either way."
-  (let ((expr (fold-nary-arith expr)))
-    (and (consp expr)
-         (or (and (member (car expr) '(+ - *)) (= (length expr) 3)
-                  (fixnum-typed-p (cadr expr)) (fixnum-typed-p (caddr expr)))
-             (and (member (car expr) '(floor truncate)) (= (length expr) 3)
-                  (not (local-function-entry (car expr)))
-                  (fixnum-exact-p (cadr expr)) (fixnum-exact-p (caddr expr)))
-             (and (member (car expr) '(1+ 1-)) (= (length expr) 2)
-                  (fixnum-typed-p (cadr expr)))))))
-
-(defun fixnum-long-lowerable-p (expr)
-  "True when COMPILE-EXPR-TO-LONG lowers EXPR natively and exactly: either
-   FIXNUM-TYPED-P (exact), or top-level +, -, *, 1+, 1- of such operands, which
-   it computes with an overflow check. For destinations that need an int64 and
-   have no use for a bignum anyway -- an array subscript above all -- where an
-   overflow signalling is as good as a generic call signalling later."
-  (or (fixnum-typed-p expr) (checked-long-arith-p expr)))
-
-(defun compile-checked-long-arith (expr)
-  "EXPR as a raw int64, checking for overflow rather than proving it away."
-  (let* ((expr (fold-nary-arith expr))
-         (op (car expr))
-         (helper (ecase op
-                   ((+ 1+) "Runtime.AddFixnumChecked")
-                   ((- 1-) "Runtime.SubtractFixnumChecked")
-                   (* "Runtime.MultiplyFixnumChecked")
-                   (floor "Runtime.FloorFixnumL")
-                   (truncate "Runtime.TruncateFixnumL"))))
-    (if (member op '(1+ 1-))
-        `(,@(compile-as-long (cadr expr)) (:ldc-i8 1) (:call ,helper))
-        `(,@(compile-long-binop-spilled (cadr expr) (caddr expr)) (:call ,helper)))))
-
-(defun compile-expr-to-long (expr)
-  "Compile EXPR leaving a raw int64 on the stack, without risking silent wrap:
-   the raw long path (compile-as-long) is taken only when a value-range proof
-   shows every intermediate fits int64. Failing that, arithmetic whose operands
-   are themselves raw goes native with an overflow check; the range proof can
-   never succeed for FIXNUM + FIXNUM (that spans one bit more than int64), so
-   without this every (SETQ ACC (+ ACC X)) in a declared-fixnum loop boxed both
-   operands, called the generic promoting ADD, and unboxed the result. Anything
-   else is evaluated boxed on the generic promoting path and unboxed; a
-   declaration-violating bignum then signals (InvalidCast) instead of wrapping.
-   Used to initialize and assign Int64-slot locals."
-  (cond
-    ((fixnum-arith-unboxed-safe-p expr) (compile-as-long expr))
-    ((checked-long-arith-p expr) (compile-checked-long-arith expr))
-    (t `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-             (compile-expr expr))
-         (:unbox-fixnum)))))
-
-(defun compile-index-to-long (expr)
-  "Compile an array subscript leaving a raw int64 on the stack. A fixnum-typed
-   subscript lowers natively (COMPILE-EXPR-TO-LONG); anything else is evaluated
-   boxed and converted by Runtime.IndexL, which reports a non-integer subscript
-   the way AREF does; where a bare unbox would surface it as a .NET cast.
-   The unboxed element paths used to demand a statically fixnum-typed subscript,
-   but an element's storage does not depend on the subscript. Requiring it meant
-   an undeclared loop variable, the usual shape, (DO ((I 0 (1+ I))) ...), boxed
-   every element the loop read."
-  (if (fixnum-long-lowerable-p expr)
-      (compile-expr-to-long expr)
-      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-            (compile-expr expr))
-        (:call "Runtime.IndexL"))))
-
-(defun compile-fixnum-binop (args op)
-  "Emit native int64 binop, boxing result back to LispObject. All of +/-/*
-   promote to Bignum on int64 overflow via Runtime.{Add,Subtract,Multiply}Fixnum.
-   A raw native :add/:sub would silently wrap, so even the
-   fixnum fast path must go through the promoting (AggressiveInlining) helper."
-  (let ((helper (ecase op
-                  (:add "Runtime.AddFixnum")
-                  (:sub "Runtime.SubtractFixnum")
-                  (:mul "Runtime.MultiplyFixnum"))))
-    `(,@(compile-long-binop-spilled (first args) (second args))
-      (:call ,helper))))
-
-(defun compile-fixbit-binop (args op)
-  "Emit native int64 bitwise binop (AND/OR/XOR), boxing result back to LispObject."
-  `(,@(compile-long-binop-spilled (first args) (second args))
-    (,op)
-    (:call "Fixnum.Make")))
-
-(defun compile-fixmod (args op)
-  "Emit native int64 MOD/REM, boxing the result back to LispObject. The result
-   is bounded by the divisor, so it is always a Fixnum -- no promotion check."
-  `(,@(compile-long-binop-spilled (first args) (second args))
-    (:call ,(if (eq op 'mod) "Runtime.ModFixnumL" "Runtime.RemFixnumL"))
-    (:call "Fixnum.Make")))
-
-(defun compile-fixbit-not (args)
-  "Emit native int64 bitwise NOT, boxing result back to LispObject."
-  `(,@(compile-as-long (first args))
-    (:not)
-    (:call "Fixnum.Make")))
-
-(defun compile-ash-fast (args)
-  "Emit native int64 ash when shift amount is a compile-time constant integer.
-   Returns NIL if not applicable (non-constant shift)."
-  (let ((x (first args))
-        (n (second args)))
-    (when (and (fixnum-exact-p x) (integerp n))
-      (if (>= n 0)
-          ;; Left shift can overflow int64 (and raw CIL shl masks count mod 64),
-          ;; so route through Runtime.AshLeftLong which promotes to Bignum.
-          `(,@(compile-as-long x)
-            (:ldc-i4 ,n)
-            (:call "Runtime.AshLeftLong"))
-          ;; Right shift of a fixnum-typed long always fits: native SHR is safe
-          ;; once the count is capped. CIL SHR takes the count mod 64, so
-          ;; (ash x -64) came back as x; any count >= 63 leaves only the sign
-          ;; (0 or -1), which is what SHR by 63 gives.
-          `(,@(compile-as-long x)
-            (:ldc-i4 ,(min 63 (- n)))
-            (:shr)
-            (:call "Fixnum.Make"))))))
-
-(defun char-code-operand (expr)
-  "Instructions leaving EXPR's character code on the stack as a raw int64, or
-   NIL when EXPR is not something whose code is reachable without building a
-   character object.
-
-   Three shapes qualify, and only three:
-   - a character literal, whose code is known here and becomes an immediate
-   - a lexical local declared CHARACTER (see *CHARACTER-LOCALS*), read from its
-     slot through CHAR-CODE-OF-L
-   - (schar s i) / (char s i), which already has a typed entry that reads the
-     code directly, so the character is never built at all
-
-   Anything else is left to the generic comparison: this is an optimization,
-   and declining it can only cost speed."
-  (setf expr (fold-constant-symbol expr))
-  (cond
-    ((characterp expr) `((:ldc-i8 ,(char-code expr))))
-    ;; A raw-code slot IS the code: the read is the whole operand. This is the
-    ;; clause the native character representation exists for -- the one below
-    ;; pays a call per comparison, and a scanner's whitespace test makes three
-    ;; of them per input character.
-    ((and (symbolp expr) expr (char-native-local-p expr) (lookup-local expr))
-     `((:ldloc ,(lookup-local expr))))
-    ((and (symbolp expr)
-          expr
-          (boundp '*character-locals*)
-          (member (var-name expr) *character-locals* :test #'string=)
-          (not (boxed-var-p expr))
-          (lookup-local expr))
-     `((:ldloc ,(lookup-local expr)) (:call "Runtime.CharCodeOfL")))
-    ((and (consp expr) (member (car expr) '(schar char)) (= (length expr) 3)
-          (not (local-function-entry (car expr))))
-     (compile-string-char-code-as-long (cadr expr) (caddr expr)))
-    (t nil)))
-
-(defun compile-char-cmp (args op)
-  "Emit a character comparison as an integer comparison of the codes. OP is the
-   same keyword set COMPILE-FIXNUM-CMP takes, and the result is the same: an i4
-   on the stack for :brfalse / :brtrue.
-
-   CHAR= on two characters is EQL on their codes, so this is the same answer the
-   generic entry gives -- without building the boolean object that entry returns
-   and then asking IsTruthy about it."
-  (let ((body (ecase op
-                (:lt '((:clt)))
-                (:gt '((:cgt)))
-                (:eq '((:ceq)))
-                (:le '((:cgt) (:ldc-i4 0) (:ceq)))
-                (:ge '((:clt) (:ldc-i4 0) (:ceq)))
-                (:ne '((:ceq) (:ldc-i4 0) (:ceq))))))
-    ;; Both operands are pushed before the comparison, so each must be a
-    ;; straight-line push; the two shapes that are not (a slot read and an
-    ;; immediate are) go through COMPILE-STRING-CHAR-CODE-AS-LONG, which spills
-    ;; to temps itself when its subexpressions are compound.
-    `(,@(char-code-operand (first args))
-      ,@(char-code-operand (second args))
-      ,@body)))
-
-(defun compile-fixnum-cmp (args op)
-  "Emit native int64 comparison. OP is :lt :le :gt :ge :eq :ne.
-   Leaves an i4 (0 or 1) on stack; suitable for :brfalse / :brtrue.
-   Callers: compile-if-fused-comparison dispatch."
-  (let ((body (ecase op
-                (:lt '((:clt)))
-                (:gt '((:cgt)))
-                (:eq '((:ceq)))
-                (:le '((:cgt) (:ldc-i4 0) (:ceq)))   ; not greater
-                (:ge '((:clt) (:ldc-i4 0) (:ceq)))   ; not less
-                (:ne '((:ceq) (:ldc-i4 0) (:ceq)))))) ; not equal
-    `(,@(compile-long-binop-spilled (first args) (second args))
-      ,@body)))
-
-(defun literal-symbol-operand (expr)
-  "If EXPR is a quoted symbol literal other than T and NIL, return that symbol.
-   T and NIL are excluded because EQ and EQL bridge the T and NIL objects to
-   the T and NIL symbols, which a plain reference comparison does not do."
-  (and (consp expr)
-       (eq (car expr) 'quote)
-       (let ((s (cadr expr)))
-         (and (symbolp s) (not (null s)) (not (eq s t)) s))))
-
-(defun compile-sym-eq (args)
-  "Emit an inline reference comparison for (EQ x 'SYM) / (EQL x 'SYM).
-   Leaves an i4 (0 or 1) on stack; the same contract as COMPILE-FIXNUM-CMP.
-
-   Runtime.IsTrueEq is Primary on both sides, ReferenceEquals, then a bridge
-   that can only fire when one side is the T or NIL symbol; IsTrueEql adds the
-   number and character cases after that. So against any other symbol literal
-   the whole call reduces to Primary + a reference compare, and the literal
-   side needs neither. What is saved is the call itself, which CASE pays once
-   for every clause it walks past.
-
-   CEQ is symmetric, but the operands are still emitted in source order.
-   Loading a symbol literal is not a pure operation here: a keyword literal
-   interns on every execution, and a literal in another package resolves (and
-   can signal) at execution time. So compiling the other operand first would be
-   observable if the package state changed between compilation and the call.
-   When the literal comes first it goes through a temp rather than staying on
-   the stack, because the other operand may compile to code containing a try
-   region, and CIL only allows entering one with an empty stack."
-  (let* ((lit-first (literal-symbol-operand (first args)))
-         (lit (if lit-first (first args) (second args)))
-         (other (if lit-first (second args) (first args)))
-         (lit-instrs (let ((*in-tail-position* nil) (*in-mv-context* nil))
-                       (compile-expr lit)))
-         (other-instrs (let ((*in-tail-position* nil) (*in-mv-context* nil))
-                         (compile-expr other))))
-    (if lit-first
-        (let ((tmp (gen-local "SE")))
-          `((:declare-local ,tmp "LispObject")
-            ,@lit-instrs
-            (:stloc ,tmp)
-            ,@other-instrs
-            (:call "Runtime.Primary")
-            (:ldloc ,tmp)
-            (:ceq)))
-        `(,@other-instrs
-          (:call "Runtime.Primary")
-          ,@lit-instrs
-          (:ceq)))))
-
-;;; ============================================================
-;;; Double-float native arithmetic
-;;; Parallel to the fixnum path above, but emits native r8 (IEEE 754
-;;; double) arithmetic with a final newobj DoubleFloat to box the result.
-;;; ============================================================
-
-(defun %double-float-type-spec-p (ty)
-  "T for a type specifier that names the double-float format: DOUBLE-FLOAT,
-   LONG-FLOAT (the same format here, as the structure slot clause of
-   DOUBLE-FLOAT-TYPED-P already assumes), or a range of either."
-  (or (member ty '(double-float long-float))
-      (and (consp ty) (member (car ty) '(double-float long-float)))))
-
-(defun %single-float-type-spec-p (ty)
-  "T for SINGLE-FLOAT or a range of it."
-  (or (eq ty 'single-float)
-      (and (consp ty) (eq (car ty) 'single-float))))
-
-(defun double-float-typed-p (expr)
-  "Return T if EXPR is statically known to produce a DoubleFloat value.
-   Recognizes: (the double-float E), local vars declared double-float
-   (via *double-float-locals*), recursive binary arithmetic (+, -, *, /)
-   and unary negate (- x) whose operands are themselves double-float-typed.
-   A literal whose value IS a double-float (e.g. 2.0d0) is recognized: the
-   read object already has a definite type, so there is no single/double
-   ambiguity; only the reader's choice for an unsuffixed 2.0 was ambiguous,
-   and that produces a single-float object here, not a double."
-  ;; A three-argument call means the same thing as nested two-argument ones
-  ;; (CLHS 12.2), but every clause below matches a two-argument call, so
-  ;; (* 2.0d0 z2 aux) was not recognized as double-typed and the enclosing
-  ;; + fell off the native path with it. FOLD-NARY-ARITH is what the integer
-  ;; side already does for the same reason.
-  (let ((expr (fold-nary-arith expr)))
-  (cond
-    ;; Literal double-float constant: unambiguous (the object is a double).
-    ((typep expr 'double-float) t)
-    ;; aref on a proven double-float-backed array local: the element is a
-    ;; double, readable as a native r8 (Runtime.ArefNum*D).
-    ((eq (numeric-array-aref-float-kind expr) :double) t)
-    ((and (symbolp expr)
-          (boundp '*double-float-locals*)
-          (member (var-name expr) *double-float-locals* :test #'string=)
-          (not (boxed-var-p expr))
-          (lookup-local expr))
-     t)
-    ((and (consp expr) (eq (car expr) 'the)
-          (let ((ty (cadr expr)))
-            (or (eq ty 'double-float)
-                (and (consp ty) (eq (car ty) 'double-float)))))
-     t)
-    ;; A structure slot declared DOUBLE-FLOAT. The integer sibling of this
-    ;; clause is in FIXNUM-TYPED-P and exists for the same reason: the slot's
-    ;; storage is a raw double, so a read that is not known to be one goes
-    ;; through the generic path and boxes the value on every read.
-    ((and (consp expr) (= (length expr) 2) (symbolp (car expr))
-          (not (local-function-entry (car expr)))
-          (boundp '*struct-accessor-types*)
-          (member (gethash (car expr) *struct-accessor-types*)
-                  '(double-float long-float)))
-     t)
-    ;; Declared double-float function return: (name ...) where name has a
-    ;; return type promising a double (see FUNCTION-RETURN-TYPE for which
-    ;; inferred ones count). The fixnum sibling is the last clause of
-    ;; FIXNUM-TYPED-P. COMPILE-AS-DOUBLE lowers it through its generic
-    ;; fallback: the call, then an unbox of the returned DoubleFloat.
-    ((and (consp expr) (symbolp (car expr))
-          (%double-float-type-spec-p (function-return-type (car expr)))
-          ;; Must not be shadowed by a local flet/labels function.
-          (not (local-function-entry (car expr))))
-     t)
-    ((and (consp expr) (= (length expr) 3)
-          (member (car expr) '(+ - * /))
-          (double-float-typed-p (cadr expr))
-          (double-float-typed-p (caddr expr)))
-     t)
-    ;; (abs x) of a double is a double -- same format, no contagion to consider.
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs))
-          (double-float-typed-p (cadr expr)))
-     t)
-    ;; Unary negate: (- x) where x is double-typed -> double.
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-)
-          (double-float-typed-p (cadr expr)))
-     t)
-    ;; (sin x), (exp x), ... of a double, and (float i 1d0) / (coerce i
-    ;; 'double-float) of a fixnum or a float: see the predicates.
-    ((double-real-unary-form-p expr) t)
-    ((double-convert-form-p expr) t)
-    (t nil))))
-
-(defparameter +double-real-unary-entries+
-  '((sin . "Math.SinDouble") (cos . "Math.CosDouble") (tan . "Math.TanDouble")
-    (atan . "Math.AtanDouble") (sinh . "Math.SinhDouble")
-    (cosh . "Math.CoshDouble") (tanh . "Math.TanhDouble")
-    (exp . "Runtime.ExpDouble"))
-  "One-argument functions whose value for any double-float argument is a
-   double-float (never a complex), with the raw r8 -> r8 entry each lowers to.
-   LOG, SQRT, ASIN, ACOS, ACOSH and ATANH are not here: a double outside their
-   real domain gives a complex. EXP signals on overflow as the generic entry
-   does, so it goes through a runtime entry rather than Math.Exp.")
-
-(defun double-real-unary-form-p (expr)
-  "T when EXPR is (F X), F one of +DOUBLE-REAL-UNARY-ENTRIES+ and X statically a
-   DOUBLE-FLOAT. The value is then a double-float, computed by the same
-   System.Math function the generic entry calls."
-  (and (consp expr) (consp (cdr expr)) (null (cddr expr))
-       (symbolp (car expr))
-       (assoc (car expr) +double-real-unary-entries+)
-       (not (local-function-entry (car expr)))
-       (double-float-typed-p (cadr expr))))
-
-(defun double-convertible-arg-p (x)
-  "T when X can become a raw double exactly as FLOAT would convert it: a
-   statically FIXNUM value (conv.r8 rounds to nearest, as the generic entry's
-   (double)long does) or a float of either format (widening is exact).
-   FIXNUM-TYPED-P only: the overflow-checked arithmetic forms would signal where
-   FLOAT of the bignum they would otherwise make is a fine double."
-  (or (fixnum-typed-p x) (float-typed-p x)))
-
-(defun double-convert-form-p (expr)
-  "T when EXPR converts to a double-float a value DOUBLE-CONVERTIBLE-ARG-P
-   accepts: (FLOAT X P) with P a double-float literal, (COERCE X 'DOUBLE-FLOAT)
-   or 'LONG-FLOAT, or (FLOAT X) of a double (which returns X)."
-  (and (consp expr) (consp (cdr expr))
-       (cond
-         ((eq (car expr) 'float)
-          (and (not (local-function-entry 'float))
-               (if (null (cddr expr))
-                   (double-float-typed-p (cadr expr))
-                   (and (null (cdddr expr))
-                        (typep (caddr expr) 'double-float)
-                        (double-convertible-arg-p (cadr expr))))))
-         ((eq (car expr) 'coerce)
-          (and (not (local-function-entry 'coerce))
-               (consp (cddr expr)) (null (cdddr expr))
-               (let ((ty (caddr expr)))
-                 (and (consp ty) (eq (car ty) 'quote) (consp (cdr ty))
-                      (member (cadr ty) '(double-float long-float))))
-               (double-convertible-arg-p (cadr expr))))
-         (t nil))))
-
-(defun compile-double-convert (x)
-  "X (DOUBLE-CONVERTIBLE-ARG-P) as a raw r8."
-  (cond ((double-float-typed-p x) (compile-as-double x))
-        ((single-float-typed-p x) `(,@(compile-as-single x) (:conv-r8)))
-        (t `(,@(compile-expr-to-long x) (:conv-r8)))))
-
-(defun float-native-local-kind (sym)
-  "If SYM is a lexical local whose slot holds a native float (r8/r4) directly
-   rather than a boxed DoubleFloat/SingleFloat, return :double / :single; else
-   NIL. Gated (like the long-locals table) on a live lexical binding and non-boxed
-   (captured vars keep the boxed slot, since env capture stores an object)."
-  (cond
-    ((and (boundp '*cstate*)
-          (native-slot-p sym (cstate-native-double-locals)))
-     :double)
-    ((and (boundp '*cstate*)
-          (native-slot-p sym (cstate-native-single-locals)))
-     :single)
-    (t nil)))
-
-(defun compile-float-native-value (expr kind)
-  "Compile EXPR leaving a native r8 (KIND :double) or r4 (KIND :single) on the
-   stack, for storing into a native float slot. A float-typed EXPR lowers via
-   compile-as-double/single (no box); anything else is compiled generically and
-   unboxed; the slot's declaration promises a float, so a non-float value
-   surfaces as a loud InvalidCast (matching the long-locals store contract)."
-  (ecase kind
-    (:double (if (double-float-typed-p expr)
-                 (compile-as-double expr)
-                 `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                       (compile-expr expr))
-                   (:unbox-double))))
-    (:single (if (single-float-typed-p expr)
-                 (compile-as-single expr)
-                 `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                       (compile-expr expr))
-                   (:unbox-single))))))
-
-(defun double-sqrt-form-p (expr)
-  "T when EXPR is (SQRT X) or (LOG X) with X statically a DOUBLE-FLOAT.
-
-   LOG follows exactly the rule SQRT does, for the same reason: the logarithm
-   of a negative double is a COMPLEX.
-
-   Deliberately NOT a clause of DOUBLE-FLOAT-TYPED-P, which is where every other
-   shape of this kind lives: the square root of a negative double is a COMPLEX,
-   so (SQRT X) alone does not have a known type even when X does. The type is
-   known only where the program has ALSO declared the result -- (THE
-   DOUBLE-FLOAT (SQRT X)), a double-declared binding, a double-float array
-   element. Those are the callers, and each of them supplies the half this
-   predicate leaves out."
-  (and (consp expr) (= (length expr) 2) (member (car expr) '(sqrt log))
-       (not (local-function-entry (car expr)))
-       (double-float-typed-p (cadr expr))))
-
-(defun double-sqrt-instr (&optional (op 'sqrt))
-  "The call a lowered (SQRT X) emits, which is where the declaration is either
-   trusted or checked. At (safety 0) a declaration is a license, as it is for
-   THE FIXNUM arithmetic, and a negative argument gives the NaN Math.Sqrt
-   returns. From (safety 1) up it is an assertion, so a negative argument -- the
-   one input whose true answer is a COMPLEX -- signals a TYPE-ERROR."
-  (if (eq op 'log)
-      (if (compiling-at-safety-0-p)
-          '(:call "Runtime.LogDouble")
-          '(:call "Runtime.LogDoubleChecked"))
-      (if (compiling-at-safety-0-p)
-          '(:call "Math.SqrtDouble")
-          '(:call "Runtime.SqrtDoubleChecked"))))
-
-(defun compile-as-double (expr)
-  "Compile EXPR leaving a native r8 (double) on the stack.
-   Caller must have verified double-float-typed-p."
-  ;; Folded the same way DOUBLE-FLOAT-TYPED-P folds it, so what this walks is
-  ;; the shape that was approved.
-  (let ((expr (fold-nary-arith expr)))
-  (cond
-    ;; A double-float literal is an IL immediate (ldc.r8). Falling through to
-    ;; the generic path instead compiles it as a constant-pool reference and
-    ;; unboxes that: ldc.i4 idx; call GetConstant; castclass LispObject;
-    ;; castclass DoubleFloat; call get_Value. Inside a loop that whole
-    ;; sequence is paid per iteration, which is why declared double-float
-    ;; arithmetic lagged the same loop written over fixnums, where a literal
-    ;; already lowered to ldc.i8.
-    ((typep expr 'double-float)
-     `((:ldc-r8 ,expr)))
-    ;; A call from a typed body to itself whose result is a DOUBLE-FLOAT.
-    ((and (typed-self-call-p expr)
-          (eq (car (third (cstate-typed-self))) :double))
-     (compile-typed-self-call expr))
-    ;; Native r8 slot (double-rep local): the raw double is already in the slot.
-    ((eq (float-native-local-kind expr) :double)
-     `((:ldloc ,(lookup-local expr))))
-    ((and (symbolp expr)
-          (boundp '*double-float-locals*)
-          (member (var-name expr) *double-float-locals* :test #'string=)
-          (lookup-local expr))
-     `((:ldloc ,(lookup-local expr))
-       (:unbox-double)))
-    ;; A structure slot declared DOUBLE-FLOAT -> raw r8 read, no box. The
-    ;; integer sibling is COMPILE-STRUCT-SLOT-AS-LONG.
-    ((and (consp expr) (= (length expr) 2) (symbolp (car expr))
-          (boundp '*struct-accessor-types*)
-          (member (gethash (car expr) *struct-accessor-types*)
-                  '(double-float long-float))
-          (struct-slot-ref expr))
-     (let* ((ref (struct-slot-ref expr))
-            (hit (struct-backing-entry (car ref) (cdr ref))))
-       (if (and hit (eql (cddr hit) 1))
-           (%struct-backing-read hit (car ref) (cdr ref))
-           `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                 (compile-expr (car ref)))
-             (:ldc-i4 ,(cdr ref))
-             (:call "Runtime.StructRefD")))))
-    ;; aref on a double-float-backed array local -> raw r8 read, no box.
-    ((eq (numeric-array-aref-float-kind expr) :double)
-     (compile-numeric-aref-float (cadr expr) (cddr expr)
-                                 (car (numeric-array-aref-entry expr))))
-    ;; (the double-float E) where E is itself provably a double: lower E the
-    ;; native way instead of compiling it generically and unboxing the result.
-    ;; The declaration is the only thing that made the SQRT shape reachable, and
-    ;; a boxed argument to it is exactly what this path exists to avoid. Gated on
-    ;; DOUBLE-FLOAT-TYPED-P of the inner form, not on the declaration: THE
-    ;; promises the VALUE's type, and (the double-float (+ i j)) over two fixnums
-    ;; must still go through the generic add that produces that double.
-    ((and (consp expr) (eq (car expr) 'the)
-          (or (double-sqrt-form-p (caddr expr))
-              (double-float-typed-p (caddr expr))))
-     (compile-as-double (caddr expr)))
-    ((and (consp expr) (eq (car expr) 'the))
-     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-           (compile-expr (caddr expr)))
-       (:unbox-double)))
-    ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - * /)))
-     (let ((op (ecase (car expr) (+ :add) (- :sub) (* :mul) (/ :div))))
-       `(,@(compile-as-double (cadr expr))
-         ,@(compile-as-double (caddr expr))
-         (,op))))
-    ;; (abs x) -> raw magnitude, no box on the way in or out.
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs)))
-     `(,@(compile-as-double (cadr expr)) (:call "Math.AbsDouble")))
-    ;; (sqrt x) -> raw root. Reached only from a context that has already
-    ;; declared the result a double-float; see DOUBLE-SQRT-FORM-P.
-    ((double-sqrt-form-p expr)
-     `(,@(compile-as-double (cadr expr)) ,(double-sqrt-instr (car expr))))
-    ;; Unary negate: (- x) -> native r8 neg.
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-))
-     `(,@(compile-as-double (cadr expr)) (:neg)))
-    ((double-real-unary-form-p expr)
-     `(,@(compile-as-double (cadr expr))
-       (:call ,(cdr (assoc (car expr) +double-real-unary-entries+)))))
-    ((double-convert-form-p expr)
-     (compile-double-convert (cadr expr)))
-    (t
-     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-           (compile-expr expr))
-       (:unbox-double))))))
-
-(defun float-typed-p (expr)
-  "T if EXPR is statically known to produce a float, of either format."
-  (or (double-float-typed-p expr) (single-float-typed-p expr)))
-
-(defun compile-as-double-widened (expr)
-  "Compile a float-typed EXPR leaving a native r8, widening a single-float one.
-   CLHS 12.1.4.1 compares a mixed pair in the longer format, and widening a
-   single to a double is exact, so a comparison can take either format this way.
-   COMPILE-AS-DOUBLE alone cannot: on a single-typed expression it falls through
-   to the generic path and unboxes a SingleFloat as a DoubleFloat."
-  (if (double-float-typed-p expr)
-      (compile-as-double expr)
-      `(,@(compile-as-single expr) (:conv-r8))))
-
-(defun compile-double-binop (args op)
-  "Emit: compile-as-double a, compile-as-double b, <op>, newobj DoubleFloat."
-  `(,@(compile-as-double (first args))
-    ,@(compile-as-double (second args))
-    (,op)
-    (:newobj "DoubleFloat")))
-
-(defun compile-double-cmp (args op)
-  "Emit native r8 comparison. OP is :lt :le :gt :ge :eq :ne.
-   Leaves an i4 (0 or 1) on stack.
-
-   NaN is unordered: <, >, <= and >= are all false against it, and only /= is
-   true. <= and >= therefore negate the UNORDERED comparison (cgt.un/clt.un),
-   which is true when the operands are unordered, so the negation is false --
-   negating the ordered form answered true for a NaN, which is how a declared
-   DOUBLE-FLOAT comparison came to disagree with the same comparison undeclared."
-  (let ((body (ecase op
-                (:lt (quote ((:clt))))
-                (:gt (quote ((:cgt))))
-                (:eq (quote ((:ceq))))
-                (:le (quote ((:cgt-un) (:ldc-i4 0) (:ceq))))
-                (:ge (quote ((:clt-un) (:ldc-i4 0) (:ceq))))
-                (:ne '((:ceq) (:ldc-i4 0) (:ceq))))))
-    `(,@(compile-as-double-widened (first args))
-      ,@(compile-as-double-widened (second args))
-      ,@body)))
-
-;;; ============================================================
-;;; Decimal native arithmetic
-;;; Parallel to the double-float path, but emits native System.Decimal ops
-;;; (decimal.op_Addition etc.) and boxes with newobj LispDecimal. The point is
-;;; SEMANTIC as well as speed: System.Decimal arithmetic preserves scale, so in a
-;;; (declare (type decimal ...)) scope 1.50m+2.25m stays 3.75m: the undeclared
-;;; tower path instead treats the decimal by its rational value (scale lost).
-;;; ============================================================
-
-;; Whether the running host knows the DECIMAL type. Evaluated at load time in the
-;; TARGET (dotcl -> T): not baked by a #+dotcl read-conditional, which would freeze
-;; the cross-compile host's answer (SBCL -> NIL) into the shipped compiler. ignore-errors
-;; makes the probe safe on the XC host, where DECIMAL is an unknown type specifier.
-(defvar *decimal-type-available*
-  (ignore-errors (progn (typep nil 'decimal) t)))
-
-(defun decimal-literal-p (expr)
-  "T if EXPR is a first-class decimal object (a #m literal). NIL (never a type error)
-   on a host without the DECIMAL type, e.g. the SBCL cross-compile host."
-  (and *decimal-type-available* (typep expr 'decimal)))
-
-;; Same load-time probe shape as *decimal-type-available*: the predicate lives in
-;; the DOTCL package, which the SBCL cross-compile host does not have, so it is
-;; looked up by name at load time rather than read as a package-qualified symbol.
-(defvar *known-type-name-p-fn*
-  (ignore-errors
-   (let ((sym (find-symbol "KNOWN-TYPE-NAME-P" "DOTCL")))
-     (and sym (fboundp sym) (symbol-function sym)))))
-
-;; Same shape, same reason: proclamations live on the runtime's symbols, and the
-;; host has neither the package nor the flags.
-(defvar *declaration-name-p-fn*
-  (ignore-errors
-   (let ((sym (find-symbol "DECLARATION-NAME-P" "DOTCL")))
-     (and sym (fboundp sym) (symbol-function sym)))))
-
-(defvar *warned-unknown-types* (make-hash-table :test #'equal :synchronized t)
-  "Names already reported by WARN-UNKNOWN-DECLARED-TYPES, so a type that is
-   declared in many places is mentioned once rather than once per binding form.")
-
-(defun %declared-type-known-p (spec)
-  "How SPEC is known as a type (:DEFTYPE / :BUILTIN / :CLASS), or NIL.
-   Only bare symbols are judged: a compound specifier's head is a separate
-   question, and NIL/T reach here as their own objects rather than symbols."
-  (cond ((null *known-type-name-p-fn*) :builtin)   ; cross-compile host: never warn
-        ((not (symbolp spec)) :builtin)
-        (t (funcall *known-type-name-p-fn* spec))))
-
-(defun warn-unknown-declared-types (body)
-  "Style-warn for each type named in BODY's leading declarations that nothing
-   defines as a type. Such a declaration is silently dropped, the compiler has
-   nothing to attach it to, so a typo, or DECIMAL where DOTCL:DECIMAL was meant,
-   costs the declaration (and any optimization or check it implied) without a
-   word. Reported once per name per session."
-  (when *known-type-name-p-fn*
-    (dolist (form body)
-      (unless (and (consp form) (eq (car form) 'declare))
-        (return))
-      (dolist (decl (cdr form))
-        (when (consp decl)
-          (let ((head (car decl)))
-            (cond
-              ;; (type SPEC var...)
-              ((and (symbolp head) (string= (var-name head) "TYPE"))
-               (%warn-if-unknown-type (cadr decl) nil t))
-              ;; (SPEC var...) shorthand, and the variable-less (SPEC) that is
-              ;; the shape of a user-proclaimed DECLARATION identifier. Both are
-              ;; reported: neither names anything the compiler can attach, and a
-              ;; proclaimed declaration name is excluded by the warner itself.
-              ((and (symbolp head)
-                    (every #'symbolp (cdr decl))
-                    (not (member (var-name head)
-                                 '("IGNORE" "IGNORABLE" "OPTIMIZE" "SPECIAL"
-                                   "DYNAMIC-EXTENT" "INLINE" "NOTINLINE"
-                                   "DECLARATION" "FTYPE" "VALUES")
-                                 :test #'string=)))
-               (%warn-if-unknown-type head (null (cdr decl)))))))))))
-
-(defun %warn-if-unknown-type (spec lone-p &optional type-form-p)
-  "Warn when a declared type name resolves to nothing. LONE-P is true for a
-   variable-less (declare (spec)), where the likely intent is a declaration
-   identifier rather than a type, so the message names the way to say that.
-   TYPE-FORM-P is true for the explicit (type spec var...) form, which is a
-   STYLE-WARNING as in SBCL (\"undefined type\"): the type may be defined
-   later, and a full WARNING sets COMPILE-FILE's failure-p. The shorthand
-   (spec var...) and the lone form stay a WARNING, as SBCL's \"unrecognized
-   declaration\" is.
-   Three ways to get here and they look identical in source:
-
-   1. nothing defines it; a typo
-   2. it is a dotcl extension type named through the WRONG symbol, e.g. a bare
-      DECIMAL where DOTCL:DECIMAL was meant. Those are gated on symbol identity
-      (KNOWN-TYPE-NAME-P answers NIL for a foreign DECIMAL), because the
-      declaration-driven native paths key on the DOTCL symbol; so the
-      declaration buys nothing and the arithmetic quietly degrades
-   3. it is meant to be a declaration identifier that was never proclaimed
-      (LONE-P). CLHS leaves an unproclaimed one undefined, and every other
-      implementation warns
-
-   Either way the compiler drops the declaration, so say so. Once per name."
-  (when (and (symbolp spec)
-             (null (%declared-type-known-p spec))
-             ;; A symbol proclaimed (declaration foo) names no type by
-             ;; definition, CLHS forbids it from naming both, so it is not an
-             ;; unknown type, it is a declaration the user told us about.
-             (null (and *declaration-name-p-fn*
-                        (funcall *declaration-name-p-fn* spec))))
-    (let ((pkg (let ((p (symbol-package spec)))
-                 (if p (package-name p) "#")))
-          (suggestion (%known-type-in-other-package spec)))
-      (let ((key (format nil "~a::~a" pkg (symbol-name spec))))
-        (unless (gethash key *warned-unknown-types*)
-          (setf (gethash key *warned-unknown-types*) t)
-          (if lone-p
-              (warn "~a::~a is neither a known type nor a proclaimed declaration; ~
-                     the declaration is ignored~@[ (did you mean ~a?)~] ~;
-                     proclaim it with (declaim (declaration ~a))"
-                    pkg (symbol-name spec) suggestion (symbol-name spec))
-              (warn (if type-form-p 'style-warning 'simple-warning)
-                    :format-control "declared type ~a::~a names no known type; the declaration is ignored~@[ (did you mean ~a?)~]"
-                    :format-arguments (list pkg (symbol-name spec) suggestion))))))))
-
-(defun %known-type-in-other-package (spec)
-  "A same-named symbol from another package that IS known as a type, rendered
-   as PKG:NAME. The DOTCL one wins when several exist; that is the case worth
-   pointing at (a bare DECIMAL meaning DOTCL:DECIMAL)."
-  (when *known-type-name-p-fn*
-    (let ((hits '()))
-      (dolist (p (list-all-packages))
-        (multiple-value-bind (sym status) (find-symbol (symbol-name spec) p)
-          (when (and status (not (eq sym spec)) (symbol-package sym)
-                     (funcall *known-type-name-p-fn* sym))
-            (pushnew sym hits :test #'eq))))
-      (let ((best (or (find-if (lambda (s)
-                                 (string= (package-name (symbol-package s)) "DOTCL"))
-                               hits)
-                      (and (= (length hits) 1) (first hits)))))
-        (when best
-          (format nil "~a:~a" (package-name (symbol-package best))
-                  (symbol-name best)))))))
-
-(defun decimal-typed-p (expr)
-  "T if EXPR is statically known to produce a decimal (LispDecimal) value:
-   a #m literal, a decimal-declared local (via *decimal-locals*), (the decimal E),
-   or recursive binary +,-,*,/ / unary - whose operands are all decimal-typed."
-  (cond
-    ((decimal-literal-p expr) t)
-    ((and (symbolp expr)
-          (boundp '*decimal-locals*)
-          (member (var-name expr) *decimal-locals* :test #'string=)
-          (not (boxed-var-p expr))
-          (lookup-local expr))
-     t)
-    ((and (consp expr) (eq (car expr) 'the)
-          (let ((ty (cadr expr)))
-            (or (decimal-type-name-p ty)
-                (and (consp ty) (decimal-type-name-p (car ty))))))
-     t)
-    ((and (consp expr) (= (length expr) 3)
-          (member (car expr) '(+ - * /))
-          (decimal-typed-p (cadr expr))
-          (decimal-typed-p (caddr expr)))
-     t)
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-)
-          (decimal-typed-p (cadr expr)))
-     t)
-    (t nil)))
-
-(defun decimal-strong-typed-p (expr)
-  "Like DECIMAL-TYPED-P, but a bare #m literal does NOT count on its own. A native
-   decimal op fires only when a declared decimal or (the decimal E) is involved, so
-   undeclared literal arithmetic, (+ #m1.5 #m1.5), stays on the standard tower and
-   degrades to a rational (conservative-extension invariant #1: standard ops/literals
-   do not spontaneously yield extended-type values). Literals are still valid OPERANDS
-   of a strong decimal expression; compile-as-decimal loads them fine."
-  (cond
-    ((and (symbolp expr)
-          (boundp '*decimal-locals*)
-          (member (var-name expr) *decimal-locals* :test #'string=)
-          (not (boxed-var-p expr))
-          (lookup-local expr))
-     t)
-    ((and (consp expr) (eq (car expr) 'the)
-          (let ((ty (cadr expr)))
-            (or (decimal-type-name-p ty)
-                (and (consp ty) (decimal-type-name-p (car ty))))))
-     t)
-    ((and (consp expr) (= (length expr) 3)
-          (member (car expr) '(+ - * /))
-          (decimal-typed-p (cadr expr))
-          (decimal-typed-p (caddr expr))
-          (or (decimal-strong-typed-p (cadr expr))
-              (decimal-strong-typed-p (caddr expr))))
-     t)
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-)
-          (decimal-strong-typed-p (cadr expr)))
-     t)
-    (t nil)))
-
-(defun decimal-float-mix-p (args)
-  "T if the two ARGS are a declared/`the` decimal on one side and a statically
-   float-typed value on the other. Such a mix has no lossless meaning (decimal is
-   base-10 exact, float is binary approximate; .NET itself forbids implicit
-   decimal<->double), so a declared scope rejects it and requires an explicit coerce
-   ((float d) / (rational d)) rather than silently widening to double."
-  (and (= (length args) 2)
-       (let ((a (first args)) (b (second args)))
-         (flet ((floatp* (e) (or (double-float-typed-p e) (single-float-typed-p e))))
-           (or (and (decimal-strong-typed-p a) (floatp* b))
-               (and (decimal-strong-typed-p b) (floatp* a)))))))
-
-(defparameter *decimal-float-mix-error*
-  "cannot mix a decimal with a float in one arithmetic op; .NET forbids implicit
- decimal<->double; coerce explicitly, e.g. (+ (rational d) x) or (float d)")
-
-(defun decimal-native-local-p (sym)
-  "T if SYM's slot holds a raw System.Decimal rather than a boxed LispDecimal.
-   Gated on a live lexical binding and non-boxed, like the float slots: a
-   captured variable keeps the boxed slot because env capture stores an object."
-  (and (boundp '*cstate*)
-       (native-slot-p sym (cstate-native-decimal-locals))))
-
-(defun char-native-local-p (sym)
-  "T if SYM's slot holds a raw character code rather than a boxed LispChar.
-   Gated on a live lexical binding and non-boxed, like the float slots."
-  (and (boundp '*cstate*)
-       (native-slot-p sym (cstate-native-char-locals))))
-
-(defun character-typed-p (expr)
-  "T if EXPR is statically known to produce a CHARACTER **and** its code is
-   reachable without building one. The second half is why this is narrower than
-   the type question: it decides whether a binding may take a raw-code slot, so
-   an expression whose code only exists inside a LispChar buys nothing.
-
-   Two shapes qualify:
-   - a character literal
-   - (SCHAR S I), which COMPILE-STRING-CHAR-CODE-AS-LONG already reads as a code
-
-   (CHAR S I) is deliberately NOT here even though its value is just as much a
-   character: CHAR accepts strings SCHAR does not, and while the typed entry
-   falls back correctly for them, a raw slot is worth having only where the init
-   path is typed end to end. Widening this to CHAR later is one symbol.
-
-   (CODE-CHAR N) is excluded for a harder reason: CLHS lets it answer NIL for a
-   code at or above CHAR-CODE-LIMIT, and NIL is not a value a raw code slot can
-   hold. The integer and float slots have no equivalent of that."
-  (setf expr (fold-constant-symbol expr))
-  (or (characterp expr)
-      (and (consp expr) (= (length expr) 3) (eq (car expr) 'schar)
-           (not (local-function-entry 'schar)))))
-
-(defun compile-char-native-value (expr)
-  "Compile EXPR leaving a raw character code on the stack as an int64, for
-   storing into a native character slot. CHARACTER-TYPED-P has already accepted
-   EXPR.
-
-   int64 rather than the int32 the code actually needs, because that is the width
-   every other character code on this path already has: CHAR-CODE-OPERAND's other
-   two shapes leave an i8, and the comparison that consumes them cannot mix
-   widths. Keeping the slot at i8 makes the hot read -- the comparison -- a bare
-   LDLOC, and puts the one narrowing on the generic read, which is the rare one."
-  (setf expr (fold-constant-symbol expr))
-  (cond
-    ((characterp expr) `((:ldc-i8 ,(char-code expr))))
-    ((character-typed-p expr)
-     (compile-string-char-code-as-long (cadr expr) (caddr expr)))
-    ;; Anything else is compiled generically and reduced to its code. Reached
-    ;; from SETQ, not from the binding: the binding only takes a raw slot when
-    ;; CHARACTER-TYPED-P accepted its init, but a later assignment may be any
-    ;; expression. The slot's declaration promises a character, and
-    ;; CHAR-CODE-OF-L reports a value that is not one as the TYPE-ERROR the
-    ;; broken promise is, rather than as a .NET cast failure.
-    (t `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-             (compile-expr expr))
-         (:call "Runtime.CharCodeOfL")))))
-
-(defun compile-as-decimal (expr)
-  "Compile EXPR leaving a native System.Decimal (valuetype) on the stack.
-   Caller must have verified decimal-typed-p."
-  (cond
-    ;; Native decimal slot: the raw value is already there.
-    ((decimal-native-local-p expr)
-     `((:ldloc ,(lookup-local expr))))
-    ((and (symbolp expr)
-          (boundp '*decimal-locals*)
-          (member (var-name expr) *decimal-locals* :test #'string=)
-          (lookup-local expr))
-     `((:ldloc ,(lookup-local expr))
-       (:unbox-decimal)))
-    ((and (consp expr) (eq (car expr) 'the))
-     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-           (compile-expr (caddr expr)))
-       (:unbox-decimal)))
-    ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - * /)))
-     (let ((op (ecase (car expr) (+ :decimal-add) (- :decimal-sub)
-                                 (* :decimal-mul) (/ :decimal-div))))
-       `(,@(compile-as-decimal (cadr expr))
-         ,@(compile-as-decimal (caddr expr))
-         (,op))))
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-))
-     `(,@(compile-as-decimal (cadr expr)) (:decimal-neg)))
-    (t
-     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-           (compile-expr expr))
-       (:unbox-decimal)))))
-
-(defun compile-decimal-native-value (expr)
-  "Compile EXPR leaving a raw System.Decimal on the stack, for storing into a
-   native decimal slot. A decimal-typed EXPR lowers through compile-as-decimal
-   (no box); anything else is compiled generically and unboxed; the slot's
-   declaration promises a decimal, so a non-decimal value surfaces as a loud
-   InvalidCast, matching the native float slots' store contract."
-  (if (decimal-typed-p expr)
-      (compile-as-decimal expr)
-      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-            (compile-expr expr))
-        (:unbox-decimal))))
-
-(defun compile-decimal-binop (args op)
-  "Emit: compile-as-decimal a, compile-as-decimal b, <decimal op>, newobj LispDecimal."
-  `(,@(compile-as-decimal (first args))
-    ,@(compile-as-decimal (second args))
-    (,op)
-    (:newobj "LispDecimal")))
-
-;;; ============================================================
-;;; Single-float native arithmetic
-;;; Parallel to the double-float path above, but emits native r4 (IEEE 754
-;;; single) arithmetic with a final conv.r4 + newobj SingleFloat to box.
-;;; ============================================================
-
-(defun single-float-typed-p (expr)
-  "Return T if EXPR is statically known to produce a SingleFloat value.
-   Recognizes: (the single-float E), local vars declared single-float
-   (via *single-float-locals*), and recursive arithmetic (+, -, *, /)
-   whose operands are themselves single-float-typed. A literal single-float
-   object (e.g. 2.0f0, or 2.0 under the default read format) is recognized;
-   its type is already definite."
-  ;; See DOUBLE-FLOAT-TYPED-P: a three-argument call means nested two-argument
-  ;; ones, and every clause below matches only the two-argument shape.
-  (let ((expr (fold-nary-arith expr)))
-  (cond
-    ;; Literal single-float constant: unambiguous (the object is a single).
-    ((typep expr 'single-float) t)
-    ;; aref on a proven single-float-backed array local: element is a single,
-    ;; readable via Runtime.ArefNum*D (double) narrowed back with conv.r4.
-    ((eq (numeric-array-aref-float-kind expr) :single) t)
-    ((and (symbolp expr)
-          (boundp '*single-float-locals*)
-          (member (var-name expr) *single-float-locals* :test #'string=)
-          (not (boxed-var-p expr))
-          (lookup-local expr))
-     t)
-    ((and (consp expr) (eq (car expr) 'the)
-          (let ((ty (cadr expr)))
-            (or (eq ty 'single-float)
-                (and (consp ty) (eq (car ty) 'single-float)))))
-     t)
-    ;; A structure slot declared SINGLE-FLOAT; see the same clause in
-    ;; DOUBLE-FLOAT-TYPED-P.
-    ((and (consp expr) (= (length expr) 2) (symbolp (car expr))
-          (not (local-function-entry (car expr)))
-          (boundp '*struct-accessor-types*)
-          (member (gethash (car expr) *struct-accessor-types*)
-                  '(single-float short-float)))
-     t)
-    ;; Declared single-float function return; see the same clause in
-    ;; DOUBLE-FLOAT-TYPED-P.
-    ((and (consp expr) (symbolp (car expr))
-          (%single-float-type-spec-p (function-return-type (car expr)))
-          (not (local-function-entry (car expr))))
-     t)
-    ((and (consp expr) (= (length expr) 3)
-          (member (car expr) '(+ - * /))
-          (single-float-typed-p (cadr expr))
-          (single-float-typed-p (caddr expr)))
-     t)
-    ;; (abs x) of a single is a single.
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs))
-          (single-float-typed-p (cadr expr)))
-     t)
-    ;; Unary negate: (- x) where x is single-typed -> single.
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-)
-          (single-float-typed-p (cadr expr)))
-     t)
-    (t nil))))
-
-(defun compile-as-single (expr)
-  "Compile EXPR leaving a native r4 (float) on the stack.
-   Caller must have verified single-float-typed-p."
-  ;; Folded the same way SINGLE-FLOAT-TYPED-P folds it.
-  (let ((expr (fold-nary-arith expr)))
-  (cond
-    ;; Literal, as an IL immediate (ldc.r4) -- see the note in
-    ;; COMPILE-AS-DOUBLE for what the generic constant-pool path costs.
-    ((typep expr 'single-float)
-     `((:ldc-r4 ,expr)))
-    ;; Native r4 slot (single-rep local): the raw float is already in the slot.
-    ((eq (float-native-local-kind expr) :single)
-     `((:ldloc ,(lookup-local expr))))
-    ((and (symbolp expr)
-          (boundp '*single-float-locals*)
-          (member (var-name expr) *single-float-locals* :test #'string=)
-          (lookup-local expr))
-     `((:ldloc ,(lookup-local expr))
-       (:unbox-single)))
-    ;; A structure slot declared SINGLE-FLOAT -> raw r4 read, no box.
-    ((and (consp expr) (= (length expr) 2) (symbolp (car expr))
-          (boundp '*struct-accessor-types*)
-          (member (gethash (car expr) *struct-accessor-types*)
-                  '(single-float short-float))
-          (struct-slot-ref expr))
-     (let* ((ref (struct-slot-ref expr))
-            (hit (struct-backing-entry (car ref) (cdr ref))))
-       (if (and hit (eql (cddr hit) 2))
-           (%struct-backing-read hit (car ref) (cdr ref))
-           `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                 (compile-expr (car ref)))
-             (:ldc-i4 ,(cdr ref))
-             (:call "Runtime.StructRefF")))))
-    ;; aref on a single-float-backed array local -> raw r8 read (widened float),
-    ;; narrowed back to r4 with conv.r4 (exact for single-float values).
-    ((eq (numeric-array-aref-float-kind expr) :single)
-     `(,@(compile-numeric-aref-float (cadr expr) (cddr expr)
-                                     (car (numeric-array-aref-entry expr)))
-       (:conv-r4)))
-    ((and (consp expr) (eq (car expr) 'the))
-     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-           (compile-expr (caddr expr)))
-       (:unbox-single)))
-    ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - * /)))
-     (let ((op (ecase (car expr) (+ :add) (- :sub) (* :mul) (/ :div))))
-       `(,@(compile-as-single (cadr expr))
-         ,@(compile-as-single (caddr expr))
-         (,op))))
-    ;; (abs x) -> raw magnitude, no box on the way in or out.
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs)))
-     `(,@(compile-as-single (cadr expr)) (:conv-r4) (:call "Math.AbsSingle")))
-    ;; Unary negate: (- x) -> native r4 neg.
-    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-))
-     `(,@(compile-as-single (cadr expr)) (:neg)))
-    (t
-     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-           (compile-expr expr))
-       (:unbox-single))))))
-
-(defun compile-single-binop (args op)
-  "Emit: compile-as-single a, compile-as-single b, <op>, conv.r4, newobj SingleFloat."
-  `(,@(compile-as-single (first args))
-    ,@(compile-as-single (second args))
-    (,op)
-    (:conv-r4)
-    (:newobj "SingleFloat")))
-
-(defun compile-single-cmp (args op)
-  "Emit native r4 comparison. OP is :lt :le :gt :ge :eq :ne.
-   Leaves an i4 (0 or 1) on stack.
-
-   See COMPILE-DOUBLE-CMP for why <= and >= negate the unordered comparison."
-  (let ((body (ecase op
-                (:lt (quote ((:clt))))
-                (:gt (quote ((:cgt))))
-                (:eq (quote ((:ceq))))
-                (:le (quote ((:cgt-un) (:ldc-i4 0) (:ceq))))
-                (:ge (quote ((:clt-un) (:ldc-i4 0) (:ceq))))
-                (:ne '((:ceq) (:ldc-i4 0) (:ceq))))))
-    `(,@(compile-as-single (first args))
-      ,@(compile-as-single (second args))
-      ,@body)))
-
-(defun %nary-fixnum-foldable-p (op args)
-  "True when (OP . ARGS) should keep folding into binary calls past the arity
-   cutoff below, because every step will take the native fixnum path.
-
-   The cutoff exists to stop a long argument list from expanding into a chain of
-   binary calls; the array form is one call instead. But it is keyed on the
-   count alone, so a fixnum-declared (+ x x ... x) of nine arguments falls to
-   Runtime.AddN, which takes LispObject[] -- and building that array costs MORE
-   than the chain it replaced. A fixnum declaration then made the code allocate
-   where the undeclared form allocated nothing, which is backwards.
-
-   Every argument has to be fixnum-typed for this: the fold re-tests the pair at
-   each step, and one generic argument puts the accumulator back on the boxed
-   path, where the chain has no advantage over the array.
-
-   Overflow is NOT asked about here, and must not be. Whether the whole sum fits
-   int64 is exactly what the range prover cannot show for an unbounded fixnum,
-   so requiring it would decline every case this exists for. The fold does not
-   need it: each binary step tests FIXNUM-ARITH-UNBOXED-SAFE-P for itself and
-   takes the promoting Runtime.Add when the proof fails, so an overflowing
-   intermediate still becomes a bignum. All this predicate decides is chain
-   versus array, and the chain is never less correct than the array."
-  (declare (ignore op))
-  (and (fixnum-typed-p (first args))
-       (fixnum-typed-p (second args))
-       (every #'fixnum-typed-p (cddr args))))
-
-(defun compile-add (args)
-  (case (length args)
-    (0 (emit-fixnum 0))
-    (1 (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args))))
-    (2
-     (cond
-       ;; Both args known decimal -> native System.Decimal add (scale preserved).
-       ((and (decimal-typed-p (first args)) (decimal-typed-p (second args))
-             (or (decimal-strong-typed-p (first args)) (decimal-strong-typed-p (second args))))
-        (compile-decimal-binop args :decimal-add))
-       ((decimal-float-mix-p args)
-        (compile-static-program-error *decimal-float-mix-error*))
-       ;; Fast path: both args known double-float -> native r8 add
-       ((and (double-float-typed-p (first args)) (double-float-typed-p (second args)))
-        (compile-double-binop args :add))
-       ;; Fast path: both args known single-float -> native r4 add
-       ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
-        (compile-single-binop args :add))
-       ;; Fast path: both args known fixnum AND no intermediate int64 overflow
-       ;; provable -> native int64 add. Otherwise fall to the promoting Runtime.Add
-       ;; so an overflowing result becomes a bignum.
-       ((fixnum-binop-native-p '+ args)
-        (compile-fixnum-binop args :add))
-       ;; Optimize (+ x 1) and (+ 1 x) to Increment
-       ((eql (second args) 1)
-        (compile-unary-call (list (first args)) "Runtime.Increment" "1+"))
-       ((eql (first args) 1)
-        (compile-unary-call (list (second args)) "Runtime.Increment" "1+"))
-       (t (compile-binary-call args "Runtime.Add"))))
-    (t (if (or (<= (length args) 8) (%nary-fixnum-foldable-p '+ args))
-           (compile-expr (cons '+ (cons (list '+ (first args) (second args)) (cddr args))))
-           `(,@(compile-args-array args) (:call "Runtime.AddN"))))))
-
-(defun compile-sub (args)
-  (case (length args)
-    (0 (compile-static-program-error "-: too few arguments: 0 (expected at least 1)"))
-    (1 (cond
-         ;; Native unary negate for a strongly-decimal operand (scale preserved). A bare
-         ;; #m literal is NOT strong, so (- #m1.5) degrades to a rational like other
-         ;; undeclared literal arithmetic.
-         ((decimal-strong-typed-p (first args))
-          `(,@(compile-as-decimal (first args)) (:decimal-neg) (:newobj "LispDecimal")))
-         ;; Native unary negate for float-typed operand.
-         ((double-float-typed-p (first args))
-          `(,@(compile-as-double (first args)) (:neg) (:newobj "DoubleFloat")))
-         ((single-float-typed-p (first args))
-          `(,@(compile-as-single (first args)) (:neg) (:conv-r4) (:newobj "SingleFloat")))
-         ;; Unary (- x): Subtract(0, x) would collapse -0.0 (0.0-0.0=+0.0), so use Negate
-         ;; (IEEE sign flip). Needed for signed-zero correctness of conjugate/eql.
-         (t (compile-unary-call (list (first args)) "Runtime.Negate" "-"))))
-    (2
-     (cond
-       ((and (decimal-typed-p (first args)) (decimal-typed-p (second args))
-             (or (decimal-strong-typed-p (first args)) (decimal-strong-typed-p (second args))))
-        (compile-decimal-binop args :decimal-sub))
-       ((decimal-float-mix-p args)
-        (compile-static-program-error *decimal-float-mix-error*))
-       ((and (double-float-typed-p (first args)) (double-float-typed-p (second args)))
-        (compile-double-binop args :sub))
-       ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
-        (compile-single-binop args :sub))
-       ((fixnum-binop-native-p '- args)
-        (compile-fixnum-binop args :sub))
-       ((eql (second args) 1)
-        (compile-unary-call (list (first args)) "Runtime.Decrement" "1-"))
-       (t (compile-binary-call args "Runtime.Subtract"))))
-    (t (if (or (<= (length args) 8) (%nary-fixnum-foldable-p '- args))
-           (compile-expr (cons '- (cons (list '- (first args) (second args)) (cddr args))))
-           `(,@(compile-args-array args) (:call "Runtime.SubtractN"))))))
-
-(defun compile-mul (args)
-  (case (length args)
-    (0 (emit-fixnum 1))
-    (1 (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args))))
-    (2
-     (cond
-       ((and (decimal-typed-p (first args)) (decimal-typed-p (second args))
-             (or (decimal-strong-typed-p (first args)) (decimal-strong-typed-p (second args))))
-        (compile-decimal-binop args :decimal-mul))
-       ((decimal-float-mix-p args)
-        (compile-static-program-error *decimal-float-mix-error*))
-       ((and (double-float-typed-p (first args)) (double-float-typed-p (second args)))
-        (compile-double-binop args :mul))
-       ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
-        (compile-single-binop args :mul))
-       ((fixnum-binop-native-p '* args)
-        (compile-fixnum-binop args :mul))
-       (t (compile-binary-call args "Runtime.Multiply"))))
-    (t (if (or (<= (length args) 8) (%nary-fixnum-foldable-p '* args))
-           (compile-expr (cons '* (cons (list '* (first args) (second args)) (cddr args))))
-           `(,@(compile-args-array args) (:call "Runtime.MultiplyN"))))))
-
-(defun compile-div (args)
-  (case (length args)
-    (0 (compile-static-program-error "/: too few arguments: 0 (expected at least 1)"))
-    (1 (compile-binary-call (list 1 (first args)) "Runtime.Divide"))
-    (2
-     (cond
-       ;; Both decimal -> native decimal divide (System.Decimal semantics: rounds
-       ;; to 28 significant digits, unlike CL's exact rational division).
-       ((and (decimal-typed-p (first args)) (decimal-typed-p (second args))
-             (or (decimal-strong-typed-p (first args)) (decimal-strong-typed-p (second args))))
-        (compile-decimal-binop args :decimal-div))
-       ((decimal-float-mix-p args)
-        (compile-static-program-error *decimal-float-mix-error*))
-       ((and (double-float-typed-p (first args)) (double-float-typed-p (second args)))
-        (compile-double-binop args :div))
-       ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
-        (compile-single-binop args :div))
-       (t (compile-binary-call args "Runtime.Divide"))))
-    (t (if (or (<= (length args) 8) (%nary-fixnum-foldable-p '/ args))
-           (compile-expr (cons '/ (cons (list '/ (first args) (second args)) (cddr args))))
-           `(,@(compile-args-array args) (:call "Runtime.DivideN"))))))
-
-;;; ============================================================
-;;; Call helpers
-;;; ============================================================
-
-(defun compile-static-program-error (msg)
-  "Emit CIL that unconditionally signals PROGRAM-ERROR with MSG."
-  `((:ldstr ,msg)
-    (:newobj "LispProgramError")
-    (:newobj "LispErrorException")
-    (:throw)))
-
-(defun compile-nary-comparison (args op method)
-  "Compile N-arg comparison (op a b c ...) as (and (op a b) (op b c) ...).
-   For N=2, directly emit binary call. For N>2, expand to let* + and."
-  (let ((n (length args)))
-    (cond
-      ((= n 0) (compile-static-program-error
-                 (format nil "~A: wrong number of arguments: 0 (expected >= 1)" op)))
-      ((= n 1)
-       ;; (< a) evaluates arg for side effects, returns T
-       `(,@(compile-expr (car args)) (:pop) ,@(emit-t)))
-      ((= n 2) (compile-binary-call args method))
-      (t
-       ;; Expand (op a b c ...) -> (let* ((t0 a) (t1 b) (t2 c) ...) (and (op t0 t1) (op t1 t2) ...))
-       (let* ((tmps (loop for i below n collect (intern (format nil "%%NARGT~A" i))))
-              (bindings (loop for tmp in tmps for arg in args collect `(,tmp ,arg)))
-              (pairs (loop for (t1 t2) on tmps while t2 collect `(,op ,t1 ,t2))))
-         (compile-expr `(let* ,bindings (and ,@pairs))))))))
-
-(defun simple-expr-p (expr)
-  "Return T if EXPR compiles to simple stack ops without try blocks.
-   Safe to leave on the evaluation stack while compiling subsequent exprs."
-  (cond ((null expr) t)
-        ((eq expr t) t)
-        ((numberp expr) t)
-        ((characterp expr) t)
-        ((stringp expr) t)
-        ;; A keyword is a constant. It must not reach LOOKUP-LOCAL below: the
-        ;; name fallback there can match a local of the same name (:CELL against
-        ;; a variable CELL), and whether it does depends on the package the
-        ;; compiler's own symbols ended up in, so the answer changed with the
-        ;; host that built the compiler.
-        ((keywordp expr) t)
-        ((symbolp expr)
-         ;; Simple if it's a lexical variable (not boxed, not symbol-macro)
-         (and (not (lookup-symbol-macro expr))
-              (lookup-local expr)
-              (not (boxed-var-p expr))))
-        ((and (consp expr) (eq (car expr) 'the))
-         (simple-expr-p (caddr expr)))
-        ((and (consp expr) (eq (car expr) 'quote)) t)
-        (t nil)))
-
-(defun compile-binary-call (args method &optional (fn-name ""))
-  ;; Pre-evaluate both args to temps so the stack is empty
-  ;; when each is compiled (CIL requires empty stack at try-block entry).
-  ;; Args are single-valued: never in tail position, never in MV context.
-  (unless (= (length args) 2)
-    (return-from compile-binary-call
-      (compile-static-program-error
-       (format nil "~a: wrong number of arguments: ~a (expected 2)" fn-name (length args)))))
-  ;; Fast path: if both args are simple, push directly without temp locals
-  (if (and (simple-expr-p (first args)) (simple-expr-p (second args)))
-      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
-        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (second args)))
-        (:call ,method))
-      (let ((t1 (gen-local "BA")) (t2 (gen-local "BB")))
-        `((:declare-local ,t1 "LispObject")
-          (:declare-local ,t2 "LispObject")
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))  (:stloc ,t1)
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (second args))) (:stloc ,t2)
-          (:ldloc ,t1) (:ldloc ,t2)
-          (:call ,method)))))
-
-(defun compile-ternary-call (args method &optional (fn-name ""))
-  (unless (= (length args) 3)
-    (return-from compile-ternary-call
-      (compile-static-program-error
-       (format nil "~a: wrong number of arguments: ~a (expected 3)" fn-name (length args)))))
-  (if (every #'simple-expr-p args)
-      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
-        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (second args)))
-        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (third args)))
-        (:call ,method))
-      (let ((t1 (gen-local "TA")) (t2 (gen-local "TB")) (t3 (gen-local "TC")))
-        `((:declare-local ,t1 "LispObject")
-          (:declare-local ,t2 "LispObject")
-          (:declare-local ,t3 "LispObject")
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))  (:stloc ,t1)
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (second args))) (:stloc ,t2)
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (third args)))  (:stloc ,t3)
-          (:ldloc ,t1) (:ldloc ,t2) (:ldloc ,t3)
-          (:call ,method)))))
-
-(defun compile-quaternary-call (args method &optional (fn-name ""))
-  (unless (= (length args) 4)
-    (return-from compile-quaternary-call
-      (compile-static-program-error
-       (format nil "~a: wrong number of arguments: ~a (expected 4)" fn-name (length args)))))
-  (if (every #'simple-expr-p args)
-      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
-        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (second args)))
-        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (third args)))
-        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (fourth args)))
-        (:call ,method))
-      (let ((t1 (gen-local "QA")) (t2 (gen-local "QB")) (t3 (gen-local "QC")) (t4 (gen-local "QD")))
-        `((:declare-local ,t1 "LispObject")
-          (:declare-local ,t2 "LispObject")
-          (:declare-local ,t3 "LispObject")
-          (:declare-local ,t4 "LispObject")
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))  (:stloc ,t1)
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (second args))) (:stloc ,t2)
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (third args)))  (:stloc ,t3)
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (fourth args))) (:stloc ,t4)
-          (:ldloc ,t1) (:ldloc ,t2) (:ldloc ,t3) (:ldloc ,t4)
-          (:call ,method)))))
-
-(defun compile-quinary-call (args method &optional (fn-name ""))
-  (unless (= (length args) 5)
-    (return-from compile-quinary-call
-      (compile-static-program-error
-       (format nil "~a: wrong number of arguments: ~a (expected 5)" fn-name (length args)))))
-  (if (every #'simple-expr-p args)
-      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
-        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (second args)))
-        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (third args)))
-        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (fourth args)))
-        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (fifth args)))
-        (:call ,method))
-      (let ((t1 (gen-local "QA")) (t2 (gen-local "QB")) (t3 (gen-local "QC"))
-            (t4 (gen-local "QD")) (t5 (gen-local "QE")))
-        `((:declare-local ,t1 "LispObject")
-          (:declare-local ,t2 "LispObject")
-          (:declare-local ,t3 "LispObject")
-          (:declare-local ,t4 "LispObject")
-          (:declare-local ,t5 "LispObject")
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))  (:stloc ,t1)
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (second args))) (:stloc ,t2)
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (third args)))  (:stloc ,t3)
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (fourth args))) (:stloc ,t4)
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (fifth args)))  (:stloc ,t5)
-          (:ldloc ,t1) (:ldloc ,t2) (:ldloc ,t3) (:ldloc ,t4) (:ldloc ,t5)
-          (:call ,method)))))
-
-(defun compile-unary-call (args method &optional (fn-name ""))
-  (unless (= (length args) 1)
-    (let ((errmsg (format nil "~a: wrong number of arguments: ~a (expected 1)" fn-name (length args))))
-      (return-from compile-unary-call
-        (compile-static-program-error errmsg))))
-  ;; Arg is single-valued: never in tail position, never in MV context
-  `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
-    (:call ,method)))
-
-(defun compile-append (args)
-  "Compile (append ...) with 0+ arguments.
-   Reduces multi-arg append to nested binary Runtime.Append calls."
-  (cond
-    ((null args) (emit-nil))
-    ((null (cdr args)) (compile-for-single-value (car args)))
-    ((null (cddr args)) (compile-binary-call args "Runtime.Append"))
-    (t ;; 3+ args: fold left into nested binary appends
-       (let ((acc (car args)))
-         (dolist (a (cdr args))
-           (setq acc (list 'append acc a)))
-         (compile-form acc)))))
-
-(defun compile-aref-native-index-call (arr idx-exprs method &optional (val nil val-p))
-  "Compile an array read/write call whose index arguments are lowered to raw
-   int64 on the stack (no Fixnum boxing); METHOD is one of the Runtime.*L
-   variants taking long indices. ARR (and VAL for setters) stay boxed
-   LispObject. Callers gate on every index being fixnum-typed-p. Mirrors the
-   compile-N-ary-call discipline: all-simple args push directly; otherwise
-   each arg is evaluated to a temp (Int64 temps for indices) so the stack is
-   empty whenever a non-simple subexpression is compiled."
-  (let ((all (append (list arr) idx-exprs (when val-p (list val)))))
-    (if (every #'simple-expr-p all)
-        `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-              (compile-expr arr))
-          ,@(loop for idx in idx-exprs append (compile-expr-to-long idx))
-          ,@(when val-p
-              (let ((*in-tail-position* nil) (*in-mv-context* nil))
-                (compile-expr val)))
-          (:call ,method))
-        (let ((arr-tmp (gen-local "NAA"))
-              (idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
-                                idx-exprs))
-              (val-tmp (when val-p (gen-local "NAV"))))
-          `((:declare-local ,arr-tmp "LispObject")
-            ,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
-            ,@(when val-p `((:declare-local ,val-tmp "LispObject")))
-            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                (compile-expr arr))
-            (:stloc ,arr-tmp)
-            ,@(loop for idx in idx-exprs
-                    for tk in idx-tmps
-                    append `(,@(compile-expr-to-long idx) (:stloc ,tk)))
-            ,@(when val-p
-                `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                      (compile-expr val))
-                  (:stloc ,val-tmp)))
-            (:ldloc ,arr-tmp)
-            ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
-            ,@(when val-p `((:ldloc ,val-tmp)))
-            (:call ,method))))))
-
-(defun %string-backing-read (entry idx fall-instrs boxp)
-  "A character read against STR's hoisted char[] buffer, with FALL-INSTRS as the
-   arm that runs when there is no buffer. BOXP leaves a character object
-   (LispChar.Make); otherwise the raw code stays as a native int.
-
-   The buffer slot is NIL whenever Runtime.BackingChars declined -- a LispString
-   still holding a System.String, or a character vector that is not simple
-   (adjustable, fill-pointered, displaced) or not rank 1. A simple character
-   LispVector, which is what (MAKE-ARRAY n :element-type 'CHARACTER) builds, is
-   fetched like a LispString's char[]. FALL-INSTRS is the typed call that ran before this
-   path existed, so declining costs the speed and nothing else. Only one arm
-   runs, so a subscript with a side effect is evaluated exactly once."
-  (let* ((back (third entry))
-         (fall (gen-label "SBFALL"))
-         (done (gen-label "SBDONE"))
-         (fast (if (simple-expr-p idx)
-                   `((:ldloc ,back)
-                     ,@(compile-index-to-long idx)
-                     (:conv-i)
-                     (:ldelem-u2)
-                     ,@(when boxp '((:call "LispChar.Make"))))
-                   (let ((tk (gen-local "SBI")))
-                     `((:declare-local ,tk "Int64")
-                       ,@(compile-index-to-long idx)
-                       (:stloc ,tk)
-                       (:ldloc ,back)
-                       (:ldloc ,tk)
-                       (:conv-i)
-                       (:ldelem-u2)
-                       ,@(when boxp '((:call "LispChar.Make"))))))))
-    (ecase (%backing-arm-for entry)
-      (:fast fast)
-      (:helper fall-instrs)
-      (:both `((:ldloc ,back)
-               (:brfalse ,fall)
-               ,@fast
-               (:br ,done)
-               (:label ,fall)
-               ,@fall-instrs
-               (:label ,done))))))
-
-(defun compile-string-char-code-as-long (str idx)
-  "Emit (char-code (schar STR IDX)) as a raw int64. When STR has a hoisted
-   char[] buffer the read is a bare ldelem against it with the typed call as the
-   other arm; otherwise it is the typed call alone."
-  (let ((back (string-backing-entry str)))
-    (if back
-        (%string-backing-read back idx (%string-char-code-call str idx) nil)
-        (%string-char-code-call str idx))))
-
-(defun %string-char-code-call (str idx)
-  "The typed call form: (char-code (schar STR IDX)) as a raw int64 (Runtime.CharCodeAtL).
-   STR stays a LispObject -- the runtime entry decides whether it is the simple
-   string it can read directly -- and IDX is lowered the way an array subscript
-   is. A non-simple subexpression is evaluated into a temp first, so the stack is
-   empty whenever one compiles."
-  (if (and (simple-expr-p str) (simple-expr-p idx))
-      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-            (compile-expr str))
-        ,@(compile-index-to-long idx)
-        (:call "Runtime.CharCodeAtL"))
-      (let ((str-tmp (gen-local "SCS"))
-            (idx-tmp (gen-local "SCI")))
-        `((:declare-local ,str-tmp "LispObject")
-          (:declare-local ,idx-tmp "Int64")
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-              (compile-expr str))
-          (:stloc ,str-tmp)
-          ,@(compile-index-to-long idx)
-          (:stloc ,idx-tmp)
-          (:ldloc ,str-tmp)
-          (:ldloc ,idx-tmp)
-          (:call "Runtime.CharCodeAtL")))))
-
-(defun compile-string-char-as-object (str idx)
-  "Emit (schar STR IDX), leaving the character on the stack. Hoisted buffer with
-   the typed call as the other arm, exactly as the code read is."
-  (let ((back (string-backing-entry str)))
-    (if back
-        (%string-backing-read back idx (%string-char-call str idx) t)
-        (%string-char-call str idx))))
-
-(defun %string-char-call (str idx)
-  "The typed call form: (schar STR IDX) as one call (Runtime.CharAtL), leaving the
-   character on the stack.
-
-   The value-position counterpart of COMPILE-STRING-CHAR-CODE-AS-LONG, and it
-   spills the same way. What it removes is what a generic call to a two-argument
-   builtin pays per element: the subscript boxed into a Fixnum, the symbol
-   lookup, and the virtual Invoke. STR stays a LispObject -- the runtime entry
-   is the one that decides whether it is the simple string it can read
-   directly -- and IDX is lowered the way an array subscript is, so an
-   undeclared index still goes in raw."
-  (if (and (simple-expr-p str) (simple-expr-p idx))
-      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-            (compile-expr str))
-        ,@(compile-index-to-long idx)
-        (:call "Runtime.CharAtL"))
-      (let ((str-tmp (gen-local "SAS"))
-            (idx-tmp (gen-local "SAI")))
-        `((:declare-local ,str-tmp "LispObject")
-          (:declare-local ,idx-tmp "Int64")
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-              (compile-expr str))
-          (:stloc ,str-tmp)
-          ,@(compile-index-to-long idx)
-          (:stloc ,idx-tmp)
-          (:ldloc ,str-tmp)
-          (:ldloc ,idx-tmp)
-          (:call "Runtime.CharAtL")))))
-
-(defun compile-backing-aref-as-long (entry idx fall-instrs)
-  "Emit (AREF V IDX) as a bare element load against V's hoisted buffer, leaving
-   a raw int64, with FALL-INSTRS as the arm that runs when there is no buffer.
-   The subscript is narrowed to a native int rather than an i4, so the CLR's own
-   bounds check still rejects a subscript outside the array (conv.i4 would wrap
-   one into range first).
-
-   The buffer slot is NIL whenever the fetch declined -- a fill-pointered or
-   adjustable vector, whose storage VECTOR-PUSH-EXTEND and ADJUST-ARRAY replace,
-   and anything that is not the declared array at all. FALL-INSTRS is the
-   per-element helper that ran before this path existed, so declining costs the
-   speed and nothing else. Only one arm runs, so a subscript with a side effect
-   is still evaluated exactly once."
-  (let ((back (third entry))
-        (kind (fourth entry))
-        (fall (gen-label "ABFALL"))
-        (done (gen-label "ABDONE")))
-    (let ((fast (if (simple-expr-p idx)
-                    `((:ldloc ,back)
-                      ,@(compile-index-to-long idx)
-                      (:conv-i)
-                      (,(%backing-ldelem kind)))
-                    (let ((tk (gen-local "NAI")))
-                      `((:declare-local ,tk "Int64")
-                        ,@(compile-index-to-long idx)
-                        (:stloc ,tk)
-                        (:ldloc ,back)
-                        (:ldloc ,tk)
-                        (:conv-i)
-                        (,(%backing-ldelem kind)))))))
-      (ecase (%backing-arm-for entry)
-        (:fast fast)
-        (:helper fall-instrs)
-        (:both `((:ldloc ,back)
-                 (:brfalse ,fall)
-                 ,@fast
-                 (:br ,done)
-                 (:label ,fall)
-                 ,@fall-instrs
-                 (:label ,done)))))))
-
-(defun compile-backing-aref-set (entry idx val fall-instrs)
-  "Emit (SETF (AREF V IDX) VAL) against V's hoisted buffer, with FALL-INSTRS as
-   the arm that runs when there is no buffer. The value is range-checked for the
-   narrow kinds first -- the opcode's narrowing would wrap an out-of-width value
-   where the boxed store path signals -- and left on the stack as a RAW int64,
-   as FALL-INSTRS must leave it too. The caller boxes it once, after the arms
-   join: boxed in each arm, the box sat before the join label, where the
-   peephole that drops a box nobody reads (statement position) cannot see it.
-
-   Only one arm runs, so VAL is evaluated exactly once even though both arms
-   contain code to evaluate it."
-  (let* ((back (third entry))
-         (kind (fourth entry))
-         (chk (%backing-store-check-instrs kind (fifth entry) val))
-         (tk (gen-local "NAI"))
-         (vk (gen-local "NAV"))
-         (fall (gen-label "ABFALL"))
-         (done (gen-label "ABDONE"))
-         (fast `((:declare-local ,tk "Int64")
-                 (:declare-local ,vk "Int64")
-                 ,@(compile-index-to-long idx)
-                 (:stloc ,tk)
-                 ,@(compile-expr-to-long val)
-                 ,@chk
-                 (:stloc ,vk)
-                 (:ldloc ,back)
-                 (:ldloc ,tk)
-                 (:conv-i)
-                 (:ldloc ,vk)
-                 (,(%backing-stelem kind))
-                 (:ldloc ,vk))))
-    (ecase (%backing-arm-for entry)
-      (:fast fast)
-      (:helper fall-instrs)
-      (:both `((:ldloc ,back)
-               (:brfalse ,fall)
-               ,@fast
-               (:br ,done)
-               (:label ,fall)
-               ,@fall-instrs
-               (:label ,done))))))
-
-
-(defun %backing-duplicable-p (form)
-  "T when FORM may be compiled twice. Compiling is not a pure function of the
-   source: LOAD-TIME-VALUE takes a slot, DEFMETHOD and DEFSTRUCT run at assembly
-   time whether or not their branch is taken, and EVAL-WHEN can do anything. A
-   body containing any of those would get two of whatever it does, so it keeps
-   the per-access test instead. Crude in the safe direction: an unfamiliar
-   operator is assumed unsafe only if it is on this list, and the list is of
-   things whose compile-time effect is known, so a false YES is possible and is
-   caught by the test suites rather than by this."
-  (cond ((not (consp form)) t)
-        ((and (symbolp (car form))
-              (member (symbol-name (car form))
-                      '("LOAD-TIME-VALUE" "DEFMETHOD" "DEFGENERIC" "DEFSTRUCT"
-                        "DEFCLASS" "EVAL-WHEN" "DEFCONSTANT" "DEFPACKAGE"
-                        "DEFINE-COMPILER-MACRO" "DEFSETF" "DEFINE-SETF-EXPANDER"
-                        "DEFMACRO" "IN-PACKAGE")
-                      :test #'string=))
-         nil)
-        (t (and (%backing-duplicable-p (car form))
-                (%backing-duplicable-p (cdr form))))))
-
-(defun %struct-backing-length (entry)
-  "How many elements ENTRY's raw slot array must have for every position its
-   layout names to be in range: one more than the largest position."
-  (1+ (or (loop for cell in (cdr (cddddr entry))
-                when (and cell (>= (car cell) 0)) maximize (car cell))
-           -1)))
-
-(defun unswitch-array-backing (entries body thunk &optional struct-entries)
-  "Emit BODY's instructions twice, once with every hoisted buffer known present
-   and once with none of them used, behind a single test per buffer. A body of
-   more than *UNSWITCH-BODY-LIMIT* instructions is emitted once instead, with
-   the test at each access, when that is the smaller of the two.
-
-   The test a hoisted access would otherwise carry is loop-invariant, and
-   leaving it at the access is what costs. Measured on the array-walk kernel:
-   the per-access form turned the inner loop from a 7-instruction single block
-   with a fall-through back-edge into 11 instructions across 4 blocks, because
-   the test also stopped the JIT hoisting the data base and the element count
-   out of the loop. Both are consequences of where the test is, not of its
-   existence, so it moves here and the fast copy goes back to the original
-   block.
-
-   All buffers are tested together rather than one unswitch per buffer: n
-   buffers would otherwise want 2^n copies, and a body that hoists two arrays
-   and gets one of them is rare enough not to pay for that.
-
-   STRUCT-ENTRIES are hoisted structure raw slot arrays (EXTRACT-STRUCT-BACKING-
-   LOCALS, which already keeps only those whose slots are reached from inside
-   a loop). Each is tested for being present AND for being as long as its
-   layout says. The length cannot be short for an array the fetch handed out
-   -- the fetch matched the layout version -- so that half is not for
-   correctness: it is what lets the JIT drop the bounds check on every
-   constant-position access in the fast copy, which it cannot do from the
-   null test alone. In the slow copy a structure access keeps its per-access
-   test, because the copy is taken when ANY buffer was missing, not
-   necessarily that one."
-  (let* ((arrays (and entries
-                      (some (lambda (e)
-                              (%var-iterated-access-p
-                               body (first e) nil
-                               (if (eq (fourth e) :char)
-                                   (function %tree-finds-schar-p)
-                                   (function %tree-finds-aref-p))))
-                            entries)))
-         (structs (and struct-entries (%backing-duplicable-p body))))
-    (if (or (not (or arrays structs))
-            (not (%backing-duplicable-p body)))
-        (funcall thunk)
-        (let* ((slow (gen-label "ABUSLOW"))
-               (done (gen-label "ABUDONE"))
-               (tests `(,@(when arrays
-                            (loop for e in entries
-                                  append `((:ldloc ,(third e)) (:brfalse ,slow))))
-                        ,@(loop for e in struct-entries
-                                append `((:ldloc ,(struct-backing-slot e))
-                                         (:brfalse ,slow)
-                                         (:ldloc ,(struct-backing-slot e))
-                                         (:ldlen)
-                                         (:conv-i4)
-                                         (:ldc-i4 ,(%struct-backing-length e))
-                                         (:blt ,slow)))))
-               (fast (let ((*backing-arm* (if arrays :fast *backing-arm*))
-                           (*array-backing-tested*
-                             (if arrays
-                                 (append (mapcar #'third entries)
-                                         (if (eq *backing-arm* :fast)
-                                             *array-backing-tested*
-                                             '()))
-                                 *array-backing-tested*))
-                           (*struct-backing-known* (append struct-entries
-                                                           *struct-backing-known*)))
-                       (funcall thunk)))
-               (slow-copy (let ((*backing-arm* (if arrays :helper *backing-arm*))
-                                (*array-backing-tested* (if arrays '() *array-backing-tested*)))
-                            (funcall thunk)))
-               (plain (and (> (length fast) *unswitch-body-limit*)
-                           (funcall thunk))))
-          ;; A body too large to be a tight loop takes whichever of the two
-          ;; shapes is smaller: two copies, or one with the test at each
-          ;; access (which carries both arms of every access, so it is not
-          ;; always the smaller).
-          (if (and plain
-                   (< (length plain) (+ (length tests) (length fast) (length slow-copy))))
-              plain
-              `(,@tests
-                ,@fast
-                (:br ,done)
-                (:label ,slow)
-                ,@slow-copy
-                (:label ,done)))))))
-
-(defun array-backing-prologue (entries)
-  "Instructions that fetch each hoisted element buffer once, right after the
-   variables are bound. At (safety 0) the fetch answers NIL when it declines --
-   a fill-pointered or adjustable vector, whose storage VECTOR-PUSH-EXTEND and
-   ADJUST-ARRAY replace, a displaced one -- and every access carries an arm that
-   runs the per-element helper for exactly that case, so a declaration this
-   cannot honour costs the speed and never the answer. Above (safety 0) such a
-   value is a TYPE-ERROR from the fetch itself (see %BACKING-FETCH-CALL)."
-  (loop for e in entries
-        for kind = (fourth e)
-        append `((:declare-local ,(third e) ,(%backing-slot-type kind))
-                 (:ldloc ,(second e))
-                 ,@(if (eq (sixth e) :checked)
-                       `((:ldc-i4 ,(or (fifth e) 0))
-                         (:call ,(%backing-narrow-fetch-call kind)))
-                       `((:call ,(%backing-fetch-call kind))))
-                 (:stloc ,(third e)))))
-
-(defun %backing-narrow-fetch-call (kind)
-  "The fetch of a :CHECKED entry (EXTRACT-ARRAY-BACKING-LOCALS): the *Checked
-   entry's tests, and the vector's element type has to be the declared one too,
-   by its narrow width (%ELEMENT-NARROW-WIDTH, 0 when the element type is the
-   buffer's own). The *Checked entry matches only the buffer, so a FIXNUM vector
-   passes for an (UNSIGNED-BYTE 32) one. A false declaration is a TYPE-ERROR,
-   as in SBCL above (safety 0)."
-  (ecase kind
-    (1 "Runtime.BackingU8Narrow") (2 "Runtime.BackingU16Narrow")
-    (3 "Runtime.BackingI32Narrow") (4 "Runtime.BackingI64Narrow")))
-
-(defun %aref-arr-temp (arr)
-  "Split the array operand of a numeric AREF into three instruction lists:
-   what to DECLARE, what to evaluate UP FRONT, and how to LOAD it where the
-   call wants it.
-
-   A plain lexical local is pure, so it declares nothing, costs nothing up
-   front and is simply loaded in place. A structure accessor call is not pure
-   and must be evaluated FIRST, into a temp: the emitters below lower
-   non-simple subscripts into temps before they load the array, and moving a
-   call past a subscript would evaluate the two in the wrong order."
-  (if (simple-expr-p arr)
-      (values '() '()
-              (let ((*in-tail-position* nil) (*in-mv-context* nil))
-                (compile-expr arr)))
-      (let ((tmp (gen-local "NAA")))
-        (values `((:declare-local ,tmp "LispObject"))
-                `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                      (compile-expr arr))
-                  (:stloc ,tmp))
-                `((:ldloc ,tmp))))))
-
-(defun compile-numeric-aref-as-long (arr idxs rank)
-  "Emit (aref ARR IDX...) on a numeric-backed array as a raw int64.
-
-   When the variable has a hoisted element buffer, the read is a bare ldelem
-   against it with the per-element helper as the other arm: the buffer slot is
-   NIL whenever the fetch declined, and declining has to cost speed rather than
-   correctness. Everything else compiles to the helper alone."
-  (let ((helper (%numeric-aref-helper-as-long arr idxs rank))
-        (back (and (= rank 1) (array-backing-entry (list* 'aref arr idxs)))))
-    (if back
-        (compile-backing-aref-as-long back (first idxs) helper)
-        helper)))
-
-(defun %numeric-aref-helper-as-long (arr idxs rank)
-  "Emit (aref ARR IDX...) on a proven numeric-backed array as a raw int64 on
-   the stack (Runtime.ArefNum*L). ARR is a plain lexical local or a structure
-   accessor call (numeric-array-aref-info); non-simple indices are evaluated to
-   Int64 temps first so the stack is empty whenever a non-simple subexpression
-   compiles, and ARR goes into a temp ahead of them when it is not a local."
-  (let ((method (ecase rank
-                  (1 "Runtime.ArefNumL")
-                  (2 "Runtime.ArefNum2DL")
-                  (3 "Runtime.ArefNum3DL"))))
-    (if (every #'simple-expr-p idxs)
-        `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-              (compile-expr arr))
-          ,@(loop for idx in idxs append (compile-index-to-long idx))
-          (:call ,method))
-        (multiple-value-bind (arr-decl arr-pre arr-load) (%aref-arr-temp arr)
-          (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
-                                  idxs)))
-            `(,@arr-decl
-              ,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
-              ,@arr-pre
-              ,@(loop for idx in idxs
-                      for tk in idx-tmps
-                      append `(,@(compile-index-to-long idx) (:stloc ,tk)))
-              ,@arr-load
-              ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
-              (:call ,method)))))))
-
-(defun compile-numeric-aref-set (arr idxs val rank)
-  "Emit (setf (aref ARR IDX...) VAL) on a numeric-backed array, boxed value on
-   the stack. Hoisted buffer with a helper arm, exactly as the read is."
-  (let ((helper (%numeric-aref-helper-set arr idxs val rank))
-        (back (and (= rank 1) (array-backing-entry (list* 'aref arr idxs)))))
-    `(,@(if back
-            (compile-backing-aref-set back (first idxs) val helper)
-            helper)
-      (:call "Fixnum.Make"))))
-
-(defun %numeric-aref-helper-set (arr idxs val rank)
-  "Emit (setf (aref ARR IDX...) VAL) on a numeric-backed array with the value
-   lowered to a raw int64 (Runtime.ArefSetNum*L; range-checked store, returns
-   the stored long). Leaves that RAW long on the stack; COMPILE-NUMERIC-AREF-SET
-   boxes it for the general setf contract, and in statement position the
-   peephole (P5 family) deletes the box."
-  (let ((method (ecase rank
-                  (1 "Runtime.ArefSetNumL")
-                  (2 "Runtime.ArefSetNum2DL")
-                  (3 "Runtime.ArefSetNum3DL"))))
-    (if (and (every #'simple-expr-p idxs) (simple-expr-p val))
-        `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-              (compile-expr arr))
-          ,@(loop for idx in idxs append (compile-index-to-long idx))
-          ,@(compile-expr-to-long val)
-          (:call ,method))
-        (multiple-value-bind (arr-decl arr-pre arr-load) (%aref-arr-temp arr)
-          (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
-                                  idxs))
-                (val-tmp (gen-local "NAV")))
-            `(,@arr-decl
-              ,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
-              (:declare-local ,val-tmp "Int64")
-              ,@arr-pre
-              ,@(loop for idx in idxs
-                      for tk in idx-tmps
-                      append `(,@(compile-index-to-long idx) (:stloc ,tk)))
-              ,@(compile-expr-to-long val)
-              (:stloc ,val-tmp)
-              ,@arr-load
-              ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
-              (:ldloc ,val-tmp)
-              (:call ,method)))))))
-
-(defvar *float-aref-set-no-backing* nil
-  "Bound to T while COMPILE-NUMERIC-AREF-SET-FLOAT builds its own helper arm, so
-   that arm is the per-element store and not the hoisted one again.")
-
-(defun %float-backing-entry (arr idxs rank)
-  "ARR's hoisted double[] / float[] entry for a rank-1 access, or NIL."
-  (and (= rank 1)
-       (not *float-aref-set-no-backing*)
-       (let ((e (array-backing-entry (list* 'aref arr idxs))))
-         (and e (member (fourth e) '(:f64 :f32)) e))))
-
-(defun compile-numeric-aref-float (arr idxs rank)
-  "Emit (aref ARR IDX...) on a proven float-backed numeric array as a native
-   r8 (double) on the stack. Mirrors compile-numeric-aref-as-long but leaves a
-   raw double and never boxes. single-float backing widens to double here;
-   callers narrow with conv.r4. A local whose double[] / float[] was hoisted at
-   its binding is read with a bare ldelem, with the per-element helper as the
-   arm for an array the fetch declined."
-  (let ((helper (%numeric-aref-float-helper arr idxs rank))
-        (back (%float-backing-entry arr idxs rank)))
-    (if back
-        (compile-backing-aref-as-long back (first idxs) helper)
-        helper)))
-
-(defun %numeric-aref-float-helper (arr idxs rank)
-  "COMPILE-NUMERIC-AREF-FLOAT through the per-element helper Runtime.ArefNum*D."
-  (let ((method (ecase rank
-                  (1 "Runtime.ArefNumD")
-                  (2 "Runtime.ArefNum2DD")
-                  (3 "Runtime.ArefNum3DD"))))
-    (if (every #'simple-expr-p idxs)
-        `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-              (compile-expr arr))
-          ,@(loop for idx in idxs append (compile-index-to-long idx))
-          (:call ,method))
-        (multiple-value-bind (arr-decl arr-pre arr-load) (%aref-arr-temp arr)
-          (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
-                                  idxs)))
-            `(,@arr-decl
-              ,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
-              ,@arr-pre
-              ,@(loop for idx in idxs
-                      for tk in idx-tmps
-                      append `(,@(compile-index-to-long idx) (:stloc ,tk)))
-              ,@arr-load
-              ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
-              (:call ,method)))))))
-
-(defun compile-numeric-aref-set-float (arr idxs val rank kind)
-  "Emit (setf (aref ARR IDX...) VAL) on a float-backed numeric array. VAL is
-   lowered to a native r8 (single-typed values widen with conv.r8) and stored
-   via Runtime.ArefSetNum*D (narrows to float for single backing). Leaves the
-   value BOXED for the setf contract; peephole removes it in statement position."
-  (let ((method (ecase rank
-                  (1 "Runtime.ArefSetNumD")
-                  (2 "Runtime.ArefSetNum2DD")
-                  (3 "Runtime.ArefSetNum3DD")))
-        (box (ecase kind
-               (:single '((:conv-r4) (:newobj "SingleFloat")))
-               (:double '((:newobj "DoubleFloat")))))
-        (back (%float-backing-entry arr idxs rank)))
-    (flet ((val-as-double ()
-             (if (eq kind :single)
-                 `(,@(compile-as-single val) (:conv-r8))
-                 (compile-as-double val))))
-      (if back
-          ;; Hoisted buffer: a bare stelem, with the helper store (which this
-          ;; same function emits without BACK) as the arm for a declined fetch.
-          ;; Both arms leave the raw r8; the box is made once after they join.
-          (let* ((fall-instrs
-                   (let ((full (let ((*float-aref-set-no-backing* t))
-                                 (compile-numeric-aref-set-float arr idxs val rank kind))))
-                     (butlast full (length box))))
-                 (tk (gen-local "NAI"))
-                 (vk (gen-local "NAV"))
-                 (fall (gen-label "ABFALL"))
-                 (done (gen-label "ABDONE"))
-                 (fast `((:declare-local ,tk "Int64")
-                         (:declare-local ,vk "Double")
-                         ,@(compile-index-to-long (first idxs))
-                         (:stloc ,tk)
-                         ,@(val-as-double)
-                         (:stloc ,vk)
-                         (:ldloc ,(third back))
-                         (:ldloc ,tk)
-                         (:conv-i)
-                         (:ldloc ,vk)
-                         (,(%backing-stelem (fourth back)))
-                         (:ldloc ,vk))))
-            `(,@(ecase (%backing-arm-for back)
-                  (:fast fast)
-                  (:helper fall-instrs)
-                  (:both `((:ldloc ,(third back))
-                           (:brfalse ,fall)
-                           ,@fast
-                           (:br ,done)
-                           (:label ,fall)
-                           ,@fall-instrs
-                           (:label ,done))))
-              ,@box))
-      (if (and (every #'simple-expr-p idxs) (simple-expr-p val))
-          `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                (compile-expr arr))
-            ,@(loop for idx in idxs append (compile-index-to-long idx))
-            ,@(val-as-double)
-            (:call ,method)
-            ,@box)
-          (multiple-value-bind (arr-decl arr-pre arr-load) (%aref-arr-temp arr)
-            (let ((idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "NAI"))
-                                    idxs))
-                  (val-tmp (gen-local "NAV")))
-              `(,@arr-decl
-                ,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
-                (:declare-local ,val-tmp "Double")
-                ,@arr-pre
-                ,@(loop for idx in idxs
-                        for tk in idx-tmps
-                        append `(,@(compile-index-to-long idx) (:stloc ,tk)))
-                ,@(val-as-double)
-                (:stloc ,val-tmp)
-                ,@arr-load
-                ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
-                (:ldloc ,val-tmp)
-                (:call ,method)
-                ,@box))))))))
-
-;;; LIST / LIST* build their conses inline for a small, fixed argument count.
-;;;
-;;; Both used to hand their arguments to a runtime function through an array, so
-;;; the call cost 24 + 8n bytes on top of the conses it returned. Writing the same
-;;; conses by hand already cost exactly the conses and nothing else. Measured
-;;; against SBCL -- whose cons is 16 bytes to a .NET object's 32, so 2x is the
-;;; floor here -- (cons a (cons b nil)) sat exactly on that floor while
-;;; (list a b) was 40 bytes above it. LIST is in every library there is.
-;;;
-;;; Left-to-right argument order is preserved: nested CONS evaluates its car
-;;; before its cdr. The bound keeps the emitted nesting from growing without
-;;; limit; past it the array is the cheaper shape.
-
-(defparameter +inline-list-max-args+ 8
-  "Longest LIST / LIST* call whose conses are emitted inline instead of through
-   the args-array runtime entry.")
-
-(defun %nested-cons-form (args tail)
-  "(CONS a1 (CONS a2 ... TAIL)) for ARGS = (a1 a2 ...)."
-  (let ((form tail))
-    (dolist (a (reverse args) form)
-      (setq form `(cons ,a ,form)))))
-
-(defun compile-list-call (args)
-  (cond
-    ((null args) (emit-nil))
-    ((<= (length args) +inline-list-max-args+)
-     (compile-expr (%nested-cons-form args nil)))
-    (t `(,@(compile-args-array args)
-         (:call "Runtime.List")
-         (:call "MultipleValues.Primary")))))
-
-(defun compile-list-star-call (args)
-  (cond
-    ((null args) (error "LIST* requires at least one argument"))
-    ;; (LIST* x) is x. Compiling it as such removes a call, and there is no cons
-    ;; to build.
-    ((null (cdr args)) (compile-for-single-value (car args)))
-    ((<= (length args) +inline-list-max-args+)
-     (compile-expr (%nested-cons-form (butlast args) (car (last args)))))
-    (t `(,@(compile-args-array args)
-         (:call "Runtime.ListStar")))))
-
-(defun compile-gethash (args)
-  (let ((nargs (length args)))
-    (cond
-      ((< nargs 2) (compile-static-program-error "GETHASH: too few arguments (expected 2-3)"))
-      ((> nargs 3) (compile-static-program-error "GETHASH: too many arguments (expected 2-3)"))
-      (t
-       ;; The arguments are single-valued wherever the GETHASH form is: a
-       ;; table from a function that returns more than one value is its
-       ;; primary value, also when the GETHASH is in tail position or inside
-       ;; MULTIPLE-VALUE-BIND.
-       `(,@(compile-value-args (list (first args) (second args)
-                                     (if (= nargs 3) (third args) '(:code (:ldnull)))))
-         (:call "Runtime.Gethash"))))))
-
-(defun compile-value-args (items)
-  "Push the single value of each of ITEMS, left to right, for a known-function
-   intrinsic call. An item is a form, or (:CODE . instructions) pushed as is.
-   Code that leaves a protected region or opens one (CATCH, HANDLER-CASE,
-   UNWIND-PROTECT, a loop exited with LEAVE) needs an empty evaluation stack,
-   and the values of the items before it would be on it, so when any item after
-   the first has such code every value is taken into a temp first."
-  (let ((codes (let ((*in-tail-position* nil) (*in-mv-context* nil))
-                 (mapcar (lambda (it)
-                           (if (and (consp it) (eq (car it) :code))
-                               (cdr it)
-                               (compile-expr it)))
-                         items))))
-    (if (notany #'%instrs-need-empty-stack-p (cdr codes))
-        (apply #'append codes)
-        (let ((temps (loop repeat (length codes) collect (gen-local "VA"))))
-          (append (loop for code in codes
-                        for tmp in temps
-                        append `((:declare-local ,tmp "LispObject") ,@code (:stloc ,tmp)))
-                  (loop for tmp in temps collect `(:ldloc ,tmp)))))))
-
-(defun compile-puthash (args)
-  "Compile (puthash key table value)."
-  `(,@(compile-value-args args)
-    (:call "Runtime.Puthash")))
-
-(defun compile-values-call (args)
-  (cond
-    ;; (values): a shared marker, no array and no wrapper to build.
-    ((null args) '((:call "MultipleValues.Values0")))
-    ;; (values x) is "the primary value of x, published as the only value", which
-    ;; is exactly what MULTIPLEVALUES.PRIMARY does -- and it publishes through a
-    ;; per-thread cached array, so nothing is allocated. Going through the general
-    ;; entry built a LispObject[1] the callee then threw away, 32 bytes a call.
-    ((null (cdr args))
-     `(,@(let ((*in-mv-context* t)) (compile-expr (car args)))
-       (:call "MultipleValues.Primary")))
-    ;; In a tail position with a value mode (the tail of a body whose caller
-    ;; passed one, or the form of a capture in this body): the values in the
-    ;; form the mode names, without an MvReturn (MultipleValues.ValuesNMode).
-    ((and *in-tail-position* (<= 2 (length args) 4) (%mv-mode-local))
-     (let* ((da (compile-direct-call-args args))
-            (temps (car da)))
-       `(,@(cdr da)
-         ,@(loop for tmp in temps append `((:ldloc ,tmp)))
-         ,@(%mv-mode-push)
-         (:call ,(ecase (length args)
-                   (2 "MultipleValues.Values2Mode")
-                   (3 "MultipleValues.Values3Mode")
-                   (4 "MultipleValues.Values4Mode"))))))
-    ;; Two values: the shape TRUNCATE, FLOOR, ROUND, GETHASH and INTERN return, and
-    ;; the one the argument array cost the most on (40 of the 64 bytes a
-    ;; multiple-value return allocated). RUNTIME.VALUES2 takes them as arguments.
-    ((= (length args) 2)
-     `(,@(compile-binary-call args "Runtime.Values2")))
-    (t `(,@(compile-args-array args)
-         (:call "Runtime.Values")))))
-
-(defun compile-subseq (args)
-  "Compile (subseq seq start &optional end)."
-  (let ((nargs (length args)))
-    (cond
-      ((or (< nargs 2) (> nargs 3))
-       ;; Wrong number of args -> PROGRAM-ERROR
-       (compile-expr '(error 'program-error)))
-      (t
-       ;; Single-valued arguments wherever the SUBSEQ form is (see GETHASH).
-       `(,@(compile-value-args (list (first args) (second args) (third args)))
-         (:call "Runtime.Subseq"))))))
-
-(defun compile-concatenate (args)
-  "Compile (concatenate result-type seq1 seq2 ...)."
-  (if (null args)
-      (compile-expr '(error 'program-error))
-      (let ((rt-tmp (gen-local "RTTYP"))
-            (arr-tmp (gen-local "CATARR")))
-        `((:declare-local ,rt-tmp "LispObject")
-          (:declare-local ,arr-tmp "LispObject[]")
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
-          (:stloc ,rt-tmp)
-          ,@(compile-args-array (cdr args))
-          (:stloc ,arr-tmp)
-          (:ldloc ,rt-tmp)
-          (:ldloc ,arr-tmp)
-          (:call "Runtime.Concatenate")))))
-
-(defun compile-args-array (args)
-  "Compile arguments into a LispObject[] array on the stack.
-   Pre-evaluates all args to temps so the stack is empty during
-   each compile-expr (CIL requires empty stack at try-block entry).
-   Args are never in tail position and receive a single value each."
-  (let ((n (length args)))
-    (if (zerop n)
-        `((:ldc-i4 0) (:newarr "LispObject"))
-        (let ((temps (loop for a in args collect (gen-local "AA"))))
-          `(,@(loop for arg in args
-                    for tmp in temps
-                    append `((:declare-local ,tmp "LispObject")
-                             ,@(let ((*in-tail-position* nil)
-                                     (*in-mv-context* nil))
-                                 (compile-expr arg)) (:stloc ,tmp)))
-            (:ldc-i4 ,n)
-            (:newarr "LispObject")
-            ,@(loop for tmp in temps
-                    for i from 0
-                    append `((:dup) (:ldc-i4 ,i) (:ldloc ,tmp) (:stelem-ref))))))))
-
-;;; ------------------------------------------------------------
-;;; (unsigned-byte 64) arrays: the runtime keeps the elements as their bits
-;;; (a ulong[]). On an array known to hold them, AREF reads the bits as an
-;;; int64 and (SETF AREF) stores bits, so a word at or above 2^63 is a bignum
-;;; only where a value has to be boxed. The 64-bit lane takes such a read as an
-;;; operand that is already exact (U64-PLAN).
-;;; ------------------------------------------------------------
-
-(defun %u64-aref-helper-bits (arr idx)
-  "(AREF ARR IDX) as the element's bits through Runtime.ArefU64Bits, which also
-   reads any other array (a declaration that does not hold, a non-simple
-   vector) and then checks the value is an (unsigned-byte 64)."
-  (if (simple-expr-p idx)
-      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-            (compile-expr arr))
-        ,@(compile-index-to-long idx)
-        (:call "Runtime.ArefU64Bits"))
-      (multiple-value-bind (arr-decl arr-pre arr-load) (%aref-arr-temp arr)
-        (let ((tk (gen-local "NAI")))
-          `(,@arr-decl
-            (:declare-local ,tk "Int64")
-            ,@arr-pre
-            ,@(compile-index-to-long idx)
-            (:stloc ,tk)
-            ,@arr-load
-            (:ldloc ,tk)
-            (:call "Runtime.ArefU64Bits"))))))
-
-(defun compile-u64-aref-bits (arr idx)
-  "Emit (AREF ARR IDX) on a rank-1 (unsigned-byte 64) array as the element's
-   bits, an int64 on the stack. A hoisted buffer is read with ldelem.i8, with
-   the helper as the arm for an array the fetch declined."
-  (let ((helper (%u64-aref-helper-bits arr idx))
-        (back (array-backing-entry (list 'aref arr idx))))
-    (if (and back (eq (fourth back) :u64))
-        (compile-backing-aref-as-long back idx helper)
-        helper)))
-
-(defun compile-as-u64-bits (val)
-  "Emit VAL as the bits of an (unsigned-byte 64), an int64 on the stack. A
-   value that is not an integer in [0, 2^64) signals a TYPE-ERROR, as the
-   store into such an array does on the generic path.
-
-   An element read of another (unsigned-byte 64) array is its bits as they
-   are; an expression the 64-bit lane can compute is computed there, with its
-   generic path (taken when an operand is not what the lane needs) checked
-   once at the end; an int64 is checked to be non-negative; anything else is
-   computed boxed and checked."
-  (let ((*in-tail-position* nil) (*in-mv-context* nil))
-    (cond
-      ((numeric-array-aref-u64-p val)
-       (compile-u64-aref-bits (cadr val) (caddr val)))
-      ((u64-native-local-p val)
-       `((:ldloc ,(u64-native-local-p val))))
-      ((let* ((*u64-leaves* nil)
-              (plan (u64-plan val :exact)))
-         (when (and plan
-                    (not (and (eq (car plan) :leaf) (eq (third plan) :obj))))
-           (let* ((leaves (reverse *u64-leaves*))
-                  (slow (gen-label "U64SSLOW"))
-                  (done (gen-label "U64SDONE"))
-                  (guards (remove-if-not #'fourth leaves)))
-             (%u64-alias-leaf-copies
-              `(,@(%u64-leaf-code leaves)
-                ,@(loop for (l) in guards
-                        append `((:ldloc ,l) (:call "Runtime.IsU64") (:brfalse ,slow)))
-                ,@(%u64-fast plan)
-                ,@(when guards
-                    `((:br ,done)
-                      (:label ,slow)
-                      ,@(%u64-generic plan)
-                      (:call "Runtime.U64Bits")
-                      (:label ,done))))
-              leaves)))))
-      ((fixnum-exact-p val)
-       `(,@(compile-as-long val)
-         (:call "Runtime.CheckStoreU64")))
-      (t
-       `(,@(compile-expr val)
-         (:call "Runtime.U64Bits"))))))
-
-(defun %u64-low-bits-plan (expr)
-  "A plan computing the low 64 bits of EXPR in the 64-bit lane, as
-   (PLAN . LEAVES), when EXPR is arithmetic on at least one (unsigned-byte 64)
-   operand held as its bits (a local, an array element, an inline call) and on
-   no operand that would have to be computed boxed. Else NIL.
-
-   For a binding whose every value fits an int64 (a declared (UNSIGNED-BYTE 32),
-   or a proven range), those bits read as an int64 are the value itself: a
-   half of a 64-bit word, (LOGAND W #xFFFFFFFF) or (LDB (BYTE 32 32) W), is
-   then never boxed on its way into the binding."
-  (let* ((expr (fold-typed-operand expr))
-         (*u64-leaves* nil)
-         (plan (and (consp expr) (u64-plan-compound expr :mod))))
-    (when (and plan
-               (not (eq (car plan) :leaf))
-               (some (lambda (l) (eq (second l) :bits)) *u64-leaves*)
-               (notany (lambda (l) (eq (second l) :obj)) *u64-leaves*))
-      (cons plan (reverse *u64-leaves*)))))
-
-(defun compile-int-slot-init (expr)
-  "COMPILE-EXPR-TO-LONG for the init of a LET binding held in a raw Int64 slot,
-   whose every value is known to fit an int64 (by its declaration or by a range
-   proof). Arithmetic on (unsigned-byte 64) words is computed in the 64-bit lane
-   (%U64-LOW-BITS-PLAN) instead of being boxed and unboxed."
-  (let ((p (and (not (fixnum-arith-unboxed-safe-p expr))
-                (not (checked-long-arith-p expr))
-                (%u64-low-bits-plan expr))))
-    (if p
-        (let ((*in-tail-position* nil) (*in-mv-context* nil))
-          (%u64-alias-leaf-copies
-           `(,@(%u64-leaf-code (cdr p))
-             ,@(%u64-fast (car p)))
-           (cdr p)))
-        (compile-expr-to-long expr))))
-
-(defun compile-u64-aref-set (arr idx val)
-  "Emit (SETF (AREF ARR IDX) VAL) on a rank-1 (unsigned-byte 64) array, the
-   boxed value on the stack. The bits are stored as they are; the box is made
-   once after the arms join, where the peephole drops it in statement
-   position. ARR, IDX and VAL are evaluated once each, in that order."
-  (let* ((back (let ((e (array-backing-entry (list 'aref arr idx))))
-                 (and e (eq (fourth e) :u64) e)))
-         (tk (gen-local "NAI"))
-         (vk (gen-local "NAV"))
-         (helper
-           (let ((tk (gen-local "NAI")) (vk (gen-local "NAV")))
-             (multiple-value-bind (arr-decl arr-pre arr-load) (%aref-arr-temp arr)
-               `(,@arr-decl
-                 (:declare-local ,tk "Int64")
-                 (:declare-local ,vk "Int64")
-                 ,@arr-pre
-                 ,@(compile-index-to-long idx)
-                 (:stloc ,tk)
-                 ,@(compile-as-u64-bits val)
-                 (:stloc ,vk)
-                 ,@arr-load
-                 (:ldloc ,tk)
-                 (:ldloc ,vk)
-                 (:call "Runtime.ArefSetU64Bits"))))))
-    `(,@(if back
-            (let ((fall (gen-label "ABFALL"))
-                  (done (gen-label "ABDONE"))
-                  (fast `((:declare-local ,tk "Int64")
-                          (:declare-local ,vk "Int64")
-                          ,@(compile-index-to-long idx)
-                          (:stloc ,tk)
-                          ,@(compile-as-u64-bits val)
-                          (:stloc ,vk)
-                          (:ldloc ,(third back))
-                          (:ldloc ,tk)
-                          (:conv-i)
-                          (:ldloc ,vk)
-                          (:stelem-i8)
-                          (:ldloc ,vk))))
-              (ecase (%backing-arm-for back)
-                (:fast fast)
-                (:helper helper)
-                (:both `((:ldloc ,(third back))
-                         (:brfalse ,fall)
-                         ,@fast
-                         (:br ,done)
-                         (:label ,fall)
-                         ,@helper
-                         (:label ,done)))))
-            helper)
-      (:call "Runtime.BoxU64"))))
+;;; have been moved to *compile-form-handlers* hash table in cil-forms-dispatch.lisp.

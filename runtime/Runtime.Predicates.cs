@@ -54,6 +54,7 @@ public static partial class Runtime
             return T.Instance;
         if (a is Fixnum fa && b is Fixnum fb && fa.Value == fb.Value) return T.Instance;
         if (a is LispChar ca && b is LispChar cb && ca.Value == cb.Value) return T.Instance;
+        if (a is LispSimdPack pa && b is LispSimdPack pb && pa.SameBits(pb)) return T.Instance;
         // eql compares floats by bit representation (CLHS): (eql 0.0 -0.0)=NIL, bit-identical
         // NaNs are eql=T. Value compare (==) would give NaN!=NaN, 0.0==-0.0; a mismatch.
         if (a is SingleFloat sa && b is SingleFloat sb
@@ -161,6 +162,11 @@ public static partial class Runtime
     }
 
     public static bool IsTrueEqual(LispObject a, LispObject b) => Equal(a, b) is not Nil;
+
+    public static LispObject Equalp(LispObject a, LispObject b)
+        => LispHashTable.Equalp(a, b) ? T.Instance : Nil.Instance;
+
+    public static bool IsTrueEqualp(LispObject a, LispObject b) => LispHashTable.Equalp(a, b);
 
     // --- Type predicates ---
 

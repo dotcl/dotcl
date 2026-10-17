@@ -34,7 +34,8 @@ expect "please contact me at someone@example.com." "please contact me at <email>
 # release version after "dotcl ", an absolute path of the measuring machine,
 # an email address.
 leaks='[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+\.g[0-9a-f]|dotcl [0-9]+\.[0-9]+\.[0-9]|(^|[^A-Za-z0-9<])/(home|Users|tmp|mnt)/|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
-for f in "$here/results.json" "$here/tests.json" "$here/forks.json" "$root/docs/library-status.md"; do
+for f in "$here/results.json" "$here/tests.json" "$here/forks.json" \
+         "$here/results-sbcl.json" "$here/tests-sbcl.json" "$root/docs/library-status.md"; do
   [ -f "$f" ] || continue
   if grep -nE "$leaks" "$f" >&2; then
     echo "check-scrub: $f has the lines above" >&2

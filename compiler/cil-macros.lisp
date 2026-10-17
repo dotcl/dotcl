@@ -241,12 +241,13 @@ before.")
 ;;; signal not to emit a registration at all.
 (defun %slot-raw-kind (slot)
   "0 when SLOT is stored as a raw int64, 1 when as a raw double, 2 when as a
-   raw single-float (its bits in the low half of the long), NIL when it stays
-   boxed."
+   raw single-float (its bits in the low half of the long), 3 when as the bits
+   of an (unsigned-byte 64), NIL when it stays boxed."
   (let ((ty (getf (cddr slot) :type)))
     (cond ((null ty) nil)
           ((member ty (quote (double-float long-float))) 1)
           ((member ty (quote (single-float short-float))) 2)
+          ((%u64-value-type-p ty) 3)
           (t (let ((r (if (eq ty (quote fixnum))
                           (cons +int64-min+ +int64-max+)
                           (integer-type-range ty))))
@@ -486,9 +487,12 @@ quietly took every typed slot back off the raw path."
              ,@(let ((k (%slot-raw-kind slot)))
                  (cond ((eql k 0) `((declare (fixnum ,tmp))))
                        ((eql k 1) `((declare (double-float ,tmp))))
-                       ((eql k 2) `((declare (single-float ,tmp))))))
-             ,@(remove nil
-                       (list (%slot-check-stmt tmp slot sname)))
+                       ((eql k 2) `((declare (single-float ,tmp))))
+                       ((eql k 3) `((declare (type (unsigned-byte 64) ,tmp))))))
+             ;; An (unsigned-byte 64) local is checked when it is bound.
+             ,@(unless (eql (%slot-raw-kind slot) 3)
+                 (remove nil
+                         (list (%slot-check-stmt tmp slot sname))))
              (%struct-set ,(cadr place) ,raw-index ,tmp)
              ,tmp)))))
 
@@ -575,6 +579,16 @@ quietly took every typed slot back off the raw path."
 
 (defvar *setf-expansion-fns* (make-hash-table :test #'equal :synchronized t)
   "DEFINE-SETF-EXPANDER entries: accessor-name-string -> (lambda (place) -> 5 values)")
+
+(defvar *get-setf-expansion-env* nil
+  "While GET-SETF-EXPANSION runs, a list of the environment it was given.")
+
+(defun %setf-expander-env ()
+  "The &ENVIRONMENT of a DEFINE-SETF-EXPANDER expander: what GET-SETF-EXPANSION
+   was given, else the compiler's current lexical environment."
+  (if *get-setf-expansion-env*
+      (car *get-setf-expansion-env*)
+      (%lexical-macro-environment)))
 
 ;;; --- Setf-expander table key computation ---
 ;;; CL symbols (CAR, CDR, ELT, ...) use bare symbol-name to match the built-in
@@ -1351,15 +1365,15 @@ quietly took every typed slot back off the raw path."
               (let ((params (first rest))
                     (store-vars (second rest))
                     (body (cddr rest))
-                    (doc nil))
+                    (doc nil)
+                    (decls '()))
                 ;; Skip docstring if present
                 (when (and (stringp (car body)) (cdr body))
                   (setf doc (car body))
                   (setf body (cdr body)))
-                ;; Skip declarations
                 (loop while (and (consp (car body))
                                  (eq (caar body) 'declare))
-                      do (setf body (cdr body)))
+                      do (push (pop body) decls))
                 ;; The defsetf lambda list is an ordinary lambda list (CLHS 3.4.7):
                 ;; &optional with defaults, &rest and &key all occur (McCLIM's
                 ;; DEFMETHOD* expands to (defsetf f (p &optional r &key k) ...)).
@@ -1384,7 +1398,9 @@ quietly took every typed slot back off the raw path."
                      (eval-when (:compile-toplevel :load-toplevel :execute)
                        (setf (gethash ,(%setf-key accessor) *setf-expanders*)
                              (let ((body-fn (lambda (,@store-vars ,@lambda-list)
+                                              ,@(reverse decls)
                                               (let (,@(when env-var `((,env-var nil))))
+                                                ,@(when env-var `((declare (ignorable ,env-var))))
                                                 (block ,accessor ,@body)))))
                                (lambda (place value)
                                  (let ((bindings '())
@@ -1425,7 +1441,6 @@ quietly took every typed slot back off the raw path."
 ;;; Defines a custom get-setf-expansion for access-fn.
 ;;; Body returns 5 values: (temps vals stores setter getter).
 ;;; Body is within implicit block named access-fn.
-;;; Lambda-list may include &environment var (passed NIL at expansion time).
 ;;; Lambda-list may include &whole var (bound to the full place form).
 (setf (gethash 'define-setf-expander *macros*)
       (lambda (form)
@@ -1448,7 +1463,8 @@ quietly took every typed slot back off the raw path."
                              no-whole-ll))
                ;; Detect and strip leading docstring
                (docstring (and (consp body) (stringp (car body)) (cdr body) (car body)))
-               (real-body (if docstring (cdr body) body)))
+               (decls (nth-value 0 (extract-declarations (if docstring (cdr body) body))))
+               (real-body (nth-value 1 (extract-declarations (if docstring (cdr body) body)))))
           (if whole-var
               ;; With &whole: expander-fn takes (place-form env) and binds whole-var to place
               `(progn
@@ -1456,10 +1472,11 @@ quietly took every typed slot back off the raw path."
                    (setf (gethash ,(%setf-key accessor) *setf-expansion-fns*)
                          (let ((expander-fn
                                 (lambda (,env-var ,whole-var ,@clean-ll)
-                                  (declare (ignore ,env-var))
+                                  (declare (ignorable ,env-var))
+                                  ,@decls
                                   (block ,accessor ,@real-body))))
                            (lambda (place)
-                             (apply expander-fn nil place (cdr place))))))
+                             (apply expander-fn (%setf-expander-env) place (cdr place))))))
                  ,@(when docstring
                      `((funcall #'(setf documentation) ,docstring ',accessor 'setf)))
                  ',accessor)
@@ -1469,10 +1486,11 @@ quietly took every typed slot back off the raw path."
                    (setf (gethash ,(%setf-key accessor) *setf-expansion-fns*)
                          (let ((expander-fn
                                 (lambda (,env-var ,@clean-ll)
-                                  (declare (ignore ,env-var))
+                                  (declare (ignorable ,env-var))
+                                  ,@decls
                                   (block ,accessor ,@real-body))))
                            (lambda (place)
-                             (apply expander-fn nil (cdr place))))))
+                             (apply expander-fn (%setf-expander-env) (cdr place))))))
                  ,@(when docstring
                      `((funcall #'(setf documentation) ,docstring ',accessor 'setf)))
                  ',accessor)))))
@@ -1939,6 +1957,17 @@ quietly took every typed slot back off the raw path."
                        (member var vars :test #'eq))
               (push (list 'type type temp) out))))))))
 
+;;; --- %simd-store ---
+;;; The SETF of a DOTCL-SIMD array reader, (%SIMD-STORE NAME ARRAY INDEX... VALUE).
+;;; The compiler stores a raw Vector128 when it can (COMPILE-SIMD-STORE-FORM);
+;;; otherwise it is the ordinary (SETF NAME) call.
+(setf (gethash '%simd-store *macros*) (lambda (form) (%simd-store-expansion form)))
+
+(dolist (k '("F64.2" "F32.4" "S64.2" "U64.2" "S32.4" "U32.4" "S16.8" "U16.8" "S8.16" "U8.16"))
+  (setf (gethash (concatenate 'string "DOTCL-SIMD:" k "-AREF") *setf-expanders*)
+        (lambda (place value)
+          `(%simd-store ,(car place) ,@(cdr place) ,value))))
+
 ;;; --- %induction-next ---
 ;;; The step of a counting loop's variable, (%INDUCTION-NEXT VAR DELTA): VAR plus
 ;;; DELTA. It is an ordinary addition; the name is what lets the compiler tell
@@ -1958,8 +1987,12 @@ quietly took every typed slot back off the raw path."
    END-TEST compares VAR against an integer literal or a variable in the
    direction that ends the loop ((>= VAR L) or (> VAR L) going up, (<= VAR L) or
    (< VAR L) going down). DO tests before every step, which is what the
-   declaration claims."
-  (let ((delta (and (consp step)
+   declaration claims. A step wrapped in THE keeps its THE."
+  (let* ((the-type (and (consp step) (eq (car step) 'the)
+                        (consp (cdr step)) (consp (cddr step)) (null (cdddr step))
+                        (cadr step)))
+         (step (if the-type (caddr step) step))
+         (delta (and (consp step)
                     (cond ((and (eq (car step) '1+) (eq (cadr step) var) (null (cddr step))) 1)
                           ((and (eq (car step) '1-) (eq (cadr step) var) (null (cddr step))) -1)
                           ((and (member (car step) '(+ -)) (= (length step) 3)
@@ -1981,7 +2014,9 @@ quietly took every typed slot back off the raw path."
                    (member (car end-test) '(<= <))))
       (values `(%induction ,var ,delta ,(caddr end-test)
                            ,(if (member (car end-test) '(> <)) t nil))
-              `(%induction-next ,var ,delta)))))
+              (if the-type
+                  `(the ,the-type (%induction-next ,var ,delta))
+                  `(%induction-next ,var ,delta))))))
 
 ;;; --- do ---
 (setf (gethash 'do *macros*)
@@ -2018,6 +2053,7 @@ quietly took every typed slot back off the raw path."
           (multiple-value-bind (decls real-body) (extract-declarations body)
             `(block nil
                (let ,(loop for v in vars for i in inits collect (list v i))
+                 ,@(when vars `((declare (ignorable ,@vars))))
                  ,@(when ind-decl `((declare ,ind-decl)))
                  ,@decls
                  (tagbody
@@ -2073,6 +2109,7 @@ quietly took every typed slot back off the raw path."
             (multiple-value-bind (decls real-body) (extract-declarations body)
               `(block nil
                  (let* ,(mapcar (lambda (vc) (list (car vc) (cadr vc))) var-clauses)
+                   ,@(when var-clauses `((declare (ignorable ,@(mapcar #'car var-clauses)))))
                    ,@decls
                    (tagbody
                     ,loop-tag
@@ -2106,7 +2143,7 @@ quietly took every typed slot back off the raw path."
                      (,elt-var nil))
                  (tagbody
                   ,loop-tag
-                  (if (null ,list-var)
+                  (if (endp ,list-var)
                       (return
                         ,(if result-form
                              ;; VAR is NIL here, which a type declared for
@@ -2126,6 +2163,7 @@ quietly took every typed slot back off the raw path."
                   (setq ,elt-var (car ,list-var))
                   (setq ,list-var (cdr ,list-var))
                   (let ((,var ,elt-var))
+                    (declare (ignorable ,var))
                     ,@decls
                     ;; The body is a TAGBODY only when it has tags: an
                     ;; empty one still costs a dispatch on every iteration.
@@ -2204,7 +2242,8 @@ quietly took every typed slot back off the raw path."
                (value-form (caddr form))
                (body (cdddr form))
                (primary-var (gensym "MVP"))
-               (split (%mv-split-floor vars value-form body)))
+               (split (or (%mv-split-floor vars value-form body)
+                          (%mv-split-float-round vars value-form body))))
           (if split
               split
           `(let* ((,primary-var (%mv-capture ,value-form))
@@ -2259,6 +2298,36 @@ quietly took every typed slot back off the raw path."
                   `((,(second vars) (,(if (eq op 'floor) 'mod 'rem) ,a ,b))))
               (,(first vars) (,op ,a ,b)))
          ,@body))))
+
+(defun %mv-split-float-round (vars value-form body)
+  "(MULTIPLE-VALUE-BIND (Q R) (FLOOR X) BODY...) with X a float of a statically
+   known format -- TRUNCATE, CEILING and ROUND likewise -- as X rounded to a
+   float of that format (FFLOOR and the rest), Q its integer and R X minus it,
+   each a single-value computation on raw floats. The remainder subtracts the
+   rounded value plus zero, as the generic entry does, so a -0.0 X keeps a
+   -0.0 remainder."
+  (when (and (consp value-form)
+             (member (car value-form) '(floor truncate ceiling round))
+             (consp (cdr value-form)) (null (cddr value-form))
+             (<= 1 (length vars) 2)
+             (every (lambda (v) (and (symbolp v) v)) vars)
+             (not (and (second vars) (eq (first vars) (second vars))))
+             (notany #'local-function-entry '(ffloor ftruncate fceiling fround + -)))
+    (unless (numberp (cadr value-form))
+      (setf *expansion-unreusable* t))
+    (let ((kind (%float-round-arg-kind (car value-form) (cdr value-form))))
+      (when kind
+        (if (null (cdr vars))
+            `(let ((,(first vars) ,value-form)) ,@body)
+            (let ((fx (gensym "FX")) (ft (gensym "FT"))
+                  (fop (car (find (car value-form) +float-round-ops+ :key #'second)))
+                  (ty (if (eq kind :single) 'single-float 'double-float)))
+              `(let* ((,fx ,(cadr value-form))
+                      (,ft (,fop ,fx)))
+                 (declare (type ,ty ,fx ,ft))
+                 (let* ((,(first vars) (,(car value-form) ,ft))
+                        (,(second vars) (- ,fx (+ ,ft ,(if (eq kind :single) 0f0 0d0)))))
+                   ,@body))))))))
 
 ;;; --- dotcl:async / dotcl:await (step B) ---------------------------
 ;;; (dotcl:async BODY...) CPS-transforms BODY into a chain of dotcl:%async-bind /
@@ -2652,31 +2721,19 @@ quietly took every typed slot back off the raw path."
            (error (c) (values nil c)))))
 
 ;;; --- check-type ---
+;;; The failure arm is a call, so PLACE is only read and assigned here: no
+;;; closure captures it on the path that passes.
 (setf (gethash 'check-type *macros*)
       (lambda (form)
-        ;; (check-type place type &optional string)
         (let ((place (cadr form))
               (type (caddr form))
               (type-string (cadddr form))
               (tag (gensym "CHECK-TYPE-"))
-              (value (gensym "VALUE")))
-          `(block nil
+              (blk (gensym "CHECK-TYPE-")))
+          `(block ,blk
              (tagbody ,tag
-               (when (typep ,place ',type) (return nil))
-               ;; SIMPLE-TYPE-ERROR with SBCL's report, as SBCL signals: a
-               ;; handler for SIMPLE-TYPE-ERROR (translate's tests) sees it.
-               (let ((,value ,place))
-                 (restart-case
-                   (error 'simple-type-error
-                          :datum ,value :expected-type ',type
-                          :format-control "The value of ~S is ~S, which is not ~:[of type ~S~;~:*~A~]."
-                          :format-arguments (list ',place ,value ,type-string ',type))
-                   (store-value (value)
-                     :report ,(if type-string
-                                  `(lambda (s) (format s "Supply a new value of type ~A." ,type-string))
-                                  `(lambda (s) (format s "Supply a new value of type ~S." ',type)))
-                     :interactive (lambda () (list (eval (read))))
-                     (setf ,place value))))
+               (when (typep ,place ',type) (return-from ,blk nil))
+               (setf ,place (%check-type-store ',place ,place ',type ,type-string))
                (go ,tag))))))
 
 ;;; --- defstruct ---
@@ -3829,7 +3886,9 @@ quietly took every typed slot back off the raw path."
                (docstring (and (consp body) (stringp (car body)) (cdr body) (car body)))
                (body (if docstring (cdr body) body)))
           `(progn
-             (%register-type-expander ',name (lambda ,params (block ,name ,@body)))
+             (%register-type-expander ',name (lambda ,params
+                                               ,@(extract-declarations body)
+                                               (block ,name ,@(nth-value 1 (extract-declarations body)))))
              ,@(when (and docstring (not *cross-compiling*))
                  `((funcall #'(setf documentation) ,docstring ',name 'type)))
              ',name))))
@@ -3981,6 +4040,7 @@ quietly took every typed slot back off the raw path."
 ;;; --- defgeneric ---
 (setf (gethash 'defgeneric *macros*)
       (lambda (form)
+        (%note-mv-tail-function (cadr form))
         ;; (defgeneric name (params...) &optional options...)
         ;; options: (:documentation "..."), (:method-combination ...), (:method qual (params...) body...)
         (let* ((name (cadr form))
@@ -4250,27 +4310,71 @@ quietly took every typed slot back off the raw path."
 ;;; Whether a method body might reach the next-method state of its invocation,
 ;;; answered conservatively: any mention of CALL-NEXT-METHOD or NEXT-METHOD-P, in
 ;;; any position (quoted, as data, as a function name), any local macro or
-;;; symbol macro definition, any call of a macro outside the CL package (a user
-;;; macro may expand into CALL-NEXT-METHOD), and any symbol macro all count as
-;;; "might". A body that answers no is called by dispatch without the
+;;; symbol macro definition, and any symbol macro all count as "might". A global
+;;; macro call is expanded and its expansion scanned, as the return-from scan of
+;;; a DEFUN does (only code positions of the binding forms, an expander error
+;;; counts as "might"). A body that answers no is called by dispatch without the
 ;;; next-method state published.
-(defun %method-body-may-use-next-methods-p (form)
+(defun %next-method-mention-p (form)
   (cond ((consp form)
-         (let ((head (car form)))
-           (or (and (symbolp head)
-                    head
-                    (not (eq (symbol-package head) (find-package "COMMON-LISP")))
-                    (or (macro-function head)
-                        (nth-value 1 (gethash head *macros*))))
-               (do ((x form (cdr x)))
-                   ((not (consp x))
-                    (and x (%method-body-may-use-next-methods-p x)))
-                 (when (%method-body-may-use-next-methods-p (car x)) (return t))))))
+         (do ((x form (cdr x)))
+             ((not (consp x)) (and x (%next-method-mention-p x)))
+           (when (%next-method-mention-p (car x)) (return t))))
         ((symbolp form)
          (or (member form '(call-next-method next-method-p macrolet symbol-macrolet)
                      :test #'eq)
              (and form (%symbol-macro-name-p form) t)))
         (t nil)))
+
+(defun %next-method-scan-forms (forms depth)
+  (%scan-code-forms (lambda (f) (%next-method-scan f depth)) forms))
+
+(defun %next-method-scan (form depth)
+  (cond
+    ((atom form) (%next-method-mention-p form))
+    ((not (symbolp (car form))) (%next-method-mention-p form))
+    ((member (car form) '(quote macrolet symbol-macrolet compiler-let) :test #'eq)
+     (%next-method-mention-p form))
+    ((member (car form) '(lambda named-lambda) :test #'eq)
+     (let ((namedp (eq (car form) 'named-lambda)))
+       (or (%next-method-scan-forms
+            (%lambda-list-init-forms (if namedp (caddr form) (cadr form))) depth)
+           (%next-method-scan-forms (if namedp (cdddr form) (cddr form)) depth))))
+    ((member (car form) '(flet labels) :test #'eq)
+     (or (%scan-code-forms
+          (lambda (fdef)
+            (or (not (consp fdef))
+                (%next-method-mention-p (car fdef))
+                (%next-method-scan-forms (%lambda-list-init-forms (cadr fdef)) depth)
+                (%next-method-scan-forms (cddr fdef) depth)))
+          (cadr form))
+         (%next-method-scan-forms (cddr form) depth)))
+    ((member (car form) '(let let*) :test #'eq)
+     (or (%scan-code-forms
+          (lambda (b) (and (consp b) (cdr b) (%next-method-scan (cadr b) depth)))
+          (cadr form))
+         (%next-method-scan-forms (cddr form) depth)))
+    ((or (macro-function (car form)) (nth-value 1 (gethash (car form) *macros*)))
+     (let ((expander (or (gethash (car form) *macros*)
+                         (let ((mf (macro-function (car form))))
+                           (and mf (lambda (f) (funcall mf f nil)))))))
+       (or (null expander)
+           (>= depth *macro-expand-depth-limit*)
+           (handler-case
+               (let ((expanded (%return-from-scan-macroexpand form expander)))
+                 (if (equal expanded form)
+                     (%next-method-scan-forms (cdr form) depth)
+                     (%next-method-scan expanded (1+ depth))))
+             (error () t)))))
+    (t
+     (or (%next-method-mention-p (car form))
+         (do ((x (cdr form) (cdr x)))
+             ((not (consp x)) (and x (%next-method-mention-p x)))
+           (when (%next-method-scan (car x) depth) (return t)))))))
+
+(defun %method-body-may-use-next-methods-p (lambda-list body)
+  (or (%next-method-scan-forms (%lambda-list-init-forms lambda-list) 0)
+      (%next-method-scan-forms body 0)))
 
 ;;; Whether DEFMETHOD, expanding now, may tell dispatch that the method body
 ;;; ignores its next-method state. Only outside any MACROLET or SYMBOL-MACROLET,
@@ -4278,11 +4382,11 @@ quietly took every typed slot back off the raw path."
 ;;; enclosing local macros in *MACROLET-SHADOWED*, the interpreter hands them to
 ;;; the expansion in *INTERP-EXPANSION-MACROS*, and both keep symbol macros in
 ;;; *SYMBOL-MACROS*.
-(defun %method-body-ignores-next-methods-p (form)
+(defun %method-body-ignores-next-methods-p (lambda-list body)
   (and (null *macrolet-shadowed*)
        (null *interp-expansion-macros*)
        (null *symbol-macros*)
-       (not (%method-body-may-use-next-methods-p form))))
+       (not (%method-body-may-use-next-methods-p lambda-list body))))
 
 (defun %walk-replace-cnm (form cv nv)
   "Replace CNM/NMP occurrences in FORM with funcall of CV/NV (local variables)."
@@ -4394,6 +4498,7 @@ quietly took every typed slot back off the raw path."
 ;;; --- defmethod ---
 (setf (gethash 'defmethod *macros*)
       (lambda (form)
+        (%note-mv-tail-function (cadr form))
         ;; (defmethod name qualifier* ((param1 class1) param2 ...) body...)
         ;; Qualifiers are the non-NIL atoms before the specialized lambda
         ;; list: none, one (:before, :after, :around, progn, ...) or several
@@ -4515,19 +4620,27 @@ quietly took every typed slot back off the raw path."
                                        name))
                                (cv (gensym "CNM-"))
                                (nv (gensym "NMP-")))
-                          (if (some #'%cnm-needs-capture-p body)
-                              `(lambda ,plain-params
-                                 ;; Capture THIS invocation's cnm/nmp closures from
-                                 ;; thread-local storage (not the global symbol-function,
-                                 ;; which a concurrent dispatch would clobber).
-                                 (let ((,cv (%captured-call-next-method))
-                                       (,nv (%captured-next-method-p)))
-                                   (block ,bn
-                                     ,@(mapcar (lambda (b)
-                                                 (%walk-replace-cnm b cv nv))
-                                               body))))
-                              `(lambda ,plain-params
-                                 (block ,bn ,@body)))))
+                          (multiple-value-bind (decls forms) (%split-leading-declares body)
+                            (let ((req (loop for p in plain-params
+                                             until (member p lambda-list-keywords)
+                                             collect p)))
+                              (when req
+                                (push `(declare (ignorable ,@req)) decls)))
+                            (if (some #'%cnm-needs-capture-p forms)
+                                `(lambda ,plain-params
+                                   ,@decls
+                                   ;; Capture THIS invocation's cnm/nmp closures from
+                                   ;; thread-local storage (not the global symbol-function,
+                                   ;; which a concurrent dispatch would clobber).
+                                   (let ((,cv (%captured-call-next-method))
+                                         (,nv (%captured-next-method-p)))
+                                     (block ,bn
+                                       ,@(mapcar (lambda (b)
+                                                   (%walk-replace-cnm b cv nv))
+                                                 forms))))
+                                `(lambda ,plain-params
+                                   ,@decls
+                                   (block ,bn ,@forms))))))
                      (method-lambda (%method-lambda-via-protocol name raw-method-lambda))
                      ;; The body cannot reach its next-method state, and the lambda
                      ;; is DEFMETHOD's own: dispatch may call it without publishing
@@ -4535,7 +4648,7 @@ quietly took every typed slot back off the raw path."
                      (ignores-next-methods
                        (and (eq method-lambda raw-method-lambda)
                             (%method-body-ignores-next-methods-p
-                             (cons specialized-params body))))
+                             specialized-params body)))
                      ;; The unspecialized lambda list, for METHOD-LAMBDA-LIST
                      ;; (AMOP): the list as written with each specializer dropped.
                      (unspec-ll (let ((req t))
@@ -5082,14 +5195,16 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                                    (t (push (car ll) result)
                                       (setq ll (cdr ll)))))
                            (nreverse result)))
+               (decls (nth-value 0 (extract-declarations body)))
+               (forms (nth-value 1 (extract-declarations body)))
                ;; &environment binding
                (wrapped-body (if env-var
-                                 `((let ((,env-var nil)) ,@body))
-                                 body))
+                                 `((let ((,env-var nil)) (declare (ignorable ,env-var)) ,@forms))
+                                 forms))
                ;; Implicit block named after the function (CLHS: same as defmacro)
                ;; Use (symbolp name) to get the block name; (setf foo) names use car
                (block-name (if (consp name) (cadr name) name))
-               (block-wrapped-body `((block ,block-name ,@wrapped-body)))
+               (block-wrapped-body `(,@decls (block ,block-name ,@wrapped-body)))
                (env-sym (gensym "ENV"))
                ;; A (FUNCALL #'NAME . args) form is destructured on ARGS, not on
                ;; (#'NAME . args); &WHOLE still gets the whole form (CLHS 3.2.2.1.3).
@@ -5104,6 +5219,7 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                      `(lambda (,whole-sym ,env-sym)
                         (declare (ignore ,env-sym))
                         (let ((,whole-var ,whole-sym))
+                          (declare (ignorable ,whole-var))
                           (destructuring-bind ,clean-ll ,args-form
                             ,@block-wrapped-body)))
                      `(lambda (,whole-sym ,env-sym)
@@ -5482,13 +5598,17 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
               (when end-form
                 (setf stream-args (append stream-args (list end-form)))))
             (if index-form
-                ;; With :index, set the index place to the stream position after body
-                (let ((stream-var (gensym "STREAM")))
-                  `(let ((,stream-var (make-string-input-stream ,@stream-args)))
+                ;; The index counts from the start of the string, FILE-POSITION from :START.
+                (let ((stream-var (gensym "STREAM"))
+                      (str-var (gensym "STRING"))
+                      (start-var (gensym "START")))
+                  `(let* ((,str-var ,(car stream-args))
+                          (,start-var ,(or start-form 0))
+                          (,stream-var (make-string-input-stream ,str-var ,start-var ,@(cddr stream-args))))
                      (multiple-value-prog1
                        (let ((,var ,stream-var))
                          ,@body)
-                       (setf ,index-form (file-position ,stream-var)))))
+                       (setf ,index-form (+ ,start-var (file-position ,stream-var))))))
                 `(let ((,var (make-string-input-stream ,@stream-args)))
                    ,@body))))))
 

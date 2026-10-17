@@ -102,6 +102,28 @@ public static partial class Runtime
             => obj is Fixnum f ? f.Value >= _lo && f.Value <= _hi : TypepGeneral(obj, _spec) is not Nil;
     }
 
+    /// <summary>(UNSIGNED-BYTE n) / (SIGNED-BYTE n): bounds in a long for a
+    /// fixnum, in BigInteger for a bignum (null is unbounded).</summary>
+    private sealed class IntegerBoundsTypeTest : TypeTest
+    {
+        private readonly long _lo, _hi;
+        private readonly System.Numerics.BigInteger? _bigLo, _bigHi;
+        private readonly LispObject _spec;
+        internal IntegerBoundsTypeTest(System.Numerics.BigInteger? lo, System.Numerics.BigInteger? hi, LispObject spec)
+        {
+            _bigLo = lo; _bigHi = hi; _spec = spec;
+            _lo = lo is { } l && l > long.MinValue ? (long)l : long.MinValue;
+            _hi = hi is { } h && h < long.MaxValue ? (long)h : long.MaxValue;
+        }
+        internal override bool Test(LispObject obj)
+        {
+            if (obj is Fixnum f) return f.Value >= _lo && f.Value <= _hi;
+            if (obj is Bignum b)
+                return (_bigLo is not { } lo || b.Value >= lo) && (_bigHi is not { } hi || b.Value <= hi);
+            return IsPlainTypepObject(obj) || obj is LispStruct ? false : TypepGeneral(obj, _spec) is not Nil;
+        }
+    }
+
     /// <summary>Objects whose TYPEP against a symbol is decided by their .NET
     /// representation alone: no class precedence list, name match, or
     /// metaobject rule applies to them in the general TYPEP.</summary>
@@ -162,9 +184,7 @@ public static partial class Runtime
                 if (ReferenceEquals(st.TypeName, _sym)) return true;
                 if (st.TypeName.Name != _sym.Name && FindClassOrNil(st.TypeName) is LispClass own)
                 {
-                    foreach (var c in own.ClassPrecedenceList)
-                        if (ReferenceEquals(c, _cls)) return true;
-                    return false;
+                    return ClassIncludes(own, _cls);
                 }
                 return TypepGeneral(obj, _sym) is not Nil;
             }
@@ -173,15 +193,74 @@ public static partial class Runtime
         }
     }
 
+    /// <summary>True when ANCESTOR is in OWN's class precedence list. A
+    /// structure class has one superclass chain, so between two structure
+    /// classes that is the one entry at ANCESTOR's depth.</summary>
+    internal static bool ClassIncludes(LispClass own, LispClass ancestor)
+    {
+        var cpl = own.ClassPrecedenceList;
+        int depth = ancestor.ClassPrecedenceList.Length;
+        if (own.IsStructureClass && ancestor.IsStructureClass && depth > 0)
+        {
+            int i = cpl.Length - depth;
+            return i >= 0 && ReferenceEquals(cpl[i], ancestor);
+        }
+        foreach (var c in cpl)
+            if (ReferenceEquals(c, ancestor)) return true;
+        return false;
+    }
+
+    private sealed class SatisfiesTypeTest : TypeTest
+    {
+        private readonly Symbol _pred;
+        private readonly LispObject _spec;
+        internal SatisfiesTypeTest(Symbol pred, LispObject spec) { _pred = pred; _spec = spec; }
+        internal override bool Test(LispObject obj)
+            => _pred.Function is LispFunction f ? f.Invoke1(obj) is not Nil : TypepGeneral(obj, _spec) is not Nil;
+    }
+
     /// <summary>A DEFTYPE'd symbol outside COMMON-LISP that is not also a
-    /// built-in type name: a plain object is tested against the expansion.</summary>
+    /// built-in type name: a plain object or a structure is tested against the
+    /// expansion.</summary>
     private sealed class DeftypeTypeTest : TypeTest
     {
         private readonly Symbol _sym;
         private readonly TypeTest _expansion;
         internal DeftypeTypeTest(Symbol sym, TypeTest expansion) { _sym = sym; _expansion = expansion; }
         internal override bool Test(LispObject obj)
-            => IsPlainTypepObject(obj) ? _expansion.Test(obj) : TypepGeneral(obj, _sym) is not Nil;
+            => IsPlainTypepObject(obj) || obj is LispStruct ? _expansion.Test(obj) : TypepGeneral(obj, _sym) is not Nil;
+    }
+
+    /// <summary>(SIMPLE-ARRAY et (*)) or (SIMPLE-ARRAY et (n)). For a simple
+    /// one-dimensional vector the answer depends only on its element type (and
+    /// length), so the general TYPEP's answer is kept per element type name.</summary>
+    private sealed class SimpleVectorTypeTest : TypeTest
+    {
+        sealed class Seen
+        {
+            internal readonly string Et; internal readonly bool Ok; internal readonly int Epoch;
+            internal Seen(string et, bool ok, int epoch) { Et = et; Ok = ok; Epoch = epoch; }
+        }
+        readonly LispObject _spec;
+        readonly int _length;
+        Seen? _seen;
+        internal SimpleVectorTypeTest(LispObject spec, int length) { _spec = spec; _length = length; }
+        internal override bool Test(LispObject obj)
+        {
+            if (obj is LispVector v && v._dimensions == null && v.IsSimple)
+            {
+                if (_length >= 0 && v.Length != _length) return false;
+                var et = v.ElementTypeName;
+                var seen = _seen;
+                int epoch = System.Threading.Volatile.Read(ref TypeExpanderEpoch);
+                if (seen != null && seen.Epoch == epoch && (ReferenceEquals(seen.Et, et) || seen.Et == et))
+                    return seen.Ok;
+                bool ok = TypepGeneral(obj, _spec) is not Nil;
+                _seen = new Seen(et, ok, epoch);
+                return ok;
+            }
+            return TypepGeneral(obj, _spec) is not Nil;
+        }
     }
 
     internal sealed class SymbolTypeTestMemo
@@ -263,6 +342,10 @@ public static partial class Runtime
                 for (var cur = c.Cdr; cur is Cons mc; cur = mc.Cdr) items.Add(mc.Car);
                 return new MemberTypeTest(items.ToArray());
             }
+            case "SATISFIES":
+                if (c.Cdr is Cons sc && sc.Cdr is Nil && sc.Car is Symbol pred)
+                    return new SatisfiesTypeTest(pred, spec);
+                break;
             case "EQL":
                 if (c.Cdr is Cons ec && ec.Cdr is Nil)
                     return new MemberTypeTest(new[] { ec.Car });
@@ -272,6 +355,33 @@ public static partial class Runtime
                     && IntegerRangeBound(c.Cdr is Cons lc2 && lc2.Cdr is Cons hc ? hc.Car : null, false, out long hi))
                     return new FixnumRangeTypeTest(lo, hi, spec);
                 break;
+            case "SIMPLE-ARRAY":
+                if (c.Cdr is Cons ac && ac.Cdr is Cons adc && adc.Cdr is Nil
+                    && adc.Car is Cons d1 && d1.Cdr is Nil)
+                {
+                    if (d1.Car is Symbol ds && ds.Name == "*" && ds.HomePackage == Startup.CL)
+                        return new SimpleVectorTypeTest(spec, -1);
+                    if (d1.Car is Fixnum df && df.Value >= 0 && df.Value <= int.MaxValue)
+                        return new SimpleVectorTypeTest(spec, (int)df.Value);
+                }
+                break;
+            case "UNSIGNED-BYTE":
+            case "SIGNED-BYTE":
+            {
+                var w = c.Cdr is Cons wc ? wc.Car : Nil.Instance;
+                if (c.Cdr is Cons wc2 && wc2.Cdr is not Nil) break;
+                bool unsigned = head.Name == "UNSIGNED-BYTE";
+                if (w is Nil || (w is Symbol ws && ws.Name == "*" && ws.HomePackage == Startup.CL))
+                    return new IntegerBoundsTypeTest(unsigned ? System.Numerics.BigInteger.Zero : null, null, spec);
+                if (w is Fixnum wf && wf.Value > 0 && wf.Value <= 4096)
+                {
+                    var one = System.Numerics.BigInteger.One;
+                    return unsigned
+                        ? new IntegerBoundsTypeTest(System.Numerics.BigInteger.Zero, (one << (int)wf.Value) - 1, spec)
+                        : new IntegerBoundsTypeTest(-(one << (int)(wf.Value - 1)), (one << (int)(wf.Value - 1)) - 1, spec);
+                }
+                break;
+            }
         }
         return new GeneralTypeTest(spec);
     }

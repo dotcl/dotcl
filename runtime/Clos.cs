@@ -95,6 +95,15 @@ public class SlotDefinition : LispObject
     public override string ToString() => $"#<SLOT-DEFINITION {Name.Name}>";
 }
 
+internal sealed class ReinitMethodKeys
+{
+    public readonly int Epoch;
+    public readonly bool AllowOtherKeys;
+    public readonly HashSet<string>? Keys;
+    public ReinitMethodKeys(int epoch, bool allowOtherKeys, HashSet<string>? keys)
+    { Epoch = epoch; AllowOtherKeys = allowOtherKeys; Keys = keys; }
+}
+
 /// <summary>
 /// CLOS class metaobject: name, slots, CPL, superclasses.
 /// </summary>
@@ -109,6 +118,9 @@ public class LispClass : LispObject
     private static int s_dispatchHashSeed;
     private static int NextDispatchHash()
         => unchecked(System.Threading.Interlocked.Increment(ref s_dispatchHashSeed) * (int)0x9E3779B1);
+    /// <summary>Creation order, so CLASS-DIRECT-SUBCLASSES can list the newest first.</summary>
+    internal readonly long CreationSeq = System.Threading.Interlocked.Increment(ref s_creationSeq);
+    private static long s_creationSeq;
     /// <summary>True when (setf (class-name ...) nil) was called to clear the proper name.</summary>
     public bool NameCleared { get; set; }
     /// <summary>The metaclass of this class. Null means STANDARD-CLASS (default).</summary>
@@ -135,6 +147,8 @@ public class LispClass : LispObject
     internal bool ReinitializingFromInitargs { get; set; }
     public LispClass[] DirectSuperclasses { get; set; }
     public LispClass[] ClassPrecedenceList { get; set; }
+    internal sealed record GrayKindEntry(LispClass[] Cpl, int Kinds);
+    internal GrayKindEntry? GrayKindCache;
     public SlotDefinition[] EffectiveSlots { get; set; }
     public Dictionary<string, int> SlotIndex { get; private set; }
 
@@ -354,6 +368,9 @@ public class LispClass : LispObject
     internal bool? CachedIsConditionClass;
     /// <summary>Cached set of valid initarg key names for ValidateInitargs.</summary>
     internal HashSet<string>? CachedValidInitargKeys;
+    /// <summary>&amp;key names of the applicable REINITIALIZE-INSTANCE and SHARED-INITIALIZE
+    /// methods, for the method epoch it was made under.</summary>
+    internal ReinitMethodKeys? ReinitKeysCache;
     public Dictionary<string, int> InitargSlotMap
     {
         get
@@ -1068,7 +1085,7 @@ public class LispMethod : LispObject
     {
         get => _function;
         // A new function is not the body the flag below was decided for.
-        set { _function = value; IgnoresNextMethodState = false; }
+        set { _function = value; IgnoresNextMethodState = false; Owner?.InvalidateCache(); }
     }
     private LispFunction _function = null!;
 
@@ -1190,6 +1207,9 @@ internal class CachedDispatch
     public List<LispMethod>? BuiltinAround;
     public bool HasEqlSpecializers;
     public bool IsBuiltinCombination;
+    /// <summary>No method applies to these argument classes and the generic function
+    /// has a fallback (the built-in it replaced): the call goes straight to it.</summary>
+    public bool FallbackOnly;
     /// <summary>EQL-specialized methods to check on cache hit (only when HasEqlSpecializers).
     /// Stored only for single-required-arg GFs whose EQL methods are all unqualified
     /// (see the DispatchGF cache-store comment), so each entry's EQL specializer is
@@ -1239,6 +1259,7 @@ internal class CachedDispatch
     /// also runnable without materialising an arguments array. Mutually exclusive with
     /// <see cref="PlainPrimaryChain"/>.</summary>
     public bool PrimaryChainWithBeforeAfter;
+    internal GenericFunction.LooseSlot? Loose;
 
     /// <summary>Set the two shape flags from the fields the cache-store path has just
     /// filled. Called there, after the entry is complete.</summary>
@@ -1276,6 +1297,8 @@ public sealed class ReaderCache
     /// <summary>The accessor name: used to (re)resolve the GF on a miss.</summary>
     internal readonly Symbol Sym;
     internal volatile Entry? E;
+    /// <summary>The entry E held before, for SLOT-VALUE sites that see two classes.</summary>
+    internal volatile Entry? E2;
     public ReaderCache(Symbol sym) { Sym = sym; }
 
     internal sealed class Entry
@@ -1385,13 +1408,46 @@ public class GenericFunction : LispFunction
     /// <summary>Method combination order: true = most-specific-first (default), false = most-specific-last</summary>
     public bool MostSpecificFirst { get; set; } = true;
     /// <summary>Lambda list structure for congruence checking (CLHS 7.6.4)</summary>
-    public int RequiredCount { get; set; }
-    public int OptionalCount { get; set; }
-    public bool HasRest { get; set; }
-    public bool HasKey { get; set; }
-    public bool HasAllowOtherKeys { get; set; }
+    public int RequiredCount { get => _requiredCount; set { _requiredCount = value; LambdaListChanged(); } }
+    public int OptionalCount { get => _optionalCount; set { _optionalCount = value; LambdaListChanged(); } }
+    public bool HasRest { get => _hasRest; set { _hasRest = value; LambdaListChanged(); } }
+    public bool HasKey { get => _hasKey; set { _hasKey = value; LambdaListChanged(); } }
+    public bool HasAllowOtherKeys { get => _hasAllowOtherKeys; set { _hasAllowOtherKeys = value; LambdaListChanged(); } }
     public List<string> KeywordNames { get; set; } = new();
-    public bool LambdaListInfoSet { get; set; }
+    public bool LambdaListInfoSet { get => _lambdaListInfoSet; set { _lambdaListInfoSet = value; LambdaListChanged(); } }
+    private int _requiredCount, _optionalCount;
+    private bool _hasRest, _hasKey, _hasAllowOtherKeys, _lambdaListInfoSet;
+
+    // Three bits per argument count 1-4: the number of leading arguments the cache
+    // is keyed on, or 0 when the call must take the full dispatcher. 0 = not computed.
+    private volatile int _looseShape;
+
+    private void LambdaListChanged() { _looseShape = 0; LooseCache = null; }
+
+    internal int LooseKnown(int argc)
+    {
+        int shape = _looseShape;
+        if (shape == 0) _looseShape = shape = ComputeLooseShape();
+        return (shape >> (3 * argc)) & 7;
+    }
+
+    private int ComputeLooseShape()
+    {
+        int shape = 1;
+        bool info = _lambdaListInfoSet;
+        bool keysChecked = info && _hasKey && !_hasAllowOtherKeys;
+        int required = info ? _requiredCount : (Arity >= 0 ? Arity : 0);
+        for (int argc = 1; argc <= 4; argc++)
+        {
+            if (argc < required) continue;
+            if (info && (keysChecked || (!_hasRest && !_hasKey))
+                && argc > _requiredCount + _optionalCount) continue;
+            int known = required < 1 ? 1 : required;
+            if (known > argc) known = argc;
+            shape |= known << (3 * argc);
+        }
+        return shape;
+    }
     /// <summary>The placeholder lambda list rebuilt from the arity when no real one
     /// was given, kept so repeated calls answer the same list. The parameter names
     /// in it are fresh uninterned symbols, that is deliberate, since dotcl does not
@@ -1409,6 +1465,10 @@ public class GenericFunction : LispFunction
     /// without losing the original C# implementation for non-Gray streams.</summary>
     public LispFunction? FallbackFunction { get; set; }
 
+    /// <summary>FallbackFunction as the least specific primary method, so qualified
+    /// methods have a primary to run around and CALL-NEXT-METHOD reaches it.</summary>
+    internal LispMethod? FallbackMethod;
+
     /// <summary>N-way polymorphic dispatch cache. An immutable array of recent
     /// successful dispatches (most-recent first), swapped atomically via this `volatile`
     /// field so a concurrent InvalidateCache (defmethod) / cache-fill publishes a
@@ -1417,6 +1477,90 @@ public class GenericFunction : LispFunction
     /// site that cycles through up to that many argument-class combinations stays warm,
     /// where the old single-entry monomorphic cache missed on every alternation.</summary>
     internal volatile CachedDispatch[]? DispatchCache;
+
+    /// <summary>In front of both: entries that are one call of the first method's
+    /// function, keyed on the classes of the first one or two arguments.</summary>
+    internal volatile LooseSlot?[]? LooseCache;
+
+    internal sealed class LooseSlot
+    {
+        internal readonly LispClass? C0, C1;
+        internal readonly LispFunction Fn;
+        // Fn's 1- and 2-argument bodies as function pointers, or 0.
+        internal readonly nint Entry1, Entry2;
+        internal LooseSlot(LispClass? c0, LispClass? c1, LispFunction fn)
+        {
+            C0 = c0; C1 = c1; Fn = fn;
+            Entry1 = StaticEntry(fn.PlainFunc1);
+            Entry2 = StaticEntry(fn.PlainFunc2);
+        }
+
+        private static nint StaticEntry(Delegate? d)
+        {
+            if (d == null || d.Target != null) return 0;
+            try
+            {
+                var m = d.Method;
+#if DOTCL_EMIT
+                if (m is System.Reflection.Emit.DynamicMethod dm) return DotCL.Emitter.CilAssembler.DynamicMethodEntry(dm);
+#endif
+                if (!m.IsStatic) return 0;
+                return m.MethodHandle.GetFunctionPointer();
+            }
+            catch { return 0; }
+        }
+    }
+
+    private const int LooseCacheMax = 1024;
+    internal const int LooseProbes = 4;
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal static int LooseIndex(LispClass? c0, LispClass? c1, int mask)
+    {
+        int h = unchecked(((c0 == null ? 0 : c0.DispatchHash) * (int)0x9E3779B1
+                           + (c1 == null ? 0 : c1.DispatchHash)) * (int)0x85EBCA6B);
+        return (h ^ (int)((uint)h >> 16)) & mask;
+    }
+
+    /// <summary>Put SL in the cache, when there is one: an invalidation drops the
+    /// cache, so an entry found before it never reaches the one made after.</summary>
+    internal void AddLoose(LooseSlot sl)
+    {
+        var lc = LooseCache;
+        if (lc == null) return;
+        if (PlaceLoose(lc, sl)) return;
+        for (int size = lc.Length * 2; size <= LooseCacheMax; size *= 2)
+        {
+            var bigger = new LooseSlot?[size];
+            bool fits = PlaceLoose(bigger, sl);
+            foreach (var old in lc)
+                if (old != null && !PlaceLoose(bigger, old)) fits = false;
+            if (fits)
+            {
+#pragma warning disable CS0420
+                System.Threading.Interlocked.CompareExchange(ref LooseCache, bigger, lc);
+#pragma warning restore CS0420
+                return;
+            }
+        }
+        lc[LooseIndex(sl.C0, sl.C1, lc.Length - 1)] = sl;
+    }
+
+    private static bool PlaceLoose(LooseSlot?[] lc, LooseSlot sl)
+    {
+        int mask = lc.Length - 1;
+        int i = LooseIndex(sl.C0, sl.C1, mask);
+        for (int n = 0; n < LooseProbes; n++, i = (i + 1) & mask)
+        {
+            var cur = lc[i];
+            if (cur == null || (ReferenceEquals(cur.C0, sl.C0) && ReferenceEquals(cur.C1, sl.C1)))
+            {
+                lc[i] = sl;
+                return true;
+            }
+        }
+        return false;
+    }
 
     /// <summary>Max entries in the polymorphic dispatch cache.</summary>
     internal const int DispatchCacheWidth = 4;
@@ -1583,7 +1727,7 @@ public class GenericFunction : LispFunction
     /// <summary>Invalidate dispatch cache when methods are added/removed.</summary>
     internal void InvalidateCache()
     {
-        DispatchCache = null; DispatchByClasses = null; BumpMethodEpoch();
+        DispatchCache = null; DispatchByClasses = null; LooseCache = null; BumpMethodEpoch();
     }
 
     /// <summary>Global method-system epoch. Bumped on any method add/remove (via

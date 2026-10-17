@@ -490,6 +490,8 @@ public partial class CilAssembler
                 _localSlotOf = null;
             }
         }
+        if (_assembleDepth == 0 && _selfFrameName != null && _selfFrameLocal == null)
+            EmitSelfFrameProlog();
         _assembleDepth++;
         try { AssembleBody(instructions); }
         finally { _assembleDepth--; }
@@ -583,6 +585,9 @@ public partial class CilAssembler
                 }
             }
             AssembleOne(instr);
+            if (instr is Cons fc && fc.Car is Symbol fs && fs.Name == "BEGIN-FINALLY-BLOCK"
+                && FinallyRunsLisp(c.Cdr))
+                EmitResumeFrames();
             // Check if this instruction makes subsequent code unreachable
             if (instr is Cons tc && tc.Car is Symbol ts)
             {
@@ -731,13 +736,15 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Dup);
                 break;
             case "RET":
+                EmitLeaveOwnFrame();
                 _il.Emit(OpCodes.Ret);
                 break;
             case "CALL":
                 EmitCall(GetString(Cadr(c)));
                 break;
             case "CALLVIRT":
-                EmitCallvirt(GetString(Cadr(c)));
+                if (!TryEmitEntryCall(GetString(Cadr(c))))
+                    EmitCallvirt(GetString(Cadr(c)));
                 break;
             case "DOTNET-CALL-DIRECT":
                 EmitDotnetCallDirect(GetString(Cadr(c)), GetString(Caddr(c)));
@@ -752,6 +759,9 @@ public partial class CilAssembler
                     throw new InvalidOperationException("CALL-KEY-SHARED outside a &key entry");
                 _il.Emit(OpCodes.Call, _keyShared);
                 break;
+            case "CALL-SAME-FILE":
+                EmitCallSameFile(c);
+                break;
             case "TAIL-SELF":
                 // Read by FindTailSites; no code of its own.
                 break;
@@ -762,8 +772,9 @@ public partial class CilAssembler
                 // CIL tail-call prefix. Must be immediately followed by a call/callvirt/calli
                 // whose next instruction is `ret`. The compiler no longer emits it (calls in
                 // tail position are found by FindTailSites); .sil written by an older one
-                // still has it before a function body's final call.
-                _il.Emit(OpCodes.Tailcall);
+                // still has it before a function body's final call. A body that
+                // unlinks its own frame before RET cannot take it.
+                if (_selfFrameLocal == null) _il.Emit(OpCodes.Tailcall);
                 break;
             case "NEWOBJ":
                 EmitNewobj(GetString(Cadr(c)));
@@ -1046,6 +1057,7 @@ public partial class CilAssembler
                 break;
             case "BEGIN-CATCH-BLOCK":
                 _il.BeginCatchBlock(ResolveType(GetString(Cadr(c))));
+                EmitResumeFrames();
                 break;
             // Filter-based handler: the filter block runs with the exception on the
             // stack and must leave 1 (handle) or 0 (keep unwinding); the handler
@@ -1057,6 +1069,7 @@ public partial class CilAssembler
                 break;
             case "BEGIN-FILTER-HANDLER":
                 _il.BeginCatchBlock(null);
+                EmitResumeFrames();
                 break;
             case "BEGIN-FINALLY-BLOCK":
                 _il.BeginFinallyBlock();
@@ -1186,13 +1199,15 @@ public partial class CilAssembler
                 break;
             }
             case "READER-IC":
+            case "SLOT-VALUE-IC":
             {
                 // (reader obj) inline-cached simple slot read. OBJ is
                 // already on the stack (LispObject). Call Runtime.ReaderIC(obj, cell),
                 // where `cell` is a per-call-site monomorphic inline cache.
+                // SLOT-VALUE-IC is (slot-value obj 'name), the cell holding NAME.
                 var ricName = GetString(Cadr(c));
                 var ricPkg = GetString(Caddr(c));
-                var ricMethod = _methodCache["Runtime.ReaderIC"];
+                var ricMethod = _methodCache[op == "READER-IC" ? "Runtime.ReaderIC" : "Runtime.SlotValueIC"];
                 if (_faslMode)
                 {
                     // The global constant pool is not serialized into a .fasl, so the
@@ -1347,6 +1362,83 @@ public partial class CilAssembler
         }
     }
 
+    /// <summary>The shared body of a &amp;key function, (:shared NPARAMS BODY) among its
+    /// direct delegates: a method of its own that takes the key values as arguments,
+    /// which the array entry and the typed entries call (SIL :call-key-shared), so it
+    /// is built before either. Null when there is none.</summary>
+    private static DynamicMethod? BuildKeySharedDm(string name, LispObject? directDelegates,
+                                                   out LispObject? sharedInstrs)
+    {
+        DynamicMethod? keyShared = null;
+        sharedInstrs = null;
+        for (var dd = directDelegates; dd is Cons ddc; dd = ddc.Cdr)
+        {
+            if (ddc.Car is not Cons spec || Car(spec) is Fixnum) continue;
+            sharedInstrs = Caddr(spec);
+            int nShared = (int)((Fixnum)Cadr(spec)).Value;
+            var sharedTypes = new Type[nShared];
+            for (int i = 0; i < nShared; i++) sharedTypes[i] = typeof(LispObject);
+            keyShared = new DynamicMethod(name + "_keybody", typeof(LispObject),
+                sharedTypes, typeof(CilAssembler).Module, true);
+            new CilAssembler { _il = keyShared.GetILGenerator() }.Assemble(Caddr(spec));
+        }
+        return keyShared;
+    }
+
+    /// <summary>Install the typed entries ((ARITY SELF-P BODY [COPY]) ...) of an
+    /// &amp;optional / &amp;key / &amp;rest function on FN. The array entry still backs
+    /// APPLY and every other arity. The fasl path builds the same entries as methods
+    /// (FaslAssembler.BuildDirectDelegateMethods).</summary>
+    private static void AttachDirectDelegatesDm(LispFunction fn, string name,
+                                                LispObject? directDelegates, DynamicMethod? keyShared,
+                                                bool noFrame = true)
+    {
+        for (var dd = directDelegates; dd is Cons ddc; dd = ddc.Cdr)
+        {
+            if (ddc.Car is not Cons spec || Car(spec) is not Fixnum) continue;
+            int arity = (int)((Fixnum)Car(spec)).Value;
+            bool selfP = Cadr(spec) is not Nil;
+            var ddBody = Caddr(spec);
+            // A &key function's required-only entry may carry a full copy of
+            // the body as a fourth element. A DynamicMethod is never inlined
+            // into its caller, so here the call to the shared body would stay
+            // a real call on the commonest shape; a fasl's entry calls it and
+            // lets the JIT inline it, and ignores the copy.
+            if (Cdr(Cdr(Cdr(spec))) is Cons { Car: Cons copy })
+                ddBody = copy;
+            // A self-recursive body reads its params from ldarg 1.. with the
+            // function itself threaded in as arg0 (BuildSelfDirectFunction does
+            // the same); the _funcN delegate then binds `fn` as that leading
+            // arg via CreateDelegate(type, fn). Non-self bodies read from ldarg
+            // 0.. and need no bound target.
+            bool selfFramed = CanSelfFrame(name, arity, noFrame);
+            bool withSelf = selfP || selfFramed;
+            int nParams = withSelf ? arity + 1 : arity;
+            var directParamTypes = new Type[nParams];
+            int off = withSelf ? 1 : 0;
+            if (withSelf) directParamTypes[0] = typeof(LispFunction);
+            for (int i = 0; i < arity; i++) directParamTypes[off + i] = typeof(LispObject);
+            var ddm = new DynamicMethod(name + "_opt" + arity, typeof(LispObject),
+                directParamTypes, typeof(CilAssembler).Module, true);
+            var ddAsm = new CilAssembler { _il = ddm.GetILGenerator(), _keyShared = keyShared };
+            if (selfFramed)
+            {
+                ddAsm._selfFrameName = string.Intern(name);
+                ddAsm._selfFrameArgc = arity;
+                ddAsm._selfFrameUnit = true;
+                if (!selfP) ddAsm._argShift = 1;
+            }
+            ddAsm.Assemble(ddBody);
+            var ddFuncArgs = new Type[arity + 1];
+            for (int i = 0; i <= arity; i++) ddFuncArgs[i] = typeof(LispObject);
+            var ddType = System.Linq.Expressions.Expression.GetFuncType(ddFuncArgs);
+            fn.SetDirectDelegate(withSelf ? ddm.CreateDelegate(ddType, fn)
+                                          : ddm.CreateDelegate(ddType));
+            if (selfFramed) fn.SetArityEntry(DynamicMethodEntry(ddm), arity);
+            if (BodyReadsMvMode(ddBody)) fn.MarkMvModeEntry(arity);
+        }
+    }
+
     private void HandleDefmethod(Cons instr)
     {
         // (:defmethod "NAME" [:pkg "PKG"] :params ("P1" ...) :body (...))
@@ -1415,23 +1507,7 @@ public partial class CilAssembler
         // Compile the body as DynamicMethod(LispObject[] args) -> LispObject
         var dm = new DynamicMethod(name, typeof(LispObject),
             new[] { typeof(LispObject[]) }, typeof(CilAssembler).Module, true);
-        // A &key function keeps its body in one method that takes the key values
-        // as arguments: (:shared NPARAMS BODY) among the direct delegates. It is
-        // not a delegate of its own; the array entry and the typed entries call
-        // it (SIL :call-key-shared), so it is built first.
-        DynamicMethod? keyShared = null;
-        LispObject? sharedInstrs = null;
-        for (var dd = directDelegates; dd is Cons ddc; dd = ddc.Cdr)
-        {
-            if (ddc.Car is not Cons spec || Car(spec) is Fixnum) continue;
-            sharedInstrs = Caddr(spec);
-            int nShared = (int)((Fixnum)Cadr(spec)).Value;
-            var sharedTypes = new Type[nShared];
-            for (int i = 0; i < nShared; i++) sharedTypes[i] = typeof(LispObject);
-            keyShared = new DynamicMethod(name + "_keybody", typeof(LispObject),
-                sharedTypes, typeof(CilAssembler).Module, true);
-            new CilAssembler { _il = keyShared.GetILGenerator() }.Assemble(Caddr(spec));
-        }
+        var keyShared = BuildKeySharedDm(name, directDelegates, out var sharedInstrs);
 
         var innerAsm = new CilAssembler();
         innerAsm._il = dm.GetILGenerator();
@@ -1446,47 +1522,7 @@ public partial class CilAssembler
             fn.StoredLambdaList = InternLambdaList(lambdaList, defPkg != null ? Package.FindPackage(defPkg) : null);
         if (noFrame) fn.SuppressDebugFrame();
 
-        // Attach typed direct delegates for an &optional function's concrete
-        // arities. The fasl path does the same from EmitDefmethodInto. The array XEP `del` above still backs
-        // apply and any arity without a direct delegate; these just let a fixed-
-        // arity call skip the args-array InvokeSlow detour.
-        if (directDelegates is Cons)
-        {
-            for (var dd = directDelegates; dd is Cons ddc; dd = ddc.Cdr)
-            {
-                if (ddc.Car is not Cons spec || Car(spec) is not Fixnum) continue;
-                int arity = (int)((Fixnum)Car(spec)).Value;
-                bool selfP = Cadr(spec) is not Nil;
-                var ddBody = Caddr(spec);
-                // A &key function's required-only entry may carry a full copy of
-                // the body as a fourth element. A DynamicMethod is never inlined
-                // into its caller, so here the call to the shared body would stay
-                // a real call on the commonest shape; a fasl's entry calls it and
-                // lets the JIT inline it, and ignores the copy.
-                if (Cdr(Cdr(Cdr(spec))) is Cons { Car: Cons copy })
-                    ddBody = copy;
-                // A self-recursive body reads its params from ldarg 1.. with the
-                // function itself threaded in as arg0 (BuildSelfDirectFunction does
-                // the same); the _funcN delegate then binds `fn` as that leading
-                // arg via CreateDelegate(type, fn). Non-self bodies read from ldarg
-                // 0.. and need no bound target.
-                int nParams = selfP ? arity + 1 : arity;
-                var directParamTypes = new Type[nParams];
-                int off = selfP ? 1 : 0;
-                if (selfP) directParamTypes[0] = typeof(LispFunction);
-                for (int i = 0; i < arity; i++) directParamTypes[off + i] = typeof(LispObject);
-                var ddm = new DynamicMethod(name + "_opt" + arity, typeof(LispObject),
-                    directParamTypes, typeof(CilAssembler).Module, true);
-                var ddAsm = new CilAssembler { _il = ddm.GetILGenerator(), _keyShared = keyShared };
-                ddAsm.Assemble(ddBody);
-                var ddFuncArgs = new Type[arity + 1];
-                for (int i = 0; i <= arity; i++) ddFuncArgs[i] = typeof(LispObject);
-                var ddType = System.Linq.Expressions.Expression.GetFuncType(ddFuncArgs);
-                fn.SetDirectDelegate(selfP ? ddm.CreateDelegate(ddType, fn)
-                                           : ddm.CreateDelegate(ddType));
-                if (BodyReadsMvMode(ddBody)) fn.MarkMvModeEntry(arity);
-            }
-        }
+        AttachDirectDelegatesDm(fn, name, directDelegates, keyShared, noFrame);
 
         if (noFrame) fn.SuppressDebugFrame();
 
@@ -1677,6 +1713,7 @@ public partial class CilAssembler
         bool noFrame = false;
         string llShape = "";
         LispObject? lambdaList = null;   // development info; see SetFaslLambdaList
+        LispObject? directDelegates = null;
 
         while (plist is Cons pc)
         {
@@ -1690,6 +1727,7 @@ public partial class CilAssembler
                 case "NO-FRAME": noFrame = true; break;
                 case "LL-SHAPE": llShape = val is LispString ls ? ls.Value : ""; break;
                 case "LAMBDA-LIST": lambdaList = val; break;
+                case "DIRECT-DELEGATES": directDelegates = val; break;
             }
             plist = Cddr(pc);
         }
@@ -1709,8 +1747,11 @@ public partial class CilAssembler
             innerAsm._faslMode = true;
             innerAsm._faslTypeBuilder = _faslTypeBuilder;
             innerAsm._faslStructMap = _faslStructMap;
+            var keyShared = FaslAssembler.BuildKeySharedMethod(_faslTypeBuilder, _faslStructMap!, methodName, directDelegates);
+            innerAsm._keyShared = keyShared;
             AssembleFaslBody(method, innerAsm, bodyInstrs);
             SetFaslLambdaList(method, lambdaList);
+            var extraDirect = FaslAssembler.BuildDirectDelegateMethods(_faslTypeBuilder, _faslStructMap!, methodName, directDelegates, keyShared);
 
             // Push new LispFunction(delegate, name, arity)
             _il.Emit(OpCodes.Ldnull);
@@ -1724,6 +1765,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldc_I4, paramCount);
             _il.Emit(OpCodes.Newobj, typeof(LispFunction)
                 .GetConstructor(new[] { typeof(Func<LispObject[], LispObject>), typeof(string), typeof(int) })!);
+            FaslAssembler.EmitInstallDirectOnStack(_il, extraDirect);
             EndFaslFunctionCache(cacheField, cacheDone);
         }
         else
@@ -1731,8 +1773,10 @@ public partial class CilAssembler
             var dm = new DynamicMethod(llShape.Length > 0 ? "lambda_" + llShape : "lambda",
                 typeof(LispObject),
                 new[] { typeof(LispObject[]) }, typeof(CilAssembler).Module, true);
+            var keyShared = BuildKeySharedDm(dm.Name, directDelegates, out _);
             var innerAsm = new CilAssembler();
             innerAsm._il = dm.GetILGenerator();
+            innerAsm._keyShared = keyShared;
             int before = _currentUnitDms?.Count ?? 0;
             innerAsm.Assemble(bodyInstrs);
 
@@ -1740,6 +1784,7 @@ public partial class CilAssembler
                 typeof(Func<LispObject[], LispObject>));
             var fn = new LispFunction(del, fnName, paramCount);
             if (lambdaList != null) fn.StoredLambdaList = InternLambdaList(lambdaList, null);
+            AttachDirectDelegatesDm(fn, dm.Name, directDelegates, keyShared);
 
             // Push the function onto the stack (unit-scoped so a dropped compile
             // result is collectible: S5).
@@ -2046,8 +2091,9 @@ public partial class CilAssembler
         // Create DynamicMethod with direct LispObject params. When selfArg0, the
         // method takes a leading LispFunction self so a non-tail self-call reaches the
         // receiver from arg0 instead of re-resolving #'NAME each recursive entry.
-        var directParamTypes = new Type[selfArg0 ? paramCount + 1 : paramCount];
-        if (selfArg0)
+        bool selfFramed = CanSelfFrame(name, paramCount, noFrame);
+        var directParamTypes = new Type[selfArg0 || selfFramed ? paramCount + 1 : paramCount];
+        if (selfArg0 || selfFramed)
         {
             directParamTypes[0] = typeof(LispFunction);
             for (int i = 0; i < paramCount; i++) directParamTypes[i + 1] = typeof(LispObject);
@@ -2061,14 +2107,22 @@ public partial class CilAssembler
             directParamTypes, typeof(CilAssembler).Module, true);
         var innerAsm = new CilAssembler();
         innerAsm._il = directDm.GetILGenerator();
+        if (selfFramed)
+        {
+            innerAsm._selfFrameName = string.Intern(name);
+            innerAsm._selfFrameArgc = paramCount;
+            innerAsm._selfFrameUnit = true;
+            if (!selfArg0) innerAsm._argShift = 1;
+        }
         innerAsm.Assemble(bodyInstrs);
 
         // Create array-based wrapper with arity check and LispFunction with direct delegate
         Func<LispObject[], LispObject> arrayDel;
         LispFunction fn;
-        if (selfArg0)
+        if (selfArg0 || selfFramed)
         {
             fn = BuildSelfDirectFunction(directDm, name, paramCount);
+            if (selfFramed) fn.SetSelfFramedEntry(DynamicMethodEntry(directDm), paramCount);
         }
         else
         switch (paramCount)
@@ -3160,6 +3214,7 @@ public partial class CilAssembler
 
     private void EmitLdarg(int n)
     {
+        n += _argShift;
         switch (n)
         {
             case 0: _il.Emit(OpCodes.Ldarg_0); break;
@@ -3260,6 +3315,11 @@ public partial class CilAssembler
         // closures/lambdas append their DebugMethodInfo here; FaslAssembler creates
         // it under DOTCL_EMIT_PDB and reads it at Save. Null -> no debug info.
         internal List<DebugMethodInfo>? DebugSink;
+
+        // The self-framed DEFUN bodies of this fasl so far, for :CALL-SAME-FILE:
+        // (package, name) -> the body, its arity, whether it takes a value mode,
+        // and the static field holding the function the DEFUN made.
+        internal readonly Dictionary<(string, string), (MethodInfo Body, int Arity, bool Mv, FieldInfo Fn)> SameFileBodies = new();
 
         // These are written by FaslAssembler, whose implementation needs .NET 9+.
         // On an older target framework it compiles out, so the fields stay null and
@@ -4491,6 +4551,14 @@ public partial class CilAssembler
                 // Use ElementAt()/Length so bit-vectors work: their elements live in
                 // _bitData, not _elements (_elements is empty for bit-vectors).
                 int vecLen = vec.Length;
+                if (vec._dimensions == null && vecLen > 32 && vec.TryPackLiteral(out var packed))
+                {
+                    _il.Emit(OpCodes.Ldstr, Track(Convert.ToBase64String(packed)));
+                    _il.Emit(OpCodes.Ldc_I4, vecLen);
+                    _il.Emit(OpCodes.Ldstr, vec.ElementTypeName);
+                    _il.Emit(OpCodes.Call, typeof(LispVector).GetMethod(nameof(LispVector.FromPackedLiteral))!);
+                    break;
+                }
                 _il.Emit(OpCodes.Ldc_I4, vecLen);
                 _il.Emit(OpCodes.Newarr, typeof(LispObject));
                 if (_faslMode && _faslTypeBuilder != null && vecLen > MaxInlineListChunk)
@@ -5020,11 +5088,32 @@ public partial class CilAssembler
     /// <summary>Forget the answers when the file is done.</summary>
     internal static void ClearMakeLoadFormMemo() => s_mlfMemo = null;
 
+    internal static Dictionary<LispObject, LispObject>? MakeLoadFormMemo
+    {
+        get => s_mlfMemo;
+        set => s_mlfMemo = value;
+    }
+
     private static LispObject CallMakeLoadForm(LispObject mlfFn, LispObject obj)
     {
         var memo = s_mlfMemo;
         if (memo != null && memo.TryGetValue(obj, out var known)) return known;
-        var raw = Runtime.Funcall(mlfFn, obj);
+        // Every caller treats an error here as "no load form" and falls back,
+        // so the error is taken where it is signalled, before an outer handler
+        // or *DEBUGGER-HOOK* can see it.
+        var tag = new object();
+        HandlerClusterStack.PushCluster(new[] { new HandlerBinding(Startup.Sym("ERROR"),
+            new LispFunction(a => throw new HandlerCaseInvocationException(tag, 0, a[0]),
+                "%MAKE-LOAD-FORM-GUARD", 1)) });
+        LispObject raw;
+        try
+        {
+            raw = Runtime.Funcall(mlfFn, obj);
+        }
+        finally
+        {
+            HandlerClusterStack.PopCluster();
+        }
         if (memo != null) memo[obj] = raw;
         return raw;
     }
@@ -5640,6 +5729,7 @@ public partial class CilAssembler
         {
             UninternedIndex = map.GetOrCreateUninternedSymbolIndex,
             InstanceKey = li => map.TryGetInstanceKey(li, out var k) ? k : null,
+            StructKey = ls => !_skipStructIntern && StructBuiltFromSlots(ls) ? map.GetOrCreate(ls) : null,
             OnSymbol = map.RecordSymbolReference,
             SharedSlot = map.CrossLiteralSlotFor,
         };
@@ -5690,12 +5780,13 @@ public partial class CilAssembler
     private bool TryEmitConstantAsData(LispObject val)
     {
         var map = _faslStructMap;
-        if (map?.UninternedTypeBuilder == null || val is not (Cons or LispVector)) return false;
+        if (map?.UninternedTypeBuilder == null || val is not (Cons or LispVector or LispStruct)) return false;
         // A dry run first: no instance is created for a literal that then
         // goes the IL route anyway (that route creates them in its own order).
         var local = CollectSharedLiteralNodes(val);
         var probe = NewFaslDataWriter();
-        probe.InstanceKey = _ => "";
+        probe.InstanceKey = o => o is LispStruct ls && StructBuiltFromSlots(ls) ? null : "";
+        probe.StructKey = _ => "";
         probe.HtPrototypePart = _ => -2;
         probe.SharedSlot = n => map.CrossLiteralShared != null && map.CrossLiteralShared.ContainsKey(n)
             && !map.CrossLiteralBuilding.Contains(n) ? 0 : -1;
@@ -5754,6 +5845,17 @@ public partial class CilAssembler
                     if (map.TryGetInstanceKey(li, out _)) return true;
                     var mlf = Startup.Sym("MAKE-LOAD-FORM");
                     return mlf?.Function != null && EnsureInstanceCreatedTopLevel(li, mlf.Function) != null;
+                case LispStruct ls:
+                    if (map.TryGetInstanceKey(ls, out _)) return true;
+                    if (StructBuiltFromSlots(ls))
+                    {
+                        if (!seen.Add(ls)) return true;
+                        foreach (var sv in ls.SlotsSnapshot())
+                            if (sv != null && !Walk(sv, depth + 1)) return false;
+                        return true;
+                    }
+                    var mlfs = Startup.Sym("MAKE-LOAD-FORM");
+                    return mlfs?.Function != null && EnsureInstanceCreatedTopLevel(ls, mlfs.Function) != null;
                 default:
                     return true;
             }
@@ -6513,6 +6615,26 @@ public partial class CilAssembler
         }
     }
 
+    /// <summary>Whether TryEmitViaLoadForm leaves LS to the direct intern
+    /// path (allocate and fill the slots) rather than to the make-load-form
+    /// registry.</summary>
+    private static bool StructBuiltFromSlots(LispStruct ls)
+    {
+        var mlfSym = Startup.Sym("MAKE-LOAD-FORM");
+        if (mlfSym?.Function == null) return true;
+        try
+        {
+            var raw = CallMakeLoadForm(mlfSym.Function, ls);
+            LispObject form = raw is MvReturn mv && mv.Count > 0 ? mv[0] : raw;
+            if (form is Nil) return true;
+            return Runtime.FindClassOrNil(ls.TypeName) is LispClass cls
+                && cls.IsStructureClass && cls.StructSlotNames != null
+                && cls.StructSlotNames.Length == ls.SlotCount
+                && FormIsSlotSaving(ls, cls, form);
+        }
+        catch { return true; }
+    }
+
     private static string ComputeStructInternKey(LispStruct ls)
     {
         var sb = new System.Text.StringBuilder();
@@ -6776,6 +6898,21 @@ public partial class CilAssembler
             ["Runtime.TypedRetL"] = typeof(Runtime).GetMethod("TypedRetL")!,
             ["Runtime.TypedRetD"] = typeof(Runtime).GetMethod("TypedRetD")!,
             ["Runtime.CheckLongRange"] = typeof(Runtime).GetMethod("CheckLongRange")!,
+            ["Runtime.CheckArgFixnum"] = typeof(Runtime).GetMethod("CheckArgFixnum")!,
+            ["Runtime.CheckArgRange"] = typeof(Runtime).GetMethod("CheckArgRange")!,
+            ["Runtime.CheckArgU64"] = typeof(Runtime).GetMethod("CheckArgU64")!,
+            ["Runtime.CheckArgDouble"] = typeof(Runtime).GetMethod("CheckArgDouble")!,
+            ["Runtime.CheckArgSingle"] = typeof(Runtime).GetMethod("CheckArgSingle")!,
+            ["Runtime.CheckArgType"] = typeof(Runtime).GetMethod("CheckArgType")!,
+            ["Runtime.CheckArgList"] = typeof(Runtime).GetMethod("CheckArgList")!,
+            ["Runtime.CheckArgCons"] = typeof(Runtime).GetMethod("CheckArgCons")!,
+            ["Runtime.CheckArgSymbol"] = typeof(Runtime).GetMethod("CheckArgSymbol")!,
+            ["Runtime.CheckArgFunction"] = typeof(Runtime).GetMethod("CheckArgFunction")!,
+            ["Runtime.CheckArgCharacter"] = typeof(Runtime).GetMethod("CheckArgCharacter")!,
+            ["Runtime.CheckArgInteger"] = typeof(Runtime).GetMethod("CheckArgInteger")!,
+            ["Runtime.CheckArgString"] = typeof(Runtime).GetMethod("CheckArgString")!,
+            ["Runtime.CheckArgStructSym"] = typeof(Runtime).GetMethod("CheckArgStructSym")!,
+            ["Runtime.CheckArgSimpleVector"] = typeof(Runtime).GetMethod("CheckArgSimpleVector")!,
             ["Runtime.SubtractFixnumChecked"] = typeof(Runtime).GetMethod("SubtractFixnumChecked")!,
             ["Runtime.MultiplyFixnumChecked"] = typeof(Runtime).GetMethod("MultiplyFixnumChecked")!,
             ["Runtime.SubtractFixnum"] = typeof(Runtime).GetMethod("SubtractFixnum")!,
@@ -6816,8 +6953,10 @@ public partial class CilAssembler
             ["Runtime.IsTrueEq"] = typeof(Runtime).GetMethod("IsTrueEq")!,
             ["Runtime.IsTrueEql"] = typeof(Runtime).GetMethod("IsTrueEql")!,
             ["Runtime.IsTrueEqual"] = typeof(Runtime).GetMethod("IsTrueEqual")!,
+            ["Runtime.IsTrueEqualp"] = typeof(Runtime).GetMethod("IsTrueEqualp")!,
             ["Runtime.IsTrueTypep"] = typeof(Runtime).GetMethod("IsTrueTypep")!,
             ["Runtime.IsTrueConsp"] = typeof(Runtime).GetMethod("IsTrueConsp")!,
+            ["Runtime.IsTrueEndp"] = typeof(Runtime).GetMethod("IsTrueEndp")!,
             ["Runtime.IsTrueAtom"] = typeof(Runtime).GetMethod("IsTrueAtom")!,
             ["Runtime.IsTrueListp"] = typeof(Runtime).GetMethod("IsTrueListp")!,
             ["Runtime.IsTrueNumberp"] = typeof(Runtime).GetMethod("IsTrueNumberp")!,
@@ -6832,6 +6971,7 @@ public partial class CilAssembler
             ["Runtime.Eq"] = typeof(Runtime).GetMethod("Eq")!,
             ["Runtime.Eql"] = typeof(Runtime).GetMethod("Eql")!,
             ["Runtime.Equal"] = typeof(Runtime).GetMethod("Equal")!,
+            ["Runtime.Equalp"] = typeof(Runtime).GetMethod("Equalp")!,
 
             // Runtime - list ops
             ["Runtime.Car"] = typeof(Runtime).GetMethod("Car")!,
@@ -6873,6 +7013,8 @@ public partial class CilAssembler
             ["Runtime.Not"] = typeof(Runtime).GetMethod("Not")!,
             ["Runtime.Atom"] = typeof(Runtime).GetMethod("Atom")!,
             ["Runtime.Consp"] = typeof(Runtime).GetMethod("Consp")!,
+            ["Runtime.Endp"] = typeof(Runtime).GetMethod("Endp")!,
+            ["Runtime.IsNotNil"] = typeof(Runtime).GetMethod("IsNotNil")!,
             ["Runtime.Listp"] = typeof(Runtime).GetMethod("Listp")!,
             ["Runtime.Numberp"] = typeof(Runtime).GetMethod("Numberp")!,
             ["Runtime.Integerp"] = typeof(Runtime).GetMethod("Integerp")!,
@@ -6924,6 +7066,12 @@ public partial class CilAssembler
             ["Math.CoshDouble"] = typeof(System.Math).GetMethod("Cosh", new[] { typeof(double) })!,
             ["Math.TanhDouble"] = typeof(System.Math).GetMethod("Tanh", new[] { typeof(double) })!,
             ["Runtime.ExpDouble"] = typeof(Runtime).GetMethod("ExpDouble")!,
+            ["Runtime.FloatIntegerS"] = typeof(Runtime).GetMethod("FloatIntegerS")!,
+            ["Runtime.FloatIntegerD"] = typeof(Runtime).GetMethod("FloatIntegerD")!,
+            ["Math.FloorDouble"] = typeof(System.Math).GetMethod("Floor", new[] { typeof(double) })!,
+            ["Math.CeilingDouble"] = typeof(System.Math).GetMethod("Ceiling", new[] { typeof(double) })!,
+            ["Math.TruncateDouble"] = typeof(System.Math).GetMethod("Truncate", new[] { typeof(double) })!,
+            ["Math.RoundDouble"] = typeof(System.Math).GetMethod("Round", new[] { typeof(double) })!,
             ["Runtime.Mod"] = typeof(Runtime).GetMethod("Mod")!,
             ["Runtime.Rem"] = typeof(Runtime).GetMethod("Rem")!,
             ["Runtime.FloorOp"] = typeof(Runtime).GetMethod("FloorOp")!,
@@ -6936,7 +7084,13 @@ public partial class CilAssembler
             ["Runtime.TruncateOpPrimary"] = typeof(Runtime).GetMethod("TruncateOpPrimary")!,
             ["Runtime.CeilingOpPrimary"] = typeof(Runtime).GetMethod("CeilingOpPrimary")!,
             ["Runtime.RoundOpPrimary"] = typeof(Runtime).GetMethod("RoundOpPrimary")!,
+            ["Runtime.FloorOpPair"] = typeof(Runtime).GetMethod("FloorOpPair")!,
+            ["Runtime.TruncateOpPair"] = typeof(Runtime).GetMethod("TruncateOpPair")!,
+            ["Runtime.CeilingOpPair"] = typeof(Runtime).GetMethod("CeilingOpPair")!,
+            ["Runtime.RoundOpPair"] = typeof(Runtime).GetMethod("RoundOpPair")!,
             ["Runtime.Min"] = typeof(Runtime).GetMethod("Min")!,
+            ["Math.MinLong"] = typeof(System.Math).GetMethod("Min", new[] { typeof(long), typeof(long) })!,
+            ["Math.MaxLong"] = typeof(System.Math).GetMethod("Max", new[] { typeof(long), typeof(long) })!,
             ["Runtime.Max"] = typeof(Runtime).GetMethod("Max")!,
             ["Runtime.Gcd"] = typeof(Runtime).GetMethod("Gcd")!,
             ["Runtime.Lcm"] = typeof(Runtime).GetMethod("Lcm")!,
@@ -6946,9 +7100,15 @@ public partial class CilAssembler
             ["Runtime.Logxor"] = typeof(Runtime).GetMethod("Logxor")!,
             ["Runtime.Logior2"] = typeof(Runtime).GetMethod("Logior2")!,
             ["Runtime.Low64"] = typeof(Runtime).GetMethod("Low64")!,
+            ["Runtime.Ldb"] = typeof(Runtime).GetMethod("Ldb")!,
+            ["Runtime.Dpb"] = typeof(Runtime).GetMethod("Dpb")!,
             ["Runtime.IsU64"] = typeof(Runtime).GetMethod("IsU64")!,
+            ["Runtime.CheckU64Arg"] = typeof(Runtime).GetMethod("CheckU64Arg")!,
             ["Runtime.BoxU64"] = typeof(Runtime).GetMethod("BoxU64")!,
             ["Runtime.ShrU64"] = typeof(Runtime).GetMethod("ShrU64")!,
+            ["Runtime.RotateLeft32"] = typeof(Runtime).GetMethod("RotateLeft32")!,
+            ["Runtime.RotateLeft64"] = typeof(Runtime).GetMethod("RotateLeft64")!,
+            ["Runtime.RotateByte"] = typeof(Runtime).GetMethod("RotateByte")!,
             ["Runtime.ReadU16LE"] = typeof(Runtime).GetMethod("ReadU16LE")!,
             ["Runtime.ReadU16BE"] = typeof(Runtime).GetMethod("ReadU16BE")!,
             ["Runtime.ReadU32LE"] = typeof(Runtime).GetMethod("ReadU32LE")!,
@@ -7019,6 +7179,11 @@ public partial class CilAssembler
             ["Runtime.Elt"] = typeof(Runtime).GetMethod("Elt")!,
             ["Runtime.Subseq"] = typeof(Runtime).GetMethod("Subseq")!,
             ["Runtime.MakeArrayOfType"] = typeof(Runtime).GetMethod("MakeArrayOfType")!,
+            ["Runtime.MakeArrayOfTypeInit"] = typeof(Runtime).GetMethod("MakeArrayOfTypeInit")!,
+            ["Runtime.MakeArrayLike"] = typeof(Runtime).GetMethod("MakeArrayLike")!,
+            ["Runtime.CheckArgSingleRange"] = typeof(Runtime).GetMethod("CheckArgSingleRange")!,
+            ["Runtime.CheckArgDoubleRange"] = typeof(Runtime).GetMethod("CheckArgDoubleRange")!,
+            ["Runtime.MakeArrayLikeInit"] = typeof(Runtime).GetMethod("MakeArrayLikeInit")!,
             ["Runtime.ReplaceKeys"] = typeof(Runtime).GetMethod("ReplaceKeys")!,
             ["Runtime.Concatenate"] = typeof(Runtime).GetMethod("Concatenate")!,
             ["Runtime.Sort"] = typeof(Runtime).GetMethod("Sort")!,
@@ -7030,6 +7195,9 @@ public partial class CilAssembler
             // Runtime - higher-order
             ["Runtime.Apply"] = typeof(Runtime).GetMethod("Apply")!,
             ["Runtime.ApplySpread1"] = typeof(Runtime).GetMethod("ApplySpread1")!,
+            ["Runtime.ApplyM"] = typeof(Runtime).GetMethod("ApplyM")!,
+            ["Runtime.ApplySpread1M"] = typeof(Runtime).GetMethod("ApplySpread1M")!,
+            ["Runtime.ApplySpread2M"] = typeof(Runtime).GetMethod("ApplySpread2M")!,
             ["Runtime.ApplySpread2"] = typeof(Runtime).GetMethod("ApplySpread2")!,
             ["Runtime.Mapcar"] = typeof(Runtime).GetMethod("Mapcar")!,
             ["Runtime.MapcarN"] = typeof(Runtime).GetMethod("MapcarN")!,
@@ -7044,6 +7212,7 @@ public partial class CilAssembler
             ["Runtime.MakeHashTable0"] = typeof(Runtime).GetMethod("MakeHashTable0")!,
             ["Runtime.Gethash"] = typeof(Runtime).GetMethod("Gethash")!,
             ["Runtime.GethashPrimary"] = typeof(Runtime).GetMethod("GethashPrimary")!,
+            ["Runtime.GethashPair"] = typeof(Runtime).GetMethod("GethashPair")!,
             ["Runtime.Puthash"] = typeof(Runtime).GetMethod("Puthash")!,
             ["Runtime.Remhash"] = typeof(Runtime).GetMethod("Remhash")!,
 
@@ -7051,6 +7220,9 @@ public partial class CilAssembler
             ["Runtime.Values"] = typeof(Runtime).GetMethod("Values")!,
             ["Runtime.Values2"] = typeof(Runtime).GetMethod("Values2")!,
             ["Runtime.Values2Primary"] = typeof(Runtime).GetMethod("Values2Primary")!,
+            ["Runtime.Values2Pair"] = typeof(Runtime).GetMethod("Values2Pair")!,
+            ["MultipleValues.CapturePair"] = typeof(MultipleValues).GetMethod("CapturePair")!,
+            ["MultipleValues.PairNth"] = typeof(MultipleValues).GetMethod("PairNth")!,
             ["Runtime.MultipleValuesList"] = typeof(Runtime).GetMethod("MultipleValuesList")!,
             ["Runtime.MultipleValuesList1"] = typeof(Runtime).GetMethod("MultipleValuesList1")!,
             ["Runtime.UnwrapMv"] = typeof(Runtime).GetMethod("UnwrapMv")!,
@@ -7070,9 +7242,17 @@ public partial class CilAssembler
             ["MultipleValues.Values2Mode"] = typeof(MultipleValues).GetMethod("Values2Mode")!,
             ["MultipleValues.Values3Mode"] = typeof(MultipleValues).GetMethod("Values3Mode")!,
             ["MultipleValues.Values4Mode"] = typeof(MultipleValues).GetMethod("Values4Mode")!,
+            ["MultipleValues.Values5Mode"] = typeof(MultipleValues).GetMethod("Values5Mode")!,
+            ["MultipleValues.Values6Mode"] = typeof(MultipleValues).GetMethod("Values6Mode")!,
+            ["MultipleValues.Values7Mode"] = typeof(MultipleValues).GetMethod("Values7Mode")!,
+            ["MultipleValues.Values8Mode"] = typeof(MultipleValues).GetMethod("Values8Mode")!,
+            ["MultipleValues.ValuesArrayMode"] = typeof(MultipleValues).GetMethod("ValuesArrayMode")!,
+            ["MultipleValues.CallBound"] = typeof(MultipleValues).GetMethod("CallBound")!,
             ["MultipleValues.Primary"] = typeof(MultipleValues).GetMethod("Primary")!,
             ["MultipleValues.SaveCount"] = typeof(MultipleValues).GetMethod("SaveCount")!,
             ["MultipleValues.SaveValues"] = typeof(MultipleValues).GetMethod("SaveValues")!,
+            ["MultipleValues.HoldValues"] = typeof(MultipleValues).GetMethod("HoldValues")!,
+            ["MultipleValues.RestoreValues"] = typeof(MultipleValues).GetMethod("RestoreValues")!,
             ["MultipleValues.RestoreSaved"] = typeof(MultipleValues).GetMethod("RestoreSaved")!,
 
             // Runtime - typep / error
@@ -7110,6 +7290,25 @@ public partial class CilAssembler
             ["Runtime.BackingU8Checked"] = typeof(Runtime).GetMethod("BackingU8Checked")!,
             ["Runtime.BackingF64Checked"] = typeof(Runtime).GetMethod("BackingF64Checked")!,
             ["Runtime.BackingF32Checked"] = typeof(Runtime).GetMethod("BackingF32Checked")!,
+            // Element access the compiled code has proven in range
+            ["Runtime.DataU8"] = typeof(Runtime).GetMethod("DataU8")!,
+            ["Runtime.DataU16"] = typeof(Runtime).GetMethod("DataU16")!,
+            ["Runtime.DataI32"] = typeof(Runtime).GetMethod("DataI32")!,
+            ["Runtime.DataI64"] = typeof(Runtime).GetMethod("DataI64")!,
+            ["Runtime.DataF64"] = typeof(Runtime).GetMethod("DataF64")!,
+            ["Runtime.DataF32"] = typeof(Runtime).GetMethod("DataF32")!,
+            ["Runtime.AtU8"] = typeof(Runtime).GetMethod("AtU8")!,
+            ["Runtime.AtU16"] = typeof(Runtime).GetMethod("AtU16")!,
+            ["Runtime.AtI32"] = typeof(Runtime).GetMethod("AtI32")!,
+            ["Runtime.AtI64"] = typeof(Runtime).GetMethod("AtI64")!,
+            ["Runtime.AtF64"] = typeof(Runtime).GetMethod("AtF64")!,
+            ["Runtime.AtF32"] = typeof(Runtime).GetMethod("AtF32")!,
+            ["Runtime.SetAtU8"] = typeof(Runtime).GetMethod("SetAtU8")!,
+            ["Runtime.SetAtU16"] = typeof(Runtime).GetMethod("SetAtU16")!,
+            ["Runtime.SetAtI32"] = typeof(Runtime).GetMethod("SetAtI32")!,
+            ["Runtime.SetAtI64"] = typeof(Runtime).GetMethod("SetAtI64")!,
+            ["Runtime.SetAtF64"] = typeof(Runtime).GetMethod("SetAtF64")!,
+            ["Runtime.SetAtF32"] = typeof(Runtime).GetMethod("SetAtF32")!,
             // Above (safety 0), matching the element type's width as well
             ["Runtime.BackingI64Narrow"] = typeof(Runtime).GetMethod("BackingI64Narrow")!,
             ["Runtime.BackingI32Narrow"] = typeof(Runtime).GetMethod("BackingI32Narrow")!,
@@ -7127,6 +7326,19 @@ public partial class CilAssembler
             ["Runtime.BackingU64Checked"] = typeof(Runtime).GetMethod("BackingU64Checked")!,
             ["Runtime.ArefU64Bits"] = typeof(Runtime).GetMethod("ArefU64Bits")!,
             ["Runtime.ArefSetU64Bits"] = typeof(Runtime).GetMethod("ArefSetU64Bits")!,
+            ["Runtime.ArefU64Bits2D"] = typeof(Runtime).GetMethod("ArefU64Bits2D")!,
+            ["Runtime.ArefU64Bits3D"] = typeof(Runtime).GetMethod("ArefU64Bits3D")!,
+            ["Runtime.ArefSetU64Bits2D"] = typeof(Runtime).GetMethod("ArefSetU64Bits2D")!,
+            ["Runtime.ArefSetU64Bits3D"] = typeof(Runtime).GetMethod("ArefSetU64Bits3D")!,
+            ["Runtime.BackingNDU8"] = typeof(Runtime).GetMethod("BackingNDU8")!,
+            ["Runtime.BackingNDU16"] = typeof(Runtime).GetMethod("BackingNDU16")!,
+            ["Runtime.BackingNDI32"] = typeof(Runtime).GetMethod("BackingNDI32")!,
+            ["Runtime.BackingNDI64"] = typeof(Runtime).GetMethod("BackingNDI64")!,
+            ["Runtime.BackingNDU64"] = typeof(Runtime).GetMethod("BackingNDU64")!,
+            ["Runtime.BackingNDF32"] = typeof(Runtime).GetMethod("BackingNDF32")!,
+            ["Runtime.BackingNDF64"] = typeof(Runtime).GetMethod("BackingNDF64")!,
+            ["Runtime.ArrayAxisOrZero"] = typeof(Runtime).GetMethod("ArrayAxisOrZero")!,
+            ["Runtime.AxisIndexL"] = typeof(Runtime).GetMethod("AxisIndexL")!,
             ["Runtime.U64Bits"] = typeof(Runtime).GetMethod("U64Bits")!,
             ["Runtime.CheckStoreU64"] = typeof(Runtime).GetMethod("CheckStoreU64")!,
             ["Runtime.ArefSetNumL"] = typeof(Runtime).GetMethod("ArefSetNumL")!,
@@ -7160,6 +7372,8 @@ public partial class CilAssembler
             // Raw-long slot read/write for fixnum-typed struct slots
             ["Runtime.StructRefL"] = typeof(Runtime).GetMethod("StructRefL")!,
             ["Runtime.StructSetL"] = typeof(Runtime).GetMethod("StructSetL")!,
+            ["Runtime.StructRefU64"] = typeof(Runtime).GetMethod("StructRefU64")!,
+            ["Runtime.StructSetU64"] = typeof(Runtime).GetMethod("StructSetU64")!,
             // The raw slot array fetched once per binding, and the two
             // reinterpretations a double slot needs on top of it
             ["Runtime.StructRawBacking"] = typeof(Runtime).GetMethod("StructRawBacking")!,
@@ -7190,6 +7404,7 @@ public partial class CilAssembler
 
             // DynamicBindings
             ["DynamicBindings.Get"] = typeof(DynamicBindings).GetMethod("Get")!,
+            ["DynamicBindings.GetConstant"] = typeof(DynamicBindings).GetMethod("GetConstant")!,
             ["DynamicBindings.Set"] = typeof(DynamicBindings).GetMethod("Set")!,
             ["DynamicBindings.SetChecked"] = typeof(DynamicBindings).GetMethod("SetChecked")!,
             ["Runtime.DefineConstant"] = typeof(Runtime).GetMethod("DefineConstant")!,
@@ -7302,6 +7517,7 @@ public partial class CilAssembler
             ["Runtime.SlotValue"] = typeof(Runtime).GetMethod("SlotValue")!,
             ["Runtime.SetSlotValue"] = typeof(Runtime).GetMethod("SetSlotValue")!,
             ["Runtime.ReaderIC"] = typeof(Runtime).GetMethod("ReaderIC")!,
+            ["Runtime.SlotValueIC"] = typeof(Runtime).GetMethod("SlotValueIC")!,
             ["Runtime.WriterIC"] = typeof(Runtime).GetMethod("WriterIC")!,
             ["Runtime.Boundp"] = typeof(Runtime).GetMethod("Boundp")!,
             ["Runtime.SymbolValue"] = typeof(Runtime).GetMethod("SymbolValue")!,
@@ -7396,6 +7612,7 @@ public partial class CilAssembler
             ["MultipleValues.CaptureForBind"] = typeof(MultipleValues).GetMethod("CaptureForBind")!,
             ["MultipleValues.BindNth"] = typeof(MultipleValues).GetMethod("BindNth")!,
             ["Runtime.ModFixnumL"] = typeof(Runtime).GetMethod("ModFixnumL")!,
+            ["Runtime.AshLong"] = typeof(Runtime).GetMethod("AshLong")!,
             ["Runtime.FloorFixnumL"] = typeof(Runtime).GetMethod("FloorFixnumL")!,
             ["Runtime.TruncateFixnumL"] = typeof(Runtime).GetMethod("TruncateFixnumL")!,
             ["Runtime.FloorFixnumBoxed"] = typeof(Runtime).GetMethod("FloorFixnumBoxed")!,
@@ -7622,8 +7839,16 @@ public partial class CilAssembler
             ["Byte[]"] = typeof(byte[]),
             ["Double[]"] = typeof(double[]),
             ["Single[]"] = typeof(float[]),
+            ["Byte"] = typeof(byte),
+            ["UInt16"] = typeof(ushort),
             ["Double"] = typeof(double),
             ["Single"] = typeof(float),
+            ["Byte&"] = typeof(byte).MakeByRefType(),
+            ["UInt16&"] = typeof(ushort).MakeByRefType(),
+            ["Int32&"] = typeof(int).MakeByRefType(),
+            ["Int64&"] = typeof(long).MakeByRefType(),
+            ["Double&"] = typeof(double).MakeByRefType(),
+            ["Single&"] = typeof(float).MakeByRefType(),
             // A local slot holding a raw System.Decimal, for the declared-decimal
             // native path: the boxed LispDecimal only reappears when the value
             // crosses back into generic code.
@@ -7638,6 +7863,7 @@ public partial class CilAssembler
             ["LispCondition"] = typeof(LispCondition),
             ["HandlerBinding"] = typeof(HandlerBinding),
             ["HandlerBinding[]"] = typeof(HandlerBinding[]),
+            ["MvHeld"] = typeof(MvHeld),
             ["RestartInvocationException"] = typeof(RestartInvocationException),
             ["LispRestart"] = typeof(LispRestart),
             ["LispRestart[]"] = typeof(LispRestart[]),
@@ -7665,5 +7891,8 @@ public partial class CilAssembler
         _registerFunction = typeof(CilAssembler).GetMethod("RegisterFunction")!;
         _registerFunctionOnSymbol = typeof(CilAssembler).GetMethod("RegisterFunctionOnSymbol")!;
         _registerSetfFunctionOnSymbol = typeof(CilAssembler).GetMethod("RegisterSetfFunctionOnSymbol")!;
+        foreach (var (name, m) in SimdLower.Methods()) _methodCache[name] = m;
+        foreach (var t in SimdLower.LaneTypes)
+            _typeCache["V128." + t.Name] = typeof(System.Runtime.Intrinsics.Vector128<>).MakeGenericType(t);
     }
 }

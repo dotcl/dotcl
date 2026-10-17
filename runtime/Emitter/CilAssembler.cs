@@ -323,11 +323,16 @@ public partial class CilAssembler
     /// (FindFunctionAcrossPackages) is NOT applied here: a package-qualified
     /// call to an unbound symbol is undefined (matches SBCL semantics).
     /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispFunction GetFunctionBySymbol(Symbol sym)
     {
         if (sym.Function is LispFunction symFn) return symFn;
-        throw new LispErrorException(new LispUndefinedFunction(sym));
+        return ThrowUndefinedFunction(sym);
     }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispFunction ThrowUndefinedFunction(Symbol sym) =>
+        throw new LispErrorException(new LispUndefinedFunction(sym));
 
     /// <summary>Symbol-based setf function lookup: sym.SetfFunction is authoritative.</summary>
     public static LispFunction GetSetfFunctionBySymbol(Symbol sym)

@@ -7,12 +7,11 @@
 ;;; displacement, sequence functions, plus loud errors on element-type
 ;;; violations (never a silent wrap).
 
-;; (integer LO HI) upgrades to the (unsigned-byte N) / (signed-byte N) of its
-;; width, the same type that spelling of the range gets (SBCL agrees where it
-;; has that width).
+;; (integer LO HI) upgrades as the (unsigned-byte N) / (signed-byte N) of its
+;; width does, to the narrowest specialized width that holds it.
 (deftest nas-upgrade-u16
   (array-element-type (make-array 3 :element-type '(integer 0 2000)))
-  (unsigned-byte 11))
+  (unsigned-byte 15))
 
 (deftest nas-upgrade-u8
   (array-element-type (make-array 3 :element-type '(integer 0 255)))
@@ -24,7 +23,7 @@
 
 (deftest nas-upgrade-signed
   (array-element-type (make-array 3 :element-type '(integer -10 10)))
-  (signed-byte 5))
+  (signed-byte 8))
 
 (deftest nas-upgrade-unbounded-stays-integer
   ;; No storage holds an unbounded integer range other than the general one,

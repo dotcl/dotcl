@@ -50,8 +50,10 @@
           (with-open-file (s src :direction :output :if-exists :supersede)
             (format s "(in-package ~s)~%" (package-name *package*))
             (format s "(defun lss-file-120 (n) (declare (ignorable n)) (lss-body 120))~%"))
-          (compile-file src :output-file fasl)
-          (load fasl)
+          ;; The test reads the IL of the module loaded from the file.
+          (with-fasl-load-in-memory ("0")
+            (compile-file src :output-file fasl)
+            (load fasl))
           (let ((flags (dotnet:static "System.Enum" "ToObject"
                                       (dotnet:resolve-type "System.Reflection.BindingFlags") 62))
                 (most 0))

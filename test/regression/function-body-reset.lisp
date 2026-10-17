@@ -76,7 +76,7 @@
 ;;; --- drift tripwire ------------------------------------------------------
 ;;; The closure boundary picks up new state automatically; the two function-body
 ;;; paths do not. If this list changes, decide what compile-function-body-inner
-;;; and compile-function-body-direct (cil-forms.lisp) must do with the new
+;;; and compile-function-body-direct (cil-forms-defun.lisp) must do with the new
 ;;; variable, then update this list.
 ;;; The registry-mechanism test registers dummy state of its own, so those are
 ;;; filtered out here: this list is about the compiler's real state.

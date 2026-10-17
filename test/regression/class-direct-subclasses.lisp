@@ -102,3 +102,13 @@
           (eq (class-finalized-p c) (dotcl-mop:class-finalized-p c))
           (= (length (class-slots c)) (length (dotcl-mop:class-slots c)))))
   (t t t t))
+
+;;; Newest first, as SBCL and CCL answer; moptilities' tests compare the order.
+(defclass cds-ord-root () ())
+(defclass cds-ord-1 (cds-ord-root) ())
+(defclass cds-ord-2 (cds-ord-root) ())
+(defclass cds-ord-3 (cds-ord-root) ())
+
+(deftest class-direct-subclasses.newest-first
+  (mapcar #'class-name (class-direct-subclasses (find-class 'cds-ord-root)))
+  (cds-ord-3 cds-ord-2 cds-ord-1))

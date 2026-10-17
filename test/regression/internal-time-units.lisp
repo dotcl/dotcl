@@ -39,7 +39,8 @@
 (deftest-runtime-once internal-time.run-time-same-unit-as-real-time
   (let* ((r0 (get-internal-real-time))
          (c0 (get-internal-run-time)))
-    (%itu-busy 3000000)
+    ;; Long enough to span several ticks of Windows' 15.6 ms CPU-time clock.
+    (loop until (> (- (get-internal-real-time) r0) 200000) do (%itu-busy 100000))
     (let ((real (- (get-internal-real-time) r0))
           (cpu (- (get-internal-run-time) c0)))
       (and (> real 0) (> cpu 0)

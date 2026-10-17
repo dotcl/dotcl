@@ -172,11 +172,9 @@ public class LispErrorException : Exception
         // Per CL spec: error signals the condition through handler-bind before throwing.
         // If a handler does a non-local exit, this constructor never returns.
         HandlerClusterStack.Signal(condition);
-        // No handler took it. Where the REPL has asked for it, that is the
-        // point ERROR hands over to the debugger, and this constructor is the
-        // one place every runtime-signalled error passes through after its
-        // handlers have run: the frames that signalled are still on the stack.
-        if (ConditionSystem.UnhandledErrorsEnterDebugger)
+        // No handler took it: this is where ERROR hands over to the debugger,
+        // with the frames that signalled still on the stack.
+        if (ConditionSystem.UnhandledErrorsInvokeDebugger)
             ConditionSystem.InvokeDebugger(condition);
     }
 
@@ -389,42 +387,48 @@ public static class HandlerClusterStack
     /// </summary>
     public static void Signal(LispCondition condition)
     {
-        if (_clusters == null) return;
-        for (int i = _clusters.Count - 1; i >= 0; i--)
+        var exit = SignalForExit(condition);
+        if (exit != null) throw exit;
+    }
+
+    /// <summary>SIGNAL, except that a handler-case clause's transfer is returned
+    /// for the caller to throw: each frame the throw crosses costs.</summary>
+    internal static HandlerCaseInvocationException? SignalForExit(LispCondition condition)
+    {
+        var clusters = _clusters;
+        if (clusters == null) return null;
+        for (int i = clusters.Count - 1; i >= 0; i--)
         {
-            var cluster = _clusters[i];
+            var cluster = clusters[i];
             foreach (var binding in cluster)
             {
-                if (Runtime.IsTruthy(Runtime.Typep(condition, binding.TypeSpec)))
-                {
-                    // Remove this cluster and above during handler call
-                    var saved = new List<HandlerBinding[]>();
-                    for (int j = _clusters.Count - 1; j >= i; j--)
-                    {
-                        saved.Add(_clusters[j]);
-                        _clusters.RemoveAt(j);
-                    }
-                    try
-                    {
-                        // A handler-case clause transfers to its clause body; the
-                        // cluster array identifies which handler-case invocation.
-                        // HCTAG is set only by a binding an older fasl built; that
-                        // fasl's filter compares against that object, so throw with
-                        // whichever identity the binding was made with.
-                        if (binding.IsHandlerCaseClause)
-                            throw new HandlerCaseInvocationException(
-                                binding.HcTag ?? cluster, binding.HcClause, condition);
-                        binding.Handler!.Invoke(condition);
-                        // Handler returned normally -> decline, restore and continue
-                    }
-                    finally
-                    {
-                        // Restore clusters
-                        saved.Reverse();
-                        _clusters.AddRange(saved);
-                    }
-                }
+                if (!Runtime.IsTruthy(Runtime.Typep(condition, binding.TypeSpec))) continue;
+                // HCTAG is set only by a binding an older fasl built; that fasl's
+                // filter compares against that object.
+                if (binding.IsHandlerCaseClause)
+                    return new HandlerCaseInvocationException(
+                        binding.HcTag ?? cluster, binding.HcClause, condition);
+                RunHandler(clusters, i, binding.Handler!, condition);
             }
+        }
+        return null;
+    }
+
+    /// <summary>Call a handler-bind handler with its cluster and those above it
+    /// removed. Returning normally declines.</summary>
+    private static void RunHandler(List<HandlerBinding[]> clusters, int i,
+                                   LispFunction handler, LispCondition condition)
+    {
+        int n = clusters.Count - i;
+        var saved = clusters.GetRange(i, n);
+        clusters.RemoveRange(i, n);
+        try
+        {
+            handler.Invoke(condition);
+        }
+        finally
+        {
+            clusters.AddRange(saved);
         }
     }
 }
@@ -698,6 +702,35 @@ public static class ConditionSystem
         set => t_unhandledErrorsEnterDebugger = value;
     }
 
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<LispObject, object>
+        s_reportingHooks = new();
+
+    /// <summary>Marks HOOK as one the runtime installs only to end the run or
+    /// the host call on an error (script, pack / build, host API). Runtime
+    /// errors treat it as NIL and unwind to the caller's report.</summary>
+    public static LispFunction ReportingDebuggerHook(LispFunction hook)
+    {
+        s_reportingHooks.GetValue(hook, h => h);
+        return hook;
+    }
+
+    private static Symbol? s_debuggerHookSym;
+
+    /// <summary>Whether an unhandled runtime-signalled error goes on to
+    /// INVOKE-DEBUGGER as ERROR does: in the REPL, or when *DEBUGGER-HOOK* is
+    /// neither NIL nor a reporting hook.</summary>
+    internal static bool UnhandledErrorsInvokeDebugger
+    {
+        get
+        {
+            if (t_unhandledErrorsEnterDebugger) return true;
+            var sym = s_debuggerHookSym ??= Startup.Sym("*DEBUGGER-HOOK*");
+            return DynamicBindings.TryGet(sym, out var hook)
+                && hook is not Nil
+                && !s_reportingHooks.TryGetValue(hook, out _);
+        }
+    }
+
     /// <summary>
     /// Hand an unhandled error to INVOKE-DEBUGGER, which runs *DEBUGGER-HOOK*
     /// and then the debugger. Returns only when there is no INVOKE-DEBUGGER to
@@ -727,8 +760,14 @@ public static class ConditionSystem
 
     private static volatile bool _interruptRequested = false;
 
-    /// <summary>Request interrupt delivery (called from Console.CancelKeyPress on another thread).</summary>
-    public static void RequestInterrupt() => _interruptRequested = true;
+    /// <summary>Request interrupt delivery (called from Console.CancelKeyPress on another thread).
+    /// Delivered on a thread that is not running a hosted REPL: Ctrl+C at the
+    /// console is not for one.</summary>
+    public static void RequestInterrupt()
+    {
+        _interruptRequested = true;
+        RaisePollGate();
+    }
 
     /// <summary>
     /// Drop a pending interrupt without delivering it; true when there was one.
@@ -768,7 +807,7 @@ public static class ConditionSystem
     {
         if (System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0)
             Runtime.RunPendingInterruptsAtSafepoint();
-        if (!_interruptRequested) return;
+        if (!_interruptRequested || ReplLoop.Hosted) return;
         _interruptRequested = false;
         Error(new LispInteractiveInterrupt());
     }
@@ -784,7 +823,19 @@ public static class ConditionSystem
     /// writing it on each iteration made threads running loops at the same time
     /// fight over its cache line (four threads ran three times slower than one).
     /// Off, the poll only reads.</summary>
-    public static bool CountPolls;
+    public static bool CountPolls
+    {
+        get => _countPolls;
+        set { _countPolls = value; RaisePollGate(); }
+    }
+    private static bool _countPolls;
+
+    /// <summary>Nonzero while a poll may have work (a queued INTERRUPT-THREAD
+    /// function, Ctrl-C, counting). Raised after the work is queued; cleared
+    /// by the slow path when it finds none.</summary>
+    internal static int PollGate;
+
+    internal static void RaisePollGate() => System.Threading.Volatile.Write(ref PollGate, 1);
 
     /// <summary>
     /// Loop back-edge safepoint. The compiler emits a call to this on the
@@ -793,36 +844,47 @@ public static class ConditionSystem
     /// the periodic check in LispFunction.Invoke, can still be stopped by
     /// Ctrl-C. Bodies declared (optimize (safety 0)) opt out at compile time.
     /// </summary>
-    /// The two branches below are what makes this method inlinable, and it has to
-    /// be: it sits on the back edge of every loop, so a real call there is a
-    /// barrier the JIT cannot see through. In a loop that chases pointers -- the
-    /// shape of every list traversal -- that barrier stops the processor
-    /// overlapping the dependent loads, and the poll cost 7 ns an element rather
-    /// than the nothing it costs when inlined. Everything that can allocate,
-    /// throw or call is in PollInterruptSlow.
+    /// A plain load: an acquire load would order the loop's later loads behind
+    /// it. The slow-path call stays in the loop, so the JIT cannot hoist it.
     [System.Runtime.CompilerServices.MethodImpl(
         System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static void PollInterrupt()
     {
-        if (CountPolls) PollCount++;
-        // Tier 2: INTERRUPT-THREAD functions queued for this thread run here.
-        // The counter gate keeps the common case to one volatile static read.
-        if (System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0
-            || _interruptRequested)
-            PollInterruptSlow();
+        if (PollGate != 0) PollInterruptSlow();
     }
 
-    /// <summary>The safepoint's work, on the rare path where there is any.</summary>
     [System.Runtime.CompilerServices.MethodImpl(
         System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static void PollInterruptSlow()
     {
+        if (_countPolls) PollCount++;
+        PollCallSlow();
+    }
+
+    /// <summary>The work of a poll without counting it: the call entry of a
+    /// body that links its own frame polls here.</summary>
+    internal static void PollCallSlow()
+    {
+        // Compiled loops may drop their resets of the values channel (they
+        // publish nothing), so work run here must leave the count as it was.
+        int mvCount = CallTls.MvCount;
         if (System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0)
             Runtime.RunPendingInterruptsAtSafepoint();
-        if (!_interruptRequested) return;
-        _interruptRequested = false;
-        Error(new LispInteractiveInterrupt());
+        if (_interruptRequested && !ReplLoop.Hosted)
+        {
+            _interruptRequested = false;
+            Error(new LispInteractiveInterrupt());
+        }
+        CallTls.MvCount = mvCount;
+        if (PollWorkPending()) return;
+        System.Threading.Volatile.Write(ref PollGate, 0);
+        System.Threading.Interlocked.MemoryBarrier();
+        if (PollWorkPending()) RaisePollGate();
     }
+
+    private static bool PollWorkPending() =>
+        _countPolls || _interruptRequested
+        || System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0;
 
     private static void CheckBreakOnSignals(LispCondition condition)
     {
@@ -855,14 +917,19 @@ public static class ConditionSystem
     }
 
     public static LispObject Error(LispCondition condition)
+        => throw ErrorExit(condition);
+
+    /// <summary>ERROR up to the throw: signals CONDITION, enters the debugger if
+    /// no handler took it, and returns the exception for the caller to throw.</summary>
+    internal static Exception ErrorExit(LispCondition condition)
     {
         CheckBreakOnSignals(condition);
-        HandlerClusterStack.Signal(condition);
-        // Not handled -> invoke debugger (per CLHS)
+        var exit = HandlerClusterStack.SignalForExit(condition);
+        if (exit != null) return exit;
         InvokeDebugger(condition);
         // Reached only if INVOKE-DEBUGGER returned. The handlers have seen this
         // condition already.
-        throw LispErrorException.WithoutSignal(condition);
+        return LispErrorException.WithoutSignal(condition);
     }
 
     public static LispObject Warn(LispCondition condition)
@@ -898,25 +965,32 @@ public static class ConditionSystem
         {
             RestartClusterStack.PopCluster();
         }
-        if (!muffled)
-        {
-            // Not handled -> print warning to *error-output*
-            try
-            {
-                // Painted only where *ERROR-OUTPUT* is still the process's
-                // standard error and the REPL has turned colour on for it.
-                var errSym = Startup.Sym("*ERROR-OUTPUT*");
-                var text = $"WARNING: {ConditionText.Report(condition)}";
-                if (DynamicBindings.TryGet(errSym, out var errStream) && errStream is LispOutputStream los)
-                    los.Writer.WriteLine(ReplColor.ForStream("WARNING", text, los));
-                else
-                    Console.Error.WriteLine(ReplColor.ForErr("WARNING", text));
-            }
-            catch
-            {
-                Console.Error.WriteLine($"WARNING: {ConditionText.Report(condition)}");
-            }
-        }
+        if (!muffled) PrintWarning(condition);
         return Nil.Instance;
+    }
+
+    /// <summary>What WARN prints when no handler muffled the warning.</summary>
+    internal static void PrintWarning(LispCondition condition)
+    {
+        try
+        {
+            // Painted only where *ERROR-OUTPUT* is still the process's
+            // standard error and the REPL has turned colour on for it.
+            var errSym = Startup.Sym("*ERROR-OUTPUT*");
+            var text = $"WARNING: {ConditionText.Report(condition)}";
+            if (DynamicBindings.TryGet(errSym, out var errStream) && errStream is LispOutputStream los)
+            {
+                los.Writer.Write(ReplColor.ForStream("WARNING", text, los));
+                los.Writer.Write('\n');
+            }
+            else if (errStream != null && errStream is not Nil)
+                Runtime.WriteLine(new LispObject[] { new LispString(text), errStream });
+            else
+                Console.Error.WriteLine(ReplColor.ForErr("WARNING", text));
+        }
+        catch
+        {
+            Console.Error.WriteLine($"WARNING: {ConditionText.Report(condition)}");
+        }
     }
 }

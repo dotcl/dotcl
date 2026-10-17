@@ -202,7 +202,8 @@ dotcl pack --system myapp --asd-search-path . ...
   is the prelude you are most likely to need. `dotcl:save-application`'s
   `:prelude` means the same thing and behaves the same way.
 - **`--r2r`** -- also compile the FASL ahead of time with crossgen2 and ship the
-  result beside it, one image per RID. The installed tool then maps native code
+  result beside it, one image per RID. (A library package gets these images by
+  default; see [Packaging a library](#packaging-a-library---library).) The installed tool then maps native code
   instead of running its own code through the JIT at every start: worth roughly
   2x on a short run. It costs a crossgen2 run per RID and roughly doubles the
   package, which is why it is opt-in. The packing host does not need to be the
@@ -287,7 +288,8 @@ own, that loads it from there.
    embedded. If `my-lib` depends on systems in other directories, make them
    visible the same way as for a tool (see
    [Making a dependency visible](#making-a-dependency-visible)): they go into
-   the package too.
+   the package too. Every fasl also gets ReadyToRun images for the six desktop
+   platforms (see [ReadyToRun images](#readytorun-images-in-a-library)).
 
 2. **Declare it in the other project.** In that project's `.asd`, a
    `(:nuget ...)` component names the package, its version and the feed:
@@ -302,7 +304,9 @@ own, that loads it from there.
    ```
 
    `:source` adds the feed to the ones NuGet already uses; leave it out for a
-   package on nuget.org or on a feed your NuGet configuration already lists.
+   package on nuget.org or on a feed your NuGet configuration already lists. A
+   relative path is read from the system's directory (from the current
+   directory for `nuget:require`).
 
 3. **Load the project** from its own directory:
 
@@ -366,33 +370,50 @@ function this dotcl no longer has, or it was made by a newer dotcl than this
 one, whose runtime .NET refuses to bind), its source is compiled and loaded in
 its place, with a note naming the file and the error.
 
-`--r2r` adds a ReadyToRun image of every fasl for the platform you pack on,
-compiled against the running dotcl. With `--from <dir>` it adds the other
-platforms in `--rids` (default: the six desktop RIDs) as well, compiled against
-the dotcl packages in `<dir>` as for a tool -- pack with the same dotcl as those
-packages.
+### ReadyToRun images in a library
+
+By default every fasl in the package also gets a ReadyToRun image
+(`<file>.fasl.r2r-<rid>`) for each of `win-x64`, `win-arm64`, `linux-x64`,
+`linux-arm64`, `osx-x64` and `osx-arm64`, all compiled on the machine you pack
+on. A consumer on one of those platforms loads native code instead of running
+the fasl through the JIT: a large library loads about a fifth faster. Each
+platform's images add about twice the size of the fasls to the package. `--rids <csv>` picks other
+platforms.
+
+The images are compiled against the running dotcl, the same one that compiled
+the fasls. With `--from <dir>` they are compiled against the dotcl packages in
+`<dir>` instead, as for a tool -- pack with the same dotcl as those packages.
+
+This needs crossgen2 and, for each platform, the .NET runtime pack, which the
+.NET SDK restores from NuGet the first time (about 12 MB for crossgen2 and 40 MB
+per platform). If they cannot be had (no SDK, no network), pack prints a warning
+and writes the package without images; it loads correctly, only slower. A
+platform whose images fail is skipped the same way. `--no-r2r` writes no images;
+`--r2r` makes a missing crossgen2 an error instead of a warning.
 
 ### Example: Coalton
 
 [Coalton](https://github.com/coalton-lang/coalton) is a large library (about 300
 files across 22 systems) that takes minutes to compile. Packaged once, it loads
-from a NuGet feed with no compiler run and no Quicklisp:
+from a NuGet feed with no compiler run and no Quicklisp. Upstream Coalton needs
+no dotcl-specific change.
 
-1. Make Coalton and its dependencies visible to ASDF and package it with
-   `--r2r`, so that every file also gets its ahead-of-time compiled image. With
-   a Coalton checkout and the Quicklisp home dotcl sets up (see
-   [Making a dependency visible](#making-a-dependency-visible)):
+1. Make Coalton and its dependencies visible to ASDF and package it. With a
+   Coalton checkout and its dependencies in the Quicklisp home dotcl sets up
+   (see [Making a dependency visible](#making-a-dependency-visible);
+   `(ql:quickload "coalton/tests")` once fetches them all):
 
    ```sh
    Q=~/.local/share/dotcl/quicklisp/dists
    export CL_SOURCE_REGISTRY="(:source-registry (:tree \"$PWD/coalton/\") \
      (:tree \"$Q/dotcl/software/\") (:tree \"$Q/quicklisp/software/\") \
      :ignore-inherited-configuration)"
-   dotcl pack --library --system coalton --version 0.1.0 -o feed/ --r2r
+   dotcl pack --library --system coalton --version 0.1.0 -o feed/
    ```
 
-   This compiles Coalton once (about three minutes) and writes
-   `feed/coalton.0.1.0.nupkg`.
+   This compiles Coalton once and writes `feed/coalton.0.1.0.nupkg` (about two
+   and a half minutes; 175 MB with the images for all six platforms, 48 MB
+   with `--rids osx-arm64` alone).
 2. Put the `.nupkg` on a feed (a directory is enough).
 3. In the application, declare it:
 
@@ -405,21 +426,40 @@ from a NuGet feed with no compiler run and no Quicklisp:
                   (:file "app")))
    ```
 
-`app.lisp` can then use Coalton right away. Measured numbers are in the table
-below.
+`app.lisp` can then use Coalton right away.
 
-| Loading Coalton (`fib 20` afterwards) | wall time | peak memory |
+To check a package against Coalton's own test suite, package `coalton/tests`
+the same way (its closure includes `coalton`) and run the suite from it in a
+fresh image, with nothing on `CL_SOURCE_REGISTRY`:
+
+```sh
+dotcl pack --library --system coalton/tests --id coalton-tests --version 0.1.0 \
+           --rids osx-arm64 -o feed/
+dotcl --eval '(require "asdf")' --eval '(require "dotnet-nuget")' \
+      --eval '(nuget:require "coalton-tests" :version "0.1.0" :source "feed/")' \
+      --eval '(asdf:load-system "coalton/tests")' \
+      --eval '(print (coalton-tests:run-coalton-tests))'
+```
+
+With the images for one platform (`--rids`, your own) packing takes about six
+minutes and the package is 93 MB; all six take about ten minutes and 400 MB.
+The run takes about four minutes; every test should pass and the last line be
+`T`.
+
+Loading `coalton/tests` (Coalton and the test systems, 559 files):
+
+| | wall time | JIT on the loading thread |
 | --- | --- | --- |
-| compiled from source (Quicklisp, Coalton's own files) | 125 s | 0.93 GB |
-| from the package, ReadyToRun images used | 18-19 s | 0.62 GB |
-| from the package, `DOTCL_NO_R2R_FASL=1` | 33 s | 0.74 GB |
+| compiled from source | 287 s | |
+| ASDF's fasl cache | 16.5-18.2 s | 19.3 MB of IL, 6.7-7.1 s |
+| from the package, first use (NuGet cache empty) | 17.8 s | |
+| from the package, already restored | 11.2-13.5 s | 0.8 MB of IL, 0.7 s |
+| from the package, `DOTCL_NO_R2R_FASL=1` | 19.3-21.3 s | 19.4 MB of IL, 7.3 s |
+| SBCL 2.6.8, compiled from source | 104 s | |
+| SBCL 2.6.8, fasl cache | 2.2-2.3 s | |
 
-(Apple M1, 16 GB, a Release build of dotcl. The first load from the
-package also resolves it and lays it out, which added about 5 seconds.
-The package is about 110 MB.)
-
-At the time of writing Coalton needs one small dotcl-specific change that is not
-yet upstream: its hash type and hash combination have no branch for dotcl.
+(Apple M1, 16 GB, a Release build of dotcl. The package rows include
+`nuget:require`, about 1 second once restored and 3-5 seconds the first time.)
 
 ## How it works
 

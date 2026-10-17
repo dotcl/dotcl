@@ -810,10 +810,11 @@ public static partial class Runtime
         if (arg is not LispClass c)
             throw new LispErrorException(new LispTypeError(
                 "CLASS-DIRECT-SUBCLASSES: not a class", arg, Startup.Sym("CLASS")));
-        var subs = new List<LispObject>();
+        var subs = new List<LispClass>();
         foreach (var cls in AllClasses())
             if (Array.IndexOf(cls.DirectSuperclasses, c) >= 0)
                 subs.Add(cls);
+        subs.Sort((a, b) => b.CreationSeq.CompareTo(a.CreationSeq));
         return List(subs.ToArray());
     }
 
@@ -2114,7 +2115,8 @@ public static partial class Runtime
         // Built-in types return their class if registered
         string typeName = obj switch
         {
-            Fixnum or Bignum => "INTEGER",
+            Fixnum => "FIXNUM",
+            Bignum => "BIGNUM",
             Ratio => "RATIO",
             LispComplex => "COMPLEX",
             SingleFloat => "SINGLE-FLOAT",
@@ -2745,6 +2747,41 @@ public static partial class Runtime
         return Emitter.CilAssembler.GetFunctionBySymbol(cell.Sym).Invoke1(obj);
     }
 
+    /// <summary>(slot-value obj 'name) with a per-call-site cache of the slot's
+    /// index, keyed and invalidated like <see cref="ReaderIC"/>.</summary>
+    public static LispObject SlotValueIC(LispObject obj, ReaderCache cell)
+    {
+        if (obj is LispInstance inst)
+        {
+            int epoch = GenericFunction.MethodEpoch;
+            var e = cell.E;
+            if (e != null && e.Epoch == epoch && ReferenceEquals(inst.Layout, e.Layout))
+            {
+                var v = inst.Slots[e.Idx];
+                if (v != null) return v;
+                return SlotValue(obj, cell.Sym);
+            }
+            var e2 = cell.E2;
+            if (e2 != null && e2.Epoch == epoch && ReferenceEquals(inst.Layout, e2.Layout))
+            {
+                var v = inst.Slots[e2.Idx];
+                if (v != null) return v;
+                return SlotValue(obj, cell.Sym);
+            }
+            if (!UsesSlotProtocol(inst.Class) && inst.Class.TryGetSlotIndex(cell.Sym, out int idx))
+            {
+                inst.EnsureCurrent();
+                if (!inst.Class.EffectiveSlots[idx].IsClassAllocation)
+                {
+                    cell.E2 = e;
+                    cell.E = inst.Layout.SlotEntry(idx, epoch);
+                }
+                return SlotValueDirect(inst, idx, cell.Sym, cell.Sym.Name);
+            }
+        }
+        return SlotValue(obj, cell.Sym);
+    }
+
     /// <summary>Item3c: the writer twin of <see cref="ReaderIC"/>: the compile-time-inlined
     /// fast path for <c>(setf (accessor obj) newval)</c>, backed by a per-call-site
     /// monomorphic inline cache. Arguments keep the (SETF name) generic function's own
@@ -3013,12 +3050,9 @@ public static partial class Runtime
             // The set stays null until a name is actually added: the usual case is no
             // &key method at all, and an empty HashSet allocated per call is the same
             // waste SHARED-INITIALIZE had.
-            HashSet<string>? methodKeys = null;
-            bool allowOtherKeysFromMethod =
-                CollectMethodKeys(li, Startup.Sym("REINITIALIZE-INSTANCE"), ref methodKeys)
-                || CollectMethodKeys(li, Startup.Sym("SHARED-INITIALIZE"), ref methodKeys);
-            if (!allowOtherKeysFromMethod)
-                ValidateInitargs(li.Class, args, 1, methodKeys);
+            var mk = ReinitMethodKeysFor(li.Class);
+            if (!mk.AllowOtherKeys)
+                ValidateInitargs(li.Class, args, 1, mk.Keys);
         }
         // Calls shared-initialize with slot-names = NIL (don't init unbound slots).
         // The small arities pass the arguments positionally: building the array only to
@@ -3093,26 +3127,34 @@ public static partial class Runtime
     /// creating the set only when there is a name to put in it. Returns true if any
     /// applicable method has &allow-other-keys, in which case the caller skips validation
     /// and the set is not needed at all.</summary>
-    private static bool CollectMethodKeys(LispInstance inst, Symbol gfSym, ref HashSet<string>? keys)
+    private static ReinitMethodKeys ReinitMethodKeysFor(LispClass cls)
+    {
+        int epoch = GenericFunction.MethodEpoch;
+        var c = cls.ReinitKeysCache;
+        if (c != null && c.Epoch == epoch) return c;
+        HashSet<string>? keys = null;
+        bool aok = CollectMethodKeys(cls, Startup.Sym("REINITIALIZE-INSTANCE"), ref keys)
+                   || CollectMethodKeys(cls, Startup.Sym("SHARED-INITIALIZE"), ref keys);
+        c = new ReinitMethodKeys(epoch, aok, aok ? null : keys);
+        cls.ReinitKeysCache = c;
+        return c;
+    }
+
+    private static bool CollectMethodKeys(LispClass cls, Symbol gfSym, ref HashSet<string>? keys)
     {
         if (gfSym.Function is not GenericFunction gf) return false;
         foreach (var method in gf.MethodsArray)
         {
-            if (!IsMethodApplicable(method, inst)) continue;
+            if (method.Specializers.Length > 0
+                && !(method.Specializers[0] is LispClass sc
+                     && (sc.Name.Name == "T" || Array.IndexOf(cls.ClassPrecedenceList, sc) >= 0)))
+                continue;
             if (method.HasAllowOtherKeys) return true;
             if (method.HasKey)
                 foreach (var kn in method.KeywordNames)
                     (keys ??= new HashSet<string>()).Add(kn);
         }
         return false;
-    }
-
-    /// <summary>Returns true if the method's first specializer matches the instance's class.</summary>
-    private static bool IsMethodApplicable(LispMethod method, LispInstance inst)
-    {
-        if (method.Specializers.Length == 0) return true;
-        var spec = method.Specializers[0];
-        return spec is LispClass cls && IsTruthy(Typep(inst, cls.Name));
     }
 
     /// <summary>Collect &key names from applicable methods of the given GF for a class (CPL-based).
@@ -3902,10 +3944,17 @@ public static partial class Runtime
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<LispFunction, Symbol>
         _macroFunctionNames = new();
 
+    // Bumped whenever a global macro or symbol macro is defined or removed. The
+    // tree-walk evaluator keeps the expansions it made (%MINI-MACROEXPAND-1-CACHED)
+    // and drops one made under an older epoch, so a redefinition is seen by the
+    // next evaluation of a form, as it was when every evaluation expanded afresh.
+    internal static int MacroEpoch;
+
     public static void RegisterMacroFunction(Symbol sym, LispFunction fn)
     {
         CheckPackageLock(sym, "DEFMACRO");
         _macroFunctions[sym] = fn;
+        System.Threading.Interlocked.Increment(ref MacroEpoch);
         // GetValue rather than AddOrUpdate: the latter is not in netstandard2.0.
         _macroFunctionNames.GetValue(fn, _ => sym);
     }
@@ -3918,6 +3967,7 @@ public static partial class Runtime
     {
         CheckPackageLock(sym, "FMAKUNBOUND");
         _macroFunctions.TryRemove(sym, out _);
+        System.Threading.Interlocked.Increment(ref MacroEpoch);
     }
 
     public static LispObject MacroFunction(LispObject name)
@@ -3957,6 +4007,7 @@ public static partial class Runtime
     public static void RegisterGlobalSymbolMacro(Symbol sym, LispObject expansion)
     {
         _globalSymbolMacros[sym] = expansion;
+        System.Threading.Interlocked.Increment(ref MacroEpoch);
     }
 
     public static bool TryGetGlobalSymbolMacro(Symbol sym, out LispObject expansion)
@@ -4032,6 +4083,19 @@ public static partial class Runtime
         var sym = ToFunctionNameSymbol(name, "MAKE-GF");
         int ar = arity is Fixnum f ? (int)f.Value : -1;
         return NewDispatchingGF(sym, ar);
+    }
+
+    private static LispMethod FallbackMethodOf(GenericFunction gf, int requiredCount)
+    {
+        var fb = gf.FallbackFunction!;
+        if (gf.FallbackMethod is { } m && ReferenceEquals(m.Function, fb)) return m;
+        var tClass = FindClass(Startup.Sym("T"));
+        var specs = new LispObject[requiredCount];
+        for (int i = 0; i < specs.Length; i++) specs[i] = tClass;
+        m = new LispMethod(specs, Array.Empty<LispObject>(), fb);
+        m.IgnoresNextMethodState = true;
+        gf.FallbackMethod = m;
+        return m;
     }
 
     public static LispObject RegisterGF(LispObject name, LispObject gfObj)
@@ -4538,6 +4602,7 @@ public static partial class Runtime
                     if (i != idx) arr[j++] = cur[i];
                 method.Owner = null;
                 gf.ReplaceMethods(arr);
+                ForgetMethodSource(gf, method);
                 gf.InvalidateCache();
                 gf.RecomputeAccessorFlags();
             }
@@ -4972,26 +5037,47 @@ public static partial class Runtime
     // on a builtin resolves Startup.Sym("NAME") + a registry hash lookup on
     // EVERY call, and ArgDispatchClass runs for every argument of every GF
     // dispatch (cache compare + applicability checks): e.g. (gf instance i)
-    // with a fixnum i paid the INTEGER lookup per call. Builtin classes are
+    // with a fixnum i paid the FIXNUM lookup per call. Builtin classes are
     // registered once at startup and CL forbids redefining them, so a one-shot
     // memo is safe. Types with special ClassOf handling (conditions, .NET
     // objects, class/GF/method metaobjects, vectors) fall through unchanged.
-    private static LispClass? _dcInteger, _dcNull, _dcSymbol, _dcCons,
+    private static LispClass? _dcFixnum, _dcBignum, _dcNull, _dcSymbol, _dcCons,
         _dcString, _dcCharacter, _dcDoubleFloat;
 
     private static LispClass? ArgDispatchClass(LispObject obj) => obj switch
     {
         LispInstance inst => inst.Class,
         LispStruct st => StructDispatchClass(st),
-        Fixnum or Bignum => _dcInteger ??= FindClassOrNil(Startup.Sym("INTEGER")) as LispClass,
+        Fixnum => _dcFixnum ??= FindClassOrNil(Startup.Sym("FIXNUM")) as LispClass,
+        Bignum => _dcBignum ??= FindClassOrNil(Startup.Sym("BIGNUM")) as LispClass,
         Nil => _dcNull ??= FindClassOrNil(Startup.Sym("NULL")) as LispClass,
         Symbol or T => _dcSymbol ??= FindClassOrNil(Startup.Sym("SYMBOL")) as LispClass,
         Cons => _dcCons ??= FindClassOrNil(Startup.Sym("CONS")) as LispClass,
         LispString => _dcString ??= FindClassOrNil(Startup.Sym("STRING")) as LispClass,
         LispChar => _dcCharacter ??= FindClassOrNil(Startup.Sym("CHARACTER")) as LispClass,
         DoubleFloat => _dcDoubleFloat ??= FindClassOrNil(Startup.Sym("DOUBLE-FLOAT")) as LispClass,
+        LispVector v => VectorDispatchClass(v),
         _ => ClassOf(obj) as LispClass
     };
+
+    // Indexed by the kinds CLASSOF tells arrays apart by.
+    private static readonly LispClass?[] _dcArray = new LispClass?[7];
+
+    private static LispClass? VectorDispatchClass(LispVector v)
+    {
+        int k;
+        if (v.Rank != 1) k = 0;
+        else
+        {
+            var et = v.ElementTypeName;
+            if (et.Length == 1) k = 6;
+            else if (et == "BIT") k = v.IsSimple ? 1 : 2;
+            else if (et is "BASE-CHAR" or "STANDARD-CHAR") k = v.IsSimple ? 3 : 4;
+            else if (et is "CHARACTER" or "NIL") k = 5;
+            else k = 6;
+        }
+        return _dcArray[k] ??= ClassOf(v) as LispClass;
+    }
 
     /// <summary>The class of a structure instance: FIND-CLASS of its type name, read
     /// from the name's memo when that is current. Structure arguments are common in
@@ -5001,7 +5087,7 @@ public static partial class Runtime
     {
         var memo = st.TypeName.ClassMemo;
         if (memo != null && memo.Epoch == System.Threading.Volatile.Read(ref ClassRegistry.Epoch))
-            return memo.Class as LispClass;
+            return memo.AsClass;
         return FindClassOrNil(st.TypeName) as LispClass;
     }
 
@@ -5197,6 +5283,8 @@ public static partial class Runtime
             }
         }
         gf.DispatchCache = list.ToArray();
+        if (entry.PlainPrimaryChain && entry.Primary[0].IgnoresNextMethodState && entry.ArgTypes.Length <= 2)
+            gf.LooseCache ??= new GenericFunction.LooseSlot?[8];
 
         if (entry.ArgTypes.Length >= 1)
         {
@@ -5270,15 +5358,124 @@ public static partial class Runtime
     /// <summary>A generic function that dispatches through DISPATCHGF, with the
     /// arity-1 entry point installed. Every GF whose dispatch is the standard one is
     /// built here, so the entry points a GF carries are decided in one place.</summary>
-    internal static GenericFunction NewDispatchingGF(Symbol name, int arity)
+    internal static unsafe GenericFunction NewDispatchingGF(Symbol name, int arity)
     {
         GenericFunction? gf = null;
-        gf = new GenericFunction(name, arity, args => DispatchGF(gf!, args));
-        gf.SetDirectDelegate((Func<LispObject, LispObject>)(a => DispatchGF1(gf!, a)));
-        gf.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)((a, b) => DispatchGF2(gf!, a, b)));
-        gf.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject>)((a, b, c) => DispatchGF3(gf!, a, b, c)));
-        gf.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)((a, b, c, d) => DispatchGF4(gf!, a, b, c, d)));
+        gf = new GenericFunction(name, arity, args => GFEntryArgs(gf!, args));
+        gf.SetDirectDelegate(GFEntries.E1.CreateDelegate(typeof(Func<LispObject, LispObject>), gf));
+        gf.SetDirectDelegate(GFEntries.E2.CreateDelegate(typeof(Func<LispObject, LispObject, LispObject>), gf));
+        gf.SetDirectDelegate(GFEntries.E3.CreateDelegate(typeof(Func<LispObject, LispObject, LispObject, LispObject>), gf));
+        gf.SetDirectDelegate(GFEntries.E4.CreateDelegate(typeof(Func<LispObject, LispObject, LispObject, LispObject, LispObject>), gf));
+        gf.MarkMvModeEntry(1);
+        gf.MarkMvModeEntry(2);
+        gf.MarkMvModeEntry(3);
+        gf.MarkMvModeEntry(4);
+        nint entry = arity switch
+        {
+            1 => (nint)(delegate*<LispFunction, LispObject, LispObject>)&GFEntry1,
+            2 => (nint)(delegate*<LispFunction, LispObject, LispObject, LispObject>)&GFEntry2,
+            3 => (nint)(delegate*<LispFunction, LispObject, LispObject, LispObject, LispObject>)&GFEntry3,
+            4 => (nint)(delegate*<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject>)&GFEntry4,
+            _ => 0,
+        };
+        gf.SetSelfFramedEntry(entry, arity);
         return gf;
+    }
+
+    private static class GFEntries
+    {
+        private static System.Reflection.MethodInfo M(string name) =>
+            typeof(Runtime).GetMethod(name, System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        internal static readonly System.Reflection.MethodInfo E1 = M(nameof(GFEntry1));
+        internal static readonly System.Reflection.MethodInfo E2 = M(nameof(GFEntry2));
+        internal static readonly System.Reflection.MethodInfo E3 = M(nameof(GFEntry3));
+        internal static readonly System.Reflection.MethodInfo E4 = M(nameof(GFEntry4));
+    }
+
+    // A generic function links its own debugger frame, as a self-framed DEFUN body
+    // does (Function.SelfFramed.cs).
+    // The entries take the caller's value mode and hand it to the method on the
+    // loose-cache path (arity 1 and 2) or the plain primary chain (3 and 4) only;
+    // every other path drops it.
+    private static unsafe LispObject GFEntry1(LispFunction self, LispObject a)
+    {
+        int mode = MultipleValues.TakeMode();
+        var n = self.FrameNameField;
+        if (n == null) { LispFunction.DropBorrow(); return DispatchGF1(Unsafe.As<GenericFunction>(self), a, mode); }
+        Unsafe.SkipInit(out LispFunction.Frame fr);
+        LispFunction.Enter1(ref fr, n, a);
+        var gf = Unsafe.As<GenericFunction>(self);
+        LispObject r;
+        if (gf.DispatchFunction == null && !AnyInvocationProtocolCustomized && LooseFast(gf, a, null, 1) is { } sl)
+        {
+            if (fr.Depth >= 0 && sl.Entry1 != 0)
+            {
+                if (mode != 0 && sl.Fn.MvModeEntry(1)) MultipleValues.SetMode(mode);
+                r = ((delegate*<LispObject, LispObject>)sl.Entry1)(a); GC.KeepAlive(sl);
+            }
+            else r = mode != 0 ? sl.Fn.InvokeFast1M(a, mode) : sl.Fn.InvokeArgc(1, a, null, null, null);
+        }
+        else r = DispatchGF1(gf, a, mode);
+        LispFunction.Leave(ref fr);
+        return r;
+    }
+
+    private static unsafe LispObject GFEntry2(LispFunction self, LispObject a, LispObject b)
+    {
+        int mode = MultipleValues.TakeMode();
+        var n = self.FrameNameField;
+        if (n == null) { LispFunction.DropBorrow(); return DispatchGF2(Unsafe.As<GenericFunction>(self), a, b, mode); }
+        Unsafe.SkipInit(out LispFunction.Frame fr);
+        LispFunction.Enter2(ref fr, n, a, b);
+        var gf = Unsafe.As<GenericFunction>(self);
+        LispObject r;
+        if (gf.DispatchFunction == null && !AnyInvocationProtocolCustomized && LooseFast(gf, a, b, 2) is { } sl)
+        {
+            if (fr.Depth >= 0 && sl.Entry2 != 0)
+            {
+                if (mode != 0 && sl.Fn.MvModeEntry(2)) MultipleValues.SetMode(mode);
+                r = ((delegate*<LispObject, LispObject, LispObject>)sl.Entry2)(a, b); GC.KeepAlive(sl);
+            }
+            else r = mode != 0 ? sl.Fn.InvokeFast2M(a, b, mode) : sl.Fn.InvokeArgc(2, a, b, null, null);
+        }
+        else r = DispatchGF2(gf, a, b, mode);
+        LispFunction.Leave(ref fr);
+        return r;
+    }
+
+    private static LispObject GFEntry3(LispFunction self, LispObject a, LispObject b, LispObject c)
+    {
+        int mode = MultipleValues.TakeMode();
+        var n = self.FrameNameField;
+        if (n == null) { LispFunction.DropBorrow(); return DispatchGF3(Unsafe.As<GenericFunction>(self), a, b, c, mode); }
+        Unsafe.SkipInit(out LispFunction.Frame fr);
+        LispFunction.Enter3(ref fr, n, a, b, c);
+        var r = DispatchGF3(Unsafe.As<GenericFunction>(self), a, b, c, mode);
+        LispFunction.Leave(ref fr);
+        return r;
+    }
+
+    private static LispObject GFEntry4(LispFunction self, LispObject a, LispObject b, LispObject c, LispObject d)
+    {
+        int mode = MultipleValues.TakeMode();
+        var n = self.FrameNameField;
+        if (n == null) { LispFunction.DropBorrow(); return DispatchGF4(Unsafe.As<GenericFunction>(self), a, b, c, d, mode); }
+        Unsafe.SkipInit(out LispFunction.Frame fr);
+        LispFunction.Enter4(ref fr, n, a, b, c, d);
+        var r = DispatchGF4(Unsafe.As<GenericFunction>(self), a, b, c, d, mode);
+        LispFunction.Leave(ref fr);
+        return r;
+    }
+
+    private static LispObject GFEntryArgs(GenericFunction gf, LispObject[] args)
+    {
+        var n = gf.FrameNameField;
+        if (n == null) { LispFunction.DropBorrow(); return DispatchGF(gf, args); }
+        Unsafe.SkipInit(out LispFunction.Frame fr);
+        LispFunction.EnterArgs(ref fr, n, args);
+        var r = DispatchGF(gf, args);
+        LispFunction.Leave(ref fr);
+        return r;
     }
 
     /// <summary>One-argument entry point for generic-function calls, installed as the
@@ -5291,18 +5488,24 @@ public static partial class Runtime
     /// combinations, an effective method built by the protocol, keyword checking,
     /// arity errors: builds the array and goes through DISPATCHGF unchanged, so this
     /// adds a fast path rather than a second dispatcher.</summary>
-    private static LispObject DispatchGF1(GenericFunction gf, LispObject a)
+    private static LispObject DispatchGF1(GenericFunction gf, LispObject a, int mode = 0)
     {
         if (gf.DispatchFunction is LispFunction df1) return df1.Invoke(new[] { a });
         // The protocol route needs the argument array anyway; the check itself is one
         // static bool read until someone specialises one of the three.
         if (AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf))
             return DispatchGFCore(gf, new[] { a });
+        if (LooseFast(gf, a, null, 1) is { } sl)
+            return mode != 0 ? sl.Fn.InvokeFast1M(a, mode) : sl.Fn.InvokeArgc(1, a, null, null, null);
         var entry = LooseEntry(gf, a, null, null, null, 1);
         if (entry != null)
         {
+            if (entry.FallbackOnly && gf.FallbackFunction is { } fb1) return fb1.Invoke1(a);
             if (entry.PlainPrimaryChain)
+            {
+                NoteLoose(gf, entry, 1);
                 return InvokeChainLoose(entry.Primary, a, null, null, null, 1);
+            }
             if (entry.PrimaryChainWithBeforeAfter)
                 return InvokeCombinationLoose(entry, a, null, null, null, 1);
             // EQL-specialized generic functions are cached only for one required
@@ -5356,16 +5559,22 @@ public static partial class Runtime
     }
 
     /// <summary>Two-argument twin of DISPATCHGF1.</summary>
-    private static LispObject DispatchGF2(GenericFunction gf, LispObject a, LispObject b)
+    private static LispObject DispatchGF2(GenericFunction gf, LispObject a, LispObject b, int mode = 0)
     {
         if (gf.DispatchFunction is LispFunction df2) return df2.Invoke(new[] { a, b });
         if (AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf))
             return DispatchGFCore(gf, new[] { a, b });
+        if (LooseFast(gf, a, b, 2) is { } sl)
+            return mode != 0 ? sl.Fn.InvokeFast2M(a, b, mode) : sl.Fn.InvokeArgc(2, a, b, null, null);
         var entry = LooseEntry(gf, a, b, null, null, 2);
         if (entry != null)
         {
+            if (entry.FallbackOnly && gf.FallbackFunction is { } fb2) return fb2.Invoke2(a, b);
             if (entry.PlainPrimaryChain)
+            {
+                NoteLoose(gf, entry, 2);
                 return InvokeChainLoose(entry.Primary, a, b, null, null, 2);
+            }
             if (entry.PrimaryChainWithBeforeAfter)
                 return InvokeCombinationLoose(entry, a, b, null, null, 2);
         }
@@ -5373,7 +5582,7 @@ public static partial class Runtime
     }
 
     /// <summary>Three-argument twin of DISPATCHGF1.</summary>
-    private static LispObject DispatchGF3(GenericFunction gf, LispObject a, LispObject b, LispObject c)
+    private static LispObject DispatchGF3(GenericFunction gf, LispObject a, LispObject b, LispObject c, int mode = 0)
     {
         if (gf.DispatchFunction is LispFunction df3) return df3.Invoke(new[] { a, b, c });
         if (AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf))
@@ -5382,7 +5591,7 @@ public static partial class Runtime
         if (entry != null)
         {
             if (entry.PlainPrimaryChain)
-                return InvokeChainLoose(entry.Primary, a, b, c, null, 3);
+                return InvokeChainLoose(entry.Primary, a, b, c, null, 3, mode);
             if (entry.PrimaryChainWithBeforeAfter)
                 return InvokeCombinationLoose(entry, a, b, c, null, 3);
         }
@@ -5402,9 +5611,13 @@ public static partial class Runtime
     {
         var before = entry.Before;
         for (int i = 0; i < before.Count; i++) InvokeLoose(before[i], a, b, c, d, argc);
+        if (before.Count != 0) MultipleValues.Reset();
         var result = InvokeChainLoose(entry.Primary, a, b, c, d, argc);
         var after = entry.After;
+        if (after.Count == 0) return result;
+        var held = MultipleValues.Hold(result);
         for (int i = 0; i < after.Count; i++) InvokeLoose(after[i], a, b, c, d, argc);
+        MultipleValues.RestoreHeld(held);
         return result;
     }
 
@@ -5413,12 +5626,44 @@ public static partial class Runtime
         LispMethod m, LispObject a, LispObject? b, LispObject? c, LispObject? d, int argc)
     {
         var fn = m.Function;
-        switch (argc)
+        if (m.IgnoresNextMethodState) { fn.InvokeArgc(argc, a, b, c, d); return; }
+        // An auxiliary method has no next method, whatever the state around it has.
+        var savedChain = _nextMethodChain;
+        var savedFallback = _nextMethodFallback;
+        var savedNmp = _capturedNmp;
+        var savedCnm = _capturedCnm;
+        _nextMethodChain = null;
+        _nextMethodFallback = null;
+        _capturedNmp = _defaultNmp;
+        _capturedCnm = _defaultCnm;
+        try { fn.InvokeArgc(argc, a, b, c, d); }
+        finally
         {
-            case 1: fn.Invoke1(a); break;
-            case 2: fn.Invoke2(a, b!); break;
-            case 3: fn.Invoke3(a, b!, c!); break;
-            default: fn.Invoke4(a, b!, c!, d!); break;
+            _nextMethodChain = savedChain;
+            _nextMethodFallback = savedFallback;
+            _capturedNmp = savedNmp;
+            _capturedCnm = savedCnm;
+        }
+    }
+
+    private static void InvokeAux(LispMethod m, LispObject[] args)
+    {
+        if (m.IgnoresNextMethodState) { m.Function.Invoke(args); return; }
+        var savedChain = _nextMethodChain;
+        var savedFallback = _nextMethodFallback;
+        var savedNmp = _capturedNmp;
+        var savedCnm = _capturedCnm;
+        _nextMethodChain = null;
+        _nextMethodFallback = null;
+        _capturedNmp = _defaultNmp;
+        _capturedCnm = _defaultCnm;
+        try { m.Function.Invoke(args); }
+        finally
+        {
+            _nextMethodChain = savedChain;
+            _nextMethodFallback = savedFallback;
+            _capturedNmp = savedNmp;
+            _capturedCnm = savedCnm;
         }
     }
 
@@ -5428,7 +5673,7 @@ public static partial class Runtime
     /// three. SHARED-INITIALIZE reaches it on every (instance slot-names . initargs)
     /// call with one initarg pair.</summary>
     private static LispObject DispatchGF4(
-        GenericFunction gf, LispObject a, LispObject b, LispObject c, LispObject d)
+        GenericFunction gf, LispObject a, LispObject b, LispObject c, LispObject d, int mode = 0)
     {
         if (gf.DispatchFunction is LispFunction df4) return df4.Invoke(new[] { a, b, c, d });
         if (AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf))
@@ -5437,7 +5682,7 @@ public static partial class Runtime
         if (entry != null)
         {
             if (entry.PlainPrimaryChain)
-                return InvokeChainLoose(entry.Primary, a, b, c, d, 4);
+                return InvokeChainLoose(entry.Primary, a, b, c, d, 4, mode);
             if (entry.PrimaryChainWithBeforeAfter)
                 return InvokeCombinationLoose(entry, a, b, c, d, 4);
         }
@@ -5458,22 +5703,16 @@ public static partial class Runtime
     {
         var dcache = gf.DispatchCache;
         if (dcache == null) return null;
-        if (gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys) return null;
-        // Argument count. DISPATCHGF checks this itself and signals a PROGRAM-ERROR,
-        // and these entry points are reached before it: INVOKE2 on a one-argument
-        // generic function lands in DISPATCHGF2, where a cache entry recorded for the
-        // one argument it dispatches on would otherwise match and run the method with
-        // an argument too many. Out of range, hand it to DISPATCHGF to signal.
-        int required = gf.LambdaListInfoSet ? gf.RequiredCount : (gf.Arity >= 0 ? gf.Arity : 0);
-        if (argc < required) return null;
-        if (gf.LambdaListInfoSet && !gf.HasRest && !gf.HasKey
-            && argc > gf.RequiredCount + gf.OptionalCount) return null;
-        int known = required < 1 ? 1 : required;
-        if (known > argc) known = argc;
-        var ca = ArgDispatchClass(a);
-        var cb = known > 1 ? ArgDispatchClass(b!) : null;
-        var cc = known > 2 ? ArgDispatchClass(c!) : null;
-        var cd = known > 3 ? ArgDispatchClass(d!) : null;
+        // Keyword checking and an argument count DISPATCHGF reports as an error
+        // (INVOKE2 on a one-argument generic function would otherwise match an entry
+        // keyed on its one argument) both leave KNOWN at 0.
+        int known = gf.LooseKnown(argc);
+        if (known == 0) return null;
+        int epoch = ClassRegistry.Epoch;
+        var ca = LooseArgClass(a, epoch);
+        var cb = known > 1 ? LooseArgClass(b!, epoch) : null;
+        var cc = known > 2 ? LooseArgClass(c!, epoch) : null;
+        var cd = known > 3 ? LooseArgClass(d!, epoch) : null;
         for (int i = 0; i < dcache.Length; i++)
         {
             var entry = dcache[i];
@@ -5494,6 +5733,51 @@ public static partial class Runtime
         return table.Lookup(ca, w > 1 ? cb : null, w > 2 ? cc : null, w > 3 ? cd : null);
     }
 
+    /// <summary>The entry for these arguments in GF's LOOSECACHE, or null.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static GenericFunction.LooseSlot? LooseFast(GenericFunction gf, LispObject a, LispObject? b, int argc)
+    {
+        var lc = gf.LooseCache;
+        if (lc == null) return null;
+        int known = gf.LooseKnown(argc);
+        if (known == 0 || known > 2) return null;
+        int epoch = ClassRegistry.Epoch;
+        var ca = LooseArgClass(a, epoch);
+        var cb = known > 1 ? LooseArgClass(b!, epoch) : null;
+        int mask = lc.Length - 1;
+        int i = GenericFunction.LooseIndex(ca, cb, mask);
+        for (int n = 0; n < GenericFunction.LooseProbes; n++, i = (i + 1) & mask)
+        {
+            var sl = lc[i];
+            if (sl == null) return null;
+            if (ReferenceEquals(sl.C0, ca) && ReferenceEquals(sl.C1, cb)) return sl;
+        }
+        return null;
+    }
+
+    private static void NoteLoose(GenericFunction gf, CachedDispatch entry, int argc)
+    {
+        var first = entry.Primary[0];
+        if (!first.IgnoresNextMethodState) return;
+        var types = entry.ArgTypes;
+        int known = gf.LooseKnown(argc);
+        if (known > 2 || types.Length != known) return;
+        var fn = first.Function;
+        var sl = entry.Loose;
+        if (sl == null || !ReferenceEquals(sl.Fn, fn))
+            entry.Loose = sl = new GenericFunction.LooseSlot(types[0], known > 1 ? types[1] : null, fn);
+        gf.AddLoose(sl);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static LispClass? LooseArgClass(LispObject obj, int epoch)
+    {
+        if (obj is LispInstance inst) return inst.Class;
+        if (obj is LispStruct st && st.TypeName.ClassMemo is { } memo && memo.Epoch == epoch)
+            return memo.AsClass;
+        return ArgDispatchClass(obj);
+    }
+
     /// <summary>Run CHAIN[0] on ARGC loose arguments with the next-method state a method
     /// body expects. The counterpart of INVOKESTANDARDCOMBINATION for the callers that
     /// hold the arguments rather than an array. A one-method chain has nowhere for
@@ -5504,7 +5788,8 @@ public static partial class Runtime
     /// published lazily: only CALL-NEXT-METHOD with no arguments needs them as a list,
     /// and it materialises them from the loose slots through CURRENTGFARGS.</summary>
     private static LispObject InvokeChainLoose(
-        List<LispMethod> primary, LispObject a, LispObject? b, LispObject? c, LispObject? d, int argc)
+        List<LispMethod> primary, LispObject a, LispObject? b, LispObject? c, LispObject? d, int argc,
+        int mode = 0)
     {
         var first = primary[0];
         // A body that cannot reach the next-method state is called as it is: nothing
@@ -5512,14 +5797,9 @@ public static partial class Runtime
         // CALL-NEXT-METHOD from it.
         if (first.IgnoresNextMethodState)
         {
-            var f0 = first.Function;
-            return argc switch
-            {
-                1 => f0.Invoke1(a),
-                2 => f0.Invoke2(a, b!),
-                3 => f0.Invoke3(a, b!, c!),
-                _ => f0.Invoke4(a, b!, c!, d!)
-            };
+            if (mode == 0) return first.Function.InvokeArgc(argc, a, b, c, d);
+            return argc == 3 ? first.Function.InvokeFast3M(a, b!, c!, mode)
+                             : first.Function.InvokeFast4M(a, b!, c!, d!, mode);
         }
         var savedChain = _nextMethodChain;
         var savedIndex = _nextMethodIndex;
@@ -5641,6 +5921,9 @@ public static partial class Runtime
         }
         if (cached != null)
         {
+                if (cached.FallbackOnly)
+                    return gf.FallbackFunction is { } cachedFallback
+                        ? cachedFallback.Invoke(args) : CallNoApplicableMethod(gf, args);
                 // The AMOP route: this generic function's effective method for these
                 // argument classes was built by the protocol on the miss below.
                 if (cached.EffectiveMethodFunction is { } cachedEmf)
@@ -5808,7 +6091,25 @@ public static partial class Runtime
             // for CL functions like CLOSE or STREAM-ELEMENT-TYPE when called with a
             // type that has no user-defined Gray-stream method).
             if (gf.FallbackFunction != null)
+            {
+                if (!hasEqlSpec)
+                {
+                    int n = zeroDispatch ? 0 : Math.Max(1, requiredCount);
+                    var types = new LispClass?[n];
+                    for (int i = 0; i < n && i < args.Length; i++)
+                        types[i] = ArgDispatchClass(args[i]);
+                    AddDispatchCache(gf, new CachedDispatch
+                    {
+                        ArgTypes = types,
+                        FallbackOnly = true,
+                        Around = new List<LispMethod>(),
+                        Before = new List<LispMethod>(),
+                        Primary = new List<LispMethod>(),
+                        After = new List<LispMethod>()
+                    });
+                }
                 return gf.FallbackFunction.Invoke(args);
+            }
             return CallNoApplicableMethod(gf, args);
         }
 
@@ -5872,13 +6173,15 @@ public static partial class Runtime
                 aroundMethods.Add(m);
         }
 
-        if (primaryMethods.Count == 0)
+        if (primaryMethods.Count == 0 && gf.FallbackFunction == null)
             throw new LispErrorException(new LispError(
                 $"No primary method for generic function {gf.Name.Name}"));
 
         // Sort: more specific first
         var bySpecificity = new SpecificityComparer(args, false);
         primaryMethods.Sort(bySpecificity);
+        if (gf.FallbackFunction != null)
+            primaryMethods.Add(FallbackMethodOf(gf, requiredCount));
         beforeMethods.Sort(bySpecificity);
         afterMethods.Sort(new SpecificityComparer(args, true)); // reverse for :after
         aroundMethods.Sort(bySpecificity);
@@ -6431,121 +6734,116 @@ public static partial class Runtime
         string mcName = gf.MethodCombination!.Name;
         // Resolve custom method combination to its operator name
         string operatorName = mcName;
-        bool identityWithOneArg = false;
+        bool identityWithOneArg = operatorName is "AND" or "OR" or "PROGN" or "NCONC" or "MAX" or "MIN" or "+";
         if (_methodCombinationRegistry.TryGetValue(mcName, out var regEntry))
         {
             operatorName = regEntry.Operator;
             identityWithOneArg = regEntry.IdentityWithOneArg;
         }
+        // :identity-with-one-argument - skip operator when single method
+        if (identityWithOneArg && combinedMethods.Count == 1)
+            return combinedMethods[0].Function.Invoke(nextArgs);
+        int last = combinedMethods.Count - 1;
+        switch (operatorName)
         {
-            // :identity-with-one-argument - skip operator when single method
-            if (identityWithOneArg && combinedMethods.Count == 1)
-                return combinedMethods[0].Function.Invoke(nextArgs);
-            switch (operatorName)
+            case "+":
             {
-                case "+":
-                {
-                    LispObject result = Fixnum.Make(0);
-                    foreach (var m in combinedMethods)
-                        result = Arithmetic.Add(AsNumber(result), AsNumber(m.Function.Invoke(nextArgs)));
-                    return result;
-                }
-                case "*":
-                {
-                    LispObject result = Fixnum.Make(1);
-                    foreach (var m in combinedMethods)
-                        result = Arithmetic.Multiply(AsNumber(result), AsNumber(m.Function.Invoke(nextArgs)));
-                    return result;
-                }
-                case "MIN":
-                {
-                    LispObject result = combinedMethods[0].Function.Invoke(nextArgs);
-                    for (int i = 1; i < combinedMethods.Count; i++)
-                    {
-                        var val = combinedMethods[i].Function.Invoke(nextArgs);
-                        if (Arithmetic.Compare(AsNumber(val), AsNumber(result)) < 0)
-                            result = val;
-                    }
-                    return result;
-                }
-                case "MAX":
-                {
-                    LispObject result = combinedMethods[0].Function.Invoke(nextArgs);
-                    for (int i = 1; i < combinedMethods.Count; i++)
-                    {
-                        var val = combinedMethods[i].Function.Invoke(nextArgs);
-                        if (Arithmetic.Compare(AsNumber(val), AsNumber(result)) > 0)
-                            result = val;
-                    }
-                    return result;
-                }
-                case "AND":
-                {
-                    LispObject result = T.Instance;
-                    foreach (var m in combinedMethods)
-                    {
-                        result = m.Function.Invoke(nextArgs);
-                        if (result is Nil) return Nil.Instance;
-                    }
-                    return result;
-                }
-                case "OR":
-                {
-                    foreach (var m in combinedMethods)
-                    {
-                        var result = m.Function.Invoke(nextArgs);
-                        if (result is not Nil) return result;
-                    }
-                    return Nil.Instance;
-                }
-                case "PROGN":
-                {
-                    LispObject result = Nil.Instance;
-                    foreach (var m in combinedMethods)
-                        result = m.Function.Invoke(nextArgs);
-                    return result;
-                }
-                case "LIST":
-                {
-                    var results = new List<LispObject>();
-                    foreach (var m in combinedMethods)
-                        results.Add(m.Function.Invoke(nextArgs));
-                    LispObject result = Nil.Instance;
-                    for (int i = results.Count - 1; i >= 0; i--)
-                        result = MakeCons(results[i], result);
-                    return result;
-                }
-                case "NCONC":
-                {
-                    LispObject result = Nil.Instance;
-                    foreach (var m in combinedMethods)
-                    {
-                        var val = m.Function.Invoke(nextArgs);
-                        result = NconcTwo(result, val);
-                    }
-                    return result;
-                }
-                case "APPEND":
-                {
-                    var results = new List<LispObject>();
-                    foreach (var m in combinedMethods)
-                        results.Add(m.Function.Invoke(nextArgs));
-                    if (results.Count == 0) return Nil.Instance;
-                    LispObject result = results[results.Count - 1];
-                    for (int i = results.Count - 2; i >= 0; i--)
-                        result = Append(results[i], result);
-                    return result;
-                }
-                default:
-                    // CLHS DEFINE-METHOD-COMBINATION short form: the operator may be
-                    // any function, macro or special operator, applied as
-                    // (operator (call-method m1) (call-method m2) ...).
-                    if (_methodCombinationOperatorSymbols.TryGetValue(mcName, out var opSym))
-                        return CallShortFormOperator(opSym, combinedMethods, nextArgs);
-                    throw new LispErrorException(new LispError(
-                        $"Unknown method combination operator: {operatorName} (combination: {mcName})"));
+                LispObject result = Fixnum.Make(0);
+                foreach (var m in combinedMethods)
+                    result = Arithmetic.Add(AsNumber(result), AsNumber(PrimaryOf(m.Function.Invoke(nextArgs))));
+                return OneValue(result);
             }
+            case "*":
+            {
+                LispObject result = Fixnum.Make(1);
+                foreach (var m in combinedMethods)
+                    result = Arithmetic.Multiply(AsNumber(result), AsNumber(PrimaryOf(m.Function.Invoke(nextArgs))));
+                return OneValue(result);
+            }
+            case "MIN":
+            case "MAX":
+            {
+                int sign = operatorName == "MAX" ? 1 : -1;
+                LispObject result = PrimaryOf(combinedMethods[0].Function.Invoke(nextArgs));
+                for (int i = 1; i < combinedMethods.Count; i++)
+                {
+                    var val = PrimaryOf(combinedMethods[i].Function.Invoke(nextArgs));
+                    if (Arithmetic.Compare(AsNumber(val), AsNumber(result)) * sign > 0)
+                        result = val;
+                }
+                return OneValue(result);
+            }
+            case "AND":
+            {
+                for (int i = 0; i < last; i++)
+                    if (PrimaryOf(combinedMethods[i].Function.Invoke(nextArgs)) is Nil)
+                        return OneValue(Nil.Instance);
+                MultipleValues.Reset();
+                return combinedMethods[last].Function.Invoke(nextArgs);
+            }
+            case "OR":
+            {
+                for (int i = 0; i < last; i++)
+                {
+                    var result = PrimaryOf(combinedMethods[i].Function.Invoke(nextArgs));
+                    if (result is not Nil) return OneValue(result);
+                }
+                MultipleValues.Reset();
+                return combinedMethods[last].Function.Invoke(nextArgs);
+            }
+            case "PROGN":
+            {
+                for (int i = 0; i < last; i++)
+                    combinedMethods[i].Function.Invoke(nextArgs);
+                MultipleValues.Reset();
+                return combinedMethods[last].Function.Invoke(nextArgs);
+            }
+            case "LIST":
+            {
+                var results = new LispObject[combinedMethods.Count];
+                for (int i = 0; i < results.Length; i++)
+                    results[i] = PrimaryOf(combinedMethods[i].Function.Invoke(nextArgs));
+                LispObject result = Nil.Instance;
+                for (int i = results.Length - 1; i >= 0; i--)
+                    result = MakeCons(results[i], result);
+                return OneValue(result);
+            }
+            case "NCONC":
+            {
+                LispObject result = Nil.Instance;
+                foreach (var m in combinedMethods)
+                    result = NconcTwo(result, PrimaryOf(m.Function.Invoke(nextArgs)));
+                return OneValue(result);
+            }
+            case "APPEND":
+            {
+                var results = new LispObject[combinedMethods.Count];
+                for (int i = 0; i < results.Length; i++)
+                    results[i] = PrimaryOf(combinedMethods[i].Function.Invoke(nextArgs));
+                LispObject result = results[last];
+                for (int i = last - 1; i >= 0; i--)
+                    result = Append(results[i], result);
+                return OneValue(result);
+            }
+            default:
+                // CLHS DEFINE-METHOD-COMBINATION short form: the operator may be
+                // any function, macro or special operator, applied as
+                // (operator (call-method m1) (call-method m2) ...).
+                if (_methodCombinationOperatorSymbols.TryGetValue(mcName, out var opSym))
+                    return CallShortFormOperator(opSym, combinedMethods, nextArgs);
+                throw new LispErrorException(new LispError(
+                    $"Unknown method combination operator: {operatorName} (combination: {mcName})"));
         }
+    }
+
+    private static LispObject PrimaryOf(LispObject v) => v is MvReturn mv ? mv.PrimaryValue : v;
+
+    /// <summary>V as the one value of the combination, which the method calls may have
+    /// published values of their own past.</summary>
+    private static LispObject OneValue(LispObject v)
+    {
+        MultipleValues.Reset();
+        return v;
     }
 
     /// <summary>Apply a short-form combination's own operator to the combined
@@ -6561,7 +6859,8 @@ public static partial class Runtime
         {
             var values = new LispObject[methods.Count];
             for (int i = 0; i < methods.Count; i++)
-                values[i] = methods[i].Function.Invoke(nextArgs);
+                values[i] = PrimaryOf(methods[i].Function.Invoke(nextArgs));
+            MultipleValues.Reset();
             return fn.Invoke(values);
         }
         var funcall = Startup.Sym("FUNCALL");
@@ -6629,15 +6928,18 @@ public static partial class Runtime
 
         // :before methods (most specific first)
         foreach (var m in before)
-            m.Function.Invoke(args);
+            InvokeAux(m, args);
+        if (before.Count != 0) MultipleValues.Reset();
 
         // Primary methods with call-next-method chain
         var result = InvokeWithNextMethods(primary, 0, args, null);
+        if (after.Count == 0) return result;
 
         // :after methods (least specific first: already sorted that way)
+        var held = MultipleValues.Hold(result);
         foreach (var m in after)
-            m.Function.Invoke(args);
-
+            InvokeAux(m, args);
+        MultipleValues.RestoreHeld(held);
         return result;
     }
 

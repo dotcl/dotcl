@@ -88,6 +88,13 @@ public sealed class LispStruct : LispObject
     /// so it falls back to the boxed path the way a kind mismatch always has.</summary>
     internal const int SlotKindSingle = unchecked((int)0x80000000);
 
+    internal const byte RawU64 = 3;
+
+    /// <summary>Both kind bits: a raw (unsigned-byte 64), its bits in the
+    /// long. A reader expecting any other kind is left with one of the two
+    /// bits set, which its range test rejects.</summary>
+    internal const int SlotKindU64 = SlotKindDouble | SlotKindSingle;
+
     public int SlotCount => _slots.Length;
 
     public LispObject GetSlot(int index)
@@ -97,7 +104,9 @@ public sealed class LispStruct : LispObject
             int entry = _layout[index];
             int pos = entry & SlotPosMask;
             if (pos != SlotBoxed)
-                return (entry & SlotKindDouble) != 0
+                return (entry & SlotKindU64) == SlotKindU64
+                    ? Runtime.BoxU64(_longs![pos])
+                    : (entry & SlotKindDouble) != 0
                     ? new DoubleFloat(BitConverter.Int64BitsToDouble(_longs![pos]))
                     : entry < 0
                     ? new SingleFloat(Compat.Int32BitsToSingle((int)_longs![pos]))
@@ -119,6 +128,15 @@ public sealed class LispStruct : LispObject
                 // check (safety 0, or a path that predates the check), and the
                 // boxed storage cannot take it because there is none -- so it
                 // is reported rather than silently dropped.
+                if ((entry & SlotKindU64) == SlotKindU64)
+                {
+                    if (!Runtime.IsU64(value))
+                        throw new LispErrorException(new LispTypeError(
+                            $"{TypeName}: slot {index} holds a raw (unsigned-byte 64), got {value}",
+                            value, Runtime.SizedByte("UNSIGNED-BYTE", 64)));
+                    _longs![pos] = Runtime.Low64(value);
+                    return;
+                }
                 if ((entry & SlotKindDouble) != 0)
                 {
                     if (value is not DoubleFloat d)
@@ -194,7 +212,8 @@ public sealed class LispStruct : LispObject
     internal byte RawKind(int index)
     {
         int entry = LayoutEntry(index);
-        return (entry & SlotKindDouble) != 0 ? RawDouble : entry < 0 ? RawSingle : RawLong;
+        return (entry & SlotKindU64) == SlotKindU64 ? RawU64
+            : (entry & SlotKindDouble) != 0 ? RawDouble : entry < 0 ? RawSingle : RawLong;
     }
 
     /// <summary>Which definition of the structure built this instance. 0 for a
@@ -268,7 +287,8 @@ public sealed class LispStruct : LispObject
                 entries[i] = (ver << LayoutVersionShift)
                              | (pos[i] >= 0 && pos[i] < SlotBoxed
                                 ? pos[i] | (kind[i] == RawDouble ? SlotKindDouble
-                                            : kind[i] == RawSingle ? SlotKindSingle : 0)
+                                            : kind[i] == RawSingle ? SlotKindSingle
+                                            : kind[i] == RawU64 ? SlotKindU64 : 0)
                                 : SlotBoxed);
             _layouts[typeName] = entries;
         }
@@ -330,7 +350,17 @@ public sealed class LispStruct : LispObject
                 // violated before the checks existed, or under safety 0. Keep
                 // the value rather than lose it: the raw storage is dropped for
                 // this instance and it behaves exactly as it did before.
-                if ((entry & SlotKindDouble) != 0)
+                if ((entry & SlotKindU64) == SlotKindU64)
+                {
+                    if (!Runtime.IsU64(slots[i]))
+                    {
+                        _longs = null;
+                        _layout = BoxedMap(slots.Length, (entry >> LayoutVersionShift) & SlotPosMask);
+                        break;
+                    }
+                    _longs![pos] = Runtime.Low64(slots[i]);
+                }
+                else if ((entry & SlotKindDouble) != 0)
                 {
                     if (slots[i] is not DoubleFloat d)
                     {
@@ -955,6 +985,46 @@ public sealed class LispVector : LispObject
         new LispErrorException(new LispTypeError(
             "array of element-type BIT: value is not a bit", val, Startup.Sym("BIT")));
 
+    /// <summary>The first Length elements of a BIT or (unsigned-byte 8) vector as
+    /// bytes, bit I of a bit vector in bit I%8 of byte I/8. False for any other
+    /// storage.</summary>
+    internal bool TryPackLiteral(out byte[] bytes)
+    {
+        int len = Length;
+        if (_displacedTo == null && _bitData != null && ElementTypeName == "BIT")
+        {
+            bytes = new byte[(len + 7) / 8];
+            for (int i = 0; i < len; i++)
+                if (((_bitData[i >> 6] >> (i & 63)) & 1) != 0)
+                    bytes[i >> 3] |= (byte)(1 << (i & 7));
+            return true;
+        }
+        if (_displacedTo == null && _numKind == 1 && _numData is byte[] raw && len <= raw.Length)
+        {
+            bytes = new byte[len];
+            Buffer.BlockCopy(raw, 0, bytes, 0, len);
+            return true;
+        }
+        bytes = Array.Empty<byte>();
+        return false;
+    }
+
+    public static LispVector FromPackedLiteral(string base64, int length, string elementType) =>
+        FromPackedBytes(Convert.FromBase64String(base64), length, elementType);
+
+    internal static LispVector FromPackedBytes(byte[] bytes, int length, string elementType)
+    {
+        var v = new LispVector(length, Nil.Instance, elementType);
+        if (v._bitData != null)
+        {
+            for (int i = 0; i < bytes.Length; i++)
+                v._bitData[i >> 3] |= (ulong)bytes[i] << ((i & 7) * 8);
+        }
+        else
+            Buffer.BlockCopy(bytes, 0, (byte[])v._numData!, 0, bytes.Length);
+        return v;
+    }
+
     private static ulong[] PackBits(LispObject[] elements)
     {
         int size = elements.Length;
@@ -1007,6 +1077,7 @@ public sealed class LispVector : LispObject
 
     // Returns true if this vector has a character element type (is a string)
     public bool IsCharVector => ElementTypeName is "CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR" or "NIL";
+    public bool IsBaseCharVector => ElementTypeName is "BASE-CHAR" or "STANDARD-CHAR";
 
     // Returns true if this is a bit vector (element type BIT)
     public bool IsBitVector => ElementTypeName == "BIT";
@@ -1503,17 +1574,26 @@ public sealed class LispHashTable : LispObject
     private readonly string _testName;
     // A table made with :HASH-FUNCTION and a test other than the four standard
     // ones: what HASH-TABLE-TEST answers, and the hash function.
-    private readonly LispFunction? _userTestFn;
-    private readonly LispObject? _userTestName;
-    private readonly LispFunction? _userHash;
+    private sealed record UserTest(LispFunction? TestFn, LispObject? TestName, LispFunction Hash);
+    private readonly UserTest? _user;
 
     private static string UserTestName(LispObject? name)
         => name is Symbol sym ? sym.Name : "USER-DEFINED";
+    // Not inline in the constructor: a captured parameter there allocates its
+    // closure object on every construction.
+    private static Func<LispObject, LispObject, bool> UserTestPredicate(LispFunction test)
+        => (a, b) => test.Invoke2(a, b) is not Nil;
     // When Synchronized, all mutating/reading operations take _lock.
     // Concurrent access without Synchronized is undefined per CLHS (mirrors
     // SBCL: make-hash-table :synchronized t opts in to thread-safety).
     private readonly object _lock = new();
     public bool Synchronized { get; }
+
+    // Bumped after every store, removal and clear. Something that remembers what
+    // it read from a table (the tree-walk evaluator's expansion cache reads the
+    // compiler's *MACROS*) compares this instead of reading the table again.
+    private int _version;
+    public int Version => System.Threading.Volatile.Read(ref _version);
     /// <summary>
     /// Weakness mode (SBCL extension), one of NULL, ":VALUE", ":KEY",
     /// ":KEY-AND-VALUE", ":KEY-OR-VALUE". A weak side is stored behind a
@@ -1547,11 +1627,9 @@ public sealed class LispHashTable : LispObject
                           LispFunction? userTest, LispObject? userTestName, LispFunction? userHash)
     {
         _testName = userTest != null ? UserTestName(userTestName) : test.ToUpperInvariant();
-        _userTestFn = userTest;
-        _userTestName = userTestName;
-        _userHash = userHash;
+        if (userHash != null) _user = new UserTest(userTest, userTestName, userHash);
         _test = userTest != null
-            ? (a, b) => userTest.Invoke2(a, b) is not Nil
+            ? UserTestPredicate(userTest)
             : _testName switch
         {
             "EQ" => (a, b) => Runtime.IsEqRef(a, b),
@@ -1715,13 +1793,15 @@ public sealed class LispHashTable : LispObject
         // resolving comparer; if present we keep the existing box key.
         if (_weakKey)
         {
-            if (_dict.ContainsKey(key)) { _dict[key] = WrapValue(value); return; }
+            if (_dict.ContainsKey(key)) { _dict[key] = WrapValue(value); _version++; return; }
             PruneBeforeInsert();
             _dict[new WeakKeyBox(key, ((WeakKeyComparer)_dict.Comparer).HashOf(key))] = WrapValue(value);
+            _version++;
             return;
         }
         if (_weakValue && !_dict.ContainsKey(key)) PruneBeforeInsert();
         _dict[key] = WrapValue(value);
+        _version++;
     }
 
     // A weak entry whose key (or value) has been collected is only removed when
@@ -1756,7 +1836,12 @@ public sealed class LispHashTable : LispObject
     }
     // Remove by live key. The resolving comparer matches the stored box, so a
     // bare key removes the corresponding weak entry.
-    private bool RemoveByLookup(LispObject key) => _dict.Remove(key);
+    private bool RemoveByLookup(LispObject key)
+    {
+        bool removed = _dict.Remove(key);
+        if (removed) _version++;
+        return removed;
+    }
 
     /// <summary>A fresh table with the test and the entries of PROTO. A fasl
     /// builds a large hash table literal once as a prototype it keeps to itself
@@ -1764,8 +1849,8 @@ public sealed class LispHashTable : LispObject
     /// (environment tables copied from a parent) share one builder.</summary>
     public static LispHashTable CopyLiteral(LispHashTable proto)
     {
-        var h = proto._userHash != null
-            ? new LispHashTable(proto._testName, false, null, proto._userTestFn, proto._userTestName, proto._userHash)
+        var h = proto._user is { } u
+            ? new LispHashTable(proto._testName, false, null, u.TestFn, u.TestName, u.Hash)
             : new LispHashTable(proto._testName);
         foreach (var kv in proto.Entries) h.Set(kv.Key, kv.Value);
         return h;
@@ -1787,19 +1872,22 @@ public sealed class LispHashTable : LispObject
 
     public void Clear()
     {
-        if (Synchronized) lock (_lock) _dict.Clear();
-        else _dict.Clear();
+        if (Synchronized) lock (_lock) { _dict.Clear(); _version++; }
+        else { _dict.Clear(); _version++; }
     }
 
     public int Count
     {
         get
         {
+            // Not under the lock even when Synchronized: the count is a field
+            // read, which a concurrent store cannot make fail, and a count read
+            // while another thread stores is out of date the moment it returns
+            // either way. Taking the lock made every thread that asks (the
+            // tree-walk evaluator asks on every form it evaluates) wait on every
+            // other.
             if (Weakness == null)
-            {
-                if (Synchronized) lock (_lock) return _dict.Count;
                 return _dict.Count;
-            }
             if (Synchronized) lock (_lock) return CountAlivePruning();
             return CountAlivePruning();
         }
@@ -1822,8 +1910,8 @@ public sealed class LispHashTable : LispObject
     /// <summary>What HASH-TABLE-TEST answers: the standard test's symbol, or
     /// for a table made with :HASH-FUNCTION and another test, that test's name
     /// (or the function itself when it has none).</summary>
-    public LispObject TestDesignator => _userTestFn != null
-        ? _userTestName ?? _userTestFn
+    public LispObject TestDesignator => _user?.TestFn is { } userTestFn
+        ? _user.TestName ?? userTestFn
         : Startup.Sym(_testName);
 
     // Enumeration returns a snapshot under lock when Synchronized so the
@@ -1978,43 +2066,42 @@ public sealed class LispHashTable : LispObject
 
     public static bool Equalp(LispObject a, LispObject b)
     {
-        // Iterative loop to handle conses without stack overflow
+        a = Runtime.Primary(a); b = Runtime.Primary(b);
         while (true)
         {
-            if (LispEqual(a, b)) return true;
-            if (a is Number na && b is Number nb)
-                return Arithmetic.IsNumericEqual(na, nb);
-            if (a is LispChar ca && b is LispChar cb)
-                return char.ToUpperInvariant(ca.Value) == char.ToUpperInvariant(cb.Value);
-            // Cons (list) comparison: recurse on car, iterate on cdr
-            if (a is Cons ca2 && b is Cons cb2)
+            if (ReferenceEquals(a, b)) return true;
+            if (a is Fixnum fa) return b is Fixnum fb ? fa.Value == fb.Value : b is Number nb0 && NumbersEqualp(fa, nb0);
+            if (a is Cons ca2)
             {
-                if (!Equalp(ca2.Car, cb2.Car)) return false;
+                if (b is not Cons cb2 || !Equalp(ca2.Car, cb2.Car)) return false;
                 a = ca2.Cdr;
                 b = cb2.Cdr;
                 continue;
             }
-            // String comparisons: case-insensitive, handle LispString <-> char-vector
-            bool aIsStr = a is LispString || (a is LispVector av && av.IsCharVector);
-            bool bIsStr = b is LispString || (b is LispVector bv && bv.IsCharVector);
-            if (aIsStr && bIsStr)
+            if (a is LispChar ca)
+                return b is LispChar cb && CharEqualp(ca.Value, cb.Value);
+            if (a is Number na) return b is Number nb && NumbersEqualp(na, nb);
+            if (a is Symbol || a is Nil || a is T) return Runtime.IsTrueEq(a, b);
+            if (a is LispSimdPack simdA) return b is LispSimdPack simdB && simdA.SameBits(simdB);
+            if (a is LispStruct sa)
             {
-                string sa2 = a is LispString ls1 ? ls1.Value : ((LispVector)a).ToCharString();
-                string sb2 = b is LispString ls2 ? ls2.Value : ((LispVector)b).ToCharString();
-                return string.Equals(sa2, sb2, StringComparison.OrdinalIgnoreCase);
-            }
-            // CL spec: arrays are equalp if same dimensions and elements are pairwise equalp.
-            int aLen = a is LispString las ? las.Length : (a is LispVector lav ? lav.Length : -1);
-            int bLen = b is LispString lbs ? lbs.Length : (b is LispVector lbv ? lbv.Length : -1);
-            if (aLen >= 0 && bLen >= 0 && aLen == bLen)
-            {
-                LispObject GetAt(LispObject seq, int i) => seq is LispString s
-                    ? LispChar.Make(s[i])
-                    : ((LispVector)seq).ElementAt(i);
-                for (int i = 0; i < aLen; i++)
-                    if (!Equalp(GetAt(a, i), GetAt(b, i))) return false;
+                if (b is not LispStruct sb) return false;
+                if (!ReferenceEquals(sa.TypeName, sb.TypeName) && sa.TypeName.Name != sb.TypeName.Name) return false;
+                if (sa.SlotCount != sb.SlotCount) return false;
+                for (int i = 0; i < sa.SlotCount; i++)
+                    if (!Equalp(sa.GetSlot(i), sb.GetSlot(i))) return false;
                 return true;
             }
+            if (a is LispString las0 && b is LispString lbs0)
+            {
+                var xs = las0.Chars; var ys = lbs0.Chars;
+                if (xs.Length != ys.Length) return false;
+                for (int i = 0; i < xs.Length; i++)
+                    if (!CharEqualp(xs[i], ys[i])) return false;
+                return true;
+            }
+            if ((a is LispString || a is LispVector) && (b is LispString || b is LispVector))
+                return ArraysEqualp(a, b);
             // Hash table comparison: same test, same count, same key->value pairs
             if (a is LispHashTable ha && b is LispHashTable hb)
             {
@@ -2037,17 +2124,50 @@ public sealed class LispHashTable : LispObject
                     && Runtime.IsTruthy(Runtime.Equal(pa.TypeComponent ?? Nil.Instance, pb.TypeComponent ?? Nil.Instance))
                     && Runtime.PathnameVersionsEqual(pa.Version, pb.Version);
             }
-            // Struct comparison: same type, all slots equalp
-            if (a is LispStruct sa && b is LispStruct sb)
-            {
-                if (sa.TypeName.Name != sb.TypeName.Name) return false;
-                if (sa.SlotCount != sb.SlotCount) return false;
-                for (int i = 0; i < sa.SlotCount; i++)
-                    if (!Equalp(sa.GetSlot(i), sb.GetSlot(i))) return false;
-                return true;
-            }
             return false;
         }
+    }
+
+    private static bool ArraysEqualp(LispObject a, LispObject b)
+    {
+        var va = a as LispVector; var vb = b as LispVector;
+        int ra = va?.Rank ?? 1, rb = vb?.Rank ?? 1;
+        if (ra != rb) return false;
+        int len;
+        if (ra == 1)
+        {
+            len = va?.Length ?? ((LispString)a).Length;
+            if (len != (vb?.Length ?? ((LispString)b).Length)) return false;
+        }
+        else
+        {
+            var da = va!.Dimensions; var db = vb!.Dimensions;
+            for (int i = 0; i < ra; i++) if (da[i] != db[i]) return false;
+            len = va.Length;
+        }
+        for (int i = 0; i < len; i++)
+        {
+            var x = va != null ? va.ElementAt(i) : LispChar.Make(((LispString)a)[i]);
+            var y = vb != null ? vb.ElementAt(i) : LispChar.Make(((LispString)b)[i]);
+            if (x is LispChar cx && y is LispChar cy)
+            {
+                if (!CharEqualp(cx.Value, cy.Value)) return false;
+            }
+            else if (!Equalp(x, y)) return false;
+        }
+        return true;
+    }
+
+    private static bool CharEqualp(char x, char y)
+        => x == y || char.ToUpperInvariant(x) == char.ToUpperInvariant(y);
+
+    // = plus EQL, so a NaN is still EQUALP to a bit-identical NaN.
+    private static bool NumbersEqualp(Number a, Number b)
+    {
+        if (a is DoubleFloat da && b is DoubleFloat db)
+            return da.Value == db.Value
+                || BitConverter.DoubleToInt64Bits(da.Value) == BitConverter.DoubleToInt64Bits(db.Value);
+        return Arithmetic.IsNumericEqual(a, b) || Runtime.IsTrueEql(a, b);
     }
 
     public override string ToString() => $"#<HASH-TABLE :{_testName}{(Synchronized ? " :SYNCHRONIZED" : "")} {_dict.Count}/{_dict.Count}>";
@@ -2055,7 +2175,6 @@ public sealed class LispHashTable : LispObject
     private class LispEqualityComparer : IEqualityComparer<LispObject>
     {
         private readonly Func<LispObject, LispObject, bool> _test;
-        private readonly string _testName;
         private readonly LispFunction? _hash;
         // The test as a small integer, so hashing a key does not compare the
         // test's name as a string on every lookup.
@@ -2066,7 +2185,6 @@ public sealed class LispHashTable : LispObject
                                     LispFunction? hash = null)
         {
             _test = test;
-            _testName = testName;
             _hash = hash;
             _kind = testName switch
             {
@@ -2116,7 +2234,7 @@ public sealed class LispHashTable : LispObject
                 case KindEql:
                     // Only numbers and characters hash by value; test for them
                     // with two type checks before trying each number type.
-                    if (obj is Number || obj is LispChar)
+                    if (obj is Number || obj is LispChar || obj is LispSimdPack)
                         return NumericOrCharHash(obj)
                                ?? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
                     return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Canonical(obj));
@@ -2138,6 +2256,7 @@ public sealed class LispHashTable : LispObject
         {
             Fixnum f => f.Value.GetHashCode(),
             LispChar c => c.Value.GetHashCode(),
+            LispSimdPack sp => HashCode.Combine((int)sp.Kind, sp.Lo, sp.Hi),
             SingleFloat sf => sf.Value.GetHashCode(),
             DoubleFloat df => df.Value.GetHashCode(),
             Bignum b => b.Value.GetHashCode(),
@@ -2207,14 +2326,34 @@ public sealed class LispHashTable : LispObject
 
         private static int GetEqualpHash(LispObject obj) => GetEqualpHash(obj, EqualHashMaxDepth);
 
+        private static int UpcaseHash(ReadOnlySpan<char> cs)
+        {
+            int h = cs.Length;
+            foreach (var c in cs) h = h * 31 + char.ToUpperInvariant(c);
+            return h;
+        }
+
+        // Must agree with UpcaseHash when V holds only characters.
+        private static int ArrayEqualpHash(LispVector v, int depth)
+        {
+            int n = v.Length;
+            int h = n;
+            for (int i = 0; i < n; i++)
+            {
+                var e = v.ElementAt(i);
+                h = h * 31 + (e is LispChar c ? char.ToUpperInvariant(c.Value) : GetEqualpHash(e, depth - 1));
+            }
+            return h;
+        }
+
         private static int GetEqualpHash(LispObject obj, int depth)
         {
             if (depth == 0) return 0;
             return obj switch
             {
-                LispString s => s.Value.ToUpperInvariant().GetHashCode(),
-                LispVector v when v.IsCharVector => v.ToCharString().ToUpperInvariant().GetHashCode(),
-                LispChar c => char.ToUpperInvariant(c.Value).GetHashCode(),
+                LispString s => UpcaseHash(s.Chars),
+                LispVector v => ArrayEqualpHash(v, depth),
+                LispChar c => char.ToUpperInvariant(c.Value),
                 // A complex has to hash by its parts: EQUALP compares numbers with
                 // =, so #C(1 2) and #C(1.0d0 2.0d0) are EQUALP and must land in
                 // the same bucket. It also has to agree with a REAL when the
@@ -2228,7 +2367,6 @@ public sealed class LispHashTable : LispObject
                                        Arithmetic.ToDouble(cx.Imaginary).GetHashCode()),
                 Number n => Arithmetic.ToDouble(n).GetHashCode(),
                 Cons c => HashCode.Combine(GetEqualpHash(c.Car, depth - 1), GetEqualpHash(c.Cdr, depth - 1)),
-                LispVector v => v.Length == 0 ? 0 : GetEqualpHash(v.ElementAt(0), depth - 1),
                 // EQUALP compares structures slot by slot, hash tables by test,
                 // count and entries, and pathnames as EQUAL does, so none of them
                 // may hash by identity: two EQUALP keys landed in different
@@ -2236,95 +2374,214 @@ public sealed class LispHashTable : LispObject
                 LispStruct st => StructEqualpHash(st, depth),
                 LispHashTable ht => HashCode.Combine(ht.TestName, ht.Count),
                 LispPathname pn => PathnameHash(pn, depth),
+                LispSimdPack sp => HashCode.Combine((int)sp.Kind, sp.Lo, sp.Hi),
                 _ => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj)
             };
         }
     }
 }
 
+/// <summary>MT19937 with SBCL's state layout and its RANDOM algorithms, so a state
+/// SBCL printed reads back here and draws the same numbers. The state is 627
+/// words: 0-1 the constants 0 and MATRIX_A (indexed by y &amp; 1 in the update),
+/// 2 the index k, 3-626 the 624 words of state.</summary>
 public class LispRandomState : LispObject
 {
-    private ulong _s0, _s1;
+    public const int StateLength = 627;
+    const int N = 624, M = 397;
+    const uint UpperMask = 0x80000000, LowerMask = 0x7FFFFFFF;
+    const uint MatrixA = 0x9908B0DF, TemperB = 0x9D2C5680, TemperC = 0xEFC60000;
 
-    public LispRandomState() {
-        var rng = new Random();
-        _s0 = (ulong)rng.NextInt64();
-        _s1 = (ulong)rng.NextInt64();
-        if (_s0 == 0 && _s1 == 0) _s1 = 1;
+    private readonly uint[] _s = new uint[StateLength];
+
+    public LispRandomState() => SeedByArray(OsSeed());
+
+    public LispRandomState(uint seed) => InitRandomState(seed);
+
+    public LispRandomState(LispRandomState other) => Array.Copy(other._s, _s, StateLength);
+
+    private LispRandomState(uint[] state, bool raw) => Array.Copy(state, _s, StateLength);
+
+    public static LispRandomState FromState(uint[] state) => new LispRandomState(state, true);
+
+    public uint[] StateWords() => (uint[])_s.Clone();
+
+    static uint[] OsSeed()
+    {
+        var bytes = new byte[32];
+        using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+            rng.GetBytes(bytes);
+        var key = new uint[8];
+        for (int i = 0; i < 8; i++) key[i] = BitConverter.ToUInt32(bytes, i * 4);
+        return key;
     }
 
-    public LispRandomState(int seed) {
-        var rng = new Random(seed);
-        _s0 = (ulong)rng.NextInt64();
-        _s1 = (ulong)rng.NextInt64();
-        if (_s0 == 0 && _s1 == 0) _s1 = 1;
-    }
-
-    // Copy constructor - key for make-random-state
-    public LispRandomState(LispRandomState other) {
-        _s0 = other._s0;
-        _s1 = other._s1;
-    }
-
-    // xorshift128+ PRNG
-    public ulong Next() {
-        ulong s1 = _s0;
-        ulong s0 = _s1;
-        _s0 = s0;
-        s1 ^= s1 << 23;
-        _s1 = s1 ^ s0 ^ (s1 >> 17) ^ (s0 >> 26);
-        return _s1 + s0;
-    }
-
-    // Random integer in [0, limit) for BigInteger limit
-    public System.Numerics.BigInteger NextBelow(System.Numerics.BigInteger limit) {
-        if (limit <= 0) throw new ArgumentException("limit must be positive");
-        if (limit <= long.MaxValue) {
-            long lim = (long)limit;
-            return (long)(Next() % (ulong)lim);
+    void InitRandomState(uint seed)
+    {
+        _s[0] = 0;
+        _s[1] = MatrixA;
+        _s[2] = N;
+        uint s = seed;
+        for (int i = 0; i < N; i++)
+        {
+            if (i > 0) s = unchecked(1812433253u * (s ^ (s >> 30)) + (uint)i);
+            _s[3 + i] = s;
         }
-        int byteCount = limit.GetByteCount(isUnsigned: true) + 1;
-        byte[] bytes = new byte[byteCount];
-        for (int i = 0; i < byteCount; i++)
-            bytes[i] = (byte)(Next() & 0xFF);
-        bytes[byteCount - 1] = 0; // ensure positive
-        var result = Compat.MakeBigInteger(bytes, isUnsigned: true);
-        return result % limit;
     }
 
-    // Random double in [0.0, 1.0)
-    public double NextDouble() {
-        return (double)(Next() >> 11) / (1UL << 53);
+    void SeedByArray(uint[] key)
+    {
+        InitRandomState(19650218);
+        int i = 1, j = 0, l = key.Length;
+        for (int k = Math.Max(N, l); k > 0; k--)
+        {
+            _s[i + 3] = unchecked((_s[i + 3] ^ ((_s[i + 2] ^ (_s[i + 2] >> 30)) * 1664525u)) + key[j] + (uint)j);
+            i++; if (i >= N) { _s[3] = _s[2 + N]; i = 1; }
+            j++; if (j >= l) j = 0;
+        }
+        for (int k = N - 1; k > 0; k--)
+        {
+            _s[i + 3] = unchecked((_s[i + 3] ^ ((_s[i + 2] ^ (_s[i + 2] >> 30)) * 1566083941u)) - (uint)i);
+            i++; if (i >= N) { _s[3] = _s[2 + N]; i = 1; }
+        }
+        _s[3] = 0x80000000;
     }
 
-    // Random float in [0.0f, 1.0f)
-    public float NextSingle() {
-        return (float)(Next() >> 40) / (1UL << 24);
+    void Update()
+    {
+        uint y;
+        int kk;
+        for (kk = 3; kk < 3 + (N - M); kk++)
+        {
+            y = (_s[kk] & UpperMask) | (_s[kk + 1] & LowerMask);
+            _s[kk] = _s[kk + M] ^ (y >> 1) ^ _s[y & 1];
+        }
+        for (; kk < 3 + (N - 1); kk++)
+        {
+            y = (_s[kk] & UpperMask) | (_s[kk + 1] & LowerMask);
+            _s[kk] = _s[kk + (M - N)] ^ (y >> 1) ^ _s[y & 1];
+        }
+        y = (_s[3 + (N - 1)] & UpperMask) | (_s[3] & LowerMask);
+        _s[3 + (N - 1)] = _s[3 + (M - 1)] ^ (y >> 1) ^ _s[y & 1];
+    }
+
+    public uint Chunk()
+    {
+        uint k = _s[2];
+        if (k >= N) { Update(); k = 0; }
+        _s[2] = k + 1;
+        uint y = _s[3 + k];
+        y ^= y >> 11;
+        y ^= (y << 7) & TemperB;
+        y ^= (y << 15) & TemperC;
+        y ^= y >> 18;
+        return y;
+    }
+
+    ulong BigChunk()
+    {
+        ulong hi = Chunk();
+        return (hi << 32) | Chunk();
+    }
+
+    static int IntegerLength(ulong x)
+    {
+        int n = 0;
+        while (x != 0) { x >>= 1; n++; }
+        return n;
+    }
+
+    const long SbclMostPositiveFixnum = (1L << 62) - 1;
+
+    /// <summary>A random integer in [0, limit), limit positive.</summary>
+    public System.Numerics.BigInteger NextBelow(System.Numerics.BigInteger limit)
+    {
+        if (limit <= 0) throw new ArgumentException("limit must be positive");
+        if (limit <= SbclMostPositiveFixnum) return NextBelowFixnum((long)limit);
+        return NextBelowBignum(limit);
+    }
+
+    public long NextBelowFixnum(long limit)
+    {
+        if (limit > SbclMostPositiveFixnum) return (long)NextBelowBignum(limit);
+        if (limit == 1) return 0;
+        int nBits = IntegerLength((ulong)(limit - 1));
+        ulong mask = (1UL << nBits) - 1;
+        while (true)
+        {
+            ulong bits = mask & (nBits <= 32 ? Chunk() : BigChunk());
+            if (bits < (ulong)limit) return (long)bits;
+        }
+    }
+
+    ulong BignumDigit() => BigChunk();
+
+    ulong BignumPartialDigit(int nBits)
+        => ((1UL << nBits) - 1) & (nBits <= 32 ? Chunk() : BigChunk());
+
+    System.Numerics.BigInteger MakeRandomBignum(long nBits)
+    {
+        long nDigits = nBits / 64;
+        int partial = (int)(nBits % 64);
+        System.Numerics.BigInteger r = 0;
+        for (long i = 0; i < nDigits; i++)
+            r |= (System.Numerics.BigInteger)BignumDigit() << (int)(64 * i);
+        if (partial != 0)
+            r |= (System.Numerics.BigInteger)BignumPartialDigit(partial) << (int)(64 * nDigits);
+        return r;
+    }
+
+    System.Numerics.BigInteger NextBelowBignum(System.Numerics.BigInteger limit)
+    {
+        long nBits = limit.GetBitLength();
+        if (limit.IsPowerOfTwo)
+        {
+            long n = nBits - 1;
+            if (n <= 32) return Chunk() >> (int)(32 - n);
+            return MakeRandomBignum(n);
+        }
+        if (nBits <= 32)
+        {
+            int shift = (int)(32 - nBits);
+            while (true)
+            {
+                uint bits = Chunk() >> shift;
+                if (bits < limit) return bits;
+            }
+        }
+        int sh = (int)(nBits - 32);
+        uint firstChunk = (uint)((limit >> sh) & 0xFFFFFFFF);
+        while (true)
+        {
+            uint rc = Chunk();
+            if (rc > firstChunk) continue;
+            var bits = ((System.Numerics.BigInteger)rc << sh) | MakeRandomBignum(sh);
+            if (rc < firstChunk || bits < limit) return bits;
+        }
+    }
+
+    public double NextDouble(double limit)
+    {
+        while (true)
+        {
+            ulong hi = 0x3FF00000UL | ((Chunk() >> 11) & 0xFFFFF);
+            ulong lo = Chunk();
+            double c = limit * (BitConverter.Int64BitsToDouble((long)((hi << 32) | lo)) - 1d);
+            if (c != limit) return c;
+        }
+    }
+
+    public float NextSingle(float limit)
+    {
+        while (true)
+        {
+            int bits = 0x3F800000 | (int)((Chunk() >> 8) & 0x7FFFFF);
+            float c = limit * (Compat.Int32BitsToSingle(bits) - 1f);
+            if (c != limit) return c;
+        }
     }
 
     public override string ToString() => "#<RANDOM-STATE>";
-
-    /// <summary>Readable form that can be read back via #. eval.</summary>
-    /// The constructor is a dotcl extension living in DOTCL-INTERNAL, so that is the
-    /// package it must be printed in. It used to be spelled COMMON-LISP::, which is
-    /// a symbol that has no function: the compiled path still worked because the
-    /// compiler resolves a call by NAME through CilAssembler (which bridges bare
-    /// names across dotcl's own packages), but the tree-walk evaluator resolves the
-    /// operator through SYMBOL-FUNCTION on that exact symbol and got
-    /// "Undefined function: MAKE-RANDOM-STATE-FROM-SEEDS" (ansi-test
-    /// PRINT.RANDOM-STATE.1). Reading the old spelling also interned a
-    /// non-standard name into COMMON-LISP as a side effect.
-    public string ToReadableString() =>
-        $"#.(DOTCL-INTERNAL::MAKE-RANDOM-STATE-FROM-SEEDS {(System.Numerics.BigInteger)_s0} {(System.Numerics.BigInteger)_s1})";
-
-    /// <summary>Restore a random state from its two seed values.</summary>
-    public static LispRandomState FromSeeds(ulong s0, ulong s1)
-    {
-        var rs = new LispRandomState();
-        rs._s0 = s0;
-        rs._s1 = s1;
-        return rs;
-    }
 }
 
 /// <summary>Pprint dispatch table: the entries set by SET-PPRINT-DISPATCH, and

@@ -86,7 +86,9 @@ public partial class CilAssembler
 
         for (int i = 0; i < cells.Count; i++)
         {
-            if (depth[i] != 0 || TailInvokeShape(cells[i].Car).arity < 0) continue;
+            if (depth[i] != 0 || (TailInvokeShape(cells[i].Car).arity < 0
+                                  && !(cells[i].Car is Cons sc && sc.Car is Symbol ss && ss.Name == "CALL-SAME-FILE")))
+                continue;
             // Follow the value to the RET. It may pass through one local on the
             // way (STLOC v ... LDLOC v), which is how a BLOCK, an inlined call
             // and a LET body hand their value on.
@@ -218,6 +220,11 @@ public partial class CilAssembler
     /// its arguments (and the value mode, for InvokeNM) are on the stack.</summary>
     private void EmitTailInvoke(LispObject instr)
     {
+        if (instr is Cons sc && sc.Car is Symbol ss && ss.Name == "CALL-SAME-FILE")
+        {
+            EmitSameFileTail(sc);
+            return;
+        }
         var (n, mode) = TailInvokeShape(instr);
         var il = _il;
         _tailFn ??= il.DeclareLocal(typeof(LispFunction));
@@ -229,12 +236,15 @@ public partial class CilAssembler
 
         void LoadArgs() { for (int k = 0; k < n; k++) il.EmitLoc(OpCodes.Ldloc, _tailArgs[k]!); }
 
+        var selfLocal = _selfFrameLocal != null ? EmitSelfTail(n, mode, _tailFn, _tailArgs, _tailMode) : null;
+
         // int kind = LispFunction.TailPrepN(fn, mode, self, a0, ...), or for more
         // than four arguments TailPrep8(fn, n, mode, self, a0, ..., a7)
         il.EmitLoc(OpCodes.Ldloc, _tailFn);
         if (n > 4) il.Emit(OpCodes.Ldc_I4, n);
         if (mode) il.EmitLoc(OpCodes.Ldloc, _tailMode!); else il.Emit(OpCodes.Ldc_I4_M1);
-        if (_tailSelf == null) il.Emit(OpCodes.Ldnull);
+        if (selfLocal != null) il.EmitLoc(OpCodes.Ldloc, selfLocal);
+        else if (_tailSelf == null) il.Emit(OpCodes.Ldnull);
         else il.Emit(OpCodes.Ldstr, Track(_tailSelf));
         int slots = n <= 4 ? n : 8;
         for (int k = 0; k < slots; k++)

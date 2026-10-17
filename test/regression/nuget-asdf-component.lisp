@@ -181,3 +181,33 @@
                         (handler-case (progn (eval req) :loaded)
                           (error (e) (princ-to-string e))))))
   (("dotnet-nuget" :loaded) ("dotnet-nuget" :loaded) ("dotnet-nuget" :loaded)))
+
+;;; Restore runs in a scratch directory, so a relative local feed has to be made
+;;; absolute first: against the current directory for NUGET:REQUIRE, against the
+;;; system's directory for a declaration. URLs and absolute paths pass through.
+(deftest nuget-asdf.relative-source-is-made-absolute
+  (let* ((base (regression-temp-dir))
+         (rel (nuget::%absolute-source "feed" base))
+         (abs (nuget::%absolute-source rel "elsewhere")))
+    (list (notnot (dotnet:static "System.IO.Path" "IsPathFullyQualified" rel))
+          (string= rel (dotnet:static "System.IO.Path" "GetFullPath"
+                                       (dotnet:static "System.IO.Path" "Combine" base "feed")))
+          (string= abs rel)
+          (nuget::%absolute-source "https://example.com/v3/index.json" base)
+          (nuget::%absolute-source nil base)))
+  (t t t "https://example.com/v3/index.json" nil))
+
+(defparameter *nac-relative*
+  (asdf:defsystem "nac-relative"
+    :pathname #.(namestring (regression-temp-dir))
+    :components ((:nuget "Local.Package" :nuget-version "1.0.0" :source "feed"))))
+
+(deftest nuget-asdf.declared-relative-source-is-against-the-system
+  (let* ((c (first (asdf:component-children *nac-relative*)))
+         (want (dotnet:static "System.IO.Path" "GetFullPath"
+                              (nuget::%combine (namestring (asdf:component-pathname *nac-relative*))
+                                               "feed"))))
+    (list (asdf-nuget:nuget-source c)
+          (string= want (nuget::req-source (asdf-nuget::%request c)))
+          (string= want (getf (asdf-nuget::%require-arguments c) :source))))
+  ("feed" t t))

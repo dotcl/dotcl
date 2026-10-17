@@ -1,0 +1,100 @@
+;;; The values of a standard-combination generic function are those of the
+;;; primary (or :around) method; what :before and :after methods return is
+;;; discarded (CLHS 7.6.6.2), on the cold and the warm (cached) paths.
+
+(defun %gav-warm (fn)
+  (let (r) (dotimes (i 40) (setf r (multiple-value-list (funcall fn)))) r))
+
+(defgeneric %gav-a1 (x))
+(defmethod %gav-a1 ((x integer)) nil)
+(defmethod %gav-a1 :after ((x integer)) (values nil nil))
+(defgeneric %gav-a2 (x y))
+(defmethod %gav-a2 ((x integer) y) nil)
+(defmethod %gav-a2 :after ((x integer) y) (values nil nil))
+(defgeneric %gav-a3 (x y z))
+(defmethod %gav-a3 ((x integer) y z) nil)
+(defmethod %gav-a3 :after ((x integer) y z) (values nil nil 3))
+(defgeneric %gav-a4 (x y z w))
+(defmethod %gav-a4 ((x integer) y z w) nil)
+(defmethod %gav-a4 :after ((x integer) y z w) (values nil nil))
+(defgeneric %gav-a5 (x y z w v))
+(defmethod %gav-a5 ((x integer) y z w v) nil)
+(defmethod %gav-a5 :after ((x integer) y z w v) (values nil nil))
+
+(deftest gf-aux-values.after
+  (list (multiple-value-list (%gav-a1 1))
+        (%gav-warm (lambda () (%gav-a1 1)))
+        (multiple-value-list (%gav-a2 1 2))
+        (%gav-warm (lambda () (%gav-a2 1 2)))
+        (%gav-warm (lambda () (%gav-a3 1 2 3)))
+        (%gav-warm (lambda () (%gav-a4 1 2 3 4)))
+        (%gav-warm (lambda () (%gav-a5 1 2 3 4 5)))
+        (%gav-warm (lambda () (funcall #'%gav-a1 1)))
+        (%gav-warm (lambda () (apply #'%gav-a2 '(1 2))))
+        (%gav-warm (lambda () (multiple-value-call #'list (%gav-a1 1))))
+        (%gav-warm (lambda () (nth-value 1 (%gav-a1 1)))))
+  ((nil) (nil) (nil) (nil) (nil) (nil) (nil) (nil) (nil) ((nil)) (nil)))
+
+(defgeneric %gav-mv (x))
+(defmethod %gav-mv ((x integer)) (values 1 2 3))
+(defmethod %gav-mv ((x symbol)) (values x 2))
+(defmethod %gav-mv ((x string)) (values))
+(defmethod %gav-mv ((x float)) (%gav-mv-tail x))
+(defun %gav-mv-tail (x) (values x x))
+(defmethod %gav-mv :after (x) (values x 9 9 9))
+
+(deftest gf-aux-values.primary-values-kept
+  (list (%gav-warm (lambda () (%gav-mv 1)))
+        (%gav-warm (lambda () (%gav-mv :k)))
+        (%gav-warm (lambda () (%gav-mv "s")))
+        (%gav-warm (lambda () (%gav-mv 1.5)))
+        (multiple-value-bind (a b c) (%gav-mv :k) (list a b c)))
+  ((1 2 3) (:k 2) () (1.5 1.5) (:k 2 nil)))
+
+(defgeneric %gav-b1 (x))
+(defmethod %gav-b1 ((x integer)) nil)
+(defmethod %gav-b1 :before ((x integer)) (values nil nil))
+(defgeneric %gav-b2 (x y))
+(defmethod %gav-b2 ((x integer) y) nil)
+(defmethod %gav-b2 :before ((x integer) y) (values nil nil))
+
+(deftest gf-aux-values.before
+  (list (%gav-warm (lambda () (%gav-b1 1)))
+        (%gav-warm (lambda () (%gav-b2 1 2))))
+  ((nil) (nil)))
+
+(defgeneric %gav-r1 (x))
+(defmethod %gav-r1 ((x integer)) nil)
+(defmethod %gav-r1 :after ((x integer)) (values nil nil))
+(defmethod %gav-r1 :around ((x integer)) (call-next-method))
+(defgeneric %gav-r2 (x))
+(defmethod %gav-r2 ((x integer)) nil)
+(defmethod %gav-r2 :after ((x integer)) (values nil nil))
+(defmethod %gav-r2 :around ((x integer)) (multiple-value-list (call-next-method)))
+(defgeneric %gav-e1 (x))
+(defmethod %gav-e1 ((x (eql 1))) nil)
+(defmethod %gav-e1 :after ((x (eql 1))) (values nil nil))
+(defgeneric %gav-k1 (x &key a))
+(defmethod %gav-k1 ((x integer) &key a) a)
+(defmethod %gav-k1 :after ((x integer) &key a) (values a nil))
+
+(deftest gf-aux-values.around-eql-key
+  (list (%gav-warm (lambda () (%gav-r1 1)))
+        (%gav-warm (lambda () (%gav-r2 1)))
+        (%gav-warm (lambda () (%gav-e1 1)))
+        (%gav-warm (lambda () (%gav-k1 1 :a nil))))
+  ((nil) ((nil)) (nil) (nil)))
+
+(defclass %gav-c () ((s :accessor %gav-c-s :initform nil)))
+(defmethod %gav-c-s :after ((o %gav-c)) (values nil nil))
+(defmethod (setf %gav-c-s) :after (v (o %gav-c)) (values v nil))
+(defmethod print-object ((o %gav-c) s) (write-string "#<GAV>" s) nil)
+(defmethod print-object :after ((o %gav-c) s) (values nil nil))
+
+(deftest gf-aux-values.accessor-print-object
+  (let ((o (make-instance '%gav-c)))
+    (list (%gav-warm (lambda () (%gav-c-s o)))
+          (%gav-warm (lambda () (setf (%gav-c-s o) nil)))
+          (%gav-warm (lambda () (print-object o (make-broadcast-stream))))
+          (%gav-warm (lambda () (write-to-string o)))))
+  ((nil) (nil) (nil) ("#<GAV>")))

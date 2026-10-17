@@ -814,12 +814,12 @@ public static partial class Runtime
         "COMPLEX" => obj is LispComplex,
         "STRING" => obj is LispString || (obj is LispVector sv && sv.IsCharVector && sv.Rank == 1),
         "SIMPLE-STRING" => obj is LispString || (obj is LispVector ssv && ssv.IsCharVector && ssv.IsSimple && ssv.Rank == 1),
-        "BASE-STRING" => obj is LispString || (obj is LispVector bsv && bsv.IsCharVector && bsv.ElementTypeName != "NIL" && bsv.Rank == 1),
-        "SIMPLE-BASE-STRING" => obj is LispString || (obj is LispVector sbsv && sbsv.IsCharVector && sbsv.IsSimple && sbsv.ElementTypeName != "NIL" && sbsv.Rank == 1),
+        "BASE-STRING" => obj is LispVector bsv && bsv.IsBaseCharVector && bsv.Rank == 1,
+        "SIMPLE-BASE-STRING" => obj is LispVector sbsv && sbsv.IsBaseCharVector && sbsv.IsSimple && sbsv.Rank == 1,
         "CHARACTER" => obj is LispChar,
-        "BASE-CHAR" => obj is LispChar,
+        "BASE-CHAR" => obj is LispChar bc && bc.Value < BaseCharCodeLimit,
         "STANDARD-CHAR" => obj is LispChar lc && IsStandardChar(lc.Value),
-        "EXTENDED-CHAR" => false, // base-char = character in dotcl, so extended-char is empty
+        "EXTENDED-CHAR" => obj is LispChar ec && ec.Value >= BaseCharCodeLimit,
         "FUNCTION" => obj is LispFunction,
         // A funcallable instance of a user class is represented as a generic function
         // (that is the callable object dotcl has), but it is not one: its class says
@@ -950,7 +950,7 @@ public static partial class Runtime
         }
         // String/char-vector -> element type is CHARACTER (not T)
         if (obj is LispString)
-            return elemType is Symbol es && es.Name is "CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR";
+            return elemType is Symbol es && es.Name == "CHARACTER";
         if (obj is LispVector v)
         {
             string et = v.ElementTypeName ?? "T";
@@ -997,7 +997,7 @@ public static partial class Runtime
         // (unsigned-byte 8) and an (unsigned-byte 8) array as FIXNUM, so a
         // TYPECASE picking a byte-vector writer took a FIXNUM vector.
         if (IsSpecializedIntegerElementType(storedET))
-            return ParseElementTypeName(elemTypeSpec) == storedET;
+            return SameElementTypeName(ParseElementTypeName(elemTypeSpec), storedET);
         // NIL reads as the empty list, not as a symbol named NIL, so it would
         // otherwise fall past every case below to the "generic vector accepts
         // anything" line. It upgrades to NIL: an array of element type NIL can
@@ -1009,7 +1009,8 @@ public static partial class Runtime
             return etName switch
             {
                 "T" => storedET == "T",
-                "CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR" => storedET is "CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR",
+                "CHARACTER" => storedET == "CHARACTER",
+                "BASE-CHAR" or "STANDARD-CHAR" => storedET is "BASE-CHAR" or "STANDARD-CHAR",
                 "BIT" => storedET == "BIT",
                 "NIL" => storedET == "NIL",
                 // FIXNUM has storage of its own. INTEGER, SIGNED-BYTE,
@@ -1038,7 +1039,7 @@ public static partial class Runtime
             // specifier upgrades to the array's element type.
             if (headN is "UNSIGNED-BYTE" or "SIGNED-BYTE" or "INTEGER" or "MOD" or "EQL"
                 or "FLOAT" or "SHORT-FLOAT" or "SINGLE-FLOAT" or "DOUBLE-FLOAT" or "LONG-FLOAT")
-                return ParseElementTypeName(elemTypeSpec) == storedET;
+                return SameElementTypeName(ParseElementTypeName(elemTypeSpec), storedET);
             if (headN == "COMPLEX")
             {
                 // Arrays of (complex single-float) and (complex double-float) are
@@ -1723,8 +1724,8 @@ public static partial class Runtime
         return et switch {
             "*" => "*",
             "BIT" => "BIT",
-            "CHARACTER" or "STANDARD-CHAR" => "CHARACTER",
-            "BASE-CHAR" => "BASE-CHAR",
+            "CHARACTER" => "CHARACTER",
+            "BASE-CHAR" or "STANDARD-CHAR" => "BASE-CHAR",
             "NIL" => "NIL",
             CharOrNilMarker => CharOrNilMarker,
             _ => "T"
@@ -1992,6 +1993,7 @@ public static partial class Runtime
         {
             bool isRank1 = arr1.Value.Rank == 1;
             bool isCharElem = arr1.Value.ElemType is "CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR" or "NIL";
+            bool isBaseElem = arr1.Value.ElemType is "BASE-CHAR" or "STANDARD-CHAR";
             bool isSimple = type1 is Cons c1s && c1s.Car is Symbol cs1s && cs1s.Name.Contains("SIMPLE");
             if (!isSimple && name1 != null) isSimple = name1.Contains("SIMPLE");
             bool res = name2 is "ARRAY" or "T" or "ATOM" ? true :
@@ -1999,8 +2001,8 @@ public static partial class Runtime
                        (name2 == "VECTOR" && isRank1) ? true :
                        (name2 == "STRING" && isRank1 && isCharElem) ? true :
                        (name2 == "SIMPLE-STRING" && isRank1 && isCharElem && isSimple) ? true :
-                       (name2 == "BASE-STRING" && isRank1 && isCharElem) ? true :
-                       (name2 == "SIMPLE-BASE-STRING" && isRank1 && isCharElem && isSimple) ? true :
+                       (name2 == "BASE-STRING" && isRank1 && isBaseElem) ? true :
+                       (name2 == "SIMPLE-BASE-STRING" && isRank1 && isBaseElem && isSimple) ? true :
                        (name2 == "SIMPLE-ARRAY" && arr1.Value.ElemType != "*") ? false : // conservative
                        false;
             MultipleValues.SetPair(res ? T.Instance : Nil.Instance, T.Instance);

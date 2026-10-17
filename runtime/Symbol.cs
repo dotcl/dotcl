@@ -59,8 +59,9 @@ public sealed class Symbol : LispObject
     internal sealed class FindClassMemo
     {
         internal readonly LispObject Class;
+        internal readonly LispClass? AsClass;
         internal readonly int Epoch;
-        internal FindClassMemo(LispObject cls, int epoch) { Class = cls; Epoch = epoch; }
+        internal FindClassMemo(LispObject cls, int epoch) { Class = cls; AsClass = cls as LispClass; Epoch = epoch; }
     }
     internal volatile FindClassMemo? ClassMemo;
 

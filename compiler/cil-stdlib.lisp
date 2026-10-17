@@ -177,6 +177,22 @@
          :format-control "too few elements in ~s to satisfy the lambda list: ~a expected"
          :format-arguments (list list (%db-count-message nreq max))))
 
+(defun %check-type-store (place value type type-string)
+  "The failure arm of CHECK-TYPE: signal, and answer the value a STORE-VALUE
+   restart supplies."
+  (restart-case
+      (error 'simple-type-error
+             :datum value :expected-type type
+             :format-control "The value of ~S is ~S, which is not ~:[of type ~S~;~:*~A~]."
+             :format-arguments (list place value type-string type))
+    (store-value (v)
+      :report (lambda (s)
+                (if type-string
+                    (format s "Supply a new value of type ~A." type-string)
+                    (format s "Supply a new value of type ~S." type)))
+      :interactive (lambda () (list (eval (read))))
+      v)))
+
 (defun %db-too-many (list nreq max)
   "Signal the PROGRAM-ERROR for a destructuring LIST with elements left over
    once its lambda list, which has no &REST, &BODY or &KEY, is satisfied."
@@ -819,6 +835,15 @@
          (dotimes (i (length s) (nreverse r))
            (push (elt s i) r))))))
 
+(defun %base-string-type-p (rt)
+  (let ((name (if (consp rt) (car rt) rt)))
+    (and (symbolp name)
+         (or (member (symbol-name name) '("BASE-STRING" "SIMPLE-BASE-STRING") :test #'string=)
+             (and (string= (symbol-name name) "VECTOR") (consp rt) (consp (cdr rt))
+                  (symbolp (cadr rt))
+                  (member (symbol-name (cadr rt)) '("BASE-CHAR" "STANDARD-CHAR") :test #'string=)))
+         t)))
+
 (defun %map-rt-category (rt)
   "Return :string, :vector, :bit-vector, :list, :nil, or :unknown for a type specifier."
   (let* ((base (if (consp rt) (car rt) rt))
@@ -896,7 +921,7 @@
     (cond
       ((eq cat :nil) nil)
       ((eq cat :null) (if result (error 'type-error :datum result :expected-type 'null) nil))
-      ((eq cat :string) (coerce result 'string))
+      ((eq cat :string) (coerce result (if (%base-string-type-p result-type) 'base-string 'string)))
       ((eq cat :bit-vector)
        (when (and (consp result-type) (consp (cdr result-type)) (integerp (cadr result-type))
                   (/= (length result) (cadr result-type)))
@@ -960,8 +985,9 @@
                                    (when etype
                                      (if (eq first-etype :none)
                                          (setq first-etype etype)
-                                       (unless (equal (upgraded-array-element-type etype)
-                                                      (upgraded-array-element-type first-etype))
+                                       (unless (let ((u1 (upgraded-array-element-type etype))
+                                                     (u2 (upgraded-array-element-type first-etype)))
+                                                 (and (subtypep u1 u2) (subtypep u2 u1)))
                                          (error 'type-error :datum result-type
                                                 :expected-type 'sequence))))))))
                            (coerce result 'vector))
@@ -1067,7 +1093,7 @@
         ((eq cat :nil) nil)
         ((eq cat :null) (if result (error 'type-error :datum result :expected-type 'null) nil))
         ((eq cat :list) result)
-        ((eq cat :string) (coerce result 'string))
+        ((eq cat :string) (coerce result (if (%base-string-type-p result-type) 'base-string 'string)))
         ((eq cat :bit-vector)
          ;; Check compound size constraint: (bit-vector n)
          (when (and (consp result-type) (consp (cdr result-type)) (integerp (cadr result-type))
@@ -1164,7 +1190,11 @@ Also expands element types within compound type specifiers like (VECTOR etype si
        ;; Check size constraint: (string n)
        (when (and (consp type) (consp (cdr type)) (integerp (cadr type)) (/= length (cadr type)))
          (error 'type-error :datum length :expected-type type))
-       (make-string length :initial-element (or initial-element #\Space)))
+       (make-string length :initial-element (or initial-element #\Space)
+                           :element-type (if (member base-name '("BASE-STRING" "SIMPLE-BASE-STRING")
+                                                     :test #'string=)
+                                             'base-char
+                                             'character)))
       ;; Bit-vector types
       ((member base-name '("BIT-VECTOR" "SIMPLE-BIT-VECTOR") :test #'string=)
        ;; Check size constraint: (bit-vector n)
@@ -1310,8 +1340,9 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 ;;; Defined here (not in cil-macros.lisp) to avoid SBCL package lock.
 ;;; Calls the compiler-internal %get-setf-expansion which is defined in cil-macros.lisp.
 (defun get-setf-expansion (place &optional env)
-  (declare (ignore env))
-  (%get-setf-expansion place))
+  (let ((*get-setf-expansion-env* (list env)))
+    (declare (special *get-setf-expansion-env*))
+    (%get-setf-expansion place)))
 
 ;;; ===== Generic atomic operations on arbitrary CL places =====
 ;;;
@@ -1332,6 +1363,15 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 ;;; names need to live in DOTCL.
 (defvar *cas-lock* (%make-lock "dotcl-cas-global"))
 
+(defun %cas-special-variable-p (place)
+  "True when PLACE is a symbol naming a globally special variable, which no
+   lexical binding can shadow, so its value is the dynamic one wherever the
+   form appears. Not a constant, and not a symbol macro."
+  (and (symbolp place) place (not (eq place t))
+       (not (keywordp place))
+       (not (constantp place))
+       (global-special-p place)))
+
 (defun %cas-expand (place old new)
   ;; Returns the PRIOR value of PLACE (sb-ext / CCL / Interlocked.CompareExchange
   ;; convention), not a T/NIL success flag: success is (eql old ret), and a failed CAS
@@ -1344,6 +1384,14 @@ Also expands element types within compound type specifiers like (VECTOR etype si
   ;; left that cache -- code ported from sb-ext works up to a point and then
   ;; silently stops swapping. EQL restores the intended semantics; it costs one
   ;; type test per attempt, under a lock that already dominates it.
+  ;; A globally special variable is read and written by the runtime under the
+  ;; same lock (%CAS-SYMBOL-VALUE), so the lock is held only for the read and the
+  ;; write. Through the general expansion the lock is held while Lisp code runs,
+  ;; and interpreted, that is long enough for the threads waiting on it to queue
+  ;; up behind each other.
+  (when (%cas-special-variable-p place)
+    (return-from %cas-expand
+      `(%cas-symbol-value *cas-lock* ',place ,old ,new)))
   (multiple-value-bind (temps vals stores setter getter) (get-setf-expansion place)
     (let ((s (car stores)) (o (gensym "OLD")) (n (gensym "NEW")) (cur (gensym "CUR")))
       `(let* (,@(mapcar #'list temps vals) (,o ,old) (,n ,new))
@@ -1355,6 +1403,11 @@ Also expands element types within compound type specifiers like (VECTOR etype si
            (%release-lock *cas-lock*))))))
 
 (defun %atomic-delta-expand (place delta op)
+  ;; A globally special variable: the runtime does it under the lock, as in
+  ;; %CAS-EXPAND.
+  (when (%cas-special-variable-p place)
+    (return-from %atomic-delta-expand
+      `(%atomic-delta-symbol-value *cas-lock* ',place ,delta ,(eq op '-))))
   (multiple-value-bind (temps vals stores setter getter) (get-setf-expansion place)
     (let ((s (car stores)) (d (gensym "D")) (r (gensym "NEW")))
       `(let* (,@(mapcar #'list temps vals) (,d ,delta))
@@ -2904,3 +2957,32 @@ accepted. Elsewhere the string is read as a Unix path with no wildcard syntax:
 empty and \".\" directory components are dropped and \"..\" becomes :BACK.
 NIL gives NIL.")
       (export (list ns pns) pkg))))
+
+;;; Signalled by LOAD (from the runtime) for a fasl another dotcl compiled.
+(let ((pkg (find-package "DOTCL")))
+  (when pkg
+    (let ((name (intern "FASL-VERSION-MISMATCH" pkg))
+          (pathname-reader (intern "FASL-VERSION-MISMATCH-PATHNAME" pkg))
+          (built-by-reader (intern "FASL-VERSION-MISMATCH-BUILT-BY" pkg))
+          (load-as-is (intern "LOAD-AS-IS" pkg)))
+      (%register-class
+       (%make-class name
+                    (list (%find-or-forward-class 'simple-error))
+                    (list (%slot-def-attrs (%make-slot-def '%fasl-pathname (list :pathname) nil)
+                                           nil nil nil nil)
+                          (%slot-def-attrs (%make-slot-def '%fasl-built-by (list :built-by) nil)
+                                           nil nil nil nil))))
+      (setf (symbol-function pathname-reader)
+            (lambda (condition) (slot-value condition '%fasl-pathname)))
+      (setf (symbol-function built-by-reader)
+            (lambda (condition) (slot-value condition '%fasl-built-by)))
+      (setf (symbol-function load-as-is)
+            (lambda (&optional condition)
+              (invoke-restart (find-restart load-as-is condition))))
+      (setf (documentation name 'type)
+            "Signalled (by ERROR) when LOAD is given a fasl that another dotcl compiled.
+Restarts: LOAD-AS-IS and CONTINUE load it anyway; neither is offered when the fasl
+needs a newer DotCL.Runtime than this one, which cannot load it at all.")
+      (setf (documentation load-as-is 'function)
+            "Invoke the LOAD-AS-IS restart: load a fasl another dotcl compiled as it is.")
+      (export (list name pathname-reader built-by-reader load-as-is) pkg))))

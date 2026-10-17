@@ -195,13 +195,13 @@
     (list (%abh-count "Runtime.Backing" d) (%abh-count "Runtime.ArefNumL" d)))
   (0 2))
 
-(deftest-emitting-only array-backing-hoist.rank-2-and-float-keep-their-helpers
+(deftest-emitting-only array-backing-hoist.rank-2-hoisted-float-keeps-its-helper
   (list (let ((d (%abh-sil #'%abh-2d)))
           (list (%abh-count "Runtime.Backing" d)
                 (%abh-count "Runtime.ArefNum2DL" d)))
         (let ((d (%abh-sil #'%abh-double)))
           (list (%abh-count "Runtime.Backing" d) (%abh-count "Runtime.ArefNumD" d))))
-  ((0 1) (0 1)))
+  ((1 0) (0 1)))
 
 ;;; ---- values ----
 

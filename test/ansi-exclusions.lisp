@@ -72,3 +72,16 @@
       (format t "~&;; note: PRINT.DOUBLE-FLOAT.4 no longer matches the patched form; ~
                  leaving the upstream test as is~%")))
 (in-package :cl-user)
+
+;;; COMPILE-FILE.2 checks that a file signalling only a STYLE-WARNING returns
+;;; warnings-p true, but RT muffles every STYLE-WARNING around a test unless it
+;;; has :do-not-muffle-warnings, and a warning muffled outside COMPILE-FILE is
+;;; not counted (SBCL 2.6.8 fails it the same way). Give it that note. RT's
+;;; HAS-NOTE compares note objects, so the object goes in, not the keyword.
+(in-package :cl-test)
+(let ((entry (cadr (gethash 'compile-file.2 regression-test::*entries-table*))))
+  (when entry
+    (push (regression-test::defnote :do-not-muffle-warnings
+            "Let the test see style-warnings its forms signal.")
+          (getf (regression-test::props entry) :notes))))
+(in-package :cl-user)

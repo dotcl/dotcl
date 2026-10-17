@@ -185,6 +185,15 @@ internal static class Compat
 #endif
     }
 
+    public static long LowBits(System.Numerics.BigInteger x)
+    {
+#if NETSTANDARD2_0
+        return (long)(ulong)(x & ulong.MaxValue);
+#else
+        return long.CreateTruncating(x);
+#endif
+    }
+
     public static void Fill<T>(T[] array, T value)
     {
 #if NETSTANDARD2_0
@@ -414,6 +423,23 @@ internal static class Compat
         => GC.GetTotalAllocatedBytes(precise);
 #endif
 
+    /// <summary>The total time the GC has paused the process since it started,
+    /// or null where the runtime cannot tell. GC.GetTotalPauseDuration is
+    /// .NET 7+; a netstandard2.0 build looks it up on the runtime it runs on.</summary>
+    public static TimeSpan? GetTotalGcPauseDuration()
+#if NETSTANDARD2_0
+    {
+        try
+        {
+            var m = typeof(GC).GetMethod("GetTotalPauseDuration", Type.EmptyTypes);
+            return m?.Invoke(null, null) is TimeSpan t ? t : (TimeSpan?)null;
+        }
+        catch { return null; }
+    }
+#else
+        => GC.GetTotalPauseDuration();
+#endif
+
     public static bool TryEnsureSufficientExecutionStack()
 #if NETSTANDARD2_0
     {
@@ -488,6 +514,20 @@ internal static class Compat
     }
 #else
         => System.Numerics.BitOperations.PopCount(v);
+#endif
+
+    public static uint RotateLeft(uint v, int k)
+#if NETSTANDARD2_0
+        => (v << k) | (v >> (32 - k));
+#else
+        => System.Numerics.BitOperations.RotateLeft(v, k);
+#endif
+
+    public static ulong RotateLeft(ulong v, int k)
+#if NETSTANDARD2_0
+        => (v << k) | (v >> (64 - k));
+#else
+        => System.Numerics.BitOperations.RotateLeft(v, k);
 #endif
 
     /// <summary>GCCollectionMode.Aggressive is net5.0+; fall back to Forced on ns2.0.</summary>
@@ -611,7 +651,7 @@ internal static class Compat
         catch (Exception e) when (overwrite && IsWindows()
                                   && (e is System.IO.IOException || e is UnauthorizedAccessException)
                                   && System.IO.File.Exists(sourceFileName)
-                                  && System.IO.File.Exists(destFileName))
+                                  && MayMoveAside(destFileName))
         {
             MoveAside(destFileName);
             MoveFileOnce(sourceFileName, destFileName, false);
@@ -635,6 +675,22 @@ internal static class Compat
     /// a loaded assembly maps it. The delete fails while that process still has it
     /// loaded; such a file is removed by the next move-aside of the same name, once
     /// the process that held it has exited.</summary>
+    /// <summary>Whether a write or delete Windows refused may be done by MoveAside
+    /// instead: only for an assembly (a fasl), which a loader may be mapping, and
+    /// never for a read-only file.</summary>
+    public static bool MayMoveAside(string path)
+    {
+        try
+        {
+            if ((System.IO.File.GetAttributes(path) & System.IO.FileAttributes.ReadOnly) != 0)
+                return false;
+            using var f = new System.IO.FileStream(path, System.IO.FileMode.Open, System.IO.FileAccess.Read,
+                System.IO.FileShare.ReadWrite | System.IO.FileShare.Delete);
+            return f.ReadByte() == 'M' && f.ReadByte() == 'Z';
+        }
+        catch { return false; }
+    }
+
     public static void MoveAside(string path)
     {
         var full = System.IO.Path.GetFullPath(path);

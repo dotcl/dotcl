@@ -30,7 +30,7 @@ $ dotcl greet.lisp world twice
 
 The arguments are strings, in order, with nothing else in the list -- no program
 name, no flags belonging to dotcl itself. Outside a script (a REPL, `--eval`,
-`--load`) it is empty.
+`--load`) it is empty, unless arguments are given after `--` (below).
 
 Anything after the file name belongs to the script, dashes included, so a script
 can take `--verbose` without dotcl reading it first:
@@ -38,6 +38,17 @@ can take `--verbose` without dotcl reading it first:
 ```console
 $ dotcl build.lisp --verbose out/
 ```
+
+Without a script file, `--` ends dotcl's own options. Everything after it is
+the program's arguments, never a script to run and never an option, and
+`dotcl:script-arguments` returns it as above:
+
+```console
+$ dotcl --load server.lisp --eval '(server:main)' -- --port 8080 conn.json
+```
+
+Here `(dotcl:script-arguments)` is `("--port" "8080" "conn.json")`. After a
+script file `--` is just one of that script's arguments.
 
 `dotcl:command-line-arguments` is a different thing and is easy to reach for by
 mistake. It is shaped the way `uiop:command-line-arguments` expects to find it --

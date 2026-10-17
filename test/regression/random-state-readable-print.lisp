@@ -1,18 +1,5 @@
-;;; A RANDOM-STATE printed readably must name a symbol that HAS the function.
-;;;
-;;; (write-to-string rs :readably t) emits
-;;; #.(...MAKE-RANDOM-STATE-FROM-SEEDS a b). The constructor is a dotcl extension
-;;; living in DOTCL-INTERNAL, but it was spelled COMMON-LISP::: and that symbol
-;;; has no function.
-;;;
-;;; The compiled path worked because the compiler resolves a call by NAME through
-;;; CilAssembler, which bridges bare names across dotcl's own packages. The
-;;; tree-walk evaluator resolves the operator with SYMBOL-FUNCTION on that exact
-;;; symbol, so it died with
-;;; "Undefined function: MAKE-RANDOM-STATE-FROM-SEEDS" (ansi-test
-;;; PRINT.RANDOM-STATE.1).
-;;;
-;;; Reading the old spelling also interned a non-standard name into COMMON-LISP.
+;;; A RANDOM-STATE printed readably reads back, compiled and interpreted, and
+;;; reading it interns nothing into COMMON-LISP.
 
 (defun %rsp (mode form)
   (let ((dotcl:*evaluator-mode* mode))

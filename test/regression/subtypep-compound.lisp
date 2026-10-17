@@ -27,14 +27,14 @@
   ((t t) (t t) (t t)))
 
 ;; A numeric class is the disjoint union of its subclasses (REAL = RATIONAL +
-;; FLOAT, RATIONAL = INTEGER + RATIO, ...), so it is a subtype of a union that
+;; FLOAT + DOTCL:DECIMAL, RATIONAL = INTEGER + RATIO, ...), so it is a subtype of a union that
 ;; covers every part, and certainly not one that leaves a part out.
 (deftype stc-real* () '(or rational float))
 
 (deftest subtypep-compound.numeric-partition
   (list (%stc-sub 'stc-real* '(or ratio float (integer 0 *) integer))
         (%stc-sub 'stc-real* '(or integer ratio float))
-        (%stc-sub 'real '(or rational float))
+        (%stc-sub 'real '(or rational float dotcl:decimal))
         (%stc-sub 'rational '(or integer ratio))
         (%stc-sub 'integer '(or fixnum bignum))
         (%stc-sub 'number '(or real complex))
@@ -146,3 +146,85 @@
         (%stc-sub 'sequence '(or cons vector))
         (%stc-sub 'sequence '(or list string)))
   ((nil t) (nil t) (nil t) (nil t)))
+
+;; Array types whose element type is one arrays are made of are tried with the
+;; same objects: a bit vector is a VECTOR but neither a STRING nor a (VECTOR T).
+(deftest subtypep-compound.witness-array-element-type
+  (list (%stc-sub 'vector '(or string (vector t)))
+        (%stc-sub 'vector '(or string bit-vector (vector t)))
+        (%stc-sub '(simple-array * (*)) '(or simple-string simple-vector))
+        (%stc-sub 'array '(or string (array t)))
+        (%stc-sub '(vector t) '(or simple-vector (vector character))))
+  ((nil t) (nil t) (nil t) (nil t) (nil t)))
+
+;; A size on a string or bit vector type is kept: (BASE-STRING 17) is
+;; (VECTOR BASE-CHAR 17), (STRING 17) the strings of length 17.
+(deftest subtypep-compound.sized-string-types
+  (list (%stc-sub '(base-string 17) '(vector base-char 17))
+        (%stc-sub '(simple-base-string 17) '(simple-array base-char (17)))
+        (%stc-sub '(string 17) 'string)
+        (%stc-sub 'string '(string 17))
+        (%stc-sub '(string 17) '(or (vector character 17) (vector base-char 17) (vector nil 17)))
+        (%stc-sub '(bit-vector 3) 'bit-vector))
+  ((t t) (t t) (t t) (nil t) (t t) (t t)))
+
+;; CHARACTER is BASE-CHAR + EXTENDED-CHAR, and a string's element type is
+;; CHARACTER, BASE-CHAR or NIL: a (VECTOR NIL) is a STRING here (ANSI STRING.8)
+;; but neither a BASE-STRING nor a (VECTOR CHARACTER).
+(deftest subtypep-compound.partition-character-string
+  (list (%stc-sub 'character '(or base-char extended-char))
+        (%stc-sub 'character '(or extended-char base-char))
+        (%stc-sub 'string '(or base-string (vector character) (vector nil)))
+        (%stc-sub 'simple-string '(or simple-base-string (simple-array character (*))
+                                   (simple-array nil (*))))
+        (%stc-sub 'string '(or (vector character) (vector base-char)))
+        (%stc-sub 'string '(or simple-string (vector character)))
+        (%stc-sub 'character '(or standard-char extended-char))
+        (%stc-sub '(vector standard-char) 'base-string))
+  ((t t) (t t) (t t) (t t) (nil t) (nil t) (nil t) (t t)))
+
+;; A bare SIGNED-BYTE is every integer, not (SIGNED-BYTE 8).
+(deftest subtypep-compound.bare-signed-byte
+  (list (%stc-sub 'signed-byte '(integer -128 127))
+        (%stc-sub 'signed-byte '(integer -128 *))
+        (%stc-sub 'signed-byte '(signed-byte 8))
+        (%stc-sub '(signed-byte 8) 'signed-byte)
+        (%stc-sub 'signed-byte 'integer))
+  ((nil t) (nil t) (nil t) (t t) (t t)))
+
+;; Real ranges with float ends against a union, class by class on the real line.
+(deftest subtypep-compound.real-ranges-cover
+  (list (%stc-sub '(real 5.5 10) '(or (real 5.5 7) (real 7 10)))
+        (%stc-sub '(integer 0 10) '(or (integer 0 5) (real 5.5 10)))
+        (%stc-sub '(single-float 0.0 1.0) '(or (single-float 0.0 0.5) (single-float (0.5) 1.0)))
+        (%stc-sub 'single-float '(or (single-float (0.0)) (single-float * 0.0)))
+        (%stc-sub '(float 0.0 1.0) '(or (single-float 0.0 1.0) (double-float 0d0 1d0)))
+        (%stc-sub '(real 1 2) '(or (rational 1 2) (float 1.0 2.0) dotcl:decimal))
+        (%stc-sub '(rational 0 2) '(or (rational 0 (1)) (rational (1) 2) integer))
+        (%stc-sub '(single-float 0.0 1.0) '(or (single-float 0.0 (0.5)) (eql 0.5) (single-float (0.5) 1.0))))
+  ((t t) (t t) (t t) (t t) (t t) (t t) (t t) (t t)))
+
+(deftest subtypep-compound.real-ranges-gap
+  (list (%stc-sub '(single-float 0.0 1.0) '(or (single-float 0.0 (0.5)) (single-float (0.5) 1.0)))
+        (%stc-sub 'single-float '(or (single-float (0.0)) (single-float * (0.0))))
+        (%stc-sub '(single-float 0.0 1.0) '(or (single-float 0.0 0.4) (single-float 0.6 1.0)))
+        (%stc-sub '(integer 0 10) '(or (integer 0 4) (real 5.5 10)))
+        (%stc-sub '(rational 0 1) '(or (rational 0 1/3) (rational 1/2 1)))
+        (%stc-sub '(single-float 0.0 1.0) '(double-float 0d0 1d0)))
+  ((nil t) (nil t) (nil t) (nil t) (nil t) (nil t)))
+
+;; 0.0 and -0.0 are not EQL: a MEMBER of one of them leaves the other out.
+(deftest subtypep-compound.real-ranges-signed-zero
+  (list (%stc-sub '(single-float 0.0) '(or (single-float (0.0)) (member 0.0)))
+        (%stc-sub '(double-float 0d0) '(or (double-float (0d0)) (member -0d0)))
+        (%stc-sub '(single-float 0.0) '(or (single-float (0.0)) (member -0.0 0.0))))
+  ((nil t) (nil t) (t t)))
+
+;; A decimal is a real but neither a rational nor a float.
+(deftest subtypep-compound.real-with-decimal
+  (list (%stc-sub 'real '(or rational float))
+        (%stc-sub '(real 0 1) '(or (rational 0 1) (float 0 1)))
+        (%stc-sub 'number '(or rational float complex))
+        (%stc-sub 'dotcl:decimal '(or rational float))
+        (%stc-sub 'stc-real* '(or integer ratio float)))
+  ((nil t) (nil t) (nil t) (nil t) (t t)))

@@ -122,6 +122,8 @@
 ;; NOT duplicated -- and LDELEM-I8 is 1, so the fast copy is still a bare
 ;; element load. Testing per access instead would keep the helper out of the
 ;; SIL but cost the loop its single basic block; see the decision record.
+;; The fast copy is itself emitted twice (the loop limit checked against the
+;; buffer's length or not), so Fixnum.Make appears three times.
 (deftest-emitting-only declared-array-native-aref.walk-is-raw
   (let ((d (%dan-sil #'%dan-walk)))
     (list (%dan-count "Runtime.BackingI64" d)
@@ -129,7 +131,7 @@
           (%dan-count "Runtime.ArefNumL" d)
           (%dan-count "Runtime.ArefL" d)
           (%dan-count "Fixnum.Make" d)))
-  (1 1 1 0 2))
+  (1 1 1 0 3))
 
 (deftest-emitting-only declared-array-native-aref.unsigned-byte-is-raw
   (let ((d (%dan-sil #'%dan-u8)))
@@ -147,8 +149,9 @@
 
 (deftest-emitting-only declared-array-native-aref.rank-2-is-raw
   (let ((d (%dan-sil #'%dan-2d)))
-    (list (%dan-count "Runtime.ArefNum2DL" d) (%dan-count "Runtime.Aref2DL" d)))
-  (1 0))
+    (list (%dan-count "Runtime.BackingNDI64" d) (%dan-count "(LDELEM-I8)" d)
+          (%dan-count "Runtime.ArefNum2DL" d) (%dan-count "Runtime.Aref2DL" d)))
+  (1 1 0 0))
 
 ;; The float declaration keeps its own helper -- widening the extractor to
 ;; integer element types must not route a double array through the int64 one.

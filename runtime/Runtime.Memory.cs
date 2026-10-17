@@ -312,6 +312,17 @@ public static partial class Runtime
         // them, so clock_gettime or strlen resolve with no LOAD-FOREIGN-LIBRARY.
         if (NativeLibrary.TryGetExport(MainProgramHandle, name, out var own))
             return PointerToLisp(own);
+        // On Windows the main module exports nothing useful; kernel32 and the
+        // C runtime are separate modules, so look through every loaded one.
+        if (Compat.IsWindows())
+        {
+            using var self = System.Diagnostics.Process.GetCurrentProcess();
+            foreach (System.Diagnostics.ProcessModule m in self.Modules)
+            {
+                if (NativeLibrary.TryGetExport(m.BaseAddress, name, out var p))
+                    return PointerToLisp(p);
+            }
+        }
         return Nil.Instance;
     }
 
@@ -405,7 +416,7 @@ public static partial class Runtime
     {
         if (et == "SINGLE-FLOAT") return 4;
         if (et == "DOUBLE-FLOAT") return 8;
-        int bits = 0;
+        int bits = et == "FIXNUM" ? 64 : 0;
         if (et.StartsWith("UNSIGNED-BYTE-", StringComparison.Ordinal))
             int.TryParse(et.Substring("UNSIGNED-BYTE-".Length), out bits);
         else if (et.StartsWith("SIGNED-BYTE-", StringComparison.Ordinal))

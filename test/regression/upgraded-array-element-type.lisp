@@ -49,7 +49,7 @@
 
 (deftest uaet-mod
   (upgraded-array-element-type '(mod 5))
-  (unsigned-byte 3))
+  (unsigned-byte 4))
 
 ;;; Types dotcl does not specialize upgrade to T, and that answer must be a
 ;;; supertype of the argument.

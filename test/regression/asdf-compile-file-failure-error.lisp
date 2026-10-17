@@ -10,7 +10,7 @@
 ;;; asdf:*central-registry*. asdf symbols are reached via read-from-string so
 ;;; loading this file does not require asdf up front.
 
-(defun %cffe-load (name body)
+(defun %cffe-load (name body &optional depends-on)
   "Write system NAME with one file holding BODY, load it with ASDF, and return
 :LOADED, or the name of the condition type that stopped the load."
   (require "asdf")
@@ -20,7 +20,8 @@
          (src (concatenate 'string dir name ".lisp")))
     (ensure-directories-exist dir)
     (with-open-file (s asd :direction :output :if-exists :supersede)
-      (format s "(defsystem ~s :components ((:file ~s)))" name name))
+      (format s "(defsystem ~s :depends-on ~s :components ((:file ~s)))"
+              name depends-on name))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (write-string body s))
     (eval (read-from-string
@@ -87,3 +88,39 @@
             (setf (symbol-value reg)
                   (remove dir (symbol-value reg) :test #'equal)))))
     :loaded))
+
+;;; A system that depends on "asdf" or "uiop" (asdf-nuget does) made ASDF load
+;;; that system from an asdf.asd / uiop.asd in the registry: COMPILE-FILE failed,
+;;; or, when the fasls were already in the output cache from a build with a
+;;; compiler, ASDF reloaded itself from them and dropped the emit-free hooks, so
+;;; every later LOAD-SYSTEM failed. The running ASDF and UIOP are kept instead.
+(unless (find :dotcl-emit *features*)
+  (deftest asdf-emit-free-keeps-running-asdf-and-uiop
+      (let ((dir (format nil "~a/dotcl-cffe-fake-asdf-uiop-~a/"
+                         (regression-temp-dir) (get-internal-real-time))))
+        (require "asdf")
+        (ensure-directories-exist dir)
+        (flet ((put (file text)
+                 (with-open-file (s (concatenate 'string dir file)
+                                    :direction :output :if-exists :supersede)
+                   (write-string text s))))
+          (put "asdf.asd" "(defsystem \"asdf\" :version \"999\"
+                             :components ((:file \"fake-asdf\")))")
+          (put "version.lisp-expr" "\"999\"")
+          (put "fake-asdf.lisp" "(error \"fake asdf loaded\")")
+          (put "uiop.asd" "(defsystem \"uiop\" :version \"999\"
+                             :components ((:file \"fake-uiop\")))")
+          ;; ASDF reads UIOP's version as the third element of the third
+          ;; element of the third form, as laid out in uiop/version.lisp.
+          (put "version.lisp" "(progn) (progn) (progn () (defparameter v \"999\"))")
+          (put "fake-uiop.lisp" "(error \"fake uiop loaded\")"))
+        (let ((reg (find-symbol "*CENTRAL-REGISTRY*" "ASDF")))
+          (push dir (symbol-value reg))
+          (unwind-protect
+               (list (%cffe-load "cffe-dep-asdf" "(defun cffe-dep-asdf-fn () 1)"
+                                 '("asdf"))
+                     (%cffe-load "cffe-dep-uiop" "(defun cffe-dep-uiop-fn () 1)"
+                                 '("uiop")))
+            (setf (symbol-value reg)
+                  (remove dir (symbol-value reg) :test #'equal)))))
+    (:loaded :loaded)))

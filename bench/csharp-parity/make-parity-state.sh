@@ -48,11 +48,11 @@ done
 # floor in every process.
 #
 # The per-process values are also checked for falling into two groups
-# (bench/modes.awk). That happens without any noise at all: the same binary
+# (bench/gate/modes.awk). That happens without any noise at all: the same binary
 # can land a hot loop on either side of an alignment boundary depending on the
 # process, and then every process is either fast or slow. The minimum is then
 # the fast group's floor only if at least one process drew the fast group, so
-# the split is recorded next to it for bench/check-ratios.sh to report:
+# the split is recorded next to it for bench/gate/check-ratios.sh to report:
 #
 #     "dotcl_split": {"fast_n": 3, "fast_ms": 39.453, "slow_n": 4, "slow_ms": 57.608}
 #
@@ -82,7 +82,7 @@ read_pairs() {
         }' "$1"
 }
 
-modes_awk="$(cd "$(dirname "$0")/.." && pwd)/modes.awk"
+modes_awk="$(cd "$(dirname "$0")/../gate" && pwd)/modes.awk"
 
 csharp_pairs=$(read_pairs "$csharp_file")
 dotcl_pairs=$(read_pairs "$dotcl_file")

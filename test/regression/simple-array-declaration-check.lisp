@@ -203,8 +203,7 @@
    ((:value 3) (:value 3))
    ((:value 3) (:value 3))))
 
-;;; --- not this check's business: a value that is not an array at all is left
-;;; to the operations that use it, as every other declaration is.
+;;; A value that is not an array at all fails the whole declaration on entry.
 (deftest simple-array-declaration-check.non-array-unchanged
   (%sdc-both '(lambda (v) (declare (simple-vector v)) (if (numberp v) :number (length v))) 7)
-  ((:value :number) (:value :number)))
+  (:type-error :type-error))

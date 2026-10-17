@@ -75,11 +75,10 @@
   (progn
     (%dlm-float-sum 1000)
     (%dlm-sin-sum 1000 0.5d0)
-    (let ((a0 (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread")))
-      (%dlm-float-sum 100000)
-      (%dlm-sin-sum 100000 0.5d0)
-      (< (- (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread") a0)
-         10000)))
+    (< (min-allocated-bytes (lambda ()
+                              (%dlm-float-sum 100000)
+                              (%dlm-sin-sum 100000 0.5d0)))
+       10000))
   t)
 
 (deftest double-lane-math.values

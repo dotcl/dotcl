@@ -60,16 +60,35 @@
   (%u64i-check 2000)
   nil)
 
-;; Declarations that do not hold give the answers of the calls one by one.
-(deftest u64-inline-lane.declarations-broken
-  (list (%u64i-add (%u64i-mul -1 3) 1)
-        (%u64i-add (%u64i-ror (expt 2 70) 3) 0)
-        (%u64i-g -5 (expt 2 80) 7)
-        (handler-case (%u64i-add (%u64i-mul 1.5d0 2) 1) (type-error () :type-error)))
+;; An argument outside (unsigned-byte 64) signals a TYPE-ERROR from (safety 1)
+;; up, also when it comes from a variable. Under (safety 0) the declarations are
+;; trusted and the calls compute as if they were not there.
+(defvar *u64i-2^70* (expt 2 70))
+(defvar *u64i--1* -1)
+(defvar *u64i-2^64* (expt 2 64))
+(defmacro %u64i-te (form) `(handler-case ,form (type-error () :type-error)))
+(defun %u64i-broken-safe ()
+  (list (%u64i-te (%u64i-add (%u64i-mul *u64i--1* 3) 1))
+        (%u64i-te (%u64i-add (%u64i-ror *u64i-2^70* 3) 0))
+        (%u64i-te (%u64i-add *u64i-2^64* 0))
+        (%u64i-te (%u64i-g -5 *u64i-2^70* 7))
+        (%u64i-te (%u64i-add (%u64i-mul -1 3) 1))
+        (%u64i-te (%u64i-add (%u64i-mul 1.5d0 2) 1))
+        (%u64i-te (%u64i-add (%u64i-mul *u64i-2^64* 0) 0))))
+(defun %u64i-broken-unsafe ()
+  (declare (optimize (safety 0)))
+  (list (%u64i-add (%u64i-mul *u64i--1* 3) 1)
+        (%u64i-add (%u64i-ror *u64i-2^70* 3) 0)
+        (%u64i-add -5 (%u64i-add *u64i-2^70* 7))))
+;; The emit-free interpreter does not check declared parameter types.
+(deftest-emitting-only u64-inline-lane.declarations-broken
+  (%u64i-broken-safe)
+  (:type-error :type-error :type-error :type-error :type-error :type-error :type-error))
+(deftest-emitting-only u64-inline-lane.declarations-broken-safety-0
+  (%u64i-broken-unsafe)
   (18446744073709551614
    #.(mod (logior (ash (expt 2 70) 61) (ash (expt 2 70) -3)) (expt 2 64))
-   #.(%u64r-g -5 (expt 2 80) 7)
-   :type-error))
+   2))
 
 ;; Arguments are evaluated once each, left to right.
 (deftest u64-inline-lane.argument-order

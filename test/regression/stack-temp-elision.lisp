@@ -56,13 +56,20 @@
         (progn
           (with-open-file (s src :direction :output :if-exists :supersede)
             (format s "(in-package ~s)~%" (package-name *package*))
-            ;; Eight additions of two plain variables: each expansion binds A
-            ;; and B to copies of them, read in order.
+            ;; 511 additions in a balanced tree over the four parameters: each
+            ;; expansion binds A and B to copies of its operands, read in
+            ;; order. The pass only runs on a body with thousands of local
+            ;; references, the size where the JIT's limit comes near.
             (format s "(defun ste-file-sum (a0 a1 a2 a3)
                          (declare (type (unsigned-byte 32) a0 a1 a2 a3)
                                   (optimize speed (safety 0)))
-                         (%ste-add (%ste-add (%ste-add a0 a1) (%ste-add a2 a3))
-                                   (%ste-add (%ste-add a1 a2) (%ste-add a3 a0))))~%"))
+                         ~s)~%"
+                    (let ((leaf -1))
+                      (labels ((tree (depth)
+                                 (if (zerop depth)
+                                     (nth (mod (incf leaf) 4) '(a0 a1 a2 a3))
+                                     (list '%ste-add (tree (1- depth)) (tree (1- depth))))))
+                        (tree 9)))))
           (compile-file src :output-file fasl)
           (load fasl)
           (let ((flags (dotnet:static "System.Enum" "ToObject"
@@ -78,10 +85,12 @@
                         (when body
                           (setf most (max most (dotnet:invoke (dotnet:invoke body "LocalVariables")
                                                               "Count"))))))))))
-            ;; The four parameters' slots and a few temporaries; the 12 copies of
-            ;; the inlined parameters are gone.
+            ;; The body declares 1,027 locals; the 1,022 copies of the inlined
+            ;; parameters are gone, and what is left (under 100, too few to be
+            ;; worth sharing slots) is the parameters and the other temporaries.
+            ;; 128 of each parameter: 1280.
             (list (funcall 'ste-file-sum 1 2 3 4)
-                  (< most 10))))
+                  (< most 100))))
       (ignore-errors (delete-file src))
       (ignore-errors (delete-file fasl))))
-  (20 t))
+  (1280 t))

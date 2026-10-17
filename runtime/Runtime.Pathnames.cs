@@ -16,11 +16,17 @@ public static partial class Runtime
         static LispObject? ToComponent(LispObject val)
         {
             if (val is Nil) return null;
-            // Keep Symbol (e.g. :WILD, :NEWEST, :UNSPECIFIC) as-is
-            if (val is Symbol) return val;
-            // Keep LispString as-is
-            if (val is LispString) return val;
+            if (val is LispVector v && v.IsCharVector && v.Rank == 1) return new LispString(v.ToCharString());
             return val;
+        }
+
+        static LispObject DirectoryComponents(LispObject dir)
+        {
+            if (dir is not Cons) return dir;
+            var items = new List<LispObject>();
+            for (var c = dir; c is Cons cell; c = cell.Cdr)
+                items.Add(ToComponent(cell.Car) ?? Nil.Instance);
+            return Runtime.List(items.ToArray());
         }
 
         for (int j = 0; j < args.Length - 1; j += 2)
@@ -51,13 +57,14 @@ public static partial class Runtime
                     // CLHS 19.2.2.4.3: a string is (:ABSOLUTE string).
                     else if (dirVal is LispString
                              || (dirVal is LispVector dirVec && dirVec.IsCharVector && dirVec.Rank == 1))
-                        directory = Runtime.List(Startup.Keyword("ABSOLUTE"), dirVal);
-                    else directory = dirVal;
+                        directory = Runtime.List(Startup.Keyword("ABSOLUTE"), ToComponent(dirVal)!);
+                    else directory = DirectoryComponents(dirVal);
                     break;
                 case "DEFAULTS":
                     var dval = args[j + 1];
                     if (dval is LispPathname dp) defaults = dp;
                     else if (dval is LispString dstr) defaults = FromNamestring(dstr.Value);
+                    else if (dval is LispVector dvec && dvec.IsCharVector && dvec.Rank == 1) defaults = FromNamestring(dvec.ToCharString());
                     break;
             }
         }
@@ -589,7 +596,7 @@ public static partial class Runtime
         // LOAD-LOGICAL-PATHNAME-TRANSLATIONS
         Emitter.CilAssembler.RegisterFunction("LOAD-LOGICAL-PATHNAME-TRANSLATIONS", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("LOAD-LOGICAL-PATHNAME-TRANSLATIONS: expected 1 argument"));
-            var hostName = args[0] is LispString ls ? ls.Value : args[0] is Symbol s ? s.Name : args[0].ToString();
+            var hostName = Runtime.StringValueOrNull(args[0]) ?? (args[0] is Symbol s ? s.Name : args[0].ToString());
             if (Runtime._logicalPathnameTranslations.ContainsKey(hostName.ToUpperInvariant()))
                 return Nil.Instance;
             throw new LispErrorException(new LispError($"Cannot find logical pathname translations for host \"{hostName}\""));

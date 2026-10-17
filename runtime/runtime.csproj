@@ -34,6 +34,8 @@
          the matching setting so the referenced library's pdb is dropped too. -->
     <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
     <DebugSymbols Condition="'$(Configuration)' == 'Release'">false</DebugSymbols>
+    <!-- To step through the C# in a debugger, build with -p:Optimize=false. -->
+    <Optimize Condition="'$(Configuration)' == 'Debug'">true</Optimize>
   </PropertyGroup>
 
   <!-- dotcl-app packaging hook: pack this apphost as another app's tool nupkg (e.g.

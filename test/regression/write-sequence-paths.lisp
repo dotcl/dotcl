@@ -65,11 +65,8 @@
   :type-error)
 
 ;;; An octet vector going to a binary file stream is written with one bulk
-;;; Stream.Write. The per-element path flushed the file after every byte, so
-;;; writing a 33 MB core image this way cost one write syscall per byte.
-;;; These pin that the bulk path keeps :start/:end, fill pointers, the order
-;;; against WRITE-BYTE, and that the bytes are visible to another handle as
-;;; soon as WRITE-SEQUENCE returns (as they were with the per-byte flush).
+;;; Stream.Write, left in the stream's buffer like WRITE-BYTE until
+;;; FINISH-OUTPUT, CLOSE or FILE-LENGTH.
 
 (defun wsp-read-octets (path)
   (with-open-file (s path :element-type '(unsigned-byte 8))
@@ -99,15 +96,17 @@
     (wsp-read-octets path))
   (10 20 30))
 
-(deftest write-sequence.octets-visible-before-close
+(deftest write-sequence.octets-buffered-until-finish-output
   (let ((path (regression-temp-file "write-sequence-octets-open.bin"))
         (v (make-array 4 :element-type '(unsigned-byte 8)
                          :initial-contents '(7 6 5 4))))
     (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
                             :if-exists :supersede)
       (write-sequence v s)
-      (list (wsp-read-octets path) (file-length s) (file-position s))))
-  ((7 6 5 4) 4 4))
+      (let ((before (wsp-read-octets path)))
+        (finish-output s)
+        (list before (wsp-read-octets path) (file-length s) (file-position s)))))
+  (nil (7 6 5 4) 4 4))
 
 (deftest write-sequence.octets-displaced
   (let* ((path (regression-temp-file "write-sequence-octets-disp.bin"))

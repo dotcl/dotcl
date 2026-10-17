@@ -53,6 +53,9 @@
 #                                  than the published one (see dists.sh)
 #   LIBRARY_STATUS_CONFIG          Release (default) or Debug: which build of
 #                                  the runtime measures (see runtime.sh)
+#   LIBRARY_STATUS_LISP=sbcl       run on SBCL (see runtime.sh); the input and
+#                                  output default to results-sbcl.json and
+#                                  tests-sbcl.json
 #
 #        run-tests.sh --judge LOG...
 #                                  judge logs already written (by this script,
@@ -68,10 +71,7 @@ root="${1:-.}"
 . "$(dirname "$0")/scrub.sh"
 . "$(dirname "$0")/dists.sh"
 here="$root/bench/library-status"
-results="${LIBRARY_STATUS_JSON:-$here/results.json}"
 targets="$here/targets.txt"
-out="${LIBRARY_STATUS_TESTS_JSON:-$here/tests.json}"
-logdir="${LIBRARY_STATUS_LOGDIR:-$root/out/library-status-tests}"
 per="${LIBRARY_STATUS_TEST_TIMEOUT:-900}"
 limit="${LIMIT:-0}"
 resume="${LIBRARY_STATUS_RESUME:-0}"
@@ -281,14 +281,18 @@ judge() {
     /^[[:space:]]*Running test [^ ]+ [.fXs]*[[:space:]]*$/ {
       s = $NF; if (s !~ /^[.fXs]+$/) next
       fp_seen = 1; fp_pass += gsub(/\./, "", s); fp_fail += gsub(/[fX]/, "", s); next }
+    # trivial-package-local-nicknames: ";; N tests run, F failures."
+    /^;; [0-9]+ tests? run, [0-9]+ failures?\.$/ { fw["tpln"]=1; pass += $2 - $5; fail += $5; next }
     # What the driver printed from the result a framework keeps (LIFT,
     # clunit): "LIBTEST-LAST-RESULT FRAMEWORK PASSED FAILED". Used at END
     # only when the output had no summary of that framework.
     /^LIBTEST-LAST-RESULT [a-z0-9]+ [0-9]+ [0-9]+$/ {
       lr_seen[$2] = 1; lr_pass[$2] += $3; lr_fail[$2] += $4; next }
-    # Nothing to run (see the driver), or hu.dwim.asdf naming a test system
+    # Nothing to run (see the driver): TEST-OP does nothing, or names a test
+    # system that is not in the release; or hu.dwim.asdf naming a test system
     # that does not exist.
     /^LIBTEST-NO-TEST-OP/ { notests = 1; next }
+    /^LIBTEST-MISSING-TEST-SYSTEM / { notests = 1; next }
     /^WARNING: No tests were run; system: / { notests = 1; next }
     /^LIBTEST-ERROR/ { err = 1 }
     /^; Debugger entered on/ { err = 1 }
@@ -326,10 +330,17 @@ if [ "$mode" = judge ]; then
   exit 0
 fi
 
+# Absolute: the Lisp runs in a directory of its own (below).
+root=$(cd "$root" && pwd)
+
 # The Release build by default, and refused when older than the sources: see
 # runtime.sh.
 . "$(dirname "$0")/runtime.sh"
 select_runtime run-tests
+sfx=""; [ "$lisp" = sbcl ] && sfx="-$lisp"
+results="${LIBRARY_STATUS_JSON:-$here/results$sfx.json}"
+out="${LIBRARY_STATUS_TESTS_JSON:-$here/tests$sfx.json}"
+logdir="${LIBRARY_STATUS_LOGDIR:-$root/out/library-status-tests$sfx}"
 # GNU timeout bounds each run. macOS has none by default; Homebrew coreutils
 # installs it as gtimeout. Without either, every run would fail with 127 and
 # be recorded as a library failure, so stop here instead.
@@ -342,6 +353,7 @@ check_dists run-tests
 checked=$(date +%Y-%m-%d)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+write_launcher "$work"
 mkdir -p "$logdir"
 
 jstr() {
@@ -399,26 +411,47 @@ for sys in $(cat "$work/list"); do
   # because with stdin closed the debugger returns rather than stopping and the
   # forms after it would still run.
   cat > "$work/drv.lisp" <<DRVEOF
-(require "quicklisp")
+$(driver_prelude)
 (format t "~&LIBTEST-DISTS ~{~a~^ ~}~%"
         (mapcar (lambda (d) (format nil "~a=~a" (ql-dist:name d) (ql-dist:version d)))
                 (ql-dist:enabled-dists)))
 (defun libtest-die (tag e code)
   (format t "~%~a ~a~%" tag e)
   (finish-output)
-  (dotcl:quit code))
+  (libstatus-quit code))
 (handler-case (ql:quickload "$sys")
   (error (e) (libtest-die "LIBTEST-LOAD-FAIL" e 3)))
+;; A test system whose .asd is in the release but not in the Quicklisp index
+;; (a system that did not build when the dist was made is left out).
+(defun libtest-local-system (name near)
+  (let* ((dir (asdf:system-source-directory near))
+         (file (and dir
+                    (first (directory
+                            (merge-pathnames
+                             (make-pathname :directory '(:relative :wild-inferiors)
+                                            :name name :type "asd")
+                             dir))))))
+    (when file
+      (asdf:load-asd file)
+      (asdf:find-system name nil))))
+;; Test systems TEST-OP needs that are not in any dist nor the release.
+(defvar *libtest-missing* '())
 ;; The systems TEST-OP on SYS depends on, usually one "SYS/test". Quicklisp
 ;; fetches a missing dependency only through QUICKLOAD, so load them that way
-;; before ASDF gets to them.
+;; before ASDF gets to them. A dependency can be a symbol in any package.
 (defun libtest-test-systems (name)
   (let ((system (asdf:find-system name)) (names '()))
     (dolist (dep (asdf:component-depends-on (asdf:make-operation 'asdf:test-op) system))
       (dolist (c (cdr dep))
-        (let ((s (ignore-errors (asdf:find-system c nil))))
-          (when (and s (not (eq s system)))
-            (pushnew (asdf:component-name s) names :test #'string=)))))
+        (let* ((n (and (or (stringp c) (and (symbolp c) c)) (asdf:coerce-name c)))
+               (s (ignore-errors (asdf:find-system c nil))))
+          (cond ((eq s system))
+                (s (pushnew (asdf:component-name s) names :test #'string=))
+                ((null n))
+                ((ql-dist:find-system n) (pushnew n names :test #'string=))
+                ((setf s (ignore-errors (libtest-local-system n system)))
+                 (pushnew (asdf:component-name s) names :test #'string=))
+                (t (pushnew n *libtest-missing* :test #'string=))))))
     (nreverse names)))
 ;; A test system's own files are loaded after LIBTEST-BEGIN, not here: many
 ;; test systems run their suite while loading (a RUN! at top level), and the
@@ -434,8 +467,12 @@ for sys in $(cat "$work/list"); do
    (let ((system (asdf:find-system name nil)))
      (when system
        (dolist (dep (asdf:system-depends-on system) t)
-         (let ((d (ignore-errors (asdf/find-component:resolve-dependency-spec system dep))))
-           (when d (ql:quickload (asdf:component-name d)))))))))
+         (let ((d (ignore-errors (asdf/find-component:resolve-dependency-spec system dep)))
+               (n (and (or (stringp dep) (and (symbolp dep) dep)) (asdf:coerce-name dep))))
+           (cond (d (ql:quickload (asdf:component-name d)))
+                 ((null n))
+                 ((ql-dist:find-system n) (ql:quickload n))
+                 ((ignore-errors (libtest-local-system n system)) (ql:quickload n)))))))))
 ;; Each entry is (NAME . REQUIRED): a test system TEST-OP depends on is
 ;; required, a guessed one (below) is not.
 (defvar *libtest-deferred* '())
@@ -459,7 +496,7 @@ remember it to load after LIBTEST-BEGIN."
 ;; know about, so their dependencies are on disk when that happens. These are
 ;; guesses, so a failure here is only noted: if the TEST-OP really needs the
 ;; system, the run fails on its own.
-(dolist (name '("$sys/test" "$sys/tests" "$sys-test" "$sys-tests"))
+(dolist (name '("$sys/test" "$sys/tests" "$sys-test" "$sys-tests" "$sys.test" "$sys.tests"))
   (when (ql-dist:find-system name)
     (handler-case (progn (libtest-prepare name nil)
                          (format t "~&LIBTEST-EXTRA-SYSTEM ~a~%" name))
@@ -468,31 +505,46 @@ remember it to load after LIBTEST-BEGIN."
 ;; start of a line, and a FRESH-LINE that misjudges the column (after PRINT, on
 ;; some streams) would glue it to the test output and lose the result.
 (format t "~%LIBTEST-BEGIN~%")
+;; Suites open files relative to the library's directory (drakma's README.md).
+(let ((dir (ignore-errors (asdf:system-source-directory "$sys"))))
+  (when dir (setf *default-pathname-defaults* dir)))
 (loop for (name . required) in *libtest-deferred*
       do (handler-case (ql:quickload name)
            (error (e)
              (if required
                  (libtest-die "LIBTEST-LOAD-FAIL" e 3)
                  (format t "~&LIBTEST-NOTE ~a did not load: ~a~%" name e)))))
-;; A TEST-OP with nothing to do: no test system among its dependencies and
-;; no PERFORM method of the library's own, only ASDF's empty default one.
+(when *libtest-missing*
+  (format t "~%LIBTEST-MISSING-TEST-SYSTEM ~{~a~^ ~}~%LIBTEST-END~%" *libtest-missing*)
+  (libstatus-quit 0))
+;; A TEST-OP with nothing to do: no PERFORM method of the library's own (only
+;; ASDF's empty default, and :AROUND methods such as the one LIFT adds for
+;; every system), and the same for every test system it depends on.
 ;; Marked so the judge can tell "defines no tests" from "ran, but printed
 ;; nothing a recogniser knows". Printed after LIBTEST-BEGIN, since the judge
 ;; reads nothing before it.
-(let* ((system (asdf:find-system "$sys"))
-       (specs (find-symbol "METHOD-SPECIALIZERS" "DOTCL-MOP"))
-       (op-class (find-class 'asdf:test-op))
-       (own (remove-if-not
-             (lambda (m)
-               (destructuring-bind (o c &rest r) (funcall specs m)
-                 (declare (ignore r))
-                 (and (or (not (typep o 'class)) (subtypep o op-class))
-                      (not (and (eq o op-class)
-                                (eq c (find-class 'asdf:component)))))))
-             (compute-applicable-methods
-              #'asdf:perform (list (asdf:make-operation 'asdf:test-op) system)))))
-  (when (and specs (null own) (null (libtest-test-systems "$sys")))
-    (format t "~%LIBTEST-NO-TEST-OP~%")))
+(defun libtest-performs-nothing-p (name &optional seen)
+  (let* ((system (asdf:find-system name))
+         (mop (or (find-package "DOTCL-MOP") (find-package "SB-MOP")))
+         (specs (and mop (find-symbol "METHOD-SPECIALIZERS" mop)))
+         (op-class (find-class 'asdf:test-op)))
+    (and specs
+         (notany
+          (lambda (m)
+            (destructuring-bind (o c &rest r) (funcall specs m)
+              (declare (ignore r))
+              (and (null (method-qualifiers m))
+                   (or (not (typep o 'class)) (subtypep o op-class))
+                   (not (and (eq o op-class)
+                             (eq c (find-class 'asdf:component)))))))
+          (compute-applicable-methods
+           #'asdf:perform (list (asdf:make-operation 'asdf:test-op) system)))
+         (every (lambda (n)
+                  (or (member n seen :test #'string=)
+                      (libtest-performs-nothing-p n (cons name seen))))
+                (libtest-test-systems name)))))
+(when (libtest-performs-nothing-p "$sys")
+  (format t "~%LIBTEST-NO-TEST-OP~%"))
 (finish-output)
 ;; An error nothing handles ends the run through the debugger hook rather
 ;; than a HANDLER-CASE around the call: a handler here would take every error
@@ -501,10 +553,49 @@ remember it to load after LIBTEST-BEGIN."
 ;; expects its hook to see it) could never pass.
 (format t "~%LIBTEST-TEST-OP~%")
 (finish-output)
-(let ((*debugger-hook* (lambda (c hook)
-                         (declare (ignore hook))
-                         (libtest-die "LIBTEST-ERROR" c 2))))
-  (asdf:test-system "$sys"))
+;; LIFT config files (lift-standard.config): report files are not written, only
+;; a report to a stream (the summary the judge reads), and a report :NAME with
+;; a directory, which older config files have and the current LIFT refuses
+;; after the suites ran, is taken as it is.
+(when (find-package "LIFT")
+  (eval (read-from-string "
+    (progn
+      (defmethod lift::handle-config-preference :around ((name (eql :report-property)) args)
+        (setf (lift::test-result-property lift::*test-result* (lift::form-keyword (first args)))
+              (second args)))
+      (defmethod lift::handle-config-preference :around ((name (eql :build-report)) args)
+        (when (streamp (lift::test-result-property lift::*test-result* :full-pathname))
+          (call-next-method))))")))
+;; Parachute's QUIET report prints nothing; print its counts the way the
+;; LIBTEST-LAST-RESULT lines below do.
+(when (find-package "PARACHUTE")
+  (eval (read-from-string "
+    (defmethod parachute:summarize :after ((report parachute:quiet))
+      (flet ((n (status)
+               (count-if-not (lambda (r) (typep r 'parachute::test-result))
+                             (parachute:results-with-status status report))))
+        (format t \"~%LIBTEST-LAST-RESULT parachute ~d ~d~%\" (n :passed) (n :failed))))")))
+(defun libtest-error-hook (c hook)
+  (declare (ignore hook))
+  (libtest-die "LIBTEST-ERROR" c 2))
+;; A PERFORM that calls OPERATE on its test system with :FORCE (cl-difflib,
+;; getopt, routes) is refused by ASDF inside the session TEST-SYSTEM opened.
+;; Then run TEST-SYSTEM on the test systems loaded above instead.
+(when (catch 'libtest-nested-force
+        (libstatus-with-debugger-hook
+            (lambda (c hook)
+              (when (and (typep c 'uiop:parameter-error)
+                         (search "arguments not allowed in a nested call"
+                                 (princ-to-string c)))
+                (throw 'libtest-nested-force t))
+              (libtest-error-hook c hook))
+          (asdf:test-system "$sys"))
+        nil)
+  (let ((names (remove "$sys" (mapcar #'car *libtest-deferred*) :test #'string=)))
+    (format t "~%LIBTEST-NOTE nested OPERATE with :FORCE, running TEST-SYSTEM on~{ ~a~}~%" names)
+    (unless names (libtest-die "LIBTEST-ERROR" "nested OPERATE with :FORCE" 2))
+    (libstatus-with-debugger-hook #'libtest-error-hook
+      (dolist (name names) (asdf:test-system name)))))
 ;; stefil keeps the result of the last suite run in *LAST-TEST-RESULT*. A test
 ;; op that does not print it leaves only progress characters, so print it here.
 (dolist (p '("HU.DWIM.STEFIL" "STEFIL"))
@@ -539,18 +630,21 @@ remember it to load after LIBTEST-BEGIN."
                     (slot-value r (sym "ERRORS" p)))))))))
 (format t "~%LIBTEST-END~%")
 (finish-output)
-(dotcl:quit 0)
+(libstatus-quit 0)
 DRVEOF
 
   # A slash in a system name ("foo/test") is not a directory here.
   log="$logdir/$(printf '%s' "$sys" | tr / _).txt"
-  t0=$(date +%s)
+  t0=$(now_seconds)
   set +e
-  "$timeout" "$per" "$exe" --core "$core" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
+  # In an empty directory, so what a suite writes there stays out of the
+  # checkout.
+  rm -rf "$work/cwd"; mkdir "$work/cwd"
+  (cd "$work/cwd" && "$timeout" "$per" "$work/lisp" "$work/drv.lisp") > "$log" 2>&1 < /dev/null
   code=$?
   set -e
-  t1=$(date +%s)
-  elapsed=$((t1 - t0))
+  t1=$(now_seconds)
+  elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')
 
   if [ "$code" -eq 124 ]; then
     set -- timeout - 0 0
@@ -565,16 +659,17 @@ DRVEOF
     if [ "$code" -ne 0 ] && [ "$1" = "pass" ]; then set -- error "$2" "$3" "$4"; fi
     note=$(sed -n 's/^LIBTEST-ERROR //p' "$log" | head -1)
     [ -n "$note" ] || note=$(sed -n 's/^; Debugger entered on //p' "$log" | head -1)
+    [ -n "$note" ] || note=$(sed -n 's/^LIBTEST-MISSING-TEST-SYSTEM \(.*\)/test system not in the release: \1/p' "$log" | head -1)
   fi
   verdict=$1; framework=$2; passed=$3; failed=$4
   tsys=$(sed -n 's/^LIBTEST-TEST-SYSTEMS *//p; s/^LIBTEST-EXTRA-SYSTEM //p' "$log" | tr '\n' ' ')
 
-  printf '  {"system": "%s", "checked": "%s", "verdict": "%s", "framework": "%s", "passed": %d, "failed": %d, "test-systems": "%s", "note": "%s", "dists": "%s", "runtime": "%s", "seconds": %d}\n' \
+  printf '  {"system": "%s", "checked": "%s", "verdict": "%s", "framework": "%s", "passed": %d, "failed": %d, "test-systems": "%s", "note": "%s", "dists": "%s", "runtime": "%s", "seconds": %s}\n' \
     "$sys" "$checked" "$verdict" "$framework" "$passed" "$failed" "$(jstr "$tsys")" "$(jstr "${note:-}")" "$dists_desc" "$runtime_desc" "$elapsed" >> "$work/entries"
   write_json
   ran=$((ran + 1))
 
-  printf '%3d %-28s %-9s %-10s %5d pass %4d fail %4ds %s\n' \
+  printf '%3d %-28s %-9s %-10s %5d pass %4d fail %6ss %s\n' \
     "$ran" "$sys" "$verdict" "$framework" "$passed" "$failed" "$elapsed" "$(jstr "${note:-}")"
 done
 

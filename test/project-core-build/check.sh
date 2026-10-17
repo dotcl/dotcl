@@ -18,14 +18,17 @@
 # packaging rather than the targets. The paths are the ones the targets compute
 # from MSBuildThisFileDirectory, so a change to that layout breaks this too.
 #
-# Four cases. The first two go together, and the second is the one worth
+# Six cases. The first two go together, and the second is the one worth
 # having. A build that fails must say what to do next: a dependency that cannot
 # be found is the first wall a new user hits, and the remedy (DotclAsdSearchPath)
 # is a build property they have no reason to know about. [2b] rebuilds that
 # project unchanged and then edited: only the edit recompiles the root. The third publishes
 # trimmed and runs the result: the .NET types the Lisp sources name have to
 # survive the trimmer without the project listing them by hand. The fourth
-# depends on a contrib stub (dotcl-thread) and runs the result.
+# depends on a contrib stub (dotcl-thread) and runs the result. The fifth
+# publishes that with PublishReadyToRun: the fasls must ship as native code.
+# The sixth publishes through DotCL.Runtime.targets, which copies the whole
+# contrib tree: only the modules the manifest requires may be published.
 #
 # Usage: check.sh <repo-root>
 set -eu
@@ -62,7 +65,8 @@ dotnet build "$(win "$ROOT/runtime/DotCL.Runtime.csproj")" -c Release -f net10.0
 
 PKG="$WORK/pkg"
 mkdir -p "$PKG/build" "$PKG/tasks" "$PKG/lib/net10.0" "$PKG/dotclassets"
-cp "$ROOT/runtime/build/DotCL.Runtime.ProjectCore.targets" "$PKG/build/"
+cp "$ROOT/runtime/build/DotCL.Runtime.ProjectCore.targets" "$ROOT/runtime/build/DotCL.Runtime.targets" \
+   "$ROOT/runtime/build/DotCL.Runtime.props" "$PKG/build/"
 cp "$ROOT/runtime/build-tasks/bin/Release/net10.0/DotCL.Build.Tasks.dll" "$PKG/tasks/"
 cp "$ROOT/runtime/bin/Release/net10.0/DotCL.Runtime.dll" "$PKG/lib/net10.0/"
 cp "$ROOT/compiler/dotcl.core" "$PKG/dotclassets/"
@@ -302,6 +306,185 @@ if dotnet build "$(win "$WORK/ctr/app/ctrapp.csproj")" -c Debug --nologo > "$WOR
 else
   note "the project with a contrib dependency did not build"
   tail -20 "$WORK/build4.log"
+fi
+
+echo "=== [5] a ReadyToRun publish compiles the published fasls in place ==="
+# Same sources as [4]. The application reports how many of its fasls carry
+# native code (a ManagedNativeHeader) and dotcl:r2r-stats. A file that is not
+# an assembly stands in for a fasl crossgen2 cannot compile: the publish must
+# warn and ship it unchanged. DotclReadyToRunFasls=false keeps every fasl IL.
+mkdir -p "$WORK/r2r"
+cp "$WORK/ctr/app/ctrapp.asd" "$WORK/ctr/app/ctrapp.lisp" "$WORK/r2r/"
+echo 'not an assembly' > "$WORK/r2r/broken.fasl"
+cat > "$WORK/r2r/Program.cs" <<'EOF'
+using System;
+using System.IO;
+using System.Linq;
+using System.Reflection.PortableExecutable;
+static class P
+{
+    static bool IsR2R(string f)
+    {
+        using var pe = new PEReader(File.OpenRead(f));
+        return pe.PEHeaders.CorHeader.ManagedNativeHeaderDirectory.Size > 0;
+    }
+    static void Main()
+    {
+        var root = AppContext.BaseDirectory;
+        DotCL.DotclHost.Initialize();
+        DotCL.DotclHost.LoadFromManifest(Path.Combine(root, "dotcl-fasl", "dotcl-deps.txt"));
+        Console.WriteLine("result: " + DotCL.DotclHost.Call("CTRAPP:RUN"));
+        Console.WriteLine("r2r-stats: " + DotCL.DotclHost.EvalString("(dotcl:r2r-stats)"));
+        var fasls = Directory.GetFiles(Path.Combine(root, "dotcl-fasl"))
+            .Where(f => f.EndsWith(".fasl") || Path.GetFileName(f) == "dotcl.core")
+            .Concat(Directory.GetFiles(Path.Combine(root, "contrib"), "*.fasl", SearchOption.AllDirectories))
+            .ToList();
+        Console.WriteLine($"native: {fasls.Count(IsR2R)}/{fasls.Count}");
+    }
+}
+EOF
+cat > "$WORK/r2r/r2rapp.csproj" <<CSPROJEOF
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <AssemblyName>pcbr2r</AssemblyName>
+    <DotclProjectAsd>\$(MSBuildProjectDirectory)/ctrapp.asd</DotclProjectAsd>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(win "$ROOT/runtime/DotCL.Runtime.csproj")" />
+    <DotclAsdSearchPath Include="$(win "$WORK/ctr/ext")" />
+    <None Include="$(win "$PKG/dotclassets/contrib")/**/*.fasl"
+          Link="contrib/%(RecursiveDir)%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" />
+    <None Include="broken.fasl" Link="extra/broken.fasl" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Import Project="$(win "$PKG/build/DotCL.Runtime.ProjectCore.targets")" />
+</Project>
+CSPROJEOF
+r2r_publish() { # $1 = output dir, $2 = log, $3.. = extra properties
+  out_dir="$1"; log="$2"; shift 2
+  dotnet publish "$(win "$WORK/r2r/r2rapp.csproj")" -c Release -r "$RID" -p:PublishReadyToRun=true "$@" \
+    -o "$(win "$out_dir")" --nologo > "$log" 2>&1
+}
+r2r_run_exe() {
+  exe="$1"
+  [ -f "$exe.exe" ] && exe="$exe.exe"
+  "$exe" < /dev/null 2>&1 || true
+}
+r2r_run() { r2r_run_exe "$1/pcbr2r"; }
+if r2r_publish "$WORK/r2r/pub" "$WORK/publish5.log"; then
+  out="$(r2r_run "$WORK/r2r/pub")"
+  native="$(echo "$out" | sed -n 's/^native: //p' | tr -d '\r')"
+  case "$out" in
+    *'result: "threads"'*) ;;
+    *) note "the ReadyToRun publish does not start"; echo "$out" | head -5 ;;
+  esac
+  case "$native" in
+    0/*|'') note "no published fasl is native code ($native)" ;;
+    *) [ "${native%/*}" = "${native#*/}" ] && echo "  PASS: every published fasl is native code ($native)" \
+         || note "some published fasls are still IL ($native)" ;;
+  esac
+  case "$out" in
+    *'r2r-stats: (0 '*) note "no fasl was loaded as native code: $(echo "$out" | grep r2r-stats)" ;;
+  esac
+  if grep -q 'crossgen2 failed on extra' "$WORK/publish5.log" \
+     && cmp -s "$WORK/r2r/broken.fasl" "$WORK/r2r/pub/extra/broken.fasl"; then
+    echo "  PASS: a fasl crossgen2 cannot compile warns and ships unchanged"
+  else
+    note "a fasl crossgen2 cannot compile did not warn, or was not shipped unchanged"
+  fi
+else
+  note "the ReadyToRun publish failed"
+  tail -20 "$WORK/publish5.log"
+fi
+if r2r_publish "$WORK/r2r/pub-il" "$WORK/publish5b.log" -p:DotclReadyToRunFasls=false; then
+  case "$(r2r_run "$WORK/r2r/pub-il")" in
+    *'native: 0/'*) echo "  PASS: DotclReadyToRunFasls=false publishes the fasls as IL" ;;
+    *) note "DotclReadyToRunFasls=false still compiled fasls" ;;
+  esac
+else
+  note "the publish with DotclReadyToRunFasls=false failed"
+  tail -20 "$WORK/publish5b.log"
+fi
+
+echo "=== [6] a publish ships only the contrib modules the manifest requires ==="
+# A contrib module that REQUIREs another at load time must declare it in its
+# .asd: the manifest lists what the walk finds there, and nothing else is
+# published.
+for lisp in "$ROOT"/contrib/*/*.lisp; do
+  mod="$(basename "$lisp" .lisp)"
+  asd="$(dirname "$lisp")/$mod.asd"
+  [ -f "$asd" ] || continue
+  for dep in $(sed -n 's/^(require "\([^"]*\)").*/\1/p' "$lisp"); do
+    grep -q "\"$dep\"" "$asd" || note "contrib/$mod requires $dep at load time but $mod.asd does not depend on it"
+  done
+done
+mkdir -p "$WORK/sel"
+cat > "$WORK/sel/selapp.asd" <<'EOF'
+(defsystem "selapp" :depends-on ("dotcl-socket") :components ((:file "selapp")))
+EOF
+cat > "$WORK/sel/selapp.lisp" <<'EOF'
+(defpackage :selapp (:use :cl) (:export #:run))
+(in-package :selapp)
+(defun run ()
+  (let ((server (dotcl-socket:make-server-socket "127.0.0.1" 0)))
+    (unwind-protect (if (plusp (dotcl-socket:local-port server)) "listening" "no port")
+      (dotcl-socket:socket-close server))))
+EOF
+sed 's/CTRAPP:RUN/SELAPP:RUN/' "$WORK/r2r/Program.cs" > "$WORK/sel/Program.cs"
+cat > "$WORK/sel/selapp.csproj" <<CSPROJEOF
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <AssemblyName>pcbsel</AssemblyName>
+    <DotclProjectAsd>\$(MSBuildProjectDirectory)/selapp.asd</DotclProjectAsd>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(win "$ROOT/runtime/DotCL.Runtime.csproj")" />
+  </ItemGroup>
+  <Import Project="$(win "$PKG/build/DotCL.Runtime.props")" />
+  <Import Project="$(win "$PKG/build/DotCL.Runtime.targets")" />
+</Project>
+CSPROJEOF
+contrib_dirs() { (cd "$1/contrib" 2>/dev/null && ls | tr '\n' ' '); }
+if dotnet publish "$(win "$WORK/sel/selapp.csproj")" -c Release -r "$RID" -p:PublishReadyToRun=true \
+     -o "$(win "$WORK/sel/pub")" --nologo > "$WORK/publish6.log" 2>&1; then
+  dirs="$(contrib_dirs "$WORK/sel/pub")"
+  if [ "$dirs" = "dotcl-bsd-sockets dotcl-socket " ]; then
+    echo "  PASS: only the required contrib modules and what they require are published"
+  else
+    note "the published contrib modules are '$dirs', not dotcl-bsd-sockets and dotcl-socket"
+  fi
+  out="$(r2r_run_exe "$WORK/sel/pub/pcbsel")"
+  native="$(echo "$out" | sed -n 's/^native: //p' | tr -d '\r')"
+  case "$out" in
+    *'result: "listening"'*) echo "  PASS: the narrowed publish starts and loads its contrib modules" ;;
+    *) note "the narrowed publish does not start"; echo "$out" | head -5 ;;
+  esac
+  case "$native" in
+    0/*|'') note "no fasl of the narrowed publish is native code ($native)" ;;
+    *) [ "${native%/*}" = "${native#*/}" ] && echo "  PASS: the narrowed set is ReadyToRun ($native)" \
+         || note "some fasls of the narrowed publish are still IL ($native)" ;;
+  esac
+else
+  note "the narrowed publish failed"
+  tail -20 "$WORK/publish6.log"
+fi
+if dotnet publish "$(win "$WORK/sel/selapp.csproj")" -c Release -r "$RID" -p:DotclPublishAllContribs=true \
+     -o "$(win "$WORK/sel/pub-all")" --nologo > "$WORK/publish6b.log" 2>&1; then
+  dirs="$(contrib_dirs "$WORK/sel/pub-all")"
+  if [ "$dirs" = "$(contrib_dirs "$PKG/dotclassets")" ]; then
+    echo "  PASS: DotclPublishAllContribs=true publishes every contrib module"
+  else
+    note "DotclPublishAllContribs=true published '$dirs', not every contrib module"
+  fi
+else
+  note "the publish with DotclPublishAllContribs=true failed"
+  tail -20 "$WORK/publish6b.log"
 fi
 
 if [ "$fail" -eq 0 ]; then

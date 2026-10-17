@@ -119,7 +119,7 @@ and why, since each rule below came from something that went wrong:
   build. Each entry
   records the build as `"runtime"`, and `render.lisp` prints it at the top of
   the table counted per row, the same way as the dists below. The load and
-  test entries also record the wall-clock time of their run as `"seconds"`
+  test entries also record the wall-clock time of their run as `"seconds"`, to a tenth
   (a load that timed out and was retried counts both runs), so two
   measurements can be compared row by row.
 - **Know which dists were measured.** All three measuring scripts read the
@@ -133,10 +133,12 @@ and why, since each rule below came from something that went wrong:
   the number of rows behind each version, so a table that is partly an older
   measurement cannot read as a new one. Before measuring, the installed dotcl dist is
   compared with the published one (`https://dotcl.github.io/dist/dotcl.txt`,
-  `LIBRARY_STATUS_DOTCL_DIST_URL` overrides it); an older one stops the run
-  with the command that updates it. `LIBRARY_STATUS_ALLOW_STALE_DIST=1` goes on
-  anyway, and the entries then record the stale version. With no network the
-  check is a warning only.
+  `LIBRARY_STATUS_DOTCL_DIST_URL` overrides it); any other version stops the
+  run with the command that updates it, and so do a home with no dotcl dist and
+  a published version that cannot be read (no network).
+  `LIBRARY_STATUS_ALLOW_STALE_DIST=1` goes on anyway, and the entries then
+  record the version that was measured. `make test-library-status-dists`
+  checks this.
 - **One at a time.** Never run two dotcl processes in parallel for this: the
   results stop being comparable and the machine stops being usable.
 - **Bound each system, not the whole run.** 120 seconds per system
@@ -212,6 +214,12 @@ each library. So this stage is two parts:
 1. For each system that loads (`load-only` or `patched` in `results.json`, in
    `targets.txt` order), a fresh dotcl quickloads it and what the systems its
    `test-op` depends on depend on (Quicklisp fetches only through `quickload`).
+   A test system missing from the Quicklisp index (it did not build when the
+   dist was made) is looked for as `NAME.asd` under the library's directory.
+   The Lisp runs in an empty directory, and from `LIBTEST-BEGIN` on
+   `*default-pathname-defaults*` is the library's directory, since suites open
+   their own files by relative names (LIFT's dribble and summary files then
+   land in the release directory of the Quicklisp home measured).
    The test systems themselves are loaded after the `LIBTEST-BEGIN` marker,
    because many run their suite while loading (a `run!` at top level); then the
    driver prints `LIBTEST-TEST-OP` and calls `(asdf:test-system SYS)`. What was
@@ -245,21 +253,27 @@ each library. So this stage is two parts:
    `P passed.`, `F failed.`, `C crashed.`; a crash counts as a failure), the
    `with-test-suite` harness of flexi-streams (cl-ppcre's shape with `Test
    suite: NAME` lines and `Test FORM failed.` per failing check), and
-   should-test (one `Test NAME: ... OK` or `FAILED` per test, no summary).
+   should-test (one `Test NAME: ... OK` or `FAILED` per test, no summary),
+   and the harness of trivial-package-local-nicknames (`;; N tests run, F
+   failures.`).
    fiveam's `run` (rather than `run!`) prints only progress, `Running test
    NAME` followed by one character per check; those are counted when no `Did N
    checks.` summary was printed. LIFT, clunit and clunit2 keep their last
    result, and a test op that drops it prints only `Start:` or `PROGRESS:`
    lines, so the driver prints its counts as `LIBTEST-LAST-RESULT FRAMEWORK
    PASSED FAILED`, read only when the output had no summary of that
-   framework. Only output after the driver's `LIBTEST-BEGIN` marker is read,
+   framework. Parachute's `quiet` report prints nothing, so the driver prints
+   its counts the same way. Only output after the driver's `LIBTEST-BEGIN` marker is read,
    so a summary printed while the library or its dependencies load is not a
    result.
 
    `run-tests.sh --judge LOG...` judges logs already written, without running
    anything. The driver is plain Common Lisp apart from loading Quicklisp,
-   quitting and the MOP package, so the same driver run on SBCL gives a log
-   to compare a recogniser against.
+   quitting, the debugger hook and the MOP package, so the same driver run on
+   SBCL gives a log to compare a recogniser against. On SBCL the hook
+   `--non-interactive` installs (`sb-ext:*invoke-debugger-hook*`) is unset
+   while the test op runs: it runs before `*debugger-hook*`, so neither the
+   driver's hook nor one a test binds would be called.
 
 Each system gets one verdict in `tests.json`:
 
@@ -269,7 +283,7 @@ Each system gets one verdict in `tests.json`:
 | `fail` | a recognised summary counted at least one failure |
 | `error` | `test-system` signalled, the debugger was entered, or the process exited abnormally, with no recognised failure count |
 | `no-result` | the run finished but printed nothing a recogniser knows |
-| `no-tests` | the run finished and there was nothing to run: `test-op` has no test system among its dependencies and no `perform` method of the library's own, or hu.dwim.asdf reported that no tests were run |
+| `no-tests` | the run finished and there was nothing to run: neither `test-op` nor the test systems it depends on have a primary `perform` method of the library's own (only ASDF's empty default; `:around` methods such as the one LIFT adds to every system do not count), a test system it names is in no dist and has no `.asd` in the release, or hu.dwim.asdf reported that no tests were run |
 | `timeout` | the bound (`LIBRARY_STATUS_TEST_TIMEOUT`, default 900 s) was hit |
 | `load-fail` | the system or one of its test systems did not load |
 
@@ -342,6 +356,29 @@ The dists are read from the Quicklisp home the bundled client uses
 and 2b ran against, or the comparison is between two different dists.
 `render.lisp` shows the entries in the `with forks` column.
 
+## Stage 2d -- the same rows on SBCL
+
+```
+LIBRARY_STATUS_LISP=sbcl LIBRARY_STATUS_QL_HOME=path/to/quicklisp \
+  sh bench/library-status/run-quickload.sh
+LIBRARY_STATUS_LISP=sbcl LIBRARY_STATUS_QL_HOME=path/to/quicklisp \
+  sh bench/library-status/run-tests.sh
+```
+
+The time a row takes on dotcl means little without the time the same work
+takes elsewhere, so stages 2 and 2b also run on SBCL. The drivers are the
+same; only loading Quicklisp (the `setup.lisp` of `LIBRARY_STATUS_QL_HOME`,
+a home with the Quicklisp client and the same dists as the dotcl run) and
+quitting differ. `LIBRARY_STATUS_SBCL` names the executable. The outputs
+default to `results-sbcl.json` and `tests-sbcl.json`, and the test list to the
+rows that load on SBCL. Give each implementation an empty compile cache
+(`XDG_CACHE_HOME`) and the same row order, so that a row's time includes the
+same dependency compilation on both.
+
+`render.lisp` shows the `"seconds"` of both as the `seconds, dotcl / SBCL`
+column, and the sums over the rows measured on both at the top of the table.
+The verdicts on SBCL are kept in the files but not shown.
+
 ## The reasons (`annotations.json`)
 
 ```json
@@ -386,8 +423,9 @@ beside it is the hand-written sentence from `annotations.json`.
 Inputs and outputs all have defaults relative to this directory and can be
 overridden: `LIBRARY_STATUS_JSON`, `LIBRARY_STATUS_TARGETS`,
 `LIBRARY_STATUS_ANNOTATIONS`, `LIBRARY_STATUS_TESTS_JSON`,
-`LIBRARY_STATUS_FORKS_JSON`, `LIBRARY_STATUS_OUT`, `DOTCL_VERSION`.
-`library-status/render:main` takes the same seven as keyword arguments.
+`LIBRARY_STATUS_FORKS_JSON`, `LIBRARY_STATUS_SBCL_JSON`,
+`LIBRARY_STATUS_SBCL_TESTS_JSON`, `LIBRARY_STATUS_OUT`, `DOTCL_VERSION`.
+`library-status/render:main` takes the same as keyword arguments.
 
 The JSON reader is part of the script. Rendering the table has to work in a
 checkout where nothing has been installed yet, which a dependency on a JSON

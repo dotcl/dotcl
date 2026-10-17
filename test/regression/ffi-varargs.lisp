@@ -105,3 +105,27 @@
                "%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f"
                '(1d0 2d0 3d0 4d0 5d0 6d0 7d0 8d0 9d0 10d0)))
   ("1 2 3 4 5 6 7 8 9 10 11" "1 2 3 4 5 6 7 8 9 10"))
+
+;;; x86-64 System V passes the number of vector registers used in AL. The
+;;; probe is "movzx eax, al; ret".
+#+(and x86-64 (not windows))
+(defun %va-al-probe ()
+  (let* ((anon #+darwin #x1000 #-darwin #x20)
+         (page (dotnet:ffi *ffi-va-libc* "mmap"
+                           :args '(:pointer :int64 :int :int :int :int64) :ret :pointer
+                           nil 4096 3 (logior 2 anon) -1 0)))
+    (loop for b in '(#x0f #xb6 #xc0 #xc3) for i from 0
+          do (dotnet:mem-write b :uint8 page i))
+    (dotnet:ffi *ffi-va-libc* "mprotect" :args '(:pointer :int64 :int) :ret :int
+                page 4096 5)
+    page))
+
+#+(and x86-64 (not windows))
+(deftest ffi-varargs.sysv-al-counts-vector-registers
+  (let ((p (%va-al-probe)))
+    (list (dotnet:%ffi-call-ptr p '(:pointer :varargs :int :double :pointer) :int nil 7 2.5d0 nil)
+          (dotnet:%ffi-call-ptr p '(:pointer :varargs :double :double :double) :int nil 1d0 2d0 3d0)
+          (dotnet:%ffi-call-ptr p '(:pointer :varargs :int) :int nil 1)
+          (dotnet:%ffi-call-ptr p (list* :pointer :varargs (make-list 10 :initial-element :double))
+                                :int nil 1d0 2d0 3d0 4d0 5d0 6d0 7d0 8d0 9d0 10d0)))
+  (1 3 0 8))

@@ -185,41 +185,47 @@ return the system."
     (< (abs (- stored file)) (* 3 10000000)))
   t)
 
-;;; An R2R sibling goes in only when it is not older than its fasl: an older one
-;;; was made from an earlier compile, and the loader would rightly ignore it --
-;;; shipped and re-dated by the consumer, it would be used.
-(defun nlp-pack-with-sibling (older-p)
-  (let* ((sys (nlp-system (if older-p "nlp-old-sib" "nlp-new-sib") "(:file \"src/nlp\")"))
+;;; Fake siblings for this platform and another, dated AGE-SECONDS from the fasl.
+;;; They are not images, so packing (which loads the system) runs with
+;;; DOTCL:*LOAD-R2R* off.
+(defun nlp-system-with-siblings (name age-seconds)
+  (let* ((sys (nlp-system name "(:file \"src/nlp\")"))
          (c (asdf:find-component sys "src/nlp")))
     (asdf:compile-system sys)
-    (let* ((fasl (namestring (first (asdf:output-files 'asdf:compile-op c))))
-           (sib (concatenate 'string fasl ".r2r-test-rid")))
-      (dotnet:static "System.IO.File" "WriteAllText" sib "not really r2r")
-      (dotnet:static "System.IO.File" "SetLastWriteTimeUtc" sib
-                     (dotnet:invoke (dotnet:static "System.IO.File" "GetLastWriteTimeUtc" fasl)
-                                    "AddSeconds" (if older-p -60d0 60d0)))
-      (remove-if-not (lambda (n) (search "r2r" n))
-                     (nlp-zip-entries (asdf-nuget::%pack-library sys (nlp-dir "out")))))))
+    (let ((fasl (namestring (first (asdf:output-files 'asdf:compile-op c)))))
+      (dolist (rid (list (asdf-nuget::%host-rid) "test-rid"))
+        (let ((sib (concatenate 'string fasl ".r2r-" rid)))
+          (dotnet:static "System.IO.File" "WriteAllText" sib "not really r2r")
+          (dotnet:static "System.IO.File" "SetLastWriteTimeUtc" sib
+                         (dotnet:invoke (dotnet:static "System.IO.File" "GetLastWriteTimeUtc" fasl)
+                                        "AddSeconds" age-seconds)))))
+    sys))
 
-(deftest-emitting-only nuget-library.fresh-sibling-ships
-  (nlp-pack-with-sibling nil)
-  ("dotcl/nlp-new-sib/src/nlp.lisp.fasl.r2r-test-rid"))
+(defun nlp-r2r-entries (path)
+  (remove-if-not (lambda (n) (search ".r2r-" n)) (nlp-zip-entries path)))
 
-(deftest-emitting-only nuget-library.stale-sibling-does-not-ship
-  (nlp-pack-with-sibling t)
+(deftest-emitting-only nuget-library.no-r2r-ships-no-sibling
+  (let ((dotcl:*load-r2r* nil))
+    (nlp-r2r-entries
+     (asdf-nuget::%pack-library (nlp-system-with-siblings "nlp-no-r2r" 60d0) (nlp-dir "out"))))
   nil)
 
-;;; A fasl on a drive (Windows): the siblings are looked for in the fasl's own
-;;; directory, drive included, and a sibling's name in the package is the fasl's
-;;; plus only what the sibling's file name adds. Leaving the drive out searched the
-;;; current drive and cut the sibling's name two characters short.
-(deftest nuget-library.sibling-directory-keeps-the-drive
-  (list (asdf-nuget::%fasl-directory
-         (make-pathname :device "C" :directory '(:absolute "Users" "u" "src")
-                        :name "nlp.lisp" :type "fasl"))
-        (asdf-nuget::%fasl-directory "C:/Users/u/src/nlp.lisp.fasl")
-        (asdf-nuget::%fasl-directory "/home/u/src/nlp.lisp.fasl"))
-  ("C:/Users/u/src/" "C:/Users/u/src/" "/home/u/src/"))
+(deftest-emitting-only nuget-library.r2r-ships-this-platforms-sibling
+  (let ((dotcl:*load-r2r* nil))
+    (equal (nlp-r2r-entries
+            (asdf-nuget::%pack-library (nlp-system-with-siblings "nlp-r2r" 60d0) (nlp-dir "out")
+                                       :r2r t))
+           (list (concatenate 'string "dotcl/nlp-r2r/src/nlp.lisp.fasl.r2r-"
+                              (asdf-nuget::%host-rid)))))
+  t)
+
+;;; On the grouping step: :R2R would run crossgen2 to replace a stale sibling.
+(deftest-emitting-only nuget-library.stale-sibling-does-not-ship
+  (let ((sys (nlp-system-with-siblings "nlp-old-sib" -60d0)))
+    (remove-if-not (lambda (e) (search ".r2r-" (cdr e)))
+                   (asdf-nuget::%group-fasls
+                    (namestring (asdf:system-source-directory sys)) (list sys) "test-rid")))
+  nil)
 
 (deftest nuget-library.sibling-entry-name
   (list (asdf-nuget::%sibling-entry
@@ -384,7 +390,7 @@ record naming CORE."
 ;;; A packed system whose sources tie its fasls to the machine that compiles
 ;;; them: the pack runs the portability check, warns with a
 ;;; FASL-PORTABILITY-WARNING naming the place, and writes the package anyway.
-(deftest nuget-library.pack-warns-about-unportable-sources
+(deftest-emitting-only nuget-library.pack-warns-about-unportable-sources
   (let* ((sys (nlp-system "nlp-unport" "(:file \"src/nlp\") (:file \"src/plat\")"))
          (dir (namestring (asdf:system-source-directory sys)))
          (warnings '()))

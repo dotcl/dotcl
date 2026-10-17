@@ -27,6 +27,13 @@ public partial class CilAssembler
     // How far past a store the matching load is looked for.
     private const int StackTempMaxSpan = 96;
 
+    // A body with fewer top-level local references than this is left alone.
+    // It is nowhere near the JIT's limit of 8,000, and in a small method the
+    // JIT's own forward substitution keeps a single-use temporary out of memory
+    // anyway. Running the pass on every method was a third of the time the
+    // assembler spent (half a second of starting from compiler/cil-out.sil).
+    private const int StackTempMinRefs = 2000;
+
     /// <summary>How many values INSTR takes off the stack and how many it
     /// leaves, or null when it is not one this pass may keep a value beneath.
     /// </summary>
@@ -75,9 +82,15 @@ public partial class CilAssembler
     {
         if (_seqPoints != null || _localVars != null) return instructions;
         var ins = new List<LispObject>();
-        for (var cur = instructions; cur is Cons c; cur = c.Cdr) ins.Add(c.Car);
+        int refs = 0;
+        for (var cur = instructions; cur is Cons c; cur = c.Cdr)
+        {
+            ins.Add(c.Car);
+            if (c.Car is Cons ic && ic.Car is Symbol iop && (iop.Name == "LDLOC" || iop.Name == "STLOC"))
+                refs++;
+        }
         int n = ins.Count;
-        if (n < 8) return instructions;
+        if (refs < StackTempMinRefs) return instructions;
 
         // Every mention of each declared local: the top-level LDLOC / STLOC
         // positions, and whether it is named anywhere else.

@@ -79,9 +79,8 @@
       (+ (f 3) (f 5))))
   16)
 
-;;; Past *LOCAL-INLINE-CALL-LIMIT* the remaining sites are ordinary calls. The
-;;; answers cannot tell the difference, which is the point.
-(deftest local-inline.past-the-call-limit
+;;; Every call site takes a copy (the sixth checks there is no count of sites).
+(deftest local-inline.many-call-sites
   (let ((x 1))
     (flet ((f (n) (+ n x)))
       (declare (inline f))
@@ -245,9 +244,12 @@
 
 (defun %li-bytes () (nth 4 (dotcl:gc-stats)))
 
+;;; A local function that escapes is substituted even without the declaration,
+;;; so the plain versions say NOTINLINE to keep the call.
 (defun %li-escape-plain (x)
   (block out
     (labels ((f (n) (when (evenp n) (return-from out :even)) (* n 2)))
+      (declare (notinline f))
       (+ (f x) 1))))
 
 (defun %li-escape-inline (x)
@@ -266,6 +268,7 @@
                (when (evenp n) (return-from out :even))
                (when (> n 100) (return-from f :big))
                (* n 2)))
+      (declare (notinline f))
       (list (f x)))))
 
 (defun %li-both-inline (x)

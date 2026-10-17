@@ -89,9 +89,28 @@ public partial class CilAssembler
 
     /// <summary>The body of the boxed entry over a typed body method:
     /// LispObject Shell(LispFunction self, LispObject a1..an).</summary>
-    internal static void EmitTypedShell(ILGenerator il, TypedForm f, MethodInfo typed)
+    /// <summary>A shell for SELFFRAMED links the function's own debugger frame
+    /// around the body (see Function.SelfFramed.cs), so that callers reach it
+    /// through the entry pointer instead of InvokeN's framed path.</summary>
+    internal static void EmitTypedShell(ILGenerator il, TypedForm f, MethodInfo typed,
+                                        bool selfFramed = false, bool unit = false)
     {
         int n = f.ParamCount;
+        LocalBuilder? fr = null;
+        if (selfFramed)
+        {
+            fr = il.DeclareLocal(typeof(LispFunction.Frame));
+            il.Emit(OpCodes.Ldloca, fr);
+            il.Emit(OpCodes.Ldstr, string.Intern(f.Name));
+            for (int i = 1; i <= n; i++) il.Emit(OpCodes.Ldarg, i);
+            il.Emit(OpCodes.Call, s_enterN[n]);
+            if (unit)
+            {
+                il.Emit(OpCodes.Ldloca, fr);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Call, s_enterUnit);
+            }
+        }
         il.Emit(OpCodes.Ldarg_0);
         for (int i = 0; i < n; i++)
         {
@@ -111,6 +130,11 @@ public partial class CilAssembler
             else { il.Emit(OpCodes.Castclass, typeof(Fixnum)); il.Emit(OpCodes.Call, FixnumGetValueTMI); }
         }
         il.Emit(OpCodes.Call, typed);
+        if (fr != null)
+        {
+            il.Emit(OpCodes.Ldloca, fr);
+            il.Emit(OpCodes.Call, s_leaveFrame);
+        }
         if (f.Sig[n + 1] == 'D') il.Emit(OpCodes.Newobj, DoubleCtorTMI);
         else il.Emit(OpCodes.Call, FixnumMakeTMI);
         il.Emit(OpCodes.Ret);
@@ -140,9 +164,11 @@ public partial class CilAssembler
         for (int i = 0; i < n; i++) shellTypes[i + 1] = typeof(LispObject);
         var shellDm = new DynamicMethod(f.Name + "_shell", typeof(LispObject), shellTypes,
             typeof(CilAssembler).Module, true);
-        EmitTypedShell(shellDm.GetILGenerator(), f, typedDm);
+        bool selfFramed = CanSelfFrame(f.Name, n, f.NoFrame);
+        EmitTypedShell(shellDm.GetILGenerator(), f, typedDm, selfFramed, unit: true);
 
         var fn = BuildSelfDirectFunction(shellDm, f.Name, n);
+        if (selfFramed) fn.SetSelfFramedEntry(DynamicMethodEntry(shellDm), n);
         fn.SetTypedEntry(typedDm.CreateDelegate(TypedEntrySig.DelegateType(f.Sig)),
             TypedEntrySig.Code(f.Sig));
         FinishInMemoryDefmethod(fn, f.Name, f.Pkg, f.LambdaList, f.NoFrame, f.Body);

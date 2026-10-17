@@ -13,12 +13,14 @@
 ;; code (DOTCL-INTERNAL symbols) and the re-loaded code (DOTCL.CIL-COMPILER symbols).
 #-dotcl
 (let ((dir (directory-namestring *load-pathname*)))
-  (load (merge-pathnames "cil-compiler.lisp" dir))
-  (load (merge-pathnames "cil-macros.lisp" dir))
+  (dolist (f '("cil-compiler" "cil-compiler-ranges" "cil-compiler-fixnum"
+               "cil-compiler-float" "cil-compiler-call" "cil-host" "cil-macros"))
+    (load (merge-pathnames (concatenate 'string f ".lisp") dir)))
   #+sbcl (sb-ext:unlock-package :cl)
-  (load (merge-pathnames "loop.lisp" dir))
-  (load (merge-pathnames "cil-analysis.lisp" dir))
-  (load (merge-pathnames "cil-forms.lisp" dir)))
+  (dolist (f '("loop" "cil-analysis" "cil-forms" "cil-forms-defun" "cil-forms-let"
+               "cil-forms-lambda" "cil-forms-interp" "cil-forms-flet"
+               "cil-forms-control" "cil-forms-dispatch"))
+    (load (merge-pathnames (concatenate 'string f ".lisp") dir))))
 
 ;; Self-host: in a running dotcl the compiler's names are split across two
 ;; packages. Its functions are registered under the source package name

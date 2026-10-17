@@ -19,6 +19,7 @@ open and dotcl reads it differently.
 | `~E` with an explicit digit count | Rounds the exact binary value | SBCL rounds the shortest representation that reads back, then pads with zeros | The conformance suite checks `~E` output against the rational the float denotes, so the exact value is what passes there. `~F` follows SBCL, since nothing checks it against a rational | permanent |
 | `open :direction :output :if-exists :append`: moving the position | Every write goes to the end of the file as it is at that moment, so another appender's data is never overwritten. `file-position` reports that end; setting it to anything else returns `nil` | SBCL opens with `O_APPEND` too, but setting the position returns `t` and the next write still goes to the end | Answering `t` would promise a write position that the OS does not honour. The end-of-file guarantee comes from the OS: an append-only handle on Windows, `O_APPEND` on Linux and macOS. Elsewhere (other Unix systems, WebAssembly) the stream seeks to the end once, at open, which is right only while it is the sole writer. `:direction :io` with `:if-exists :append` also still seeks once | until a caller needs the other answer |
 | `~G`: how many digits a value with no short exact form gets, and which way an exact tie rounds | `(format nil "~g" 123456789.0)` gives `123456792.` (the exact single-float value); `(format nil "~,3g" 1234.5)` gives `1.234e+3` | SBCL gives `123456790.` (the shortest form that reads back) and `1.235e+3` | CLHS 22.3.3.3 decides neither, and dotcl's own format tests already record the direction of an exact tie as free. Every other `~G` form measured against SBCL agrees | until a caller needs one |
+| `subtypep` with `real` against `(or rational float)` | `(subtypep 'real '(or rational float))` is `nil t`: `dotcl:decimal` is a third kind of real, neither rational nor float (see numbers.md) | SBCL answers `t t` | The answer has to agree with `typep`: `#m0.5` is a real in no member of the union, and a `t t` would let the compiler drop a case it can reach | permanent |
 
 ## Library backends
 
@@ -46,7 +47,7 @@ its own table in [DESIGN.md](../DESIGN.md), section 3.11.
 
 ## Where the conformance suite is adjusted
 
-dotcl runs the ansi-test suite unmodified, from a fresh clone. Three
+dotcl runs the ansi-test suite unmodified, from a fresh clone. Four
 adjustments are made in the harness instead, and they follow from the table
 above:
 
@@ -64,6 +65,12 @@ above:
   exponential notation. The remaining draws still run, and the override checks
   that the upstream test still looks the way it did when it was written, so a
   change upstream is reported rather than silently shadowed.
+- **One `COMPILE-FILE` test is run without the harness muffling its
+  style-warnings.** It checks that a style-warning makes `COMPILE-FILE` return
+  a true warnings-p, while the harness muffles every style-warning around a
+  test, and a warning muffled outside `COMPILE-FILE` is not counted (SBCL
+  answers the same way). The test gets the suite's own
+  `:do-not-muffle-warnings` note, so it sees the warning as written.
 
 Everything else in the suite is expected to pass; the current count and the one
 known failure live in `ansi-state.json`.

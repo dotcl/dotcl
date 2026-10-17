@@ -49,10 +49,14 @@
             (push (list a b c d) bad))))))
   nil)
 
-;; The expected value is what SBCL gives for the same source.
+;; The expected value is what SBCL gives for the same source. The emit-free
+;; build interprets the loop, where the slots this is about do not exist, and
+;; runs fewer rounds; the answer for those is SBCL's too.
 (deftest u64-let-slot.checksum
-  (reduce #'logxor (%u64v-mix 1 (expt 2 63) (1- (expt 2 64)) 12345 100000))
-  2167232548050145232)
+  (let ((n (emit-free-scale 100000 10000)))
+    (= (reduce #'logxor (%u64v-mix 1 (expt 2 63) (1- (expt 2 64)) 12345 n))
+       (if (= n 100000) 2167232548050145232 6360510883765741510)))
+  t)
 
 ;; The declaration is checked where the slot is written: the binding and each
 ;; assignment, whatever computed the value. A check of compiled code: the

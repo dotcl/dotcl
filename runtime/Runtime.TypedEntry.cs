@@ -61,4 +61,133 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long CheckLongRange(long v, long lo, long hi) =>
         v >= lo && v <= hi ? v : throw TypedEntryTypeError(Fixnum.Make(v), IntegerRangeType(lo, hi));
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgFixnum(LispObject v)
+    {
+        if (v is not Fixnum) throw TypedEntryTypeError(v, Startup.Sym("FIXNUM"));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgRange(LispObject v, long lo, long hi)
+    {
+        if (!(v is Fixnum f && f.Value >= lo && f.Value <= hi))
+            throw TypedEntryTypeError(v, IntegerRangeType(lo, hi));
+    }
+
+    public static void CheckArgU64(LispObject v)
+    {
+        if (!IsU64(v)) throw TypedEntryTypeError(v, SizedByte("UNSIGNED-BYTE", 64));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgDouble(LispObject v)
+    {
+        if (v is not DoubleFloat) throw TypedEntryTypeError(v, Startup.Sym("DOUBLE-FLOAT"));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgSingle(LispObject v)
+    {
+        if (v is not SingleFloat) throw TypedEntryTypeError(v, Startup.Sym("SINGLE-FLOAT"));
+    }
+
+    /// <summary>(SINGLE-FLOAT LO HI) with inclusive bounds; anything else
+    /// goes to CheckArgType with SPEC, which decides and reports.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgSingleRange(LispObject v, float lo, float hi, LispObject spec)
+    {
+        if (v is SingleFloat sf && sf.Value >= lo && sf.Value <= hi) return;
+        CheckArgType(v, spec);
+    }
+
+    /// <summary>The DOUBLE-FLOAT counterpart of CheckArgSingleRange.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgDoubleRange(LispObject v, double lo, double hi, LispObject spec)
+    {
+        if (v is DoubleFloat df && df.Value >= lo && df.Value <= hi) return;
+        CheckArgType(v, spec);
+    }
+
+    static readonly ConditionalWeakTable<LispObject, TypeTest> ArgTypeTests = new();
+
+    public static void CheckArgType(LispObject v, LispObject spec)
+    {
+        TypeTest? test = spec is Symbol sym ? SymbolTypeTest(sym)
+            : ArgTypeTests.GetValue(spec, static s => BuildTypeTest(s));
+        bool ok;
+        if (test != null)
+        {
+            try { ok = test.Test(v); }
+            catch (LispErrorException) { return; }
+        }
+        else
+        {
+            try { ok = Typep(v, spec) is not Nil; }
+            catch (LispErrorException) { return; }
+        }
+        if (!ok) throw TypedEntryTypeError(v, spec);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgList(LispObject v)
+    {
+        if (v is not (Cons or Nil)) throw TypedEntryTypeError(v, Startup.Sym("LIST"));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgCons(LispObject v)
+    {
+        if (v is not Cons) throw TypedEntryTypeError(v, Startup.Sym("CONS"));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgSymbol(LispObject v)
+    {
+        if (v is not (Symbol or Nil or T)) throw TypedEntryTypeError(v, Startup.Sym("SYMBOL"));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgFunction(LispObject v)
+    {
+        if (v is not LispFunction) throw TypedEntryTypeError(v, Startup.Sym("FUNCTION"));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgCharacter(LispObject v)
+    {
+        if (v is not LispChar) throw TypedEntryTypeError(v, Startup.Sym("CHARACTER"));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgInteger(LispObject v)
+    {
+        if (v is not (Fixnum or Bignum)) throw TypedEntryTypeError(v, Startup.Sym("INTEGER"));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgString(LispObject v, LispObject spec)
+    {
+        if (v is not LispString) CheckArgType(v, spec);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgStructSym(LispObject v, LispObject sym)
+    {
+        if (!(v is LispStruct s && (ReferenceEquals(s.TypeName, sym) || IsStructSubclass(s.TypeName, sym))))
+            CheckArgType(v, sym);
+    }
+
+    static bool IsStructSubclass(Symbol name, LispObject sym) =>
+        FindClassOrNil(name) is LispClass own && own.IsStructureClass
+        && FindClassOrNil(sym) is LispClass cls && cls.IsStructureClass
+        && ReferenceEquals(cls.Name, sym) && ClassIncludes(own, cls);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgSimpleVector(LispObject v, LispObject spec, string et)
+    {
+        if (!(v is LispVector lv && lv._dimensions == null && lv.IsSimple
+              && lv.ElementTypeName == et))
+            CheckArgType(v, spec);
+    }
 }

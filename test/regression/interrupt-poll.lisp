@@ -136,3 +136,66 @@
       (dotcl:thread-join th)
       *s603-note*))
   nil)
+
+;; The poll in a typed array loop whose subscripts are checked before it starts
+;; (no bounds checks inside): INTERRUPT-THREAD stops it, twice in a row on the
+;; same thread, and a pending Ctrl-C request stops it too.
+(defun %s1158-add (a b c)
+  (declare (type (simple-array double-float (*)) a b c)
+           (optimize (speed 3) (safety 1)))
+  (dotimes (i (length c) c)
+    (setf (aref c i) (+ (aref a i) (aref b i)))))
+
+(defun %s1158-arrays ()
+  (values (make-array 100000 :element-type 'double-float :initial-element 1d0)
+          (make-array 100000 :element-type 'double-float :initial-element 2d0)
+          (make-array 100000 :element-type 'double-float)))
+
+(defvar *s1184-phase* 0)
+
+(defun %s1184-await-phase (p)
+  (loop repeat 3000 until (>= *s1184-phase* p) do (sleep 0.01)))
+
+(deftest interrupt-poll.interrupt-thread-typed-array-loop
+  (multiple-value-bind (a b c) (%s1158-arrays)
+    (setq *s1184-phase* 0)
+    (let ((th (dotcl:make-thread
+               (lambda ()
+                 (list (catch 'stop (setq *s1184-phase* 1) (loop (%s1158-add a b c)))
+                       (catch 'stop (setq *s1184-phase* 2) (loop (%s1158-add a b c))))))))
+      (%s1184-await-phase 1)
+      (dotcl:interrupt-thread th (lambda () (throw 'stop 1)))
+      (%s1184-await-phase 2)
+      (dotcl:interrupt-thread th (lambda () (throw 'stop 2)))
+      (dotcl:thread-join th)))
+  (1 2))
+
+;; INTERRUPT-THREAD reaching a thread blocked in a .NET wait (a monitor here,
+;; as inside the runtime's own locks) does not end it: FN runs at the first
+;; safepoint after the wait.
+(deftest interrupt-poll.interrupt-thread-blocked-in-dotnet-wait
+  (let ((obj (dotnet:new "System.Object")))
+    (setq *s1184-phase* 0)
+    (dotnet:static "System.Threading.Monitor" "Enter" obj)
+    (let ((th (dotcl:make-thread
+               (lambda ()
+                 (catch 'stop
+                   (setq *s1184-phase* 1)
+                   (dotnet:static "System.Threading.Monitor" "Enter" obj)
+                   (loop))
+                 :stopped))))
+      (%s1184-await-phase 1)
+      (sleep 0.1)
+      (dotcl:interrupt-thread th (lambda () (throw 'stop nil)))
+      (sleep 0.1)
+      (dotnet:static "System.Threading.Monitor" "Exit" obj)
+      (dotcl:thread-join th)))
+  :stopped)
+
+(deftest interrupt-poll.request-interrupt-typed-array-loop
+  (multiple-value-bind (a b c) (%s1158-arrays)
+    (handler-case
+        (progn (dotnet:static "DotCL.ConditionSystem" "RequestInterrupt")
+               (loop (%s1158-add a b c)))
+      (interactive-interrupt () :interrupted)))
+  :interrupted)

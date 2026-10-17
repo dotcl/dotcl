@@ -8,7 +8,7 @@
 ;;; This is the same class as the package/setf lowering targets that were given
 ;;; function entities earlier, the compiler's name test being the only
 ;;; definition, and the fix follows the PUTHASH precedent already in
-;;; cil-forms.lisp.
+;;; cil-forms-interp.lisp.
 ;;;
 ;;; Both evaluator paths are asserted by binding dotcl:*evaluator-mode* around
 ;;; the EVAL, so this runs under the ordinary compiled harness.

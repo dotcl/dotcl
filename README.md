@@ -79,6 +79,7 @@ dotcl --load my-program.lisp
 
 [dotcl for Lisp programmers](docs/for-lispers.md) starts there: libraries,
 editors, the REPL, and shipping what you write as a .NET tool or an executable.
+[Editors](docs/editors.md) connects Emacs with SLIME or SLY.
 To try it without installing anything, the
 [playground](https://dotcl.github.io/playground/) runs dotcl in your browser.
 

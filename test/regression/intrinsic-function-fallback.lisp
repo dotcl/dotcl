@@ -31,7 +31,11 @@
     ;; These three appear only in the bodies the compiler generates for the
     ;; entries of a &key function, which it compiles itself; no macro expands
     ;; into them, so the interpreter never meets them.
-    "%ABSENT-KEY" "%KEY-ABSENT-P" "%KEY-VALUE" "%CALL-KEY-SHARED")
+    "%ABSENT-KEY" "%KEY-ABSENT-P" "%KEY-VALUE" "%CALL-KEY-SHARED"
+    ;; The loop a mapping function with a literal lambda opens into. Only the
+    ;; compiler's own MAPCAR / SOME / ... handlers make it, and compile it at
+    ;; once; no macro expands into it.
+    "%MAP-OPEN")
   "Intrinsics that must NOT have a function binding, with the reason each.")
 
 (defun %ifb-handler-table ()

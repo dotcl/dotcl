@@ -570,13 +570,18 @@ public static class TypeParser
 
     private static CType ParseSpecializedVector(string headName, LispObject? args)
     {
-        // STRING -> (ARRAY CHARACTER (*))
-        // SIMPLE-STRING -> (SIMPLE-ARRAY CHARACTER (*))
-        // BIT-VECTOR -> (ARRAY BIT (*))
-        // etc.
-        // Keep as NamedType for now: handled by the hierarchy table
-        // Full array-type normalization is Phase 2 work
-        return NamedType.Get(headName);
+        if (args is not Cons c || c.Car is Symbol { Name: "*" })
+            return NamedType.Get(headName);
+        bool? simple = headName.StartsWith("SIMPLE-", StringComparison.Ordinal) ? true : null;
+        var dims = new Cons(c.Car, Nil.Instance);
+        CType Vec(string et) => new ArrayType(NamedType.Get(et), dims, simple,
+            et == "NIL" ? Nil.Instance : Startup.Sym(et));
+        return headName switch
+        {
+            "BASE-STRING" or "SIMPLE-BASE-STRING" => Vec("BASE-CHAR"),
+            "BIT-VECTOR" or "SIMPLE-BIT-VECTOR" => Vec("BIT"),
+            _ => new UnionType(new[] { Vec("CHARACTER"), Vec("BASE-CHAR"), Vec("NIL") }),
+        };
     }
 
     // --- Compound deftype ---
@@ -794,6 +799,8 @@ public static class CTypeOps
         {
             var arr2conv = NamedToArrayType(n2arr.Name);
             if (arr2conv != null) return SubtypepArray(arr1b, arr2conv);
+            if (n2arr.Name is "STRING" or "SIMPLE-STRING")
+                return Subtypep(arr1b, new UnionType(TypePartition(n2arr.Name)!));
         }
         if (ct1 is NamedType n1arr && ct2 is ArrayType arr2b)
         {
@@ -939,6 +946,7 @@ public static class CTypeOps
             if (need.TrueForAll(r => RangesCover(r.lo, r.hi, have))) return (true, true);
             if (exact) return (false, true);
         }
+        if (SubtypepRealUnion(ct1, union2) is (bool, bool) real) return real;
         // X <: (OR A rest) iff (AND X (NOT A)) <: rest. Only the YES is taken. Tried
         // for a MEMBER, and for a member whose complement another member names:
         // SYMBOL <: (OR (MEMBER T NIL) (AND SYMBOL (NOT (MEMBER T NIL)))),
@@ -957,12 +965,12 @@ public static class CTypeOps
         // A type that is the disjoint union of its parts is a subtype iff every part
         // is: REAL <: (OR INTEGER RATIO FLOAT), LIST <: (OR CONS NULL). Exact, so a
         // certain NO for one part is a certain NO for the whole.
-        if (ct1 is NamedType pn && TypePartition(pn.Name) is string[] parts)
+        if (ct1 is NamedType pn && TypePartition(pn.Name) is CType[] parts)
         {
             bool allCert = true;
             foreach (var part in parts)
             {
-                var (sub, cert) = Subtypep(NamedType.Get(part), union2);
+                var (sub, cert) = Subtypep(part, union2);
                 if (!sub)
                 {
                     if (cert) return (false, true);
@@ -1041,7 +1049,7 @@ public static class CTypeOps
         _ => null,
     };
 
-    /// <summary>The least integer above (or at, when inclusive) a rational bound; null for a float.</summary>
+    /// <summary>The least integer above (or at, when inclusive) a real bound; null for an infinity.</summary>
     private static BigInteger? CeilingOf(LispObject x, bool exclusive)
     {
         if (AsBig(x) is BigInteger v) return exclusive ? v + 1 : v;
@@ -1050,10 +1058,15 @@ public static class CTypeOps
             var q = BigInteger.Divide(r.Numerator, r.Denominator);  // truncates toward zero
             return r.Numerator > 0 ? q + 1 : q;
         }
+        if (FloatValue(x) is double d && !double.IsInfinity(d) && !double.IsNaN(d))
+        {
+            var c = Math.Ceiling(d);
+            return exclusive && c == d ? new BigInteger(c) + 1 : new BigInteger(c);
+        }
         return null;
     }
 
-    /// <summary>The greatest integer below (or at, when inclusive) a rational bound; null for a float.</summary>
+    /// <summary>The greatest integer below (or at, when inclusive) a real bound; null for an infinity.</summary>
     private static BigInteger? FloorOf(LispObject x, bool exclusive)
     {
         if (AsBig(x) is BigInteger v) return exclusive ? v - 1 : v;
@@ -1062,7 +1075,235 @@ public static class CTypeOps
             var q = BigInteger.Divide(r.Numerator, r.Denominator);
             return r.Numerator < 0 ? q - 1 : q;
         }
+        if (FloatValue(x) is double d && !double.IsInfinity(d) && !double.IsNaN(d))
+        {
+            var f = Math.Floor(d);
+            return exclusive && f == d ? new BigInteger(f) - 1 : new BigInteger(f);
+        }
         return null;
+    }
+
+    private static double? FloatValue(LispObject x) => x switch
+    {
+        SingleFloat sf => sf.Value,
+        DoubleFloat df => df.Value,
+        _ => null,
+    };
+
+    /// <summary>A real interval; a null end is unbounded.</summary>
+    private readonly record struct RealRange(LispObject? Lo, bool LoEx, LispObject? Hi, bool HiEx);
+
+    private static readonly string[] s_realClasses = { "INTEGER", "RATIO", "SINGLE-FLOAT", "DOUBLE-FLOAT", "DECIMAL" };
+
+    private static string[]? RealClassesOf(string name) => name switch
+    {
+        "REAL" => s_realClasses,
+        "RATIONAL" => new[] { "INTEGER", "RATIO" },
+        "INTEGER" => new[] { "INTEGER" },
+        "RATIO" => new[] { "RATIO" },
+        "FLOAT" => new[] { "SINGLE-FLOAT", "DOUBLE-FLOAT" },
+        "SINGLE-FLOAT" or "SHORT-FLOAT" => new[] { "SINGLE-FLOAT" },
+        "DOUBLE-FLOAT" or "LONG-FLOAT" => new[] { "DOUBLE-FLOAT" },
+        "DECIMAL" => new[] { "DECIMAL" },
+        _ => null,
+    };
+
+    private static string? RealClassOf(LispObject o) => o switch
+    {
+        Fixnum or Bignum => "INTEGER",
+        Ratio => "RATIO",
+        SingleFloat => "SINGLE-FLOAT",
+        DoubleFloat => "DOUBLE-FLOAT",
+        LispDecimal => "DECIMAL",
+        _ => null,
+    };
+
+    /// <summary>
+    /// Add to INTO the reals of class CLS in ct as intervals. False when they
+    /// cannot be told exactly.
+    /// </summary>
+    private static bool RealPieces(CType ct, string cls, List<RealRange> into)
+    {
+        switch (ct)
+        {
+            case NamedType n when RealClassesOf(n.Name) is string[] cs:
+                if (System.Array.IndexOf(cs, cls) >= 0) into.Add(new RealRange(null, false, null, false));
+                return true;
+            case NumericType num when RealClassesOf(num.NumClass) is string[] cs:
+                if (System.Array.IndexOf(cs, cls) >= 0)
+                    into.Add(new RealRange(num.Low, num.LowExclusiveP, num.High, num.HighExclusiveP));
+                return true;
+            case MemberType mem:
+                // 0.0 and -0.0 are one point of the line: covered only when both are members.
+                int zeros = 0;
+                foreach (var o in mem.Members)
+                {
+                    if (RealClassOf(o) != cls) continue;
+                    if (FloatValue(o) is 0.0) zeros |= Runtime.IsTrueEql(o, cls == "SINGLE-FLOAT"
+                        ? new SingleFloat(0.0f) : new DoubleFloat(0.0)) ? 1 : 2;
+                    else into.Add(new RealRange(o, false, o, false));
+                }
+                if (zeros == 3) into.Add(new RealRange(Fixnum.Make(0), false, Fixnum.Make(0), false));
+                return true;
+        }
+        if (cls == "INTEGER")
+        {
+            var ints = new List<(BigInteger? lo, BigInteger? hi)>();
+            if (IntegerPieces(ct, ints))
+            {
+                foreach (var (lo, hi) in ints)
+                    into.Add(new RealRange(lo is BigInteger l ? Bignum.MakeInteger(l) : null, false,
+                                           hi is BigInteger h ? Bignum.MakeInteger(h) : null, false));
+                return true;
+            }
+        }
+        if (NumericNode(ct) is string node)
+            return !NumericAncestorOrSelf(node, cls) && !NumericAncestorOrSelf(cls, node);
+        return AreDisjoint(NamedType.Get("NUMBER"), ct);
+    }
+
+    /// <summary>
+    /// A real type against a union, class by class (integers, ratios, floats, decimals)
+    /// on the real line: (REAL 5.5 10) is a subtype of
+    /// (OR (REAL 5.5 7) (REAL 7 10)). A NO is taken only with a number of ct1 that
+    /// TYPEP finds in no member. Null when undecided.
+    /// </summary>
+    private static (bool, bool)? SubtypepRealUnion(CType ct1, UnionType union2)
+    {
+        if (ct1 is not (NumericType or NamedType) || NumericNode(ct1) is not string node1
+            || !NumericAncestorOrSelf("REAL", node1))
+            return null;
+        bool covered = true;
+        foreach (var cls in s_realClasses)
+        {
+            var need = new List<RealRange>();
+            if (!RealPieces(ct1, cls, need)) return null;
+            if (need.Count == 0) continue;
+            var have = new List<RealRange>();
+            foreach (var m in union2.Types)
+                if (!RealPieces(m, cls, have)) return null;
+            if (!need.TrueForAll(r => RealClassCovered(cls, r, have))) { covered = false; break; }
+        }
+        if (covered) return (true, true);
+        foreach (var o in RealWitnessCandidates(ct1, union2))
+            if (IsTypep(o, ct1) && !IsTypep(o, union2)) return (false, true);
+        return null;
+    }
+
+    private static bool RealClassCovered(string cls, RealRange need, List<RealRange> have)
+    {
+        if (cls == "INTEGER")
+        {
+            BigInteger? lo = null, hi = null;
+            if (need.Lo != null && (lo = CeilingOf(need.Lo, need.LoEx)) == null) return false;
+            if (need.Hi != null && (hi = FloorOf(need.Hi, need.HiEx)) == null) return false;
+            var pieces = new List<(BigInteger? lo, BigInteger? hi)>();
+            foreach (var r in have)
+            {
+                BigInteger? plo = null, phi = null;
+                if (r.Lo != null && (plo = CeilingOf(r.Lo, r.LoEx)) == null) continue;
+                if (r.Hi != null && (phi = FloorOf(r.Hi, r.HiEx)) == null) continue;
+                pieces.Add((plo, phi));
+            }
+            return RangesCover(lo, hi, pieces);
+        }
+        return IntervalCovered(need, have, cls == "RATIO");
+    }
+
+    /// <summary>Do the intervals PIECES cover every real in NEED (but integers, when SKIPINTEGERS)?</summary>
+    private static bool IntervalCovered(RealRange need, List<RealRange> pieces, bool skipIntegers)
+    {
+        // Everything below p is covered; p itself too when pDone.
+        LispObject? p = need.Lo;
+        bool pDone = need.LoEx;
+        for (int step = 0; ; step++)
+        {
+            if (p != null && need.Hi != null)
+            {
+                int c = CompareBounds(p, need.Hi);
+                if (c == int.MinValue) return false;
+                if (c > 0 || (c == 0 && (pDone || need.HiEx))) return true;
+            }
+            if (step > 2 * pieces.Count + 1) return false;
+            RealRange? best = null;
+            foreach (var r in pieces)
+            {
+                if (p == null ? r.Lo != null
+                    : r.Lo != null && CompareBounds(r.Lo, p) is int cl
+                        && (cl == int.MinValue || cl > 0 || (cl == 0 && r.LoEx && !pDone)))
+                    continue;
+                if (r.Hi == null) return true;
+                if (p != null)
+                {
+                    int ch = CompareBounds(r.Hi, p);
+                    if (ch == int.MinValue || ch < 0 || (ch == 0 && (r.HiEx || pDone))) continue;
+                }
+                if (best is not RealRange b) { best = r; continue; }
+                int cb = CompareBounds(r.Hi, b.Hi!);
+                if (cb > 0 || (cb == 0 && b.HiEx && !r.HiEx)) best = r;
+            }
+            if (best is not RealRange next)
+            {
+                if (!skipIntegers || pDone || p is not (Fixnum or Bignum)) return false;
+                pDone = true;
+                continue;
+            }
+            p = next.Hi;
+            pDone = !next.HiEx;
+        }
+    }
+
+    /// <summary>Numbers near the bounds in ct1 and union2, and between them.</summary>
+    private static IEnumerable<LispObject> RealWitnessCandidates(CType ct1, UnionType union2)
+    {
+        var bounds = new List<LispObject>();
+        void Collect(CType ct)
+        {
+            if (ct is NumericType num)
+            {
+                if (num.Low != null) bounds.Add(num.Low);
+                if (num.High != null) bounds.Add(num.High);
+            }
+            else if (ct is MemberType mem)
+                foreach (var o in mem.Members)
+                    if (RealClassOf(o) != null) bounds.Add(o);
+        }
+        Collect(ct1);
+        foreach (var m in union2.Types) Collect(m);
+        yield return new SingleFloat(-0.0f);
+        yield return new DoubleFloat(-0.0);
+        var rats = new List<LispObject> { Fixnum.Make(0) };
+        foreach (var b in bounds)
+        {
+            yield return b;
+            if (FloatValue(b) is double d && (double.IsInfinity(d) || double.IsNaN(d))) continue;
+            rats.Add(b is SingleFloat or DoubleFloat ? Runtime.DoubleToRational(FloatValue(b)!.Value) : b);
+        }
+        rats.Sort((a, b) => CompareBounds(a, b) is int c && c != int.MinValue ? c : 0);
+        var points = new List<LispObject>(rats);
+        for (int i = 0; i + 1 < rats.Count; i++)
+            points.Add(Runtime.Divide(Runtime.Add(rats[i], rats[i + 1]), Fixnum.Make(2)));
+        var half = Runtime.Divide(Fixnum.Make(1), Fixnum.Make(2));
+        var third = Runtime.Divide(Fixnum.Make(1), Fixnum.Make(3));
+        foreach (var x in points)
+        {
+            yield return x;
+            foreach (var dx in new[] { Fixnum.Make(1), half, third })
+            {
+                yield return Runtime.Add(x, dx);
+                yield return Runtime.Subtract(x, dx);
+            }
+            var n = (Number)x;
+            float f = Arithmetic.ToSingle(n);
+            yield return new SingleFloat(f);
+            yield return new SingleFloat(MathF.BitIncrement(f));
+            yield return new SingleFloat(-MathF.BitIncrement(-f));
+            double g = Arithmetic.ToDouble(n);
+            yield return new DoubleFloat(g);
+            yield return new DoubleFloat(Compat.BitIncrement(g));
+            yield return new DoubleFloat(-Compat.BitIncrement(-g));
+            if (Math.Abs(g) < 1e20) yield return new LispDecimal((decimal)g);
+        }
     }
 
     /// <summary>Do the inclusive ranges PIECES cover every integer in [lo, hi]?</summary>
@@ -1109,18 +1350,32 @@ public static class CTypeOps
     /// Types that partition a built-in type, or null. SHORT-FLOAT is SINGLE-FLOAT
     /// and LONG-FLOAT is DOUBLE-FLOAT here. A SEQUENCE is a list or a vector: no
     /// other object is one (TYPEP), and a class cannot have SEQUENCE as a superclass.
+    /// A string's element type is CHARACTER, BASE-CHAR or NIL.
     /// </summary>
-    private static string[]? TypePartition(string name) => name switch
+    private static CType[]? TypePartition(string name) => s_partitions.Value.TryGetValue(name, out var p) ? p : null;
+
+    private static readonly Lazy<Dictionary<string, CType[]>> s_partitions = new(() =>
     {
-        "LIST" => new[] { "CONS", "NULL" },
-        "SEQUENCE" => new[] { "LIST", "VECTOR" },
-        "NUMBER" => new[] { "REAL", "COMPLEX" },
-        "REAL" => new[] { "RATIONAL", "FLOAT" },
-        "RATIONAL" => new[] { "INTEGER", "RATIO" },
-        "INTEGER" or "SIGNED-BYTE" => new[] { "FIXNUM", "BIGNUM" },
-        "FLOAT" => new[] { "SINGLE-FLOAT", "DOUBLE-FLOAT" },
-        _ => null,
-    };
+        CType[] Named(params string[] names) => names.Select(n => (CType)NamedType.Get(n)).ToArray();
+        CType[] Strings(bool simple) => new[] { "CHARACTER", "BASE-CHAR", "NIL" }
+            .Select(e => (CType)new ArrayType(NamedType.Get(e), Runtime.List(Startup.Sym("*")),
+                simple ? true : null, e == "NIL" ? Nil.Instance : Startup.Sym(e)))
+            .ToArray();
+        return new Dictionary<string, CType[]>
+        {
+            ["LIST"] = Named("CONS", "NULL"),
+            ["SEQUENCE"] = Named("LIST", "VECTOR"),
+            ["NUMBER"] = Named("REAL", "COMPLEX"),
+            ["REAL"] = Named("RATIONAL", "FLOAT", "DECIMAL"),
+            ["RATIONAL"] = Named("INTEGER", "RATIO"),
+            ["INTEGER"] = Named("FIXNUM", "BIGNUM"),
+            ["SIGNED-BYTE"] = Named("FIXNUM", "BIGNUM"),
+            ["FLOAT"] = Named("SINGLE-FLOAT", "DOUBLE-FLOAT"),
+            ["CHARACTER"] = Named("BASE-CHAR", "EXTENDED-CHAR"),
+            ["STRING"] = Strings(false),
+            ["SIMPLE-STRING"] = Strings(true),
+        };
+    });
 
     /// <summary>The complex representations a type holds, if it holds only complexes.</summary>
     private static int? ComplexMask(CType ct) => ct switch
@@ -1148,7 +1403,7 @@ public static class CTypeOps
         return name switch
         {
             "NUMBER" or "REAL" or "COMPLEX" or "RATIONAL" or "FLOAT" or "INTEGER"
-                or "RATIO" or "FIXNUM" or "BIGNUM" => name,
+                or "RATIO" or "FIXNUM" or "BIGNUM" or "DECIMAL" => name,
             "SIGNED-BYTE" or "UNSIGNED-BYTE" or "BIT" => "INTEGER",
             "SINGLE-FLOAT" or "SHORT-FLOAT" => "SINGLE-FLOAT",
             "DOUBLE-FLOAT" or "LONG-FLOAT" => "DOUBLE-FLOAT",
@@ -1159,7 +1414,7 @@ public static class CTypeOps
     private static string? NumericParent(string node) => node switch
     {
         "REAL" or "COMPLEX" => "NUMBER",
-        "RATIONAL" or "FLOAT" => "REAL",
+        "RATIONAL" or "FLOAT" or "DECIMAL" => "REAL",
         "INTEGER" or "RATIO" => "RATIONAL",
         "FIXNUM" or "BIGNUM" => "INTEGER",
         "SINGLE-FLOAT" or "DOUBLE-FLOAT" => "FLOAT",
@@ -1455,8 +1710,7 @@ public static class CTypeOps
     /// <summary>Convert named array types to their equivalent ArrayType.</summary>
     private static ArrayType? NamedToArrayType(string name)
     {
-        // Only convert structural array types (not STRING/BIT-VECTOR which have
-        // implementation-dependent element types via upgraded-array-element-type)
+        // Not STRING: its element type is CHARACTER, BASE-CHAR or NIL.
         return name switch
         {
             "ARRAY" => new ArrayType(NamedType.Get("*")),
@@ -1465,6 +1719,12 @@ public static class CTypeOps
                 new Cons(Startup.Sym("*"), Nil.Instance)),
             "SIMPLE-VECTOR" => new ArrayType(NamedType.Get("T"),
                 new Cons(Startup.Sym("*"), Nil.Instance), true),
+            "BASE-STRING" or "SIMPLE-BASE-STRING" => new ArrayType(NamedType.Get("BASE-CHAR"),
+                new Cons(Startup.Sym("*"), Nil.Instance), name == "SIMPLE-BASE-STRING" ? true : null,
+                Startup.Sym("BASE-CHAR")),
+            "BIT-VECTOR" or "SIMPLE-BIT-VECTOR" => new ArrayType(NamedType.Get("BIT"),
+                new Cons(Startup.Sym("*"), Nil.Instance), name == "SIMPLE-BIT-VECTOR" ? true : null,
+                Startup.Sym("BIT")),
             _ => null,
         };
     }
@@ -1480,8 +1740,7 @@ public static class CTypeOps
                 new Fixnum(0), false, new Fixnum(1), false),
             "UNSIGNED-BYTE" => new NumericType("INTEGER",
                 new Fixnum(0), false, null, false),
-            "SIGNED-BYTE" => new NumericType("INTEGER",
-                new Fixnum(-128), false, new Fixnum(127), false),
+            "SIGNED-BYTE" => new NumericType("INTEGER"),
             _ => null,
         };
     }
@@ -1542,7 +1801,7 @@ public static class CTypeOps
         try
         {
             var u1 = Runtime.ParseElementTypeName(e1);
-            return u1 != "T" && u1 == Runtime.ParseElementTypeName(e2);
+            return u1 != "T" && Runtime.SameElementTypeName(u1, Runtime.ParseElementTypeName(e2));
         }
         catch (LispErrorException) { return false; }
     }
@@ -1779,11 +2038,27 @@ public static class CTypeOps
         NamedType n => n.Name is not ("VALUES" or "*"),
         NumericType or MemberType or ClassCType or ComplexType => true,
         ConsType c => WitnessSafe(c.CarType) && WitnessSafe(c.CdrType),
+        ArrayType a => a.SimpleP != false && ElementTypeIsUpgraded(a),
         NegationType neg => WitnessSafe(neg.Inner),
         UnionType u => System.Array.TrueForAll(u.Types, WitnessSafe),
         IntersectionType i => System.Array.TrueForAll(i.Types, WitnessSafe),
         _ => false,
     };
+
+    /// <summary>Is the element type one arrays are made of, so TYPEP and the algebra agree?</summary>
+    private static bool ElementTypeIsUpgraded(ArrayType a)
+    {
+        string? name = a.ElementSpec switch
+        {
+            null => a.ElementType is NamedType n ? n.Name : null,
+            Nil => "NIL",
+            T => "T",
+            Symbol sym => sym.Name,
+            _ => null,
+        };
+        return name is "*" or "T" or "NIL" or "CHARACTER" or "BASE-CHAR" or "BIT"
+            or "SINGLE-FLOAT" or "DOUBLE-FLOAT";
+    }
 
     /// <summary>
     /// One object of each of many built-in kinds: numbers of every class and both
@@ -1802,6 +2077,10 @@ public static class CTypeOps
             " #.(cl:make-array 3 :element-type 'cl:bit :adjustable cl:t)" +
             " #.(cl:make-array 2 :element-type 'cl:fixnum :initial-element 0)" +
             " #.(cl:make-array 2 :element-type 'cl:double-float :initial-element 0d0)" +
+            " #.(cl:make-array 0 :element-type cl:nil) #.(cl:make-string 1 :element-type 'cl:base-char)" +
+            " #.(cl:make-array 2 :element-type 'cl:base-char :adjustable cl:t :initial-element #\\a)" +
+            " #.(cl:code-char 1) #.(cl:code-char 955)" +
+            " #.(cl:make-array '(2 2) :element-type 'cl:bit)" +
             " #.(cl:make-hash-table) #.(cl:find-package \"COMMON-LISP\") #.(cl:function cl:car))";
         var syms = new[] { "*READTABLE*", "*READ-BASE*", "*READ-SUPPRESS*", "*READ-EVAL*",
                            "*READ-DEFAULT-FLOAT-FORMAT*" };
@@ -1905,6 +2184,11 @@ public static class CTypeOps
             }
             case SatisfiesType sat:
                 return new Cons(Startup.Sym("SATISFIES"), new Cons(sat.Predicate, Nil.Instance));
+            case ArrayType arr:
+                return Runtime.List(Startup.Sym(arr.SimpleP == true ? "SIMPLE-ARRAY" : "ARRAY"),
+                    arr.ElementType is NamedType { Name: "*" } ? Startup.Sym("*")
+                        : arr.ElementSpec ?? CTypeToSpecifier(arr.ElementType),
+                    arr.Dimensions ?? Startup.Sym("*"));
             case ConsType cons:
                 return new Cons(Startup.Sym("CONS"),
                     new Cons(CTypeToSpecifier(cons.CarType),
@@ -1970,7 +2254,7 @@ public static class CTypeOps
         ["RATIO"] = "NUMBER", ["FLOAT"] = "NUMBER",
         ["SINGLE-FLOAT"] = "NUMBER", ["DOUBLE-FLOAT"] = "NUMBER",
         ["SHORT-FLOAT"] = "NUMBER", ["LONG-FLOAT"] = "NUMBER",
-        ["COMPLEX"] = "NUMBER",
+        ["COMPLEX"] = "NUMBER", ["DECIMAL"] = "NUMBER",
         // CHARACTER group
         ["CHARACTER"] = "CHARACTER", ["BASE-CHAR"] = "CHARACTER",
         ["STANDARD-CHAR"] = "CHARACTER", ["EXTENDED-CHAR"] = "CHARACTER",

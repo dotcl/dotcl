@@ -28,7 +28,7 @@ internal static class DotclHttp
         new(new HttpClientHandler { AllowAutoRedirect = false });
 
     private static string AsString(LispObject o) =>
-        o is LispString s ? s.Value : o.ToString()!;
+        Runtime.StringValueOrNull(o) ?? o.ToString()!;
 
     // Some hosts refuse a request with no User-Agent outright, api.github.com
     // answers 403, so send one by default. A header supplied by the caller

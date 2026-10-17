@@ -111,6 +111,10 @@ the slots are the axes NUGET:RESOLVE identifies a package by."))
 (defmethod asdf:output-files ((o asdf:operation) (c nuget-package))
   (values nil t))
 
+(defun %component-source (c)
+  (let ((dir (asdf:component-pathname (asdf:component-system c))))
+    (nuget::%absolute-source (nuget-source c) (and dir (namestring dir)))))
+
 (defun %require-arguments (c)
   "The keyword arguments for NUGET:REQUIRE, omitting the ones left unset so the
 defaults in NUGET:RESOLVE apply."
@@ -118,7 +122,7 @@ defaults in NUGET:RESOLVE apply."
     (when (nuget-tfm c) (setf args (list* :tfm (nuget-tfm c) args)))
     (when (nuget-rid c) (setf args (list* :rid (nuget-rid c) args)))
     (when (nuget-prerelease c) (setf args (list* :prerelease (nuget-prerelease c) args)))
-    (when (nuget-source c) (setf args (list* :source (nuget-source c) args)))
+    (when (nuget-source c) (setf args (list* :source (%component-source c) args)))
     (when (nuget-version c) (setf args (list* :version (nuget-version c) args)))
     args))
 
@@ -140,7 +144,7 @@ spec does not belong there. Write :NUGET-VERSION ~S instead."
 (defun %request (c)
   (nuget::make-req (asdf:component-name c)
                    (nuget::%spec (nuget-version c) (nuget-prerelease c))
-                   (nuget-source c)
+                   (%component-source c)
                    :declared))
 
 (defun %declare (components &key rid)
@@ -446,12 +450,6 @@ so the files the systems name as components are not enough."
                                          (asdf:component-name (first systems)))))
           (%tree-files dir skip)))
 
-(defun %fasl-directory (fasl)
-  "The directory FASL is in, as a namestring that keeps its device (the drive on
-Windows). DIRECTORY-NAMESTRING leaves the device out, so the search for siblings
-ran on the current drive, and a sibling found there had a shorter name than FASL."
-  (namestring (make-pathname :name nil :type nil :version nil :defaults (pathname fasl))))
-
 (defun %sibling-entry (rel fasl sib)
   "The relative path SIB, an R2R sibling of FASL, ships under when FASL ships as
 REL: REL followed by what SIB's file name adds to FASL's."
@@ -459,12 +457,33 @@ REL: REL followed by what SIB's file name adds to FASL's."
         (sib-name (dotnet:static "System.IO.Path" "GetFileName" sib)))
     (concatenate 'string rel (subseq sib-name (length fasl-name)))))
 
-(defun %group-fasls (dir systems)
+(defun %host-rid ()
+  "The os-arch RID DOTCL:WRITE-R2R-SIBLING names siblings with."
+  (let ((arch (string-downcase
+               (dotnet:invoke
+                (dotnet:static "System.Runtime.InteropServices.RuntimeInformation"
+                               "get_ProcessArchitecture")
+                "ToString"))))
+    (concatenate 'string
+                 (cond ((dotnet:static "System.OperatingSystem" "IsWindows") "win")
+                       ((dotnet:static "System.OperatingSystem" "IsMacOS") "osx")
+                       (t "linux"))
+                 "-" arch)))
+
+(defun %fresh-sibling (fasl rid)
+  "FASL.r2r-<RID> when it exists and is not older than FASL (an older one is
+left from an earlier compile)."
+  (let ((sib (concatenate 'string fasl ".r2r-" rid)))
+    (when (and (dotnet:static "System.IO.File" "Exists" sib)
+               (not (nuget::%newer-p fasl sib)))
+      sib)))
+
+(defun %group-fasls (dir systems &optional rid)
   "The compiled files of SYSTEMS (already compiled), as (values ENTRIES PAIRS).
 ENTRIES are (absolute-path . relative-path): each source's fasl ships as
-<source>.fasl beside it, and an R2R sibling ASDF left beside the fasl as
-<source>.fasl.r2r-<rid>, the name the loader looks for. PAIRS are
-(fasl-relative-path . source-relative-path), for the consumer to place them."
+<source>.fasl beside it, and, when RID is given, its fresh R2R sibling for RID
+as <source>.fasl.r2r-<RID>. Other siblings in the compile cache stay out. PAIRS
+are (fasl-relative-path . source-relative-path), for the consumer to place them."
   (let ((entries '()) (pairs '()))
     (dolist (s systems)
       (dolist (c (%source-files s))
@@ -476,32 +495,20 @@ ENTRIES are (absolute-path . relative-path): each source's fasl ships as
             (when (probe-file fasl)
               (push (cons fasl rel) entries)
               (push (cons rel src-rel) pairs)
-              (dolist (sib (nuget::%dir-files
-                            (%fasl-directory fasl)
-                            (format nil "~A.r2r-*"
-                                    (dotnet:static "System.IO.Path" "GetFileName" fasl))))
-                ;; A sibling older than its fasl was made from an earlier
-                ;; compile; the loader would ignore it, and shipping it
-                ;; re-dated would make it be used.
-                (unless (nuget::%newer-p fasl sib)
-                  (push (cons sib (%sibling-entry rel fasl sib))
-                        entries))))))))
+              (let ((sib (and rid (%fresh-sibling fasl rid))))
+                (when sib
+                  (push (cons sib (%sibling-entry rel fasl sib)) entries))))))))
     (values (nreverse entries) (nreverse pairs))))
 
 (defun %write-r2r-siblings (systems)
   "Give every compiled file of SYSTEMS a ReadyToRun sibling for this platform,
 unless it has a fresh one. Returns how many were written."
-  (let ((n 0))
+  (let ((n 0) (rid (%host-rid)))
     (dolist (s systems n)
       (dolist (c (%source-files s))
         (when (typep c 'asdf:cl-source-file)
           (let ((fasl (namestring (first (asdf:output-files 'asdf:compile-op c)))))
-            (when (and (probe-file fasl)
-                       (null (remove-if (lambda (sib) (nuget::%newer-p fasl sib))
-                                        (nuget::%dir-files
-                                         (%fasl-directory fasl)
-                                         (format nil "~A.r2r-*"
-                                                 (dotnet:static "System.IO.Path" "GetFileName" fasl))))))
+            (when (and (probe-file fasl) (null (%fresh-sibling fasl rid)))
               (when (dotcl:write-r2r-sibling fasl) (incf n)))))))))
 
 (defun %build-record (pairs)
@@ -560,7 +567,7 @@ DESCRIPTION to its :author and :description.
 
 With FASL (the default) the systems are loaded first, which compiles them, their
 sources are checked as CHECK-PORTABILITY-OP does (a FASL-PORTABILITY-WARNING when
-something is found; the package is written all the same), and each group's fasls -- and any R2R siblings beside them -- go in next to the
+something is found; the package is written all the same), and each group's fasls go in next to the
 sources, with dotcl-build.sexp saying which dotcl made them and on which OS and
 CPU. A consumer on the same OS and CPU loads them without compiling, also under
 another dotcl (after a NUGET:FASL-VERSION-MISMATCH warning); on another platform
@@ -568,8 +575,8 @@ it compiles the sources, which are always there.
 
 With R2R, each fasl first gets a ReadyToRun sibling for this platform, compiled
 against the running dotcl -- the same dotcl the consumer has to run to use the
-fasls at all. Siblings for other platforms are the command line's business
-(`dotcl pack --library --r2r --from`)."
+fasls at all -- and only that sibling goes in. Siblings for other platforms are the command line's business
+(`dotcl pack --library`)."
   (let* ((roots (mapcar (lambda (s) (if (typep s 'asdf:system) s (asdf:find-system s)))
                         (if (listp systems) systems (list systems))))
          (first-root (first roots))
@@ -616,7 +623,8 @@ fasls at all. Siblings for other platforms are the command line's business
                             do (%zip-add zip from (concatenate 'string prefix
                                                                (substitute #\/ #\\ rel))))
                       (when fasl
-                        (multiple-value-bind (entries pairs) (%group-fasls dir group)
+                        (multiple-value-bind (entries pairs)
+                            (%group-fasls dir group (and r2r (%host-rid)))
                           (when entries
                             (loop for (from . rel) in entries
                                   do (%zip-add zip from (concatenate 'string prefix

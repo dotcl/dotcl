@@ -67,12 +67,14 @@
       (error "cannot locate this process's executable")))
 
 (defun scz-image ()
-  "The --core this process was started on, if any, for the child to use too."
+  "The --core this process was started on, else compiler/dotcl.core
+(REGRESSION-CHILD-CORE): a child never assembles cil-out.sil."
   (let* ((args (dotnet:static "System.Environment" "GetCommandLineArgs"))
          (count (dotnet:invoke args "Length")))
-    (loop for i below (1- count)
-          when (equal (dotnet:invoke args "GetValue" i) "--core")
-            return (list "--core" (dotnet:invoke args "GetValue" (1+ i))))))
+    (or (loop for i below (1- count)
+              when (equal (dotnet:invoke args "GetValue" i) "--core")
+                return (list "--core" (dotnet:invoke args "GetValue" (1+ i))))
+        (list "--core" (regression-child-core)))))
 
 (defun scz-run (args text)
   "Run dotcl with ARGS and the characters of TEXT, all below 256, on standard

@@ -128,6 +128,31 @@
         (%fcb-call (lambda () (values 1 2)) '() nil))
   (7 5 nil))
 
+;;; A non-local exit out of a native callback can not unwind native frames; it
+;;; continues when the native call returns, and the next call works again.
+(deftest ffi-callback-throw-reaches-caller
+  (list (catch 'out (%fcb-call (lambda () (throw 'out :thrown)) '() :int))
+        (handler-case (%fcb-call (lambda (x) (error "boom ~a" x)) '(:int) :int 3)
+          (error (e) (princ-to-string e)))
+        (%fcb-call (lambda (x) (1+ x)) '(:int) :int 41))
+  (:thrown "boom 3" 42))
+
+;;; Nested: the inner callback's exit is caught inside the outer callback.
+(deftest ffi-callback-throw-nested-caught-inside
+  (%fcb-call (lambda ()
+               (+ 100 (catch 'in (%fcb-call (lambda () (throw 'in 5)) '() :int))))
+             '() :int)
+  105)
+
+;;; An unwind-protect cleanup in the callback runs on the way out.
+(deftest ffi-callback-throw-runs-cleanup
+  (let ((log '()))
+    (catch 'out
+      (%fcb-call (lambda () (unwind-protect (throw 'out nil) (push :cleanup log)))
+                 '() :pointer))
+    log)
+  (:cleanup))
+
 ;;; --- dotcl:*foreign-callback-propagate* (opt-in) ---
 ;;; Containment keeps a .NET-driven loop alive, but a callback that Lisp itself
 ;;; triggered (a lambda handed to a .NET API) is far easier to debug when the error

@@ -551,6 +551,61 @@ public static partial class Runtime
     private static bool IsStandardChar(char c)
         => c == '\n' || (c >= ' ' && c <= '~');
 
+    internal const int BaseCharCodeLimit = 128;
+
+    internal static LispVector MakeBaseString(string chars)
+    {
+        var v = new LispVector(chars.Length, Nil.Instance, "BASE-CHAR");
+        for (int i = 0; i < chars.Length; i++)
+            v.CharSet(i, CheckBaseChar(chars[i]));
+        return v;
+    }
+
+    static char CheckBaseChar(char c)
+    {
+        if (c >= BaseCharCodeLimit)
+            throw new LispErrorException(new LispTypeError(
+                "not a BASE-CHAR", LispChar.Make(c), Startup.Sym("BASE-CHAR")));
+        return c;
+    }
+
+    /// <summary>A new simple base string with the characters of a list or vector,
+    /// or null when SEQ is neither.</summary>
+    internal static LispVector? BaseStringFromSequence(LispObject seq)
+    {
+        static char Elt(LispObject e) => e is LispChar c
+            ? CheckBaseChar(c.Value)
+            : throw new LispErrorException(new LispTypeError("COERCE: element not a character", e, Startup.Sym("BASE-CHAR")));
+        switch (seq)
+        {
+            case Nil:
+                return new LispVector(0, Nil.Instance, "BASE-CHAR");
+            case Cons:
+            {
+                int n = 0;
+                for (var p = seq; p is Cons pc; p = pc.Cdr) n++;
+                var v = new LispVector(n, Nil.Instance, "BASE-CHAR");
+                int i = 0;
+                for (var p = seq; p is Cons pc; p = pc.Cdr) v.CharSet(i++, Elt(pc.Car));
+                return v;
+            }
+            case LispString str:
+            {
+                var v = new LispVector(str.Length, Nil.Instance, "BASE-CHAR");
+                for (int i = 0; i < str.Length; i++) v.CharSet(i, CheckBaseChar(str[i]));
+                return v;
+            }
+            case LispVector { Rank: 1 } vec:
+            {
+                var v = new LispVector(vec.Length, Nil.Instance, "BASE-CHAR");
+                for (int i = 0; i < vec.Length; i++) v.CharSet(i, Elt(vec.ElementAt(i)));
+                return v;
+            }
+            default:
+                return null;
+        }
+    }
+
     public static LispObject TypeOf(LispObject obj) => obj switch
     {
         Nil => Startup.Sym("NULL"),
@@ -564,10 +619,10 @@ public static partial class Runtime
         Cons => Startup.Sym("CONS"),
         Symbol sym2 when sym2.HomePackage?.Name == "KEYWORD" => Startup.Sym("KEYWORD"),
         Symbol => Startup.Sym("SYMBOL"),
-        LispString => Startup.Sym("SIMPLE-BASE-STRING"),
+        LispString ls => Runtime.List(Startup.Sym("SIMPLE-ARRAY"), Startup.Sym("CHARACTER"), Runtime.List(Fixnum.Make(ls.Length))),
         LispChar c when IsStandardChar(c.Value) => Startup.Sym("STANDARD-CHAR"),
-        LispChar c when c.Value <= '\x7F' => Startup.Sym("BASE-CHAR"),
-        LispChar => Startup.Sym("CHARACTER"),
+        LispChar c when c.Value < BaseCharCodeLimit => Startup.Sym("BASE-CHAR"),
+        LispChar => Startup.Sym("EXTENDED-CHAR"),
         MethodCombinationObject => Startup.Sym("METHOD-COMBINATION"),
         EqlSpecializer => Startup.Sym("EQL-SPECIALIZER"),
         GenericFunction gf when gf.StoredClass != null => gf.StoredClass.Name,
@@ -577,8 +632,9 @@ public static partial class Runtime
         // the more specific answer, and code compares TYPE-OF against it.
         LispVector v when v.IsBitVector && v.IsSimple && v.Rank == 1 => Runtime.List(Startup.Sym("SIMPLE-BIT-VECTOR"), Fixnum.Make(v.Dimensions[0])),
         LispVector v when v.IsBitVector && v.Rank == 1 => Startup.Sym("BIT-VECTOR"),
-        LispVector v when v.IsCharVector && v.ElementTypeName != "NIL" && v.IsSimple && v.Rank == 1 => Startup.Sym("SIMPLE-BASE-STRING"),
-        LispVector v when v.IsCharVector && v.ElementTypeName != "NIL" && v.Rank == 1 => Startup.Sym("BASE-STRING"),
+        LispVector v when v.IsBaseCharVector && v.Rank == 1 => Runtime.List(Startup.Sym(v.IsSimple ? "SIMPLE-BASE-STRING" : "BASE-STRING"), Fixnum.Make(v.Dimensions[0])),
+        LispVector v when v.ElementTypeName == "CHARACTER" && v.IsSimple && v.Rank == 1 => Runtime.List(Startup.Sym("SIMPLE-ARRAY"), Startup.Sym("CHARACTER"), Runtime.List(Fixnum.Make(v.Dimensions[0]))),
+        LispVector v when v.ElementTypeName == "CHARACTER" && v.Rank == 1 => Runtime.List(Startup.Sym("VECTOR"), Startup.Sym("CHARACTER"), Fixnum.Make(v.Dimensions[0])),
         LispVector v when v.IsCharVector && v.ElementTypeName == "NIL" => VectorTypeOf(v),
         LispVector v when !v.IsCharVector && !v.IsBitVector && v.IsSimple && v.ElementTypeName == "T" && v.Rank == 1 => Runtime.List(Startup.Sym("SIMPLE-VECTOR"), Fixnum.Make(v.Dimensions[0])),
         LispVector v when v.Rank == 1 && v.IsSimple => VectorTypeOf(v), // (SIMPLE-ARRAY et (n))
@@ -587,6 +643,7 @@ public static partial class Runtime
         LispVector v => VectorTypeOf(v),
         LispReadtable => Startup.Sym("READTABLE"),
         LispRandomState => Startup.Sym("RANDOM-STATE"),
+        LispSimdPack sp => Startup.SymInPkg(SimdInfo.Name(sp.Kind), "DOTCL-SIMD"),
         LispWeakPointer => Startup.Sym("WEAK-POINTER"),
         LispPprintDispatchTable => Startup.Sym("PPRINT-DISPATCH-TABLE"),
         LispMethod lmeta when lmeta.MetaClass != null => lmeta.MetaClass.Name,
@@ -640,7 +697,8 @@ public static partial class Runtime
     private static LispObject VectorTypeOf(LispVector v)
     {
         bool isSimple = v.IsSimple;
-        string elemTypeName = (v.IsCharVector && v.ElementTypeName != "NIL") ? "CHARACTER" : v.IsBitVector ? "BIT" : (v.ElementTypeName ?? "T");
+        string elemTypeName = v.IsBaseCharVector ? "BASE-CHAR"
+            : (v.IsCharVector && v.ElementTypeName != "NIL") ? "CHARACTER" : v.IsBitVector ? "BIT" : (v.ElementTypeName ?? "T");
         var head = isSimple ? Startup.Sym("SIMPLE-ARRAY") : Startup.Sym("ARRAY");
         var elem = ElemTypeSpecifier(elemTypeName);
         LispObject dimList;
@@ -698,6 +756,23 @@ public static partial class Runtime
         if (ReferenceEquals(obj, Nil.Instance)) return Nil.Instance;
         throw new LispErrorException(new LispTypeError(CdrTypeErrorMessage(obj), obj, Startup.Sym("LIST")));
     }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static bool IsTrueEndp(LispObject obj)
+    {
+        if (obj is Cons) return false;
+        if (ReferenceEquals(obj, Nil.Instance)) return true;
+        return IsTrueEndpSlow(obj);
+    }
+
+    private static bool IsTrueEndpSlow(LispObject obj)
+    {
+        if (obj is MvReturn mv) return IsTrueEndp(mv.PrimaryValue);
+        throw TypedEntryTypeError(obj, Startup.Sym("LIST"));
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static LispObject Endp(LispObject obj) => IsTrueEndp(obj) ? T.Instance : Nil.Instance;
 
     /// <summary>Built outside CDR so the inlined fast path stays small.</summary>
     private static string CdrTypeErrorMessage(LispObject obj)
@@ -1444,7 +1519,7 @@ public static partial class Runtime
         if (tv._displacedTo != null || sv._displacedTo != null
             || tv._dimensions != null || sv._dimensions != null
             || tv._bitData != null || sv._bitData != null
-            || !string.Equals(tv.ElementTypeName, sv.ElementTypeName, StringComparison.Ordinal))
+            || !SameElementTypeName(tv.ElementTypeName, sv.ElementTypeName))
             return false;
         if (tv._numData != null || sv._numData != null)
         {
@@ -1757,6 +1832,15 @@ public static partial class Runtime
         if (ht.TryGet(key, out var value))
             return MultipleValues.Values2Primary(value, T.Instance);
         return MultipleValues.Values2Primary(defaultValue ?? Nil.Instance, Nil.Instance);
+    }
+
+    public static LispObject GethashPair(LispObject key, LispObject table, LispObject? defaultValue = null)
+    {
+        if (table is not LispHashTable ht)
+            throw new LispErrorException(new LispTypeError("GETHASH: not a hash-table", table));
+        if (ht.TryGet(key, out var value))
+            return MultipleValues.Values2Pair(value, T.Instance);
+        return MultipleValues.Values2Pair(defaultValue ?? Nil.Instance, Nil.Instance);
     }
     public static LispObject HashTablePairs(LispObject table)
     {

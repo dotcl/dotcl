@@ -3,6 +3,157 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.34 -- 2026-10-17
+
+This release adds `dotcl-simd`, a contrib with 128-bit SIMD types and
+operations, and speeds up several kinds of typed numeric code. Several changes
+make code that used to run quietly signal an error or return a different
+value; they are listed under Upgrading.
+
+### Upgrading
+
+- **Declared argument types are checked on entry at safety 1 or higher**
+  (`defun`, `lambda`, `flet`, `labels`, `defmethod`, and `ftype`
+  declarations), compiled and interpreted. A wrong argument signals
+  TYPE-ERROR. `(safety 0)` skips the check.
+- **`base-char` is a character with code below 128, and a string of element
+  type `character` is no longer a `base-string`.** `(type-of "abc")` is now
+  `(SIMPLE-ARRAY CHARACTER (3))`.
+- **`upgraded-array-element-type` and `make-array` round integer element
+  types up to a fixed list of widths.** `(integer -10 0)` gives
+  `(signed-byte 8)` (it gave `(signed-byte 5)`), and `(unsigned-byte 3)`
+  gives `(unsigned-byte 4)`.
+- **Loading a fasl built by a different dotcl core signals
+  `DOTCL:FASL-VERSION-MISMATCH`** (restarts `LOAD-AS-IS` and `CONTINUE`); it
+  used to warn and load. ASDF recompiles by itself.
+- **`subtypep` splits `real` into `rational`, `float` and `dotcl:decimal`**,
+  so `(subtypep 'real '(or rational float))` is `NIL, T`.
+- **`random-state` is MT19937.** A seed gives different numbers than in
+  0.1.33, and the printed form is `#S(RANDOM-STATE :STATE ...)`.
+- **`class-of` returns `fixnum` or `bignum`** instead of `integer`.
+- **Standard method combination:** `:before` and `:after` methods no longer
+  contribute values, and operator combinations (`and`, `+`, `append`, ...) use
+  each method's primary value only.
+- **Unused lexical variables produce a STYLE-WARNING.**
+- **In a script, an unhandled runtime error calls `*debugger-hook*`.**
+- **`thread-join` on the calling thread signals an error** instead of hanging.
+- **`file-position` on a string input stream counts from `:start`.**
+- **`coerce` of a sequence containing `nil` to a numeric or bit vector signals
+  TYPE-ERROR** (it stored 0).
+- **A Gray stream that inherits only a binary class has no character
+  defaults**: `read-line`, `format` and the like signal
+  NO-APPLICABLE-METHOD-ERROR. Inherit a `fundamental-character-*-stream` class
+  too.
+- **A published app that uses `DotclProjectAsd` includes only the contribs its
+  manifests require.** `DotclPublishAllContribs=true` restores all of them.
+- **`dotcl pack --library` builds ReadyToRun code for the six desktop
+  platforms by default** (`--no-r2r` turns it off).
+- **`--` on the command line ends dotcl's own options.**
+- **`launch-process` starts the child in its own process group** unless
+  `:input t` (Unix).
+- **On Windows, `warn` and `trace` end lines with LF.**
+- **`dotcl-lsp-api` is renamed `dotcl-code-info`**, with no alias.
+
+### Added
+
+- **`dotcl-simd`** (`(require "dotcl-simd")`): ten 128-bit pack types
+  (`f64.2`, `f32.4`, `s64.2` ... `u8.16`), arithmetic, comparisons, shifts,
+  horizontal operations, conversions and array access, with the names sb-simd
+  uses. On net8 and net10 they use `Vector128<T>`; on netstandard2.0 they run
+  lane by lane. Compiled code keeps packs unboxed in nested operations and in
+  `let`, `let*`, `do` variables and `defun` arguments declared with a pack
+  type; elsewhere a pack is a boxed object. See docs/dotcl-simd.md.
+- **`dotcl-repl:run-repl`** runs the REPL on a terminal supplied by a host
+  program (`dotcl-repl:make-terminal`), for programs that embed dotcl.
+- **`dotcl:definition-sources` / `dotcl:definition-source`** list where each
+  function, macro, method, variable, class and package was defined.
+- **Gray streams follow the Gray stream proposal more closely** (direction is
+  no longer decided by the class, `read-line` calls `stream-read-line`,
+  `close` makes `open-stream-p` false).
+- **`&environment` carries the lexical environment**, and `dotcl-cltl2`
+  answers from it.
+- **Counterparts of `sb-ext` functions:** `dotcl:posix-environ`,
+  `dotcl:getpid`, `dotcl:string-to-octets`, `dotcl:octets-to-string`,
+  `dotcl:*exit-hooks*`, `dotcl:pretty-stream-p`; `float-nan-p` and
+  `float-infinity-p` in `dotcl-float`.
+- **Contribs `dotcl-bsd-sockets`** (TCP and UDP sockets with the
+  `sb-bsd-sockets` interface) **and `dotcl-rotate-byte`** (the
+  `sb-rotate-byte` `rotate-byte`).
+- **Division-by-zero conditions carry `operation` and `operands`.**
+- **`launch-process` accepts any Lisp stream** for `:input`, `:output` and
+  `:error`.
+- **A NuGet `:source` can be a relative path.**
+- **`quickload` can load a prebuilt nupkg listed by the dist** for this dotcl
+  version and platform. The dist lists none yet.
+
+### Faster
+
+Numbers are from one Mac unless marked Linux (one x86-64 machine), minimum of
+alternating runs.
+
+- single-float code no longer boxes in declared and inferred `let` variables.
+- Multiple values read at once by the caller do not allocate (`gethash` 40 B
+  to 0 B).
+- Calls: a direct call within a file, `funcall`, typed `defun`s and
+  `&optional`/`&key` entries cost less (`funcall` 5.05 to 4.07 ns per loop).
+- Generic function dispatch: two arguments of five classes 30.3 to 17.6 ns.
+- `(unsigned-byte 64)` arguments, slots and `ldb`/`dpb` use raw 64-bit values
+  (ironclad SHA-256 over one block about 7.6 to 0.54 us).
+- Bignum `*` up to 2048 bits, and `mod`/`rem` by multi-word divisors.
+- `(loop for x in l ...)` 8.8 to 1.95 ns per element.
+- Compiling: alexandria 9.8 to 1.9 s, generic-cl 18.2 to 12.1 s.
+- Fasls with large octet-vector literals store them packed.
+- `write-sequence` of an octet vector no longer flushes on every call;
+  `format` and `princ` compute the output column only when needed.
+- A `PublishReadyToRun` publish also precompiles the shipped fasls (process
+  start-up on a Mac 335 to 177 ms).
+- cl-bench against 0.1.33 (Linux, 57 kernels): geometric mean 0.967.
+  `clos/defmethod` and `clos/complex-methods` are slower by 30% and 17%.
+
+### Libraries
+
+docs/library-status.md (425 libraries, one Mac, the dist overlay) lists 134
+that load and pass their own tests (114 in 0.1.33) and 22 that do not load
+(32). Part of the change is the measuring script reading more test output, not
+dotcl. Coalton's tests pass on Coalton's upstream main; the 2026-01 Quicklisp
+release of Coalton does not load.
+
+### Windows
+
+- Variadic C calls on x64 pass `double` correctly (`sprintf` with `%f`).
+- A loaded fasl that is overwritten or removed by NuGet is renamed out of the
+  way.
+- `dotnet:find-symbol-any` also searches modules already loaded into the
+  process.
+
+### Browser (browser-wasm)
+
+The browser build starts again; builds against 0.1.27 through 0.1.33 stopped
+while loading the core. browser-wasm is not a supported target.
+
+### Fixed
+
+- `coerce` to a simple array type copies a fill-pointer or adjustable vector
+  instead of returning it.
+- A `defmethod` body declaration applies as in `defun`.
+- `make-pathname`, `launch-process` and .NET entry points accept fill-pointer
+  and displaced strings.
+- x86-64 System V variadic C calls set the vector-register count.
+- Warnings muffled by an outer `handler-bind` no longer count in
+  `compile-file`'s `warnings-p` and `failure-p`.
+- `defsetf`, `define-setf-expander`, `define-compiler-macro` and `deftype`
+  keep declarations at the head of their bodies.
+- After C# catches an error from a Lisp callback, a later non-local exit no
+  longer loops or crashes.
+- On macOS and Linux, overwriting a loaded fasl no longer breaks its uncalled
+  functions.
+- `interrupt-thread` reaches a thread blocked reading a socket.
+
+### Thanks
+
+- Bohong Huang -- for reporting that `coerce` to a simple array type returned
+  the original fill-pointer or adjustable vector.
+
 ## v0.1.33 -- 2026-10-09
 
 This is a performance release. For small kernels whose types are declared,

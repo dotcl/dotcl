@@ -18,6 +18,41 @@ internal static class GrayStreamLookup
         }
         return Startup.Sym(name).Function as LispFunction;
     }
+
+    internal sealed class Cached(string name)
+    {
+        private Symbol? _sym;
+        private int _epoch;
+
+        public LispFunction? Get()
+        {
+            var sym = _sym;
+            if (sym != null && _epoch == Package.MappingEpoch && sym.Function is LispFunction fn)
+                return fn;
+            return Resolve();
+        }
+
+        private LispFunction? Resolve()
+        {
+            int epoch = Package.MappingEpoch;
+            var grayPkg = Package.FindPackage("DOTCL-GRAY");
+            if (grayPkg != null)
+            {
+                var (gsym, gstatus) = grayPkg.FindSymbol(name);
+                if (gstatus != SymbolStatus.None && gsym.Function is LispFunction gfn)
+                {
+                    _epoch = epoch;
+                    _sym = gsym;
+                    return gfn;
+                }
+            }
+            _sym = null;
+            return Startup.Sym(name).Function as LispFunction;
+        }
+    }
+
+    internal static readonly Cached StreamWriteByte = new("STREAM-WRITE-BYTE");
+    internal static readonly Cached StreamReadByte = new("STREAM-READ-BYTE");
 }
 
 /// <summary>

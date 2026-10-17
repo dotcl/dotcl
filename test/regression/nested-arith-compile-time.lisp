@@ -41,3 +41,17 @@
 (deftest nested-arith-mixed-logand
   (list (%nact-mixed-fn 0) (%nact-mixed-fn 1000))
   (900 1900))
+
+;;; The answers about operands are kept across the levels of one native int64
+;;; chain, but not across a form that is compiled on its own: here the same
+;;; operand cons (+ v 1) appears under a FIXNUM V and under a bignum V, and only
+;;; the first may be computed in raw int64.
+(defmacro %nact-twice-env (form)
+  `(+ (let ((v 1)) (declare (fixnum v)) (logand ,form 255))
+      (let ((v (expt 2 70))) (logand ,form 255))))
+
+(defun %nact-twice-env-fn () (%nact-twice-env (+ v 1)))
+
+(deftest nested-arith-shared-operand-two-envs
+  (%nact-twice-env-fn)
+  3)

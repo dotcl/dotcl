@@ -61,6 +61,12 @@ public static class ReplColor
     /// <summary>True when text written to standard error is painted.</summary>
     public static volatile bool Err;
 
+    /// <summary><see cref="Out"/>, or on the thread of a hosted REPL, its own setting.</summary>
+    public static bool OutOn => ReplLoop.Hosted ? ReplLoop.HostColor : Out;
+
+    /// <summary>As <see cref="OutOn"/>, for <see cref="Err"/>.</summary>
+    public static bool ErrOn => ReplLoop.Hosted ? ReplLoop.HostColor : Err;
+
     /// <summary>
     /// The SGR parameters each role is painted with unless DOTCL_COLORS or
     /// <see cref="SetColors"/> says otherwise. Only the 16 basic colours and
@@ -215,20 +221,23 @@ public static class ReplColor
     }
 
     /// <summary>TEXT as it should be written to standard output.</summary>
-    public static string ForOut(string role, string text) => Paint(role, text, Out);
+    public static string ForOut(string role, string text) => Paint(role, text, OutOn);
 
     /// <summary>TEXT as it should be written to standard error.</summary>
-    public static string ForErr(string role, string text) => Paint(role, text, Err);
+    public static string ForErr(string role, string text) => Paint(role, text, ErrOn);
 
     /// <summary>
     /// TEXT as it should be written to STREAM: painted only when STREAM is the
-    /// process's own standard output or standard error. A stream a program has
-    /// bound *ERROR-OUTPUT* to (a string, a file) gets the text as it is.
+    /// process's own standard output or standard error, or a hosted REPL's. A
+    /// stream a program has bound *ERROR-OUTPUT* to (a string, a file) gets the
+    /// text as it is.
     /// </summary>
     public static string ForStream(string role, string text, LispObject? stream)
     {
         if (stream != null && ReferenceEquals(stream, Startup.ErrorOutput)) return ForErr(role, text);
         if (stream != null && ReferenceEquals(stream, Startup.StandardOutput)) return ForOut(role, text);
+        if (ReplLoop.IsHostStream(stream, true)) return ForErr(role, text);
+        if (ReplLoop.IsHostStream(stream, false)) return ForOut(role, text);
         return text;
     }
 }

@@ -245,13 +245,21 @@ public static partial class Runtime
     {
         if (alist is not Nil && alist is not Cons)
             throw new LispErrorException(new LispTypeError("ASSOC: not a list", alist, Startup.Sym("LIST")));
+        // A symbol (other than the T and NIL symbols, which are EQL to the T and
+        // NIL objects) is EQL to exactly itself, so the test is an identity
+        // check. The tree-walk evaluator's environment is an alist keyed by
+        // symbols, and it looks names up in it several times per form.
+        key = Primary(key);
+        bool symKey = key is Symbol
+            && !ReferenceEquals(key, Startup.T_SYM) && !ReferenceEquals(key, Startup.NIL_SYM);
         var current = alist;
         while (current is Cons c)
         {
             var entry = c.Car;
             if (entry is not Nil && entry is not Cons)
                 throw new LispErrorException(new LispTypeError("ASSOC: alist entry is not a cons", entry, Startup.Sym("CONS")));
-            if (entry is Cons pair && IsTrueEql(key, pair.Car))
+            if (entry is Cons pair
+                && (symKey ? ReferenceEquals(key, Primary(pair.Car)) : IsTrueEql(key, pair.Car)))
                 return pair;
             current = c.Cdr;
         }
@@ -548,6 +556,73 @@ public static partial class Runtime
         return fn.Invoke(args);
     }
 
+    /// <summary>APPLY, APPLYSPREAD1 and APPLYSPREAD2 with the caller's value mode
+    /// (MultipleValues.TakeMode), handed to the callee when it gets at most four
+    /// arguments.</summary>
+    public static LispObject ApplyM(LispObject func, LispObject argList, int mode)
+    {
+        var fn = CoerceToFunction(func);
+        switch (ApplyTailLength(argList))
+        {
+            case 0: return fn.Invoke0M(mode);
+            case 1: return fn.Invoke1M(((Cons)argList).Car, mode);
+            case 2:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr;
+                return fn.Invoke2M(c0.Car, c1.Car, mode);
+            }
+            case 3:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr; var c2 = (Cons)c1.Cdr;
+                return fn.Invoke3M(c0.Car, c1.Car, c2.Car, mode);
+            }
+            case 4:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr; var c2 = (Cons)c1.Cdr; var c3 = (Cons)c2.Cdr;
+                return fn.Invoke4M(c0.Car, c1.Car, c2.Car, c3.Car, mode);
+            }
+        }
+        return Apply(fn, argList);
+    }
+
+    public static LispObject ApplySpread1M(LispObject func, LispObject a, LispObject argList, int mode)
+    {
+        var fn = CoerceToFunction(func);
+        switch (ApplyTailLength(argList))
+        {
+            case 0: return fn.Invoke1M(a, mode);
+            case 1: return fn.Invoke2M(a, ((Cons)argList).Car, mode);
+            case 2:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr;
+                return fn.Invoke3M(a, c0.Car, c1.Car, mode);
+            }
+            case 3:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr; var c2 = (Cons)c1.Cdr;
+                return fn.Invoke4M(a, c0.Car, c1.Car, c2.Car, mode);
+            }
+        }
+        return ApplySpread1(fn, a, argList);
+    }
+
+    public static LispObject ApplySpread2M(LispObject func, LispObject a, LispObject b,
+                                           LispObject argList, int mode)
+    {
+        var fn = CoerceToFunction(func);
+        switch (ApplyTailLength(argList))
+        {
+            case 0: return fn.Invoke2M(a, b, mode);
+            case 1: return fn.Invoke3M(a, b, ((Cons)argList).Car, mode);
+            case 2:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr;
+                return fn.Invoke4M(a, b, c0.Car, c1.Car, mode);
+            }
+        }
+        return ApplySpread2(fn, a, b, argList);
+    }
+
     /// <summary>APPLY with two fixed arguments ahead of the list. See APPLYSPREAD1.</summary>
     public static LispObject ApplySpread2(LispObject func, LispObject a, LispObject b,
                                           LispObject argList)
@@ -707,6 +782,7 @@ public static partial class Runtime
         if (SetfNameTarget(name) is Symbol ftarget)
         {
             ftarget.SetfFunction = null;
+            ForgetFunctionSources(ftarget, setf: true);
             return name;
         }
         if (name is Cons)
@@ -720,6 +796,7 @@ public static partial class Runtime
         // keeps rewriting calls (e.g. $foo -> $foo-impl) after the function is killed
         // and redefined with a different signature, referencing a removed -IMPL.
         RemoveUserCompilerMacro(sym);
+        ForgetFunctionSources(sym, setf: false);
         return sym;
     }
 
@@ -838,7 +915,7 @@ public static partial class Runtime
             }
             if (a is LispVector va && b is LispVector vb
                 && !va.IsCharVector && !vb.IsCharVector
-                && va.ElementTypeName == vb.ElementTypeName
+                && SameElementTypeName(va.ElementTypeName, vb.ElementTypeName)
                 && System.Linq.Enumerable.SequenceEqual(va.Dimensions, vb.Dimensions)
                 && va.Length == vb.Length)
             {
@@ -891,7 +968,41 @@ public static partial class Runtime
 
     /// <summary>NAME if arrays are specialized on it, otherwise "T".</summary>
     internal static string UpgradeElementTypeName(string name)
-        => IsSpecializedElementTypeName(name) ? name : "T";
+    {
+        name = CanonicalElementTypeName(name);
+        return IsSpecializedElementTypeName(name) ? name : "T";
+    }
+
+    // 7/15/31/63 keep upgrading monotonic: (unsigned-byte 7) is in (signed-byte 8).
+    // As in SBCL, (signed-byte 33..63) upgrades to FIXNUM, which here is the same
+    // type and storage as (signed-byte 64).
+    private static readonly int[] UnsignedElementWidths = { 2, 4, 7, 8, 15, 16, 31, 32, 62, 63, 64 };
+
+    internal static bool SameElementTypeName(string a, string b)
+        => a == b || (a is "FIXNUM" or "SIGNED-BYTE-64" && b is "FIXNUM" or "SIGNED-BYTE-64");
+
+    internal static string CanonicalElementTypeName(string name)
+    {
+        if (name == "STANDARD-CHAR") return "BASE-CHAR";
+        const string ub = "UNSIGNED-BYTE-";
+        const string sb = "SIGNED-BYTE-";
+        if (name.StartsWith(ub, StringComparison.Ordinal)
+            && int.TryParse(name.Substring(ub.Length), out int un) && un >= 1)
+        {
+            if (un == 1) return "BIT";
+            foreach (int w in UnsignedElementWidths)
+                if (un <= w) return w == un ? name : ub + w;
+            return "T";
+        }
+        if (name.StartsWith(sb, StringComparison.Ordinal)
+            && int.TryParse(name.Substring(sb.Length), out int sn) && sn >= 1)
+        {
+            if (sn > 32 && sn < 64) return "FIXNUM";
+            int w = sn <= 8 ? 8 : sn <= 16 ? 16 : sn <= 32 ? 32 : sn == 64 ? 64 : 0;
+            return w == 0 ? "T" : w == sn ? name : sb + w;
+        }
+        return name;
+    }
 
     /// <summary>True for the element type names that have storage of their own:
     /// only these may come back from UPGRADED-ARRAY-ELEMENT-TYPE as themselves.</summary>
@@ -944,11 +1055,6 @@ public static partial class Runtime
         if (typeSpec is Cons etCons && etCons.Car is Symbol etHead)
         {
             string hname = etHead.Name;
-            // (signed-byte 1) is [-1, 0]: its upgrade has to hold BIT too,
-            // since (eql 0) is in it and upgrades to BIT (CLHS 15.1.2.1), so
-            // the narrowest signed element type is (signed-byte 2).
-            if (hname == "SIGNED-BYTE" && etCons.Cdr is Cons sb1C && sb1C.Car is Fixnum { Value: 1 })
-                return "SIGNED-BYTE-2";
             if ((hname == "UNSIGNED-BYTE" || hname == "SIGNED-BYTE") && etCons.Cdr is Cons nbC && nbC.Car is Fixnum nbF)
                 return $"{hname}-{nbF.Value}";
             if (hname == "UNSIGNED-BYTE" || hname == "SIGNED-BYTE") return hname;
@@ -991,14 +1097,9 @@ public static partial class Runtime
             }
             if (hname == "INTEGER")
             {
-                // (integer LO HI) with constant bounds upgrades to the narrowest
-                // (unsigned-byte N) / (signed-byte N) that holds the range, the
-                // same element type that spelling of the range gets: arrays are
-                // specialized on every such N, and (integer 0 4294967295) is
-                // the same type as (unsigned-byte 32), so the two have to
-                // upgrade alike (CLHS 15.1.2.1). The storage follows from N
-                // (NumKindForElementType), so (integer 0 2000) still lands on
-                // the unboxed ushort backing.
+                // (integer LO HI) with constant bounds is named as the
+                // (unsigned-byte N) / (signed-byte N) that holds it, so it
+                // upgrades the way that spelling does.
                 if (etCons.Cdr is Cons loC && loC.Car is Fixnum loF
                     && loC.Cdr is Cons hiC && hiC.Car is Fixnum hiF
                     && loF.Value <= hiF.Value)
@@ -1006,7 +1107,7 @@ public static partial class Runtime
                     long lo = loF.Value, hi = hiF.Value;
                     if (lo >= 0 && hi <= 1) return "BIT";
                     if (lo >= 0) return $"UNSIGNED-BYTE-{IntegerLength(hi)}";
-                    return $"SIGNED-BYTE-{System.Math.Max(2, System.Math.Max(IntegerLength(lo), IntegerLength(hi)) + 1)}";
+                    return $"SIGNED-BYTE-{System.Math.Max(IntegerLength(lo), IntegerLength(hi)) + 1}";
                 }
                 // A non-negative range whose upper bound needs the 64th bit is an
                 // (unsigned-byte 64), which has storage of its own.
@@ -1042,7 +1143,12 @@ public static partial class Runtime
         return "T";
     }
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispFunction CoerceToFunction(LispObject designator)
+        => designator as LispFunction ?? CoerceToFunctionSlow(designator);
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispFunction CoerceToFunctionSlow(LispObject designator)
     {
         designator = Primary(designator);
         if (designator is LispFunction fn) return fn;
@@ -1221,19 +1327,26 @@ public static partial class Runtime
     public static LispObject Values2Primary(LispObject a, LispObject b) =>
         MultipleValues.Values2Primary(a, b);
 
+    public static LispObject Values2Pair(LispObject a, LispObject b) =>
+        MultipleValues.Values2Pair(a, b);
+
     /// <summary>
     /// Unwrap MvReturn to its primary value. Inserted by compiler at non-MV positions.
     /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispObject UnwrapMv(LispObject obj)
     {
-        if (obj is MvReturn mv)
-        {
-            var primary = mv.PrimaryValue;
-            // Also update thread-static to single value for backward compat
-            MultipleValues.Primary(primary);
-            return primary;
-        }
+        if (obj is MvReturn mv) return UnwrapMvSlow(mv);
         return obj;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispObject UnwrapMvSlow(MvReturn mv)
+    {
+        var primary = mv.PrimaryValue;
+        // Also update thread-static to single value for backward compat
+        MultipleValues.Primary(primary);
+        return primary;
     }
 
     /// <summary>VALUES-LIST. Counts the list first and fills one array of exactly
@@ -1244,6 +1357,14 @@ public static partial class Runtime
     ///
     /// Zero, one and two values need no array at all -- MvReturn carries up to two
     /// inline -- so those go to the entries that take them as arguments.</summary>
+    /// <summary>VALUES-LIST's function object, whose arity-1 entry takes the
+    /// caller's value mode (MultipleValues.TakeMode).</summary>
+    internal static LispObject ValuesListTakingMode(LispObject list)
+    {
+        int mode = MultipleValues.TakeMode();
+        return mode == MultipleValues.ModeNone ? ValuesList(list) : MultipleValues.ValuesListMode(list, mode);
+    }
+
     public static LispObject ValuesList(LispObject list)
     {
         int n = 0;
@@ -1310,7 +1431,7 @@ public static partial class Runtime
     private static LispCondition? MapWellKnownClrException(Exception ex)
     {
         if (ex is DivideByZeroException)
-            return new LispError(ex.Message)
+            return new LispError("arithmetic error DIVISION-BY-ZERO signalled")
             { ConditionTypeName = "DIVISION-BY-ZERO", ClrExceptionType = ex.GetType(), ClrException = ex };
         // Heap exhaustion must surface as STORAGE-CONDITION, not PROGRAM-ERROR:
         // a raw OutOfMemoryException is catchable in .NET, and the CL spelling
@@ -1540,7 +1661,7 @@ public static partial class Runtime
             HandlerClusterStack.Signal(outcome.Condition);
             // No handler took it: this is where ERROR would enter the debugger,
             // with the raising frames still there to look at.
-            if (ConditionSystem.UnhandledErrorsEnterDebugger)
+            if (ConditionSystem.UnhandledErrorsInvokeDebugger)
                 ConditionSystem.InvokeDebugger(outcome.Condition);
         }
         catch (Exception transfer)
@@ -1989,6 +2110,19 @@ public static partial class Runtime
         // %PROGV-BIND, %PROGV-UNBIND
         Startup.RegisterBinary("%PROGV-BIND", DynamicBindings.ProgvBind);
         Startup.RegisterUnary("%PROGV-UNBIND", DynamicBindings.ProgvUnbind);
+
+        // %MAKE-UNREGISTERED-SYMBOL name package: a fresh symbol whose home
+        // package is PACKAGE but which PACKAGE does not hold, so FIND-SYMBOL and
+        // INTERN never return it and it is garbage once nothing refers to it.
+        // The compiler uses it for names it makes up while compiling one form
+        // that must still read as belonging to its own package.
+        Startup.RegisterBinary("%MAKE-UNREGISTERED-SYMBOL", (name, pkg) =>
+            new Symbol(name is LispString s ? s.Value
+                           : throw new LispErrorException(new LispTypeError(
+                               "%MAKE-UNREGISTERED-SYMBOL: name is not a string", name, Startup.Sym("STRING"))),
+                       pkg as Package
+                           ?? throw new LispErrorException(new LispTypeError(
+                               "%MAKE-UNREGISTERED-SYMBOL: not a package", pkg, Startup.Sym("PACKAGE")))));
 
         // %OBJECT-ID, FUNCTION-LAMBDA-EXPRESSION
         Startup.RegisterUnary("%OBJECT-ID", obj =>

@@ -15,7 +15,7 @@
         (array-element-type (make-array 4 :element-type 'single-float))
         (array-element-type (make-array 4 :element-type 'double-float))
         (array-element-type (make-array 4 :element-type 'character)))
-  ((unsigned-byte 10) bit (unsigned-byte 8) fixnum single-float double-float character))
+  ((unsigned-byte 15) bit (unsigned-byte 8) fixnum single-float double-float character))
 
 (deftest packed-array-alloc.default-contents
   (list (coerce (make-array 3 :element-type '(integer 0 1000)) 'list)
@@ -41,7 +41,7 @@
           (aref a 0 0 0)
           (aref a 1 2 3)
           (array-total-size a)))
-  ((2 3 4) (unsigned-byte 10) 5 999 24))
+  ((2 3 4) (unsigned-byte 15) 5 999 24))
 
 (deftest packed-array-alloc.two-dimensional-write-read
   (let ((a (make-array '(3 3) :element-type 'double-float :initial-element 0.0d0)))
@@ -65,7 +65,7 @@
          (b (make-array 2 :element-type '(integer 0 1000) :initial-element 7 :adjustable t))
          (c (adjust-array b 4 :initial-element 9)))
     (list (coerce a 'list) (coerce c 'list) (array-element-type c)))
-  ((1 2 3) (7 7 9 9) (unsigned-byte 10)))
+  ((1 2 3) (7 7 9 9) (unsigned-byte 15)))
 
 ;;; A fill pointer on a packed vector still tracks pushes.
 (deftest packed-array-alloc.fill-pointer

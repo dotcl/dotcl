@@ -35,6 +35,11 @@ and the bundled contribs, for `win-x64`, `win-arm64`, `linux-x64`,
 `linux-arm64`, `osx-x64` and `osx-arm64`. Each per-platform package carries only
 its own platform's set. You do not have to do anything to get these.
 
+An application that embeds dotcl gets the same for everything it ships by
+publishing with `PublishReadyToRun=true` and a runtime identifier: the FASLs
+in the publish output are compiled in place, under their own names. See
+[ReadyToRun publish](sdk.md#readytorun-publish).
+
 ## Writing siblings for your own code
 
 Off by default. Set `dotcl:*compile-r2r*` to a true value and ASDF writes a

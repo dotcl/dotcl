@@ -7,7 +7,7 @@ itself. Each measurement answers a different question:
 | --- | --- | --- |
 | bench-parity (`bench/csharp-parity`) | How does fully declared Lisp compare with the same loop written in C#, on the same .NET runtime? | time ratio, dotcl / C# |
 | il-parity (`bench/il-parity`) | Which IL instructions does dotcl emit that the C# compiler does not? | static instruction count |
-| cl-bench | How does dotcl compare with a native Common Lisp compiler on a general benchmark suite? | time ratio, dotcl / SBCL |
+| cl-bench (`bench/cl-bench-runner`) | How does dotcl compare with a native Common Lisp compiler on a general benchmark suite? | time ratio, dotcl / SBCL |
 
 These are snapshots from one commit on one or two machines. They are not a
 general statement about dotcl's speed. Small kernels say little about a real
@@ -35,7 +35,7 @@ same inputs.
   uses the minimum over the 5 processes on each side.
 - Per-process values are checked for a split into two groups (the JIT
   sometimes settles on a different code placement for a whole process;
-  `bench/modes.awk`). In this run every kernel on both sides formed one group.
+  `bench/gate/modes.awk`). In this run every kernel on both sides formed one group.
 
 ### Result
 
@@ -238,7 +238,20 @@ make il-parity        # il-parity; deterministic counts
 make bench-state      # cl-bench on dotcl and SBCL (SBCL via SBCL_RUN, default: ros -L sbcl-bin run)
 ```
 
-`bench/check-ratios.sh` compares the ratios with the per-machine baselines in
-`bench/ratio-baseline.json`. Those baselines belong to one fixed machine, so a
+`bench/gate/check-ratios.sh` compares the ratios with the per-machine baselines in
+`bench/gate/ratio-baseline.json`. Those baselines belong to one fixed machine, so a
 run elsewhere should be compared with itself (two builds measured alternately
 on the same machine), not with the numbers on this page.
+
+## Regression suite time
+
+`make regression-time` runs the compiled regression suite the way
+`make test-regression` does and records its wall time in `bench-state.json` as
+`regression/compiled`. The suite compiles thousands of small forms and runs
+them, so the number is mostly compile time, which none of the measurements
+above looks at. `bench/gate/regression-time.sh` judges it against
+`<platform>/regression/compiled-seconds` in `bench/gate/ratio-baseline.json`, with
+the limit `regression_threshold` times the baseline. It is a time in seconds,
+not a ratio, so only a baseline from the same machine says anything; a machine
+without one gets UNJUDGED, as in the ratio check. The suite has to pass for its
+time to be judged.

@@ -212,4 +212,122 @@
     </ItemGroup>
   </Target>
 
+  <!-- Step 8: publish only the contrib modules a published manifest REQUIREs
+       (its "require <module>" lines, which already include what those modules
+       require). A module the application REQUIREs at run time without
+       declaring it in an .asd is not published; declare it, or set
+       DotclPublishAllContribs=true to publish every contrib module. -->
+  <Target Name="_DotCLSelectPublishedContribs"
+          AfterTargets="ComputeResolvedFilesToPublishList"
+          Condition="'$(DotclProjectAsd)' != '' and '$(DotclPublishAllContribs)' != 'true'">
+    <PropertyGroup>
+      <_DotclContribRoot>$(_DotCLContribDir)</_DotclContribRoot>
+      <_DotclContribRoot Condition="'$(DotclAssetsDir)' != ''">$(DotclAssetsDir)contrib</_DotclContribRoot>
+      <_DotclContribRoot>$([MSBuild]::NormalizeDirectory('$(_DotclContribRoot)'))</_DotclContribRoot>
+    </PropertyGroup>
+    <ItemGroup>
+      <_DotclPublishedManifest Include="$(DotclDeployedManifest)" Condition="Exists('$(DotclDeployedManifest)')" />
+      <_DotclPublishedManifest Include="@(ResolvedFileToPublish)"
+                               Condition="'%(ResolvedFileToPublish.Extension)' == '.txt' and $([System.String]::Copy('%(ResolvedFileToPublish.RelativePath)').Replace('\', '/').StartsWith('dotcl-fasl/'))" />
+    </ItemGroup>
+    <ReadLinesFromFile File="%(_DotclPublishedManifest.FullPath)" Condition="'@(_DotclPublishedManifest)' != ''">
+      <Output TaskParameter="Lines" ItemName="_DotclPublishedManifestLine" />
+    </ReadLinesFromFile>
+    <ItemGroup>
+      <_DotclRequiredContrib Include="$([System.String]::Copy('%(_DotclPublishedManifestLine.Identity)').Substring(8).Trim().ToLowerInvariant())"
+                             Condition="$([System.String]::Copy('%(_DotclPublishedManifestLine.Identity)').StartsWith('require '))" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_DotclKeptContribs>;@(_DotclRequiredContrib);</_DotclKeptContribs>
+    </PropertyGroup>
+    <ItemGroup Condition="'@(_DotclPublishedManifest)' != ''">
+      <_DotclContribFile Include="@(ResolvedFileToPublish)"
+                         Condition="$([System.String]::Copy('%(ResolvedFileToPublish.FullPath)').StartsWith('$(_DotclContribRoot)'))" />
+      <_DotclContribFile>
+        <DotclRel>$([System.String]::Copy('%(FullPath)').Substring($(_DotclContribRoot.Length)).Replace('\', '/'))/</DotclRel>
+      </_DotclContribFile>
+      <_DotclContribFile>
+        <DotclModule>$([System.String]::Copy('%(DotclRel)').Substring(0, $([System.String]::Copy('%(DotclRel)').IndexOf('/'))).ToLowerInvariant())</DotclModule>
+      </_DotclContribFile>
+      <_DotclDroppedContrib Include="@(_DotclContribFile)"
+                            Condition="!$(_DotclKeptContribs.Contains(';%(_DotclContribFile.DotclModule);'))" />
+      <ResolvedFileToPublish Remove="@(_DotclDroppedContrib)" />
+    </ItemGroup>
+    <Message Importance="normal" Condition="'@(_DotclPublishedManifest)' != ''"
+             Text="dotcl: contrib modules published: @(_DotclRequiredContrib->Distinct(), ' '); left out: @(_DotclDroppedContrib->'%(DotclModule)'->Distinct(), ' ') (DotclPublishAllContribs=true publishes all)" />
+  </Target>
+
+  <!-- Step 9: a ReadyToRun publish. The SDK compiles only the DLLs; compile
+       every published fasl (dotcl.core, dotcl-fasl/, contrib/) with the same
+       crossgen2 and publish the image under the fasl's own name.
+       DotclReadyToRunFasls: unset = a failure warns and keeps the IL fasl,
+       true = a failure is an error, false = off. -->
+  <Target Name="_DotCLReadyToRunFasls"
+          AfterTargets="CreateReadyToRunImages"
+          DependsOnTargets="_DotCLReadyToRunFaslsPrepare;_DotCLReadyToRunFaslsStage;_DotCLReadyToRunFaslsRun"
+          Condition="'$(PublishReadyToRun)' == 'true' and '$(RuntimeIdentifier)' != '' and '$(DotclReadyToRunFasls)' != 'false'">
+    <ItemGroup>
+      <_DotclR2RDone Include="@(_DotclR2RFasl)" Condition="Exists('%(R2RImage)')" />
+      <_DotclR2RFailed Include="@(_DotclR2RFasl)" Condition="'$(_DotclCrossgen2)' != '' and !Exists('%(R2RImage)')" />
+      <ResolvedFileToPublish Remove="@(_DotclR2RDone)" />
+      <ResolvedFileToPublish Include="@(_DotclR2RDone->'%(R2RImage)')" />
+    </ItemGroup>
+    <Warning Condition="'@(_DotclR2RFailed)' != ''"
+             Text="dotcl: crossgen2 failed on @(_DotclR2RFailed->'%(RelativePath)', ', '); published as IL (it loads correctly, only slower)." />
+  </Target>
+
+  <Target Name="_DotCLReadyToRunFaslsPrepare">
+    <PropertyGroup>
+      <_DotclR2RDir>$(IntermediateOutputPath)dotcl-r2r\</_DotclR2RDir>
+      <_DotclR2RContinue>WarnAndContinue</_DotclR2RContinue>
+      <_DotclR2RContinue Condition="'$(DotclReadyToRunFasls)' == 'true'">false</_DotclR2RContinue>
+      <_DotclCrossgen2>@(Crossgen2Tool)</_DotclCrossgen2>
+      <_DotclCrossgen2Host>@(Crossgen2Tool->'%(DotNetHostPath)')</_DotclCrossgen2Host>
+      <_DotclCrossgen2Os>@(Crossgen2Tool->'%(TargetOS)')</_DotclCrossgen2Os>
+      <_DotclCrossgen2Arch>@(Crossgen2Tool->'%(TargetArch)')</_DotclCrossgen2Arch>
+      <_DotclR2RExcluded>;@(PublishReadyToRunExclude->'%(Filename)%(Extension)');</_DotclR2RExcluded>
+      <_DotclCrossgen2Cmd>"$(_DotclCrossgen2)"</_DotclCrossgen2Cmd>
+      <_DotclCrossgen2Cmd Condition="'$(_DotclCrossgen2Host)' != ''">"$(_DotclCrossgen2Host)" "$(_DotclCrossgen2)"</_DotclCrossgen2Cmd>
+    </PropertyGroup>
+    <ItemGroup>
+      <_DotclR2RCandidate Include="@(ResolvedFileToPublish)"
+                          Condition="'%(Extension)' == '.fasl' or '%(Filename)%(Extension)' == 'dotcl.core'" />
+      <_DotclR2RCandidate Remove="@(_DotclR2RCandidate)"
+                          Condition="$(_DotclR2RExcluded.Contains(';%(_DotclR2RCandidate.Filename)%(_DotclR2RCandidate.Extension);'))" />
+      <_DotclR2RFasl Include="@(_DotclR2RCandidate)">
+        <ILCopy>$(_DotclR2RDir)il\%(RelativePath).dll</ILCopy>
+        <R2RImage>$(_DotclR2RDir)%(RelativePath)</R2RImage>
+        <Rsp>$(_DotclR2RDir)%(RelativePath).rsp</Rsp>
+      </_DotclR2RFasl>
+    </ItemGroup>
+    <Warning Condition="'@(_DotclR2RFasl)' != '' and '$(_DotclCrossgen2)' == '' and '$(_DotclR2RContinue)' != 'false'"
+             Text="dotcl: no crossgen2 for $(RuntimeIdentifier); the fasls are published as IL (they load correctly, only slower)." />
+    <Error Condition="'@(_DotclR2RFasl)' != '' and '$(_DotclCrossgen2)' == '' and '$(_DotclR2RContinue)' == 'false'"
+           Text="dotcl: no crossgen2 for $(RuntimeIdentifier); cannot compile the fasls to ReadyToRun (DotclReadyToRunFasls=true)." />
+  </Target>
+
+  <!-- crossgen2 takes one input per run, and only under a .dll name. -->
+  <Target Name="_DotCLReadyToRunFaslsStage"
+          Condition="'@(_DotclR2RFasl)' != '' and '$(_DotclCrossgen2)' != ''">
+    <Copy SourceFiles="@(_DotclR2RFasl)" DestinationFiles="@(_DotclR2RFasl->'%(ILCopy)')" SkipUnchangedFiles="true" />
+    <ItemGroup>
+      <_DotclR2RRef Include="@(_ReadyToRunAssembliesToReference)" />
+      <_DotclR2RRef Include="@(_DotclR2RFasl->'%(ILCopy)')" />
+    </ItemGroup>
+    <WriteLinesToFile File="%(_DotclR2RFasl.Rsp)"
+                      Lines="&quot;%(_DotclR2RFasl.ILCopy)&quot;;-o:&quot;%(_DotclR2RFasl.R2RImage)&quot;;--targetos:$(_DotclCrossgen2Os);--targetarch:$(_DotclCrossgen2Arch);-O;@(_DotclR2RRef->'-r:&quot;%(FullPath)&quot;')"
+                      Overwrite="true"
+                      WriteOnlyWhenDifferent="true" />
+  </Target>
+
+  <Target Name="_DotCLReadyToRunFaslsRun"
+          Condition="'@(_DotclR2RFasl)' != '' and '$(_DotclCrossgen2)' != ''"
+          Inputs="@(_DotclR2RRef);%(_DotclR2RFasl.Rsp)"
+          Outputs="%(_DotclR2RFasl.R2RImage)">
+    <Delete Files="%(_DotclR2RFasl.R2RImage)" />
+    <Exec Command="$(_DotclCrossgen2Cmd) @&quot;%(_DotclR2RFasl.Rsp)&quot;"
+          StandardOutputImportance="low"
+          ContinueOnError="$(_DotclR2RContinue)" />
+  </Target>
+
 </Project>

@@ -23,7 +23,10 @@ public class FaslAssembler
 #pragma warning disable CS0649, CS0169
 #if NET9_0_OR_GREATER
     private readonly PersistedAssemblyBuilder _ab;
+    private readonly AssemblyBuilder? _runAb;
+    private readonly string _moduleName = "";
 #endif
+    private FaslAssembler? _twin;  // see AlsoBuildInMemory
     private readonly ModuleBuilder _mb;
     private readonly TypeBuilder _tb;
     private readonly ILGenerator _initIl;
@@ -114,6 +117,10 @@ public class FaslAssembler
         typeof(CilAssembler).GetMethod("GetSetfFunctionBySymbol")!;
     internal static readonly MethodInfo SetLambdaListSourceMI =
         typeof(Runtime).GetMethod("SetLambdaListSource")!;
+    internal static readonly MethodInfo SetSelfFramedEntryMI =
+        typeof(LispFunction).GetMethod("SetSelfFramedEntry")!;
+    internal static readonly MethodInfo SetArityEntryMI =
+        typeof(LispFunction).GetMethod("SetArityEntry")!;
     internal static readonly MethodInfo SetDirectDelegateMI =
         typeof(LispFunction).GetMethod("SetDirectDelegate")!;
     internal static readonly MethodInfo SetNativeDelegateMI =
@@ -187,7 +194,11 @@ public class FaslAssembler
     }
 #endif
 
-    public FaslAssembler(string moduleName)
+    public FaslAssembler(string moduleName) : this(moduleName, false) { }
+
+    /// <summary>RUNNABLE: emit into an assembly this process runs directly
+    /// instead of one written to a file.</summary>
+    private FaslAssembler(string moduleName, bool runnable)
     {
 #if !NET9_0_OR_GREATER
         // A Lisp condition, not a raw CLR exception: the caller is Lisp code that
@@ -206,9 +217,20 @@ public class FaslAssembler
         // assembly / LTV-namespace identifier (a guid suffix keeps it unique), so
         // replacing the offending characters is lossless in practice.
         moduleName = SanitizeModuleName(moduleName);
-        _ab = new PersistedAssemblyBuilder(
-            new AssemblyName(moduleName), typeof(object).Assembly);
-        _mb = _ab.DefineDynamicModule(moduleName);
+        _moduleName = moduleName;
+        if (runnable)
+        {
+            _ab = null!;
+            _runAb = AssemblyBuilder.DefineDynamicAssembly(
+                new AssemblyName(moduleName), AssemblyBuilderAccess.Run);
+            _mb = _runAb.DefineDynamicModule(moduleName);
+        }
+        else
+        {
+            _ab = new PersistedAssemblyBuilder(
+                new AssemblyName(moduleName), typeof(object).Assembly);
+            _mb = _ab.DefineDynamicModule(moduleName);
+        }
         _tb = _mb.DefineType("CompiledModule",
             TypeAttributes.Public | TypeAttributes.Class);
 
@@ -236,21 +258,24 @@ public class FaslAssembler
 
     // --- Definition source table ---
     // Where each top level definition of the compiled file is (file, package,
-    // symbol name, line), so DOTCL:FUNCTION-SOURCE-LOCATION answers for code
+    // symbol name, line, kind, method qualifiers and specializers), so DOTCL:FUNCTION-SOURCE-LOCATION answers for code
     // loaded from the fasl as it does for code loaded from source. Written as
-    // one data part; ModuleInit hands it to Runtime.RegisterFaslDefinitionSources
+    // one data part; ModuleInit hands it to Runtime.RegisterFaslDefinitionKindSources
     // just before the code of the first definition.
     private int _defSourcesPart = -1;
-    private readonly List<(int File, int Pkg, string Name, int Line)> _defSources = new();
+    private readonly List<(int File, int Pkg, string Name, int Line, int Kind, string Detail)> _defSources = new();
+    private readonly HashSet<(int, int, string, int, int, string)> _defSourceSet = new();
     private readonly Dictionary<string, int> _defSourceFiles = new();
     private readonly Dictionary<string, int> _defSourcePkgs = new();
     private readonly List<string> _defSourceFileList = new();
     private readonly List<string> _defSourcePkgList = new();
 
-    /// <summary>Record that the next top level form defines PKG::NAME at
-    /// FILE:LINE. Call before that form's AddTopLevelForm.</summary>
-    public void AddDefinitionSource(string file, string pkg, string name, int line)
+    /// <summary>Record that the next top level form defines PKG::NAME (PKG
+    /// null for an uninterned name) at FILE:LINE. Call before that form's
+    /// AddTopLevelForm.</summary>
+    public void AddDefinitionSource(string file, string? pkg, string name, int line, int kind, string detail)
     {
+        Twin(t => t.AddDefinitionSource(file, pkg, name, line, kind, detail));
         if (_defSourcesPart < 0)
         {
             CloseChunk();
@@ -258,7 +283,7 @@ public class FaslAssembler
             _initIl.Emit(OpCodes.Ldsfld, _structInternMap.DataPartsField());
             _initIl.Emit(OpCodes.Ldc_I4, _defSourcesPart);
             _initIl.Emit(OpCodes.Ldelem_Ref);
-            _initIl.Emit(OpCodes.Call, typeof(Runtime).GetMethod("RegisterFaslDefinitionSources")!);
+            _initIl.Emit(OpCodes.Call, typeof(Runtime).GetMethod("RegisterFaslDefinitionKindSources")!);
         }
         if (!_defSourceFiles.TryGetValue(file, out int fi))
         {
@@ -266,13 +291,15 @@ public class FaslAssembler
             _defSourceFileList.Add(file);
             _defSourceFiles[file] = fi;
         }
-        if (!_defSourcePkgs.TryGetValue(pkg, out int pi))
+        int pi = 0;
+        if (pkg != null && !_defSourcePkgs.TryGetValue(pkg, out pi))
         {
-            pi = _defSourcePkgList.Count;
             _defSourcePkgList.Add(pkg);
+            pi = _defSourcePkgList.Count;
             _defSourcePkgs[pkg] = pi;
         }
-        _defSources.Add((fi, pi, name, line));
+        var entry = (fi, pi, name, line, kind, detail);
+        if (_defSourceSet.Add(entry)) _defSources.Add(entry);
     }
 
     private void FinishDefinitionSources()
@@ -284,12 +311,14 @@ public class FaslAssembler
         w.Varint((ulong)_defSourcePkgList.Count);
         foreach (var p in _defSourcePkgList) w.Str(p);
         w.Varint((ulong)_defSources.Count);
-        foreach (var (f, p, name, line) in _defSources)
+        foreach (var (f, p, name, line, kind, detail) in _defSources)
         {
             w.Varint((ulong)f);
             w.Varint((ulong)p);
             w.Str(name);
             w.Varint((ulong)System.Math.Max(line, 0));
+            w.Varint((ulong)kind);
+            w.Str(detail);
         }
         _structInternMap.SetDataPart(_defSourcesPart, w.BodyToArray());
     }
@@ -314,6 +343,7 @@ public class FaslAssembler
         try { AddTopLevelFormImpl(instrList); }
         catch (Exception ex) { ThrowWithStringDiag(ex, _structInternMap, "AddTopLevelForm"); throw; }
         finally { _structInternMap.EndFormLiterals(); }
+        Twin(t => t.AddTopLevelForm(instrList));
     }
 
     /// <summary>As <see cref="AddTopLevelForm(LispObject)"/>, tagging any function
@@ -677,6 +707,7 @@ public class FaslAssembler
     /// <summary>Emit init forms whose creation dependencies are now satisfied. Call after each AddTopLevelForm.</summary>
     public void FlushInitForms()
     {
+        Twin(t => t.FlushInitForms());
         foreach (var (_, initForm) in _structInternMap.PopEagerInitForms())
             EmitEvalTopLevel(initForm);
     }
@@ -684,6 +715,7 @@ public class FaslAssembler
     /// <summary>Emit any remaining init forms (e.g. cycle members). Call once before Save.</summary>
     public void FlushRemainingInitForms()
     {
+        Twin(t => t.FlushRemainingInitForms());
         foreach (var (_, initForm) in _structInternMap.FlushRemainingInitForms())
             EmitEvalTopLevel(initForm);
     }
@@ -771,8 +803,9 @@ public class FaslAssembler
         // When selfArg0, arg0 is the self LispFunction (threaded so a non-tail
         // self-call reaches its receiver from arg0 instead of re-resolving #'NAME each
         // recursive entry); the direct params then start at ldarg 1.
-        var directParamTypes = new Type[selfArg0 ? paramCount + 1 : paramCount];
-        if (selfArg0)
+        bool selfFramed = CilAssembler.CanSelfFrame(name, paramCount, noFrame);
+        var directParamTypes = new Type[selfArg0 || selfFramed ? paramCount + 1 : paramCount];
+        if (selfArg0 || selfFramed)
         {
             directParamTypes[0] = typeof(LispFunction);
             for (int i = 0; i < paramCount; i++) directParamTypes[i + 1] = typeof(LispObject);
@@ -792,9 +825,24 @@ public class FaslAssembler
         innerAsm._faslMode = true;
         innerAsm._faslTypeBuilder = tb;
         innerAsm._faslStructMap = structMap;
+        if (selfFramed)
+        {
+            innerAsm._selfFrameName = name;
+            innerAsm._selfFrameArgc = paramCount;
+            if (!selfArg0) innerAsm._argShift = 1;
+        }
         if (onBodyMethod != null) { innerAsm._seqPoints = new(); innerAsm._localVars = new(); innerAsm._completedScopes = new(); }
         innerAsm.Assemble(bodyInstrs);
         if (onBodyMethod != null) onBodyMethod(bodyMethod, innerAsm);
+        FieldBuilder? sameFileField = null;
+        if (selfFramed && defPkg != null
+            && DynamicBindings.TryGet(Startup.Sym("*SAME-FILE-FUNCTIONS*"), out var sff) && sff is LispHashTable)
+        {
+            sameFileField = tb.DefineField("sf" + id, typeof(LispFunction),
+                FieldAttributes.Public | FieldAttributes.Static);
+            structMap.SameFileBodies[(defPkg, name)] =
+                (bodyMethod, paramCount, CilAssembler.BodyReadsMvMode(bodyInstrs), sameFileField);
+        }
 
         // 2. Array-arg wrapper: static LispObject Name(LispObject[] args)
         string wrapperName = SanitizeName(name) + "_" + id;
@@ -829,6 +877,8 @@ public class FaslAssembler
                 wil.Emit(OpCodes.Call, GetFunctionBySymbolMI);
             }
         }
+        else if (selfFramed)
+            wil.Emit(OpCodes.Ldnull);
         for (int i = 0; i < paramCount; i++)
         {
             wil.Emit(OpCodes.Ldarg_0);
@@ -841,8 +891,9 @@ public class FaslAssembler
         // 3. Registration IL (includes _funcN for direct-call fast path). selfArg0 binds
         // the direct delegate's target to fn (open-instance, self bound).
         EmitRegistrationInto(initIl, name, wrapperMethod, paramCount, defPkg, bodyMethod, noFrame: noFrame,
-            selfBound: selfArg0, lambdaList: lambdaList,
-            directMv: CilAssembler.BodyReadsMvMode(bodyInstrs));
+            selfBound: selfArg0 || selfFramed, lambdaList: lambdaList,
+            directMv: CilAssembler.BodyReadsMvMode(bodyInstrs), selfFramed: selfFramed,
+            sameFileField: sameFileField);
     }
 
     /// <summary>
@@ -882,7 +933,8 @@ public class FaslAssembler
         // delegate it installs at load is the same one. Without this every such
         // function loaded from a fasl fell back to the args-array entry -- and we
         // ship fasls, so that was the only shape a user ever ran.
-        var extraDirect = BuildDirectDelegateMethods(tb, structMap, methodName, directDelegates, keyShared);
+        var extraDirect = BuildDirectDelegateMethods(tb, structMap, methodName, directDelegates, keyShared,
+            noFrame ? null : name);
         // No _funcN for plain DEFMETHOD: body signature is LispObject[] -> LispObject.
         EmitRegistrationInto(initIl, name, method, paramCount, defPkg, directBodyMethod: null, noFrame: noFrame,
             lambdaList: lambdaList, extraDirect: extraDirect);
@@ -999,6 +1051,9 @@ public class FaslAssembler
             selfBound: true, noFrame: noFrame, lambdaList: lambdaList);
     }
 
+    // A small typed body is inlined into its shell (and into typed callers).
+    const int TypedInlineMaxIL = 120;
+
     /// <summary>
     /// Emit a DEFMETHOD-TYPED into the TypeBuilder: the typed body method (raw
     /// arguments and result, see TypedEntrySig), the boxed shell over it, the
@@ -1024,6 +1079,8 @@ public class FaslAssembler
         bodyAsm._typedSelfMethod = typedMethod;
         if (onBodyMethod != null) { bodyAsm._seqPoints = new(); bodyAsm._localVars = new(); bodyAsm._completedScopes = new(); }
         bodyAsm.Assemble(f.Body);
+        if (onBodyMethod == null && bodyAsm._il.ILOffset <= TypedInlineMaxIL)
+            typedMethod.SetImplementationFlags(MethodImplAttributes.AggressiveInlining);
         if (onBodyMethod != null) onBodyMethod(typedMethod, bodyAsm);
 
         // 2. Shell: static LispObject Name_shell_N(LispFunction self, LispObject p1, ...)
@@ -1032,7 +1089,8 @@ public class FaslAssembler
         for (int i = 0; i < paramCount; i++) shellTypes[i + 1] = typeof(LispObject);
         var shellMethod = tb.DefineMethod(SanitizeName(name) + "_shell_" + id,
             MethodAttributes.Public | MethodAttributes.Static, typeof(LispObject), shellTypes);
-        CilAssembler.EmitTypedShell(shellMethod.GetILGenerator(), f, typedMethod);
+        bool selfFramed = CilAssembler.CanSelfFrame(name, paramCount, f.NoFrame);
+        CilAssembler.EmitTypedShell(shellMethod.GetILGenerator(), f, typedMethod, selfFramed);
 
         // 3. Array wrapper: static LispObject Name_N(LispObject[] args). As for a
         // native function, self is resolved through the symbol on this slow path.
@@ -1060,7 +1118,7 @@ public class FaslAssembler
 
         // 4. Registration.
         EmitRegistrationInto(initIl, name, wrapperMethod, paramCount, f.Pkg,
-            directBodyMethod: shellMethod, selfBound: true, noFrame: f.NoFrame,
+            directBodyMethod: shellMethod, selfBound: true, noFrame: f.NoFrame, selfFramed: selfFramed,
             lambdaList: f.LambdaList != null ? Runtime.FormatObject(f.LambdaList, true) : null,
             typedEntry: (typedMethod, f.Sig));
     }
@@ -1068,13 +1126,13 @@ public class FaslAssembler
     /// <summary>One typed arity of an &amp;optional / &amp;key / &amp;rest function:
     /// the arity, whether the body wants the LispFunction threaded in as its
     /// leading argument, and the method holding it.</summary>
-    private readonly record struct DirectArity(int Arity, bool SelfP, MethodBuilder Method, bool Mv);
+    internal readonly record struct DirectArity(int Arity, bool SelfP, MethodBuilder Method, bool Mv, bool SelfFramed = false);
 
     /// <summary>A &amp;key function keeps its body in one method taking the key
     /// values as arguments: (:shared NPARAMS BODY) among the direct delegates. A
     /// plain method, not a delegate; the array entry and the typed entries call it
     /// (SIL :call-key-shared), so it is built before either.</summary>
-    private static MethodBuilder? BuildKeySharedMethod(
+    internal static MethodBuilder? BuildKeySharedMethod(
         TypeBuilder tb, CilAssembler.FaslStructInternMap structMap,
         string baseName, LispObject? directDelegates)
     {
@@ -1102,9 +1160,10 @@ public class FaslAssembler
     /// <summary>Compile each ((arity self-p body) ...) spec into a method on the
     /// fasl's type. The JIT path builds the same thing with DynamicMethod; a fasl
     /// needs real methods, but the delegate installed at load is identical.</summary>
-    private static List<DirectArity> BuildDirectDelegateMethods(
+    internal static List<DirectArity> BuildDirectDelegateMethods(
         TypeBuilder tb, CilAssembler.FaslStructInternMap structMap,
-        string baseName, LispObject? directDelegates, MethodBuilder? keyShared)
+        string baseName, LispObject? directDelegates, MethodBuilder? keyShared,
+        string? frameName = null)
     {
         var result = new List<DirectArity>();
         if (directDelegates is not Cons) return result;
@@ -1117,11 +1176,13 @@ public class FaslAssembler
             if (arity < 0 || arity > 8) continue;
             bool selfP = Runtime.Cadr(spec) is not Nil;
             var body = Runtime.Caddr(spec);
+            bool selfFramed = frameName != null && CilAssembler.CanSelfFrame(frameName, arity, false);
+            bool withSelf = selfP || selfFramed;
 
-            int nParams = selfP ? arity + 1 : arity;
+            int nParams = withSelf ? arity + 1 : arity;
             var types = new Type[nParams];
-            int off = selfP ? 1 : 0;
-            if (selfP) types[0] = typeof(LispFunction);
+            int off = withSelf ? 1 : 0;
+            if (withSelf) types[0] = typeof(LispFunction);
             for (int i = 0; i < arity; i++) types[off + i] = typeof(LispObject);
 
             var m = tb.DefineMethod($"{baseName}_dd{arity}_{n++}",
@@ -1135,10 +1196,36 @@ public class FaslAssembler
                 _faslStructMap = structMap,
                 _keyShared = keyShared,
             };
+            if (selfFramed)
+            {
+                asm._selfFrameName = frameName;
+                asm._selfFrameArgc = arity;
+                if (!selfP) asm._argShift = 1;
+            }
             asm.Assemble(body);
-            result.Add(new DirectArity(arity, selfP, m, CilAssembler.BodyReadsMvMode(body)));
+            result.Add(new DirectArity(arity, withSelf, m, CilAssembler.BodyReadsMvMode(body), selfFramed));
         }
         return result;
+    }
+
+    /// <summary>Install EXTRADIRECT on the LispFunction on top of the stack, leaving
+    /// it there.</summary>
+    internal static void EmitInstallDirectOnStack(ILGenerator il, List<DirectArity> extraDirect)
+    {
+        foreach (var d in extraDirect)
+        {
+            il.Emit(OpCodes.Dup);
+            if (d.SelfP) il.Emit(OpCodes.Dup); else il.Emit(OpCodes.Ldnull);
+            il.Emit(OpCodes.Ldftn, d.Method);
+            il.Emit(OpCodes.Newobj, TypedFuncCtors[d.Arity]);
+            il.Emit(OpCodes.Callvirt, SetDirectDelegateMI);
+            if (d.Mv)
+            {
+                il.Emit(OpCodes.Dup);
+                il.Emit(OpCodes.Ldc_I4, d.Arity);
+                il.Emit(OpCodes.Callvirt, MarkMvModeEntryMI);
+            }
+        }
     }
 
     /// <summary>
@@ -1168,7 +1255,8 @@ public class FaslAssembler
         string? defPkg, MethodBuilder? directBodyMethod, MethodBuilder? nativeBodyMethod = null,
         bool selfBound = false, bool noFrame = false, string? lambdaList = null,
         List<DirectArity>? extraDirect = null, bool directMv = false,
-        (MethodBuilder Method, string Sig)? typedEntry = null)
+        (MethodBuilder Method, string Sig)? typedEntry = null, bool selfFramed = false,
+        FieldInfo? sameFileField = null)
     {
         var fnLocal = il.DeclareLocal(typeof(LispFunction));
 
@@ -1213,6 +1301,18 @@ public class FaslAssembler
             il.Emit(OpCodes.Newobj, TypedFuncCtors[paramCount]);
             il.Emit(OpCodes.Callvirt, SetDirectDelegateMI);
             if (directMv) EmitMarkMvModeEntry(il, fnLocal, paramCount);
+            if (selfFramed)
+            {
+                il.EmitLoc(OpCodes.Ldloc, fnLocal);
+                il.Emit(OpCodes.Ldftn, directBodyMethod);
+                il.Emit(OpCodes.Ldc_I4, paramCount);
+                il.Emit(OpCodes.Callvirt, SetSelfFramedEntryMI);
+            }
+            if (sameFileField != null)
+            {
+                il.EmitLoc(OpCodes.Ldloc, fnLocal);
+                il.Emit(OpCodes.Stsfld, sameFileField);
+            }
         }
 
         // The extra typed arities, installed the same way: a self-taking body binds
@@ -1227,6 +1327,13 @@ public class FaslAssembler
                 il.Emit(OpCodes.Newobj, TypedFuncCtors[d.Arity]);
                 il.Emit(OpCodes.Callvirt, SetDirectDelegateMI);
                 if (d.Mv) EmitMarkMvModeEntry(il, fnLocal, d.Arity);
+                if (d.SelfFramed)
+                {
+                    il.EmitLoc(OpCodes.Ldloc, fnLocal);
+                    il.Emit(OpCodes.Ldftn, d.Method);
+                    il.Emit(OpCodes.Ldc_I4, d.Arity);
+                    il.Emit(OpCodes.Callvirt, SetArityEntryMI);
+                }
             }
         }
 
@@ -1326,34 +1433,15 @@ public class FaslAssembler
         throw new LispErrorException(new LispProgramError(
             "FASL emission (compile-file) requires .NET 9+; this runtime build runs precompiled .fasl only"));
 #else
-        CloseChunk();
-        CilAssembler.CloseMlfBatch(_structInternMap);
-        CilAssembler.ClearMakeLoadFormMemo();
-        EmitPreinternSymbols();
-        FinishDefinitionSources();
-        // Before the initializer is closed: the array every uninterned symbol is
-        // indexed out of, built from a names blob rather than from per-symbol IL.
-        _structInternMap.EmitUninternedTableInit(_cctorIl);
-        _structInternMap.EmitDataPartsInit(_cctorIl);
-
-        // return Nil.Instance
-        _initIl.Emit(OpCodes.Ldsfld,
-            typeof(Nil).GetField("Instance")!);
-        _initIl.Emit(OpCodes.Ret);
-
-        // Close the type initializer (empty when the module named no functions).
-        _cctorIl.Emit(OpCodes.Ret);
-
-        // Literal holders spilled off CompiledModule, each with its own
-        // initializer. Created before CompiledModule, which references them.
-        foreach (var (holder, cctor) in _structInternMap.OverflowHolders)
+        System.Reflection.Assembly? inMemory = null;
+        if (_twin != null && !_emitDebug && retargetCorlib == null)
         {
-            cctor.Emit(OpCodes.Ret);
-            holder.CreateType();
+            _twin.SelfGeneration = SelfGeneration;
+            try { _twin.Close(); inMemory = _twin._runAb; }
+            catch { }
         }
-
-        _tb.CreateType();
-        StampCoreGeneration();
+        _twin = null;
+        Close();
         // The image is finished in memory and written once. Post-processing the
         // file after writing it meant reading a just-written PE back, and on
         // Windows each such read is a full antivirus scan of the file.
@@ -1384,8 +1472,64 @@ public class FaslAssembler
         // Replaced, never rewritten in place: the old fasl may be loaded (LOAD
         // reads fasls by path) and still mapped by this process.
         Compat.WriteAllBytesReplacing(outputPath, image);
+        if (inMemory != null) Runtime.RememberCompiledFasl(outputPath, inMemory);
 #endif
     }
+
+    /// <summary>Also emit the module into an assembly this process can run, for a
+    /// LOAD of the saved file to use. An in-memory module that is never loaded
+    /// stays in memory: dynamic assemblies of this kind are not unloaded.</summary>
+    public void AlsoBuildInMemory()
+    {
+#if NET9_0_OR_GREATER
+        // Both maps answer MAKE-LOAD-FORM from one memo, so a method is still
+        // called once per object per file.
+        var memo = CilAssembler.MakeLoadFormMemo;
+        _twin = new FaslAssembler(_moduleName, runnable: true);
+        CilAssembler.MakeLoadFormMemo = memo;
+#endif
+    }
+
+    private void Twin(Action<FaslAssembler> step)
+    {
+        if (_twin == null) return;
+        try { step(_twin); }
+        catch { _twin = null; }
+    }
+
+#if NET9_0_OR_GREATER
+    private void Close()
+    {
+        CloseChunk();
+        CilAssembler.CloseMlfBatch(_structInternMap);
+        CilAssembler.ClearMakeLoadFormMemo();
+        EmitPreinternSymbols();
+        FinishDefinitionSources();
+        // Before the initializer is closed: the array every uninterned symbol is
+        // indexed out of, built from a names blob rather than from per-symbol IL.
+        _structInternMap.EmitUninternedTableInit(_cctorIl);
+        _structInternMap.EmitDataPartsInit(_cctorIl);
+
+        // return Nil.Instance
+        _initIl.Emit(OpCodes.Ldsfld,
+            typeof(Nil).GetField("Instance")!);
+        _initIl.Emit(OpCodes.Ret);
+
+        // Close the type initializer (empty when the module named no functions).
+        _cctorIl.Emit(OpCodes.Ret);
+
+        // Literal holders spilled off CompiledModule, each with its own
+        // initializer. Created before CompiledModule, which references them.
+        foreach (var (holder, cctor) in _structInternMap.OverflowHolders)
+        {
+            cctor.Emit(OpCodes.Ret);
+            holder.CreateType();
+        }
+
+        _tb.CreateType();
+        StampCoreGeneration();
+    }
+#endif
 
     /// <summary>When set, the generation this assembly IS rather than the one that
     /// built it. A core stamps its own identity (derived from the .sil it embodies);
@@ -1414,7 +1558,7 @@ public class FaslAssembler
             var ctor = typeof(System.Reflection.AssemblyMetadataAttribute)
                 .GetConstructor(new[] { typeof(string), typeof(string) });
             if (ctor != null)
-                _ab.SetCustomAttribute(new CustomAttributeBuilder(
+                ((AssemblyBuilder?)_runAb ?? _ab).SetCustomAttribute(new CustomAttributeBuilder(
                     ctor, new object[] { Startup.CoreGenerationKey, gen }));
         }
         catch { /* best-effort: the fasl is still valid without the stamp */ }

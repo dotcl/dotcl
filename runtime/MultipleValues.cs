@@ -64,12 +64,23 @@ public sealed class MvReturn : LispObject
     public override string ToString() => Count > 0 ? this[0].ToString()! : "NIL";
 }
 
+/// <summary>The values of a form, held in fields across code that may publish
+/// values of its own (an UNWIND-PROTECT cleanup, the rest of a
+/// MULTIPLE-VALUE-PROG1). N is the count, -1 when nothing was published, -2 when
+/// the form's MvReturn carries them.</summary>
+public struct MvHeld
+{
+    internal int N;
+    internal LispObject? V0, V1, V2, V3;
+    internal LispObject[]? Rest;
+}
+
 public static class MultipleValues
 {
     [ThreadStatic]
     private static LispObject[]? _values;
-    [ThreadStatic]
-    private static int _count;
+    // Lives in CallTls (see there): read and written around every call.
+    private static ref int _count => ref CallTls.MvCount;
     [ThreadStatic]
     private static LispObject[]? _primaryCache;
     /// <summary>The two values of a (VALUES A B) whose thread state was published
@@ -180,6 +191,16 @@ public static class MultipleValues
     /// caller cannot accidentally pair the wrong secondary with the primary.</summary>
     public static LispObject Values2Primary(LispObject a, LispObject b) => Primary(a);
 
+    /// <summary>VALUES2 for a call whose values are read out of the thread state by
+    /// the very next instruction (CAPTUREFORBIND, NTHVALUEOF): those readers take a
+    /// pair state whose first value is the primary as this call's values, so the
+    /// MvReturn is not needed.</summary>
+    public static LispObject Values2Pair(LispObject a, LispObject b)
+    {
+        SetPair(a, b);
+        return a;
+    }
+
     public static LispObject Values(params LispObject[] vals)
     {
         Set(vals);
@@ -279,6 +300,25 @@ public static class MultipleValues
         return count > 0 ? snap[0] : Nil.Instance;
     }
 
+    /// <summary>CAPTUREFORBIND right after a VALUES2PAIR entry, which left the pair
+    /// state with PRIMARY as its first value.</summary>
+    public static LispObject CapturePair(LispObject primary)
+    {
+        var snap = SnapFor(2);
+        snap[0] = primary;
+        snap[1] = _pair1!;
+        _bindCount = 2;
+        _count = -1;
+        return primary;
+    }
+
+    /// <summary>NTHVALUEOF right after a VALUES2PAIR entry.</summary>
+    public static LispObject PairNth(LispObject primary, int n)
+    {
+        _count = -1;
+        return n == 0 ? primary : n == 1 ? _pair1! : Nil.Instance;
+    }
+
     /// <summary>Fill the bind snapshot from a LIST of values and answer the
     /// primary. The tree-walk interpreter takes this route: it evaluates the
     /// value form with the host's MULTIPLE-VALUE-LIST (its own way of keeping
@@ -353,24 +393,23 @@ public static class MultipleValues
     // body that read a mode returns its tail (VALUES ...) without an MvReturn:
     // the primary value alone for PRIMARY, the values published in the thread
     // state for CAPTURE.
-    [ThreadStatic] private static int s_mode;
     public const int ModeNone = 0, ModePrimary = 1, ModeCapture = 2;
 
     /// <summary>The mode the caller of the current body asked for, consumed.</summary>
     public static int TakeMode()
     {
-        int m = s_mode;
-        if (m != 0) s_mode = 0;
+        int m = CallTls.Mode;
+        if (m != 0) CallTls.Mode = 0;
         return m;
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    internal static void SetMode(int mode) => s_mode = mode;
+    internal static void SetMode(int mode) => CallTls.Mode = mode;
 
     /// <summary>Hand MODE on to the body called next, which must take it as its
     /// first instruction: the typed entry of a &amp;key or &amp;optional function
     /// passing its own caller's mode to the shared body it calls directly.</summary>
-    public static void PassMode(int mode) => s_mode = mode;
+    public static void PassMode(int mode) => CallTls.Mode = mode;
 
     // A capture-mode return writes its values straight into the bind snapshot
     // (see CAPTUREFORBIND) and says so with this count: the caller's capture is
@@ -457,6 +496,113 @@ public static class MultipleValues
         return Values(a, b, c, d);
     }
 
+    public static LispObject Values5Mode(LispObject a, LispObject b, LispObject c, LispObject d,
+                                         LispObject e, int mode)
+    {
+        if (mode == ModePrimary) return PrimaryOnly(a);
+        if (mode != ModeCapture) return Values(a, b, c, d, e);
+        var s = SnapFor(5);
+        s[0] = a; s[1] = b; s[2] = c; s[3] = d; s[4] = e;
+        return CaptureN(5, a);
+    }
+
+    public static LispObject Values6Mode(LispObject a, LispObject b, LispObject c, LispObject d,
+                                         LispObject e, LispObject f, int mode)
+    {
+        if (mode == ModePrimary) return PrimaryOnly(a);
+        if (mode != ModeCapture) return Values(a, b, c, d, e, f);
+        var s = SnapFor(6);
+        s[0] = a; s[1] = b; s[2] = c; s[3] = d; s[4] = e; s[5] = f;
+        return CaptureN(6, a);
+    }
+
+    public static LispObject Values7Mode(LispObject a, LispObject b, LispObject c, LispObject d,
+                                         LispObject e, LispObject f, LispObject g, int mode)
+    {
+        if (mode == ModePrimary) return PrimaryOnly(a);
+        if (mode != ModeCapture) return Values(a, b, c, d, e, f, g);
+        var s = SnapFor(7);
+        s[0] = a; s[1] = b; s[2] = c; s[3] = d; s[4] = e; s[5] = f; s[6] = g;
+        return CaptureN(7, a);
+    }
+
+    public static LispObject Values8Mode(LispObject a, LispObject b, LispObject c, LispObject d,
+                                         LispObject e, LispObject f, LispObject g, LispObject h, int mode)
+    {
+        if (mode == ModePrimary) return PrimaryOnly(a);
+        if (mode != ModeCapture) return Values(a, b, c, d, e, f, g, h);
+        var s = SnapFor(8);
+        s[0] = a; s[1] = b; s[2] = c; s[3] = d; s[4] = e; s[5] = f; s[6] = g; s[7] = h;
+        return CaptureN(8, a);
+    }
+
+    /// <summary>(VALUES ...) of more than eight values where a value mode applies.</summary>
+    public static LispObject ValuesArrayMode(LispObject[] vals, int mode)
+    {
+        if (mode == ModePrimary) return PrimaryOnly(vals[0]);
+        if (mode != ModeCapture) return Values(vals);
+        Array.Copy(vals, SnapFor(vals.Length), vals.Length);
+        return CaptureN(vals.Length, vals[0]);
+    }
+
+    /// <summary>VALUES-LIST where a value mode applies.</summary>
+    public static LispObject ValuesListMode(LispObject list, int mode)
+    {
+        int n = 0;
+        var cur = list;
+        while (cur is Cons c) { n++; cur = c.Cdr; }
+        if (cur is not Nil)
+            throw new LispErrorException(new LispTypeError("VALUES-LIST: not a proper list", list));
+        if (n == 0)
+        {
+            if (mode == ModePrimary) return PrimaryOnly(Nil.Instance);
+            _values = Array.Empty<LispObject>();
+            _count = 0;
+            return Nil.Instance;
+        }
+        var first = ((Cons)list).Car;
+        if (mode == ModePrimary || n == 1) return PrimaryOnly(first);
+        var s = SnapFor(n);
+        cur = list;
+        for (int i = 0; i < n; i++) { var c = (Cons)cur; s[i] = c.Car; cur = c.Cdr; }
+        return CaptureN(n, first);
+    }
+
+    /// <summary>MULTIPLE-VALUE-CALL of FN on the values CAPTUREFORBIND has just put in
+    /// the bind snapshot, with the caller's value mode.</summary>
+    public static LispObject CallBound(LispObject fn, int mode)
+    {
+        var s = _bindSnap;
+        int n = _bindCount;
+        LispObject a = Nil.Instance, b = Nil.Instance, c = Nil.Instance, d = Nil.Instance;
+        LispObject[]? args = null;
+        if (n > 4) { args = new LispObject[n]; Array.Copy(s!, args, n); }
+        else
+        {
+            if (n > 0) a = s![0];
+            if (n > 1) b = s![1];
+            if (n > 2) c = s![2];
+            if (n > 3) d = s![3];
+        }
+        var f = Runtime.CoerceToFunction(fn);
+        return n switch
+        {
+            0 => f.Invoke0M(mode),
+            1 => f.Invoke1M(a, mode),
+            2 => f.Invoke2M(a, b, mode),
+            3 => f.Invoke3M(a, b, c, mode),
+            4 => f.Invoke4M(a, b, c, d, mode),
+            _ => f.Invoke(args!),
+        };
+    }
+
+    private static LispObject CaptureN(int n, LispObject a)
+    {
+        _bindCount = n;
+        _count = CountSnap;
+        return a;
+    }
+
     /// <summary>The bind snapshot and its count when a capture-mode return put
     /// the values of the call whose primary value is PRIMARY there, consumed;
     /// otherwise null (and the state is left as it was).</summary>
@@ -494,11 +640,113 @@ public static class MultipleValues
         return c == 0 ? 0 : -1;
     }
 
+    private static readonly LispObject[] s_heldInPrimary = new LispObject[1];
+
+    /// <summary>The values of a call whose primary value is PRIMARY, for RESTOREHELD to
+    /// publish again after code that may publish its own.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal static LispObject[]? Hold(LispObject primary)
+    {
+        if (primary is MvReturn) return s_heldInPrimary;
+        if (_count == -1) return null;
+        return HoldSlow(primary);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispObject[]? HoldSlow(LispObject primary)
+    {
+        int n = OwnCount(primary);
+        return n == 0 || n > 1 ? Get() : null;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal static void RestoreHeld(LispObject[]? held)
+    {
+        if (held == null) _count = -1;
+        else if (!ReferenceEquals(held, s_heldInPrimary)) Set(held);
+    }
+
     internal static LispObject OwnNth(int i)
     {
         var vals = _values;
         if (vals == null) return (i == 0 ? _pair0 : _pair1) ?? Nil.Instance;
         return vals[i] ?? Nil.Instance;
+    }
+
+    /// <summary>The values of the form whose value is PRIMARY: the MvReturn, or the
+    /// thread state when it is that form's (OWNCOUNT's test).</summary>
+    public static MvHeld HoldValues(LispObject primary)
+    {
+        MvHeld h = default;
+        if (primary is MvReturn) { h.N = -2; return h; }
+        int c = _count;
+        LispObject[]? vals;
+        if (c == CountSnap) { c = _bindCount; vals = _bindSnap!; }
+        else vals = _values;
+        if (c == 0) { h.N = 0; return h; }
+        if (c < 0) { h.N = -1; return h; }
+        if (vals == null)
+        {
+            if (!ReferenceEquals(_pair0, primary)) { h.N = -1; return h; }
+            h.N = c; h.V0 = primary; h.V1 = c > 1 ? _pair1 : null;
+            return h;
+        }
+        if (c > vals.Length || !ReferenceEquals(vals[0], primary)) { h.N = -1; return h; }
+        h.N = c;
+        if (c > 4)
+        {
+            // A snapshot or a longer buffer is reused; a published array of exactly C is not.
+            if (vals.Length == c && _count != CountSnap) h.Rest = vals;
+            else { h.Rest = new LispObject[c]; Array.Copy(vals, h.Rest, c); }
+            return h;
+        }
+        h.V0 = primary;
+        if (c > 1) h.V1 = vals[1];
+        if (c > 2) h.V2 = vals[2];
+        if (c > 3) h.V3 = vals[3];
+        return h;
+    }
+
+    /// <summary>Publish H again and return the form's value, in the form MODE asks
+    /// for (see TAKEMODE). -1: no mode applies, PRIMARY is returned as it is.</summary>
+    public static LispObject RestoreValues(MvHeld h, LispObject primary, int mode)
+    {
+        int n = h.N;
+        if (n == -2)
+        {
+            var mv = (MvReturn)primary;
+            if (mode == ModePrimary) { _count = -1; return mv.PrimaryValue; }
+            n = mv.Count;
+            if (n > 2) { Set(mv.ToArray()); return primary; }
+            if (n == 2) SetPair(mv[0], mv[1]);
+            else if (n == 1) SetOne(mv[0]);
+            else { _values = Array.Empty<LispObject>(); _count = 0; }
+            return primary;
+        }
+        if (n == -1 || mode == ModePrimary) { _count = -1; return primary; }
+        switch (n)
+        {
+            case 0: _values = Array.Empty<LispObject>(); _count = 0; break;
+            case 1: SetOne(h.V0!); break;
+            case 2: SetPair(h.V0!, h.V1!); break;
+            case 3: case 4:
+                var snap = SnapFor(n);
+                snap[0] = h.V0!; snap[1] = h.V1!; snap[2] = h.V2!;
+                if (n == 4) snap[3] = h.V3!;
+                _bindCount = n;
+                _count = CountSnap;
+                break;
+            default: Set(h.Rest!); break;
+        }
+        if (mode != ModeNone || n <= 1) return primary;
+        // The caller passed no mode: the values leave in an MvReturn, as a tail VALUES does.
+        return n switch
+        {
+            2 => Values2(h.V0!, h.V1!),
+            3 => Values(h.V0!, h.V1!, h.V2!),
+            4 => Values(h.V0!, h.V1!, h.V2!, h.V3!),
+            _ => Values(h.Rest!),
+        };
     }
 
     // Save/restore for unwind-protect: preserve body's secondary values across cleanup

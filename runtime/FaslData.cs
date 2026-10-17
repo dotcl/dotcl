@@ -25,7 +25,7 @@ public static class FaslData
     internal const byte TNil = 0, TT = 1, TFixnum = 2, TString = 3, TSymbol = 4, TUninterned = 5,
         TChar = 6, TSingle = 7, TDouble = 8, TBignum = 9, TRatio = 10, TList = 11, TVector = 12,
         TInstance = 13, THashTable = 14, TComplex = 15, THtPrototype = 16,
-        TShared = 17, TDef = 18, TRef = 19;
+        TShared = 17, TDef = 18, TRef = 19, TStruct = 20, TPathname = 21, TTypedVector = 22, TPackedVector = 23;
 
     /// <summary>Split the joined parts (each prefixed by its length) back into
     /// the parts. The blob may come in several pieces: one data field can hold
@@ -263,6 +263,39 @@ public static class FaslData
                     return new LispVector(items);
                 }
                 case TInstance: return LispInstance.InternViaEval(Str(), Nil.Instance);
+                case TPackedVector:
+                {
+                    string et = Str();
+                    int n = (int)Varint();
+                    int nb = (int)Varint();
+                    var bytes = new byte[nb];
+                    Buffer.BlockCopy(_b, Pos, bytes, 0, nb);
+                    Pos += nb;
+                    return LispVector.FromPackedBytes(bytes, n, et);
+                }
+                case TTypedVector:
+                {
+                    string et = Str();
+                    int n = (int)Varint();
+                    var items = new LispObject[n];
+                    for (int i = 0; i < n; i++) items[i] = Value();
+                    return new LispVector(items, et);
+                }
+                case TPathname:
+                {
+                    string ns = Str();
+                    var version = Value();
+                    return version is Nil ? LispPathname.FromString(ns) : LispPathname.FromStringWithVersion(ns, version);
+                }
+                case TStruct:
+                {
+                    string key = Str();
+                    var type = Value();
+                    int n = (int)Varint();
+                    var slots = new LispObject[n];
+                    for (int i = 0; i < n; i++) slots[i] = Value();
+                    return LispStruct.Intern(key, type, slots);
+                }
                 case THashTable:
                 {
                     var ht = new LispHashTable(Str());
@@ -318,7 +351,10 @@ internal sealed class FaslDataWriter
     public Func<Symbol, int>? UninternedIndex;
     /// <summary>Key of an instance already registered for creation in this
     /// fasl, or null.</summary>
-    public Func<LispInstance, string?>? InstanceKey;
+    public Func<LispObject, string?>? InstanceKey;
+    /// <summary>Intern key of a structure built from its slots (as
+    /// LispStruct.Intern), or null to refuse it.</summary>
+    public Func<LispStruct, string?>? StructKey;
     /// <summary>Called with (name, package) for every interned symbol written.</summary>
     public Action<string, string>? OnSymbol;
     /// <summary>For an object several literals of the current top level form
@@ -373,13 +409,20 @@ internal sealed class FaslDataWriter
         }
     }
 
+    private readonly HashSet<int> _localOpen = new();
+    private readonly HashSet<LispObject> _sharedWritten = new(ReferenceEqualityComparer.Instance);
+    private readonly List<LispObject> _sharedOrder = new();
+
     public bool TryValue(LispObject v)
     {
         var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
         int mark = Mark;
         int locals = _localIdx.Count;
+        int shareds = _sharedOrder.Count;
         if (Write(v, seen, 0)) return true;
         Reset(mark);
+        for (int i = _sharedOrder.Count - 1; i >= shareds; i--) _sharedWritten.Remove(_sharedOrder[i]);
+        _sharedOrder.RemoveRange(shareds, _sharedOrder.Count - shareds);
         if (_localIdx.Count != locals)
             foreach (var k in new List<LispObject>(_localIdx.Keys))
                 if (_localIdx[k] >= locals) _localIdx.Remove(k);
@@ -407,22 +450,31 @@ internal sealed class FaslDataWriter
     {
         if (depth > MaxDepth) return false;
         Nodes++;
-        if (!here && v is Cons or LispVector or LispHashTable)
+        if (!here && v is Cons or LispVector or LispHashTable or LispStruct or LispPathname)
         {
             int slot = SharedSlot?.Invoke(v) ?? -1;
             if (slot >= 0)
             {
                 _body.Add(FaslData.TShared);
                 Varint((ulong)slot);
+                if (_sharedWritten.Contains(v))
+                {
+                    // Read by then: the reader finds it in the slot and skips nothing.
+                    Varint(0);
+                    return true;
+                }
                 int len = ReserveLength();
                 if (!Write(v, seen, depth, here: true)) return false;
                 PatchLength(len);
+                _sharedWritten.Add(v);
+                _sharedOrder.Add(v);
                 return true;
             }
             if (LocalShared != null && LocalShared.Contains(v))
             {
                 if (_localIdx.TryGetValue(v, out int known))
                 {
+                    if (_localOpen.Contains(known)) return false;
                     _body.Add(FaslData.TRef);
                     Varint((ulong)known);
                     return true;
@@ -431,7 +483,10 @@ internal sealed class FaslDataWriter
                 _localIdx[v] = idx;
                 _body.Add(FaslData.TDef);
                 Varint((ulong)idx);
-                return Write(v, seen, depth, here: true);
+                _localOpen.Add(idx);
+                bool done = Write(v, seen, depth, here: true);
+                _localOpen.Remove(idx);
+                return done;
             }
         }
         switch (v)
@@ -513,9 +568,23 @@ internal sealed class FaslDataWriter
             }
             case LispVector vec:
             {
-                if (vec.ElementTypeName != "T" || vec._dimensions != null) return false;
+                if (vec._dimensions != null) return false;
                 if (!seen.Add(vec)) return false;
-                _body.Add(FaslData.TVector);
+                if (vec.ElementTypeName != "T" && vec.TryPackLiteral(out var packed))
+                {
+                    _body.Add(FaslData.TPackedVector);
+                    Str(vec.ElementTypeName);
+                    Varint((ulong)vec.Length);
+                    Varint((ulong)packed.Length);
+                    _body.AddRange(packed);
+                    return true;
+                }
+                if (vec.ElementTypeName != "T")
+                {
+                    _body.Add(FaslData.TTypedVector);
+                    Str(vec.ElementTypeName);
+                }
+                else _body.Add(FaslData.TVector);
                 Varint((ulong)vec.Length);
                 for (int i = 0; i < vec.Length; i++)
                     if (!Write(vec.ElementAt(i), seen, depth + 1)) return false;
@@ -527,6 +596,30 @@ internal sealed class FaslDataWriter
                 if (key == null) return false;
                 _body.Add(FaslData.TInstance);
                 Str(key);
+                return true;
+            }
+            case LispPathname pn:
+                _body.Add(FaslData.TPathname);
+                Str(pn.ToNamestring());
+                return Write(pn.Version ?? Nil.Instance, seen, depth + 1);
+            case LispStruct ls:
+            {
+                var ikey = InstanceKey?.Invoke(ls);
+                if (ikey != null)
+                {
+                    _body.Add(FaslData.TInstance);
+                    Str(ikey);
+                    return true;
+                }
+                var skey = StructKey?.Invoke(ls);
+                if (skey == null || !seen.Add(ls)) return false;
+                _body.Add(FaslData.TStruct);
+                Str(skey);
+                if (!Write(ls.TypeName, seen, depth + 1)) return false;
+                var slots = ls.SlotsSnapshot();
+                Varint((ulong)slots.Length);
+                foreach (var sv in slots)
+                    if (!Write(sv ?? Nil.Instance, seen, depth + 1)) return false;
                 return true;
             }
             case LispHashTable ht:
