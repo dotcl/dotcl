@@ -145,9 +145,12 @@ unoptimized: `dotnet build runtime/runtime.csproj -p:Optimize=false`.
 
 On Windows:
 
-- **`make`**: the build needs GNU Make. Git Bash (bundled with
-  [Git for Windows](https://gitforwindows.org/)) ships GNU Make and works;
-  run the commands above from a Git Bash prompt. WSL works too.
+- **`make`**: the build needs GNU Make, which Git for Windows does not
+  include. Install it from [MSYS2](https://www.msys2.org/)
+  (`pacman -S make`) and run the commands above from the MSYS2 shell or Git
+  Bash with MSYS2's `usr/bin` on `PATH`. WSL works too. Avoid a Cygwin-built
+  make (`make --version` says `x86_64-pc-cygwin`): it rewrites paths to
+  `/cygdrive/c/...` form.
 - **Path translation**: run the build from Git Bash (`/c/...` paths) rather
   than a shell that rewrites paths to Cygwin form (`/cygdrive/c/...`). The
   Roswell/SBCL bootstrap reads the paths verbatim, so `/cygdrive/...` paths

@@ -75,6 +75,7 @@ public static partial class Runtime
             if (v < long.MaxValue) return Fixnum.Make(v + 1);
             return Bignum.MakeInteger(new System.Numerics.BigInteger(v) + 1);
         }
+        if (a is Ratio r) return Ratio.MakeReduced(r.Numerator + r.Denominator, r.Denominator);
         return Arithmetic.Add(AsNumber(a), Fixnum.Make(1));
     }
 
@@ -87,6 +88,7 @@ public static partial class Runtime
             if (v > long.MinValue) return Fixnum.Make(v - 1);
             return Bignum.MakeInteger(new System.Numerics.BigInteger(v) - 1);
         }
+        if (a is Ratio r) return Ratio.MakeReduced(r.Numerator - r.Denominator, r.Denominator);
         return Arithmetic.Subtract(AsNumber(a), Fixnum.Make(1));
     }
 
@@ -285,6 +287,28 @@ public static partial class Runtime
         return r;
     }
 
+    // The exact result, or long.MinValue when it overflows (the caller then takes the generic path).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long AddOrMin(long a, long b)
+    {
+        long r = unchecked(a + b);
+        return ((a ^ r) & (b ^ r)) < 0 ? long.MinValue : r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long SubtractOrMin(long a, long b)
+    {
+        long r = unchecked(a - b);
+        return ((a ^ b) & (a ^ r)) < 0 ? long.MinValue : r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long MultiplyOrMin(long a, long b)
+    {
+        long hi = Compat.BigMul(a, b, out long r);
+        return hi == (r >> 63) ? r : long.MinValue;
+    }
+
     /// <summary>Subtract int64s, promoting to Bignum on signed overflow.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject SubtractFixnum(long a, long b)
@@ -333,7 +357,8 @@ public static partial class Runtime
             long av = fa.Value;
             if (bv == -1) return Arithmetic.Negate(fa);
             if (av % bv == 0) return Fixnum.Make(av / bv);
-            // Fall through to ratio creation via Arithmetic.Divide
+            if (av != long.MinValue && bv != long.MinValue)
+                return FixnumRatio(av, bv);
         }
         // Float division by zero follows IEEE (an infinity, or NaN for 0.0/0.0)
         // instead of signalling. The compiled path already did: `(/ 1.0d0 0.0d0)`
@@ -348,6 +373,27 @@ public static partial class Runtime
             return new DoubleFloat(da.Value / db.Value);
         if (a is SingleFloat sfa && b is SingleFloat sfb)
             return new SingleFloat(sfa.Value / sfb.Value);
+        if ((a is DoubleFloat || b is DoubleFloat)
+            && a is Number na && b is Number nb && na is not LispComplex && nb is not LispComplex)
+            return new DoubleFloat(Arithmetic.ToDouble(na) / Arithmetic.ToDouble(nb));
+        return DivideSlow(a, b);
+    }
+
+    /// <summary>AV/BV reduced, for fixnums that do not divide evenly and are
+    /// not long.MinValue (so their absolute values are longs).</summary>
+    private static LispObject FixnumRatio(long av, long bv)
+    {
+        ulong x = (ulong)System.Math.Abs(av), y = (ulong)System.Math.Abs(bv);
+        while (y != 0) { ulong r = x % y; x = y; y = r; }
+        long g = (long)x;
+        if (bv < 0) { av = -av; bv = -bv; }
+        return Ratio.MakeReduced(av / g, bv / g);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject DivideSlow(LispObject a, LispObject b)
+    {
+        if (b is Ratio rb && a is Fixnum { Value: 1 }) return Arithmetic.RatioReciprocal(rb);
         try { return Arithmetic.Divide(AsNumber(a), AsNumber(b)); }
         catch (DivideByZeroException) { throw DivisionByZero("/", a, b); }
     }
@@ -445,6 +491,21 @@ public static partial class Runtime
     /// exclusively, whose tests (> counter limit) and (<= counter limit) change
     /// at the floor of a non-integer limit.</summary>
     public static long LoopLimitFloor(LispObject limit) => IntegerLoopLimit(limit, true);
+
+    /// <summary>The value of a LOOP BY phrase, which must be a positive real.</summary>
+    public static LispObject LoopBy(LispObject x)
+    {
+        x = Primary(x);
+        if (x is Fixnum f ? f.Value > 0 : x is Number && x is not LispComplex && IsTruePlusp(x))
+            return x;
+        throw LoopByError(x);
+    }
+
+    public static long LoopByFixnum(long x) => x > 0 ? x : throw LoopByError(Fixnum.Make(x));
+
+    static LispErrorException LoopByError(LispObject x) =>
+        new LispErrorException(new LispTypeError("LOOP: the BY value is not a positive real", x,
+            Runtime.List(Startup.Sym("REAL"), Runtime.List(Fixnum.Make(0)))));
 
     static long IntegerLoopLimit(LispObject x, bool floor)
     {
@@ -581,11 +642,27 @@ public static partial class Runtime
 
     // --- Bool-returning unary predicates (fused in compile-if) ---
 
+    public static LispObject Zerop(LispObject a)
+    {
+        bool z = a switch
+        {
+            Fixnum f => f.Value == 0,
+            DoubleFloat d => d.Value == 0.0,
+            SingleFloat sf => sf.Value == 0f,
+            Bignum or Ratio => false,
+            _ => IsTrueZerop(a),
+        };
+        return z ? T.Instance : Nil.Instance;
+    }
+
     public static bool IsTrueZerop(LispObject a)
     {
         a = Primary(a);
         if (a is Fixnum fa) return fa.Value == 0;
         if (a is DoubleFloat da) return da.Value == 0.0;
+        if (a is SingleFloat sa) return sa.Value == 0f;
+        // Never zero: a zero integer is a fixnum, and a ratio has a nonzero numerator.
+        if (a is Bignum or Ratio) return false;
         return Arithmetic.IsNumericEqual(AsNumber(a), Fixnum.Make(0));
     }
 
@@ -748,14 +825,19 @@ public static partial class Runtime
         return result;
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject Reciprocal(LispObject a)
+    {
+        if (a is Ratio r) return Arithmetic.RatioReciprocal(r);
+        try { return Arithmetic.Divide(Fixnum.Make(1), AsNumber(a)); }
+        catch (DivideByZeroException) { throw DivisionByZero("/", a); }
+    }
+
     public static LispObject DivideN(params LispObject[] args)
     {
         Runtime.CheckArityMin("/", args, 1);
         if (args.Length == 1)
-        {
-            try { return Arithmetic.Divide(Fixnum.Make(1), AsNumber(args[0])); }
-            catch (DivideByZeroException) { throw DivisionByZero("/", args[0]); }
-        }
+            return Reciprocal(args[0]);
         LispObject result = args[0];
         for (int i = 1; i < args.Length; i++)
             result = Divide(result, args[i]);
@@ -2029,6 +2111,13 @@ public static partial class Runtime
 
     public static LispObject Max(LispObject a, LispObject b) =>
         Arithmetic.Compare(AsNumber(a), AsNumber(b)) >= 0 ? a : b;
+
+    // MIN / MAX of two raw doubles, choosing the operand Min / Max choose.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double MinDouble(double a, double b) => a.CompareTo(b) <= 0 ? a : b;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double MaxDouble(double a, double b) => a.CompareTo(b) >= 0 ? a : b;
 
     internal static void RegisterArithmeticBuiltins()
     {

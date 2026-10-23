@@ -101,15 +101,15 @@
         (%fpn-count "Runtime.MultiplyFixnum" (%fpn-sil #'%fpn-mul2)))
   (1 1 1))
 
-;; A raw operand is a LEAF or nothing. The inner multiply qualifies; the outer
-;; add does not and keeps its generic operation.
+;; The inner multiply is computed raw with an overflow check and only the sum is
+;; boxed; the generic calls remain for the path taken on overflow.
 (deftest-emitting-only fixnum-param-native-arith.nested-operand-stays-generic
   (let ((d (%fpn-sil #'%fpn-nested)))
-    (list (%fpn-count "Runtime.MultiplyFixnum" d)
+    (list (%fpn-count "Runtime.MultiplyOrMin" d)
           (%fpn-count "Runtime.Increment" d)
           (%fpn-count "Runtime.AddFixnum" d)
           (%fpn-count "Runtime.Add)" d)))
-  (1 1 0 0))
+  (1 0 1 1))
 
 ;;; ---- values ----
 

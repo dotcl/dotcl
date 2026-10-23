@@ -150,6 +150,10 @@ matters.
 ;; => (T 42): return value first, then each out/ref parameter
 ```
 
+A COM object reached through IDispatch carries no signature, so there every
+argument is passed, out positions included, and each one's value after the call
+follows the return value.
+
 A .NET exception arrives as a Lisp condition that remembers its CLR type:
 
 ```lisp
@@ -160,6 +164,70 @@ A .NET exception arrives as a Lisp condition that remembers its CLR type:
   (dotnet:handler-bind (("System.FormatException" (e) (return-from nil :format-error)))
     (dotnet:static "System.Int32" "Parse" "nope")))                   ; => :FORMAT-ERROR
 ```
+
+## Spans and memory
+
+A parameter typed `Span<T>`, `ReadOnlySpan<T>`, `Memory<T>` or `ReadOnlyMemory<T>`
+takes a Lisp vector directly. When the vector's storage has element type `T`, the
+span is a view of that storage, not a copy, so a method that writes into a span
+writes into the vector:
+
+```lisp
+(let ((buf (make-array 16 :element-type '(unsigned-byte 8))))
+  (dotnet:invoke stream "Read" buf))            ; Stream.Read(Span<byte>) fills BUF
+
+(dotnet:invoke (dotnet:static "System.Text.Encoding" "UTF8") "GetBytes" "abc" buf)
+(multiple-value-list (dotnet:call-out "System.Int32" "TryParse" octets))  ; ReadOnlySpan<byte>
+(dotnet:static-generic "System.MemoryExtensions" "Reverse" '("System.Double") doubles)
+```
+
+| Lisp vector | storage |
+|---|---|
+| string | `char` |
+| `(unsigned-byte 8)` | `byte` |
+| `(unsigned-byte 16)` | `ushort` |
+| `(signed-byte 32)` | `int` |
+| `(signed-byte 64)`, `fixnum` | `long` |
+| `(unsigned-byte 64)` | `ulong` |
+| `single-float` / `double-float` | `float` / `double` |
+
+`(unsigned-byte 32)`, `(signed-byte 8)` and `(signed-byte 16)` vectors are stored
+wider than their element type, except those made by `dotcl:make-pinned-vector`.
+The span covers the vector's active part: up to its fill pointer, starting at its
+displaced offset. A .NET array or memory object passes as itself.
+
+A read-only span or memory can also take a list, a general vector, or a numeric
+vector of another width; it then receives a copy. A writable one needs the
+storage itself, since writes into a copy would be lost.
+
+An array parameter (`T[]`, or `System.Array`) works the same way for a vector
+whose storage is that array: a one-dimensional vector without a fill pointer or
+displacement is passed as its storage, so `Stream.Read(byte[], int, int)`,
+`Array.Copy` or `TextReader.Read(char[], int, int)` write into the vector. A vector
+with such storage and a fill pointer or a displacement signals a `type-error`
+rather than receiving a copy whose writes would be lost; pass a simple vector
+(`copy-seq`, then `replace` the result back). A list, a general vector, or a vector
+of another element type (including `(unsigned-byte 4)`, whose storage is a `byte[]`) is still
+copied in. An array a method keeps (`new MemoryStream(byte[])`) is the vector's
+storage until `adjust-array` replaces it. `dotnet:new` chooses among constructors
+the same way, so `(dotnet:new "System.IO.MemoryStream" octets)` is a stream over
+`octets` and `(dotnet:new "System.IO.MemoryStream" 16)` one with capacity 16.
+Constructors taking a span or a pointer are not called.
+
+A method that returns a span gives back a fresh Lisp vector of the element type
+(a string for `char`):
+
+```lisp
+(dotnet:static "System.MemoryExtensions" "Trim" "  hi  ")    ; => "hi"
+```
+
+When overloads differ only in a span, memory or string/array parameter, the one the
+arguments fit is used; overloads with no span or memory parameter are preferred, then
+span ones, then memory ones. Span arguments and results go through generated code, so
+on a build without `System.Reflection.Emit` (netstandard2.0, `DotclNoEmit`) such a call
+signals an error; `Memory<T>` parameters work there. Other ref struct types
+(`Utf8JsonReader`, ...) cannot be passed. If storage is replaced by `adjust-array`, a
+`Memory<T>` a method kept no longer refers to the vector.
 
 ## Delegates and callbacks
 

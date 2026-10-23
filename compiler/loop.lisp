@@ -1899,7 +1899,8 @@ collected result will be returned as the value of the LOOP."
 	   (multiple-value-setq (form stepby-constantp stepby)
 	     (loop-constant-fold-if-possible form indexv-type))
 	   (unless stepby-constantp
-	     (loop-make-variable (setq stepby (loop-gentemp 'loop-step-by-)) form indexv-type)))
+	     (loop-make-variable (setq stepby (loop-gentemp 'loop-step-by-))
+				 `(dotcl.cil-compiler::%loop-by ,form) indexv-type)))
 	 (t (loop-error
 	      "~S invalid preposition in sequencing or sequence path.~@
 	       Invalid prepositions specified in iteration path descriptor or something?"
@@ -1936,12 +1937,16 @@ collected result will be returned as the value of the LOOP."
      ;; (%INDUCTION-RANGE in the compiler), which it does only when nothing
      ;; but this step, written with the marker, assigns the variable.
      (when (and indexv (symbolp indexv) testfn limit-given
-		stepby-constantp (integerp stepby) (plusp stepby)
+		(if stepby-constantp (and (integerp stepby) (plusp stepby)) (symbolp stepby))
 		(if limit-constantp (integerp limit-value) (symbolp endform)))
-       (let ((delta (if (member dir '(nil :up)) stepby (- stepby))))
+       (let* ((up (member dir '(nil :up)))
+	      (delta (cond ((integerp stepby) (if up stepby (- stepby)))
+			   (up stepby)
+			   (t `(- ,stepby)))))
 	 (setq step `(dotcl.cil-compiler::%induction-next ,indexv ,delta))
 	 (push `(dotcl.cil-compiler::%induction ,indexv ,delta ,(if limit-constantp limit-value endform)
-			    ,(if inclusive-iteration t nil))
+			    ,(if inclusive-iteration t nil)
+			    ,@(unless (integerp stepby) (if up '(:up) '(:down))))
 	       *loop-declarations*)))
      ;; dotcl: an integer counter starting at a constant and moving by a small
      ;; constant step towards a limit computed at run time is a fixnum, and
@@ -2470,6 +2475,35 @@ collected result will be returned as the value of the LOOP."
                         (loop-desetq-internal (pop var-val-pairs) (pop var-val-pairs))
                         actions))))))
 
+(defun %loop-end-test-p (form var up)
+  (and (consp form) (eq (car form) 'when) (= (length form) 3)
+       (equal (caddr form) '(go end-loop))
+       (let ((test (cadr form)))
+         (and (consp test) (= (length test) 3)
+              (member (car test) (if up '(> >=) '(< <=)))
+              (eq (cadr test) var)))))
+
+(defun %loop-overflow-exits (main epilogue)
+  "MAIN, the forms after NEXT-LOOP, where each counting step
+   (SETQ V (%INDUCTION-NEXT V D)) that V's end test follows at once (next, or
+   first after NEXT-LOOP) gets the exit (GO END-LOOP): a step that leaves int64
+   has passed the limit, so the test would end the loop there. The EPILOGUE
+   rides along so that the compiler can check that it does not read V."
+  (let ((first (car main)))
+    (loop for (x next) on main
+          collect (let ((v (and (consp x) (eq (car x) 'setq) (= (length x) 3)
+                                (caddr x))))
+                    (if (and (consp v) (= (length v) 3)
+                             (eq (car v) 'dotcl.cil-compiler::%induction-next)
+                             (eq (cadr v) (cadr x))
+                             (let* ((d (caddr v))
+                                    (up (if (integerp d) (plusp d) (symbolp d))))
+                               (or (%loop-end-test-p next (cadr x) up)
+                                   (and (equal next '(go next-loop))
+                                        (%loop-end-test-p first (cadr x) up)))))
+                        `(setq ,(cadr x) (,@v (go end-loop) (progn ,@epilogue)))
+                        x)))))
+
 (defun %expand-loop-body (form)
   ;; (loop-body prologue before-loop main-body after-loop epilogue)
   ;; Pre-expand internal loop macros in all sublists so that
@@ -2501,7 +2535,9 @@ collected result will be returned as the value of the LOOP."
                (let ((result `(tagbody
                                 ,@(psimp (append prologue (nreverse rbefore)))
                               next-loop
-                                ,@(psimp (append main-body (nreconc rafter `((go next-loop)))))
+                                ,@(%loop-overflow-exits
+                                   (psimp (append main-body (nreconc rafter `((go next-loop)))))
+                                   (psimp epilogue))
                               end-loop
                                 ,@(psimp epilogue))))
                  (if flagvar `(let ((,flagvar nil)) ,result) result))))

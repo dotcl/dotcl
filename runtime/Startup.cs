@@ -190,15 +190,83 @@ public static class Startup
             {
                 foreach (var a in System.Reflection.CustomAttributeExtensions
                              .GetCustomAttributes<System.Reflection.AssemblyMetadataAttribute>(CoreAssembly))
-                    if (a.Key == CoreGenerationKey) { _coreGeneration = a.Value; break; }
+                    if (a.Key == CoreGenerationKey)
+                    {
+                        var v = a.Value;
+                        int nl = v?.IndexOf('\n') ?? -1;
+                        _coreGeneration = nl < 0 ? v : nl == 0 ? null : v!.Substring(0, nl);
+                        break;
+                    }
             }
             // .sil text path (development `--asm`): the source itself is the
             // compiler, so hashing it is both meaningful and deterministic.
             else if (CorePath != null && System.IO.File.Exists(CorePath))
                 _coreGeneration = HashFileGeneration(CorePath);
+            if (_coreGeneration != null)
+                _coreGeneration = WithRuntimeSource(CompilerPart(_coreGeneration));
         }
         catch { /* best-effort: no stamp is better than a failed compile */ }
         return _coreGeneration;
+    }
+
+    private static string? _runtimeSource;
+    private static bool _runtimeSourceComputed;
+
+    /// <summary>The digest of the C# source this runtime was built from (the
+    /// dotcl-runtime-source assembly metadata), or null when it was not stamped.
+    /// A generation ends with it: a fasl compiled against other runtime source may
+    /// call members that are not here.</summary>
+    public static string? RuntimeSource()
+    {
+        if (_runtimeSourceComputed) return _runtimeSource;
+        _runtimeSourceComputed = true;
+        try
+        {
+            foreach (var a in System.Reflection.CustomAttributeExtensions
+                         .GetCustomAttributes<System.Reflection.AssemblyMetadataAttribute>(typeof(Startup).Assembly))
+                if (a.Key == "dotcl-runtime-source" && !string.IsNullOrEmpty(a.Value))
+                { _runtimeSource = a.Value; break; }
+        }
+        catch { }
+        return _runtimeSource;
+    }
+
+    /// <summary>A generation is COMPILER-RUNTIME: the compiler source digest, then
+    /// the runtime source digest when the runtime carries one.</summary>
+    internal static string WithRuntimeSource(string compilerGeneration) =>
+        RuntimeSource() is string r ? compilerGeneration + "-" + r : compilerGeneration;
+
+    /// <summary>The runtime digest the booted core was built with, when it is not
+    /// this runtime's; otherwise null.</summary>
+    public static string? CoreRuntimeMismatch()
+    {
+        try
+        {
+            if (CoreAssembly == null || RuntimeSource() is not string mine) return null;
+            foreach (var a in System.Reflection.CustomAttributeExtensions
+                         .GetCustomAttributes<System.Reflection.AssemblyMetadataAttribute>(CoreAssembly))
+                if (a.Key == CoreGenerationKey && a.Value != null)
+                {
+                    int nl = a.Value.IndexOf('\n');
+                    var gen = nl < 0 ? a.Value : a.Value.Substring(0, nl);
+                    return RuntimePart(gen) is string theirs && theirs != mine ? theirs : null;
+                }
+        }
+        catch { }
+        return null;
+    }
+
+    internal static string CompilerPart(string generation)
+    {
+        int dash = generation.IndexOf('-');
+        return dash < 0 ? generation : generation.Substring(0, dash);
+    }
+
+    /// <summary>The runtime part of GENERATION, or null when it has none.</summary>
+    internal static string? RuntimePart(string generation)
+    {
+        int dash = generation.IndexOf('-');
+        return dash < 0 ? null : generation.Substring(dash + 1);
     }
 
     /// <summary>The generation a core built from SOURCEPATH must carry: a short digest
@@ -216,7 +284,6 @@ public static class Startup
     /// build has no writer but still loads fasls: and must still be able to warn
     /// that one was compiled by a different core.</summary>
     internal const string CoreGenerationKey = "dotcl-core-generation";
-
     /// <summary>True when dotcl:*debug-stacktrace* is non-NIL.</summary>
     public static bool DebugStacktrace =>
         DotclPkg?.FindSymbol("*DEBUG-STACKTRACE*") is var (sym, _) && sym?.Value is not Nil and not null;
@@ -320,6 +387,23 @@ public static class Startup
                 ? System.Runtime.InteropServices.NativeLibrary.Load(p)
                 : System.IntPtr.Zero;
         };
+        if (!RuntimeLoadContext.IsDefault)
+        {
+            RuntimeLoadContext.Context.Resolving += (ctx, name) =>
+            {
+                if (name.Name == null) return null;
+                var reg = Runtime.FindRegisteredAssembly(name.Name);
+                return reg != null ? ctx.LoadFromAssemblyPath(reg)
+                                   : RuntimeLoadContext.ProbeLoadFromDirs(ctx, name);
+            };
+            RuntimeLoadContext.Context.ResolvingUnmanagedDll += (asm, libName) =>
+            {
+                var p = Runtime.FindRegisteredNative(libName);
+                return p != null
+                    ? System.Runtime.InteropServices.NativeLibrary.Load(p)
+                    : System.IntPtr.Zero;
+            };
+        }
 #endif
 
         // Invalidate the resolve-type memoization cache whenever a new assembly
@@ -680,6 +764,15 @@ public static class Startup
         DotclPkg.Export(starHostFeatures);
         starHostFeatures.IsSpecial = true;
         starHostFeatures.Value = featuresList;
+
+        foreach (var name in new[] { "*INTERRUPTS-ENABLED*", "*ALLOW-WITH-INTERRUPTS*" })
+        {
+            var (iv, _) = DotclPkg.Intern(name);
+            DotclPkg.Export(iv);
+            iv.IsSpecial = true;
+            iv.Value = T.Instance;
+            if (name == "*INTERRUPTS-ENABLED*") Runtime.InterruptsEnabledSym = iv;
+        }
 
         // Load-related special variables
         var loadPathname = InternExport("*LOAD-PATHNAME*");
@@ -1409,7 +1502,7 @@ public static class Startup
         // (cst:nth 1 cst) called CL:NTH on a CST object and quietly returned NIL).
         if (packageName is not null)
         {
-            var homePkg = Package.FindPackage(packageName);
+            var homePkg = Package.FindPackagePhysical(packageName);
             if (homePkg is not null)
             {
                 var (homeSym, homeStatus) = homePkg.FindSymbol(name);
@@ -1503,7 +1596,7 @@ public static class Startup
         var key = (name, pkgName);
         int epoch = Package.MappingEpoch;
         if (_symInPkgCache.TryGetValue(key, out var cached) && cached.Epoch == epoch) return cached.Sym;
-        var pkg = Package.FindPackage(pkgName);
+        var pkg = Package.FindPackagePhysical(pkgName);
         if (pkg != null)
         {
             var (sym, status) = pkg.FindSymbol(name);
@@ -1928,6 +2021,9 @@ public static class Startup
             var eflSym = Startup.Sym("*EMIT-FRAME-LOCALS*");
             DotclPkg.Import(eflSym);
             DotclPkg.Export(eflSym);
+            var efpSym = Startup.Sym("*EMIT-FORM-PREFIX*");
+            DotclPkg.Import(efpSym);
+            DotclPkg.Export(efpSym);
             var pbtFn = new LispFunction(Runtime.PrintBacktrace);
             RegisterDotcl("PRINT-BACKTRACE", pbtFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:PRINT-BACKTRACE", pbtFn);
@@ -2377,6 +2473,8 @@ public static class Startup
         Emitter.CilAssembler.RegisterFunction("%LOOP-LIMIT-FLOOR",
             new LispFunction(args => Fixnum.Make(Runtime.LoopLimitFloor(args[0])),
                              "%LOOP-LIMIT-FLOOR", 1));
+        Emitter.CilAssembler.RegisterFunction("%LOOP-BY",
+            new LispFunction(args => Runtime.LoopBy(args[0]), "%LOOP-BY", 1));
 
         // Same shape: the compiler lowers (%getenv "X") to a direct call, and the
         // compiler's own source uses it (reading DOTCL_DUMP_SIL_FOR), so an
@@ -2408,6 +2506,35 @@ public static class Startup
                 args.Length > 0 ? args[0] : DynamicBindings.Get(Sym("*PACKAGE*")))));
         RegisterDotcl("PACKAGE-LOCALLY-NICKNAMED-BY-LIST",
             new LispFunction(args => Runtime.PackageLocallyNicknamedByList(args[0])));
+        // Package units. Not exported until the entry point is settled.
+        RegisterDotclInternal("LIST-EVERY-PACKAGE", new LispFunction(args => {
+            Runtime.CheckArityExact("LIST-EVERY-PACKAGE", args, 0);
+            return Runtime.ListEveryPackage();
+        }, "LIST-EVERY-PACKAGE", 0));
+        RegisterDotclInternal("%MAKE-PACKAGE-UNIT", new LispFunction(args => {
+            Runtime.CheckArityExact("%MAKE-PACKAGE-UNIT", args, 2);
+            return new LispDotNetObject(Package.MakeUnit(
+                Runtime.ToPackageName(args[0]), Runtime.ToPackageName(args[1])));
+        }, "%MAKE-PACKAGE-UNIT", 2));
+        RegisterDotclInternal("%SWAP-PACKAGE-UNIT", new LispFunction(args => {
+            Runtime.CheckArityExact("%SWAP-PACKAGE-UNIT", args, 1);
+            var old = Package.SwapUnit(args[0] is LispDotNetObject o ? o.Value : null);
+            return old == null ? Nil.Instance : new LispDotNetObject(old);
+        }, "%SWAP-PACKAGE-UNIT", 1));
+        RegisterDotclInternal("%ADD-PACKAGE-UNIT-SPECIAL", new LispFunction(args => {
+            Runtime.CheckArityExact("%ADD-PACKAGE-UNIT-SPECIAL", args, 2);
+            var u = (Package.Unit)((LispDotNetObject)args[0]).Value;
+            var sym = (Symbol)args[1];
+            u.AddSpecial(sym, DynamicBindings.Get(sym));
+            return Nil.Instance;
+        }, "%ADD-PACKAGE-UNIT-SPECIAL", 2));
+        // Nested, unlike %SWAP-PACKAGE-UNIT: safe inside bindings of the unit's specials.
+        RegisterDotclInternal("%CALL-IN-PACKAGE-UNIT", new LispFunction(args => {
+            Runtime.CheckArityExact("%CALL-IN-PACKAGE-UNIT", args, 2);
+            var u = (Package.Unit)((LispDotNetObject)args[0]).Value;
+            var fn = args[1];
+            return Package.CallInUnit(u, () => Runtime.Funcall(fn));
+        }, "%CALL-IN-PACKAGE-UNIT", 2));
 
         // Compiler-callable package lock check, used by compile-defmacro before
         // it mutates the Lisp-side *macros* table (which bypasses RegisterMacroFunction).
@@ -2544,7 +2671,7 @@ public static class Startup
             // built it: it IS this compiler source. Derived from the .sil so that
             // rebuilding from identical input keeps the value, and so the per-RID
             // R2R core (same metadata, different bytes) keeps it too.
-            fasl.SelfGeneration = HashFileGeneration(inPath);
+            fasl.SelfGeneration = WithRuntimeSource(HashFileGeneration(inPath));
             // A cross-compiled .sil carries one segment per source file, joined by
             // (:TOPLEVEL-BOUNDARY). Each segment is a top-level form of its own;
             // emitting them through AddTopLevelForm keeps each file's code in its
@@ -3001,6 +3128,20 @@ public static class Startup
             new LispFunction(args =>
                 args[0] is Symbol s && s.IsDeclarationName ? (LispObject)T.Instance : Nil.Instance,
                 "DECLARATION-NAME-P", 1));
+        RegisterDotcl("WATCH-FDEFINITION",
+            new LispFunction(FunctionWatch.Watch, "WATCH-FDEFINITION", 2),
+            "(dotcl:watch-fdefinition symbol function): call FUNCTION with SYMBOL and its new global function definition (NIL when removed) after each change to it; FUNCTION NIL stops watching.");
+        // (dotcl::%set-proclaimed-inlinep symbol notinline-p inline-p): put back
+        // the proclamations PROCLAIM changed; there is no standard way back to
+        // neither.
+        RegisterDotclInternal("%SET-PROCLAIMED-INLINEP",
+            new LispFunction(args =>
+            {
+                var s = (Symbol)args[0];
+                s.IsNotinlineProclaimed = args[1] is not Nil;
+                s.IsInlineProclaimed = args[2] is not Nil;
+                return args[0];
+            }, "%SET-PROCLAIMED-INLINEP", 3));
         RegisterDotcl("GLOBAL-NOTINLINE-P",
             new LispFunction(args =>
                 (args[0] is Symbol s ? s.IsNotinlineProclaimed
@@ -3220,6 +3361,12 @@ public static class Startup
             ReplLoop.RunHosted(args[0], args[1], args[2] is not Nil, readline, args[4] as LispFunction);
             return Nil.Instance;
         }, "DOTCL:%REPL-RUN", 5));
+
+        RegisterDotclInternal("%RECEIVE-PENDING-INTERRUPT", new LispFunction(args =>
+        {
+            ConditionSystem.ReceivePendingInterrupt();
+            return Nil.Instance;
+        }, "DOTCL:%RECEIVE-PENDING-INTERRUPT", 0));
 
         // (%INTERACTIVE-INTERRUPT): what Ctrl+C does at a safepoint, for a
         // function handed to INTERRUPT-THREAD.

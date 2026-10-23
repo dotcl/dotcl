@@ -480,8 +480,11 @@ public static partial class Runtime
         if (pkg is Package pp && pp.IsDeleted) return Nil.Instance;
         var p = ResolvePackage(pkg, "PACKAGE-NAME");
         if (p.IsDeleted) return Nil.Instance;
-        return p.NameString;
+        return p.VisibleNameString;
     }
+
+    public static LispObject InternMv(LispObject[] args) => MultipleValues.Boxed(InternSymbolV(args));
+    public static LispObject InternPrimary(LispObject[] args) => MultipleValues.Alone(InternSymbolV(args));
 
     public static LispObject InternSymbolV(LispObject[] args)
     {
@@ -555,7 +558,7 @@ public static partial class Runtime
         };
     }
 
-    private static string ToPackageName(LispObject obj) => ToStringDesignator(obj);
+    internal static string ToPackageName(LispObject obj) => ToStringDesignator(obj);
 
     public static LispObject MakePackageK(LispObject[] args)
     {
@@ -819,6 +822,9 @@ public static partial class Runtime
         return FindSymbolIn(args[0], args.Length > 1 ? args[1] : null);
     }
 
+    public static LispObject FindSymbolMv(LispObject[] args) => MultipleValues.Boxed(FindSymbolL(args));
+    public static LispObject FindSymbolPrimary(LispObject[] args) => MultipleValues.Alone(FindSymbolL(args));
+
     /// <summary>FIND-SYMBOL proper. PKG null means *PACKAGE*.</summary>
     private static LispObject FindSymbolIn(LispObject nameArg, LispObject? pkgArg)
     {
@@ -913,12 +919,23 @@ public static partial class Runtime
         ValidatePackageDesignator(pkg, "PACKAGE-NICKNAMES");
         var p = ResolvePackage(pkg, "PACKAGE-NICKNAMES");
         LispObject result = Nil.Instance;
-        foreach (var n in p.Nicknames)
+        foreach (var n in p.VisibleNicknames)
             result = new Cons(new LispString(n), result);
         return result;
     }
 
     public static LispObject ListAllPackages()
+    {
+        LispObject result = Nil.Instance;
+        bool units = Package.UnitsInUse;
+        foreach (var p in Package.AllPackages)
+            if (!units || p.IsVisible)
+                result = new Cons(p, result);
+        return result;
+    }
+
+    /// <summary>Every package in every unit, whether or not the current one sees it.</summary>
+    public static LispObject ListEveryPackage()
     {
         LispObject result = Nil.Instance;
         foreach (var p in Package.AllPackages)

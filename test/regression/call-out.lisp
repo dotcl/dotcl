@@ -540,3 +540,40 @@
   (handler-case (progn (dotnet:invoke (dotnet:new "System.Object") "NoSuchMethodXyz") :ok)
     (error () :errored))
   :errored)
+
+;;; An out parameter on an interface the type implements explicitly: the
+;;; method is private on the type, so it is found on the interface, the one a
+;;; dotnet:cast named or else any the type implements. This is also how a COM
+;;; interface (IConnectionPointContainer.FindConnectionPoint) is reached on a
+;;; __ComObject.
+(defun %queue-with (x)
+  (let ((q (dotnet:new "System.Collections.Concurrent.ConcurrentQueue`1[System.Int32]")))
+    (dotnet:invoke q "Enqueue" x)
+    q))
+
+(deftest call-out-explicit-interface-via-cast
+  (multiple-value-list
+   (dotnet:call-out (dotnet:cast (%queue-with 5)
+                                 "System.Collections.Concurrent.IProducerConsumerCollection`1[System.Int32]")
+                    "TryTake"))
+  (t 5))
+
+(deftest call-out-explicit-interface-without-cast
+  (multiple-value-list (dotnet:call-out (%queue-with 6) "TryTake"))
+  (t 6))
+
+;;; A COM object reached through IDispatch has no signature: every argument is
+;;; passed (out positions too) by reference and each comes back after the
+;;; return value. WMI's StdRegProv.GetStringValue writes its 4th argument.
+(deftest call-out-com-idispatch-byref
+  (if (dotnet:static "System.OperatingSystem" "IsWindows")
+      (let* ((reg (dotnet:invoke (dotnet:invoke (dotnet:new "WbemScripting.SWbemLocator")
+                                                "ConnectServer" "." "root\\default")
+                                 "Get" "StdRegProv"))
+             (vals (multiple-value-list
+                    (dotnet:call-out reg "GetStringValue" -2147483646
+                                     "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"
+                                     "CurrentBuild" nil))))
+        (list (first vals) (length vals) (stringp (fifth vals))))
+      (list 0 5 t))
+  (0 5 t))

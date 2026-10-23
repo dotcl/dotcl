@@ -125,6 +125,8 @@
 (defparameter +native-int-ops+
   '(+ - * 1+ 1- logand logior logxor lognot ash logbitp
     zerop plusp minusp evenp oddp = /= < > <= >= min max
+    ldb dpb mask-field deposit-field
+    logandc1 logandc2 logorc1 logorc2 lognand lognor logeqv
     aref svref elt char schar the)
   "Operators whose compiler support reads an integer argument as a raw int64
    (compile-as-long), so a reference in argument position costs no unbox when
@@ -197,6 +199,21 @@
                             (arg-p (cdr form)))
                        t)
                       ((%inline-int-param-use-p form var) t)
+                      ;; Stored into a variable whose slot is a raw integer.
+                      ((and (eq head 'setq)
+                            (loop for (v val) on (cdr form) by #'cddr
+                                  thereis (and (eq val var) (symbolp v) v
+                                               (or (native-slot-p v (cstate-long-locals))
+                                                   (u64-native-local-p v)))))
+                       t)
+                      ;; The init of another binding, which may get a raw slot
+                      ;; in turn.
+                      ((and (member head '(let let*)) (consp (cdr form)) (listp (cadr form))
+                            (some (lambda (b)
+                                    (and (consp b) (consp (cdr b))
+                                         (eq (strip-value-wrappers (cadr b)) var)))
+                                  (cadr form)))
+                       t)
                       (t (do ((r form (cdr r)))
                              ((not (consp r)) nil)
                            (when (walk (car r)) (return t)))))))))
@@ -229,9 +246,42 @@
                       ((and (member head +native-float-ops+ :test #'eq)
                             (do ((a (cdr form) (cdr a)))
                                 ((not (consp a)) nil)
-                              (when (eq (car a) var) (return t))))
+                              (when (eq (strip-value-wrappers (car a)) var) (return t))))
+                       t)
+                      ;; The init of another binding, which may be inferred a
+                      ;; float in turn.
+                      ((and (member head '(let let*)) (consp (cdr form)) (listp (cadr form))
+                            (some (lambda (b)
+                                    (and (consp b) (consp (cdr b))
+                                         (eq (strip-value-wrappers (cadr b)) var)))
+                                  (cadr form)))
                        t)
                       ((%inline-single-param-use-p form var) t)
+                      ;; The value checked against a float slot type, or stored
+                      ;; into a structure with raw slots (an inlined constructor).
+                      ((and (eq head '%check-slot-type) (consp (cdr form))
+                            (eq (strip-value-wrappers (cadr form)) var)
+                            (consp (cddr form)) (consp (caddr form))
+                            (eq (car (caddr form)) 'quote)
+                            (member (cadr (caddr form))
+                                    '(double-float single-float long-float short-float)))
+                       t)
+                      ;; An argument of a call that is substituted inline: it
+                      ;; is the init of the parameter's binding there.
+                      ((and (symbolp head) head
+                            (gethash head *inline-defs*)
+                            (do ((a (cdr form) (cdr a)))
+                                ((not (consp a)) nil)
+                              (when (eq (strip-value-wrappers (car a)) var) (return t)))
+                            (maybe-expand-inline head form))
+                       t)
+                      ((and (eq head '%make-struct) (consp (cdr form))
+                            (consp (cadr form)) (eq (car (cadr form)) 'quote)
+                            (gethash (cadr (cadr form)) *struct-raw-layouts*)
+                            (do ((a (cddr form) (cdr a)))
+                                ((not (consp a)) nil)
+                              (when (eq (strip-value-wrappers (car a)) var) (return t))))
+                       t)
                       (t (do ((r form (cdr r)))
                              ((not (consp r)) nil)
                            (when (walk (car r)) (return t)))))))))
@@ -244,21 +294,16 @@
    what makes an undeclared let var like crc's new-rmdr = (logior bit (* rmdr 2))
    participate in native int64 arithmetic. Mutated bindings are excluded: a setf
    could move the value outside the init range, breaking the range gate's
-   soundness (and the inline unbox-fixnum, which assumes a Fixnum). Init ranges
-   are evaluated against the enclosing *small-int-locals* (callers leave the
-   prior binding in effect), so the result is sound for both let and let*."
-  (let ((result '()))
-    (dolist (b binding-info)
-      (let ((var (first b)) (init (second b)) (is-special (third b)))
-        (when (and (not is-special)
-                   init
-                   (not (member (var-name var) needs-boxing :test #'string=))
-                   (not (member (var-name var) mutated :test #'string=)))
-          (let ((r (expr-int-range init)))
-            (when (and r (range-fits-int64-p r))
-              ;; Keyed by slot (fourth b), matching SMALL-INT-LOCAL-RANGE.
-              (push (cons (fourth b) r) result))))))
-    result))
+   soundness (and the inline unbox-fixnum, which assumes a Fixnum). The ranges
+   are the ones %LET-INT-RANGE-INITS computed in the scope the inits are
+   evaluated in: in the body an init (X X) would ask about the new X."
+  (loop for b in binding-info
+        for e = (assoc (fourth b) *let-int-range-inits* :test #'equal)
+        when (and e
+                  (not (third b))
+                  (not (member (var-name (first b)) needs-boxing :test #'string=))
+                  (not (member (var-name (first b)) mutated :test #'string=)))
+          collect e))
 
 ;;; ------------------------------------------------------------
 ;;; The type of an assigned LET variable: its init and every assignment
@@ -285,7 +330,7 @@
 ;;; IR: (:K LO . HI) a known range, (:CELL . C) the range of variable C,
 ;;; (:OP OP ARG...) arithmetic, (:U A B) either, (:MEET A LO . HI) A within a
 ;;; known range, :TOP unknown.
-;;; A cell is #(SYM DECL SOURCES TOP CUR NATIVE READS): DECL a declared range
+;;; A cell is #(SYM DECL SOURCES TOP CUR NATIVE READS PENDING): DECL a declared range
 ;;; (then the sources do not matter), SOURCES the IR of the init and of every
 ;;; assigned value, TOP true when some value is unknown, CUR the solved range
 ;;; or :EMPTY, NATIVE the number of reads where an integer is used raw (an
@@ -293,6 +338,9 @@
 ;;; integer type, which is how an INLINE function's parameter reads it), READS
 ;;; the number of all reads. Each other read of a raw slot boxes the value
 ;;; (Fixnum.Make, BoxU64), where a boxed slot boxes once per assignment.
+;;; PENDING is (:PENDING . TAGS) for a NIL init the body overwrites before it
+;;; can be read (%NIL-INIT-FIRST-ASSIGNMENT), until the walk reaches that
+;;; assignment (%AVT-ASSIGNED-VALUE).
 
 (defvar *avt-scope* nil
   "Bindings in scope during the walk, innermost first: (:VAR SYM . CELL),
@@ -310,11 +358,51 @@
    counter is still growing.")
 
 (defun %avt-cell (sym sources &optional decl top)
-  (let ((c (vector sym decl sources top :empty 0 0)))
+  (let ((c (vector sym decl sources top :empty 0 0 nil)))
     (push c *avt-cells*)
     c))
 
 (defun %avt-k (r) (if (consp r) (list* :k (car r) (cdr r)) :top))
+
+(defvar *avt-go-watch* nil
+  "Entries (TAGS . BOX): a GO walked now to one of TAGS sets (CAR BOX).")
+
+(defun %nil-init-first-assignment (var forms &optional tagbody-p)
+  "True when the first thing FORMS (a LET body without declarations, or the
+   statements of a TAGBODY when TAGBODY-P) do is assign VAR with SETQ or SETF.
+   The second value is the tags of the TAGBODYs around that assignment."
+  (let ((tags (and tagbody-p (remove-if-not (lambda (f) (or (symbolp f) (integerp f)))
+                                            forms))))
+    (dolist (f forms nil)
+      (cond ((and tagbody-p (atom f)))
+            ((atom f) (return nil))
+            ((and (or (eq (car f) 'setq)
+                      (and (eq (car f) 'setf) (not (macrolet-shadowed-p 'setf))))
+                  (consp (cdr f)) (eq (cadr f) var) (consp (cddr f)))
+             (return (values t tags)))
+            ((member (car f) '(tagbody progn))
+             (multiple-value-bind (found inner)
+                 (%nil-init-first-assignment var (cdr f) (eq (car f) 'tagbody))
+               (return (and found (values t (append inner tags))))))
+            (t (return nil))))))
+
+(defun %avt-assigned-value (sym val)
+  "The IR of VAL, assigned to SYM. For the assignment that overwrites SYM's
+   pending NIL init, the init is live after all when VAL reads SYM or GOes to
+   a tag around the assignment: then SYM's values are unknown."
+  (let* ((e (%avt-lookup-var sym))
+         (c (and e (eq (cadr e) sym) (cddr e)))
+         (pending (and c (svref c 7))))
+    (if (null pending)
+        (%avt-form val)
+        (let* ((reads (svref c 6))
+               (box (list nil))
+               (ir (let ((*avt-go-watch* (cons (cons (cdr pending) box) *avt-go-watch*)))
+                     (setf (svref c 7) nil)
+                     (%avt-form val))))
+          (when (or (car box) (/= reads (svref c 6)))
+            (setf (svref c 3) t))
+          ir))))
 
 (defun %avt-give-up () (throw '%avt-abort nil))
 
@@ -667,7 +755,7 @@
                      (multiple-value-bind (exp found) (%avt-symbol-macro var)
                        (if found
                            (setf ir (%avt-form `(setf ,exp ,val)))
-                           (let ((v (%avt-form val)))
+                           (let ((v (%avt-assigned-value var val)))
                              (%avt-assign var v)
                              (setf ir v)))))
             ir))
@@ -689,8 +777,16 @@
                      (when (and (eq (car e) :block) (eq (cadr e) (car args))) (return e)))))
             (when e (push ir (svref (cddr e) 2)))
             :top))
-         (tagbody (dolist (f args) (unless (atom f) (%avt-form f))) :top)
-         (go :top)
+         (tagbody
+          (let ((*avt-go-watch*
+                  (mapcar (lambda (w) (cons (remove-if (lambda (tag) (member tag args)) (car w))
+                                            (cdr w)))
+                          *avt-go-watch*)))
+            (dolist (f args) (unless (atom f) (%avt-form f))))
+          :top)
+         (go (dolist (w *avt-go-watch*)
+               (when (member (car args) (car w)) (setf (car (cdr w)) t)))
+             :top)
          ((catch throw unwind-protect multiple-value-call progv)
           (let ((irs (mapcar #'%avt-form args)))
             (if (eq head 'unwind-protect) (car irs) :top)))
@@ -715,21 +811,14 @@
               (let ((*avt-scope* fn-scope))
                 (%avt-body (cdr args))))))
          (macrolet
-          (let ((defs (car args)) (saved '()))
-            (unwind-protect
-                 (progn
-                   (dolist (d defs)
-                     (push (cons (car d) (gethash (car d) *macros*)) saved)
-                     (setf (gethash (car d) *macros*)
-                           (%eval-macrolet-expander (cadr d) (cddr d))))
-                   (let ((*macroexpand-scope* (cons defs *macroexpand-scope*))
-                         (*macrolet-shadowed* (append (mapcar #'car defs) *macrolet-shadowed*))
-                         (*lexical-operators* (%macrolet-lexical-operators defs)))
-                     (%avt-body (cdr args))))
-              (dolist (s saved)
-                (if (cdr s)
-                    (setf (gethash (car s) *macros*) (cdr s))
-                    (remhash (car s) *macros*))))))
+          (let ((defs (car args)))
+            (let ((*macroexpand-scope* (cons defs *macroexpand-scope*))
+                  (*macrolet-shadowed* (append (mapcar #'car defs) *macrolet-shadowed*))
+                  (*lexical-operators* (%macrolet-lexical-operators
+                                        defs
+                                        (mapcar (lambda (d) (%eval-macrolet-expander (cadr d) (cddr d)))
+                                                defs))))
+              (%avt-body (cdr args)))))
          (symbol-macrolet
           (let ((*symbol-macros* (append (mapcar (lambda (b) (cons (car b) (cadr b))) (car args))
                                          *symbol-macros*)))
@@ -806,6 +895,7 @@
   (cond
     ((eq ir :top) nil)
     ((eq (car ir) :k) (cdr ir))
+    ((eq (car ir) :none) :empty)
     ((eq (car ir) :cell) (%avt-cell-value (cdr ir)))
     ((eq (car ir) :meet)
      (let ((a (%avt-eval (second ir))) (k (cddr ir)))
@@ -870,39 +960,76 @@
         (when (member var (if (eq (car d) 'type) (cddr d) (cdr d)) :test #'eq)
           (return-from %avt-var-declared-p t))))))
 
+(defun %u64-wide-init-p (init)
+  "True when INIT, walked on its own, is known to be an integer in [0, 2^64)
+   that int64 cannot hold: an (UNSIGNED-BYTE 64) local or array element, or
+   arithmetic of them such as the inline modular sums of a hash. A variable it
+   initializes is then a candidate for the bits slot even when nothing assigns
+   it; whose value fits int64 is the range promotion's business instead."
+  (and init
+       (or (consp init) (and (symbolp init) (u64-native-local-p init)))
+       (let ((*avt-cells* nil)
+             (*avt-scope* nil)
+             (*avt-go-watch* nil)
+             (*avt-budget* 2000))
+         (catch '%avt-abort
+           (let ((ir (%avt-form init)))
+             (and (%avt-solve *avt-cells*)
+                  (let ((r (%avt-eval ir)))
+                    (and (consp r) (>= (car r) 0) (<= (cdr r) +u64-mask+)
+                         (> (cdr r) +int64-max+)))))))))
+
 (defun %assigned-binding-declarations (binding-info body real-body mutated captured
                                        sequential-p)
-  "Type declarations for the variables of a parallel LET that its body assigns:
+  "Type declarations for the variables of a parallel LET that its body assigns,
+   or whose init is a wide (UNSIGNED-BYTE 64) (%U64-WIDE-INIT-P):
    (TYPE (INTEGER LO HI) VAR) or (TYPE (UNSIGNED-BYTE 64) VAR) when the init and
    every value assigned to VAR (see above) stay in that range, and the body reads
    VAR where a raw integer is used (%NATIVE-INT-USE-P). NIL when there is none.
-   Not for a special, a variable a closure captures, or one with a declared type."
+   Not for a special, a variable a closure captures, or one with a declared type.
+   A NIL init the body overwrites before reading it does not count; the second
+   value is ((VAR . LO) ...) for such variables declared here, whose init is to
+   be LO instead."
   (unless sequential-p
-    (let ((cands (loop for b in binding-info
-                       for v = (first b)
-                       when (and (not (third b)) (second b)
-                                 (member (var-name v) mutated :test #'string=)
-                                 (not (member (var-name v) captured :test #'string=))
-                                 (not (%avt-var-declared-p v body)))
-                         collect v)))
+    (let* ((dead (loop for b in binding-info
+                       collect (and (null (second b)) (not (third b))
+                                    (multiple-value-bind (found tags)
+                                        (%nil-init-first-assignment (first b) real-body)
+                                      (and found (list tags))))))
+           (cands (loop for b in binding-info
+                        for d in dead
+                        for v = (first b)
+                        when (and (not (third b)) (or (second b) d)
+                                  (or (member (var-name v) mutated :test #'string=)
+                                      (and (not d) (%u64-wide-init-p (second b))))
+                                  (not (member (var-name v) captured :test #'string=))
+                                  (not (%avt-var-declared-p v body)))
+                          collect v)))
       (when cands
         (let ((*avt-cells* nil)
               (*avt-scope* nil)
+              (*avt-go-watch* nil)
               (*avt-budget* 200000))
           (catch '%avt-abort
-            (let* ((inits (mapcar (lambda (b) (if (second b) (%avt-form (second b)) :top))
-                                  binding-info))
+            (let* ((inits (loop for b in binding-info
+                                for d in dead
+                                collect (cond (d '(:none))
+                                              ((second b) (%avt-form (second b)))
+                                              (t :top))))
                    (known (loop for b in binding-info
                                 for i in inits
+                                for d in dead
                                 thereis (and (member (first b) cands)
-                                             (consp (%avt-eval i))))))
+                                             (or d (consp (%avt-eval i)))))))
               (when known
                 (multiple-value-bind (decl-types specials) (%avt-decls body)
                   (let ((cells (%avt-bind-cells (mapcar #'first binding-info) inits
                                                 decl-types specials)))
                     (loop for b in binding-info
                           for c in cells
-                          when (third b) do (setf (svref c 3) t))
+                          for d in dead
+                          when (third b) do (setf (svref c 3) t)
+                          when d do (setf (svref c 7) (cons :pending (car d))))
                     (labels ((enter (bs cs)
                                (if (null bs)
                                    (%avt-shadow-specials
@@ -913,22 +1040,30 @@
                                      (enter (cdr bs) (cdr cs))))))
                       (enter binding-info cells))
                     (when (%avt-solve *avt-cells*)
-                      (loop for b in binding-info
-                            for c in cells
-                            for v = (first b)
-                            for r = (and (member v cands) (%avt-cell-value c))
-                            ;; Only where it pays: some read is raw, and the reads
-                            ;; that box the value (see the cell) are no more than
-                            ;; the assignments, which box it in a LispObject slot.
-                            when (and (consp r)
-                                      (plusp (svref c 5))
-                                      (<= (- (svref c 6) (svref c 5))
-                                          (1- (length (svref c 2)))))
-                              append (cond ((range-fits-int64-p r)
-                                            `((type (integer ,(car r) ,(cdr r)) ,v)))
-                                           ((and (>= (car r) 0) (<= (cdr r) +u64-mask+)
-                                                 (not *emit-frame-locals*))
-                                            `((type (unsigned-byte 64) ,v))))))))))))))))
+                      (let ((decls '()) (inits '()))
+                        (loop for b in binding-info
+                              for c in cells
+                              for d in dead
+                              for v = (first b)
+                              for r = (and (member v cands)
+                                           (not (svref c 7))
+                                           (%avt-cell-value c))
+                              ;; Only where it pays: some read is raw, and the reads
+                              ;; that box the value (see the cell) are no more than
+                              ;; the assignments, which box it in a LispObject slot.
+                              do (when (and (consp r)
+                                            (plusp (svref c 5))
+                                            (<= (- (svref c 6) (svref c 5))
+                                                (1- (length (svref c 2)))))
+                                   (let ((decl (cond ((range-fits-int64-p r)
+                                                      `(type (integer ,(car r) ,(cdr r)) ,v))
+                                                     ((and (>= (car r) 0) (<= (cdr r) +u64-mask+)
+                                                           (not *emit-frame-locals*))
+                                                      `(type (unsigned-byte 64) ,v)))))
+                                     (when decl
+                                       (push decl decls)
+                                       (when d (push (cons v (car r)) inits))))))
+                        (values (nreverse decls) (nreverse inits))))))))))))))
 
 (defun %dotnet-sym-p (x name)
   "True when X is a symbol named NAME in the DOTNET package. Cross-compile safe:
@@ -1100,18 +1235,21 @@
                            ;; string and reads it once was paying a fetch it could
                            ;; never amortise.
                            ;;
-                           ;; The float kinds are gated the same way, for the
-                           ;; same reason: their fetch answers null rather than
-                           ;; signalling for a vector of another element type
-                           ;; (the per-element helper reads such a vector), so
-                           ;; it has no diagnostic to lose either.
+                           ;; The float kinds are gated the same way. Their
+                           ;; fetch signals for a vector of another element
+                           ;; type above (safety 0), but without it the
+                           ;; per-element helper reads such a vector, so the
+                           ;; gate costs no wrong answer.
                            (case kind
                              (:char (%var-iterated-access-p
                                      body (var-name v) nil
                                      (function %tree-finds-schar-p)))
-                             ((:f64 :f32) (%var-iterated-access-p
-                                           body (var-name v) nil
-                                           (function %tree-finds-aref-p)))
+                             ((:f64 :f32)
+                              (some (lambda (name)
+                                      (%var-iterated-access-p
+                                       body name nil (function %tree-finds-aref-p)))
+                                    (cons (var-name v)
+                                          (%let-aliases-of body (var-name v)))))
                              (t t)))
                   (pushnew (list (var-name v) v kind
                                  (%simple-array-store-narrow spec)
@@ -1126,16 +1264,183 @@
         ;; :CHECKED: above (safety 0) an integer buffer's fetch also matches
         ;; the vector's element type against the declared one
         ;; (ARRAY-BACKING-PROLOGUE), so its elements are known to be in the
-        ;; declared element type (%ELEMENT-STORE-RANGE).
+        ;; declared element type (%ELEMENT-STORE-RANGE). A float buffer's
+        ;; fetch there signals instead of answering null (%BACKING-NEVER-DECLINES-P).
         (loop with checked = (not (compiling-at-safety-0-p))
               for (name sym kind narrow dims elt) in cands
               unless (member name mutated :test #'string=)
                 collect (list name (lookup-local sym) (gen-local "ABACK") kind
                               narrow
-                              (and checked (member kind '(1 2 3 4)) :checked)
+                              (and checked (member kind '(1 2 3 4 :f64 :f32)) :checked)
                               (mapcar (lambda (d) (if (integerp d) d (gen-local "ADIM")))
                                       dims)
                               elt))))))
+
+(defun %map-tree-symbols (fn tree)
+  (cond ((consp tree) (%map-tree-symbols fn (car tree)) (%map-tree-symbols fn (cdr tree)))
+        ((and tree (symbolp tree)) (funcall fn tree))))
+
+(defun %tree-mentions-any-p (tree names)
+  (cond ((consp tree) (or (%tree-mentions-any-p (car tree) names)
+                          (%tree-mentions-any-p (cdr tree) names)))
+        (t (and tree (symbolp tree) (member tree names :test #'eq) t))))
+
+(defun %local-macro-definitions (body)
+  "The (NAME LAMBDA-LIST . BODY) definitions of the MACROLET macros in scope
+   here and of those BODY binds with MACROLET."
+  (let ((defs '()))
+    (dolist (scope *macroexpand-scope*)
+      (when (listp scope)
+        (dolist (d scope)
+          (when (and (consp d) (symbolp (car d)) (macrolet-shadowed-p (car d)))
+            (push d defs)))))
+    (labels ((walk (form)
+               (when (and (consp form) (not (eq (car form) 'quote)))
+                 (when (and (eq (car form) 'macrolet) (consp (cdr form)) (listp (cadr form)))
+                   (dolist (d (cadr form))
+                     (when (and (consp d) (symbolp (car d))) (push d defs))))
+                 (do ((r form (cdr r)))
+                     ((not (consp r)))
+                   (walk (car r))))))
+      (dolist (f body) (walk f)))
+    defs))
+
+(defun %macros-reaching (sym defs)
+  "The names of the macros in DEFS whose definition mentions SYM, directly or
+   through another such macro."
+  (let ((names '()) (changed t))
+    (loop while changed
+          do (setf changed nil)
+             (dolist (d defs)
+               (unless (member (car d) names :test #'eq)
+                 (when (or (%tree-mentions-any-p (cdr d) (list sym))
+                           (and names (%tree-mentions-any-p (cdr d) names)))
+                   (push (car d) names)
+                   (setf changed t)))))
+    names))
+
+(defun %constant-read-sites (body sym macros)
+  "The number of (AREF SYM ...) forms and calls to MACROS in BODY's tree."
+  (let ((n 0))
+    (labels ((walk (form)
+               (when (and (consp form) (not (eq (car form) 'quote)))
+                 (when (or (and (eq (car form) 'aref) (consp (cdr form)) (eq (cadr form) sym))
+                           (and (symbolp (car form)) (member (car form) macros :test #'eq)))
+                   (incf n))
+                 (do ((r form (cdr r)))
+                     ((not (consp r)))
+                   (walk (car r))))))
+      (dolist (f body) (walk f)))
+    n))
+
+(defun extract-constant-array-backing-locals (body)
+  "*array-backing-locals* entries for the constant variables BODY reads as
+   (AREF C I) inside a loop, whose value is a rank-1 simple array with an
+   unboxed buffer: the buffer is fetched once in the prologue instead of each
+   element going through the helper. The kind is the value's own element type.
+   The entry's KEY is NIL (a constant has no slot; LOOKUP-LOCAL answers NIL
+   for it) and its last element is the symbol, which the prologue loads."
+  (let ((syms '()))
+    (labels ((walk (form)
+               (when (and (consp form) (not (eq (car form) 'quote)))
+                 (when (and (eq (car form) 'aref)
+                            (consp (cdr form))
+                            (symbolp (cadr form))
+                            (cadr form)
+                            (not (member (cadr form) syms :test #'eq))
+                            (constant-array-numeric-info (cadr form)))
+                   (push (cadr form) syms))
+                 (do ((r form (cdr r)))
+                     ((not (consp r)))
+                   (walk (car r))))))
+      (dolist (f body) (walk f)))
+    (let ((defs (%local-macro-definitions body)))
+      (dolist (d defs)
+        (%map-tree-symbols (lambda (s)
+                             (when (and (not (member s syms :test #'eq))
+                                        (constant-array-numeric-info s))
+                               (push s syms)))
+                           (cdr d)))
+      (when (and syms (not (local-function-entry 'aref)))
+        (loop for c in syms
+              for val = (symbol-value c)
+              for dims = (array-dimensions val)
+              for spec = `(simple-array ,(array-element-type val) ,dims)
+              for kind = (%simple-array-backing-kind spec)
+              for reaching = (%macros-reaching c defs)
+              when (and kind (not (eq kind :char))
+                        (or (%var-iterated-access-p
+                             body (var-name c) nil
+                             (lambda (form var layout)
+                               (or (%tree-finds-aref-p form var layout)
+                                   (and reaching (%tree-mentions-any-p form reaching)))))
+                            ;; Read often enough without a loop: a round written
+                            ;; out in full.
+                            (>= (%constant-read-sites body c reaching) 4)))
+                collect (list (var-name c) nil (gen-local "ABACK") kind
+                              (%simple-array-store-narrow spec) nil
+                              (and (cdr dims) dims)
+                              (array-element-type val) c :never-null))))))
+
+(defun %collected-constant-backing (c)
+  "The entry for the constant array C in *CONSTANT-BACKING-COLLECTOR*, made on
+   the first read. Its fetch signals instead of declining (the tenth element),
+   so every access is the bare element load."
+  (let ((cell *constant-backing-collector*))
+    (and cell
+         (not (local-function-entry 'aref))
+         (constant-array-numeric-info c)
+         (or (find c (car cell) :key #'ninth :test #'eq)
+             (and (not (member c (cdr cell) :test #'eq))
+                  (let* ((val (symbol-value c))
+                         (dims (array-dimensions val))
+                         (spec `(simple-array ,(array-element-type val) ,dims))
+                         (kind (%simple-array-backing-kind spec)))
+                    (when (and kind (not (eq kind :char)))
+                      (let ((e (list (var-name c) nil (gen-local "ABACK") kind
+                                     (%simple-array-store-narrow spec) nil
+                                     (and (cdr dims) dims)
+                                     (array-element-type val) c :never-null
+                                     (gen-local "ACONST"))))
+                        (push e (car cell))
+                        e))))))))
+
+(defun %written-constant-arrays (body)
+  "The constant arrays named in BODY or in the MACROLET definitions in scope.
+   EXTRACT-CONSTANT-ARRAY-BACKING-LOCALS has decided about these; the DEFUN
+   collects only the ones that reach the body from elsewhere."
+  (let ((syms '()) (budget 200000))
+    (labels ((walk (form)
+               (loop while (and (consp form) (plusp (decf budget))
+                                (not (eq (car form) 'quote)))
+                     do (walk (car form))
+                        (setf form (cdr form)))
+               (when (and form (symbolp form)
+                          (not (member form syms :test #'eq))
+                          (constant-array-numeric-info form))
+                 (push form syms))))
+      (walk body)
+      (dolist (d (%local-macro-definitions body))
+        (walk (cdr d))))
+    syms))
+
+(defun array-backing-entry-for-read (expr)
+  "ARRAY-BACKING-ENTRY, or for (AREF C IDX...) on a constant array that has no
+   entry, the one the enclosing DEFUN collects."
+  (or (array-backing-entry expr)
+      (and *constant-backing-collector*
+           (consp expr) (eq (car expr) 'aref)
+           (consp (cdr expr)) (symbolp (cadr expr)) (cadr expr)
+           (let ((e (%collected-constant-backing (cadr expr))))
+             (and e
+                  (= (length (cddr expr)) (max 1 (length (backing-entry-dims e))))
+                  (let ((n (if (backing-entry-dims e) nil
+                               (length (symbol-value (cadr expr))))))
+                    (loop for idx in (cddr expr)
+                          for d in (or (backing-entry-dims e) (list n))
+                          for k = (%const-index-value idx)
+                          never (and k (or (minusp k) (>= k d)))))
+                  e)))))
 
 (defun %make-array-typed-element-name (spec)
   "The runtime's element type name (LispVector.ElementTypeName) for the constant
@@ -1436,6 +1741,31 @@
         ((consp form) (or (%tree-finds-schar-p (car form) var)
                           (%tree-finds-schar-p (cdr form) var)))
         (t nil)))
+
+(defun %let-aliases-of (form var)
+  "VAR-NAMEs of the variables FORM's LET / LET* / PROG / PROG* forms bind to a
+   plain reference to VAR, as in (PROG ((AR AREAL)) ...)."
+  (let ((out '()))
+    (labels ((walk (x)
+               (loop while (consp x)
+                     do (let ((f (car x)))
+                          (when (and (consp f) (symbolp (car f))
+                                     (member (symbol-name (car f)) '("LET" "LET*" "PROG" "PROG*")
+                                             :test #'string=)
+                                     (consp (cdr f)))
+                            (let ((bs (cadr f)))
+                              (loop while (consp bs)
+                                    do (let ((b (car bs)))
+                                         (when (and (consp b) (symbolp (car b)) (car b)
+                                                    (consp (cdr b)) (symbolp (cadr b)) (cadr b)
+                                                    (string= (var-name (cadr b)) var))
+                                           (pushnew (var-name (car b)) out :test #'string=)))
+                                       (setq bs (cdr bs)))))
+                          (unless (and (consp f) (eq (car f) 'quote))
+                            (walk f)))
+                        (setq x (cdr x)))))
+      (walk (list form)))
+    out))
 
 (defun %tree-finds-aref-p (form var &optional layout)
   "T when FORM's tree contains (AREF VAR ...) -- the shape of both an element
@@ -1804,6 +2134,466 @@
         (when (and ty (not (eq ty :self-recursive)))
           ty)))))
 
+;;; A LET whose every variable is read once, where nothing the body evaluates
+;;; before the read can tell the difference, is compiled as its body with the
+;;; init forms in place of the reads.
+
+(defparameter +let-subst-ops+
+  '(+ - * = /= < > <= >= 1+ 1- identity values mod rem logand logior logxor ash
+    min max abs))
+
+(defun %let-subst-spine (form vars)
+  "FORM's operands in evaluation order, as far as it is made of calls to
+   +LET-SUBST-OPS+, THE, LOCALLY with OPTIMIZE, and LET inits: (:V I) for a read
+   of the Ith of VARS, :CONST, (:SYM S) for another variable, :CALL for an
+   operation, :OPAQUE for anything else."
+  (let ((acc '()))
+    (labels ((walk (form)
+               (cond ((symbolp form)
+                      (let ((i (position form vars)))
+                        (push (cond (i (list :v i))
+                                    ((or (null form) (eq form t) (keywordp form)) :const)
+                                    ((nth-value 1 (lookup-symbol-macro form)) :opaque)
+                                    (t (list :sym form)))
+                              acc)))
+                     ((atom form) (push :const acc))
+                     ((eq (car form) 'quote) (push :const acc))
+                     ((not (symbolp (car form))) (push :opaque acc))
+                     ((and (eq (car form) 'the) (consp (cdr form)) (consp (cddr form))
+                           (null (cdddr form)))
+                      (walk (caddr form)))
+                     ((and (member (car form) '(locally progn))
+                           (not (eq (strip-value-wrappers form) form)))
+                      (walk (car (last form))))
+                     ((and (member (car form) '(let let*)) (consp (cdr form)) (listp (cadr form)))
+                      (dolist (b (if (eq (car form) 'let) (cadr form) (list (car (cadr form)))))
+                        (walk (and (consp b) (consp (cdr b)) (cadr b))))
+                      (push :opaque acc))
+                     ((and (member (car form) +let-subst-ops+)
+                           (not (local-function-entry (car form)))
+                           (not (macrolet-shadowed-p (car form)))
+                           (listp (cdr form)))
+                      (dolist (a (cdr form)) (walk a))
+                      (push :call acc))
+                     (t (push :opaque acc)))))
+      (walk form))
+    (nreverse acc)))
+
+(defun %let-subst-reachable-p (form vars)
+  "True when every one of VARS occurs where the spine of FORM could reach it
+   once the LETs along it are substituted: like %LET-SUBST-SPINE, but also
+   through the last body form of a LET."
+  (let ((missing (copy-list vars)))
+    (labels ((walk (form)
+               (cond ((null missing))
+                     ((symbolp form)
+                      (when (member form missing) (setf missing (delete form missing))))
+                     ((or (atom form) (not (symbolp (car form))) (eq (car form) 'quote)))
+                     ((and (eq (car form) 'the) (consp (cdr form)) (consp (cddr form)))
+                      (walk (caddr form)))
+                     ((and (member (car form) '(locally progn)) (consp (cdr form)))
+                      (walk (car (last form))))
+                     ((and (member (car form) '(let let*)) (consp (cdr form)) (listp (cadr form)))
+                      (dolist (b (cadr form))
+                        (when (and (consp b) (consp (cdr b))) (walk (cadr b))))
+                      (when (consp (cddr form)) (walk (car (last form)))))
+                     ((and (member (car form) +let-subst-ops+) (listp (cdr form)))
+                      (dolist (a (cdr form)) (walk a))))))
+      (walk form))
+    (null missing)))
+
+(defun %count-symbol (sym form limit)
+  "Occurrences of SYM in the tree FORM, or NIL when FORM has more than LIMIT conses."
+  (let ((n 0) (budget limit))
+    (labels ((walk (x)
+               (loop
+                 (cond ((eq x sym) (incf n) (return))
+                       ((atom x) (return))
+                       ((< (decf budget) 0) (return-from %count-symbol nil))
+                       (t (walk (car x)) (setf x (cdr x)))))))
+      (walk form))
+    n))
+
+(defvar *let-subst-size-memo* nil
+  "NIL, or a cons whose car is NIL or an EQ table from LET forms to their
+   %LET-SUBST-SIZE (NIL when too big), so a chain of nested LETs is measured
+   once rather than once per level.")
+
+(defun %let-subst-size (form limit)
+  "The conses in FORM, or NIL when there are more than LIMIT."
+  (let ((memo (and *let-subst-size-memo*
+                   (or (car *let-subst-size-memo*)
+                       (setf (car *let-subst-size-memo*) (make-hash-table :test 'eq))))))
+    (labels ((size (x budget)
+               (if (and memo (consp x) (member (car x) '(let let*)))
+                   (multiple-value-bind (s found) (gethash x memo)
+                     (unless found
+                       (setf (gethash x memo) nil)
+                       (setf s (conses x limit))
+                       (setf (gethash x memo) s))
+                     (and s (<= s budget) s))
+                   (conses x budget)))
+             (conses (x budget)
+               (let ((n 0))
+                 (loop
+                   (cond ((atom x) (return n))
+                         ((< (decf budget) 0) (return nil))
+                         (t (incf n)
+                            (unless (atom (car x))
+                              (let ((s (size (car x) budget)))
+                                (unless s (return nil))
+                                (incf n s)
+                                (decf budget s)))
+                            (setf x (cdr x))))))))
+      (size form limit))))
+
+(defun %let-subst-pure-p (init)
+  (or (and (atom init) (not (symbolp init)))
+      (and (consp init) (eq (car init) 'quote))
+      (and (symbolp init)
+           (or (null init) (eq init t) (keywordp init)
+               (and (lookup-local init)
+                    (not (special-var-p init))
+                    (not (nth-value 1 (lookup-symbol-macro init))))))))
+
+(defun %let-subst-normalize (form)
+  "FORM with the LETs along its evaluation spine (see %LET-SUBST-SPINE)
+   substituted where LET-SUBSTITUTE-SINGLE-READS allows."
+  (cond ((atom form) form)
+        ((not (symbolp (car form))) form)
+        ((and (eq (car form) 'the) (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+         (list 'the (cadr form) (%let-subst-normalize (caddr form))))
+        ((and (member (car form) '(locally progn))
+              (not (eq (strip-value-wrappers form) form)))
+         (append (butlast form) (list (%let-subst-normalize (car (last form))))))
+        ((and (member (car form) '(let let*)) (consp (cdr form)) (listp (cadr form))
+              (or (eq (car form) 'let) (and (consp (cadr form)) (null (cdr (cadr form))))))
+         (let ((new (let-substitute-single-reads (cadr form) (cddr form))))
+           (if new (%let-subst-normalize new) form)))
+        ((and (member (car form) +let-subst-ops+)
+              (not (local-function-entry (car form)))
+              (not (macrolet-shadowed-p (car form)))
+              (listp (cdr form)))
+         (cons (car form) (mapcar #'%let-subst-normalize (cdr form))))
+        (t form)))
+
+(defun let-substitute-single-reads (bindings body)
+  "The LET of BINDINGS and BODY as its body with each init form in place of the
+   one read of its variable, or NIL (see above)."
+  (when (and (not *emit-source-lines*)
+             (consp bindings)
+             (<= (length bindings) 8)
+             (every (lambda (b) (and (consp b) (symbolp (car b))
+                                     (not (constant-binding-name-p (car b)))
+                                     (consp (cdr b)) (null (cddr b))))
+                    bindings))
+    (let* ((vars (mapcar #'car bindings))
+           (inits (mapcar #'cadr bindings))
+           (decls (loop for f in body while (and (consp f) (eq (car f) 'declare)) collect f))
+           (forms (nthcdr (length decls) body)))
+      (when (and (consp forms) (null (cdr forms))
+                 (= (length (remove-duplicates vars)) (length vars))
+                 (notany #'special-var-p vars)
+                 (notany (lambda (v) (nth-value 1 (lookup-symbol-macro v))) vars)
+                 (every (lambda (d)
+                          (every (lambda (spec)
+                                   (and (consp spec) (member (car spec) '(ignore ignorable))
+                                        (every (lambda (n) (member n vars)) (cdr spec))))
+                                 (cdr d)))
+                        decls)
+                 (%let-subst-size (car forms) 2000)
+                 (%let-subst-reachable-p (car forms) vars)
+                 (progn (setf forms (list (%let-subst-normalize (car forms))))
+                        (every (lambda (v) (eql (%count-symbol v (car forms) 2000) 1)) vars)))
+        (let* ((spine (%let-subst-spine (car forms) vars))
+               (pos (mapcar (lambda (i) (position (list :v i) spine :test #'equal))
+                            (loop for i below (length vars) collect i)))
+               (pure (mapcar #'%let-subst-pure-p inits)))
+          (when (and (notany #'null pos)
+                     (loop for i from 0 for p in pos for pure-p in pure for init in inits
+                           always
+                           (if pure-p
+                               (or (not (symbolp init))
+                                   (and (loop for e in inits for e-pure in pure
+                                              never (and (not e-pure)
+                                                         (not (eql (%count-symbol init e 2000) 0))))
+                                        (not (member :opaque (subseq spine 0 p)))))
+                               (loop for e in (subseq spine 0 p)
+                                     always (or (eq e :const)
+                                                (and (consp e) (eq (car e) :v)
+                                                     (or (< (cadr e) i)
+                                                         (nth (cadr e) pure))))))))
+            (labels ((tail-var (x)
+                       (loop (cond ((and (consp x) (eq (car x) 'the) (consp (cdr x)) (consp (cddr x)))
+                                    (setf x (caddr x)))
+                                   ((and (consp x) (member (car x) '(locally progn)))
+                                    (setf x (car (last x))))
+                                   (t (return x)))))
+                     (subst-form (x)
+                       (cond ((symbolp x)
+                              (let ((i (position x vars)))
+                                (if i
+                                    (let ((init (nth i inits)))
+                                      (if (and (consp init) (eq x (tail-var (car forms))))
+                                          (list 'values init)
+                                          init))
+                                    x)))
+                             ((atom x) x)
+                             (t (let ((a (subst-form (car x)))
+                                      (d (subst-form (cdr x))))
+                                  (if (and (eq a (car x)) (eq d (cdr x))) x (cons a d)))))))
+              (subst-form (car forms)))))))))
+
+;;; A LET binding one variable to a new structure that only has its slots read
+;;; and its type tested -- directly or through LETs that rename it -- is
+;;; compiled with the slot values in variables of their own and no structure.
+;;; Coalton's MATCH on a tuple built in place, (match (Tuple a b) ...), is this.
+
+(defun %sra-struct-chain (name)
+  "NAME and the structures it includes, nearest first."
+  (loop for n = name then (getf (gethash n *struct-info*) :parent)
+        while n collect n))
+
+(defun %sra-constructor-parts (init)
+  "For INIT, a form that only builds a standard structure, the list
+   (NAME BINDINGS PRE SLOTS): BINDINGS evaluate the arguments left to right
+   into fresh variables, PRE are the slot type checks to run on them, SLOTS
+   gives each slot's value (a variable of BINDINGS or a constant). NIL when INIT
+   is not such a form."
+  (labels ((make-struct-p (f)
+             (and (consp f) (eq (car f) '%make-struct) (consp (cdr f))
+                  (consp (cadr f)) (eq (car (cadr f)) 'quote)
+                  (symbolp (cadr (cadr f))) (cadr (cadr f))
+                  (gethash (cadr (cadr f)) *struct-info*)
+                  (null (getf (gethash (cadr (cadr f)) *struct-info*) :type-option))))
+           (from-binding-form (f)
+             ;; (LET[*] ((p a) ...) [decls] [(block n] [(progn checks...] (%make-struct ...)))
+             (when (and (consp f) (member (car f) '(let let*)) (consp (cdr f))
+                        (listp (cadr f)))
+               (let* ((bs (cadr f))
+                      (rest (cddr f))
+                      (decls (loop while (and (consp rest) (consp (car rest))
+                                              (eq (caar rest) 'declare))
+                                   collect (pop rest))))
+                 (when (and (every (lambda (b) (and (consp b) (symbolp (car b)) (car b)
+                                                    (consp (cdr b)) (null (cddr b))
+                                                    (not (special-var-p (car b)))))
+                                   bs)
+                            (every (lambda (d)
+                                     (every (lambda (sp)
+                                              (and (consp sp)
+                                                   (member (car sp) '(ignore ignorable type))))
+                                            (cdr d)))
+                                   decls)
+                            (consp rest) (null (cdr rest)))
+                   (let ((body (car rest)))
+                     (when (and (consp body) (eq (car body) 'block) (consp (cdr body))
+                                (consp (cddr body)))
+                       (let ((forms (cddr body)))
+                         (when (and (stringp (car forms)) (cdr forms))
+                           (pop forms))
+                         (setf body (if (null (cdr forms)) (car forms) :none))))
+                     (let ((checks '()))
+                       (when (and (consp body) (eq (car body) 'progn))
+                         (setf checks (butlast (cdr body))
+                               body (car (last body))))
+                       (when (and (make-struct-p body)
+                                  (every (lambda (c) (and (consp c) (eq (car c) '%check-slot-type)))
+                                         checks))
+                         (let* ((vars (mapcar #'car bs))
+                                (temps (mapcar (lambda (v) (gensym (symbol-name v))) vars))
+                                (alist (mapcar #'cons vars temps)))
+                           (when (every (lambda (x) (or (member x vars) (and (constantp x) (not (symbolp x)))
+                                                        (and (consp x) (eq (car x) 'quote))
+                                                        (null x) (eq x t) (keywordp x)))
+                                        (cddr body))
+                             (list (cadr (cadr body))
+                                   (mapcar (lambda (b tmp) (list tmp (cadr b))) bs temps)
+                                   (append (mapcar (lambda (d)
+                                                     `(declare
+                                                       ,@(mapcar (lambda (sp)
+                                                                   (if (eq (car sp) 'type)
+                                                                       (list* 'type (cadr sp) (sublis alist (cddr sp)))
+                                                                       (cons (car sp) (sublis alist (cdr sp)))))
+                                                                 (cdr d))))
+                                                   decls)
+                                           (mapcar (lambda (c)
+                                                     (list* (car c)
+                                                            (let ((a (assoc (cadr c) alist)))
+                                                              (if a (cdr a) (cadr c)))
+                                                            (cddr c)))
+                                                   checks))
+                                   (sublis alist (cddr body)))))))))))))
+    (cond ((make-struct-p init)
+           (let ((temps (mapcar (lambda (a) (declare (ignore a)) (gensym "SLOT")) (cddr init))))
+             (list (cadr (cadr init))
+                   (mapcar #'list temps (cddr init))
+                   '()
+                   temps)))
+          ((and (consp init) (symbolp (car init)) (car init)
+                (not (local-function-entry (car init)))
+                (not (macrolet-shadowed-p (car init))))
+           (let ((entry (gethash (car init) *struct-keyword-ctors*)))
+             (if entry
+                 (let ((direct (%struct-ctor-direct-form entry (cdr init))))
+                   (cond ((null direct) nil)
+                         ((make-struct-p direct) (%sra-constructor-parts direct))
+                         (t (from-binding-form direct))))
+                 (when (gethash (car init) *inline-defs*)
+                   (from-binding-form (maybe-expand-inline (car init) init)))))))))
+
+(defun %sra-rewrite-body (forms var name slots)
+  "FORMS with every use of VAR, an instance of structure NAME whose slot values
+   are the variables SLOTS, replaced, or :FAIL when some use needs the object."
+  (let ((chain (%sra-struct-chain name)))
+    (labels ((fail () (throw '%sra :fail))
+             (struct-type-known (ty)
+               (cond ((member ty chain) t)
+                     ((member ty '(t structure-object)) t)
+                     ((and (symbolp ty) (gethash ty *struct-info*)) nil)
+                     (t (fail))))
+             (alias-p (x aliases) (and (symbolp x) x (member x aliases)))
+             (rw (x aliases)
+               (cond ((alias-p x aliases) (fail))
+                     ((atom x) x)
+                     ((eq (car x) 'quote) x)
+                     ((and (symbolp (car x)) (consp (cdr x)) (null (cddr x))
+                           (alias-p (cadr x) aliases)
+                           (gethash (car x) *struct-accessors*))
+                      (let ((owner (gethash (car x) *struct-accessor-owners*))
+                            (idx (ldb (byte +slot-version-shift+ 0)
+                                      (gethash (car x) *struct-accessors*))))
+                        (unless (and (member owner chain)
+                                     (not (local-function-entry (car x)))
+                                     (not (macrolet-shadowed-p (car x)))
+                                     (< idx (length slots)))
+                          (fail))
+                        (nth idx slots)))
+                     ((and (eq (car x) 'typep) (consp (cdr x)) (alias-p (cadr x) aliases)
+                           (consp (cddr x)) (null (cdddr x))
+                           (consp (caddr x)) (eq (car (caddr x)) 'quote)
+                           (not (local-function-entry 'typep)))
+                      (struct-type-known (cadr (caddr x))))
+                     ((and (member (car x) '(let let*)) (consp (cdr x))
+                           (consp (cadr x)) (null (cdr (cadr x)))
+                           (consp (car (cadr x))) (symbolp (car (car (cadr x))))
+                           (consp (cdr (car (cadr x))))
+                           (alias-p (cadr (car (cadr x))) aliases))
+                      (let* ((m (car (car (cadr x))))
+                             (rest (cddr x))
+                             (decls (loop while (and (consp rest) (consp (car rest))
+                                                     (eq (caar rest) 'declare))
+                                          collect (pop rest))))
+                        (when (or (null m) (special-var-p m)
+                                  (nth-value 1 (lookup-symbol-macro m)))
+                          (fail))
+                        `(locally
+                             ,@(drop-decls decls m)
+                           ,@(mapcar (lambda (f) (rw f (cons m aliases))) rest))))
+                     ((and (member (car x) '(flet labels macrolet))
+                           (consp (cdr x)) (listp (cadr x))
+                           (some (lambda (b) (and (consp b)
+                                                  (or (eq (car b) 'typep)
+                                                      (gethash (car b) *struct-accessors*))))
+                                 (cadr x)))
+                      (fail))
+                     (t (let ((a (rw (car x) aliases))
+                              (d (rw-list (cdr x) aliases)))
+                          (if (and (eq a (car x)) (eq d (cdr x))) x (cons a d))))))
+             (rw-list (l aliases)
+               (cond ((alias-p l aliases) (fail))
+                     ((atom l) l)
+                     (t (let ((a (rw (car l) aliases))
+                              (d (rw-list (cdr l) aliases)))
+                          (if (and (eq a (car l)) (eq d (cdr l))) l (cons a d))))))
+             (drop-decls (decls v)
+               (loop for d in decls
+                     for specs = (loop for sp in (cdr d)
+                                       unless (and (consp sp) (member v (cdr sp)))
+                                         collect sp
+                                       when (and (consp sp) (member v (cdr sp)))
+                                         do (unless (case (car sp)
+                                                      ((ignore ignorable dynamic-extent) t)
+                                                      (type (struct-type-known (cadr sp)))
+                                                      (t nil))
+                                              (fail)))
+                     when specs collect `(declare ,@specs))))
+      (catch '%sra
+        (list (drop-decls (loop for f in forms while (and (consp f) (eq (car f) 'declare))
+                                collect f)
+                          var)
+              (mapcar (lambda (f) (rw f (list var)))
+                      (loop for tail on forms
+                            unless (and (consp (car tail)) (eq (caar tail) 'declare))
+                              return tail)))))))
+
+(defun %sra-slots-safe-p (name)
+  "True when no slot of structure NAME has a type check that a store through
+   SETF of an accessor would have to make."
+  (every (lambda (s)
+           (or (getf (cddr s) :read-only)
+               (member (getf (cddr s) :type) '(nil t))))
+         (getf (gethash name *struct-info*) :slots)))
+
+(defun let-scalar-replace-struct (bindings body)
+  "The LET of BINDINGS and BODY without the structure its one variable is bound
+   to, or NIL (see above)."
+  (when (and (not *emit-source-lines*)
+             (consp bindings) (null (cdr bindings))
+             (consp (car bindings)) (symbolp (caar bindings)) (caar bindings)
+             (consp (cdar bindings)) (null (cddar bindings))
+             (consp (cadar bindings)))
+    (let ((var (caar bindings))
+          (init (cadar bindings)))
+      (when (and (not (special-var-p var))
+                 (not (nth-value 1 (lookup-symbol-macro var)))
+                 (not (constant-binding-name-p var))
+                 (eql 0 (%sra-bare-uses var body)))
+        (let ((parts (%sra-constructor-parts init)))
+          (when (and parts (%sra-slots-safe-p (first parts)))
+            (destructuring-bind (name binds pre slot-forms) parts
+              (let* ((slot-temps (mapcar (lambda (f) (if (and (symbolp f) f (not (eq f t))
+                                                              (not (keywordp f)))
+                                                         f
+                                                         (gensym "K")))
+                                         slot-forms))
+                     (const-binds (loop for f in slot-forms for tmp in slot-temps
+                                        unless (eq f tmp) collect (list tmp f)))
+                     (new (%sra-rewrite-body body var name slot-temps)))
+                (unless (eq new :fail)
+                  (let ((pre-decls (remove-if-not (lambda (f) (and (consp f) (eq (car f) 'declare))) pre))
+                        (pre-checks (remove-if (lambda (f) (and (consp f) (eq (car f) 'declare))) pre)))
+                    `(let* (,@binds ,@const-binds)
+                       ,@pre-decls
+                       ,@pre-checks
+                       (locally ,@(first new) ,@(second new)))))))))))))
+
+(defun %sra-bare-uses (var body)
+  "How many times VAR occurs in BODY other than as (F VAR) for a symbol F, the
+   init of a one-variable LET or LET*, or in a declaration; NIL past a size limit.
+   A cheap screen before the structure's definition is looked up."
+  (let ((n 0) (budget 4000))
+    (labels ((walk (x)
+               (when (< (decf budget) 0) (return-from %sra-bare-uses nil))
+               (cond ((eq x var) (incf n))
+                     ((atom x))
+                     ((eq (car x) 'quote))
+                     ((eq (car x) 'declare))
+                     ((and (symbolp (car x)) (consp (cdr x)) (eq (cadr x) var)
+                           (or (null (cddr x))
+                               (and (eq (car x) 'typep) (consp (cddr x)) (null (cdddr x)))))
+                      (when (eq (car x) 'typep) (walk (caddr x))))
+                     ((and (member (car x) '(let let*)) (consp (cdr x))
+                           (consp (cadr x)) (null (cdr (cadr x)))
+                           (consp (car (cadr x))) (consp (cdr (car (cadr x))))
+                           (eq (cadr (car (cadr x))) var))
+                      (walk (cddr x)))
+                     (t (loop for tail = x then (cdr tail)
+                              while (consp tail) do (walk (car tail))
+                              finally (when (eq tail var) (incf n)))))))
+      (walk body))
+    n))
+
 (defun compile-let (bindings body sequential-p &optional boolean-tail)
   "Compile (let/let* ...), wrapping the result in a debug scope so its lexical
    locals are named only within this binding form. Nested lets nest their scopes,
@@ -1832,9 +2622,38 @@
         *decimal-locals*      (type-locals-after-binding name dec *decimal-locals*))
   nil)
 
-(defun compile-let-body-instrs (real-body body binding-info let-bound-names
+(defun %mv-clean-init-p (form)
+  "True when evaluating FORM cannot leave values in the channel."
+  (cond ((atom form) t)
+        ((member (car form) '(quote function)) t)
+        ((eq (car form) 'the) (%mv-clean-init-p (third form)))
+        (t nil)))
+
+(defun %instrs-reset-first-p (instrs)
+  "True when INSTRS empty the channel before any branch, label or return."
+  (dolist (ins instrs nil)
+    (when (consp ins)
+      (cond ((equal ins '(:call "MultipleValues.Reset")) (return t))
+            ((member (car ins) '(:label :br :brtrue :brfalse :beq :bne-un :blt :ble
+                                 :bgt :bge :blt-un :ble-un :bgt-un :bge-un :leave
+                                 :ret :throw :switch :begin-exception-block :go-local))
+             (return nil))))))
+
+(defun compile-let-body-instrs (&rest args)
+  "%COMPILE-LET-BODY-INSTRS, preceded by MultipleValues.Reset when the LET's
+   values are read, an init may have left values in the channel, and the body
+   does not empty the channel before it can produce a value."
+  (let ((instrs (apply #'%compile-let-body-instrs args)))
+    (if (and (or *in-tail-position* *in-mv-context*)
+             (null (nth 8 args))
+             (notevery (lambda (b) (%mv-clean-init-p (second b))) (third args))
+             (not (%instrs-reset-first-p instrs)))
+        (cons '(:call "MultipleValues.Reset") instrs)
+        instrs)))
+
+(defun %compile-let-body-instrs (real-body body binding-info let-bound-names
                                 needs-boxing mutated special-syms declared-specials
-                                &optional boolean-tail)
+                                &optional boolean-tail sequential-p)
   "Compile REAL-BODY in the scope a LET/LET* body sees, and return its
    instruction list. Establishes the body's own type declarations (name-keyed
    tables shadow-filtered by LET-BOUND-NAMES, slot-keyed tables rekeyed via
@@ -1872,10 +2691,27 @@
                      (append
                       (extract-numeric-array-locals body)
                       (infer-numeric-array-bindings
-                       binding-info mutated (cstate-numeric-array-locals)))
+                       binding-info mutated (cstate-numeric-array-locals)
+                       sequential-p))
                      +cs-dotnet-typed-locals+
                      (infer-dotnet-typed-bindings
-                      binding-info mutated (cstate-dotnet-typed-locals)))))
+                      binding-info mutated (cstate-dotnet-typed-locals))
+                     +cs-proven-type-locals+
+                     (append (loop for b in binding-info
+                                   for e = (assoc (fourth b) *let-proven-type-inits*
+                                                  :test #'equal)
+                                   when (and e (not (third b))
+                                             (not (member (var-name (first b)) mutated
+                                                          :test #'string=)))
+                                     collect e)
+                             (cstate-proven-type-locals))
+                     +cs-float-range-locals+
+                     (append (rekey-by-binding
+                              (extract-float-range-locals body)
+                              binding-info)
+                             (infer-float-range-bindings
+                              binding-info needs-boxing mutated)
+                             (cstate-float-range-locals)))))
            (if declared-specials
                (cstate-with cs +cs-locals+
                             (remove-locals-shadowed-by declared-specials
@@ -1949,15 +2785,28 @@
    not hoisted yet: such a binding gets no entry."
   (let ((result '()) (seen '()))
     (dolist (b binding-info)
-      (let ((init (second b)))
-        (unless (or (third b)
-                    (not (symbolp init))
-                    (and sequential-p
-                         (member (var-name init) seen :test #'string=)))
-          (let ((src (%array-backing-source init)))
-            (when src (push (cons (fourth b) src) result)))))
+      (let* ((init (second b))
+             (c (and (not (third b)) (%init-constant-array init))))
+        (cond (c
+               (let ((src (%collected-constant-backing c)))
+                 (when src (push (cons (fourth b) src) result))))
+              ((or (third b)
+                   (not (symbolp init))
+                   (and sequential-p
+                        (member (var-name init) seen :test #'string=))))
+              (t
+               (let ((src (%array-backing-source init)))
+                 (when src (push (cons (fourth b) src) result))))))
       (push (var-name (first b)) seen))
     result))
+
+(defun %init-constant-array (init)
+  "C when INIT is C or (LOAD-TIME-VALUE C [READ-ONLY-P]) for a constant array C."
+  (let ((c (if (and (consp init) (eq (car init) 'load-time-value)
+                    (consp (cdr init)) (%ltv-constant-symbol-p (cadr init)))
+               (cadr init)
+               init)))
+    (and (symbolp c) c (constant-array-numeric-info c) c)))
 
 (defun %array-backing-source (init)
   "When INIT is a plain reference to a local whose element buffer is hoisted in
@@ -2011,7 +2860,7 @@
                  (equal (seventh src) (seventh e))
                  (equal (eighth src) (eighth e)))
             (push (list (first e) (second e) (third src) (fourth e) (fifth e)
-                        (sixth src) (seventh src) (eighth src))
+                        (sixth src) (seventh src) (eighth src) nil (tenth src))
                   aliases)
             (push e fetched))))
     (dolist (b binding-info)
@@ -2025,7 +2874,7 @@
           (let ((src (cdr (assoc (fourth b) *let-backing-sources*))))
             (when src
               (push (list (var-name var) (fourth b) (third src) (fourth src)
-                          (fifth src) (sixth src) (seventh src) (eighth src))
+                          (fifth src) (sixth src) (seventh src) (eighth src) nil (tenth src))
                     aliases))))))
     (values (nreverse fetched) (nreverse aliases))))
 
@@ -2040,13 +2889,14 @@
 ;;; variable, which only the compiler can see through the body's macros. So
 ;;; they state the shape, as a declaration the compiler resolves here:
 ;;;
-;;;   (%INDUCTION VAR DELTA LIMIT INCLUSIVE-P)
+;;;   (%INDUCTION VAR DELTA LIMIT INCLUSIVE-P [:UNTIL-EQUAL])
 ;;;
 ;;; VAR is bound by this LET; DELTA is a nonzero integer (VAR goes up when it is
 ;;; positive); LIMIT is an integer or a variable; the test ends the loop when VAR
 ;;; passes LIMIT (or reaches it, when INCLUSIVE-P is NIL) before every step; and
 ;;; every step is an assignment of (%INDUCTION-NEXT VAR DELTA) (DOTIMES writes
-;;; (%DOTIMES-1+ VAR)). Before a step VAR is within LIMIT, so after it VAR is at
+;;; (%DOTIMES-1+ VAR)). With :UNTIL-EQUAL the test is (= VAR LIMIT) instead,
+;;; which bounds VAR the same way only when VAR cannot step over LIMIT. Before a step VAR is within LIMIT, so after it VAR is at
 ;;; most DELTA past the limit; the start bounds the other side.
 ;;;
 ;;; When the claim checks out the declaration becomes (TYPE (INTEGER LO HI) VAR),
@@ -2097,19 +2947,139 @@
                  (d (%hide-induction-steps (cdr form) var dummy budget)))
              (if (and (eq a (car form)) (eq d (cdr form))) form (cons a d))))))
 
-(defun %induction-range (spec binding-info real-body mutated)
+(defvar *induction-overflow-exits* '()
+  "(KEY . UP) for the counting variables whose step leaves the loop through its
+   exit form when the sum leaves int64 (see %INDUCTION-RANGE): KEY is the
+   variable's slot, UP true when it counts up.")
+
+(defun %induction-exit-form (body var)
+  "The exit form of the first (SETQ VAR (%INDUCTION-NEXT VAR DELTA EXIT [AFTER]))
+   in BODY, or NIL. AFTER is what runs after EXIT leaves the loop, when EXIT
+   does not show it; the second value is EXIT with AFTER, for the check that
+   neither reads VAR."
+  (labels ((walk (x)
+             (when (and (consp x) (not (eq (car x) 'quote)))
+               (if (and (eq (car x) 'setq) (consp (cdr x)) (eq (cadr x) var)
+                        (consp (cddr x)) (null (cdddr x)))
+                   (let ((v (caddr x)))
+                     (when (and (consp v) (symbolp (car v))
+                                (string= (symbol-name (car v)) "%INDUCTION-NEXT")
+                                (eq (cadr v) var)
+                                (consp (cdddr v)))
+                       (return-from %induction-exit-form
+                         (values (cadddr v) `(progn ,@(cdddr v))))))
+                   (loop for tail on x
+                         while (consp tail)
+                         do (walk (car tail)))))))
+    (walk body)
+    nil))
+
+(defun %form-references-p (form var)
+  (let* ((*bmr-cache* (or *bmr-cache* (make-hash-table :test #'eq)))
+         (s (%fmc-summary form nil 0))
+         (n (var-name var)))
+    (or (member n (mapcar #'var-name (car s)) :test #'string=)
+        (member n (mapcar #'var-name (cadr s)) :test #'string=)
+        (member n (mapcar #'var-name (cddr s)) :test #'string=))))
+
+(defun %induction-var-typed-p (var specs)
+  "True when a declaration among SPECS other than the counting macros' own
+   gives VAR a type that leaves out some integer."
+  (some (lambda (d)
+          (and (consp d) (symbolp (car d))
+               (not (member (symbol-name (car d))
+                            '("%INDUCTION" "%INDUCTION-COMPANION" "IGNORE" "IGNORABLE"
+                              "DYNAMIC-EXTENT" "SPECIAL" "OPTIMIZE" "INLINE"
+                              "NOTINLINE" "FTYPE" "DECLARATION")
+                            :test #'string=))
+               (member var (if (string= (symbol-name (car d)) "TYPE") (cddr d) (cdr d))
+                       :test #'eq)
+               (not (ignore-errors
+                     (subtypep 'integer (if (string= (symbol-name (car d)) "TYPE")
+                                            (cadr d)
+                                            (car d)))))))
+        specs))
+
+(defvar *induction-delta-signs* '()
+  "(KEY . SIGN) for the variables whose sign (:NONNEG or :NONPOS) a
+   %INDUCTION-VERSION has tested before the copy being compiled, and which
+   nothing assigns in it.")
+
+(defun %induction-delta-var-range (v)
+  "The range of the variable V as a counting variable's step, or NIL: V is a
+   lexical variable nothing outside this function can assign, or a constant."
+  (and (symbolp v) v
+       (not (global-special-p v))
+       (not (nth-value 1 (lookup-symbol-macro v)))
+       (or (not (lookup-local v)) (not (boxed-var-p v)))
+       (let ((r (expr-int-range v))
+             (sign (and (lookup-local v)
+                        (cdr (assoc (lookup-local v) *induction-delta-signs*
+                                    :test #'equal)))))
+         (cond ((null r) nil)
+               ((eq sign :nonneg) (and (<= 0 (cdr r)) (cons (max 0 (car r)) (cdr r))))
+               ((eq sign :nonpos) (and (<= (car r) 0) (cons (car r) (min 0 (cdr r)))))
+               (t r)))))
+
+(defun compile-induction-version (expr)
+  (destructuring-bind (v sign typed generic) (cdr expr)
+    (let ((r (%induction-delta-var-range v)))
+      (cond ((null r) (compile-expr generic))
+            ((if (eq sign :nonneg) (>= (car r) 0) (<= (cdr r) 0))
+             (compile-expr typed))
+            ((or (not (lookup-local v))
+                 (find-mutated-and-captured-vars (list typed) (list (var-name v))))
+             (compile-expr generic))
+            (t (compile-expr
+                `(if (,(if (eq sign :nonneg) '>= '<=) ,v 0)
+                     (%induction-signed ,v ,sign ,typed)
+                     ,generic)))))))
+
+(defun compile-induction-signed (expr)
+  (destructuring-bind (v sign form) (cdr expr)
+    (let ((*induction-delta-signs* (if (lookup-local v)
+                                       (acons (lookup-local v) sign *induction-delta-signs*)
+                                       *induction-delta-signs*)))
+      (compile-expr form))))
+
+(defun %induction-delta-range (delta more &optional binding-info mutated)
+  "The range of DELTA's value, a variable V or (- V), when the direction the
+   end test names in MORE (:UP or :DOWN) holds for every value it can take.
+   A V the same LET binds (LOOP's BY) has the range of its init when nothing
+   assigns it."
+  (let* ((v (if (consp delta) (cadr delta) delta))
+         (lb (assoc v binding-info :test #'eq))
+         (r (cond ((null lb) (%induction-delta-var-range v))
+                  ((or (third lb) (member (var-name v) mutated :test #'string=)) nil)
+                  (t (expr-int-range (second lb)))))
+         (r (and r (if (consp delta) (cons (- (cdr r)) (- (car r))) r))))
+    (cond ((null r) nil)
+          ((member :up more) (and (>= (car r) 0) r))
+          ((member :down more) (and (<= (cdr r) 0) r))
+          (t nil))))
+
+(defun %induction-range (spec binding-info real-body mutated &optional captured all-specs)
   "The (LO . HI) range an (%INDUCTION VAR DELTA LIMIT INCLUSIVE-P) declaration
    proves for VAR, or NIL. Called with the LET's enclosing scope in effect, so
    EXPR-INT-RANGE of an init form, or of a LIMIT variable this LET does not
-   bind, sees what the form itself sees."
+   bind, sees what the form itself sees.
+   A second value true means the range was cut at the int64 bound: the last
+   step of VAR may pass it, and that step must take the exit form instead of
+   storing (*INDUCTION-OVERFLOW-EXITS*). Only when the step has an exit form
+   that does not read VAR, nothing captures VAR, and VAR has no declared type."
   (destructuring-bind (&optional var delta limit inclusive &rest more) (cdr spec)
-    (declare (ignore more))
-    (let ((b (and (symbolp var) var (assoc var binding-info :test #'eq))))
+    (let ((b (and (symbolp var) var (assoc var binding-info :test #'eq)))
+          (rd (cond ((integerp delta) (and (/= delta 0) (cons delta delta)))
+                    ((member :until-equal more) nil)
+                    (t (%induction-delta-range delta more binding-info mutated)))))
       (when (and b
                  (not (third b))
-                 (integerp delta) (/= delta 0)
-                 (or (integerp limit) (and limit (symbolp limit))))
+                 rd
+                 (or (integerp limit)
+                     (and limit (symbolp limit)
+                          (not (nth-value 1 (lookup-symbol-macro limit))))))
         (let ((rs (expr-int-range (second b)))
+              (up (if (integerp delta) (plusp delta) (member :up more)))
               (rl (if (integerp limit)
                       (cons limit limit)
                       (let ((lb (assoc limit binding-info :test #'eq)))
@@ -2121,6 +3091,8 @@
                                nil)
                               (t (expr-int-range (second lb))))))))
           (when (and rs rl
+                     (or (not (member :until-equal more))
+                         (%induction-reaches-limit-p delta rs rl))
                      ;; Nothing assigns VAR but its own steps.
                      (catch '%induction-give-up
                        (not (member (var-name var)
@@ -2130,39 +3102,139 @@
                                                             (list 200000))
                                      (list (var-name var)))
                                     :test #'string=))))
-            (let ((r (if (plusp delta)
+            (let ((r (if up
                          (cons (car rs)
-                               (max (cdr rs) (+ (cdr rl) delta (if inclusive 0 -1))))
-                         (cons (min (car rs) (+ (car rl) delta (if inclusive 0 1)))
+                               (max (cdr rs) (+ (cdr rl) (cdr rd) (if inclusive 0 -1))))
+                         (cons (min (car rs) (+ (car rl) (car rd) (if inclusive 0 1)))
                                (cdr rs)))))
-              (and (range-fits-int64-p r) r))))))))
+              (cond ((range-fits-int64-p r) r)
+                    ((and (range-fits-int64-p rs)
+                          (range-fits-int64-p rl)
+                          (range-fits-int64-p rd)
+                          (not (member :until-equal more))
+                          (not (member (var-name var) captured :test #'string=))
+                          (not (%induction-var-typed-p var all-specs))
+                          (multiple-value-bind (exit all) (%induction-exit-form real-body var)
+                            (and exit (not (%form-references-p all var)))))
+                     (values (if up
+                                 (cons (car r) +int64-max+)
+                                 (cons +int64-min+ (cdr r)))
+                             t))
+                    (t nil)))))))))
 
-(defun %resolve-induction-declarations (body binding-info real-body mutated sequential-p)
+(defun %induction-reaches-limit-p (delta rs rl)
+  "True when a variable starting in RS and stepped by DELTA passes through
+   every limit in RL exactly, before going past it: the limit is never behind
+   the start, and the distance is a multiple of DELTA."
+  (if (plusp delta)
+      (and (<= (cdr rs) (car rl))
+           (or (= delta 1)
+               (and (= (car rs) (cdr rs)) (= (car rl) (cdr rl))
+                    (zerop (mod (- (car rl) (car rs)) delta)))))
+      (and (>= (car rs) (cdr rl))
+           (or (= delta -1)
+               (and (= (car rs) (cdr rs)) (= (car rl) (cdr rl))
+                    (zerop (mod (- (car rs) (car rl)) (- delta))))))))
+
+(defun %resolve-induction-declarations (body binding-info real-body mutated sequential-p
+                                         &optional captured)
   "BODY with each leading (%INDUCTION ...) declaration replaced by the
    (TYPE (INTEGER LO HI) VAR) it proves, or dropped when it proves nothing (a
    LET* is not resolved: its inits see their earlier siblings). BODY itself when
-   it has none."
+   it has none. The second value lists the slot keys of the variables whose
+   range was cut at the int64 bound (see %INDUCTION-RANGE)."
   (flet ((induction-spec-p (d)
            (and (consp d) (symbolp (car d))
-                (string= (symbol-name (car d)) "%INDUCTION"))))
+                (member (symbol-name (car d)) '("%INDUCTION" "%INDUCTION-COMPANION")
+                        :test #'string=))))
     (if (not (loop for form in body
                    while (and (consp form) (eq (car form) 'declare))
                    thereis (some #'induction-spec-p (cdr form))))
         body
-        (let ((rest body) (decls '()))
+        (let ((rest body) (decls '()) (exits '())
+              (all (loop for form in body
+                         while (and (consp form) (eq (car form) 'declare))
+                         append (cdr form))))
           (loop while (and (consp (car rest)) (eq (car (car rest)) 'declare))
                 do (let ((specs '()))
                      (dolist (d (cdr (pop rest)))
                        (if (not (induction-spec-p d))
                            (push d specs)
-                           (let ((r (and (not sequential-p)
-                                         (%induction-range d binding-info
-                                                           real-body mutated))))
+                           (multiple-value-bind (r cut)
+                               (and (not sequential-p)
+                                    (if (string= (symbol-name (car d)) "%INDUCTION")
+                                        (%induction-range d binding-info
+                                                          real-body mutated captured all)
+                                        (%induction-companion-range
+                                         d all binding-info real-body mutated)))
+                             (when cut
+                               (push (cons (fourth (assoc (cadr d) binding-info :test #'eq))
+                                           (let ((delta (caddr d)))
+                                             (if (integerp delta)
+                                                 (plusp delta)
+                                                 (and (member :up (cddddr (cdr d))) t))))
+                                     exits))
                              (when r
                                (push `(type (integer ,(car r) ,(cdr r)) ,(cadr d))
-                                     specs)))))
+                                     specs)
+                               (dolist (w (%induction-sibling-ranges d binding-info mutated))
+                                 (push w specs))))))
                      (push (cons 'declare (nreverse specs)) decls)))
-          (append (nreverse decls) rest)))))
+          (values (append (nreverse decls) rest) exits)))))
+
+(defun %induction-sibling-ranges (spec binding-info mutated)
+  "Type declarations for the limit and the step variable of the %INDUCTION
+   SPEC when the same LET binds them (LOOP's limit and BY) and nothing assigns
+   them: the range of the init, so that the end test and the step read int64."
+  (let ((delta (third spec)))
+    (loop for w in (list (fourth spec) (if (consp delta) (cadr delta) delta))
+          for lb = (and w (symbolp w) (assoc w binding-info :test #'eq))
+          for rw = (and lb (not (third lb))
+                        (not (member (var-name w) mutated :test #'string=))
+                        (expr-int-range (second lb)))
+          when (and rw (range-fits-int64-p rw))
+            collect `(type (integer ,(car rw) ,(cdr rw)) ,w))))
+
+(defun %induction-companion-range (spec all-specs binding-info real-body mutated)
+  "The (LO . HI) range of W for (%INDUCTION-COMPANION W DELTA IND): W is
+   stepped by DELTA each time the counting variable IND is stepped, and by
+   nothing else, so it takes at most as many steps as IND's proven range
+   allows from IND's initial value. NIL when IND has no range or W is
+   assigned elsewhere."
+  (destructuring-bind (&optional var delta ind &rest more) (cdr spec)
+    (declare (ignore more))
+    (let* ((b (and (symbolp var) var (assoc var binding-info :test #'eq)))
+           (ib (and (symbolp ind) ind (assoc ind binding-info :test #'eq)))
+           (ispec (find-if (lambda (d)
+                             (and (consp d) (symbolp (car d))
+                                  (string= (symbol-name (car d)) "%INDUCTION")
+                                  (consp (cdr d)) (eq (cadr d) ind)))
+                           all-specs))
+           (idelta (and ispec (caddr ispec))))
+      (when (and b ib ispec (not (third b))
+                 (integerp delta) (/= delta 0)
+                 (integerp idelta) (/= idelta 0))
+        (let ((rw (expr-int-range (second b)))
+              (ri0 (expr-int-range (second ib)))
+              (ri (multiple-value-bind (r cut)
+                      (%induction-range ispec binding-info real-body mutated)
+                    (and (not cut) r))))
+          (when (and rw ri0 ri
+                     (catch '%induction-give-up
+                       (not (member (var-name var)
+                                    (find-mutated-and-captured-vars
+                                     (%hide-induction-steps real-body var
+                                                            (make-symbol "STEP")
+                                                            (list 200000))
+                                     (list (var-name var)))
+                                    :test #'string=))))
+            (let* ((n (if (plusp idelta)
+                          (floor (- (cdr ri) (car ri0)) idelta)
+                          (floor (- (cdr ri0) (car ri)) (- idelta))))
+                   (r (if (plusp delta)
+                          (cons (car rw) (+ (cdr rw) (* n delta)))
+                          (cons (+ (car rw) (* n delta)) (cdr rw)))))
+              (and (>= n 0) (range-fits-int64-p r) r))))))))
 
 (defun %bounded-loop-candidate (body binding-info real-body sequential-p)
   "*BOUNDED-LOOP-CANDIDATE* for a LET whose body is one TAGBODY and whose
@@ -2353,28 +3425,41 @@
            (mutated (first mc))
            (captured (second mc))
            (needs-boxing (%strings-in-both mutated captured))
+           (*let-float-range-inits* (%let-float-range-inits binding-info sequential-p mutated))
+           (*let-int-range-inits* (%let-int-range-inits binding-info sequential-p mutated))
+           (*let-proven-type-inits* (%let-proven-type-inits binding-info sequential-p mutated))
            ;; A counting loop's variable becomes a declared bounded integer
            ;; when its %INDUCTION claim holds (see %INDUCTION-RANGE). Before
            ;; anything below reads the declarations.
            (bounded-candidate (%bounded-loop-candidate body binding-info real-body
                                                        sequential-p))
-           (body (%resolve-induction-declarations body binding-info real-body
-                                                  mutated sequential-p))
+           (resolved (multiple-value-list
+                      (%resolve-induction-declarations body binding-info real-body
+                                                       mutated sequential-p captured)))
+           (body (first resolved))
+           (*induction-overflow-exits* (append (second resolved)
+                                               *induction-overflow-exits*))
            ;; An assigned variable whose init and every assigned value stay in
            ;; one integer range is declared that type (see
            ;; %ASSIGNED-BINDING-DECLARATIONS), before anything below reads the
            ;; declarations.
-           (body (let ((extra (%assigned-binding-declarations
-                               binding-info body real-body mutated captured
-                               sequential-p)))
-                   (if extra (cons `(declare ,@extra) body) body)))
+           (avt (multiple-value-list
+                 (%assigned-binding-declarations binding-info body real-body mutated
+                                                 captured sequential-p)))
+           (body (if (first avt) (cons `(declare ,@(first avt)) body) body))
+           (binding-info (if (second avt)
+                             (mapcar (lambda (b)
+                                       (let ((lo (assoc (first b) (second avt) :test #'eq)))
+                                         (if lo (list* (first b) (cdr lo) (cddr b)) b)))
+                                     binding-info)
+                             binding-info))
            (body (let ((u64 (%u64-slot-binding-names binding-info body scan-forms
                                                      mutated captured)))
                    (if u64 (cons `(declare (type (unsigned-byte 64) ,@u64)) body) body)))
-           (body (let ((sgl (and (not sequential-p)
-                                 (%single-binding-names binding-info body real-body
+           (inferred-floats (and (not sequential-p)
+                                 (multiple-value-list
+                                  (%float-binding-names binding-info body real-body
                                                         mutated captured))))
-                   (if sgl (cons `(declare (single-float ,@sgl)) body) body)))
            (raw-plan (%raw-array-plan binding-info body real-body
                                       mutated captured no-raw))
            (*raw-array-plan* (append raw-plan *raw-array-plan*))
@@ -2401,7 +3486,8 @@
                                   (mapcar #'car (extract-small-int-locals body))))
            (fx-rep-names
              (when fx-decl-names
-               (loop for b in binding-info
+               (loop with earlier = '()
+                     for b in binding-info
                      for nm = (var-name (first b))
                      when (and (not (third b))
                                (second b)
@@ -2411,14 +3497,24 @@
                                ;; an init that is right only modulo 2^64 is
                                ;; enough here. COMPILE-EXPR-TO-LONG lowers it
                                ;; with a proof or an overflow check anyway.
-                               (or (fixnum-wrap-typed-p (second b))
+                               (or (if (and sequential-p (symbolp (second b))
+                                            (assoc (var-name (second b)) earlier
+                                                   :test #'string=))
+                                       ;; A LET* init naming an earlier sibling
+                                       ;; reads that sibling's slot.
+                                       (cdr (assoc (var-name (second b)) earlier
+                                                   :test #'string=))
+                                       (fixnum-wrap-typed-p (second b)))
                                    ;; A word half computed from an (unsigned-byte
                                    ;; 64) in the 64-bit lane (COMPILE-INT-SLOT-INIT).
                                    ;; Parallel LET only: the init is planned in the
                                    ;; scope it is evaluated in.
                                    (and (not sequential-p)
                                         (%u64-low-bits-plan (second b)) t)))
-                       collect nm)))
+                       collect nm into acc
+                       and do (push (cons nm t) earlier)
+                     else do (push (cons nm nil) earlier)
+                     finally (return acc))))
            ;; The same slot promotion WITHOUT a fixnum declaration: a binding
            ;; whose init has a statically proven int64 range (EXPR-INT-RANGE).
            ;; crc-division-step's (let ((new-rmdr (logior bit (* rmdr 2)))) ...)
@@ -2475,23 +3571,27 @@
            (dbl-decl-names (extract-double-float-locals body))
            (sgl-decl-names (extract-single-float-locals body))
            (double-rep-names
-             (when dbl-decl-names
-               (loop for b in binding-info
-                     for nm = (var-name (first b))
-                     when (and (not (third b)) (second b)
-                               (member nm dbl-decl-names :test #'string=)
-                               (not (member nm captured :test #'string=))
-                               (double-float-typed-p (second b)))
-                       collect nm)))
+             (append
+              (when dbl-decl-names
+                (loop for b in binding-info
+                      for nm = (var-name (first b))
+                      when (and (not (third b)) (second b)
+                                (member nm dbl-decl-names :test #'string=)
+                                (not (member nm captured :test #'string=))
+                                (double-float-typed-p (second b)))
+                        collect nm))
+              (mapcar #'var-name (second inferred-floats))))
            (single-rep-names
-             (when sgl-decl-names
-               (loop for b in binding-info
-                     for nm = (var-name (first b))
-                     when (and (not (third b)) (second b)
-                               (member nm sgl-decl-names :test #'string=)
-                               (not (member nm captured :test #'string=))
-                               (single-float-typed-p (second b)))
-                       collect nm)))
+             (append
+              (when sgl-decl-names
+                (loop for b in binding-info
+                      for nm = (var-name (first b))
+                      when (and (not (third b)) (second b)
+                                (member nm sgl-decl-names :test #'string=)
+                                (not (member nm captured :test #'string=))
+                                (single-float-typed-p (second b)))
+                        collect nm))
+              (mapcar #'var-name (first inferred-floats))))
            ;; Decimal-rep candidates: same rule as the float slots: declared
            ;; decimal, plain lexical, not captured, decimal-typed init.
            (dec-decl-names (extract-decimal-locals body))
@@ -2804,7 +3904,6 @@
                   (*double-float-locals* *double-float-locals*)
                   (*single-float-locals* *single-float-locals*)
                   (*decimal-locals* *decimal-locals*)
-                  (inferred-sgl '())
                   ;; Extended/shadowed incrementally as bindings are processed
                   ;; so each init sees exactly the earlier siblings' slots.
                   (*cstate* *cstate*))
@@ -2864,10 +3963,6 @@
                                                  (t (%let*-float-rep b binding-info real-body
                                                                      captured mutated needs-boxing
                                                                      body dbl-decl-names sgl-decl-names))))
-                                      (inferred-p (and (eq nfk :single)
-                                                       (not (member (var-name var) sgl-decl-names
-                                                                    :test #'string=))
-                                                       (push var inferred-sgl)))
                                       (dec-rep-p (member (var-name var) decimal-rep-names
                                                          :test #'string=))
                                       (chr-rep-p (member (var-name var) char-rep-names
@@ -2917,9 +4012,7 @@
                                  (step-let*-type-locals (var-name var)
                                                         fx-decl-names chr-decl-names
                                                         dbl-decl-names
-                                                        (if inferred-p
-                                                            (cons (var-name var) sgl-decl-names)
-                                                            sgl-decl-names)
+                                                        sgl-decl-names
                                                         dec-decl-names)
                                  ;; Native-representation slots for subsequent
                                  ;; inits/body, recorded by slot key. A non-native
@@ -3005,12 +4098,10 @@
                      ;; introduce a try/finally (see parallel-let branch).
                      (body-instrs (compile-let-body-instrs
                                     real-body
-                                    (if inferred-sgl
-                                        (cons `(declare (single-float ,@inferred-sgl)) body)
-                                        body)
+body
                                     binding-info let-bound-names
                                     needs-boxing mutated special-syms declared-specials
-                                    boolean-tail)))
+                                    boolean-tail t)))
                 (%compile-let-star-specials
                  bind-segments bind-instrs body-instrs)))))))
         (values instrs (and raw-plan (%raw-array-failures raw-plan instrs)))))))
@@ -3078,31 +4169,40 @@
       (walk forms))
     (and (> total 0) (= total lane))))
 
-(defun %single-binding-names (binding-info body real-body mutated captured)
-  "The variables of a parallel LET to declare SINGLE-FLOAT: undeclared,
-   unassigned, not captured, their init SINGLE-FLOAT-TYPED-P, and read in float
-   arithmetic in the body."
-  (loop for b in binding-info
-        for v = (first b)
-        for nm = (var-name v)
-        when (and (not (third b))
-                  (consp (second b))
-                  (not (member nm mutated :test #'string=))
-                  (not (member nm captured :test #'string=))
-                  (not (%avt-var-declared-p v body))
-                  (= 1 (count nm binding-info
-                              :key (lambda (x) (var-name (first x))) :test #'string=))
-                  (single-float-typed-p (second b))
-                  (%native-float-use-p v real-body))
-          collect v))
+(defun %inferred-float-kind (v init binding-info body mutated captured use-forms)
+  "The float kind (:SINGLE / :DOUBLE / NIL) a binding of V to INIT is given
+   without a declaration: unassigned, not captured, bound once in this form,
+   INIT typed so, and read in float arithmetic in USE-FORMS."
+  (let ((nm (var-name v)))
+    (and init
+         (not (member nm mutated :test #'string=))
+         (not (member nm captured :test #'string=))
+         (not (%avt-var-declared-p v body))
+         (= 1 (count nm binding-info
+                     :key (lambda (x) (var-name (first x))) :test #'string=))
+         (let ((kind (cond ((single-float-typed-p init) :single)
+                           ((double-float-typed-p init) :double))))
+           (and kind (%native-float-use-p v use-forms) kind)))))
+
+(defun %float-binding-names (binding-info body real-body mutated captured)
+  "The variables of a parallel LET to declare SINGLE-FLOAT and DOUBLE-FLOAT, as
+   two values (see %INFERRED-FLOAT-KIND)."
+  (let ((sgl '()) (dbl '()))
+    (dolist (b binding-info)
+      (unless (third b)
+        (case (%inferred-float-kind (first b) (second b) binding-info body
+                                    mutated captured real-body)
+          (:single (push (first b) sgl))
+          (:double (push (first b) dbl)))))
+    (values (nreverse sgl) (nreverse dbl))))
 
 (defun %let*-float-rep (b binding-info real-body captured mutated needs-boxing
                         body dbl-decl-names sgl-decl-names)
   "The native float slot kind (:DOUBLE / :SINGLE / NIL) of the LET* binding B,
    decided with the init in its own scope, after the earlier siblings. A binding
    declared DOUBLE-FLOAT or SINGLE-FLOAT qualifies when its init is typed so; an
-   undeclared, unassigned one whose init is SINGLE-FLOAT-TYPED-P qualifies when a
-   later init or the body reads it in float arithmetic."
+   undeclared one qualifies as %INFERRED-FLOAT-KIND says, a later init or the
+   body being where it must be read in float arithmetic."
   (let* ((var (first b)) (init (second b)) (nm (var-name var)))
     (when (and (not (third b))
                init
@@ -3112,16 +4212,11 @@
              (and (double-float-typed-p init) :double))
             ((member nm sgl-decl-names :test #'string=)
              (and (single-float-typed-p init) :single))
-            ((and (not (member nm mutated :test #'string=))
-                  (not (%avt-var-declared-p var body))
-                  (= 1 (count nm binding-info
-                              :key (lambda (x) (var-name (first x))) :test #'string=))
-                  (consp init)
-                  (single-float-typed-p init)
-                  (%native-float-use-p var (append (mapcar #'second
-                                                           (cdr (member b binding-info :test #'eq)))
-                                                   real-body)))
-             :single)))))
+            (t
+             (%inferred-float-kind var init binding-info body mutated captured
+                                   (append (mapcar #'second
+                                                   (cdr (member b binding-info :test #'eq)))
+                                           real-body)))))))
 
 (defun rekey-by-binding (name-alist binding-info)
   "Re-key a (NAME . INFO) alist to (SLOT-KEY . INFO) using BINDING-INFO. Entries
@@ -3152,23 +4247,20 @@
   "Wrap body with try/finally for special variable cleanup if needed."
   (if (null special-syms)
       (eliminate-single-ref-locals `(,@init-instrs ,@bind-instrs ,@body-instrs))
-      (let ((result-key (gen-local "RESULT")))
+      (let ((result-key (gen-local "RESULT"))
+            (depth-key (gen-local "BDEPTH")))
         `(,@init-instrs
+          (:declare-local ,depth-key "Int32")
+          (:call "DynamicBindings.BindDepth")
+          (:stloc ,depth-key)
           ,@bind-instrs
           (:declare-local ,result-key "LispObject")
           (:begin-exception-block)
           ,@body-instrs
           (:stloc ,result-key)
           (:begin-finally-block)
-          ;; Pop in REVERSE of push order (LIFO). All call sites pass SPECIAL-SYMS
-          ;; in push (source) order, so the naive in-order loop emitted FIFO Pops
-          ;; for a multi-special frame. The current by-symbol DynamicBindings.Pop
-          ;; tolerates any order, so this is behavior-neutral today: but it lets a
-          ;; shallow-binding Pop take its O(1) top-of-stack fast path instead of the
-          ;; out-of-order search fallback.
-          ,@(loop for sym in (reverse special-syms)
-                  append `(,@(compile-sym-lookup sym)
-                           (:castclass "Symbol") (:call "DynamicBindings.Pop")))
+          (:ldloc ,depth-key)
+          (:call "DynamicBindings.UnbindTo")
           (:end-exception-block)
           (:ldloc ,result-key)))))
 

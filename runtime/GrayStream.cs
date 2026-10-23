@@ -89,7 +89,7 @@ public class GrayStreamTextWriter : TextWriter
 
     public override void Write(char value)
     {
-        GetWriteCharFn().Invoke(new LispObject[] { _stream, LispChar.Make(value) });
+        Runtime.CallForPrimary(GetWriteCharFn(), _stream, LispChar.Make(value));
     }
 
     public override void Write(string? value)
@@ -98,7 +98,7 @@ public class GrayStreamTextWriter : TextWriter
         var fn = GetWriteStringFn();
         if (fn != null)
         {
-            fn.Invoke(new LispObject[] { _stream, new LispString(value) });
+            Runtime.CallForPrimary(fn, _stream, new LispString(value));
         }
         else
         {
@@ -143,7 +143,7 @@ public class GrayStreamTextReader : TextReader
 
     public override int Read()
     {
-        var result = GetReadCharFn().Invoke(new LispObject[] { _stream });
+        var result = Runtime.CallForPrimary(GetReadCharFn(), _stream);
         if (result is LispChar lc) return lc.Value;
         if (result is Symbol s && s.Name == "EOF") return -1;
         return -1;
@@ -157,7 +157,7 @@ public class GrayStreamTextReader : TextReader
         }
         if (_peekCharFn != null)
         {
-            var result = _peekCharFn.Invoke(new LispObject[] { _stream });
+            var result = Runtime.CallForPrimary(_peekCharFn, _stream);
             if (result is LispChar lc) return lc.Value;
             return -1;
         }

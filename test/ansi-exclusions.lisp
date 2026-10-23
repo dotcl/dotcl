@@ -31,46 +31,53 @@
   "Arithmetic LOOP leaves the stepped value visible in FINALLY (SBCL/ABCL behavior)." t)
 (in-package :cl-user)
 
-;;; PRINT.DOUBLE-FLOAT.4 draws 10000 integers from [-10^7, 10^7-1] and requires
-;;; PRIN1 of each as a double to read back as "N.0". The low endpoint is out of
-;;; spec: CLHS 22.1.3.1.3 stops fixed-point notation at |x| = 10^7, so -10^7
-;;; must print as -1.0d7 -- which dotcl, SBCL and ABCL all do. At 0.05% of runs
-;;; it read as an unreproducible CI red.
+;;; PRINT.{SHORT,SINGLE,DOUBLE,LONG}-FLOAT.{2,4} each draw 10000 integers from
+;;; [-10^7, 10^7-1] and require PRIN1 of each as a float to read back as
+;;; "N.0<d>". The low endpoint is out of spec: CLHS 22.1.3.1.3 stops
+;;; fixed-point notation at |x| = 10^7, so -10^7 must print as -1.0xs --
+;;; which dotcl, SBCL and ABCL all do. At 0.05% per test it read as an
+;;; unreproducible CI red.
 ;;;
-;;; Narrow the range by that one value instead of skipping the test: the other
-;;; 19999999 draws are real printer coverage. The guard makes the override
-;;; self-invalidating -- if the upstream body stops matching what was patched
-;;; here, it is left alone and reported rather than silently shadowed.
+;;; Narrow the range by that one value instead of skipping the tests: the
+;;; other 19999999 draws are real printer coverage. The rewrite edits the
+;;; upstream body itself rather than restating it, and the guard makes the
+;;; override self-invalidating -- if the upstream body stops carrying the
+;;; draw that was narrowed, it is left alone and reported rather than
+;;; silently shadowed.
 (in-package :cl-test)
-(let* ((entry (cadr (gethash 'print.double-float.4 regression-test::*entries-table*)))
-       (form (and entry (regression-test::form entry))))
-  (if (and form (search "20000000" (let ((*print-readably* nil)) (princ-to-string form))))
-      (deftest print.double-float.4
-        (let ((chars *possible-double-float-exponent-markers*))
-          (loop for type in '(short-float double-float long-float)
-                nconc
-                (and (not (subtypep 'double-float type))
-                     (with-standard-io-syntax
-                      (let ((*print-readably* nil)
-                            (*read-default-float-format* type))
-                        ;; Upstream: (- (random 20000000) 10000000), whose lower
-                        ;; endpoint -10^7 is the one value CLHS prints in
-                        ;; exponential form.
-                        (loop for i = (- (random 19999999) 9999999)
-                              for f = (float i 0.0d0)
-                              for s1 = (with-output-to-string (s) (prin1 f s))
-                              for len1 = (length s1)
-                              for s2 = (format nil "~A.0" i)
-                              repeat 10000
-                              unless (or (/= i (rational f))
-                                         (and (> len1 4)
-                                              (string-equal s1 s2 :start1 0 :end1 (- len1 2))
-                                              (eql (char s1 (- len1 1)) #\0)
-                                              (member (char s1 (- len1 2)) chars)))
-                              collect (list type i f s1 s2)))))))
-        nil)
-      (format t "~&;; note: PRINT.DOUBLE-FLOAT.4 no longer matches the patched form; ~
-                 leaving the upstream test as is~%")))
+
+(defun narrow-float-print-draw (form)
+  "Copy FORM with (- (random 20000000) 10000000) -- whose lower endpoint
+-10^7 is the one magnitude CLHS prints in exponential form -- replaced by
+the narrowed draw (- (random 19999999) 9999999). Second value is true
+when the draw was found."
+  (let ((found nil))
+    (labels ((rew (x)
+               (cond ((equal x '(- (random 20000000) 10000000))
+                      (setf found t)
+                      '(- (random 19999999) 9999999))
+                     ((atom x) x)
+                     (t (cons (rew (car x)) (rew (cdr x)))))))
+      (values (rew form) found))))
+
+(defun narrow-float-print-test (name)
+  (let* ((entry (cadr (gethash name regression-test::*entries-table*)))
+         (form (and entry (regression-test::form entry))))
+    (multiple-value-bind (new-form found) (and form (narrow-float-print-draw form))
+      (if found
+          (regression-test::add-entry
+           (regression-test::make-entry :pend t :name name
+                                        :props (regression-test::props entry)
+                                        :form new-form
+                                        :vals (regression-test::vals entry)))
+          (format t "~&;; note: ~A no longer matches the narrowed draw; ~
+                     leaving the upstream test as is~%" name)))))
+
+(dolist (name '(print.short-float.2 print.short-float.4
+                print.single-float.2 print.single-float.4
+                print.double-float.2 print.double-float.4
+                print.long-float.2 print.long-float.4))
+  (narrow-float-print-test name))
 (in-package :cl-user)
 
 ;;; COMPILE-FILE.2 checks that a file signalling only a STYLE-WARNING returns

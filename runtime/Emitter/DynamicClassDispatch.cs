@@ -47,7 +47,7 @@ public static partial class DynamicClassBuilder
         IEnumerable<(string Key, LispObject Body)> handlers)
     {
         foreach (var (key, body) in handlers)
-            _methodHandlers[(typeFullName, key)] = body;
+            _methodHandlers[(typeFullName, key)] = Package.BindToCurrentUnit(body);
     }
 
     /// <summary>

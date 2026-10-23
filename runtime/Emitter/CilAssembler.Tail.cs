@@ -35,6 +35,9 @@ public partial class CilAssembler
     /// call, or (-1, false) for anything else.</summary>
     private static (int arity, bool mode) TailInvokeShape(LispObject instr)
     {
+        // A call through a call site cache takes the stack INVOKE1[M] does.
+        if (instr is Cons g && g.Car is Symbol gs && gs.Name == "GF-IC1")
+            return (1, g.Cdr is Cons g1 && g1.Cdr is Cons g2 && g2.Cdr is Cons);
         if (instr is not Cons c || c.Car is not Symbol op || op.Name != "CALLVIRT"
             || c.Cdr is not Cons a || a.Car is not LispString s) return (-1, false);
         var name = s.Value;
@@ -157,10 +160,10 @@ public partial class CilAssembler
         for (int i = 0; i < cells.Count; i++)
         {
             if (depth[i] != 0 || cells[i].Car is not Cons ci || ci.Car is not Symbol cs
-                || (cs.Name != "CALL-TYPED-SELF" && cs.Name != "CALL-TYPED-ENTRY")) continue;
+                || (cs.Name != "CALL-TYPED-SELF" && cs.Name != "CALL-TYPED-ENTRY" && cs.Name != "CALL-TYPED-SYM")) continue;
             // A call to another function's typed entry is a tail call only when
             // its raw result is of the kind this body returns.
-            if (cs.Name == "CALL-TYPED-ENTRY")
+            if (cs.Name != "CALL-TYPED-SELF")
             {
                 var sig = GetString(Cadr(ci));
                 if (TypedEntrySig.KindType(sig[^1]) != _typedSelfMethod!.ReturnType) continue;
@@ -292,9 +295,9 @@ public partial class CilAssembler
     private string? _typedTailSelf;
 
     /// <summary>Emit the tail call for a (:call-typed-entry SIG) site
-    /// FindTypedTailSites chose. The callee and its raw arguments are on the
-    /// stack.</summary>
-    private void EmitTypedTailInvoke(string sig)
+    /// FindTypedTailSites chose. The callee (its symbol when VIASYMBOL) and its
+    /// raw arguments are on the stack.</summary>
+    private void EmitTypedTailInvoke(string sig, bool viaSymbol = false)
     {
         var il = _il;
         int n = sig.Length - 2;
@@ -303,18 +306,17 @@ public partial class CilAssembler
         var args = new LocalBuilder[n];
         for (int k = 0; k < n; k++) args[k] = il.DeclareLocal(TypedEntrySig.KindType(sig[k]));
         for (int k = n - 1; k >= 0; k--) il.EmitLoc(OpCodes.Stloc, args[k]);
+        if (viaSymbol) il.Emit(OpCodes.Call, typeof(CilAssembler).GetMethod("GetFunctionBySymbol")!);
         il.EmitLoc(OpCodes.Stloc, fnLocal);
         void LoadArgs() { for (int k = 0; k < n; k++) il.EmitLoc(OpCodes.Ldloc, args[k]); }
 
-        var argTypes = new Type[n];
-        for (int k = 0; k < n; k++) argTypes[k] = TypedEntrySig.KindType(sig[k]);
         // kind = TailPrepTypedN(fn, code, self, a0, ...)
         il.EmitLoc(OpCodes.Ldloc, fnLocal);
         il.Emit(OpCodes.Ldc_I4, code);
         if (_typedTailSelf == null) il.Emit(OpCodes.Ldnull);
         else il.Emit(OpCodes.Ldstr, Track(_typedTailSelf));
         LoadArgs();
-        il.Emit(OpCodes.Call, typeof(LispFunction).GetMethod("TailPrepTyped" + n)!.MakeGenericMethod(argTypes));
+        il.Emit(OpCodes.Call, LispFunction.TypedTailPrepMethod(sig));
         var invoke = il.DefineLabel();
         il.Emit(OpCodes.Brfalse, invoke);   // TailKindInvoke = 0
 

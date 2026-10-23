@@ -1,0 +1,6 @@
+(defpackage :rx (:use :cl) (:export #:version #:farewell))
+(defpackage :rx/extra (:use :cl))
+(in-package :rx)
+(defun version () "3.0.0")
+(defun farewell (who) (list :bye who))
+(rcommon:note "rx 3.0.0")

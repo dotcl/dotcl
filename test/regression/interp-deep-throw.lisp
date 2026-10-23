@@ -38,9 +38,11 @@
 ;;; arrive as a catchable STORAGE-CONDITION rather than killing the process.
 
 (deftest interp-deep-throw.storage-condition-catchable
-  (%idt :interpret
-        '(progn
-          (defun %idt-runaway (n) (if (zerop n) 0 (+ 1 (%idt-runaway (- n 1)))))
-          (handler-case (%idt-runaway 10000000)
-            (storage-condition () :caught-storage-condition))))
+  (call-on-small-stack
+   (lambda ()
+     (%idt :interpret
+           '(progn
+             (defun %idt-runaway (n) (if (zerop n) 0 (+ 1 (%idt-runaway (- n 1)))))
+             (handler-case (%idt-runaway 10000000)
+               (storage-condition () :caught-storage-condition))))))
   :caught-storage-condition)

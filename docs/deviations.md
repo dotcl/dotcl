@@ -58,13 +58,14 @@ above:
   because they ask the question the standard leaves open above. The suite tags
   them as a spec problem itself; disabling the narrow note rather than that tag
   keeps unrelated tests running.
-- **One printer test has its random range narrowed by a single value.** It
-  draws integers from a range whose low endpoint is exactly the magnitude at
-  which CLHS 22.1.3.1.3 stops using fixed-point notation, so at that one draw
-  the test's expectation is out of spec -- dotcl, SBCL and ABCL all print it in
-  exponential notation. The remaining draws still run, and the override checks
-  that the upstream test still looks the way it did when it was written, so a
-  change upstream is reported rather than silently shadowed.
+- **Eight printer tests get their random range narrowed by a single value.**
+  `PRINT.{SHORT,SINGLE,DOUBLE,LONG}-FLOAT.{2,4}` each draw integers from a
+  range whose low endpoint is exactly the magnitude at which CLHS
+  22.1.3.1.3 stops using fixed-point notation, so at that one draw the
+  tests' expectation is out of spec -- dotcl, SBCL and ABCL all print it in
+  exponential notation. The remaining draws still run, and the override
+  checks that the upstream test still carries the draw it was written with,
+  so a change upstream is reported rather than silently shadowed.
 - **One `COMPILE-FILE` test is run without the harness muffling its
   style-warnings.** It checks that a style-warning makes `COMPILE-FILE` return
   a true warnings-p, while the harness muffles every style-warning around a

@@ -7,8 +7,12 @@ per job:
 - `cl-bench-runner/`: runs the cl-bench suites on dotcl and SBCL and merges the
   times into `bench-state.json` (`make bench`, `make bench-state`,
   `make bench-survey`).
+- `coalton/`: small Coalton programs and Coalton's ray tracer, timed on dotcl
+  and SBCL with the same Coalton checkout (`make bench-coalton`).
 - `csharp-parity/`: small kernels written in fully declared Lisp and in C#,
   timed on the same runtime (`make bench-parity`).
+- `ledger/`: re-measures every dotcl-versus-SBCL ruler (cl-bench, Coalton,
+  parity, ironclad, imago) in one run and writes one table of current values.
 - `il-parity/`: the same data structures in C# and in Lisp, compared by the IL
   instructions each compiler emits (`make il-parity`).
 - `gate/`: the per-machine baselines and the scripts that judge a run against
@@ -24,6 +28,11 @@ per job:
   [docs/library-status.md](../docs/library-status.md).
 - `docker/`: a base image with dotcl and SBCL side by side, for measurements
   that need a fixed Linux environment.
+- `parallel-compile/`: times cold ASDF builds per system and per file on dotcl
+  and SBCL, bounds what building files in parallel could gain, and probes what
+  breaks when several threads compile at once.
+- `gc-latency/`: compares .NET GC latency settings on an allocation-heavy Lisp
+  workload. See [the report](../docs/gc-latency-report.md) for how to run it.
 - `probes/`: single-question scripts (allocation per call, fasl load cost,
   generic function dispatch) and a profile helper. Each file's header says how
   to run it and what its rows mean.

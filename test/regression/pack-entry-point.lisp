@@ -70,7 +70,8 @@
 ;;; The metadata read carries the entry point.
 (deftest-emitting-only pack-entry-point.read-from-the-asd
   (progn (pep-setup)
-         (dotnet:invoke (dotnet:static "DotCL.DotclBuild" "ReadSystemMeta" "pep-exe" nil)
+         (dotnet:invoke (with-asdf-immutable-systems-restored
+                          (dotnet:static "DotCL.DotclBuild" "ReadSystemMeta" "pep-exe" nil))
                         "EntryPoint"))
   "pep-exe:main")
 

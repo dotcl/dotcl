@@ -5,6 +5,9 @@ public static partial class Runtime
     // --- Format ---
 
     public static LispObject Format(LispObject dest, LispObject[] args)
+        => MultipleValues.Alone(FormatTo(dest, args));
+
+    private static LispObject FormatTo(LispObject dest, LispObject[] args)
     {
         if (args.Length == 0)
             throw new LispErrorException(new LispError("FORMAT: missing format string"));
@@ -1299,7 +1302,7 @@ public static partial class Runtime
         try
         {
             var fn = GrayStreamLookup.GrayOrCl("STREAM-LINE-COLUMN");
-            if (fn != null && fn.Invoke(new LispObject[] { gi }) is Fixnum col && col.Value >= 0)
+            if (fn != null && CallForPrimary(fn, gi) is Fixnum col && col.Value >= 0)
                 return (int)col.Value;
         }
         catch (LispErrorException)

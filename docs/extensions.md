@@ -36,6 +36,25 @@ rather than for code you ship.
 - `quicklisp`: the Quicklisp client. `(require "quicklisp")` loads it without
   touching the network; the first `ql:quickload` installs a dist.
   [Using libraries](libraries.md#common-lisp-libraries)
+- `dotcl-lock` (experimental, the lock format may change): loads two versions
+  of one system in the same image. A lock file names the `.asd`
+  of each system and puts the conflicting version in a package unit:
+  `(dotcl-lock:use-lock "dotcl-systems.lock")`, then `asdf:load-system`.
+  `resolve.lisp` beside it writes the lock from directories holding several
+  versions of a system, choosing versions as Cargo does (also runs on SBCL).
+- `asdf-version-range` (experimental): a `:version` dependency may name a
+  range, `(:version "foo" (:^ "1.2"))` or `(:version "foo" (:>= "1.2" :< "2"))`,
+  and ASDF checks it. Other ASDFs accept the form and ignore the range. Also
+  runs on SBCL.
+- `asdf-parallel` (experimental): builds a system with several files compiling
+  at once, on threads, following ASDF's dependencies:
+  `(asdf-parallel:load-system "ironclad" :jobs 4)`. Loads stay in the calling
+  thread. The same file runs on SBCL, with forked processes.
+- `asdf-extra-deps` (experimental): adds dependencies a system uses but does
+  not declare, from a supplement file guarded by the hash of its `.asd`,
+  without editing it: `(asdf-extra-deps:load-supplements "file.sexp")`.
+  `audit.lisp` beside it finds them by building the system in two orders.
+  Also runs on SBCL.
 
 ### Common Lisp compatibility
 
@@ -69,6 +88,11 @@ What other implementations provide and portable libraries build on.
 - `dotcl-code-info`: what an editor asks a live image about the code at a point:
   `dotcl-code-info:completions`, `documentation-url` and `describe-at`, each given
   the text and an offset into it.
+- `dotcl-lsp`: a Language Server Protocol server in the running process, on
+  standard input and output (`dotcl-lsp:serve-stdio`) or TCP
+  (`dotcl-lsp:start-server`). An early stage: documents, diagnostics and hover.
+- `dotcl-lsp-coalton`: Coalton type errors and types for `dotcl-lsp`, checked
+  from the editor's text without loading it. Needs Coalton loaded.
 
 ### .NET
 
@@ -103,6 +127,12 @@ resolve their NuGet package on first use.
 - `dotcl-jitdisasm`: makes `dotcl:jit-disassemble` print the native code the JIT
   produced for a function. Not part of a packaged dotcl: build it from a source
   tree with `make contrib-dotcl-jitdisasm`.
+- `dotcl-dap`: a Debug Adapter Protocol server in the running process
+  (`dotcl-dap:start-server`). A function breakpoint, or a condition that would
+  enter the debugger, stops only the thread it happens on; the REPL and other
+  threads keep running. Function breakpoints, stack, variables, evaluate,
+  continue, and resuming through a restart. Line breakpoints and stepping are
+  not there yet.
 
 ### Lower layers
 
@@ -111,6 +141,8 @@ Not meant to be used directly.
 - `dotcl-bsd-sockets`: TCP and UDP over System.Net.Sockets in the shape of
   SBCL's sb-bsd-sockets. The layer under the dotcl backends of socket
   libraries such as usocket; use those.
+- `dotcl-jsonrpc`: JSON and the `Content-Length` framing of DAP and LSP
+  messages, under `dotcl-dap` and `dotcl-lsp`.
 
 ## Reader syntax
 
@@ -214,6 +246,7 @@ Threads:
 - `dotcl:make-thread`, `dotcl:current-thread`, `dotcl:all-threads`, `dotcl:thread-join`, `dotcl:thread-yield`: create and join threads (they are .NET threads).
 - `dotcl:threadp`, `dotcl:thread-name`, `dotcl:thread-alive-p`, `dotcl:thread-object`: about a thread.
 - `dotcl:interrupt-thread`, `dotcl:destroy-thread`: run a function in another thread, or stop it.
+- `dotcl:without-interrupts`, `dotcl:with-interrupts`, `dotcl:allow-with-interrupts`, `dotcl:with-local-interrupts`, `dotcl:*interrupts-enabled*`, `dotcl:*allow-with-interrupts*`: hold back `interrupt-thread`, `destroy-thread` and Ctrl-C until the body is left (normally or by a non-local exit), as in SBCL. A sleep or wait inside the body is not cut short, except that `destroy-thread` still ends a thread blocked in one. `with-local-interrupts` lets them in again inside the body; `with-interrupts` does only under `allow-with-interrupts`.
 - `dotcl:make-lock`, `dotcl:acquire-lock`, `dotcl:release-lock`, `dotcl:lockp`, `dotcl:make-recursive-lock`, `dotcl:recursive-lock-p`: locks.
 - `dotcl:make-condition-variable`, `dotcl:condition-wait`, `dotcl:condition-notify`, `dotcl:condition-broadcast`, `dotcl:condition-variable-p`: condition variables.
 - `dotcl:make-semaphore`, `dotcl:signal-semaphore`, `dotcl:wait-on-semaphore`, `dotcl:semaphore-p`: semaphores.
@@ -246,6 +279,7 @@ Introspection and debugging:
 
 - `dotcl:function-lambda-list`: the lambda list of a function or macro. [Using libraries](libraries.md#what-ships-with-dotcl)
 - `dotcl:function-source-location`: the file and line where a name was last defined.
+- `dotcl:watch-fdefinition`: call a function after each change to a symbol's global function definition (a debugger re-wrapping a redefined function).
 - `dotcl:definition-sources`: every recorded definition of a name (function, macro, compiler macro, generic function and each method, variable, class, type, method combination, ...; a package's `defpackage` given its name), each with its kind, file and line.
 - `dotcl:definition-source`: the file and line where a function, macro function, generic function, method, class or package object was defined.
 - `dotcl:record-definition-sources`: attribute the definitions in a form to a file and line, for a tool that compiles one form at a time.

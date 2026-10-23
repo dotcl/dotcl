@@ -158,6 +158,291 @@ public partial class LispFunction
         try { return InvokeTyped4<A0, A1, A2, A3, R>(fn, a0, a1, a2, a3, code); } finally { s_top = kf.Prev; }
     }
 
+    // ---- Framed typed entries ----
+    //
+    // A typed function that records a frame also has an entry that links that
+    // frame itself (no try/finally, as a DEFUN body, Function.SelfFramed.cs)
+    // around a call to the typed body: R Entry(LispFunction self, T1..Tn).
+    // CallTypedN enters it by calli when the function's typed code is the
+    // caller's, and otherwise takes InvokeTypedN.
+
+    internal nint _typedEntry;   // read only while _nativeArity is the typed code
+
+    public void SetTypedFramedEntry(System.IntPtr entry, int sigCode)
+    {
+        if (_nativeArity == sigCode) _typedEntry = entry;
+    }
+
+    // What the boxed shell checks the first two arguments against, a
+    // TypedArgSpec byte each; 0 when not recorded (an older fasl). A ushort
+    // fits the object's padding; a wider field grows every function.
+    internal ushort _typedArgSpec;
+
+    public void SetTypedArgRanges(long lo0, long hi0, long lo1, long hi1,
+                                  long lo2, long hi2, long lo3, long hi3)
+        => _typedArgSpec = (ushort)(TypedArgSpec(lo0, hi0) | TypedArgSpec(lo1, hi1) << 8);
+
+    // 1: any value; 2 + W: (UNSIGNED-BYTE W); 66 + W: (SIGNED-BYTE W);
+    // 0 for any other range, which the fast paths do not take.
+    static int TypedArgSpec(long lo, long hi)
+    {
+        if (lo == long.MinValue && hi == long.MaxValue) return 1;
+        for (int w = 1; w < 64; w++)
+        {
+            if (lo == 0 && hi == (1L << w) - 1) return 2 + w;
+            if (lo == -(1L << (w - 1)) && hi == (1L << (w - 1)) - 1) return 66 + w;
+        }
+        return 0;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static bool TypedArgFits(int spec, long v)
+    {
+        if (spec == 1) return true;
+        if (spec <= 65) return spec >= 3 && (ulong)v >> (spec - 2) == 0;
+        long t = v >> (spec - 67);
+        return t == 0 || t == -1;
+    }
+
+    /// <summary>For tests: "framed", "typed" (InvokeTypedN only) or "none".</summary>
+    public static string TypedEntryState(LispObject fn) =>
+        fn is LispFunction f ? (f.TypedEntryCode != 0 && f._typedEntry != 0 ? "framed" : f.TypedEntryCode != 0 ? "typed" : "none") : "none";
+
+    const int TypedL2L = 0x120, TypedL2D = 0x130, TypedD2L = 0x121, TypedD2D = 0x131;
+
+    // The common case of TryTypedOnElement on its own: an integer -> integer
+    // entry and a simple 1-D vector stored as long[].
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe bool TryTypedLongOnLongElement(LispFunction fn, LispObject a, long i, out long r)
+    {
+        if (fn._nativeArity == TypedL2L
+            && a is LispVector v && v._numData is long[] l
+            && v._dimensions == null && v._displacedTo == null
+            && (ulong)i < (ulong)l.Length)
+        {
+            long e = l[(int)i];
+            var entry = fn._typedEntry;
+            if (entry != 0 && TypedArgFits(fn._typedArgSpec & 0xFF, e))
+            {
+                r = ((delegate*<LispFunction, long, long>)entry)(fn, e);
+                return true;
+            }
+        }
+        r = 0;
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe bool TryTypedLongOnLong(LispFunction fn, long e, out long r)
+    {
+        var entry = fn._typedEntry;
+        if (fn._nativeArity == TypedL2L && entry != 0 && TypedArgFits(fn._typedArgSpec & 0xFF, e))
+        {
+            r = ((delegate*<LispFunction, long, long>)entry)(fn, e);
+            return true;
+        }
+        r = 0;
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool TryTypedOnLongElement(LispFunction fn, LispObject a, long i, out LispObject r)
+    {
+        if (TryTypedLongOnLongElement(fn, a, i, out long x))
+        {
+            r = Fixnum.Make(x);
+            return true;
+        }
+        r = null!;
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool TryTypedOnElement(LispFunction fn, LispVector v, int x, out LispObject r)
+    {
+        int spec = fn._typedArgSpec & 0xFF;
+        int c = fn._nativeArity;
+        if (spec != 0 && fn._typedEntry != 0)
+        {
+            var nd = v._numData;
+            if (c == TypedL2L || c == TypedL2D)
+            {
+                long e;
+                if (nd != null)
+                {
+                    if (!v.IsRawNumKind || v.IsFloatNumKind) goto no;
+                    e = v.NumGet(x);
+                }
+                else if (v._elements[x] is Fixnum f) e = f.Value;
+                else goto no;
+                if (!TypedArgFits(spec, e)) goto no;
+                r = c == TypedL2L
+                    ? Fixnum.Make(CallTyped1<long, long>(fn, e, c))
+                    : new DoubleFloat(CallTyped1<long, double>(fn, e, c));
+                return true;
+            }
+            if (c == TypedD2L || c == TypedD2D)
+            {
+                double e;
+                if (nd != null)
+                {
+                    if (v._numKind != 6) goto no;
+                    e = ((double[])nd)[x];
+                }
+                else if (v._elements[x] is DoubleFloat d) e = d.Value;
+                else goto no;
+                r = c == TypedD2L
+                    ? Fixnum.Make(CallTyped1<double, long>(fn, e, c))
+                    : new DoubleFloat(CallTyped1<double, double>(fn, e, c));
+                return true;
+            }
+        }
+    no:
+        r = null!;
+        return false;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe R CallTyped1<A0, R>(LispFunction fn, A0 a0, int code)
+        where A0 : unmanaged where R : unmanaged
+        => fn._nativeArity == code && fn._typedEntry != 0
+            ? ((delegate*<LispFunction, A0, R>)fn._typedEntry)(fn, a0)
+            : InvokeTyped1<A0, R>(fn, a0, code);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe R CallTyped2<A0, A1, R>(LispFunction fn, A0 a0, A1 a1, int code)
+        where A0 : unmanaged where A1 : unmanaged where R : unmanaged
+        => fn._nativeArity == code && fn._typedEntry != 0
+            ? ((delegate*<LispFunction, A0, A1, R>)fn._typedEntry)(fn, a0, a1)
+            : InvokeTyped2<A0, A1, R>(fn, a0, a1, code);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe R CallTyped3<A0, A1, A2, R>(LispFunction fn, A0 a0, A1 a1, A2 a2, int code)
+        where A0 : unmanaged where A1 : unmanaged where A2 : unmanaged where R : unmanaged
+        => fn._nativeArity == code && fn._typedEntry != 0
+            ? ((delegate*<LispFunction, A0, A1, A2, R>)fn._typedEntry)(fn, a0, a1, a2)
+            : InvokeTyped3<A0, A1, A2, R>(fn, a0, a1, a2, code);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe R CallTyped4<A0, A1, A2, A3, R>(LispFunction fn, A0 a0, A1 a1, A2 a2, A3 a3, int code)
+        where A0 : unmanaged where A1 : unmanaged where A2 : unmanaged where A3 : unmanaged where R : unmanaged
+        => fn._nativeArity == code && fn._typedEntry != 0
+            ? ((delegate*<LispFunction, A0, A1, A2, A3, R>)fn._typedEntry)(fn, a0, a1, a2, a3)
+            : InvokeTyped4<A0, A1, A2, A3, R>(fn, a0, a1, a2, a3, code);
+
+    // Calls through the typed entry the symbol keeps for its function. The code
+    // is read again after the entry and the function: a redefinition clears it
+    // first, so a second match means the entry read is one of signature CODE.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe R CallTypedSym1<A0, R>(Symbol s, A0 a0, int code)
+        where A0 : unmanaged where R : unmanaged
+    {
+        if (s._typedCode == code)
+        {
+            var e = System.Threading.Volatile.Read(ref s._typedEntry);
+            var f = s.FunctionRaw;
+            if (s._typedCode == code)
+                return ((delegate*<LispFunction, A0, R>)e)(Unsafe.As<LispFunction>(f!), a0);
+        }
+        return CallTyped1<A0, R>(Emitter.CilAssembler.GetFunctionBySymbol(s), a0, code);
+    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe R CallTypedSym2<A0, A1, R>(Symbol s, A0 a0, A1 a1, int code)
+        where A0 : unmanaged where A1 : unmanaged where R : unmanaged
+    {
+        if (s._typedCode == code)
+        {
+            var e = System.Threading.Volatile.Read(ref s._typedEntry);
+            var f = s.FunctionRaw;
+            if (s._typedCode == code)
+                return ((delegate*<LispFunction, A0, A1, R>)e)(Unsafe.As<LispFunction>(f!), a0, a1);
+        }
+        return CallTyped2<A0, A1, R>(Emitter.CilAssembler.GetFunctionBySymbol(s), a0, a1, code);
+    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe R CallTypedSym3<A0, A1, A2, R>(Symbol s, A0 a0, A1 a1, A2 a2, int code)
+        where A0 : unmanaged where A1 : unmanaged where A2 : unmanaged where R : unmanaged
+    {
+        if (s._typedCode == code)
+        {
+            var e = System.Threading.Volatile.Read(ref s._typedEntry);
+            var f = s.FunctionRaw;
+            if (s._typedCode == code)
+                return ((delegate*<LispFunction, A0, A1, A2, R>)e)(Unsafe.As<LispFunction>(f!), a0, a1, a2);
+        }
+        return CallTyped3<A0, A1, A2, R>(Emitter.CilAssembler.GetFunctionBySymbol(s), a0, a1, a2, code);
+    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe R CallTypedSym4<A0, A1, A2, A3, R>(Symbol s, A0 a0, A1 a1, A2 a2, A3 a3, int code)
+        where A0 : unmanaged where A1 : unmanaged where A2 : unmanaged where A3 : unmanaged where R : unmanaged
+    {
+        if (s._typedCode == code)
+        {
+            var e = System.Threading.Volatile.Read(ref s._typedEntry);
+            var f = s.FunctionRaw;
+            if (s._typedCode == code)
+                return ((delegate*<LispFunction, A0, A1, A2, A3, R>)e)(Unsafe.As<LispFunction>(f!), a0, a1, a2, a3);
+        }
+        return CallTyped4<A0, A1, A2, A3, R>(Emitter.CilAssembler.GetFunctionBySymbol(s), a0, a1, a2, a3, code);
+    }
+
+    /// <summary>CallTypedSymN (CallTypedSymWN for a wide one) for the typed-entry signature SIG.</summary>
+    public static System.Reflection.MethodInfo TypedSymCallMethod(string sig) => TypedGeneric("CallTypedSym", sig, true);
+
+    // Like InvokeTypedN, the frame is linked whatever CallTls.Borrow says.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void EnterTypedCore(ref Frame fr, ref TypedFrameArgs ta, string name, int argc, int code)
+    {
+        ta.Code = code;
+        fr.Name = name;
+        fr._argc = argc | Frame.TypedArgsBit;
+        fr._ext = (FrameExt*)Unsafe.AsPointer(ref ta);
+        LinkTop(ref fr);
+        if ((fr.Depth & 255) == 0 || ConditionSystem.PollGate != 0) EnterSlow(ref fr);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void EnterTyped1<A0>(ref Frame fr, ref TypedFrameArgs ta, string name, int code, A0 a0)
+        where A0 : unmanaged
+    {
+        ta.R0 = RawBits(a0);
+        EnterTypedCore(ref fr, ref ta, name, 1, code);
+    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void EnterTyped2<A0, A1>(ref Frame fr, ref TypedFrameArgs ta, string name, int code, A0 a0, A1 a1)
+        where A0 : unmanaged where A1 : unmanaged
+    {
+        ta.R0 = RawBits(a0); ta.R1 = RawBits(a1);
+        EnterTypedCore(ref fr, ref ta, name, 2, code);
+    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void EnterTyped3<A0, A1, A2>(ref Frame fr, ref TypedFrameArgs ta, string name, int code, A0 a0, A1 a1, A2 a2)
+        where A0 : unmanaged where A1 : unmanaged where A2 : unmanaged
+    {
+        ta.R0 = RawBits(a0); ta.R1 = RawBits(a1); ta.R2 = RawBits(a2);
+        EnterTypedCore(ref fr, ref ta, name, 3, code);
+    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void EnterTyped4<A0, A1, A2, A3>(ref Frame fr, ref TypedFrameArgs ta, string name, int code, A0 a0, A1 a1, A2 a2, A3 a3)
+        where A0 : unmanaged where A1 : unmanaged where A2 : unmanaged where A3 : unmanaged
+    {
+        ta.R0 = RawBits(a0); ta.R1 = RawBits(a1); ta.R2 = RawBits(a2); ta.R3 = RawBits(a3);
+        EnterTypedCore(ref fr, ref ta, name, 4, code);
+    }
+
+    /// <summary>CallTypedN for the typed-entry signature SIG.</summary>
+    public static System.Reflection.MethodInfo TypedCallMethod(string sig) => TypedGeneric("CallTyped", sig, true);
+
+    /// <summary>EnterTypedN for the argument kinds of SIG.</summary>
+    public static System.Reflection.MethodInfo TypedEnterMethod(string sig) => TypedGeneric("EnterTyped", sig, false);
+
+    static System.Reflection.MethodInfo TypedGeneric(string stem, string sig, bool withResult)
+    {
+        int n = sig.Length - 2;
+        if (DotCL.Emitter.TypedEntrySig.IsWide(sig)) stem += "W";
+        var targs = new System.Type[withResult ? n + 1 : n];
+        for (int i = 0; i < n; i++) targs[i] = DotCL.Emitter.TypedEntrySig.KindType(sig[i]);
+        if (withResult) targs[n] = DotCL.Emitter.TypedEntrySig.KindType(sig[n + 1]);
+        return typeof(LispFunction).GetMethod(stem + n)!.MakeGenericMethod(targs);
+    }
+
     // ---- Tail calls through a typed entry ----
     //
     // A typed body whose result is the result of a call to another function's
@@ -189,7 +474,7 @@ public partial class LispFunction
             // Any other frame would need the arguments boxed on every call of
             // the chain: the callee gets a typed frame of its own instead
             // (InvokeTypedN), once, and the calls after it reuse that one.
-            if ((top->_argc & Frame.TypedArgsBit) == 0) return TailKindInvoke;
+            if ((top->_argc & (Frame.TypedArgsBit | Frame.TypedWideBit)) != Frame.TypedArgsBit) return TailKindInvoke;
             var ta = (TypedFrameArgs*)top->_ext;
             ta->R0 = r0; ta->R1 = r1; ta->R2 = r2; ta->R3 = r3; ta->Code = code;
             top->Name = callee;
@@ -225,6 +510,13 @@ public partial class LispFunction
         var targs = new System.Type[n + 1];
         for (int i = 0; i < n; i++) targs[i] = DotCL.Emitter.TypedEntrySig.KindType(sig[i]);
         targs[n] = DotCL.Emitter.TypedEntrySig.KindType(sig[n + 1]);
-        return typeof(LispFunction).GetMethod("InvokeTyped" + n)!.MakeGenericMethod(targs);
+        var stem = DotCL.Emitter.TypedEntrySig.IsWide(sig) ? "InvokeTypedW" : "InvokeTyped";
+        return typeof(LispFunction).GetMethod(stem + n)!.MakeGenericMethod(targs);
     }
+}
+
+public partial class LispFunction
+{
+    /// <summary>TailPrepTypedN (TailPrepTypedWN for a wide one) for the argument kinds of SIG.</summary>
+    public static System.Reflection.MethodInfo TypedTailPrepMethod(string sig) => TypedGeneric("TailPrepTyped", sig, false);
 }

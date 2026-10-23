@@ -23,6 +23,14 @@
 ;;; handles the condition.
 (defvar *deftest-contain-errors* t)
 
+;;; A reporting hook, like the script's: binding it must not send the runtime's
+;;; unhandled errors to the debugger where a script run unwinds them.
+(defvar *deftest-debugger-hook*
+  (dotnet:static "DotCL.ConditionSystem" "ReportingDebuggerHook"
+                 (lambda (condition hook)
+                   (declare (ignore hook))
+                   (throw '%deftest-debugger (list condition)))))
+
 ;;; A test records its outcome; it never takes the run down with it.
 ;;;
 ;;; A value mismatch was always recorded and the run continued. An ERROR was
@@ -35,6 +43,8 @@
 ;;; bug in the harness still surfaces as a harness bug rather than as a test
 ;;; failure. ERROR and not CONDITION: a WARNING must stay a warning, and a
 ;;; non-error condition signalled with SIGNAL does not unwind anything anyway.
+;;; A non-ERROR condition that still reaches the debugger (INTERACTIVE-INTERRUPT)
+;;; is taken by *DEFTEST-DEBUGGER-HOOK*; the script's hook would exit.
 ;;;
 ;;; Tests that expect an error are unaffected -- every one of them wraps the
 ;;; error INSIDE the form (HANDLER-CASE, HANDLER-BIND, SIGNALS-ERROR and the
@@ -44,36 +54,91 @@
 ;;; the paired top-level SETFs that several files bracket themselves with are
 ;;; now more likely to be restored, not less: the old behaviour could leave
 ;;; global state set and then skip the very tests that would have noticed.
+(setf (fdefinition '%run-test-form)
+ (lambda (thunk)
+  (if *deftest-contain-errors*
+      (let ((cond nil) (result nil))
+        (let ((caught
+                (catch '%deftest-debugger
+                  (handler-case
+                      (let ((*debugger-hook* *deftest-debugger-hook*))
+                        (setq result (funcall thunk))
+                        nil)
+                    (error (c) (setq cond c) nil)))))
+          (when caught (setq cond (car caught))))
+        (values result cond))
+      (values (funcall thunk) nil))))
+
+;;; The names in ASDF's set of immutable systems, sorted; NIL before ASDF is
+;;; loaded. An immutable system is answered from the image and never looked up
+;;; again, so one left behind changes what every later ASDF test sees.
+(defun %asdf-immutable-system-names ()
+  (let* ((pkg (find-package "ASDF"))
+         (sym (and pkg (find-symbol "*IMMUTABLE-SYSTEMS*" pkg)))
+         (table (and sym (boundp sym) (symbol-value sym)))
+         (names nil))
+    (when (hash-table-p table)
+      (maphash (lambda (k v) (declare (ignore v)) (push k names)) table))
+    (sort names #'string<)))
+
+(defmacro with-asdf-immutable-systems-restored (&body body)
+  "Run BODY, then put ASDF's set of immutable systems back as it was."
+  (let ((saved (gensym "SAVED")))
+    `(let ((,saved (%asdf-immutable-system-names)))
+       (unwind-protect (progn ,@body)
+         (%restore-asdf-immutable-systems ,saved)))))
+
+(defun %restore-asdf-immutable-systems (names)
+  (let* ((pkg (find-package "ASDF"))
+         (sym (and pkg (find-symbol "*IMMUTABLE-SYSTEMS*" pkg))))
+    (when sym
+      (setf (symbol-value sym)
+            (when names
+              (let ((table (make-hash-table :test 'equal)))
+                (dolist (n names table) (setf (gethash n table) t))))))))
+
+(defvar *asdf-immutable-systems-seen* nil)
+
+;;; True, after printing what changed, when the set differs from the last look.
+;;; A test that leaves it changed (or runs after top-level code that did) fails.
+(defun %asdf-immutable-systems-changed-p ()
+  (let ((now (%asdf-immutable-system-names)))
+    (unless (equal now *asdf-immutable-systems-seen*)
+      (print (list "ASDF::*IMMUTABLE-SYSTEMS*" 'FROM *asdf-immutable-systems-seen*
+                   'TO now 'IN (and *load-truename* (file-namestring *load-truename*))))
+      (setq *asdf-immutable-systems-seen* now)
+      t)))
+
+(setf (fdefinition '%run-deftest)
+ (lambda (name thunk expected)
+  (incf *test-count*)
+  (let ((leaked (%asdf-immutable-systems-changed-p)))
+    (multiple-value-bind (result cond) (%run-test-form thunk)
+      (when (%asdf-immutable-systems-changed-p) (setq leaked t))
+      (cond (cond
+             (incf *fail-count*)
+             (push name *fail-names*)
+             (print (list 'FAIL name))
+             (print (list 'EXPECTED expected))
+             (print (list 'ERROR (type-of cond) (princ-to-string cond))))
+            ((and (equal result expected) (not leaked))
+             (incf *pass-count*))
+            (leaked
+             (incf *fail-count*)
+             (push name *fail-names*)
+             (print (list 'FAIL name 'LEFT "ASDF::*IMMUTABLE-SYSTEMS*" 'CHANGED)))
+            (t
+             (incf *fail-count*)
+             (push name *fail-names*)
+             (print (list 'FAIL name))
+             (print (list 'EXPECTED expected))
+             (print (list 'GOT result))))))))
+
+;;; The expansion is kept to one call: it is compiled once per test, thousands
+;;; of times a run. The two functions above are anonymous so that they leave no
+;;; frame in the backtraces the tests look at, in every mode.
 (defmacro deftest (name form &rest expected)
-  (let ((result-var (gensym "R"))
-        (expected-var (gensym "E"))
-        (cond-var (gensym "C"))
-        (caught-var (gensym "CAUGHT"))
-        (run-var (gensym "RUN")))
-    `(let ((,expected-var '(,@expected))
-           (,result-var nil)
-           (,cond-var nil))
-       (incf *test-count*)
-       (flet ((,run-var () (multiple-value-list ,form)))
-         (if *deftest-contain-errors*
-             (handler-case (setq ,result-var (,run-var))
-               (error (,caught-var) (setq ,cond-var ,caught-var)))
-             (setq ,result-var (,run-var))))
-       (cond (,cond-var
-              (incf *fail-count*)
-              (push ',name *fail-names*)
-              (print (list 'FAIL ',name))
-              (print (list 'EXPECTED ,expected-var))
-              (print (list 'ERROR (type-of ,cond-var)
-                           (princ-to-string ,cond-var))))
-             ((equal ,result-var ,expected-var)
-              (incf *pass-count*))
-             (t
-              (incf *fail-count*)
-              (push ',name *fail-names*)
-              (print (list 'FAIL ',name))
-              (print (list 'EXPECTED ,expected-var))
-              (print (list 'GOT ,result-var)))))))
+  `(%run-deftest ',name (lambda () (multiple-value-list ,form)) '(,@expected)))
 
 ;;; Some tests assert a COMPILER behaviour rather than a language behaviour: a
 ;;; compile-time warning, a compile-time type error, the IL size limit, or the
@@ -132,6 +197,21 @@
 (defmacro deftest-emitting-only (name form &rest expected)
   `(when (emitting-mode-p)
      (deftest ,name ,form ,@expected)))
+
+;;; Runs THUNK on a new thread with a BYTES stack and returns its value. For
+;;; tests that recurse until the stack runs out: the check that turns that into
+;;; a STORAGE-CONDITION is the same on any stack, and exhausting (then
+;;; unwinding) the 256 MB of the main thread takes seconds where 16 MB takes
+;;; milliseconds. Specials are not inherited by the new thread.
+(defun call-on-small-stack (thunk &optional (bytes (* 16 1024 1024)))
+  (let* ((result :thread-did-not-finish)
+         (thread (dotnet:new "System.Threading.Thread"
+                             (dotnet:make-delegate "System.Threading.ThreadStart"
+                                                   (lambda () (setq result (funcall thunk))))
+                             bytes)))
+    (dotnet:invoke thread "Start")
+    (dotnet:invoke thread "Join")
+    result))
 
 (defun min-allocated-bytes (thunk &optional (n 5))
   (let ((best nil))

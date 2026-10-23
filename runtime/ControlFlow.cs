@@ -198,32 +198,304 @@ public class GoException : Exception
 /// a matching catch exists before throwing CatchThrowException.
 /// If no matching catch, throw signals CONTROL-ERROR instead.
 /// </summary>
+/// <summary>Per-thread state of CATCH / THROW: the catch tags and ThrowReturn's
+/// arm, in one thread-static object so the common path reads one TLS slot.</summary>
+internal sealed class CatchState
+{
+    internal LispObject[] Tags = new LispObject[16];
+    internal int Count;
+    internal LispFunction? ArmFn;
+    internal int ArmIdx;
+    internal LispObject? Pending;
+    internal int AsyncDepth;
+}
+
 public static class CatchTagStack
 {
     [ThreadStatic]
-    private static List<LispObject>? _tags;
+    private static CatchState? _state;
 
-    public static void Push(LispObject tag)
-    {
-        _tags ??= new List<LispObject>();
-        _tags.Add(tag);
-    }
+    internal static CatchState State => _state ??= new CatchState();
+
+    internal static CatchState? StateOrNull => _state;
+
+    public static void Push(LispObject tag) => PushIndex(tag);
 
     public static void Pop()
     {
-        _tags!.RemoveAt(_tags.Count - 1);
+        var s = _state!;
+        s.Tags[--s.Count] = null!;
+    }
+
+    public static int PushIndex(LispObject tag)
+    {
+        var s = State;
+        int n = s.Count;
+        if (n == s.Tags.Length) Array.Resize(ref s.Tags, n * 2);
+        s.Tags[n] = tag;
+        s.Count = n + 1;
+        return n;
+    }
+
+    /// <summary>Index of the innermost entry that the CATCH filter would accept
+    /// for TAG (reference identity), or -1.</summary>
+    public static int InnermostIndex(LispObject tag)
+    {
+        var s = _state;
+        if (s == null) return -1;
+        var tags = s.Tags;
+        for (int i = s.Count - 1; i >= 0; i--)
+            if (ReferenceEquals(tags[i], tag)) return i;
+        return -1;
     }
 
     public static bool HasMatchingCatch(LispObject tag)
     {
-        if (_tags == null) return false;
-        for (int i = _tags.Count - 1; i >= 0; i--)
+        var s = _state;
+        if (s == null) return false;
+        var tags = s.Tags;
+        for (int i = s.Count - 1; i >= 0; i--)
         {
-            if (ReferenceEquals(_tags[i], tag)) return true;
+            if (ReferenceEquals(tags[i], tag)) return true;
             // For non-reference types (numbers), use Equals
-            if (_tags[i].Equals(tag)) return true;
+            if (tags[i].Equals(tag)) return true;
         }
         return false;
+    }
+}
+
+/// <summary>
+/// THROW without a .NET exception, for one shape: the CATCH body's value is a
+/// call (CallN, "armed" with the callee and the catch's CatchTagStack index) and
+/// the callee is a compiled function containing the THROW, which takes the arm
+/// on entry (Claim). A THROW in it whose innermost matching catch is the claimed
+/// one leaves the function normally (cleanups run as finally blocks) and returns
+/// Sentinel, which only ever reaches the CallN that armed it.
+/// </summary>
+public static class ThrowReturn
+{
+    private sealed class SentinelObject : LispObject
+    {
+        public override string ToString() => "#<throw-return>";
+    }
+
+    private static readonly LispObject Sentinel = new SentinelObject();
+
+    /// <summary>Entry of a function that may return Sentinel: the claimed catch
+    /// index, or -1. Always disarms.</summary>
+    public static int Claim(LispFunction self)
+    {
+        var s = CatchTagStack.StateOrNull;
+        if (s == null) return -1;
+        var fn = s.ArmFn;
+        if (fn == null) return -1;
+        s.ArmFn = null;
+        return ReferenceEquals(fn, self) ? s.ArmIdx : -1;
+    }
+
+    /// <summary>Whether a THROW of TAG may leave by returning to the claimed catch.</summary>
+    public static bool CanReturn(LispObject tag, int claimed)
+    {
+        if (claimed < 0) return false;
+        var s = CatchTagStack.StateOrNull;
+        if (s == null || s.AsyncDepth > 0 || claimed >= s.Count) return false;
+        var tags = s.Tags;
+        for (int i = s.Count - 1; i > claimed; i--)
+            if (ReferenceEquals(tags[i], tag)) return false;
+        return ReferenceEquals(tags[claimed], tag);
+    }
+
+    /// <summary>The function's exit for such a THROW, after its cleanups ran.</summary>
+    public static LispObject Return(LispObject value)
+    {
+        CatchTagStack.State.Pending = value;
+        return Sentinel;
+    }
+
+    /// <summary>Clear the arm around runtime work that may run Lisp code between
+    /// arming and the callee's entry (interrupts, stack checks).</summary>
+    internal static LispFunction? Disarm()
+    {
+        var s = CatchTagStack.StateOrNull;
+        if (s == null) return null;
+        var fn = s.ArmFn;
+        s.ArmFn = null;
+        return fn;
+    }
+
+    internal static void Rearm(LispFunction? fn)
+    {
+        if (fn != null) CatchTagStack.State.ArmFn = fn;
+    }
+
+    private static LispObject Take(CatchState s, LispObject r)
+    {
+        if (!ReferenceEquals(r, Sentinel)) return r;
+        r = s.Pending!;
+        s.Pending = null;
+        return r;
+    }
+
+    public static bool IsReturned(LispObject r) => ReferenceEquals(r, Sentinel);
+
+    public static LispObject TakePending()
+    {
+        var s = CatchTagStack.State;
+        var r = s.Pending!;
+        s.Pending = null;
+        return r;
+    }
+
+    // A self-call of a function holding a claim: the callee may take it over
+    // and return Sentinel, which the caller passes on.
+    public static LispObject Forward0(LispFunction fn, int idx)
+    {
+        if (idx < 0 || fn._func0 == null) return fn.Invoke0();
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke0();
+        s.ArmFn = null;
+        return r;
+    }
+
+    public static LispObject Forward1(LispFunction fn, LispObject a, int idx)
+    {
+        if (idx < 0 || fn._func1 == null) return fn.Invoke1(a);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke1(a);
+        s.ArmFn = null;
+        return r;
+    }
+
+    public static LispObject Forward2(LispFunction fn, LispObject a, LispObject b, int idx)
+    {
+        if (idx < 0 || fn._func2 == null) return fn.Invoke2(a, b);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke2(a, b);
+        s.ArmFn = null;
+        return r;
+    }
+
+    public static LispObject Forward3(LispFunction fn, LispObject a, LispObject b, LispObject c, int idx)
+    {
+        if (idx < 0 || fn._func3 == null) return fn.Invoke3(a, b, c);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke3(a, b, c);
+        s.ArmFn = null;
+        return r;
+    }
+
+    public static LispObject Forward4(LispFunction fn, LispObject a, LispObject b, LispObject c, LispObject d, int idx)
+    {
+        if (idx < 0 || fn._func4 == null) return fn.Invoke4(a, b, c, d);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke4(a, b, c, d);
+        s.ArmFn = null;
+        return r;
+    }
+
+    public static LispObject Forward0M(LispFunction fn, int mode, int idx)
+    {
+        if (idx < 0 || fn._func0 == null) return fn.Invoke0M(mode);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke0M(mode);
+        s.ArmFn = null;
+        return r;
+    }
+
+    public static LispObject Forward1M(LispFunction fn, LispObject a, int mode, int idx)
+    {
+        if (idx < 0 || fn._func1 == null) return fn.Invoke1M(a, mode);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke1M(a, mode);
+        s.ArmFn = null;
+        return r;
+    }
+
+    public static LispObject Forward2M(LispFunction fn, LispObject a, LispObject b, int mode, int idx)
+    {
+        if (idx < 0 || fn._func2 == null) return fn.Invoke2M(a, b, mode);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke2M(a, b, mode);
+        s.ArmFn = null;
+        return r;
+    }
+
+    public static LispObject Forward3M(LispFunction fn, LispObject a, LispObject b, LispObject c, int mode, int idx)
+    {
+        if (idx < 0 || fn._func3 == null) return fn.Invoke3M(a, b, c, mode);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke3M(a, b, c, mode);
+        s.ArmFn = null;
+        return r;
+    }
+
+    public static LispObject Forward4M(LispFunction fn, LispObject a, LispObject b, LispObject c, LispObject d, int mode, int idx)
+    {
+        if (idx < 0 || fn._func4 == null) return fn.Invoke4M(a, b, c, d, mode);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke4M(a, b, c, d, mode);
+        s.ArmFn = null;
+        return r;
+    }
+
+    public static LispObject Call0(LispFunction fn, int idx)
+    {
+        if (fn._func0 == null) return fn.Invoke0();
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke0();
+        s.ArmFn = null;
+        return Take(s, r);
+    }
+
+    public static LispObject Call1(LispFunction fn, LispObject a, int idx)
+    {
+        if (fn._func1 == null) return fn.Invoke1(a);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke1(a);
+        s.ArmFn = null;
+        return Take(s, r);
+    }
+
+    public static LispObject Call2(LispFunction fn, LispObject a, LispObject b, int idx)
+    {
+        if (fn._func2 == null) return fn.Invoke2(a, b);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke2(a, b);
+        s.ArmFn = null;
+        return Take(s, r);
+    }
+
+    public static LispObject Call3(LispFunction fn, LispObject a, LispObject b, LispObject c, int idx)
+    {
+        if (fn._func3 == null) return fn.Invoke3(a, b, c);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke3(a, b, c);
+        s.ArmFn = null;
+        return Take(s, r);
+    }
+
+    public static LispObject Call4(LispFunction fn, LispObject a, LispObject b, LispObject c, LispObject d, int idx)
+    {
+        if (fn._func4 == null) return fn.Invoke4(a, b, c, d);
+        var s = CatchTagStack.State;
+        s.ArmIdx = idx; s.ArmFn = fn;
+        var r = fn.Invoke4(a, b, c, d);
+        s.ArmFn = null;
+        return Take(s, r);
     }
 }
 
@@ -250,13 +522,11 @@ public static class CatchTagStack
 /// </summary>
 public static class AsyncContinuation
 {
-    [ThreadStatic] private static int _depth;
+    public static bool Active => CatchTagStack.StateOrNull is { AsyncDepth: > 0 };
 
-    public static bool Active => _depth > 0;
+    public static void Enter() => CatchTagStack.State.AsyncDepth++;
 
-    public static void Enter() => _depth++;
-
-    public static void Exit() => _depth--;
+    public static void Exit() => CatchTagStack.State.AsyncDepth--;
 }
 
 /// <summary>

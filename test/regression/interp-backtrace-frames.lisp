@@ -125,7 +125,7 @@
 ;;; and so depends on Invoke recording a frame, is covered in frame-locals.lisp.)
 (deftest-compiled-only interp-backtrace.apply-compile
   (%ibt :compile '(progn (defun %ibt-c-ap (x) (declare (ignore x)) (dotcl:backtrace))
-                         (defun %ibt-c-apc (n) (apply #'%ibt-c-ap (list n)))
+                         (defun %ibt-c-apc (n) (values (apply #'%ibt-c-ap (list n))))
                          (%ibt-c-apc 1)))
   ("%IBT-C-AP" "%IBT-C-APC"))
 

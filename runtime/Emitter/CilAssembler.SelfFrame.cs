@@ -22,10 +22,17 @@ public partial class CilAssembler
         typeof(LispFunction).GetMethod("Enter2")!, typeof(LispFunction).GetMethod("Enter3")!,
         typeof(LispFunction).GetMethod("Enter4")!,
     };
+    private static readonly MethodInfo[] s_enterNU =
+    {
+        typeof(LispFunction).GetMethod("Enter0U")!, typeof(LispFunction).GetMethod("Enter1U")!,
+        typeof(LispFunction).GetMethod("Enter2U")!, typeof(LispFunction).GetMethod("Enter3U")!,
+        typeof(LispFunction).GetMethod("Enter4U")!,
+    };
     private static readonly MethodInfo s_enterUnit = typeof(LispFunction).GetMethod("EnterUnit")!;
     private static readonly MethodInfo s_leaveFrame = typeof(LispFunction).GetMethod("Leave")!;
     private static readonly MethodInfo s_resumeFrame = typeof(LispFunction).GetMethod("Resume")!;
     private static readonly MethodInfo s_resumeBelow = typeof(LispFunction).GetMethod("ResumeBelow")!;
+    private static readonly MethodInfo s_unlinkIfTop = typeof(LispFunction).GetMethod("UnlinkIfTop")!;
     private static readonly MethodInfo s_selfTailEntry = typeof(LispFunction).GetMethod("SelfTailEntry")!;
     private static readonly MethodInfo s_selfTailPrepare = typeof(LispFunction).GetMethod("SelfTailPrepare")!;
     private static readonly FieldInfo s_tailLendMarker = typeof(LispFunction).GetField("TailLendMarker")!;
@@ -55,14 +62,9 @@ public partial class CilAssembler
         _selfFrameLocal = il.DeclareLocal(typeof(LispFunction.Frame));
         il.EmitLoc(OpCodes.Ldloca, _selfFrameLocal);
         il.Emit(OpCodes.Ldstr, Track(_selfFrameName!));
+        if (_selfFrameUnit) il.Emit(OpCodes.Ldarg_0);
         for (int i = 1; i <= _selfFrameArgc; i++) EmitRawLdarg(i);
-        il.Emit(OpCodes.Call, s_enterN[_selfFrameArgc]);
-        if (_selfFrameUnit)
-        {
-            il.EmitLoc(OpCodes.Ldloca, _selfFrameLocal);
-            il.Emit(OpCodes.Ldarg_0);
-            il.Emit(OpCodes.Call, s_enterUnit);
-        }
+        il.Emit(OpCodes.Call, (_selfFrameUnit ? s_enterNU : s_enterN)[_selfFrameArgc]);
     }
 
     private void EmitRawLdarg(int n)
@@ -96,12 +98,17 @@ public partial class CilAssembler
         _ehMarker ??= _il.DeclareLocal(typeof(byte));
         _il.EmitLoc(OpCodes.Ldloca, _ehMarker);
         _il.Emit(OpCodes.Call, s_resumeBelow);
+        if (_icFrame != null)
+        {
+            _il.EmitLoc(OpCodes.Ldloca, _icFrame);
+            _il.Emit(OpCodes.Call, s_unlinkIfTop);
+        }
     }
 
     private static readonly HashSet<string> s_inertOps = new()
     {
-        "LDLOC", "STLOC", "LDARG", "LDC-I4", "LDC-I8", "LDC-R8", "LDC-R4", "LDSFLD", "LDNULL",
-        "LOAD-SYM", "LOAD-SYM-PKG", "LOAD-CONST", "CASTCLASS", "POP", "DUP", "LABEL", "LINE",
+        "LDLOC", "STLOC", "LDLOCA", "LDARG", "LDC-I4", "LDC-I8", "LDC-R8", "LDC-R4", "LDSFLD", "LDNULL",
+        "LOAD-SYM", "LOAD-SYM-PKG", "LOAD-CONST", "CASTCLASS", "ISINST", "POP", "DUP", "LABEL", "LINE",
         "DECLARE-LOCAL", "BR", "BRFALSE", "BRTRUE", "LEAVE", "LOCAL-VAR", "SCOPE-BEGIN", "SCOPE-END",
     };
 

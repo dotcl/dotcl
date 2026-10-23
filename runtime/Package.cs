@@ -48,19 +48,315 @@ public class Package : LispObject
 
     public Package(string name, params string[] nicknames)
     {
-        Name = name;
-        _allPackages[name] = this;
-        foreach (var n in nicknames)
+        if (_unitsInUse)
         {
-            _allPackages[n] = this;
-            _nicknames.Add(n);
+            var u = _currentUnit.Value;
+            if (u != null && u.Owns(name)) HomeUnit = u;
+        }
+        Name = Register(name);
+        foreach (var n in nicknames)
+            _nicknames.Add(Register(n));
+    }
+
+    /// <summary>The unit this package belongs to, or null for the global namespace.</summary>
+    public Unit? HomeUnit { get; private set; }
+
+    /// <summary>
+    /// A package unit owns a set of package names (exact, or a prefix ending in
+    /// <c>*</c>). While it is current, those names mean its own packages. A unit
+    /// package is <c>UNIT!NAME</c> globally (that is <see cref="Name"/>) and
+    /// <c>NAME</c> in the unit; a global package the unit hides is <c>!NAME</c>.
+    /// </summary>
+    public sealed class Unit
+    {
+        public readonly string UnitName;
+        public readonly string Prefix;
+        private readonly string[] _owned;
+        internal readonly ConcurrentDictionary<string, Package> Table = new();
+        private readonly List<Symbol> _syms = new();
+        private readonly List<LispObject?> _vals = new();
+
+        public Unit(string name, string ownedCsv)
+        {
+            UnitName = name;
+            Prefix = name + UnitSeparator;
+            _owned = ownedCsv.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(s => s.Trim()).Where(s => s.Length > 0).ToArray();
+        }
+
+        public bool Owns(string name)
+        {
+            foreach (var o in _owned)
+                if (o.EndsWith('*') ? name.StartsWith(o.AsSpan(0, o.Length - 1), StringComparison.Ordinal)
+                                    : name == o)
+                    return true;
+            return false;
+        }
+
+        /// <summary>A module or system name: owned in any case.</summary>
+        public bool OwnsName(string name) => Owns(name) || Owns(name.ToUpperInvariant());
+
+        internal bool Binds(Symbol sym)
+        {
+            lock (_syms) return _syms.Contains(sym);
+        }
+
+        /// <summary>Owned names, and any other name a unit package was given.</summary>
+        public bool Hides(string name) => Table.ContainsKey(name) || Owns(name);
+
+        public override string ToString() => $"#<PACKAGE-UNIT {UnitName}>";
+
+        public void AddSpecial(Symbol sym, LispObject? value)
+        {
+            lock (_syms) { _syms.Add(sym); _vals.Add(value); }
+        }
+
+        internal void Enter()
+        {
+            lock (_syms)
+                for (int i = 0; i < _syms.Count; i++)
+                    DynamicBindings.Push(_syms[i], _vals[i] ?? DynamicBindings.Unbound);
+        }
+
+        internal void Leave()
+        {
+            lock (_syms)
+                for (int i = _syms.Count - 1; i >= 0; i--)
+                {
+                    _vals[i] = DynamicBindings.TryGet(_syms[i], out var v) ? v : null;
+                    DynamicBindings.Pop(_syms[i]);
+                }
+        }
+    }
+
+    public const char UnitSeparator = '!';
+
+    private static readonly System.Threading.AsyncLocal<Unit?> _currentUnit = new();
+    internal static bool _unitsInUse;
+
+    /// <summary>Set once, when a unit is first made current.</summary>
+    public static bool UnitsInUse => _unitsInUse;
+
+    public static Unit? CurrentUnit => _unitsInUse ? _currentUnit.Value : null;
+
+    public static Unit MakeUnit(string name, string ownedCsv)
+    {
+        if (name.Length == 0 || name.Contains(UnitSeparator))
+            throw new LispErrorException(new LispError($"MAKE-UNIT: bad unit name \"{name}\""));
+        return new Unit(name, ownedCsv);
+    }
+
+    /// <summary>Make UNIT (or null for none) current in this execution context
+    /// and return the previous one. Threads started afterwards inherit it.</summary>
+    public static object? SwapUnit(object? unit)
+    {
+        var u = unit as Unit;
+        if (u != null && !_unitsInUse) System.Threading.Volatile.Write(ref _unitsInUse, true);
+        var old = _currentUnit.Value;
+        if (ReferenceEquals(old, u) && ReferenceEquals(t_entered, u)) return old;
+        t_entered?.Leave();
+        _currentUnit.Value = u;
+        t_entered = u;
+        u?.Enter();
+        return old;
+    }
+
+    /// <summary>The unit whose specials this thread has bound. The current unit
+    /// flows into threads and thread-pool work with the execution context; the
+    /// bindings do not.</summary>
+    [ThreadStatic] private static Unit? t_entered;
+
+    /// <summary>Bind the specials of the unit this new thread inherited.</summary>
+    public static void EnterInheritedUnit()
+    {
+        var u = CurrentUnit;
+        if (u == null) return;
+        t_entered = u;
+        u.Enter();
+    }
+
+    public static void LeaveThreadUnit()
+    {
+        t_entered?.Leave();
+        t_entered = null;
+    }
+
+    /// <summary>True when the current unit keeps its own value of REGISTRY (a
+    /// special such as *MODULES*) but does not own NAME: that entry belongs to the
+    /// global value, shared by every unit.</summary>
+    public static bool SharesRegistryEntry(Symbol registry, string name)
+    {
+        var u = CurrentUnit;
+        return u != null && u.Binds(registry) && !u.OwnsName(name);
+    }
+
+    /// <summary>Run BODY in unit U, however the calling thread came to run it.</summary>
+    public static T CallInUnit<T>(Unit u, Func<T> body)
+    {
+        if (ReferenceEquals(t_entered, u) && ReferenceEquals(_currentUnit.Value, u)) return body();
+        if (!_unitsInUse) System.Threading.Volatile.Write(ref _unitsInUse, true);
+        var oldCurrent = _currentUnit.Value;
+        var oldEntered = t_entered;
+        _currentUnit.Value = u;
+        t_entered = u;
+        u.Enter();
+        try { return body(); }
+        finally
+        {
+            u.Leave();
+            t_entered = oldEntered;
+            _currentUnit.Value = oldCurrent;
+        }
+    }
+
+    /// <summary>FN, or, made inside a unit, a function that runs FN in that unit
+    /// wherever it is called from: for Lisp code .NET calls back into.</summary>
+    public static LispObject BindToCurrentUnit(LispObject fn)
+    {
+        var u = CurrentUnit;
+        if (u == null) return fn;
+        var lf = fn as LispFunction;
+        return new LispFunction(args => CallInUnit(u, () => Runtime.Funcall(fn, args)),
+            lf?.Name ?? "PACKAGE-UNIT-CALLBACK", lf?.Arity ?? -1);
+    }
+
+
+    private string Register(string name)
+    {
+        var u = HomeUnit;
+        if (u == null)
+        {
+            _allPackages[name] = this;
+            return name;
+        }
+        u.Table[name] = this;
+        var physical = u.Prefix + name;
+        _allPackages[physical] = this;
+        return physical;
+    }
+
+    private void Unregister(string physical)
+    {
+        _allPackages.TryRemove(physical, out _);
+        var u = HomeUnit;
+        if (u != null && physical.StartsWith(u.Prefix, StringComparison.Ordinal))
+        {
+            var bare = physical.Substring(u.Prefix.Length);
+            if (u.Table.TryGetValue(bare, out var p) && ReferenceEquals(p, this))
+                u.Table.TryRemove(bare, out _);
         }
     }
 
     public static Package? FindPackage(string name)
     {
+        if (_unitsInUse) return FindPackageInUnits(name);
         _allPackages.TryGetValue(name, out var pkg);
         return pkg;
+    }
+
+    private static Package? FindPackageInUnits(string name)
+    {
+        var cur = _currentUnit.Value;
+        if (cur != null)
+        {
+            if (cur.Table.TryGetValue(name, out var own)) return own;
+            if (cur.Owns(name)) return null;
+        }
+        if (_allPackages.TryGetValue(name, out var pkg)) return pkg;
+        if (name.Length > 1 && name[0] == UnitSeparator
+            && _allPackages.TryGetValue(name.Substring(1), out pkg) && pkg.HomeUnit == null)
+            return pkg;
+        return null;
+    }
+
+    /// <summary>The package whose name or nickname, as <see cref="Name"/> spells it,
+    /// is NAME. Compiled code names packages this way, so what it finds does not
+    /// depend on the unit current where it runs.</summary>
+    public static Package? FindPackagePhysical(string name)
+    {
+        _allPackages.TryGetValue(name, out var pkg);
+        return pkg;
+    }
+
+    /// <summary>How a fasl records a package it names: the physical name, and,
+    /// when it differs, the name the source used for it where it was compiled.</summary>
+    public static string FaslPackageEntry(string physical)
+    {
+        if (!_unitsInUse) return physical;
+        var p = FindPackagePhysical(physical);
+        if (p == null) return physical;
+        var text = p.Visible(physical, _currentUnit.Value);
+        return text == physical ? physical : physical + "\t" + text;
+    }
+
+    /// <summary>The first package of a fasl's recorded ENTRIES (see
+    /// <see cref="FaslPackageEntry"/>) that its source would name differently from
+    /// here, as (source name, physical name in the fasl, physical name here); or
+    /// null when every package means the same here as where it was compiled.</summary>
+    public static (string Text, string Compiled, string Here)? FaslUnitMismatch(string entries)
+    {
+        var cur = _unitsInUse ? _currentUnit.Value : null;
+        if (cur == null && entries.IndexOf('\t') < 0) return null;
+        foreach (var entry in entries.Split('\n'))
+        {
+            if (entry.Length == 0) continue;
+            int tab = entry.IndexOf('\t');
+            var physical = tab < 0 ? entry : entry.Substring(0, tab);
+            var text = tab < 0 ? entry : entry.Substring(tab + 1);
+            var here = PhysicalNameFor(text, cur);
+            if (here != physical) return (text, physical, here);
+        }
+        return null;
+    }
+
+    private static string PhysicalNameFor(string text, Unit? cur)
+    {
+        int sep = text.IndexOf(UnitSeparator);
+        if (sep == 0) return text.Substring(1);
+        if (sep > 0 || cur == null || !cur.Hides(text)) return text;
+        return cur.Table.TryGetValue(text, out var own) ? own.Name : cur.Prefix + text;
+    }
+
+    /// <summary>The name, from unit CUR, that FIND-PACKAGE maps to this package.</summary>
+    private string Visible(string physical, Unit? cur)
+    {
+        var u = HomeUnit;
+        if (u != null)
+            return ReferenceEquals(u, cur) ? physical.Substring(u.Prefix.Length) : physical;
+        return cur != null && cur.Hides(physical) ? UnitSeparator + physical : physical;
+    }
+
+    public string VisibleName => _unitsInUse ? Visible(Name, _currentUnit.Value) : Name;
+
+    public LispString VisibleNameString => _unitsInUse ? VisibleNameStringInUnits() : NameString;
+
+    private LispString VisibleNameStringInUnits()
+    {
+        var v = Visible(Name, _currentUnit.Value);
+        return ReferenceEquals(v, Name) ? NameString : new LispString(v);
+    }
+
+    public IReadOnlyList<string> VisibleNicknames
+    {
+        get
+        {
+            var nicks = Nicknames;
+            if (!_unitsInUse) return nicks;
+            var cur = _currentUnit.Value;
+            return nicks.Select(n => Visible(n, cur)).ToList();
+        }
+    }
+
+    /// <summary>Found by its bare name from the current unit.</summary>
+    public bool IsVisible
+    {
+        get
+        {
+            if (!_unitsInUse) return true;
+            var cur = _currentUnit.Value;
+            if (HomeUnit != null) return ReferenceEquals(HomeUnit, cur);
+            return cur == null || !cur.Hides(Name);
+        }
     }
 
     public static IEnumerable<Package> AllPackages => _allPackages.Values.Distinct();
@@ -297,11 +593,9 @@ public class Package : LispObject
     {
         lock (_pkgLock)
         {
-            if (!_nicknames.Contains(nickname))
-            {
-                _nicknames.Add(nickname);
-                _allPackages[nickname] = this;
-            }
+            var physical = HomeUnit == null ? nickname : HomeUnit.Prefix + nickname;
+            if (!_nicknames.Contains(physical))
+                _nicknames.Add(Register(nickname));
         }
     }
 
@@ -455,23 +749,19 @@ public class Package : LispObject
         lock (_pkgLock)
         {
             // Remove old name and nicknames from registry
-            _allPackages.TryRemove(Name, out _);
+            Unregister(Name);
             foreach (var n in _nicknames)
-                _allPackages.TryRemove(n, out _);
+                Unregister(n);
             _nicknames.Clear();
-            Name = newName;
+            Name = Register(newName);
             _nameString = null;
             BumpMappingEpoch();   // PACKAGE-NAME must answer with the new name
-            _allPackages[newName] = this;
             if (newNicknames != null)
                 foreach (var n in newNicknames)
                 {
-                    // AddNickname would re-acquire _pkgLock (re-entrant lock, but avoid nested pattern)
-                    if (!_nicknames.Contains(n))
-                    {
-                        _nicknames.Add(n);
-                        _allPackages[n] = this;
-                    }
+                    var physical = HomeUnit == null ? n : HomeUnit.Prefix + n;
+                    if (!_nicknames.Contains(physical))
+                        _nicknames.Add(Register(n));
                 }
         }
     }
@@ -513,9 +803,9 @@ public class Package : LispObject
             _shadowingSymbols.Clear();
 
             // Remove from global package list
-            _allPackages.TryRemove(Name, out _);
+            Unregister(Name);
             foreach (var n in _nicknames)
-                _allPackages.TryRemove(n, out _);
+                Unregister(n);
             _nicknames.Clear();
 
             // Mark as deleted
@@ -523,5 +813,5 @@ public class Package : LispObject
         }
     }
 
-    public override string ToString() => _deleted ? "#<DELETED PACKAGE>" : $"#<PACKAGE \"{Name}\">";
+    public override string ToString() => _deleted ? "#<DELETED PACKAGE>" : $"#<PACKAGE \"{VisibleName}\">";
 }

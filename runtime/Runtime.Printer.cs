@@ -211,7 +211,7 @@ public static partial class Runtime
         // declared. *PRINT-READABLY* does not change this -- the text stays
         // readable, in the package it would be read in.
         string homeName = currentPkg.LocalNicknameFor(sym.HomePackage)
-                          ?? sym.HomePackage.Name;
+                          ?? sym.HomePackage.VisibleName;
         string pkgName = SymbolNeedsEscaping(homeName)
             ? EscapeSymbolName(homeName)
             : ApplyPrintCase(homeName);
@@ -1265,7 +1265,7 @@ public static partial class Runtime
                 var peSym = Startup.Sym("*PRINT-ESCAPE*");
                 DynamicBindings.Push(peSym, escape ? (LispObject)T.Instance : Nil.Instance);
                 PprintPushStaged(sw.GetStringBuilder());
-                try { fn.Invoke(new LispObject[] { stream, obj }); }
+                try { CallForPrimary(fn, stream, obj); }
                 finally
                 {
                     PprintPopStaged(sw.GetStringBuilder());
@@ -1812,7 +1812,7 @@ public static partial class Runtime
                 _fmtCoreDepth = 0;
             }
             PprintPushStaged(sw.GetStringBuilder());
-            try { gf.Invoke(new LispObject[] { obj, stream }); }
+            try { CallForPrimary(gf, obj, stream); }
             finally
             {
                 PprintPopStaged(sw.GetStringBuilder());
@@ -2552,7 +2552,7 @@ public static partial class Runtime
         if (gi == null) return false;
         var fn = GrayStreamLookup.GrayOrCl("STREAM-TERPRI");
         if (fn == null) return false;
-        fn.Invoke(new LispObject[] { gi });
+        CallForPrimary(fn, gi);
         PprintTrackWriteChar('\n');
         PprintAfterNewline(GetTextWriter(stream));
         return true;
@@ -2567,7 +2567,7 @@ public static partial class Runtime
     {
         var fn = GrayStreamLookup.GrayOrCl("STREAM-START-LINE-P");
         if (fn == null) return true;
-        try { return fn.Invoke(new LispObject[] { gi }) is not Nil; }
+        try { return CallForPrimary(fn, gi) is not Nil; }
         catch (LispErrorException) { return true; }
     }
 
@@ -2590,7 +2590,7 @@ public static partial class Runtime
             var freshFn = GrayStreamLookup.GrayOrCl("STREAM-FRESH-LINE");
             if (freshFn != null)
             {
-                if (freshFn.Invoke(new LispObject[] { grayOut }) is Nil) return Nil.Instance;
+                if (CallForPrimary(freshFn, grayOut) is Nil) return Nil.Instance;
                 PprintTrackWriteChar('\n');
                 PprintAfterNewline(GetTextWriter(stream));
                 return T.Instance;

@@ -19,6 +19,15 @@ public sealed class ByRef
     public object? Value;
     public ByRef(object? value) { Value = value; }
     public override string ToString() => $"#<byref {Value}>";
+
+    /// <summary>The cell's value as the parameter's element type. A Lisp integer
+    /// is stored as Int32 or Int64 by magnitude, which unbox.any would reject for
+    /// IntPtr, Int64, an enum and the like.</summary>
+    public static object? Coerce(object? value, Type elem)
+    {
+        if (value != null && elem.IsInstanceOfType(value)) return value;
+        return DotCL.Runtime.LispToDotNet(DotCL.Runtime.DotNetToLisp(value), elem);
+    }
 }
 
 /// <summary>
@@ -131,7 +140,7 @@ public static partial class DynamicClassBuilder
         // fresh dynamic assembly per call, historical behavior.
         int id = System.Threading.Interlocked.Increment(ref _assemblyCounter);
         var asmName = new AssemblyName("DotclDynamic_" + id);
-        var ab = AssemblyBuilder.DefineDynamicAssembly(asmName, AssemblyBuilderAccess.Run);
+        var ab = AssemblyBuilder.DefineDynamicAssembly(asmName, RuntimeLoadContext.RunAccess);
         var mb = ab.DefineDynamicModule(asmName.Name!);
 
         var (createdType, handlers) = PopulateType(mb, fullName, baseType, fields, attributes,
@@ -143,7 +152,7 @@ public static partial class DynamicClassBuilder
         // re-define of the same full name overwrites (matches "fresh assembly
         // per call").
         foreach (var (key, body) in handlers)
-            _methodHandlers[(fullName, key)] = body;
+            _methodHandlers[(fullName, key)] = Package.BindToCurrentUnit(body);
 
         return createdType;
     }
@@ -1172,6 +1181,8 @@ public static partial class DynamicClassBuilder
     private static readonly ConstructorInfo ByRefCtor =
         typeof(ByRef).GetConstructor(new[] { typeof(object) })!;
 
+    private static readonly MethodInfo ByRefCoerceMethod =
+        typeof(ByRef).GetMethod(nameof(ByRef.Coerce))!;
     private static readonly FieldInfo ByRefValueField =
         typeof(ByRef).GetField(nameof(ByRef.Value))!;
 
@@ -1242,7 +1253,13 @@ public static partial class DynamicClassBuilder
             il.Emit(OpCodes.Ldarg, i + argOffset);
             il.EmitLoc(OpCodes.Ldloc, cells[i]!);
             il.Emit(OpCodes.Ldfld, ByRefValueField);
-            if (elem.IsValueType) il.Emit(OpCodes.Unbox_Any, elem);
+            if (elem.IsValueType)
+            {
+                il.Emit(OpCodes.Ldtoken, elem);
+                il.Emit(OpCodes.Call, GetTypeFromHandleMI);
+                il.Emit(OpCodes.Call, ByRefCoerceMethod);
+                il.Emit(OpCodes.Unbox_Any, elem);
+            }
             else if (elem != typeof(object)) il.Emit(OpCodes.Castclass, elem);
             EmitStoreIndirect(il, elem);
         }

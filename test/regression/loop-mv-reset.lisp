@@ -43,3 +43,28 @@
     (dotcl:interrupt-thread th (lambda () (setf (cdr cell) nil) (values :end 2)))
     (dotcl:thread-join th))
   (:end))
+
+(setf dotcl:*save-sil* t)
+
+;; Double-float arithmetic, a float literal, ABS and the boxes of the float
+;; variables' SETQ values publish no values either.
+(defun %lmr-float (c)
+  (declare (double-float c))
+  (let ((y (funcall *lmr-two*)) (z 0d0) (w 1d0))
+    (declare (double-float z w) (ignorable y))
+    (do ((i 0 (1+ i))) ((or (> (abs z) 4.0) (> i 50)) i)
+      (setq w (* w -1d0)
+            z (+ (* z 0.5d0) (- c) w)))))
+
+(deftest loop-mv-reset.float
+  (list (multiple-value-list (%lmr-float 0.5d0))
+        (multiple-value-list (%lmr-float 3d0)))
+  ((51) (3)))
+
+(deftest-emitting-only loop-mv-reset.float-shape
+  (let* ((s (%flat-text (dotcl:function-sil #'%lmr-float)))
+         (n 0) (p (search "ConditionSystem.PollInterrupt" s)))
+    (loop (let ((q (search "MultipleValues.Reset)" s :start2 p)))
+            (if q (setq n (1+ n) p (1+ q)) (return))))
+    n)
+  1)

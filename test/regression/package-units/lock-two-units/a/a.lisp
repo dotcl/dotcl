@@ -1,0 +1,6 @@
+(defpackage :pulock2-a (:use :cl) (:export #:x-version #:x-version-by-name))
+(in-package :pulock2-a)
+(defun x-version () (pulock2-x:version))
+(defun x-version-by-name ()
+  (let ((p (find-package "PULOCK2-X")))
+    (and p (funcall (find-symbol "VERSION" p)))))

@@ -48,5 +48,5 @@
 
 (deftest-emitting-only constant-global-read.typed-aref-shape
   (let ((text (%flat-text (dotcl:function-sil #'%cgr-rot-sum))))
-    (list (and (search "Runtime.ArefL)" text) t) (and (search "Runtime.ArefNumL" text) t)))
+    (list (and (search "Runtime.ArefL)" text) t) (and (search "(LDELEM-" text) t)))
   (nil t))

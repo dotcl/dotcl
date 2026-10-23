@@ -212,3 +212,37 @@
   (let ((s (%lcr-sil #'%lcr-loop-const-limit)))
     (list (and (search "Runtime.IsTrue" s) t) (%lcr-generic-arith-p #'%lcr-loop-const-limit)))
   (nil nil))
+
+;;; DO ended by (= I L): the variable is bounded only when it cannot step over
+;;; L. Otherwise the loop runs past L (here until the body returns), and no
+;;; range may be assumed.
+
+(deftest loop-counting-range.do-until-equal
+  (list (do ((i 0 (1+ i)) (s 0 (+ s i))) ((= i 10) (list i s)))
+        (do ((i 0 (+ i 2)) (r nil (cons i r))) ((= i 8) (list i r)))
+        (do ((i 10 (1- i)) (s 0 (+ s i))) ((= i 0) (list i s)))
+        (let ((n 7)) (do ((i 0 (1+ i))) ((= i n) i)))
+        (do ((i 0 (+ i 3))) ((= i 10) :never) (when (> i 20) (return i)))
+        (do ((i 5 (1+ i))) ((= i 3) :never) (when (> i 8) (return i)))
+        (do ((i 0 (1- i))) ((= i 3) :never) (when (< i -4) (return i)))
+        (do ((i 0 (1+ i))) ((= i 10) :never) (when (= i 4) (setq i 12)) (when (> i 15) (return i))))
+  ((10 45) (8 (6 4 2 0)) (0 55) 7 21 9 -5 16))
+
+(defun %lcr-do-until-equal (v)
+  (declare (type (simple-array fixnum (*)) v))
+  (let ((s 0))
+    (declare (fixnum s))
+    (do ((j 0 (+ j 2))) ((= j 128)) (setq s (logxor s (aref v j) (aref v (+ j 1)))))
+    (do ((j 127 (1- j))) ((= j 0)) (setq s (logxor s (ash (aref v j) 1))))
+    s))
+
+(deftest loop-counting-range.do-until-equal-value
+  (%lcr-do-until-equal *lcr-v*)
+  #.(let ((s 0))
+      (dotimes (j 128) (setq s (logxor s (* j j))))
+      (loop for j from 127 downto 1 do (setq s (logxor s (* 2 j j))))
+      s))
+
+(deftest-emitting-only loop-counting-range.do-until-equal-typed
+  (%lcr-generic-arith-p #'%lcr-do-until-equal)
+  nil)

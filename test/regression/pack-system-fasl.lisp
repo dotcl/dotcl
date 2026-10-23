@@ -100,7 +100,8 @@ the generator test pass without generating anything."
 
 (defun psf-pack (system output &optional toplevel)
   "Build SYSTEM's closure into one fasl at OUTPUT, the way `dotcl pack` does."
-  (dotnet:static "DotCL.DotclBuild" "PackFasl" system output toplevel nil nil)
+  (with-asdf-immutable-systems-restored
+    (dotnet:static "DotCL.DotclBuild" "PackFasl" system output toplevel nil nil))
   output)
 
 (defun psf-build-app ()

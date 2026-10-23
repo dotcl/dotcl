@@ -122,7 +122,7 @@
       (setq s (logand (+ s (* i 3)) #xFFFFFF)))))
 (deftest-emitting-only fixnum-wrap-consumers.mask-stays-native
   (let ((a (%fwc-sil #'%fwc-mask-sil)) (b (%fwc-sil #'%fwc-acc-sil)))
-    (list (and (search "(AND)" a) t) (search "Runtime.Logand" a)
+    (list (and (or (search "(AND)" a) (search "(CONV-U4)" a)) t) (search "Runtime.Logand" a)
           (and (search "(AND)" b) t) (search "Runtime.Logand" b)))
   (t nil t nil))
 (setf dotcl:*save-sil* nil)

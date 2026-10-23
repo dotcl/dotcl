@@ -1,0 +1,6 @@
+(defpackage :pulock-common (:use :cl) (:export #:note #:*notes* #:*loads*))
+(in-package :pulock-common)
+(defvar *loads* 0)
+(incf *loads*)
+(defvar *notes* '())
+(defun note (what) (push what *notes*))

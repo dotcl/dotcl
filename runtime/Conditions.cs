@@ -425,6 +425,7 @@ public static class HandlerClusterStack
         try
         {
             handler.Invoke(condition);
+            MultipleValues.Reset();
         }
         finally
         {
@@ -564,38 +565,28 @@ public static class RestartClusterStack
         return false;
     }
 
+    /// <summary>CLHS 9.1.4.2: a restart is visible for CONDITION (NIL included)
+    /// only if its test function returns true, and, for a non-NIL condition, it
+    /// is associated with that condition or with none.</summary>
+    private static bool IsApplicable(LispRestart r, LispObject? condition)
+    {
+        if (condition == null) condition = Nil.Instance;
+        if (condition is not Nil && !IsAssociatedWith(r, condition) && IsAssociatedWithAny(r))
+            return false;
+        if (r.TestFunction == null) return true;
+        // The test's extra values must not leak out as the caller's.
+        var applicable = Runtime.IsTruthy(Runtime.Funcall(r.TestFunction, condition));
+        MultipleValues.Reset();
+        return applicable;
+    }
+
     public static LispRestart? FindRestartByName(string name, LispObject? condition = null)
     {
         if (_clusters == null) return null;
         for (int i = _clusters.Count - 1; i >= 0; i--)
-        {
             foreach (var r in _clusters[i])
-            {
-                if (r.Name == name)
-                {
-                    if (condition == null || condition is Nil)
-                    {
-                        // No condition: check test function with nil
-                        if (r.TestFunction != null)
-                        {
-                            var result = Runtime.Funcall(r.TestFunction, condition ?? Nil.Instance);
-                            if (result is Nil) continue;
-                        }
-                        return r;
-                    }
-                    // Has condition: check test function first
-                    if (r.TestFunction != null)
-                    {
-                        var result = Runtime.Funcall(r.TestFunction, condition);
-                        if (result is Nil) continue;
-                        return r;
-                    }
-                    // No test function: use association logic
-                    if (IsAssociatedWith(r, condition) || !IsAssociatedWithAny(r))
-                        return r;
-                }
-            }
-        }
+                if (r.Name == name && IsApplicable(r, condition))
+                    return r;
         return null;
     }
 
@@ -607,26 +598,7 @@ public static class RestartClusterStack
             for (int i = _clusters.Count - 1; i >= 0; i--)
                 foreach (var r in _clusters[i])
                     if (ReferenceEquals(r, restart))
-                    {
-                        if (condition == null || condition is Nil)
-                        {
-                            if (r.TestFunction != null)
-                            {
-                                var testResult = Runtime.Funcall(r.TestFunction, condition ?? Nil.Instance);
-                                if (testResult is Nil) return null;
-                            }
-                            return r;
-                        }
-                        if (r.TestFunction != null)
-                        {
-                            var testResult = Runtime.Funcall(r.TestFunction, condition);
-                            if (testResult is Nil) return null;
-                            return r;
-                        }
-                        if (IsAssociatedWith(r, condition) || !IsAssociatedWithAny(r))
-                            return r;
-                        return null;
-                    }
+                        return IsApplicable(r, condition) ? r : null;
             return null;
         }
         string name = nameOrRestart switch
@@ -642,28 +614,14 @@ public static class RestartClusterStack
     {
         if (_clusters == null) return Nil.Instance;
         LispObject result = Nil.Instance;
-        // Iterate from oldest cluster (0) to newest (Count-1),
-        // and within each cluster from last to first.
-        // Prepending with Cons produces: newest-cluster's first restart at head.
+        // Oldest cluster first, each cluster back to front, prepending: the
+        // newest cluster's first restart ends up at the head.
         for (int i = 0; i < _clusters.Count; i++)
         {
             var cluster = _clusters[i];
             for (int j = cluster.Length - 1; j >= 0; j--)
-            {
-                var r = cluster[j];
-                if (condition != null && condition is not Nil)
-                {
-                    // Check test function
-                    if (r.TestFunction != null)
-                    {
-                        var testResult = Runtime.Funcall(r.TestFunction, condition);
-                        if (testResult is Nil) continue;
-                    }
-                    else if (!IsAssociatedWith(r, condition) && IsAssociatedWithAny(r))
-                        continue;
-                }
-                result = new Cons(r, result);
-            }
+                if (IsApplicable(cluster[j], condition))
+                    result = new Cons(cluster[j], result);
         }
         return result;
     }
@@ -807,7 +765,7 @@ public static class ConditionSystem
     {
         if (System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0)
             Runtime.RunPendingInterruptsAtSafepoint();
-        if (!_interruptRequested || ReplLoop.Hosted) return;
+        if (!_interruptRequested || ReplLoop.Hosted || Runtime.InterruptsDeferred()) return;
         _interruptRequested = false;
         Error(new LispInteractiveInterrupt());
     }
@@ -870,7 +828,7 @@ public static class ConditionSystem
         int mvCount = CallTls.MvCount;
         if (System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0)
             Runtime.RunPendingInterruptsAtSafepoint();
-        if (_interruptRequested && !ReplLoop.Hosted)
+        if (_interruptRequested && !ReplLoop.Hosted && !Runtime.InterruptsDeferred())
         {
             _interruptRequested = false;
             Error(new LispInteractiveInterrupt());
@@ -880,6 +838,12 @@ public static class ConditionSystem
         System.Threading.Volatile.Write(ref PollGate, 0);
         System.Threading.Interlocked.MemoryBarrier();
         if (PollWorkPending()) RaisePollGate();
+    }
+
+    /// <summary>Deliver what WITHOUT-INTERRUPTS held back, on leaving it.</summary>
+    public static void ReceivePendingInterrupt()
+    {
+        if (PollGate != 0) PollCallSlow();
     }
 
     private static bool PollWorkPending() =>

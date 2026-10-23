@@ -44,7 +44,12 @@ public partial class LispFunction : LispObject
         // an interpreted DEFUN. Compiled code names its functions at emit time;
         // the interpreter has no emit step, so it names them right after
         // construction through %SET-FUNCTION-NAME. Nothing else mutates this.
-        internal set { _name = value; _frameName = FrameNameOf(value); }
+        internal set
+        {
+            _name = value; _frameName = FrameNameOf(value);
+            // A closure entry records no frame; a named closure goes back to InvokeN.
+            if (_closureEntry && _frameName != null) { _entryKey = 0; _entry = 0; _closureEntry = false; }
+        }
     }
 
     // Name to record on the debugger call stack, or null when this function must
@@ -119,8 +124,15 @@ public partial class LispFunction : LispObject
     // exists only for interpreted closures, so a compiled DEFUN had nothing.
     public LispObject? StoredLambdaList { get; internal set; }
 
-    // Debug: SIL body stored when dotcl:*save-sil* is true at defun time
-    public LispObject? Sil { get; internal set; }
+    // Debug: SIL body stored when dotcl:*save-sil* is true at defun time. Kept
+    // beside the function, not in it: almost no function has one, and every
+    // closure would carry the slot.
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<LispFunction, LispObject> s_sil = new();
+    public LispObject? Sil
+    {
+        get => s_sil.TryGetValue(this, out var v) ? v : null;
+        internal set { s_sil.Remove(this); if (value != null) s_sil.Add(this, value); }
+    }
 
     // Name this function was registered under, for the InvokeSlow statistics only.
     // C# builtins are constructed as anonymous lambdas and keep Name == null on
@@ -287,7 +299,7 @@ public partial class LispFunction : LispObject
         // frame to a callee that records no frame of its own (see TailPrepCore).
         // Kept in the same word so the frame does not grow for it.
         internal int _argc;
-        public int Argc => _argc & ~(LentBit | TypedArgsBit | TailRestBit);
+        public int Argc => _argc & ~(LentBit | TypedArgsBit | TailRestBit | TypedWideBit);
         internal bool Lent => (_argc & LentBit) != 0;
         internal const int LentBit = 1 << 30;
         // Set when the arguments are raw values held by the typed call that
@@ -297,6 +309,8 @@ public partial class LispFunction : LispObject
         // Set when _rest was allocated by Retarget, so the next Retarget of the
         // same length may overwrite it.
         internal const int TailRestBit = 1 << 28;
+        // With TypedArgsBit: _ext points at a TypedFrameArgsW (a wide typed call).
+        internal const int TypedWideBit = 1 << 27;
         public string Name;
         internal LispObject? _a0, _a1, _a2, _a3;
         internal LispObject[]? _rest; // non-null when args came as an array
@@ -305,6 +319,8 @@ public partial class LispFunction : LispObject
         // 0-4 argument frames stay as small as before and no array is
         // allocated. Only read while the frame is linked (see SnapshotFrames).
         internal FrameExt* _ext;
+        // This thread's CallTls.Top, so that Leave needs no TLS lookup.
+        internal Frame** _slot;
         // Compilation units kept alive for tail calls made while this frame is
         // linked (see KeepUnit): null, one unit holder, or a UnitSet.
         internal object? _unit;
@@ -392,12 +408,15 @@ public partial class LispFunction : LispObject
         { Prev = null; Depth = 0; Name = name; _argc = args.Length; _a0 = _a1 = _a2 = _a3 = null; _rest = args; _ext = null; _unit = null; }
         public Frame(string name, int argc, TypedFrameArgs* raw)
         { Prev = null; Depth = 0; Name = name; _argc = argc | TypedArgsBit; _a0 = _a1 = _a2 = _a3 = null; _rest = null; _ext = (FrameExt*)raw; _unit = null; }
+        public Frame(string name, int argc, TypedFrameArgsW* raw)
+        { Prev = null; Depth = 0; Name = name; _argc = argc | TypedArgsBit | TypedWideBit; _a0 = _a1 = _a2 = _a3 = null; _rest = null; _ext = (FrameExt*)raw; _unit = null; }
 
         public LispObject? Arg(int i)
         {
             if (_rest != null) return (uint)i < (uint)_rest.Length ? _rest[i] : null;
             if ((uint)i >= (uint)Argc) return null;
-            if ((_argc & TypedArgsBit) != 0) return ((TypedFrameArgs*)_ext)->Box(i);
+            if ((_argc & TypedArgsBit) != 0)
+                return (_argc & TypedWideBit) != 0 ? ((TypedFrameArgsW*)_ext)->Box(i) : ((TypedFrameArgs*)_ext)->Box(i);
             return i switch
             {
                 0 => _a0, 1 => _a1, 2 => _a2, 3 => _a3,
@@ -514,10 +533,12 @@ public partial class LispFunction : LispObject
     {
         if (++_stackCheckCounter % 256 == 0)
         {
+            var armed = ThrowReturn.Disarm();
             if (!Compat.TryEnsureSufficientExecutionStackWithMargin())
                 throw new LispErrorException(new LispStorageCondition(
                     $"Stack overflow in function {Name ?? "anonymous"}"));
             ConditionSystem.CheckInterrupt();
+            ThrowReturn.Rearm(armed);
         }
         // Push a debugger frame, exactly as InvokeSlow does for the same
         // args-array shape. This is the entry every non-emitted caller uses,
@@ -1315,6 +1336,8 @@ public partial class LispFunction : LispObject
             ConditionSystem.PollInterrupt();
             return TailKindDirect;
         }
+        if ((callee._sfMask & 1) != 0 && callee._func0 != null && (self == null || self.Length == 0))
+            return TailPrepSelfFramedAnon(callee, mode, self, 1);
         return callee.TailPrepCore(0, mode, self, null, null, null, null);
     }
 
@@ -1345,6 +1368,8 @@ public partial class LispFunction : LispObject
             ConditionSystem.PollInterrupt();
             return TailKindDirect;
         }
+        if ((callee._sfMask & 2) != 0 && callee._func1 != null && (self == null || self.Length == 0))
+            return TailPrepSelfFramedAnon(callee, mode, self, 2);
         return callee.TailPrepCore(1, mode, self, a0, null, null, null);
     }
 
@@ -1375,6 +1400,8 @@ public partial class LispFunction : LispObject
             ConditionSystem.PollInterrupt();
             return TailKindDirect;
         }
+        if ((callee._sfMask & 4) != 0 && callee._func2 != null && (self == null || self.Length == 0))
+            return TailPrepSelfFramedAnon(callee, mode, self, 4);
         return callee.TailPrepCore(2, mode, self, a0, a1, null, null);
     }
 
@@ -1405,6 +1432,8 @@ public partial class LispFunction : LispObject
             ConditionSystem.PollInterrupt();
             return TailKindDirect;
         }
+        if ((callee._sfMask & 8) != 0 && callee._func3 != null && (self == null || self.Length == 0))
+            return TailPrepSelfFramedAnon(callee, mode, self, 8);
         return callee.TailPrepCore(3, mode, self, a0, a1, a2, null);
     }
 
@@ -1435,7 +1464,21 @@ public partial class LispFunction : LispObject
             ConditionSystem.PollInterrupt();
             return TailKindDirect;
         }
+        if ((callee._sfMask & 16) != 0 && callee._func4 != null && (self == null || self.Length == 0))
+            return TailPrepSelfFramedAnon(callee, mode, self, 16);
         return callee.TailPrepCore(4, mode, self, a0, a1, a2, a3);
+    }
+
+    /// <summary>TailPrepCore's answer for a callee that links its own frame,
+    /// called from a body that owns no named frame.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe int TailPrepSelfFramedAnon(LispFunction callee, int mode, string? self, int bit)
+    {
+        ConditionSystem.PollInterrupt();
+        var top = s_top;
+        if (self != null && top != null && top->Lent) CallTls.Borrow = 1;
+        if (mode >= 0 && (callee._mvModeMask & bit) != 0) MultipleValues.SetMode(mode);
+        return TailKindDirect;
     }
 
     /// <summary>TailPrep for 5 to 8 arguments.</summary>
@@ -1827,6 +1870,8 @@ public partial class LispFunction : LispObject
     {
         // Clear the tag first so no reader pairs a new delegate with an old arity.
         _nativeArity = 0;
+        _typedEntry = 0;
+        _typedArgSpec = 0;
         _nativeDel = del;
         switch (del)
         {
@@ -1850,6 +1895,8 @@ public partial class LispFunction : LispObject
         if ((sigCode & 0x100) == 0)
             throw new ArgumentException($"SetTypedEntry: bad signature code {sigCode}");
         _nativeArity = 0;
+        _typedEntry = 0;
+        _typedArgSpec = 0;
         _nativeDel = del;
         Volatile.Write(ref _nativeArity, sigCode);
     }

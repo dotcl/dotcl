@@ -83,6 +83,9 @@ jobs:
     # Since 2026-09-29 the push set is about 12 min and the full run (below) is
     # the old nightly with nothing taken out, ~65-70 min. The ceiling is set by
     # the full run.
+    # The full run's pack path, ANSI and benchmarks are in the job
+    # full-pack-ansi-bench below; this job is the build, the gates and the
+    # regression suite in its three modes.
     timeout-minutes: 90
     # RUN_FULL selects the full run: the scheduled run, a run started by hand,
     # and a push to the public mirror (which moves only at releases, so a push
@@ -117,7 +120,24 @@ jobs:
       # fresh clone -- and makes them useless here, because a skip and a pass
       # look identical in the step list. With this set, a skip is a failure.
       DOTCL_CI: "1"
+      # The whole checkout is visible to ASDF, and nothing from the runner's own
+      # configuration is: a run reads the same registry on every machine.
+      CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") :ignore-inherited-configuration)'
     steps:
+      # A full disk fails a run somewhere unrelated, much later. Checked first
+      # on our own runners, which keep their disk between runs.
+      - name: Free disk space
+        if: runner.environment != 'github-hosted'
+        run: |
+          avail_kb=$(df -Pk / | awk 'NR == 2 { print $4 }')
+          echo "$((avail_kb / 1024)) MB free on /"
+          if [ "$avail_kb" -lt $((5 * 1024 * 1024)) ]; then
+            echo "::error::Less than 5 GB free on /"
+            df -h /
+            du -sh "$HOME"/.nuget/packages/* 2>/dev/null | sort -rh | head -20
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -139,6 +159,17 @@ jobs:
           echo 0 > "/sys/fs/cgroup${cg}/memory.peak" 2>/dev/null \
             && echo "=== memory.peak reset: yes ===" \
             || echo "=== memory.peak reset: no (kernel < 6.8, or not writable) ==="
+
+      # Every later bash step gets an empty XDG_CACHE_HOME of its own (bash reads
+      # BASH_ENV first), so no step passes because an earlier one, or an earlier
+      # run, left compiled fasls in the shared cache.
+      - name: Per-step cache directory
+        run: |
+          cat > "$RUNNER_TEMP/step-env.sh" <<'EOF'
+          export XDG_CACHE_HOME="$RUNNER_TEMP/xdg-cache/$GITHUB_ACTION"
+          mkdir -p "$XDG_CACHE_HOME"
+          EOF
+          echo "BASH_ENV=$RUNNER_TEMP/step-env.sh" >> "$GITHUB_ENV"
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -204,7 +235,7 @@ jobs:
       # instead (test/regression/inline-cs-short-opcodes.lisp). Full run only:
       # it builds the runtime in Release for net10.0, which nothing else in the
       # job has done by this point. Roslyn comes from the NuGet cache, which the
-      # pack step below has kept warm on a runner that keeps its home directory.
+      # pack step keeps warm on a runner that keeps its home directory.
       # ~10s on an M1 from a clean tree with a warm cache; about 1 min expected
       # here, going by the Build step.
       - name: Build contrib/dotnet-cs (full run; inline-cs regression tests)
@@ -352,252 +383,9 @@ jobs:
         if: env.RUN_FULL == 'true'
         run: make test-debug-pdb
 
-      # The other half of the MSBuild story: the step above builds with the legacy
-      # targets (external process), this one with the ProjectCore targets driving
-      # the in-process tasks -- the configuration every NuGet consumer gets, and
-      # the only one that executes DotCL.Build.Tasks.dll at all. Also the gate on
-      # what a failing build TELLS the user: a dependency that cannot be found is
-      # the first wall a new user hits, and the remedy is a build property they
-      # have no reason to know about. ~90s.
-      - name: Project-core MSBuild tasks
-        if: env.RUN_FULL == 'true'
-        run: make test-project-core-build
-
-      # -- Walk the release pack path without a tag -------------------------
-      # release.yml runs `make pack` only on a tag push, so a break anywhere in
-      # the packaging chain (a renamed R2R artifact, a csproj glob, a dropped
-      # staging step) surfaced for the first time AFTER the tag was already
-      # pushed, forcing a re-tag. v0.1.28 was cut twice for exactly that.
-      #
-      # One RID walks the whole chain: crossgen2, the runtime/ staging, both
-      # packs and the cleanup afterwards. ~11-14 min, so it is in the full run
-      # only. On the public mirror a push is a release, so it runs there too.
-      # The two `test -f` lines are the point: a pack that exits 0 without
-      # producing the base pointer or the per-RID package is the failure mode
-      # that reaches a release. `make pack` itself also fails if a tool package
-      # (dotcl, dotcl.<rid>, dotcl.any) lists a dependency: test/pack-nuspec/tool-deps.sh.
-      #
-      # The version is throwaway but not arbitrary: `dotcl pack` refuses a --from
-      # payload older than the first release whose runtime loads a loose user
-      # fasl (PackRestamp.LoaderFloor), and it reads that off the version string,
-      # so a 0.0.0 donor is refused however new the bits actually are. The step
-      # below packs from this one.
-      - name: Pack path (full run, one RID)
-        if: env.RUN_FULL == 'true'
-        run: |
-          make pack \
-            R2R_RIDS=linux-x64 \
-            PACK_VERSION=0.1.99-nightly \
-            PACK_ARGS=-p:DotclToolNoAndroid=true
-          test -f out/dotcl.0.1.99-nightly.nupkg
-          test -f out/dotcl.linux-x64.0.1.99-nightly.nupkg
-          ls -l out/*0.1.99-nightly*.nupkg
-
-      # `make pack` builds the nuspec from the project; this asserts the field
-      # rules (donor fields dropped when unsupplied, required fields refused
-      # rather than inherited) without publishing anything. ~20s.
-      #
-      # It needs a directory of published dotcl packages to restamp, and its
-      # check.sh SKIPs when there is none -- which is what it did in EVERY run
-      # it was ever enabled for: it sat above the step that produces them, so
-      # `out/` was always empty and the step finished in 4 seconds wearing a
-      # passing face. It now runs directly after the pack above, on the same
-      # condition, using those packages as the donor. That is also why it is not
-      # one of the every-push gates: the donor costs minutes to make.
-      - name: Pack nuspec rules (full run; donor = the packages above)
-        if: env.RUN_FULL == 'true'
-        run: make test-pack-nuspec
-
-      # A library packed with `dotcl pack --library` onto a local feed and loaded
-      # by another project through (:nuget ...), using the dotcl tool installed
-      # from the packages above, as a user has it. It fails, rather than skips,
-      # without them (DOTCL_CI=1), and checks the consumer compiled only its own
-      # file: the library's fasls came from the package. No network. ~5s on an
-      # M1 with the tool install, so ~10s here.
-      - name: Library package end to end (full run; dotcl = the packages above)
-        if: env.RUN_FULL == 'true'
-        run: make test-pack-library-e2e
-
-      # The same library packed by the previous released dotcl (installed from
-      # nuget.org, PREVIOUS_DOTCL_VERSION in the Makefile) and loaded by the tool
-      # above: the old fasls have to be used as they are and run, after one
-      # warning line per package. Catches a runtime change that breaks fasls
-      # already published. ~7s on an M1 including the download, so ~20s here.
-      - name: Library package from the previous release (full run)
-        if: env.RUN_FULL == 'true'
-        run: make test-pack-library-previous
-
-      # Cleanup is its own step so it also runs when the steps above fail: `out/`
-      # and the staged runtime/contrib are hundreds of MB on a runner that keeps
-      # its disk between runs.
-      - name: Clean up pack artifacts
-        if: ${{ always() && env.RUN_FULL == 'true' }}
-        run: rm -rf out runtime/contrib
-
-      # Fetching ansi-test is its own step so a failure there is reported as
-      # what it is. It used to be a prerequisite of the run below, whose `|| true`
-      # (there so a known ANSI failure does not fail the build) also swallowed a
-      # failed clone: the suite then ran zero categories, reported success, and
-      # the run went red three steps later inside the summary formatter.
-      - name: Fetch ansi-test
-        if: env.RUN_FULL == 'true'
-        run: make setup-ansi-test
-
-      # No `|| true`: the suite's own result is judged by the gate below (a known
-      # failure must not fail this step), but everything else this command can
-      # fail for -- the build, a missing runtime, the clone -- was being swallowed
-      # too, which is how the run stayed green while reporting nothing.
-      # Outputs land in out/ansi inside the workspace (ANSI_OUT in the
-      # Makefile), not in /tmp, which a persistent runner shares across jobs.
-      - name: ANSI tests
-        if: env.RUN_FULL == 'true'
-        run: mkdir -p out/ansi && make test-ansi-all STDBUF="stdbuf -oL" 2>&1 | tee out/ansi/summary.txt
-
-      - name: Generate failure details
-        if: ${{ always() && env.RUN_FULL == 'true' }}
-        run: |
-          for f in out/ansi/ansi-*.txt; do
-            [ -f "$f" ] || continue
-            grep -a -A 8 "^Test .* failed" "$f" 2>/dev/null | grep -a -E "^Test .* failed|^Form:|^Expected|^Actual|^          " | grep -v "^--$"
-          done > out/ansi/failures.txt || true
-
-      - name: Upload test outputs
-        if: ${{ always() && env.RUN_FULL == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ansi-test-outputs
-          path: |
-            out/ansi/ansi-*.txt
-            out/ansi/failures.txt
-            out/ansi/summary.txt
-
-      # The gate: the set of failing test names must be the set ansi-state.json
-      # records. Not a count -- ansi-test is an upstream clone whose total moves
-      # on its own, so a real regression can arrive in a run whose count is
-      # unchanged. Runs after the outputs are uploaded (so a red is diagnosable
-      # from the artifact) and BEFORE the state file is regenerated below, which
-      # would otherwise rewrite the very record being checked.
-      - name: ANSI gate
-        if: env.RUN_FULL == 'true'
-        run: make test-ansi-gate
-
-      - name: Update ansi-state.json
-        if: env.RUN_FULL == 'true'
-        run: make update-ansi-state
-
-      # Random differential test (test/random/): 1000 fresh random integer
-      # forms, each checked inside dotcl (optimized against notinline) and
-      # replayed on SBCL (Roswell, installed above) with the results diffed.
-      # The forms differ on every run, so a red here is a new finding rather
-      # than a regression of a known case: the uploaded cases.lsp and
-      # self-discrepancies.lsp reproduce it. Full run only.
-      - name: Random differential test
-        if: env.RUN_FULL == 'true'
-        run: make test-random-forms RANDOM_N=1000
-
-      - name: Upload random differential test outputs
-        if: ${{ failure() && env.RUN_FULL == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: random-forms-outputs
-          path: out/random-forms/
-
-      # A tree without bench/cl-bench-runner/run.lisp gives this step no inputs, and it used to
-      # run anyway on RUN_FULL alone and fail every time, kept green by the
-      # `|| true`: a step that could never succeed, wearing a passing face.
-      # Gate on the file instead, so it runs exactly where it can work and is
-      # honestly reported as skipped elsewhere.
-      # The `|| true` stays on purpose: benchmarks are data collection, not a
-      # gate, and a slow or missing SBCL must not fail the build.
-      # Benchmarks do not run on GitHub-hosted runners. A time ratio depends on
-      # the CPU, and hosted runners hand out different CPUs from run to run
-      # (EPYC 7763, 9V74, 9V45 seen within a week), so a baseline recorded on
-      # one cannot judge another: the gate either misses real regressions or
-      # fails on the luck of the draw. The baselines in
-      # bench/gate/ratio-baseline.json each belong to one fixed machine.
-      - name: Benchmarks
-        if: env.RUN_FULL == 'true' && hashFiles('bench/cl-bench-runner/run.lisp') != '' && runner.environment != 'github-hosted'
-        run: make bench-state || true
-
-      # Unlike the step above, this one is a gate and has no `|| true`. It can
-      # be: it compares dotcl against a C# program in this repository, so there
-      # is no external toolchain to be missing, and the check itself is a
-      # comparison against recorded ratios in bench/gate/ratio-baseline.json rather
-      # than against absolute times.
-      #
-      # It runs after `make bench-state` on purpose. bench-parity merges into
-      # the same bench-state.json, so running it second means the cl-bench rows
-      # are present and the median half of the check has something to work with.
-      #
-      # A measurement with no recorded baseline is printed in the format the
-      # baseline file wants. That is how a new runner gets its first numbers:
-      # read them out of this step's log and commit them.
-      #
-      # When any measurement it took had no baseline, check-ratios.sh says
-      # UNJUDGED and exits 3 rather than ok. All 9 linux-x64 measurements (8 parity kernels
-      # plus the cl-bench median) now have a baseline in
-      # bench/gate/ratio-baseline.json, so this gate judges every measurement it
-      # produces and CHECK_RATIOS_ALLOW_UNJUDGED is not needed here. If a new
-      # kernel is added to bench/csharp-parity/kernels.lisp without a matching
-      # linux-x64 entry, this step goes back to failing (exit 3) until one is
-      # recorded; that is intentional, not a regression to work around by
-      # re-adding the variable.
-      - name: Benchmark ratio gate
-        if: env.RUN_FULL == 'true' && hashFiles('bench/csharp-parity/kernels.lisp') != '' && runner.environment != 'github-hosted'
-        run: make bench-parity
-
       - name: Disk usage (after)
         if: always()
         run: df -h / && du -sh out/ansi 2>/dev/null || true
-
-      - name: Show results
-        if: ${{ always() && env.RUN_FULL == 'true' }}
-        run: |
-          {
-            echo "## ANSI Test Results"
-            echo ""
-            if [ -f out/ansi/summary.txt ]; then
-              echo '### Per-category (pass / elapsed / alloc)'
-              echo '```'
-              # Keep only result + TOTAL lines, drop build noise. The `|| echo`
-              # matters: this step runs under `set -e`, so a grep that matches
-              # nothing (a run that produced no category lines at all) would fail
-              # the job here: pointing at the summary formatter instead of at
-              # whatever actually went wrong upstream. Reporting must never
-              # decide the colour of the run.
-              grep -E '^(cons|strings|sequences|data-and-control-flow|hash-tables|symbols|arrays|types-and-classes|characters|pathnames|files|system-construction|iteration|eval-and-compile|conditions|printer|environment|structures|packages|objects|reader|numbers|streams|misc):|^TOTAL:|^GC TOTAL:' out/ansi/summary.txt \
-                || echo '(no per-category lines; see the ANSI step output)'
-              echo '```'
-              echo ''
-            fi
-            if [ -f ansi-state.json ]; then
-              echo '```json'
-              cat ansi-state.json
-              echo '```'
-            else
-              echo "ansi-state.json not generated"
-            fi
-            echo ""
-            echo "## Failed Tests (details)"
-            echo ""
-            if [ -s out/ansi/failures.txt ]; then
-              echo '```'
-              head -1000 out/ansi/failures.txt
-              echo '```'
-            else
-              echo "No failures found in output files"
-            fi
-            echo ""
-            echo "## Benchmark Results"
-            echo ""
-            if [ -f bench-state.json ]; then
-              echo '```json'
-              cat bench-state.json
-              echo '```'
-            else
-              echo "bench-state.json not generated"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
 
       # What this job actually costs in memory, written to the step summary.
       #
@@ -663,15 +451,419 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY" 2>&1
           exit 0
 
+  # -- The second half of the full run ----------------------------------------
+  # The pack path, ANSI, the random differential test and the benchmarks. A job
+  # of its own so the full run can use both runners; the benchmarks go last.
+  full-pack-ansi-bench:
+    name: full (pack, ANSI, bench)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push')
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      DOTCL_CI: "1"
+      CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") :ignore-inherited-configuration)'
+    steps:
+      # As in the test job.
+      - name: Free disk space
+        if: runner.environment != 'github-hosted'
+        run: |
+          avail_kb=$(df -Pk / | awk 'NR == 2 { print $4 }')
+          echo "$((avail_kb / 1024)) MB free on /"
+          if [ "$avail_kb" -lt $((5 * 1024 * 1024)) ]; then
+            echo "::error::Less than 5 GB free on /"
+            df -h /
+            du -sh "$HOME"/.nuget/packages/* 2>/dev/null | sort -rh | head -20
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Runner info
+        run: |
+          echo "=== CPU ===" && lscpu | grep -E 'Model name|^CPU\(s\)|Thread'
+          echo "=== Memory ===" && free -h
+          echo "=== Disk ===" && df -h /
+          cg=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup 2>/dev/null || true)
+          echo 0 > "/sys/fs/cgroup${cg}/memory.peak" 2>/dev/null \
+            && echo "=== memory.peak reset: yes ===" \
+            || echo "=== memory.peak reset: no (kernel < 6.8, or not writable) ==="
+
+      # As in the test job.
+      - name: Per-step cache directory
+        run: |
+          cat > "$RUNNER_TEMP/step-env.sh" <<'EOF'
+          export XDG_CACHE_HOME="$RUNNER_TEMP/xdg-cache/$GITHUB_ACTION"
+          mkdir -p "$XDG_CACHE_HOME"
+          EOF
+          echo "BASH_ENV=$RUNNER_TEMP/step-env.sh" >> "$GITHUB_ENV"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Roswell
+        run: |
+          if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
+            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          fi
+          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
+
+      - name: Cross-compile
+        run: make cross-compile
+
+      - name: Build
+        run: make build
+
+      # -- Walk the release pack path without a tag -------------------------
+      # release.yml runs `make pack` only on a tag push, so a break anywhere in
+      # the packaging chain (a renamed R2R artifact, a csproj glob, a dropped
+      # staging step) surfaced for the first time AFTER the tag was already
+      # pushed, forcing a re-tag. v0.1.28 was cut twice for exactly that.
+      #
+      # One RID walks the whole chain: crossgen2, the runtime/ staging, both
+      # packs and the cleanup afterwards. Only that RID's tool package (and the
+      # any-RID one) is built. ~11-14 min, so it is in the full run
+      # only. On the public mirror a push is a release, so it runs there too.
+      # The two `test -f` lines are the point: a pack that exits 0 without
+      # producing the base pointer or the per-RID package is the failure mode
+      # that reaches a release. `make pack` itself also fails if a tool package
+      # (dotcl, dotcl.<rid>, dotcl.any) lists a dependency: test/pack-nuspec/tool-deps.sh.
+      #
+      # The version is throwaway but not arbitrary: `dotcl pack` refuses a --from
+      # payload older than the first release whose runtime loads a loose user
+      # fasl (PackRestamp.LoaderFloor), and it reads that off the version string,
+      # so a 0.0.0 donor is refused however new the bits actually are. The step
+      # below packs from this one.
+      - name: Pack path (full run, one RID)
+        run: |
+          make pack \
+            R2R_RIDS=linux-x64 \
+            PACK_VERSION=0.1.99-nightly \
+            PACK_ARGS="-p:DotclToolNoAndroid=true -p:DotclToolRid=linux-x64"
+          test -f out/dotcl.0.1.99-nightly.nupkg
+          test -f out/dotcl.linux-x64.0.1.99-nightly.nupkg
+          ls -l out/*0.1.99-nightly*.nupkg
+
+      # `make pack` builds the nuspec from the project; this asserts the field
+      # rules (donor fields dropped when unsupplied, required fields refused
+      # rather than inherited) without publishing anything. ~20s.
+      #
+      # It needs a directory of published dotcl packages to restamp, and its
+      # check.sh SKIPs when there is none -- which is what it did in EVERY run
+      # it was ever enabled for: it sat above the step that produces them, so
+      # `out/` was always empty and the step finished in 4 seconds wearing a
+      # passing face. It now runs directly after the pack above, on the same
+      # condition, using those packages as the donor. That is also why it is not
+      # one of the every-push gates: the donor costs minutes to make.
+      - name: Pack nuspec rules (full run; donor = the packages above)
+        run: make test-pack-nuspec
+
+      # A library packed with `dotcl pack --library` onto a local feed and loaded
+      # by another project through (:nuget ...), using the dotcl tool installed
+      # from the packages above, as a user has it. It fails, rather than skips,
+      # without them (DOTCL_CI=1), and checks the consumer compiled only its own
+      # file: the library's fasls came from the package. No network. ~5s on an
+      # M1 with the tool install, so ~10s here.
+      - name: Library package end to end (full run; dotcl = the packages above)
+        run: make test-pack-library-e2e
+
+      # The same library packed by the previous released dotcl (installed from
+      # nuget.org, PREVIOUS_DOTCL_VERSION in the Makefile) and loaded by the tool
+      # above: the old fasls have to be used as they are and run, after one
+      # warning line per package. Catches a runtime change that breaks fasls
+      # already published. ~7s on an M1 including the download, so ~20s here.
+      - name: Library package from the previous release (full run)
+        run: make test-pack-library-previous
+
+      # Cleanup is its own step so it also runs when the steps above fail: `out/`
+      # and the staged runtime/contrib are hundreds of MB on a runner that keeps
+      # its disk between runs.
+      - name: Clean up pack artifacts
+        if: always()
+        run: rm -rf out runtime/contrib
+
+      # The other half of the MSBuild story: the Project composition step in the
+      # test job builds with the legacy targets (external process), this one
+      # with the ProjectCore targets driving the in-process tasks -- the
+      # configuration every NuGet consumer gets, and the only one that executes
+      # DotCL.Build.Tasks.dll at all. Also the gate on what a failing build TELLS
+      # the user: a dependency that cannot be found is the first wall a new user
+      # hits, and the remedy is a build property they have no reason to know
+      # about. Here, after the pack, the contrib fasls it needs are already built
+      # (~2 min; ~9 min in the test job, which has to build them first).
+      - name: Project-core MSBuild tasks
+        run: make test-project-core-build
+
+      # Fetching ansi-test is its own step so a failure there is reported as
+      # what it is. It used to be a prerequisite of the run below, whose `|| true`
+      # (there so a known ANSI failure does not fail the build) also swallowed a
+      # failed clone: the suite then ran zero categories, reported success, and
+      # the run went red three steps later inside the summary formatter.
+      - name: Fetch ansi-test
+        run: make setup-ansi-test
+
+      # No `|| true`: the suite's own result is judged by the gate below (a known
+      # failure must not fail this step), but everything else this command can
+      # fail for -- the build, a missing runtime, the clone -- was being swallowed
+      # too, which is how the run stayed green while reporting nothing.
+      # Outputs land in out/ansi inside the workspace (ANSI_OUT in the
+      # Makefile), not in /tmp, which a persistent runner shares across jobs.
+      - name: ANSI tests
+        run: mkdir -p out/ansi && make test-ansi-all STDBUF="stdbuf -oL" 2>&1 | tee out/ansi/summary.txt
+
+      - name: Generate failure details
+        if: always()
+        run: |
+          for f in out/ansi/ansi-*.txt; do
+            [ -f "$f" ] || continue
+            grep -a -A 8 "^Test .* failed" "$f" 2>/dev/null | grep -a -E "^Test .* failed|^Form:|^Expected|^Actual|^          " | grep -v "^--$"
+          done > out/ansi/failures.txt || true
+
+      - name: Upload test outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ansi-test-outputs
+          path: |
+            out/ansi/ansi-*.txt
+            out/ansi/failures.txt
+            out/ansi/summary.txt
+
+      # The gate: the set of failing test names must be the set ansi-state.json
+      # records. Not a count -- ansi-test is an upstream clone whose total moves
+      # on its own, so a real regression can arrive in a run whose count is
+      # unchanged. Runs after the outputs are uploaded (so a red is diagnosable
+      # from the artifact) and BEFORE the state file is regenerated below, which
+      # would otherwise rewrite the very record being checked.
+      - name: ANSI gate
+        run: make test-ansi-gate
+
+      - name: Update ansi-state.json
+        run: make update-ansi-state
+
+      # Random differential test (test/random/): 1000 fresh random integer
+      # forms, each checked inside dotcl (optimized against notinline) and
+      # replayed on SBCL (Roswell, installed above) with the results diffed.
+      # The forms differ on every run, so a red here is a new finding rather
+      # than a regression of a known case: the uploaded cases.lsp and
+      # self-discrepancies.lsp reproduce it. Full run only.
+      - name: Random differential test
+        run: make test-random-forms RANDOM_N=1000
+
+      - name: Upload random differential test outputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: random-forms-outputs
+          path: out/random-forms/
+
+      # A tree without bench/cl-bench-runner/run.lisp gives this step no inputs, and it used to
+      # run anyway on RUN_FULL alone and fail every time, kept green by the
+      # `|| true`: a step that could never succeed, wearing a passing face.
+      # Gate on the file instead, so it runs exactly where it can work and is
+      # honestly reported as skipped elsewhere.
+      # The `|| true` stays on purpose: benchmarks are data collection, not a
+      # gate, and a slow or missing SBCL must not fail the build.
+      # Benchmarks do not run on GitHub-hosted runners. A time ratio depends on
+      # the CPU, and hosted runners hand out different CPUs from run to run
+      # (EPYC 7763, 9V74, 9V45 seen within a week), so a baseline recorded on
+      # one cannot judge another: the gate either misses real regressions or
+      # fails on the luck of the draw. The baselines in
+      # bench/gate/ratio-baseline.json each belong to one fixed machine.
+      - name: Benchmarks
+        if: hashFiles('bench/cl-bench-runner/run.lisp') != '' && runner.environment != 'github-hosted'
+        run: make bench-state || true
+
+      # Unlike the step above, this one is a gate and has no `|| true`. It can
+      # be: it compares dotcl against a C# program in this repository, so there
+      # is no external toolchain to be missing, and the check itself is a
+      # comparison against recorded ratios in bench/gate/ratio-baseline.json rather
+      # than against absolute times.
+      #
+      # It runs after `make bench-state` on purpose. bench-parity merges into
+      # the same bench-state.json, so running it second means the cl-bench rows
+      # are present and the median half of the check has something to work with.
+      #
+      # A measurement with no recorded baseline is printed in the format the
+      # baseline file wants. That is how a new runner gets its first numbers:
+      # read them out of this step's log and commit them.
+      #
+      # When any measurement it took had no baseline, check-ratios.sh says
+      # UNJUDGED and exits 3 rather than ok. All 9 linux-x64 measurements (8 parity kernels
+      # plus the cl-bench median) now have a baseline in
+      # bench/gate/ratio-baseline.json, so this gate judges every measurement it
+      # produces and CHECK_RATIOS_ALLOW_UNJUDGED is not needed here. If a new
+      # kernel is added to bench/csharp-parity/kernels.lisp without a matching
+      # linux-x64 entry, this step goes back to failing (exit 3) until one is
+      # recorded; that is intentional, not a regression to work around by
+      # re-adding the variable.
+      - name: Benchmark ratio gate
+        if: hashFiles('bench/csharp-parity/kernels.lisp') != '' && runner.environment != 'github-hosted'
+        run: make bench-parity
+
+      - name: Disk usage (after)
+        if: always()
+        run: df -h / && du -sh out/ansi 2>/dev/null || true
+
+      - name: Show results
+        if: always()
+        run: |
+          {
+            echo "## ANSI Test Results"
+            echo ""
+            if [ -f out/ansi/summary.txt ]; then
+              echo '### Per-category (pass / elapsed / alloc)'
+              echo '```'
+              # Keep only result + TOTAL lines, drop build noise. The `|| echo`
+              # matters: this step runs under `set -e`, so a grep that matches
+              # nothing (a run that produced no category lines at all) would fail
+              # the job here: pointing at the summary formatter instead of at
+              # whatever actually went wrong upstream. Reporting must never
+              # decide the colour of the run.
+              grep -E '^(cons|strings|sequences|data-and-control-flow|hash-tables|symbols|arrays|types-and-classes|characters|pathnames|files|system-construction|iteration|eval-and-compile|conditions|printer|environment|structures|packages|objects|reader|numbers|streams|misc):|^TOTAL:|^GC TOTAL:' out/ansi/summary.txt \
+                || echo '(no per-category lines; see the ANSI step output)'
+              echo '```'
+              echo ''
+            fi
+            if [ -f ansi-state.json ]; then
+              echo '```json'
+              cat ansi-state.json
+              echo '```'
+            else
+              echo "ansi-state.json not generated"
+            fi
+            echo ""
+            echo "## Failed Tests (details)"
+            echo ""
+            if [ -s out/ansi/failures.txt ]; then
+              echo '```'
+              head -1000 out/ansi/failures.txt
+              echo '```'
+            else
+              echo "No failures found in output files"
+            fi
+            echo ""
+            echo "## Benchmark Results"
+            echo ""
+            if [ -f bench-state.json ]; then
+              echo '```json'
+              cat bench-state.json
+              echo '```'
+            else
+              echo "bench-state.json not generated"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Memory peak (informational)
+        if: always()
+        run: |
+          set +e
+          show_mem() {
+            for f in memory.peak memory.current memory.max \
+                     memory.max_usage_in_bytes memory.usage_in_bytes memory.limit_in_bytes; do
+              [ -r "$1/$f" ] && echo "$1/$f = $(cat "$1/$f")"
+            done
+          }
+          {
+            echo "## Job memory"
+            echo ""
+            echo '```'
+            echo "nproc: $(nproc)"
+            echo ""
+            echo "--- /proc/self/cgroup ---"
+            cat /proc/self/cgroup
+            echo ""
+            echo "--- cgroup memory (this cgroup first, then its ancestors) ---"
+            cg2=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)
+            cg1=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ { print $3; exit }' /proc/self/cgroup)
+            for base in "/sys/fs/cgroup${cg2}" ${cg1:+"/sys/fs/cgroup/memory${cg1}"}; do
+              d="$base"
+              while : ; do
+                case "$d" in /sys/fs/cgroup*) ;; *) break ;; esac
+                show_mem "$d"
+                nd=$(dirname "$d")
+                [ "$nd" = "$d" ] && break
+                d="$nd"
+              done
+            done
+            echo ""
+            echo "--- free -m ---"
+            free -m
+            echo ""
+            echo "--- /usr/bin/time ---"
+            if [ -x /usr/bin/time ]; then
+              echo "present (the three heavy steps can be wrapped in /usr/bin/time -v)"
+            else
+              echo "absent (apt-get install time) -- the cgroup figures above are the only route"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" 2>&1
+          exit 0
+
+  # -- A red scheduled run opens an issue --------------------------------------
+  # Nobody watches a run started by the clock. Opens an issue on the first red
+  # scheduled run and comments on it after that, until someone closes it.
+  # Never on the public mirror, which has no scheduled runs anyway.
+  report-scheduled-failure:
+    needs: [test, full-pack-ansi-bench, playground]
+    if: always() && github.event_name == 'schedule' && github.repository != 'dotcl/dotcl' && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      issues: write
+    steps:
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          api="$GITHUB_API_URL/repos/$GITHUB_REPOSITORY"
+          get() { curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
+          title="Scheduled full CI run failed"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          failed=$(get "$api/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+            | jq -r '.jobs[] | .name as $j | (.steps // [])[] | select(.conclusion == "failure" or .conclusion == "cancelled") | "- \($j): \(.name) (\(.conclusion))"')
+          body=$(printf '%s, commit %s\n%s\n\n%s\n' "$(date -u '+%Y-%m-%d %H:%M UTC')" "$GITHUB_SHA" "$run_url" "${failed:-(no failed step found; see the run)}")
+          num=$(get "$api/issues?state=open&creator=github-actions%5Bbot%5D&per_page=100" \
+            | jq -r --arg t "$title" '[.[] | select(.title == $t and (.pull_request | not))][0].number // empty')
+          if [ -n "$num" ]; then
+            jq -n --arg b "$body" '{body: $b}' | get -X POST "$api/issues/$num/comments" -d @- >/dev/null
+            echo "commented on issue $num"
+          else
+            jq -n --arg t "$title" --arg b "Close when the scheduled full run is green again.
+
+          $body" '{title: $t, body: $b}' | get -X POST "$api/issues" -d @- | jq -r '"opened issue \(.number)"'
+          fi
+
   # -- browser-wasm playground, full run only ---------------------------------
   # `dotnet publish` of a browser-wasm app succeeds while the page hangs or
   # dies at boot, so only a browser tells. Builds dotcl/playground against this
   # checkout and requires its probe to report `status: ready`.
   playground:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push')
+    # After the shorter of the two full-run jobs, so the test job does not wait
+    # for a runner behind it; always(), so a red pack or ANSI does not skip it.
+    needs: full-pack-ansi-bench
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push'))
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 40
     steps:
+      # As in the test job.
+      - name: Free disk space
+        if: runner.environment != 'github-hosted'
+        run: |
+          avail_kb=$(df -Pk / | awk 'NR == 2 { print $4 }')
+          echo "$((avail_kb / 1024)) MB free on /"
+          if [ "$avail_kb" -lt $((5 * 1024 * 1024)) ]; then
+            echo "::error::Less than 5 GB free on /"
+            df -h /
+            du -sh "$HOME"/.nuget/packages/* 2>/dev/null | sort -rh | head -20
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive

@@ -18,6 +18,9 @@
 
   "april": "The Quicklisp dist's april release ships cape/cape.asd in its tarball but does not index it, so `(ql:quickload \"april\")` fails with `System \"cape\" not found` on SBCL as well. Loaded from the unpacked release tree instead, `(april (test))` passes 1140 of 1140 here.",
 
+  "hu.dwim.quasi-quote": "Does not load: `hu.dwim.walker` has no dotcl branch for its lexical-environment code (`source/lexenv.lisp` signals `This is not implemented for your lisp`), so macroexpanding `lambda-with-bang-args-expander` in `source/generic/string.lisp` errors and the compile fails.",
+  "hu.dwim.rdbms": "Does not load, for the same reason as `hu.dwim.quasi-quote`: `hu.dwim.walker` has no dotcl branch for its lexical-environment code, so the macroexpansion of `lambda-with-bang-args-expander` in `source/generic/cursor.lisp` errors and the compile fails.",
+
   "hu.dwim.util": "Loads; `source/place.lisp` warns at read time (`#.(warn ...)`) that `symbol-global-value` has no implementation outside SBCL and falls back to `symbol-value`.",
 
   "hu.dwim.walker": "Loads. Its test system needs iolib, which has no branch for dotcl's Gray streams, and, as on SBCL, the C library libfixposix, which the measuring machine does not have.",
@@ -26,7 +29,7 @@
 
   "clx": "Loads. Its tests connect to an X server, and the measuring machine has none (`DISPLAY` is not set); SBCL fails the same four. `dependent.lisp` still warns at compile time that `buffer-input-wait-default` falls back to polling on an implementation it has no code for.",
 
-  "magicl": "Loads, but `with-array-pointers` signals an error while expanding on an implementation it does not know, so the tests stop at the first BLAS call. With a dotcl branch there the tests get as far as on SBCL, which stops in the LAPACK examples on `zuncsd_`, a routine the measuring machine's LAPACK does not export.",
+  "magicl": "Does not load: `magicl/ext-blas` expands `with-array-pointers`, which signals an error on an implementation it has no branch for, and the expansion error makes the compile of `blas-cffi` fail. With a dotcl branch there the system loads and the tests get as far as on SBCL, which stops in the LAPACK examples on `zuncsd_`, a routine the measuring machine's LAPACK does not export.",
 
   "coalton": "The released Coalton (2026-01-01) implements its hashing only for SBCL, Allegro and CCL and stops with `#.(error ...)` elsewhere, so it does not load. Coalton's upstream main supports dotcl, and the with forks column is measured from it: it loads in 51 seconds and its suite passes (698 checks), but building the test system takes 201 seconds and running the suite 481 (SBCL 2.6.8 on the same machine: 20, 70 and 53 seconds, with 757 checks including the thread tests dotcl does not run)."
 }

@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using static DotCL.NumStorage;
 
 namespace DotCL;
 
@@ -90,9 +91,13 @@ public static partial class Runtime
     /// ARRAY-ELEMENT-TYPE reports.</summary>
     public static LispObject MakeArrayLike(LispObject dims, LispObject array)
     {
-        if (dims is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue
-            && array is LispVector v && IsSpecializedStorageName(v.ElementTypeName))
-            return new LispVector((int)f.Value, Nil.Instance, v.ElementTypeName);
+        if (dims is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue && array is LispVector v)
+        {
+            if (v._numData != null && v._numKind is (>= 1 and <= 6) or 11)
+                return new LispVector((int)f.Value, v);
+            if (IsSpecializedStorageName(v.ElementTypeName))
+                return new LispVector((int)f.Value, Nil.Instance, v.ElementTypeName);
+        }
         return MakeArray(new[] { dims, Startup.Keyword("ELEMENT-TYPE"), ArrayElementType(array) });
     }
 
@@ -1039,6 +1044,208 @@ public static partial class Runtime
         return ArefSet2DSlow(array, Fixnum.Make(i0), Fixnum.Make(i1), value);
     }
 
+    // (SETF (AREF DST ...) (AREF SRC ...)) with its value unused, the element
+    // types unknown at compile time. The digits name the ranks of DST and SRC.
+    // When both subscripts reach a slot of the same storage, the element moves
+    // without being boxed; otherwise this is the ArefSet*L of the Aref*L.
+    public static void ArefCopy11L(LispObject dst, long d0, LispObject src, long s0)
+    {
+        if (Slot1(dst, d0, out var dv, out int dx) && Slot1(src, s0, out var sv, out int sx)
+            && MoveElement(dv, dx, sv, sx))
+            return;
+        ArefSetL(dst, d0, ArefL(src, s0));
+    }
+
+    public static void ArefCopy12L(LispObject dst, long d0, LispObject src, long s0, long s1)
+    {
+        if (Slot1(dst, d0, out var dv, out int dx) && Slot2(src, s0, s1, out var sv, out int sx)
+            && MoveElement(dv, dx, sv, sx))
+            return;
+        ArefSetL(dst, d0, Aref2DL(src, s0, s1));
+    }
+
+    public static void ArefCopy21L(LispObject dst, long d0, long d1, LispObject src, long s0)
+    {
+        if (Slot2(dst, d0, d1, out var dv, out int dx) && Slot1(src, s0, out var sv, out int sx)
+            && MoveElement(dv, dx, sv, sx))
+            return;
+        ArefSet2DL(dst, d0, d1, ArefL(src, s0));
+    }
+
+    public static void ArefCopy22L(LispObject dst, long d0, long d1, LispObject src, long s0, long s1)
+    {
+        if (Slot2(dst, d0, d1, out var dv, out int dx) && Slot2(src, s0, s1, out var sv, out int sx)
+            && MoveElement(dv, dx, sv, sx))
+            return;
+        ArefSet2DL(dst, d0, d1, Aref2DL(src, s0, s1));
+    }
+
+    // (SETF (AREF DST ...) X) with its value unused, DST's element type unknown
+    // at compile time and X an integer held as an int64.
+    public static void ArefSetLong1L(LispObject dst, long d0, long x)
+    {
+        if (Slot1(dst, d0, out var v, out int k) && StoreLong(v, k, x))
+            return;
+        ArefSetL(dst, d0, Fixnum.Make(x));
+    }
+
+    public static void ArefSetLong2L(LispObject dst, long d0, long d1, long x)
+    {
+        if (Slot2(dst, d0, d1, out var v, out int k) && StoreLong(v, k, x))
+            return;
+        ArefSet2DL(dst, d0, d1, Fixnum.Make(x));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool StoreLong(LispVector v, int k, long x)
+    {
+        if (v._numData == null)
+        {
+            v._elements[k] = Fixnum.Make(x);
+            return true;
+        }
+        if (!v.IsRawNumKind || v.IsFloatNumKind) return false;
+        v.NumSet(k, x);
+        return true;
+    }
+
+    // (FUNCALL FN (AREF A ...)), A's element type unknown at compile time: an
+    // element stored raw goes unboxed to FN's typed entry when FN has one that
+    // takes it; otherwise the ordinary call.
+    public static LispObject FuncallAref1L(LispFunction fn, LispObject a, long i)
+        => LispFunction.TryTypedOnLongElement(fn, a, i, out var r)
+           || fn._typedArgSpec != 0 && Slot1(a, i, out var v, out int x) && LispFunction.TryTypedOnElement(fn, v, x, out r)
+            ? r : LispFunction.Call1(fn, ArefL(a, i));
+
+    public static LispObject FuncallAref1LM(LispFunction fn, LispObject a, long i, int mode)
+        => LispFunction.TryTypedOnLongElement(fn, a, i, out var r)
+           || fn._typedArgSpec != 0 && Slot1(a, i, out var v, out int x) && LispFunction.TryTypedOnElement(fn, v, x, out r)
+            ? r : LispFunction.Call1M(fn, ArefL(a, i), mode);
+
+    // The same with the value wanted as an int64: the caller has declared it
+    // an integer within int64, and a value that is not a fixnum fails as
+    // UNBOX-FIXNUM fails.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long FuncallAref1LL(LispFunction fn, LispObject a, long i)
+        => LispFunction.TryTypedLongOnLongElement(fn, a, i, out long r)
+            ? r : FuncallAref1LLSlow(fn, a, i);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long FuncallAref1LLM(LispFunction fn, LispObject a, long i, int mode)
+        => LispFunction.TryTypedLongOnLongElement(fn, a, i, out long r)
+            ? r : FuncallAref1LLMSlow(fn, a, i, mode);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static long FuncallAref1LLSlow(LispFunction fn, LispObject a, long i)
+        => ((Fixnum)UnwrapMv(FuncallAref1L(fn, a, i))).Value;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static long FuncallAref1LLMSlow(LispFunction fn, LispObject a, long i, int mode)
+        => ((Fixnum)UnwrapMv(FuncallAref1LM(fn, a, i, mode))).Value;
+
+    // (FUNCALL FN X) with X an integer the caller holds as an int64 (an element
+    // of an array whose storage is known at compile time).
+    public static LispObject FuncallLong1(LispFunction fn, long e)
+        => LispFunction.TryTypedLongOnLong(fn, e, out long r) ? Fixnum.Make(r) : LispFunction.Call1(fn, Fixnum.Make(e));
+
+    public static LispObject FuncallLong1M(LispFunction fn, long e, int mode)
+        => LispFunction.TryTypedLongOnLong(fn, e, out long r) ? Fixnum.Make(r) : LispFunction.Call1M(fn, Fixnum.Make(e), mode);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long FuncallLong1L(LispFunction fn, long e)
+        => LispFunction.TryTypedLongOnLong(fn, e, out long r) ? r : FuncallLong1LSlow(fn, e);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long FuncallLong1LM(LispFunction fn, long e, int mode)
+        => LispFunction.TryTypedLongOnLong(fn, e, out long r) ? r : FuncallLong1LMSlow(fn, e, mode);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static long FuncallLong1LSlow(LispFunction fn, long e)
+        => ((Fixnum)UnwrapMv(LispFunction.Call1(fn, Fixnum.Make(e)))).Value;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static long FuncallLong1LMSlow(LispFunction fn, long e, int mode)
+        => ((Fixnum)UnwrapMv(LispFunction.Call1M(fn, Fixnum.Make(e), mode))).Value;
+
+    public static long FuncallAref2LL(LispFunction fn, LispObject a, long i0, long i1)
+        => ((Fixnum)UnwrapMv(FuncallAref2L(fn, a, i0, i1))).Value;
+
+    public static long FuncallAref2LLM(LispFunction fn, LispObject a, long i0, long i1, int mode)
+        => ((Fixnum)UnwrapMv(FuncallAref2LM(fn, a, i0, i1, mode))).Value;
+
+    public static LispObject FuncallAref2L(LispFunction fn, LispObject a, long i0, long i1)
+        => fn._typedArgSpec != 0 && Slot2(a, i0, i1, out var v, out int x) && LispFunction.TryTypedOnElement(fn, v, x, out var r)
+            ? r : LispFunction.Call1(fn, Aref2DL(a, i0, i1));
+
+    public static LispObject FuncallAref2LM(LispFunction fn, LispObject a, long i0, long i1, int mode)
+        => fn._typedArgSpec != 0 && Slot2(a, i0, i1, out var v, out int x) && LispFunction.TryTypedOnElement(fn, v, x, out var r)
+            ? r : LispFunction.Call1M(fn, Aref2DL(a, i0, i1), mode);
+
+    // The slot ArefL / ArefSetL would take for I, under the same conditions.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool Slot1(LispObject a, long i, out LispVector v, out int x)
+    {
+        if (a is LispVector lv && lv._displacedTo == null && lv._dimensions == null
+            && lv._bitData == null
+            && (lv._numData != null ? (ulong)i < (ulong)lv._numLen
+                                    : (ulong)i < (ulong)lv._elements.Length))
+        {
+            v = lv; x = (int)i; return true;
+        }
+        v = null!; x = 0; return false;
+    }
+
+    // The slot Aref2DL / ArefSet2DL would take for (I0 I1).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool Slot2(LispObject a, long i0, long i1, out LispVector v, out int x)
+    {
+        if (a is LispVector lv
+            && lv._displacedTo == null && lv._bitData == null
+            && lv._dimensions != null && lv._dimensions.Length == 2
+            && (ulong)i0 < (ulong)lv._dimensions[0] && (ulong)i1 < (ulong)lv._dimensions[1])
+        {
+            long idx = i0 * lv._dimensions[1] + i1;
+            if (lv._numData != null ? (ulong)idx < (ulong)lv._numLen
+                                    : (ulong)idx < (ulong)lv._elements.Length)
+            {
+                v = lv; x = (int)idx; return true;
+            }
+        }
+        v = null!; x = 0; return false;
+    }
+
+    // Element storage of the same kind and width on both sides: every value
+    // of S is an element of D, so the store cannot fail and needs no box.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool MoveElement(LispVector d, int dx, LispVector s, int sx)
+    {
+        var dn = d._numData;
+        var sn = s._numData;
+        if (dn == null)
+        {
+            if (sn != null) return false;
+            d._elements[dx] = s._elements[sx] ?? Nil.Instance;
+            return true;
+        }
+        if (sn == null || d._numKind != s._numKind || d._numNarrow != s._numNarrow)
+            return false;
+        switch (d._numKind)
+        {
+            case 1: ((byte[])dn)[dx] = ((byte[])sn)[sx]; return true;
+            case 2: ((ushort[])dn)[dx] = ((ushort[])sn)[sx]; return true;
+            case 3: ((int[])dn)[dx] = ((int[])sn)[sx]; return true;
+            case 4: ((long[])dn)[dx] = ((long[])sn)[sx]; return true;
+            case 5: ((float[])dn)[dx] = ((float[])sn)[sx]; return true;
+            case 6: ((double[])dn)[dx] = ((double[])sn)[sx]; return true;
+            case 7: ((char[])dn)[dx] = ((char[])sn)[sx]; return true;
+            case 8: ((uint[])dn)[dx] = ((uint[])sn)[sx]; return true;
+            case 9: ((sbyte[])dn)[dx] = ((sbyte[])sn)[sx]; return true;
+            case 10: ((short[])dn)[dx] = ((short[])sn)[sx]; return true;
+            case 11: ((ulong[])dn)[dx] = ((ulong[])sn)[sx]; return true;
+            default: return false;
+        }
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject Aref3DL(LispObject array, long i0, long i1, long i2)
     {
@@ -1209,7 +1416,7 @@ public static partial class Runtime
     /// the buffer cannot be swapped while a binding holds it.</summary>
     private static char[]? SimpleCharVectorData(LispObject s)
         => s is LispVector v && v._dimensions == null && v.IsSimple
-           && v._numData is char[] cv ? cv : null;
+           && ArrayAs<char>(v._numData) is { } cv ? cv : null;
 
     /// <summary>The int64 element buffer of a vector declared
     /// (simple-array fixnum (*)) / (simple-array (signed-byte 64) (*)).</summary>
@@ -1218,7 +1425,7 @@ public static partial class Runtime
         if (array is LispVector v && v._dimensions == null)
         {
             if (!BackingPinned(v)) return null;
-            if (v._numKind == 4 && v._numData is long[] d) return d;
+            if (v._numKind == 4 && ArrayAs<long>(v._numData) is { } d) return d;
             if (v.IsForeignWidthKind) return null;
         }
         throw BackingTypeError(array, "FIXNUM");
@@ -1244,7 +1451,7 @@ public static partial class Runtime
         if (array is LispVector v && v._dimensions == null)
         {
             if (!BackingPinned(v)) return null;
-            if (v._numData is int[] d) return d;
+            if (ArrayAs<int>(v._numData) is { } d) return d;
             if (v.IsForeignWidthKind) return null;
         }
         throw BackingTypeError(array, "SIGNED-BYTE-32");
@@ -1255,7 +1462,7 @@ public static partial class Runtime
         if (array is LispVector v && v._dimensions == null)
         {
             if (!BackingPinned(v)) return null;
-            if (v._numData is ushort[] d) return d;
+            if (ArrayAs<ushort>(v._numData) is { } d) return d;
         }
         throw BackingTypeError(array, "UNSIGNED-BYTE-16");
     }
@@ -1281,7 +1488,7 @@ public static partial class Runtime
         if (array is LispVector v && v._dimensions == null)
         {
             if (!BackingPinned(v)) return null;
-            if (v._numData is byte[] d) return d;
+            if (ArrayAs<byte>(v._numData) is { } d) return d;
         }
         throw BackingTypeError(array, "UNSIGNED-BYTE-8");
     }
@@ -1297,7 +1504,7 @@ public static partial class Runtime
         if (array is LispVector v && v._dimensions == null)
         {
             if (!BackingPinned(v)) return null;
-            if (v._numData is double[] d) return d;
+            if (ArrayAs<double>(v._numData) is { } d) return d;
             return null;
         }
         throw BackingTypeError(array, "DOUBLE-FLOAT");
@@ -1310,7 +1517,7 @@ public static partial class Runtime
         if (array is LispVector v && v._dimensions == null)
         {
             if (!BackingPinned(v)) return null;
-            if (v._numData is float[] d) return d;
+            if (ArrayAs<float>(v._numData) is { } d) return d;
             return null;
         }
         throw BackingTypeError(array, "SINGLE-FLOAT");
@@ -1362,7 +1569,7 @@ public static partial class Runtime
         {
             if (!BackingPinned(v))
                 throw NotSimpleDeclError(array, SimpleVectorOf(SizedByte("SIGNED-BYTE", 64)), null);
-            if (v._numKind == 4 && v._numData is long[] d) return d;
+            if (v._numKind == 4 && ArrayAs<long>(v._numData) is { } d) return d;
             if (v.IsForeignWidthKind) return null;
         }
         throw BackingTypeError(array, "FIXNUM");
@@ -1385,7 +1592,7 @@ public static partial class Runtime
         {
             if (!BackingPinned(v))
                 throw NotSimpleDeclError(array, SimpleVectorOf(SizedByte("SIGNED-BYTE", 32)), null);
-            if (v._numData is int[] d) return d;
+            if (ArrayAs<int>(v._numData) is { } d) return d;
             if (v.IsForeignWidthKind) return null;
         }
         throw BackingTypeError(array, "SIGNED-BYTE-32");
@@ -1397,8 +1604,7 @@ public static partial class Runtime
         {
             if (!BackingPinned(v))
                 throw NotSimpleDeclError(array, SimpleVectorOf(Startup.Sym("DOUBLE-FLOAT")), null);
-            if (v._numData is double[] d) return d;
-            return null;
+            if (ArrayAs<double>(v._numData) is { } d) return d;
         }
         throw BackingTypeError(array, "DOUBLE-FLOAT");
     }
@@ -1409,8 +1615,7 @@ public static partial class Runtime
         {
             if (!BackingPinned(v))
                 throw NotSimpleDeclError(array, SimpleVectorOf(Startup.Sym("SINGLE-FLOAT")), null);
-            if (v._numData is float[] d) return d;
-            return null;
+            if (ArrayAs<float>(v._numData) is { } d) return d;
         }
         throw BackingTypeError(array, "SINGLE-FLOAT");
     }
@@ -1450,13 +1655,20 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static void SetAtF64(ref double r, long i, double v) => Unsafe.Add(ref r, (nint)i) = v;
     [MethodImpl(MethodImplOptions.AggressiveInlining)] public static void SetAtF32(ref float r, long i, double v) => Unsafe.Add(ref r, (nint)i) = (float)v;
 
+    // The compiled code read the constant NAME's element buffer without a
+    // fallback, because its value had one when the code was compiled.
+    public static Exception ConstantArrayChanged(LispObject name) =>
+        new LispErrorException(new LispTypeError(
+            $"the constant {name} no longer holds the kind of array it held when the code reading it was compiled",
+            name, Startup.Sym("SIMPLE-ARRAY")));
+
     public static ushort[] BackingU16Checked(LispObject array)
     {
         if (array is LispVector v && v._dimensions == null)
         {
             if (!BackingPinned(v))
                 throw NotSimpleDeclError(array, SimpleVectorOf(SizedByte("UNSIGNED-BYTE", 16)), null);
-            if (v._numData is ushort[] d) return d;
+            if (ArrayAs<ushort>(v._numData) is { } d) return d;
         }
         throw BackingTypeError(array, "UNSIGNED-BYTE-16");
     }
@@ -1467,7 +1679,7 @@ public static partial class Runtime
         {
             if (!BackingPinned(v))
                 throw NotSimpleDeclError(array, SimpleVectorOf(SizedByte("UNSIGNED-BYTE", 8)), null);
-            if (v._numData is byte[] d) return d;
+            if (ArrayAs<byte>(v._numData) is { } d) return d;
         }
         throw BackingTypeError(array, "UNSIGNED-BYTE-8");
     }
@@ -1503,7 +1715,7 @@ public static partial class Runtime
         if (array is LispVector v && v._dimensions == null && v._numNarrow == narrow
             && BackingPinned(v))
         {
-            if (v._numKind == 4 && v._numData is long[] d) return d;
+            if (v._numKind == 4 && ArrayAs<long>(v._numData) is { } d) return d;
             if (v.IsForeignWidthKind) return null;
         }
         throw NarrowDeclError(array, narrow, Startup.Sym("FIXNUM"));
@@ -1514,7 +1726,7 @@ public static partial class Runtime
         if (array is LispVector v && v._dimensions == null && v._numNarrow == narrow
             && BackingPinned(v))
         {
-            if (v._numData is int[] d) return d;
+            if (ArrayAs<int>(v._numData) is { } d) return d;
             if (v.IsForeignWidthKind) return null;
         }
         throw NarrowDeclError(array, narrow, SizedByte("SIGNED-BYTE", 32));
@@ -1523,7 +1735,7 @@ public static partial class Runtime
     public static ushort[] BackingU16Narrow(LispObject array, int narrow)
     {
         if (array is LispVector v && v._dimensions == null && v._numNarrow == narrow
-            && BackingPinned(v) && v._numData is ushort[] d)
+            && BackingPinned(v) && ArrayAs<ushort>(v._numData) is { } d)
             return d;
         throw NarrowDeclError(array, narrow, SizedByte("UNSIGNED-BYTE", 16));
     }
@@ -1531,7 +1743,7 @@ public static partial class Runtime
     public static byte[] BackingU8Narrow(LispObject array, int narrow)
     {
         if (array is LispVector v && v._dimensions == null && v._numNarrow == narrow
-            && BackingPinned(v) && v._numData is byte[] d)
+            && BackingPinned(v) && ArrayAs<byte>(v._numData) is { } d)
             return d;
         throw NarrowDeclError(array, narrow, SizedByte("UNSIGNED-BYTE", 8));
     }
@@ -2013,6 +2225,20 @@ public static partial class Runtime
     /// here instead cost a second array per structure created, which for a two-slot
     /// structure was a third of the allocation.
     /// </summary>
+    public static LispObject MakeStructRaw(LispObject typeName, LispObject[]? slots, long[] raws,
+                                           int version, long kinds, int slotCount)
+    {
+        if (typeName is not Symbol sym)
+            throw new LispErrorException(new LispTypeError("MAKE-STRUCT: type name must be a symbol", typeName));
+        return LispStruct.MakeRaw(sym, slots, raws, version, kinds, slotCount);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long DoubleBits(double d) => BitConverter.DoubleToInt64Bits(d);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long SingleBits(float f) => Compat.SingleToInt32Bits(f);
+
     public static LispObject MakeStruct(LispObject typeName, params LispObject[] slots)
     {
         if (typeName is not Symbol sym)
@@ -2082,7 +2308,68 @@ public static partial class Runtime
             $"structure {s.TypeName} was redefined (slot layout version {s.LayoutVersion}, "
             + $"this accessor was compiled against {want}); recompile the caller"));
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject StructRefI(LispObject obj, int packed)
+    {
+        if (obj is LispStruct s && s.BoxedSlotOrNull(packed) is LispObject v) return v;
+        return StructRefISlow(obj, packed);
+    }
+
+    /// <summary>StructRefI for the accessor of the structure TYPE: OBJ must be
+    /// a TYPE or a structure that includes it.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject StructRefIT(LispObject obj, int packed, LispObject type)
+    {
+        if (obj is LispStruct s && ReferenceEquals(s.TypeName, type)
+            && s.BoxedSlotOrNull(packed) is LispObject v) return v;
+        return StructRefITSlow(obj, packed, type);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject StructRefITSlow(LispObject obj, int packed, LispObject type)
+        => StructRefI(StructOf(obj, type), packed);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject StructSetIT(LispObject obj, int packed, LispObject value, LispObject type)
+    {
+        if (obj is LispStruct s && ReferenceEquals(s.TypeName, type)
+            && s.TrySetBoxedSlot(packed, value)) return value;
+        return StructSetITSlow(obj, packed, value, type);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject StructSetITSlow(LispObject obj, int packed, LispObject value, LispObject type)
+        => StructSetI(StructOf(obj, type), packed, value);
+
+    /// <summary>OBJ, when it is a structure of TYPE or of a type that includes
+    /// TYPE; else a TYPE-ERROR.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject StructOf(LispObject obj, LispObject type)
+    {
+        if (obj is LispStruct s && ReferenceEquals(s.TypeName, type)) return obj;
+        return StructOfSlow(obj, type);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject StructOfSlow(LispObject obj, LispObject type)
+    {
+        switch (obj)
+        {
+            case LispStruct s:
+                if (ReferenceEquals(s.TypeName, type) || IsStructSubclass(s.TypeName, type)) return obj;
+                break;
+            case LispInstance inst when inst.Class.IsStructureClass:
+                if (FindClassOrNil(type) is LispClass c && ClassIncludes(inst.Class, c)) return obj;
+                break;
+            // The SBCL cross-build reads its PACKAGE structure's slots off ours.
+            case Package:
+                return obj;
+        }
+        throw TypedEntryTypeError(obj, type);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject StructRefISlow(LispObject obj, int packed)
     {
         if (obj is LispStruct s)
         {
@@ -2483,7 +2770,15 @@ public static partial class Runtime
         return type;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject StructSetI(LispObject obj, int packed, LispObject value)
+    {
+        if (obj is LispStruct s && s.TrySetBoxedSlot(packed, value)) return value;
+        return StructSetISlow(obj, packed, value);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject StructSetISlow(LispObject obj, int packed, LispObject value)
     {
         if (obj is LispStruct s)
         {
@@ -2549,14 +2844,21 @@ public static partial class Runtime
         throw new LispErrorException(new LispTypeError("STRUCT-SET: not a structure", obj));
     }
 
+    /// <summary>A structure named OWN matches the type TARGET by name only when
+    /// TARGET is a different symbol of the same name that does not name another
+    /// class (a same-named structure of another package is another type).</summary>
+    internal static bool StructNameMatches(Symbol own, Symbol target) =>
+        own.Name == target.Name
+        && !(FindClassOrNil(target) is LispClass tc && FindClassOrNil(own) is LispClass oc
+             && !ReferenceEquals(tc, oc));
+
     public static LispObject StructTypep(LispObject obj, LispObject typeName)
     {
         if (obj is LispStruct s && typeName is Symbol sym)
         {
             // Fast path: exact symbol reference equality
             if (ReferenceEquals(s.TypeName, sym)) return T.Instance;
-            // Fallback: name comparison (different symbol objects, same name)
-            if (s.TypeName.Name == sym.Name) return T.Instance;
+            if (StructNameMatches(s.TypeName, sym)) return T.Instance;
             // Check class hierarchy for :include inheritance
             var cls = FindClassOrNil(s.TypeName) as LispClass;
             var targetCls = FindClassOrNil(sym) as LispClass;

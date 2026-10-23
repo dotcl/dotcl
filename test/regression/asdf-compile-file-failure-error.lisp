@@ -124,3 +124,64 @@
             (setf (symbol-value reg)
                   (remove dir (symbol-value reg) :test #'equal)))))
     (:loaded :loaded)))
+
+;;; The same on a build with a compiler: ASDF takes an asdf.asd of its own
+;;; version as modified source and reloads itself from it, which undoes what
+;;; dotcl replaced after loading ASDF (uiop:parse-unix-namestring on Windows).
+;;; The fakes here carry the running versions and signal an error if loaded.
+(defun %cffe-fake-asdf-uiop-dir (tag asdf-version uiop-version)
+  (let ((dir (format nil "~a/dotcl-cffe-~a-~a/"
+                     (regression-temp-dir) tag (get-internal-real-time))))
+    (ensure-directories-exist dir)
+    (flet ((put (file text)
+             (with-open-file (s (concatenate 'string dir file)
+                                :direction :output :if-exists :supersede)
+               (write-string text s))))
+      (put "asdf.asd" "(defsystem \"asdf\" :components ((:file \"fake-asdf\")))")
+      (put "version.lisp-expr" (format nil "~s" asdf-version))
+      (put "fake-asdf.lisp" "(error \"fake asdf loaded\")")
+      (put "uiop.asd" "(defsystem \"uiop\" :components ((:file \"fake-uiop\")))")
+      (put "version.lisp"
+           (format nil "(progn) (progn) (progn () (defparameter v ~s))" uiop-version))
+      (put "fake-uiop.lisp" "(error \"fake uiop loaded\")"))
+    dir))
+
+(deftest asdf-keeps-running-asdf-and-uiop-of-same-version
+    (progn
+      (require "asdf")
+      (let ((dir (%cffe-fake-asdf-uiop-dir
+                  "same-asdf-uiop"
+                  (funcall (read-from-string "asdf:asdf-version"))
+                  (symbol-value (find-symbol "*UIOP-VERSION*" "UIOP"))))
+            (reg (find-symbol "*CENTRAL-REGISTRY*" "ASDF")))
+        (push dir (symbol-value reg))
+        (unwind-protect
+             (list (%cffe-load "cffe-same-asdf" "(defun cffe-same-asdf-fn () 1)"
+                               '("asdf"))
+                   (%cffe-load "cffe-same-uiop" "(defun cffe-same-uiop-fn () 1)"
+                               '("uiop")))
+          (setf (symbol-value reg)
+                (remove dir (symbol-value reg) :test #'equal)))))
+  (:loaded :loaded))
+
+;;; A strictly newer asdf.asd / uiop.asd in the registry is still found, so ASDF
+;;; can upgrade to it. Checked on the search alone: loading the fake would leave
+;;; it registered as "asdf".
+(deftest-emitting-only asdf-leaves-newer-asdf-and-uiop-to-asdf
+    (progn
+      (require "asdf")
+      (let ((dir (%cffe-fake-asdf-uiop-dir "newer-asdf-uiop" "999" "999"))
+            (reg (find-symbol "*CENTRAL-REGISTRY*" "ASDF"))
+            (locate (read-from-string "asdf::locate-system")))
+        (push dir (symbol-value reg))
+        (unwind-protect
+             (mapcar (lambda (name)
+                       (let ((asd (nth-value 2 (funcall locate name))))
+                         (and asd
+                              (search "newer-asdf-uiop" (namestring asd))
+                              (equal (file-namestring asd)
+                                     (concatenate 'string name ".asd")))))
+                     '("asdf" "uiop"))
+          (setf (symbol-value reg)
+                (remove dir (symbol-value reg) :test #'equal)))))
+  (t t))

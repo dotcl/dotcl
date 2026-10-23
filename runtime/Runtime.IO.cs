@@ -1762,7 +1762,7 @@ public static partial class Runtime
         {
             var fn = GrayStreamLookup.GrayOrCl("STREAM-READ-CHAR-NO-HANG")
                 ?? throw new LispErrorException(new LispError("Gray stream: STREAM-READ-CHAR-NO-HANG not defined"));
-            var r = fn.Invoke(new LispObject[] { grIn });
+            var r = CallForPrimary(fn, grIn);
             if (r is Symbol es && es.Name == "EOF")
             {
                 if (IsTruthy(eofErrorP)) throw new LispErrorException(MakeEndOfFileError(streamObj));
@@ -1847,7 +1847,7 @@ public static partial class Runtime
                 return T.Instance;
             var listenFn = GrayStreamLookup.GrayOrCl("STREAM-LISTEN");
             if (listenFn != null)
-                return IsTruthy(listenFn.Invoke(new LispObject[] { gli })) ? T.Instance : Nil.Instance;
+                return IsTruthy(CallForPrimary(listenFn, gli)) ? T.Instance : Nil.Instance;
         }
         // Resolve stream designators
         var resolved = stream;
@@ -1895,7 +1895,7 @@ public static partial class Runtime
         // Binary gray streams included, for the same reason as force-output.
         if (GrayComponent(stream, true) is LispInstance gi)
         {
-            GrayStreamLookup.GrayOrCl("STREAM-CLEAR-INPUT")?.Invoke(new LispObject[] { gi });
+            CallForPrimary(GrayStreamLookup.GrayOrCl("STREAM-CLEAR-INPUT"), gi);
             return Nil.Instance;
         }
         // Validate: must be a stream designator (stream, nil, or t)
@@ -1942,7 +1942,7 @@ public static partial class Runtime
                 throw new LispErrorException(new LispTypeError("WRITE-BYTE: not an integer", byteObj));
             var fn = GrayStreamLookup.StreamWriteByte.Get()
                 ?? throw new LispErrorException(new LispError("Gray stream: STREAM-WRITE-BYTE not defined"));
-            fn.Invoke2(gbo, byteObj);
+            CallForPrimary(fn, gbo, byteObj);
             return byteObj;
         }
 
@@ -1969,7 +1969,7 @@ public static partial class Runtime
         {
             var fn = GrayStreamLookup.StreamReadByte.Get()
                 ?? throw new LispErrorException(new LispError("Gray stream: STREAM-READ-BYTE not defined"));
-            var r = fn.Invoke1(gbi);
+            var r = CallForPrimary(fn, gbi);
             if (r is Symbol es && es.Name == "EOF")
             {
                 if (eofErrorP) throw new LispErrorException(MakeEndOfFileError(stream));
@@ -2070,7 +2070,7 @@ public static partial class Runtime
         {
             var fn = GrayStreamLookup.GrayOrCl("STREAM-READ-BYTE")
                 ?? throw new LispErrorException(new LispError("Gray stream: STREAM-READ-BYTE not defined"));
-            var r = fn.Invoke(new LispObject[] { gi });
+            var r = CallForPrimary(fn, gi);
             if (r is Symbol s && s.Name == "EOF") return -1;
             if (r is Fixnum f) return (int)f.Value & 0xFF;
             return -1;
@@ -2112,7 +2112,7 @@ public static partial class Runtime
         {
             var fn = GrayStreamLookup.GrayOrCl("STREAM-WRITE-BYTE")
                 ?? throw new LispErrorException(new LispError("Gray stream: STREAM-WRITE-BYTE not defined"));
-            fn.Invoke(new LispObject[] { gi, Fixnum.Make(b & 0xFF) });
+            CallForPrimary(fn, gi, Fixnum.Make(b & 0xFF));
             return;
         }
         if (stream is LispBinaryStream bin)
@@ -2487,7 +2487,7 @@ public static partial class Runtime
             if (wsFn != null)
             {
                 int gEnd = end < 0 ? GraySeqLength(seq) : end;
-                wsFn.Invoke(new LispObject[] { grOut, seq, Fixnum.Make(start), Fixnum.Make(gEnd) });
+                CallForPrimary(wsFn, grOut, seq, Fixnum.Make(start), Fixnum.Make(gEnd));
                 return seq;
             }
         }
@@ -2634,6 +2634,11 @@ public static partial class Runtime
         => GuardStreamIO(stream, stream, eofErrorP, eofValue,
                          static (st, ee, ev) => ReadLineUnguarded(st, ee, ev));
 
+    public static LispObject ReadLineMv(LispObject stream, LispObject eofErrorP, LispObject eofValue)
+        => MultipleValues.Boxed(ReadLine(stream, eofErrorP, eofValue));
+    public static LispObject ReadLinePrimary(LispObject stream, LispObject eofErrorP, LispObject eofValue)
+        => MultipleValues.Alone(ReadLine(stream, eofErrorP, eofValue));
+
     private static LispObject ReadLineUnguarded(LispObject stream, LispObject eofErrorP, LispObject eofValue)
     {
         if (stream is LispInstance gli && IsGrayStream(gli)
@@ -2779,7 +2784,7 @@ public static partial class Runtime
             var rcFn = GrayStreamLookup.GrayOrCl("STREAM-READ-CHAR");
             if (rcFn != null)
             {
-                var r = rcFn.Invoke(new LispObject[] { grIn });
+                var r = CallForPrimary(rcFn, grIn);
                 if (r is LispChar lcg) return lcg;
                 if (IsTruthy(eofErrorP)) throw new LispErrorException(MakeEndOfFileError(streamObj));
                 return eofValue;
@@ -2856,10 +2861,10 @@ public static partial class Runtime
         {
             while (true)
             {
-                var p = peekFn.Invoke(arg);
+                var p = CallForPrimary(peekFn, arg);
                 if (IsEof(p)) return Eof();
                 if (p is LispChar pc && pc.Value == targetChar.Value) return pc;
-                readFn.Invoke(arg); // consume the non-matching char
+                CallForPrimary(readFn, arg); // consume the non-matching char
             }
         }
         if (peekType is T)
@@ -2868,14 +2873,14 @@ public static partial class Runtime
             var readtable = rtObj is LispReadtable lrt ? lrt : Startup.StandardReadtable;
             while (true)
             {
-                var p = peekFn.Invoke(arg);
+                var p = CallForPrimary(peekFn, arg);
                 if (IsEof(p)) return Eof();
                 if (p is LispChar pc && readtable.GetSyntaxType(pc.Value) != SyntaxType.Whitespace) return pc;
-                readFn.Invoke(arg); // consume the whitespace char
+                CallForPrimary(readFn, arg); // consume the whitespace char
             }
         }
         // NIL peek-type: peek at the next character.
-        var r = peekFn.Invoke(arg);
+        var r = CallForPrimary(peekFn, arg);
         return IsEof(r) ? Eof() : r;
     }
 
@@ -2979,7 +2984,7 @@ public static partial class Runtime
             var fn = GrayStreamLookup.GrayOrCl("STREAM-UNREAD-CHAR");
             if (fn != null)
             {
-                fn.Invoke(new LispObject[] { grIn, lc });
+                CallForPrimary(fn, grIn, lc);
                 return Nil.Instance;
             }
         }
@@ -4854,7 +4859,7 @@ public static partial class Runtime
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
                 if (recursiveP is not Nil) eofErrorP = T.Instance;
-                return Runtime.ReadLine(stream, eofErrorP, eofValue);
+                return Runtime.ReadLineMv(stream, eofErrorP, eofValue);
             }, "READ-LINE", -1));
 
         // --- Stream factory functions for composite stream types ---
@@ -4946,7 +4951,7 @@ public static partial class Runtime
                     if (target is not T && GrayComponent(target, false) is LispInstance gi)
                     {
                         var gfn = GrayStreamLookup.GrayOrCl("STREAM-" + fn);
-                        gfn?.Invoke(new LispObject[] { gi });
+                        CallForPrimary(gfn, gi);
                         return Nil.Instance;
                     }
                     if (args.Length > 0 && args[0] is not (LispStream or Nil or T))
@@ -5002,7 +5007,7 @@ public static partial class Runtime
             // output side is a gray stream: an explicit FORCE-OUTPUT has to reach
             // it. (The TextWriter bridge's Flush no longer does; see
             // GrayStreamTextWriter.Flush.)
-            GrayStreamLookup.GrayOrCl("STREAM-FORCE-OUTPUT")?.Invoke(new LispObject[] { gi });
+            CallForPrimary(GrayStreamLookup.GrayOrCl("STREAM-FORCE-OUTPUT"), gi);
         }
         else
         {

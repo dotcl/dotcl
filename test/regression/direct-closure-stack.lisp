@@ -20,11 +20,13 @@
 ;; serious-condition but outside error (SBCL's control-stack-exhausted behaves
 ;; the same), so (error ...) clauses are transparent to it.
 (deftest direct-closure.stack-overflow-catchable
-  (let ((f nil))
-    (setq f (lambda (n) (if (zerop n) 0 (+ 1 (funcall f (- n 1))))))
-    (handler-case (progn (funcall f 10000000) :no-overflow)
-      (error () :caught-error)
-      (storage-condition () :caught-storage-condition)))
+  (call-on-small-stack
+   (lambda ()
+     (let ((f nil))
+       (setq f (lambda (n) (if (zerop n) 0 (+ 1 (funcall f (- n 1))))))
+       (handler-case (progn (funcall f 10000000) :no-overflow)
+         (error () :caught-error)
+         (storage-condition () :caught-storage-condition)))))
   :caught-storage-condition)
 
 ;; Named simple function (assembler-installed _funcN): moderate-depth non-tail
@@ -38,8 +40,10 @@
 ;; Named simple function overflow: deep non-TCO recursion must surface as a
 ;; catchable STORAGE-CONDITION, not process death via raw StackOverflowException.
 (deftest direct-named.stack-overflow-catchable
-  (handler-case (progn (%named-deep-rec 10000000) :no-overflow)
-    (storage-condition () :caught-storage-condition))
+  (call-on-small-stack
+   (lambda ()
+     (handler-case (progn (%named-deep-rec 10000000) :no-overflow)
+       (storage-condition () :caught-storage-condition))))
   :caught-storage-condition)
 
 ;;; apply chain: Runtime.Apply frames are fatter than plain InvokeN calls, and
@@ -51,9 +55,11 @@
 (defun %apply-chain-rec (n) (+ 1 (apply #'%apply-chain-rec (list (- n 1)))))
 
 (deftest apply-chain.stack-overflow-catchable
-  (handler-case (progn (%apply-chain-rec 10000000) :no-overflow)
-    (error () :caught-error)
-    (storage-condition () :caught-storage-condition))
+  (call-on-small-stack
+   (lambda ()
+     (handler-case (progn (%apply-chain-rec 10000000) :no-overflow)
+       (error () :caught-error)
+       (storage-condition () :caught-storage-condition))))
   :caught-storage-condition)
 
 ;;; Recursion that goes Lisp -> .NET delegate -> Lisp at every level. Reflection
@@ -78,9 +84,11 @@
   100)
 
 (deftest callback-chain.stack-overflow-catchable
-  (handler-case (progn (%cb-chain-rec 10000000) :no-overflow)
-    (error () :caught-error)
-    (storage-condition () :caught-storage-condition))
+  (call-on-small-stack
+   (lambda ()
+     (handler-case (progn (%cb-chain-rec 10000000) :no-overflow)
+       (error () :caught-error)
+       (storage-condition () :caught-storage-condition))))
   :caught-storage-condition)
 
 ;;; Stack exhaustion inside a callback reaches the code that called into .NET.
@@ -104,11 +112,13 @@
 (define-condition %run-callback (condition) ())
 
 (deftest callback-boundary.storage-condition-passes
-  (let ((d (dotnet:make-delegate "System.Func`1[System.Int32]"
-                                 (lambda () (%in-callback-deep-rec 10000000)))))
-    (handler-bind ((%run-callback (lambda (c) (declare (ignore c)) (dotnet:invoke d "Invoke"))))
-      (handler-case (progn (signal '%run-callback) :no-overflow)
-        (storage-condition () :caught-storage-condition))))
+  (call-on-small-stack
+   (lambda ()
+     (let ((d (dotnet:make-delegate "System.Func`1[System.Int32]"
+                                    (lambda () (%in-callback-deep-rec 10000000)))))
+       (handler-bind ((%run-callback (lambda (c) (declare (ignore c)) (dotnet:invoke d "Invoke"))))
+         (handler-case (progn (signal '%run-callback) :no-overflow)
+           (storage-condition () :caught-storage-condition))))))
   :caught-storage-condition)
 
 ;;; An ERROR in a callback is still contained, as before.

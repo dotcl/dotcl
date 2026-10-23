@@ -1,0 +1,5 @@
+(defpackage :pulock-x (:use :cl) (:export #:version #:greet))
+(in-package :pulock-x)
+(defun version () "1")
+(defun greet (who) (list :hello who))
+(pulock-common:note "x 1")

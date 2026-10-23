@@ -176,16 +176,6 @@ public partial class CilAssembler
 #endif
     }
 
-    public static void Reset()
-    {
-        lock (_constantsLock)
-        {
-            _constants = Array.Empty<object>();
-            _constantsSize = 0;
-        }
-        _unitStore.Clear();
-    }
-
     /// <summary>
     /// Parse a "(SETF NAME)" flat function name. compile-named-call emits
     /// (:ldstr "(SETF NAME)") (:call "CilAssembler.GetFunction") for non-symbol
@@ -325,10 +315,7 @@ public partial class CilAssembler
     /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispFunction GetFunctionBySymbol(Symbol sym)
-    {
-        if (sym.Function is LispFunction symFn) return symFn;
-        return ThrowUndefinedFunction(sym);
-    }
+        => sym._callee ?? ThrowUndefinedFunction(sym);
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static LispFunction ThrowUndefinedFunction(Symbol sym) =>
@@ -500,6 +487,37 @@ public partial class CilAssembler
         System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static object GetConstant(int index) =>
         System.Threading.Volatile.Read(ref _constants)[index];
+
+    /// <summary>GetConstant for an INDEX the emitter added a LispObject at.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static LispObject GetConstantObject(int index) =>
+        System.Runtime.CompilerServices.Unsafe.As<LispObject>(ConstantAt(index));
+
+    /// <summary>GetConstant for an INDEX the emitter added a Symbol at.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static Symbol GetConstantSymbol(int index) =>
+        System.Runtime.CompilerServices.Unsafe.As<Symbol>(ConstantAt(index));
+
+    /// <summary>The symbol of the SymFnSite at INDEX of the constant pool.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static Symbol FnSiteSymbol(int index) =>
+        System.Runtime.CompilerServices.Unsafe.As<Startup.SymFnSite>(ConstantAt(index)).Resolve();
+
+    // INDEX came from AddConstant, and the pool only grows: no bounds check.
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static object ConstantAt(int index)
+    {
+#if NET5_0_OR_GREATER
+        return System.Runtime.CompilerServices.Unsafe.Add(
+            ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(
+                System.Threading.Volatile.Read(ref _constants)), index);
+#else
+        return System.Threading.Volatile.Read(ref _constants)[index];
+#endif
+    }
 
     /// <summary>Diagnostic snapshot of the global constant pool. Returns
     /// the live entry count, how many are retained DynamicMethods: each roots a

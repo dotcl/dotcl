@@ -99,7 +99,9 @@
 (deftest-emitting-only ftype-float-return.long-and-range-are-r8
   (let ((r (%ffr-sil #'%ffr-lr)))
     (list (%ffr-count "Runtime.Mul" r) (%ffr-count "UNBOX-DOUBLE" r)))
-  (0 2))
+  ;; A for each typed entry, and the boxed result of %FFR-R (its range has no
+  ;; raw result kind).
+  (0 3))
 
 (deftest-emitting-only ftype-float-return.declaim-after-defun-is-r8
   (%ffr-count "Runtime.Add" (%ffr-sil #'%ffr-late-use))

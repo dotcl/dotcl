@@ -116,11 +116,26 @@
    declares exactly what the expansion does; without this a declaration through
    a type name chose the generic per-element path. Anything that does not
    expand comes back unchanged."
-  (if (or (and (symbolp type) type)
-          (and (consp type) (symbolp (car type))
-               (not (member (car type) '(simple-array array vector)))))
-      (%typexpand-for-range type)
-      type))
+  (let ((type (if (or (and (symbolp type) type)
+                      (and (consp type) (symbolp (car type))
+                           (not (member (car type) '(simple-array array vector)))))
+                  (%typexpand-for-range type)
+                  type)))
+    ;; The element type too: (simple-array octet (*)) with OCTET a DEFTYPE.
+    (if (and (consp type) (member (car type) '(simple-array array vector))
+             (consp (cdr type))
+             (%user-type-specifier-p (cadr type)))
+        (list* (car type) (%typexpand-for-range (cadr type)) (cddr type))
+        type)))
+
+(defun %user-type-specifier-p (spec)
+  "T for a type specifier whose head is a symbol outside COMMON-LISP, the
+   shape a DEFTYPE name takes."
+  (let ((head (if (consp spec) (car spec) spec)))
+    (and head (symbolp head)
+         (not (eq head '*))
+         (let ((pkg (symbol-package head)))
+           (not (and pkg (string= (package-name pkg) "COMMON-LISP")))))))
 
 (defun %simple-array-backing-kind (type)
   "Element-buffer kind for a (SIMPLE-ARRAY <integer type> (DIM...)) specifier of
@@ -168,7 +183,7 @@
   (ecase kind (1 "Byte[]") (2 "UInt16[]") (3 "Int32[]") (4 "Int64[]")
          (:u64 "Int64[]") (:char "Char[]") (:f64 "Double[]") (:f32 "Single[]")))
 
-(defun %backing-fetch-call (kind)
+(defun %backing-fetch-call (kind &optional checked)
   "Runtime entry that checks the declaration once and returns the buffer.
 
    Above (safety 0) the *Checked entry: it signals a TYPE-ERROR where the plain
@@ -176,8 +191,9 @@
    displaced), which a SIMPLE-* declaration says the value is not. At (safety 0)
    the declaration is trusted, and the null sends each access to the
    per-element helper, which reads the right values. The branch is on the path
-   the plain fetch takes when it declines, so a true declaration pays nothing."
-  (if (compiling-at-safety-0-p)
+   the plain fetch takes when it declines, so a true declaration pays nothing.
+   CHECKED asks for the *Checked entry at any safety."
+  (if (and (not checked) (compiling-at-safety-0-p))
       (ecase kind
         (1 "Runtime.BackingU8") (2 "Runtime.BackingU16")
         (3 "Runtime.BackingI32") (4 "Runtime.BackingI64")
@@ -311,10 +327,15 @@
    against its declaration on the way in, so only a proof from what is
    actually stored counts there: see %STORE-VALUE-RANGE."
   (and val range
-       (let ((r (if (compiling-at-safety-0-p)
-                    (expr-int-range val)
-                    (%store-value-range val))))
+       (let ((r (or (and (consp val) (cdr (assoc val *sunk-store-ranges* :test #'eq)))
+                    (if (compiling-at-safety-0-p)
+                        (expr-int-range val)
+                        (%store-value-range val)))))
          (and r (<= (car range) (car r)) (<= (cdr r) (cdr range))))))
+
+(defvar *sunk-store-ranges* nil
+  "Alist (FORM . (LO . HI)): the last form of a LET that %AREF-SET-LET-SUNK
+   moved a store into, with the range %STORE-VALUE-RANGE proved for the LET.")
 
 (defvar *store-range-env* nil
   "Alist (VAR . (LO . HI)) of the variables bound by the LET forms
@@ -695,8 +716,17 @@
             collect (cons v spec))))
 
 (defun arg-decl-check-forms (decl-forms names)
-  (loop for (v . spec) in (arg-decl-checks decl-forms names)
-        collect `(%check-arg-decl ,v (quote ,spec))))
+  "The (%CHECK-ARG-DECL VAR 'SPEC [PROVEN]) statements. PROVEN when DECL-FORMS,
+   the body, never assigns VAR, so the checked type holds for all of it."
+  (let* ((checks (arg-decl-checks decl-forms names))
+         (cands (loop for (v . spec) in checks
+                      when (%proven-arg-type v spec) collect (var-name v)))
+         (mutated (and cands (find-mutated-and-captured-vars decl-forms cands))))
+    (loop for (v . spec) in checks
+          collect (if (and (member (var-name v) cands :test #'string=)
+                           (not (member (var-name v) mutated :test #'string=)))
+                      `(%check-arg-decl ,v (quote ,spec) t)
+                      `(%check-arg-decl ,v (quote ,spec))))))
 
 (defun insert-simple-decl-checks (body names)
   "BODY with its SIMPLE-* declaration checks inserted right after its leading
@@ -707,8 +737,11 @@
          (checks (and names
                       (not (and (consp first-form)
                                 (member (car first-form) '(%check-simple-decl %check-arg-decl))))
-                      (append (simple-decl-check-forms body names)
-                                    (arg-decl-check-forms body names)))))
+                      (let ((simple (simple-decl-check-forms body names))
+                            (args (arg-decl-check-forms body names)))
+                        (if (and args (null simple))
+                            (append args (list '(%tco-checks-done)))
+                            (append simple args))))))
     (if (null checks)
         body
         (let ((decls '()) (rest body))
@@ -804,7 +837,7 @@
    slot -- the same thing the packed per-access constant does, asked once."
   (fifth entry))
 
-(defun struct-backing-entry (obj packed)
+(defun struct-backing-entry (obj packed &optional type)
   "For a raw slot read or write at the constant PACKED index on the local
    variable OBJ, (BACKING-ENTRY RAW-POSITION . KIND) when OBJ's raw slot array
    was hoisted and the slot PACKED names is a raw one; else NIL.
@@ -828,6 +861,9 @@
               (eq (lookup-local obj) (second e))
               (not (boxed-var-p obj))
               (= (ash packed (- +slot-version-shift+)) (struct-backing-version e))
+              (or (null type)
+                  (eq type (struct-backing-type e))
+                  (ignore-errors (subtypep (struct-backing-type e) type)))
               (let ((cell (nth (logand packed (1- (ash 1 +slot-version-shift+)))
                                (cdr (cddddr e)))))
                 (and cell (>= (car cell) 0) (cons e cell)))))))
@@ -913,36 +949,57 @@
                     (let ((r (%numeric-storage-range spec)))
                       (and r (cons rank r)))))))))
 
-(defun infer-numeric-array-bindings (binding-info mutated outer)
+(defun infer-numeric-array-bindings (binding-info mutated outer &optional sequential-p)
   "Numeric-array environment for a let/let* body: start from OUTER, drop
    every name this let binds (shadowing), then add (NAME KEY RANK LO . HI)
    (or (NAME KEY RANK . :single/:double) for float backing) for each plain
    lexical, non-mutated binding whose init is a recognizable numeric make-array,
    OR whose init is a bare reference to an array local already proven numeric
    (copy propagation, e.g. the Gabriel fft's (prog ((ar areal)) ...) that
-   aliases a (simple-array single-float (1025)) parameter). KEY pins the
+   aliases a (simple-array single-float (1025)) parameter, or the
+   (LET ((A A)) ...) an inline local function's parameter becomes). KEY pins the
    binding: a consumer only trusts the entry while (lookup-local NAME) still
    resolves to it (a closure body re-keys its captured vars, so stale entries
-   self-invalidate). Mutated bindings are excluded; a setq could install an
-   array with different backing; a mutated SOURCE alias is likewise not
-   propagated."
+   self-invalidate). The source of a copy is held to the same rule: its entry
+   is used only when its key is the binding the init sees, which for a LET is
+   the one outside it and for a LET* (SEQUENTIAL-P) may be an earlier binding.
+   Mutated bindings are excluded; a setq could install an array with different
+   backing; a mutated SOURCE alias is likewise not propagated."
   (let* ((bound-names (mapcar (lambda (b) (var-name (first b))) binding-info))
+         (new-keys (mapcar #'fourth binding-info))
          (result (remove-if (lambda (e) (member (car e) bound-names :test #'string=))
                             outer)))
-    (dolist (b binding-info)
-      (let ((var (first b)) (init (second b)) (is-special (third b)) (key (fourth b)))
-        (when (and (not is-special)
-                   init
-                   (not (member (var-name var) mutated :test #'string=)))
-          (let ((info (or (%make-array-numeric-info init)
-                          ;; copy propagation: init is a plain var already known
-                          ;; numeric-backed and itself not mutated -> same backing.
-                          (and (symbolp init)
-                               (not (member (var-name init) mutated :test #'string=))
-                               (let ((src (assoc (var-name init) result :test #'string=)))
-                                 (and src (cddr src)))))))
-            (when info
-              (push (list* (var-name var) key info) result))))))
+    (flet ((source-info (init earlier)
+             (let* ((name (var-name init))
+                    (inner (and sequential-p
+                                (find name earlier :key (lambda (e) (var-name (first e)))
+                                                   :test #'string= :from-end t)))
+                    (src (if inner
+                             (find (fourth inner) result :key #'second :test #'eq)
+                             (let ((o (assoc name outer :test #'string=)))
+                               (and o
+                                    (eq (second o)
+                                        (let ((*cstate* (cstate-with *cstate* +cs-locals+
+                                                          (remove-if (lambda (e)
+                                                                       (member (cdr e) new-keys
+                                                                               :test #'eq))
+                                                                     (cstate-locals)))))
+                                          (lookup-local init)))
+                                    o)))))
+               (and src (cddr src)))))
+      (loop for tail on binding-info
+            for b = (car tail)
+            for earlier = (ldiff binding-info tail)
+            do (let ((var (first b)) (init (second b)) (is-special (third b)) (key (fourth b)))
+                 (when (and (not is-special)
+                            init
+                            (not (member (var-name var) mutated :test #'string=)))
+                   (let ((info (or (%make-array-numeric-info init)
+                                   (and (symbolp init)
+                                        (not (member (var-name init) mutated :test #'string=))
+                                        (source-info init earlier)))))
+                     (when info
+                       (push (list* (var-name var) key info) result)))))))
     result))
 
 (defun struct-accessor-array-info (expr)
@@ -1021,10 +1078,22 @@
                         (cddr entry))
                    (let ((info (constant-array-numeric-info v)))
                      (and info (= (length idxs) (car info)) info))))
-             (let ((info (struct-accessor-array-info v)))
+             (let ((info (or (struct-accessor-array-info v)
+                             (the-array-numeric-info v))))
                (and info
                     (= (length idxs) (car info))
                     info))))))
+
+(defun the-array-numeric-info (expr)
+  "For (THE TYPE FORM) with TYPE an integer array type, the info tail
+   STRUCT-ACCESSOR-ARRAY-INFO would answer for a slot of that type. A hint like
+   the slot's type: an array of another kind still reads through the helper's
+   fallback. Not for the float kinds, whose helper converts what it finds."
+  (and (consp expr)
+       (eq (car expr) 'the)
+       (consp (cdr expr)) (consp (cddr expr)) (null (cdddr expr))
+       (let ((info (%array-type-numeric-info (cadr expr))))
+         (and info (not (member (cdr info) '(:single :double))) info))))
 
 (defun constant-array-numeric-info (sym)
   "For SYM a constant variable whose value is a simple array with an unboxed
@@ -1112,6 +1181,20 @@
      (let ((e (%typexpand-for-range type)))
        (if (equal e type) :none (%integer-type-bounds e (1+ depth)))))
     (t :none)))
+
+(defun %exact-integer-type-p (type &optional (depth 0))
+  "T when TYPE admits exactly the integers within its %INTEGER-TYPE-BOUNDS: an
+   integer type, an AND of only such types, or a DEFTYPE expanding to one."
+  (cond ((> depth 8) nil)
+        ((and (consp type) (eq (car type) 'and))
+         (and (cdr type)
+              (every (lambda (s) (%exact-integer-type-p s (1+ depth))) (cdr type))))
+        ((eq (%integer-type-bounds type depth) :none) nil)
+        ((or (member type '(bit fixnum unsigned-byte integer signed-byte))
+             (and (consp type) (member (car type) '(signed-byte unsigned-byte mod integer))))
+         t)
+        (t (let ((e (%typexpand-for-range type)))
+             (and (not (equal e type)) (%exact-integer-type-p e (1+ depth)))))))
 
 (defun integer-type-range (type)
   "Inclusive (LO . HI) for a bounded integer TYPE specifier, or NIL if TYPE is
@@ -1237,6 +1320,19 @@
                         (if (plusp d) (cons 0 m) (cons (- m) 0))
                         (cons (- m) m))))
             (and (range-fits-int64-p r) r))))
+    ;; The same with a divisor not constant but of a positive proven range.
+    ((and (consp expr) (= (length expr) 3)
+          (member (car expr) '(mod rem))
+          (not (local-function-entry (car expr)))
+          (fixnum-typed-p (cadr expr))
+          (let ((d (expr-int-range (caddr expr))))
+            (and d (>= (car d) 1)
+                 (let* ((m (1- (cdr d)))
+                        (x (expr-int-range (cadr expr)))
+                        (r (cond ((and x (>= (car x) 0)) (cons 0 (min m (cdr x))))
+                                 ((eq (car expr) 'mod) (cons 0 m))
+                                 (t (cons (- m) m)))))
+                   (and (range-fits-int64-p r) r))))))
     ;; (length x) -> [0, 2^31-1]. The other half of the same omission the slot
     ;; clause above fixes: FIXNUM-TYPED-P has long taken LENGTH as an integer
     ;; leaf, but FIXNUM-LEAF-RANGE never did, so EXPR-INT-RANGE answered NIL
@@ -1294,6 +1390,10 @@
     ((and (consp expr) (= (length expr) 2)
           (member (car expr) '(%dotimes-limit %loop-limit-floor)))
      (cons +int64-min+ +int64-max+))
+    ;; %loop-by: LOOP's BY value, which it checks is positive.
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '%loop-by))
+     (let ((r (expr-int-range (cadr expr))))
+       (and r (>= (cdr r) 1) (cons (max 1 (car r)) (cdr r)))))
     ;; (logand X M) with M non-negative: [0, max M], and exact even when X is
     ;; only right modulo 2^64 (see FIXNUM-TYPED-P).
     ((and (consp expr) (= (length expr) 3) (eq (car expr) 'logand)
@@ -1524,6 +1624,17 @@
         (when (and vals (every #'%fold-small-rational-p vals))
           (if (cdr vals) `(values ,@vals) (car vals)))))))
 
+(defun %integer-symbol-macro-value (expr)
+  "The integer a symbol macro in scope expands to, for EXPR such a symbol
+   ((symbol-macrolet ((i 3)) ...), how an unrolled loop names its index);
+   else NIL."
+  (and (symbolp expr) expr
+       (not (keywordp expr))
+       (boundp '*cstate*)
+       (not (lookup-local expr))
+       (multiple-value-bind (exp found) (lookup-symbol-macro expr)
+         (and found (integerp exp) exp))))
+
 (defun fold-constant-symbol (expr)
   "EXPR with a reference to a foldable constant (FOLDABLE-CONSTANT-SYMBOL-P)
    replaced by its value, and a read of a constant array at literal indices
@@ -1534,6 +1645,7 @@
    as (setf (aref a i) 1) instead of reading the symbol through the dynamic
    binding lookup and falling to the generic store."
   (cond ((foldable-constant-symbol-p expr) (symbol-value expr))
+        ((%integer-symbol-macro-value expr))
         ((%fold-constant-aref expr))
         ((%fold-rational-call expr))
         (t expr)))
@@ -1583,11 +1695,28 @@
    it is compiled. A call to a MACROLET-bound macro, or to a global macro, is
    looked at through its expansion (%EXPAND-LOCAL-MACRO-OPERAND)."
   (let ((expr (%expand-local-macro-operand expr)))
+    (let ((c (%local-funcall-as-call expr)))
+      (when c (setf expr c)))
     (let ((a (%typed-vector-struct-read expr)))
       (when a (setf expr a)))
     (cond ((%literal-ldb-form-p expr) (%literal-ldb-as-logand expr))
           ((%literal-dpb-form-p expr) (%literal-dpb-as-logior expr))
+          ((%literal-byte-field-form-p expr) (%literal-byte-field-as-logand expr))
+          ((%logical-complement-form expr))
           (t (fold-constant-symbol expr)))))
+
+(defun %local-funcall-as-call (expr)
+  "For EXPR (FUNCALL #'F ARG...) with F a local function, the call (F ARG...);
+   else NIL."
+  (and (consp expr) (eq (car expr) 'funcall)
+       (consp (cdr expr))
+       (let ((fn (cadr expr)))
+         (and (consp fn) (eq (car fn) 'function)
+              (consp (cdr fn)) (null (cddr fn))
+              (symbolp (cadr fn))
+              (local-function-entry (cadr fn))
+              (not (macrolet-shadowed-p (cadr fn)))
+              (cons (cadr fn) (cddr expr))))))
 
 (defun %typed-vector-struct-read (expr)
   "For EXPR a call (ACC X) to the reader of a (:TYPE VECTOR) structure
@@ -1619,7 +1748,7 @@
   (loop repeat 16
         while (and (consp expr) (symbolp (car expr)))
         do (let ((expander (if (macrolet-shadowed-p (car expr))
-                               (gethash (car expr) *macros*)
+                               (%macro-expander-here (car expr))
                                (%global-macro-operand-expander (car expr)))))
              (unless expander (return))
              (let ((e (handler-case (cached-macroexpand expr expander)
@@ -1677,6 +1806,45 @@
         `(logand ,x ,mask)
         `(logand (ash ,x ,(- pos)) ,mask))))
 
+;; (MASK-FIELD (BYTE SIZE POS) X) and (DEPOSIT-FIELD V (BYTE SIZE POS) X) with
+;; literal SIZE and POS: the masks they mean, as LDB and DPB above.
+(defun %literal-byte-field-form-p (expr)
+  (and (consp expr) (member (car expr) '(mask-field deposit-field))
+       (let ((n (if (eq (car expr) 'mask-field) 2 3)))
+         (and (= (length expr) (1+ n))
+              (%literal-byte-spec (nth (- n 2) (cdr expr)))))
+       (not (local-function-entry (car expr)))
+       (not (local-function-entry 'byte))
+       (not (macrolet-shadowed-p (car expr)))
+       (not (macrolet-shadowed-p 'byte))))
+
+(defun %literal-byte-field-as-logand (expr)
+  (if (eq (car expr) 'mask-field)
+      (let ((spec (%literal-byte-spec (cadr expr))))
+        `(logand ,(caddr expr) ,(ash (1- (ash 1 (car spec))) (cdr spec))))
+      (let* ((spec (%literal-byte-spec (caddr expr)))
+             (mask (ash (1- (ash 1 (car spec))) (cdr spec))))
+        `(logior (logand ,(cadr expr) ,mask)
+                 (logand ,(cadddr expr) ,(lognot mask))))))
+
+;; Two-argument LOGANDC1 ... LOGEQV as the LOGAND / LOGIOR / LOGXOR / LOGNOT
+;; form they mean, operands in the same order.
+(defun %logical-complement-form (expr)
+  (and (consp expr)
+       (member (car expr) '(logandc1 logandc2 logorc1 logorc2 lognand lognor logeqv))
+       (= (length expr) 3)
+       (notany (lambda (op) (or (local-function-entry op) (macrolet-shadowed-p op)))
+               (list (car expr) 'logand 'logior 'logxor 'lognot))
+       (let ((a (cadr expr)) (b (caddr expr)))
+         (ecase (car expr)
+           (logandc1 `(logand (lognot ,a) ,b))
+           (logandc2 `(logand ,a (lognot ,b)))
+           (logorc1 `(logior (lognot ,a) ,b))
+           (logorc2 `(logior ,a (lognot ,b)))
+           (lognand `(lognot (logand ,a ,b)))
+           (lognor `(lognot (logior ,a ,b)))
+           (logeqv `(lognot (logxor ,a ,b)))))))
+
 (defvar *int-type-memo* nil
   "EQ table of answers of FIXNUM-TYPED-P and EXPR-INT-RANGE, bound for the
    duration of one outermost query. The two recurse into each other on the same
@@ -1728,6 +1896,7 @@
   (cond
     ((integerp expr) (cons expr expr))
     ((%rotate-byte-32-long-p expr) (cons 0 #xFFFFFFFF))
+    ((%u64-local-field expr) (cons 0 (cddr (%u64-local-field expr))))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
      (let ((ra (expr-int-range (cadr expr)))
            (rb (expr-int-range (caddr expr))))
@@ -1738,6 +1907,13 @@
      (let ((ra (expr-int-range (cadr expr))))
        (and ra
             (let ((r (range-arith (if (eq (car expr) '1+) '+ '-) ra '(1 . 1))))
+              (and (range-fits-int64-p r) r)))))
+    ;; (- X): the bounds negated and swapped. Only most-negative-fixnum has no
+    ;; negation in int64.
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-))
+     (let ((ra (expr-int-range (cadr expr))))
+       (and ra
+            (let ((r (cons (- (cdr ra)) (- (car ra)))))
               (and (range-fits-int64-p r) r)))))
     ;; (min a b ...) / (max a b ...): the bounds of the bounds.
     ((and (consp expr) (member (car expr) '(min max)) (consp (cdr expr))
@@ -1805,6 +1981,7 @@
                    (q2 (if (eql d -1) (- (cdr ra)) (funcall fn (cdr ra) d)))
                    (r (cons (min q1 q2) (max q1 q2))))
               (and (range-fits-int64-p r) r)))))
+    ((float-round-int-range expr))
     (t (fixnum-leaf-range expr)))))
 
 (defun %const-divisor-quotient-p (expr)
@@ -1818,6 +1995,217 @@
        (not (zerop (caddr expr)))
        (<= +int64-min+ (caddr expr) +int64-max+)
        (fixnum-exact-p (cadr expr))))
+
+;;; ------------------------------------------------------------
+;;; Ranges of real-valued expressions (float arithmetic included)
+;;; ------------------------------------------------------------
+;;; Bounds are exact rationals that enclose every value the expression can
+;;; take, float rounding included. They exist to prove that a float rounded to
+;;; an integer (TRUNCATE / FLOOR / CEILING / ROUND) is a fixnum.
+
+(defparameter +float-range-limit+ (expt 2 100)
+  "Bounds beyond this are not tracked; far inside single-float's finite range,
+   so no tracked operation overflows to an infinity.")
+
+(defun %float-bound (b)
+  "B (a type bound, possibly in a one-element exclusive list) as a rational, or
+   NIL when it is not a finite real within +FLOAT-RANGE-LIMIT+."
+  (let ((b (if (and (consp b) (null (cdr b))) (car b) b)))
+    (and (realp b)
+         (<= (- +float-range-limit+) b +float-range-limit+)
+         (rational b))))
+
+(defun %checked-float-range (lo hi)
+  (and lo hi (<= lo hi)
+       (<= (- +float-range-limit+) lo) (<= hi +float-range-limit+)
+       (cons lo hi)))
+
+(defun declared-float-range (type)
+  "(LO . HI) for a (SINGLE-FLOAT LO HI) / (DOUBLE-FLOAT LO HI) type (SHORT-,
+   LONG- and plain FLOAT too, DEFTYPEs expanded) with both bounds given."
+  (let ((type (if (and (consp type)
+                       (member (car type) '(single-float double-float short-float
+                                            long-float float)))
+                  type
+                  (%typexpand-for-range type))))
+    (and (consp type)
+         (member (car type) '(single-float double-float short-float long-float float))
+         (consp (cdr type)) (consp (cddr type)) (null (cdddr type))
+         (%checked-float-range (%float-bound (second type)) (%float-bound (third type))))))
+
+(defun %widen-float-range (r)
+  "R widened by a margin that covers rounding each operand to a float and the
+   result of one operation (relative 2^-16 plus a tiny absolute part for
+   values near zero)."
+  (and r
+       (%checked-float-range (- (car r) (/ (abs (car r)) 65536) (expt 2 -100))
+                             (+ (cdr r) (/ (abs (cdr r)) 65536) (expt 2 -100)))))
+
+(defun float-local-range (sym)
+  "The range recorded for SYM's binding in CSTATE-FLOAT-RANGE-LOCALS, or NIL."
+  (and (symbolp sym)
+       (boundp '*cstate*)
+       (cstate-float-range-locals)
+       (not (boxed-var-p sym))
+       (let ((key (lookup-local sym)))
+         (and key (cdr (assoc key (cstate-float-range-locals) :test #'equal))))))
+
+(defun float-expr-range (expr)
+  "Rational (LO . HI) enclosing every value of the real-valued EXPR, or NIL."
+  (%int-type-memoized :float-range expr #'%float-expr-range))
+
+(defun %float-expr-range (expr)
+  (let ((expr (fold-nary-arith (strip-value-wrappers expr))))
+    (cond
+      ((realp expr) (let ((b (%float-bound expr))) (and b (cons b b))))
+      ((symbolp expr)
+       (or (float-local-range expr)
+           (let ((r (expr-int-range expr))) (and r (fixnum-exact-p expr) r))))
+      ((not (consp expr)) nil)
+      ((local-function-entry (car expr)) nil)
+      ((and (eq (car expr) 'the) (consp (cdr expr)) (consp (cddr expr)) (null (cdddr expr)))
+       (let ((d (declared-float-range (cadr expr)))
+             (r (float-expr-range (caddr expr))))
+         (cond ((and d r) (%checked-float-range (max (car d) (car r)) (min (cdr d) (cdr r))))
+               (t (or d r)))))
+      ((and (member (car expr) '(+ - *)) (= (length expr) 3))
+       (let* ((ra (float-expr-range (cadr expr)))
+              (rb (and ra (float-expr-range (caddr expr)))))
+         (and rb (%widen-float-range (range-arith (car expr) ra rb)))))
+      ((and (eq (car expr) '-) (= (length expr) 2))
+       (let ((r (float-expr-range (cadr expr))))
+         (and r (cons (- (cdr r)) (- (car r))))))
+      ((and (member (car expr) '(1+ 1-)) (= (length expr) 2))
+       (let ((r (float-expr-range (cadr expr))))
+         (and r (%widen-float-range
+                 (range-arith (if (eq (car expr) '1+) '+ '-) r '(1 . 1))))))
+      ((and (member (car expr) '(ffloor ftruncate fceiling fround)) (= (length expr) 2))
+       (let ((r (float-expr-range (cadr expr))))
+         (and r (%checked-float-range (floor (car r)) (ceiling (cdr r))))))
+      ((and (eq (car expr) 'float) (<= 2 (length expr) 3))
+       (let ((r (float-expr-range (cadr expr))))
+         (and r (%widen-float-range r))))
+      ((and (eq (car expr) 'if) (= (length expr) 4))
+       (let ((ra (float-expr-range (caddr expr)))
+             (rb (float-expr-range (cadddr expr))))
+         (and ra rb (cons (min (car ra) (car rb)) (max (cdr ra) (cdr rb))))))
+      ((and (member (car expr) '(min max)) (consp (cdr expr)))
+       (let ((rs (mapcar #'float-expr-range (cdr expr))))
+         (and (every #'identity rs)
+              (if (eq (car expr) 'min)
+                  (cons (reduce #'min rs :key #'car) (reduce #'min rs :key #'cdr))
+                  (cons (reduce #'max rs :key #'car) (reduce #'max rs :key #'cdr))))))
+      (t (let ((r (expr-int-range expr))) (and r (fixnum-exact-p expr) r))))))
+
+(defun float-round-int-range (expr)
+  "For (FLOOR X) / (TRUNCATE X) / (CEILING X) / (ROUND X) of a float X of known
+   format whose range is known, the integer range of the first value when it
+   fits int64; else NIL."
+  (and (consp expr)
+       (member (car expr) '(floor truncate ceiling round))
+       (consp (cdr expr)) (null (cddr expr))
+       (%float-round-arg-kind (car expr) (cdr expr))
+       (let ((r (float-expr-range (cadr expr))))
+         (and r
+              (let ((ir (cons (1- (floor (car r))) (1+ (ceiling (cdr r))))))
+                (and (range-fits-int64-p ir) ir))))))
+
+(defun extract-float-range-locals (body)
+  "Alist (name-string . (LO . HI)) of the variables BODY's head declarations
+   give a ranged float type."
+  (let ((result '()))
+    (dolist (form body)
+      (unless (and (consp form) (eq (car form) 'declare))
+        (return))
+      (dolist (decl (cdr form))
+        (when (consp decl)
+          (multiple-value-bind (type vars)
+              (if (eq (car decl) 'type)
+                  (values (cadr decl) (cddr decl))
+                  (values (car decl) (cdr decl)))
+            (let ((range (declared-float-range type)))
+              (when range
+                (dolist (v vars)
+                  (when (symbolp v)
+                    (pushnew (cons (var-name v) range) result
+                             :key #'car :test #'string=)))))))))
+    result))
+
+(defvar *let-float-range-inits* '()
+  "Alist (SLOT-KEY . (LO . HI)) of the ranges of the current LET's inits,
+   computed in the scope the inits are evaluated in (see
+   %LET-FLOAT-RANGE-INITS).")
+
+(defun %mentions-name-p (form names)
+  (cond ((symbolp form) (and form (member (var-name form) names :test #'string=)))
+        ((consp form) (or (%mentions-name-p (car form) names)
+                          (%mentions-name-p (cdr form) names)))
+        (t nil)))
+
+(defun %let-float-range-inits (binding-info sequential-p mutated)
+  "*LET-FLOAT-RANGE-INITS* for BINDING-INFO, asked before the LET's own names
+   shadow anything. In a LET* an init that mentions an earlier sibling's name
+   gets no entry."
+  (let ((result '()) (seen '()))
+    (dolist (b binding-info)
+      (let ((init (second b)))
+        (when (and (not (third b))
+                   (not (member (var-name (first b)) mutated :test #'string=))
+                   (or (floatp init)
+                       (and (symbolp init) (float-local-range init))
+                       (and (consp init)
+                            (member (car init) '(+ - * 1+ 1- ffloor ftruncate fceiling
+                                                 fround float the))))
+                   (not (and sequential-p seen (%mentions-name-p init seen))))
+          (let ((r (float-expr-range init)))
+            (when r (push (cons (fourth b) r) result)))))
+      (push (var-name (first b)) seen))
+    result))
+
+(defvar *let-int-range-inits* '()
+  "Like *LET-FLOAT-RANGE-INITS*, for the EXPR-INT-RANGE of the inits.")
+
+(defun %let-int-range-inits (binding-info sequential-p mutated)
+  (let ((result '()) (seen '()))
+    (dolist (b binding-info)
+      (let ((init (second b)))
+        (when (and (not (third b))
+                   init
+                   (not (member (var-name (first b)) mutated :test #'string=))
+                   (not (and sequential-p seen (%mentions-name-p init seen))))
+          (let ((r (expr-int-range init)))
+            (when (and r (range-fits-int64-p r))
+              (push (cons (fourth b) r) result)))))
+      (push (var-name (first b)) seen))
+    result))
+
+(defvar *let-proven-type-inits* '()
+  "(SLOT-KEY . TYPE) for the LET bindings whose init has a %STATIC-VALUE-TYPE,
+   computed in the scope the inits are evaluated in.")
+
+(defun %let-proven-type-inits (binding-info sequential-p mutated)
+  (let ((result '()) (seen '()))
+    (dolist (b binding-info)
+      (let ((init (second b)))
+        (when (and (not (third b))
+                   init
+                   (not (member (var-name (first b)) mutated :test #'string=))
+                   (not (and sequential-p seen (%mentions-name-p init seen))))
+          (let ((ty (%static-value-type init)))
+            (when ty (push (cons (fourth b) ty) result)))))
+      (push (var-name (first b)) seen))
+    result))
+
+(defun infer-float-range-bindings (binding-info needs-boxing mutated)
+  "The entries of *LET-FLOAT-RANGE-INITS* for BINDING-INFO's lexical bindings
+   that the body neither assigns nor captures by reference."
+  (loop for b in binding-info
+        for e = (assoc (fourth b) *let-float-range-inits* :test #'equal)
+        when (and e
+                  (not (third b))
+                  (not (member (var-name (first b)) needs-boxing :test #'string=))
+                  (not (member (var-name (first b)) mutated :test #'string=)))
+          collect e))
 
 (defun fixnum-binop-native-p (op args)
   "True when (OP A B) may be computed by COMPILE-FIXNUM-BINOP -- both operands

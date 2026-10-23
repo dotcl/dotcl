@@ -17,6 +17,7 @@ public partial class LispFunction
     internal int _entryKey;   // arity + 1 while _entry is set
     internal bool _selfFramed;   // the array entry too
     internal int _sfMask;        // bit N: _funcN links its own frame
+    internal bool _closureEntry; // _entry is a closure body's: no frame, no _funcN
 
     public void SetSelfFramedEntry(System.IntPtr entry, int arity)
     {
@@ -36,9 +37,51 @@ public partial class LispFunction
         }
     }
 
-    /// <summary>For tests: "entry", "self-framed" (no entry) or "none".</summary>
+    /// <summary>A closure body that records no frame, entered through
+    /// _entry by CallN. ENTRY takes (LispFunction self, a0..aN-1).</summary>
+    public static LispObject WithClosureEntry(LispObject fn, System.IntPtr entry, int arity)
+    {
+        var f = (LispFunction)fn;
+        if (f._entryKey == 0 && f._frameName == null)
+        {
+            f._entry = entry;
+            f._entryKey = arity + 1;
+            f._closureEntry = true;
+        }
+        return fn;
+    }
+
+    /// <summary>The innermost frame, for C# that calls Lisp through CallN in a
+    /// loop and puts the frame list back once in its own finally, as InvokeN
+    /// does on every call.</summary>
+    internal static unsafe nint CurrentTop => (nint)s_top;
+    internal static unsafe void RestoreTop(nint top) => s_top = (Frame*)top;
+
+    /// <summary>The check InvokeN makes before a closure body, made by the body
+    /// itself when it has a closure entry.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void ClosureEntryCheck()
+    {
+        if (++CallTls.StackCheck % 256 == 0) ClosureEntryCheckSlow();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ClosureEntryCheckSlow()
+    {
+        int mode = MultipleValues.TakeMode();
+        try
+        {
+            if (!Compat.TryEnsureSufficientExecutionStackWithMargin())
+                throw new LispErrorException(new LispStorageCondition(
+                    "Stack overflow in function anonymous"));
+            ConditionSystem.CheckInterrupt();
+        }
+        finally { if (mode != 0) MultipleValues.SetMode(mode); }
+    }
+
+    /// <summary>For tests: "entry", "closure-entry", "self-framed" (no entry) or "none".</summary>
     public static string EntryState(LispObject fn) =>
-        fn is LispFunction f ? (f._entryKey != 0 ? "entry" : f._sfMask != 0 ? "self-framed" : "none") : "none";
+        fn is LispFunction f ? (f._entryKey != 0 ? (f._closureEntry ? "closure-entry" : "entry") : f._sfMask != 0 ? "self-framed" : "none") : "none";
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe LispObject Call0(LispFunction fn)
@@ -98,7 +141,7 @@ public partial class LispFunction
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool SelfTailEntry(ref Frame fr, LispFunction callee, int arity, int mode)
     {
-        if (callee._entryKey != arity + 1) return false;
+        if (callee._entryKey != arity + 1 || callee._closureEntry) return false;
         ConditionSystem.PollInterrupt();
         if (mode >= 0 && (callee._mvModeMask & (1 << arity)) != 0) MultipleValues.SetMode(mode);
         if (fr.Depth == 0) CallTls.Borrow = 1;
@@ -197,28 +240,81 @@ public partial class LispFunction
     private static unsafe void LinkOwn(ref Frame fr)
     {
         if (CallTls.Borrow != 0) { EnterBorrowed(ref fr); return; }
-        ref var top = ref CallTls.Top;
-        var p = top;
-        fr.Prev = p;
-        int d = p == null ? 1 : p->Depth + 1;
-        fr.Depth = d;
-        top = (Frame*)Unsafe.AsPointer(ref fr);
-        if (((d & 255) == 0) | (ConditionSystem.PollGate != 0)) EnterSlow(ref fr);
+        LinkTop(ref fr);
+        if ((fr.Depth & 255) == 0 || ConditionSystem.PollGate != 0) EnterSlow(ref fr);
     }
 
-    // The value mode the caller handed this body is kept across the poll.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void LinkTop(ref Frame fr)
+    {
+        var slot = (Frame**)Unsafe.AsPointer(ref CallTls.TopWord);
+        fr._slot = slot;
+        var p = *slot;
+        fr.Prev = p;
+        fr.Depth = p == null ? 1 : p->Depth + 1;
+        *slot = (Frame*)Unsafe.AsPointer(ref fr);
+    }
+
+    // EnterN followed by EnterUnit, for a body whose function may hold a RetainUnit.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void LinkOwnUnit(ref Frame fr, LispFunction self)
+    {
+        fr._unit = self.RetainUnit;
+        if (CallTls.Borrow != 0) { EnterBorrowedUnit(ref fr); return; }
+        LinkTop(ref fr);
+        if ((fr.Depth & 255) == 0 || ConditionSystem.PollGate != 0) EnterSlow(ref fr);
+    }
+
+    // A borrowed frame keeps the unit in the frame it borrows.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static unsafe void EnterBorrowedUnit(ref Frame fr)
+    {
+        EnterBorrowed(ref fr);
+        if (fr.Depth == 0 && fr._unit is { } u) fr.Prev->KeepUnit(u);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Enter0U(ref Frame fr, string name, LispFunction self)
+    {
+        fr.Name = name;
+        LinkOwnUnit(ref fr, self);
+    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Enter1U(ref Frame fr, string name, LispFunction self, LispObject a0)
+    {
+        fr.Name = name; fr._argc = 1; fr._a0 = a0;
+        LinkOwnUnit(ref fr, self);
+    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Enter2U(ref Frame fr, string name, LispFunction self, LispObject a0, LispObject a1)
+    {
+        fr.Name = name; fr._argc = 2; fr._a0 = a0; fr._a1 = a1;
+        LinkOwnUnit(ref fr, self);
+    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Enter3U(ref Frame fr, string name, LispFunction self, LispObject a0, LispObject a1, LispObject a2)
+    {
+        fr.Name = name; fr._argc = 3; fr._a0 = a0; fr._a1 = a1; fr._a2 = a2;
+        LinkOwnUnit(ref fr, self);
+    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void Enter4U(ref Frame fr, string name, LispFunction self, LispObject a0, LispObject a1, LispObject a2, LispObject a3)
+    {
+        fr.Name = name; fr._argc = 4; fr._a0 = a0; fr._a1 = a1; fr._a2 = a2; fr._a3 = a3;
+        LinkOwnUnit(ref fr, self);
+    }
+
+    // The value mode the caller handed this body is kept across the poll, and
+    // dropped when the poll or the stack check throws: the body does not run.
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void EnterSlow(ref Frame fr)
     {
         int mode = MultipleValues.TakeMode();
-        try
-        {
-            if ((fr.Depth & 255) == 0 && !Compat.TryEnsureSufficientExecutionStackWithMargin())
-                throw new LispErrorException(new LispStorageCondition(
-                    $"Stack overflow in function {fr.Name}"));
-            if (ConditionSystem.PollGate != 0) ConditionSystem.PollCallSlow();
-        }
-        finally { if (mode != 0) MultipleValues.SetMode(mode); }
+        if ((fr.Depth & 255) == 0 && !Compat.TryEnsureSufficientExecutionStackWithMargin())
+            throw new LispErrorException(new LispStorageCondition(
+                $"Stack overflow in function {fr.Name}"));
+        if (ConditionSystem.PollGate != 0) ConditionSystem.PollCallSlow();
+        if (mode != 0) MultipleValues.SetMode(mode);
     }
 
     // Borrow 2 (InvokeNoFrame): run on no frame at all (Depth -1).
@@ -227,6 +323,7 @@ public partial class LispFunction
     {
         var how = CallTls.Borrow;
         CallTls.Borrow = 0;
+        fixed (Frame** pt = &CallTls.Top) fr._slot = pt;
         var top = CallTls.Top;
         fr.Prev = top;
         if (how == 1 && top != null)
@@ -248,11 +345,25 @@ public partial class LispFunction
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static unsafe void Leave(ref Frame fr) => CallTls.Top = fr.Prev;
+    public static unsafe void Leave(ref Frame fr)
+    {
+#if NET5_0_OR_GREATER
+        *fr._slot = fr.Prev;
+#else
+        CallTls.Top = fr.Prev;
+#endif
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe void Resume(ref Frame fr) =>
         CallTls.Top = fr.Depth > 0 ? (Frame*)Unsafe.AsPointer(ref fr) : fr.Prev;
+
+    /// <summary>After ResumeBelow: FR, a frame local of the handler's method that
+    /// may lie above its marker, is unlinked when it is still the innermost.</summary>
+    public static unsafe void UnlinkIfTop(ref Frame fr)
+    {
+        if (s_top == (Frame*)Unsafe.AsPointer(ref fr)) s_top = fr.Prev;
+    }
 
     /// <summary>MARKER is a local of the handler's method.</summary>
     // A frame below MARKER (the stack grows down) belongs to a method deeper than

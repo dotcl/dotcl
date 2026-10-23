@@ -65,11 +65,13 @@
   (:caught 0 :thrown 0 0))
 
 (deftest-emitting-only gf-self-framed.stack-overflow-is-a-condition
-  (let ((base (%gsf-depth)))
-    (list (handler-case (%gsf-no-bottom 0) (storage-condition () :overflow))
-          (- (%gsf-depth) base)
-          (handler-case (%gsf-down 50 :error) (error () :caught))
-          (- (%gsf-depth) base)))
+  (call-on-small-stack
+   (lambda ()
+     (let ((base (%gsf-depth)))
+       (list (handler-case (%gsf-no-bottom 0) (storage-condition () :overflow))
+             (- (%gsf-depth) base)
+             (handler-case (%gsf-down 50 :error) (error () :caught))
+             (- (%gsf-depth) base)))))
   (:overflow 0 :caught 0))
 
 ;; A method that needs its next-method state and one that does not, on the

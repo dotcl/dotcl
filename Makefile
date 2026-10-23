@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: regression-time test-random-forms test-random-type-prop il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-coverage test-ansi-all test-ansi-gate library-status library-status-tests test-library-status-dists test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree refresh-quicklisp-contrib test-pack-nuspec test-pack-library-e2e test-pack-library-previous test-dist-package-e2e test-save-class-lib test-project-compose test-project-core-build test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotnet-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: refresh-fasls regression-time test-random-forms test-random-type-prop il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-coverage test-ansi-all test-ansi-gate library-status library-status-tests test-library-status-dists test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree refresh-quicklisp-contrib test-pack-nuspec test-pack-library-e2e test-pack-library-previous test-dist-package-e2e test-save-class-lib test-project-compose test-project-core-build test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check cross-compile-seed loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotnet-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -127,7 +127,7 @@ endef
 # pack, build, the REPL on a pipe, RUN-PROGRAM) start them from the FASL core
 # (REGRESSION-CHILD-CORE in test/framework.lisp). Some of them also load under
 # the interpreter, so test-regression-interp needs it too.
-test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)compiler/dotcl.core $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl) refresh-quicklisp-contrib
+test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil refresh-fasls
 	@echo "=== Running dotcl regression tests ==="
 	$(TREE_STAMP)
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/regression/run.lisp
@@ -143,7 +143,7 @@ test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)compiler/d
 # only: LOAD still compiles top-level forms. This exercises the interpreter
 # wherever a test reaches it through EVAL, which is far better than nothing but
 # is not the same as running the suite ON an emit-free build.
-test-regression-interp: build $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)compiler/dotcl.core $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl) refresh-quicklisp-contrib
+test-regression-interp: build $(DOTCL_ROOT)compiler/cil-out.sil refresh-fasls
 	@echo "=== Running dotcl regression tests (tree-walk interpreter) ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(setq dotcl:*evaluator-mode* :interpret)' $(DOTCL_ROOT)test/regression/run.lisp
 
@@ -162,7 +162,7 @@ test-regression-interp: build $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)com
 # framework (see runtime/DotCL.Runtime.csproj), so this differs from a normal run
 # in exactly one axis. It needs the FASL core: --asm of a .sil would itself want
 # the assembler.
-test-regression-emitfree: $(DOTCL_ROOT)compiler/dotcl.core $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl) refresh-quicklisp-contrib
+test-regression-emitfree: refresh-fasls
 	@echo "=== Running dotcl regression tests (emit-free build) ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -p:DotclNoEmit=true -- --core $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)test/regression/run.lisp
 
@@ -194,7 +194,7 @@ test-pack-library-e2e: build $(DOTCL_ROOT)compiler/dotcl.core
 # The same, with the library packed by a released dotcl (installed from nuget.org)
 # and loaded by this one: the old fasls have to load and run here as they are.
 # Pinned like the seed; move it to the newest release when one ships.
-PREVIOUS_DOTCL_VERSION ?= 0.1.33
+PREVIOUS_DOTCL_VERSION ?= 0.1.34
 
 test-pack-library-previous: build $(DOTCL_ROOT)compiler/dotcl.core
 	@echo "=== Running library package check (packed by dotcl $(PREVIOUS_DOTCL_VERSION)) ==="
@@ -735,6 +735,22 @@ setup-quicklisp:
 	@mkdir -p $(DOTCL_ROOT)contrib/quicklisp
 	@sh $(DOTCL_ROOT)scripts/build-quicklisp.sh $(DOTCL_ROOT)quicklisp-client $(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp
 
+# The prebuilt fasls the regression targets load: the core, asdf, quicklisp and
+# every contrib. One built against other runtime source (its stamp names another
+# digest than the runtime just built) is removed first and built again; the C#
+# files' timestamps are not consulted, so a checkout that only touches them
+# rebuilds nothing. Otherwise the usual rules apply (older than the .lisp or
+# cil-out.sil). The sub-make sees the removals.
+RUNTIME_SOURCE_ID := $(DOTCL_ROOT)runtime/obj/Debug/net10.0/dotcl-runtime-source.id
+REFRESH_FASLS = $(DOTCL_ROOT)compiler/dotcl.core \
+  $(if $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.lisp),$(DOTCL_ROOT)contrib/asdf/asdf.fasl) \
+  $(foreach n,$(CONTRIB_NAMES),$(if $(wildcard $(DOTCL_ROOT)contrib/$(n)/$(n).lisp),$(DOTCL_ROOT)contrib/$(n)/$(n).fasl))
+QUICKLISP_FASL = $(if $(wildcard $(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp),$(DOTCL_ROOT)contrib/quicklisp/quicklisp.fasl)
+
+refresh-fasls: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@sh $(DOTCL_ROOT)scripts/drop-stale-fasls.sh $(RUNTIME_SOURCE_ID) $(REFRESH_FASLS) $(QUICKLISP_FASL)
+	@$(MAKE) --no-print-directory $(REFRESH_FASLS) refresh-quicklisp-contrib $(QUICKLISP_FASL)
+
 # contrib/quicklisp/ is generated (setup-quicklisp, compile-quicklisp-fasl) and
 # gitignored, so a change to how it is generated -- scripts/build-quicklisp.sh, or
 # the client checkout -- reaches a tree only when someone thinks to rebuild it, and
@@ -939,16 +955,28 @@ bench-parity: cross-compile bench-build
 
 endif
 
-# The wall time of the compiled regression suite, recorded in bench-state.json
-# as "regression/compiled" and judged against
-# "<platform>/regression/compiled-seconds" in bench/gate/ratio-baseline.json. The
-# suite is mostly compile time (thousands of small forms, compiled and run), so
-# this is the number that shows a compiler change making compilation slower.
-# Seconds, not a ratio: only comparable on the machine the baseline came from.
-regression-time: build $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)compiler/dotcl.core $(wildcard $(DOTCL_ROOT)contrib/asdf/asdf.fasl) refresh-quicklisp-contrib
+# Code generated by Coalton, timed on dotcl and SBCL (bench/coalton/README.md).
+# COALTON_DIR is a Coalton checkout; Quicklisp must have Coalton's dependencies.
+.PHONY: bench-coalton
+bench-coalton: cross-compile bench-build compile-core-fasl compile-quicklisp-fasl
+	@test -n "$(COALTON_DIR)" || { echo "bench-coalton: set COALTON_DIR to a Coalton checkout"; exit 2; }
+	@bash $(DOTCL_ROOT)bench/coalton/compare.sh $(COALTON_DIR) $(BENCH_TMP)/coalton
+
+# The compiled regression suite timed file by file, judged against the per-file
+# table bench/gate/regression-file-times.tsv (rows of <platform>); the whole
+# time goes into bench-state.json as "regression/compiled". The suite is mostly
+# compile time (thousands of small forms, compiled and run), so this is the
+# number that shows a compiler change making compilation slower. Seconds, not
+# ratios: only comparable on the machine the table came from.
+# regression-time-baseline runs the suite twice and rewrites this platform's
+# rows with the smaller time of each file; run it on that machine after a
+# landing.
+REGRESSION_TIME_ARGS = $(DOTCL_ROOT). $(DOTCL_ROOT)bench-state.json $(DOTCL_ROOT)bench/gate/regression-file-times.tsv $(BENCH_PLATFORM) $(BENCH_TMP)/regression-time.txt
+.PHONY: regression-time-baseline
+regression-time regression-time-baseline: build $(DOTCL_ROOT)compiler/cil-out.sil refresh-fasls
 	@mkdir -p $(BENCH_TMP)
 	$(TREE_STAMP)
-	@bash $(DOTCL_ROOT)bench/gate/regression-time.sh $(DOTCL_ROOT). $(DOTCL_ROOT)bench-state.json $(DOTCL_ROOT)bench/gate/ratio-baseline.json $(BENCH_PLATFORM) $(BENCH_TMP)/regression-time.txt
+	@bash $(DOTCL_ROOT)bench/gate/regression-time.sh $(if $(filter regression-time-baseline,$@),--record) $(REGRESSION_TIME_ARGS)
 
 
 ## --- IL parity (bench/il-parity) ------------------------------------------
@@ -1054,15 +1082,18 @@ cross-compile: $(DOTCL_ROOT)compiler/cil-out.sil
 #
 # The seed is a RELEASED dotcl, never a locally built one: a build must not be
 # able to poison the thing that builds it, and a pinned version is reproducible.
-# It installs under build/ (gitignored, disposable) rather than the user's
-# global tools, so `rm -rf build/seed` is always the way back.
+# It installs under build/seed/<version> (gitignored, disposable) rather than the
+# user's global tools, so `rm -rf build/seed` is always the way back, and a tree
+# that already holds an older seed installs the pinned one next to it instead of
+# going on with the old one.
 #
-# Not yet the default: 0.1.24 predates the fixes that let dotcl host its own
-# cross-compile, and the core it produces from this tree does not work. The
-# first release cut after those fixes can serve as the seed, and flipping the
-# default is then this one line plus a CI lane swap.
-DOTCL_SEED_VERSION ?= 0.1.25
-DOTCL_SEED_DIR := $(DOTCL_ROOT)build/seed
+# A machine without SBCL builds with `make cross-compile-seed` and uses the core
+# the seed builds (stage 1) as is. seed-check alone does not show that this
+# works: it compares stage 2 with stage 3, both built by the tree's own runtime,
+# so a seed that miscompiles the compiler at stage 1 still passes it. A new pin
+# has to pass seed-check and the suite on its stage 1.
+DOTCL_SEED_VERSION ?= 0.1.34
+DOTCL_SEED_DIR := $(DOTCL_ROOT)build/seed/$(DOTCL_SEED_VERSION)
 DOTCL_SEED := $(DOTCL_SEED_DIR)/dotcl$(if $(filter Windows_NT,$(OS)),.cmd,)
 
 # build/ holds artifacts, not sources, and the seed is a whole released dotcl --
@@ -1079,13 +1110,17 @@ $(DOTCL_BUILD_SRCREG):
 	@printf '(:source-registry-cache)\n' > $@
 
 $(DOTCL_SEED):
-	@echo "=== Installing seed dotcl $(DOTCL_SEED_VERSION) into build/seed ==="
+	@echo "=== Installing seed dotcl $(DOTCL_SEED_VERSION) into build/seed/$(DOTCL_SEED_VERSION) ==="
 	dotnet tool install dotcl --version $(DOTCL_SEED_VERSION) --tool-path $(DOTCL_SEED_DIR)
 
 # The marker is a prerequisite of its own rather than a line in the rule above:
 # the seed is a file target, so a tree that already has one skips that rule
 # entirely and would never get the marker written.
 seed-install: $(DOTCL_SEED) $(DOTCL_BUILD_SRCREG)
+
+# The cross-compile hosted by the seed instead of a Common Lisp.
+cross-compile-seed: seed-install
+	$(MAKE) cross-compile DOTCL_LISP=$(DOTCL_SEED)
 
 # Can the pinned seed build this tree? Answers the one question that gates
 # making dotcl the default host. Builds the core with the seed, then rebuilds it
@@ -1148,7 +1183,7 @@ publish:
 # Compile contrib/asdf/asdf.lisp -> asdf.fasl (.NET IL assembly) with dotcl
 # itself. .fasl is the shipped artifact (fastest load); .sil and .lisp are
 # not distributed. All 3 are gitignored.
-$(DOTCL_ROOT)contrib/asdf/asdf.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/asdf/asdf.lisp $(RUNTIME_SOURCES)
+$(DOTCL_ROOT)contrib/asdf/asdf.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/asdf/asdf.lisp
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp")'
 
 compile-asdf-fasl: setup-asdf $(DOTCL_ROOT)contrib/asdf/asdf.fasl
@@ -1165,7 +1200,7 @@ compile-asdf-fasls: compile-asdf-fasl
 # asdf has to be loaded first: the client reads asdf: symbols at read time
 # (client.lisp, dist.lisp, misc.lisp, setup.lisp), exactly as upstream's
 # bootstrap loads asdf.lisp before the client files.
-$(DOTCL_ROOT)contrib/quicklisp/quicklisp.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp $(DOTCL_ROOT)contrib/asdf/asdf.fasl $(RUNTIME_SOURCES)
+$(DOTCL_ROOT)contrib/quicklisp/quicklisp.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp $(DOTCL_ROOT)contrib/asdf/asdf.fasl
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(progn (require "asdf") (compile-file "$(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp"))'
 
 compile-quicklisp-fasl: setup-quicklisp compile-asdf-fasl $(DOTCL_ROOT)contrib/quicklisp/quicklisp.fasl
@@ -1202,7 +1237,7 @@ $(DOTCL_ROOT)contrib/$(1)/$(1).fasl: $(foreach d,$(call CONTRIB_REQUIRE_NAMES,$(
 endef
 $(foreach n,$(CONTRIB_NAMES),$(eval $(call CONTRIB_ORDER_RULE,$(n))))
 
-$(DOTCL_ROOT)contrib/%.fasl: $(DOTCL_ROOT)contrib/%.lisp $(DOTCL_ROOT)compiler/cil-out.sil $(RUNTIME_SOURCES)
+$(DOTCL_ROOT)contrib/%.fasl: $(DOTCL_ROOT)contrib/%.lisp $(DOTCL_ROOT)compiler/cil-out.sil
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$<")'
 	@n=$$(echo '$*' | cut -d/ -f1); \
 	if [ -d "$(DOTCL_ROOT)runtime/contrib/$$n" ]; then \
@@ -1215,7 +1250,7 @@ compile-contrib-fasls: $(CONTRIB_FASLS)
 # dotcl:sil-to-fasl. The resulting .fasl loads in ~0.3s vs ~1.0s for .sil
 # because Reader parse (~1.1s) + CIL assemble (~170ms) are both skipped.
 # Ships in the pack as the default core.
-$(DOTCL_ROOT)compiler/dotcl.core: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs $(RUNTIME_SOURCES)
+$(DOTCL_ROOT)compiler/dotcl.core: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs
 	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(dotcl:sil-to-fasl "$(DOTCL_ROOT)compiler/cil-out.sil" "$(DOTCL_ROOT)compiler/dotcl.core")'
 
 compile-core-fasl: $(DOTCL_ROOT)compiler/dotcl.core

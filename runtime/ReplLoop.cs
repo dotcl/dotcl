@@ -167,7 +167,7 @@ public static class ReplLoop
             {
             var pkg = DynamicBindings.Get(Startup.Sym("*PACKAGE*")) as Package;
             var pkgName = pkg != null
-                ? new[] { pkg.Name }.Concat(pkg.Nicknames).OrderBy(n => n.Length).First()
+                ? new[] { pkg.VisibleName }.Concat(pkg.VisibleNicknames).OrderBy(n => n.Length).First()
                 : "CL-USER";
 
             // The continuation prompt is as wide as the primary one looks,

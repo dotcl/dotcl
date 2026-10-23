@@ -587,6 +587,7 @@
   (cond
     ((integerp expr) (<= +int64-min+ expr +int64-max+))
     ((%rotate-byte-32-long-p expr) t)
+    ((%u64-local-field expr) t)
     ;; Direct Int64 local in native function body: already long, no unbox needed
     ((and (symbolp expr)
           (boundp '*cstate*)
@@ -653,6 +654,11 @@
           (fixnum-typed-p (cadr expr))
           (or *fixnum-wrap-licensed* (expr-int-range expr)))
      t)
+    ((and (consp expr) (= (length expr) 2)
+          (eq (car expr) '-)
+          (fixnum-typed-p (cadr expr))
+          (or *fixnum-wrap-licensed* (expr-int-range expr)))
+     t)
     ;; %dotimes-1+: dotimes-emitted increment whose result is asserted to fit
     ;; int64 (counter < limit at the increment site), fixnum-typed like 1+.
     ((and (consp expr) (= (length expr) 2)
@@ -662,6 +668,9 @@
     ;; %dotimes-limit / %loop-limit-floor: a loop limit clamped into int64.
     ((and (consp expr) (= (length expr) 2)
           (member (car expr) '(%dotimes-limit %loop-limit-floor)))
+     t)
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '%loop-by)
+          (fixnum-typed-p (cadr expr)))
      t)
     ;; logand/logior/logxor with fixnum operands -> fixnum result. Each bit of
     ;; the result depends on the same bit of the operands only, so exact
@@ -697,6 +706,7 @@
      t)
     ;; MIN / MAX of exact fixnums is one of them.
     ((%fixnum-min-max-p expr) t)
+    ((float-round-int-range expr) t)
     ;; lognot with fixnum operand -> fixnum result
     ((and (consp expr) (= (length expr) 2)
           (eq (car expr) 'lognot)
@@ -923,6 +933,24 @@
        (fixnum-exact-p (fourth expr))
        (let ((r (expr-int-range (fourth expr))))
          (and r (>= (car r) 0) (<= (cdr r) #xFFFFFFFF)))))
+
+(defun %u64-local-field (expr)
+  "(KEY SHIFT . MASK) when EXPR is (LDB (BYTE S P) X), or the LOGAND / ASH form
+   it folds to, of a local X holding (UNSIGNED-BYTE 64) bits, with a mask below
+   2^63: a logical shift and a mask of the raw slot, always a fixnum. Else NIL."
+  (let ((e (fold-typed-operand expr)))
+    (when (and (consp e) (eq (car e) 'logand) (= (length e) 3)
+               (not (local-function-entry 'logand)))
+      (let* ((m (if (integerp (caddr e)) (caddr e) (cadr e)))
+             (x (if (eq m (caddr e)) (cadr e) (caddr e)))
+             (shift 0))
+        (when (and (integerp m) (<= 0 m +int64-max+))
+          (when (and (consp x) (eq (car x) 'ash) (= (length x) 3)
+                     (integerp (caddr x)) (<= -63 (caddr x) 0)
+                     (not (local-function-entry 'ash)))
+            (setf shift (- (caddr x)) x (cadr x)))
+          (let ((key (and (symbolp x) x (u64-native-local-p x))))
+            (and key (list* key shift m))))))))
 
 (defun compile-rotate-byte-32-long (expr)
   (let ((tc (gen-local "ROTC")) (tx (gen-local "ROTX"))
@@ -1220,7 +1248,7 @@
   "A plan for computing EXPR in the 64-bit lane, or NIL. NEED is :exact (the
    value itself must lie in [0, 2^64)) or :mod (its low 64 bits will do).
    Records the operands in *U64-LEAVES*."
-  (let ((expr (fold-nary-arith expr))
+  (let ((expr (fold-nary-arith (%spec-strip expr)))
         (inl nil))
     (cond
       ((integerp expr)
@@ -1334,8 +1362,7 @@
        (let ((ref (%u64-struct-slot-ref expr))
              (l (gen-local "U64O")))
          (push (list l :bits expr nil
-                     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                           (compile-expr (car ref)))
+                     `(,@(compile-struct-object (car ref) (struct-slot-ref-type expr))
                        (:ldc-i4 ,(cdr ref))
                        (:call "Runtime.StructRefU64")))
                *u64-leaves*)
@@ -1351,6 +1378,11 @@
            (and (not (eq expr *u64-plan-root*))
                 (%u64-structured-leaf expr))
            (%u64-leaf expr :obj (eq need :exact))))
+      ;; A substituted local function call: its bits, when its body computes
+      ;; the word in the lane.
+      ((and (consp expr) (not *u64-in-inline-body*) (not (eq expr *u64-plan-root*))
+            (%u64-local-inline-call-p expr)
+            (%u64-structured-leaf expr)))
       ;; Any other operand is computed as it is and taken apart here.
       ((%literal-ldb-form-p expr) nil)
       ((and (symbolp expr) (or (null expr) (eq expr t) (keywordp expr))) nil)
@@ -1605,6 +1637,145 @@
                  (:label ,done))))
          leaves)))))
 
+;;; Nested +, -, *: when every operand is a fixnum, the intermediates are int64
+;;; with an overflow check and only the result is boxed; otherwise the generic calls.
+
+(defvar *spec-leaves* nil)
+
+(defun %spec-integer-type-p (type)
+  (or (member type '(integer number rational real t))
+      (and (consp type) (eq (car type) 'integer))))
+
+(defun %spec-strip (expr)
+  (loop
+    (let ((e (strip-value-wrappers expr)))
+      (cond ((and (consp e) (eq (car e) 'identity) (consp (cdr e)) (null (cddr e))
+                  (not (local-function-entry 'identity)))
+             (setf expr (cadr e)))
+            ((and (consp e) (eq (car e) 'the) (consp (cdr e)) (consp (cddr e))
+                  (null (cdddr e)) (%spec-integer-type-p (cadr e)))
+             (setf expr (caddr e)))
+            ((and (consp e) (member (car e) '(let let*)) (consp (cdr e))
+                  (or (eq (car e) 'let) (and (consp (cadr e)) (null (cdr (cadr e))))))
+             (let ((form (let-substitute-single-reads (cadr e) (cddr e))))
+               (if form (setf expr form) (return e))))
+            (t (return e))))))
+
+(defun %spec-op (expr)
+  "EXPR, a two-operand +, - or * (or 1+ / 1-), as (KIND A B); else NIL."
+  (let ((e (%spec-strip expr)))
+    (when (and (consp e) (symbolp (car e))
+               (member (car e) '(+ - * 1+ 1-))
+               (not (local-function-entry (car e)))
+               (not (macrolet-shadowed-p (car e))))
+      (let ((e (fold-nary-arith e)))
+        (case (and (consp e) (car e))
+          ((+ - *) (when (and (consp (cdr e)) (consp (cddr e)) (null (cdddr e)))
+                     (list (ecase (car e) (+ :add) (- :sub) (* :mul)) (cadr e) (caddr e))))
+          (1+ (when (and (consp (cdr e)) (null (cddr e))) (list :add (cadr e) 1)))
+          (1- (when (and (consp (cdr e)) (null (cddr e))) (list :sub (cadr e) 1))))))))
+
+(defun %spec-pure-p (expr)
+  (or (integerp expr)
+      (and (symbolp expr) expr (not (keywordp expr))
+           (not (nth-value 1 (lookup-symbol-macro expr))))))
+
+(defun %spec-plan (expr after-op root)
+  "The tree of EXPR, or NIL. AFTER-OP: an operation precedes EXPR in evaluation
+   order, so EXPR must not have side effects (the generic path would have
+   signalled before evaluating it). ROOT: the caller checks FIXNUM-TYPED-P of
+   EXPR itself, and only when the plan succeeds."
+  (let ((op (let ((op (%spec-op expr)))
+              (and op (or root (not (fixnum-typed-p expr))) op))))
+    (if op
+        (let* ((a (%spec-plan (second op) after-op nil))
+               (b (and a (%spec-plan (third op) (or after-op (eq (car a) :node)) nil))))
+          (and b (list :node (first op) a b)))
+        (let ((x (%spec-strip expr)))
+          (cond ((integerp x)
+                 (and (<= +int64-min+ x +int64-max+) (list :const x)))
+                ((or (numberp x) (characterp x) (stringp x)) nil)
+                ((and after-op (not (%spec-pure-p x))) nil)
+                ((> (length *spec-leaves*) 8) nil)
+                ((or (double-float-typed-p x) (single-float-typed-p x) (decimal-typed-p x)) nil)
+                (t (let ((l (gen-local "SPL"))
+                         (kind (if (fixnum-typed-p x) :long :obj)))
+                     (push (list l kind x) *spec-leaves*)
+                     (list :leaf l kind))))))))
+
+(defun %spec-load (node)
+  (ecase (car node)
+    (:const `((:ldc-i8 ,(second node))))
+    (:leaf (if (eq (third node) :long)
+               `((:ldloc ,(second node)))
+               `((:ldloc ,(second node)) (:unbox-fixnum))))))
+
+(defun %spec-fast (node slow root)
+  "(values CODE LOAD): CODE computes NODE's intermediates into locals, LOAD
+   pushes its int64 value; at ROOT, CODE leaves the boxed result."
+  (if (not (eq (car node) :node))
+      (values nil (%spec-load node))
+      (multiple-value-bind (ca la) (%spec-fast (third node) slow nil)
+        (multiple-value-bind (cb lb) (%spec-fast (fourth node) slow nil)
+          (if root
+              (values `(,@ca ,@cb ,@la ,@lb
+                        (:call ,(ecase (second node)
+                                  (:add "Runtime.AddFixnum") (:sub "Runtime.SubtractFixnum")
+                                  (:mul "Runtime.MultiplyFixnum"))))
+                      nil)
+              (let ((tmp (gen-local "SPT")))
+                (values `(,@ca ,@cb
+                          (:declare-local ,tmp "Int64")
+                          ,@la ,@lb
+                          (:call ,(ecase (second node)
+                                    (:add "Runtime.AddOrMin") (:sub "Runtime.SubtractOrMin")
+                                    (:mul "Runtime.MultiplyOrMin")))
+                          (:stloc ,tmp) (:ldloc ,tmp) (:ldc-i8 ,+int64-min+) (:beq ,slow))
+                        `((:ldloc ,tmp)))))))))
+
+(defun %spec-generic (node)
+  (ecase (car node)
+    (:const `((:ldc-i8 ,(second node)) (:call "Fixnum.Make")))
+    (:leaf (if (eq (third node) :long)
+               `((:ldloc ,(second node)) (:call "Fixnum.Make"))
+               `((:ldloc ,(second node)))))
+    (:node `(,@(%spec-generic (third node)) ,@(%spec-generic (fourth node))
+             (:call ,(ecase (second node)
+                       (:add "Runtime.Add") (:sub "Runtime.Subtract")
+                       (:mul "Runtime.Multiply")))))))
+
+(defun try-compile-spec-arith (expr)
+  "EXPR, a +, - or * with another of them among its operands, computed on int64
+   when its operands are fixnums (see above), leaving the boxed value; or NIL."
+  (let* ((*spec-leaves* nil)
+         (op (%spec-op expr))
+         (plan (and op
+                    (or (%spec-op (second op)) (%spec-op (third op)))
+                    (let ((*int-type-memo* (or *int-type-memo* (make-hash-table :test 'eq))))
+                      (%spec-plan expr nil t)))))
+    (when (and plan (eq (car plan) :node)
+               (or (eq (car (third plan)) :node) (eq (car (fourth plan)) :node))
+               (<= (length *spec-leaves*) 8)
+               (not (fixnum-typed-p expr)))
+      (let ((leaves (reverse *spec-leaves*))
+            (slow (gen-label "SPSLOW"))
+            (done (gen-label "SPDONE")))
+        `(,@(loop for (l kind x) in leaves
+                  append `((:declare-local ,l ,(if (eq kind :long) "Int64" "LispObject"))
+                           ,@(if (eq kind :long)
+                                 (compile-as-long x)
+                                 (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                                   (compile-expr x)))
+                           (:stloc ,l)))
+          ,@(loop for (l kind) in leaves
+                  unless (eq kind :long)
+                    append `((:ldloc ,l) (:call "Runtime.IsFixnumObject") (:brfalse ,slow)))
+          ,@(%spec-fast plan slow t)
+          (:br ,done)
+          (:label ,slow)
+          ,@(%spec-generic plan)
+          (:label ,done))))))
+
 (defun compile-guarded-long-bitop (fn a b)
   (let ((op (ecase fn (logand :and) (logior :or) (logxor :xor)))
         (method (ecase fn (logand "Runtime.Logand2") (logior "Runtime.Logior2")
@@ -1717,6 +1888,11 @@
     ((integerp expr)
      `((:ldc-i8 ,expr)))
     ((%rotate-byte-32-long-p expr) (compile-rotate-byte-32-long expr))
+    ((%u64-local-field expr)
+     (destructuring-bind (key shift . mask) (%u64-local-field expr)
+       `((:ldloc ,key)
+         ,@(when (plusp shift) `((:ldc-i8 ,shift) (:call "Runtime.ShrU64")))
+         (:ldc-i8 ,mask) (:and))))
     ;; Direct Int64 local in native body: already long, no unbox
     ((and (symbolp expr)
           (boundp '*cstate*)
@@ -1740,6 +1916,7 @@
           (boundp '*cstate*) (cstate-native-self-name)
           (cstate-self-fn-local)
           (string= (mangle-name (car expr)) (cstate-native-self-name))
+          (self-call-shortcut-p (car expr))
           (not (local-function-entry (car expr)))
           (let ((n (length (cdr expr)))) (and (>= n 1) (<= n 4)))
           ;; The parameters of a native self are all declared FIXNUM.
@@ -1791,7 +1968,7 @@
     ;; instead of the slot's LispObject through UnwrapMv and an unbox.
     ((struct-slot-ref expr)
      (let ((ref (struct-slot-ref expr)))
-       (compile-struct-slot-as-long (car ref) (cdr ref))))
+       (compile-struct-slot-as-long (car ref) (cdr ref) (struct-slot-ref-type expr))))
     ;; (if c a b), both arms fixnum-typed: branch with a raw int64 on each path
     ;; instead of boxing at the merge. The condition goes through the same
     ;; compile-boolean-branch the ordinary IF uses, so fused comparisons and
@@ -1833,6 +2010,9 @@
      `(,@(compile-as-long (cadr expr))
        (:ldc-i8 1)
        (:sub)))
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '-))
+     `(,@(compile-as-long (cadr expr))
+       (:neg)))
     ;; %dotimes-1+: raw add: the emitting macro asserts the result fits int64
     ;; (the increment site is only reached while counter < limit <= int64-max).
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '%dotimes-1+))
@@ -1850,6 +2030,9 @@
            (:call ,(if (eq (car expr) '%dotimes-limit)
                        "Runtime.DotimesLimit"
                        "Runtime.LoopLimitFloor")))))
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) '%loop-by))
+     `(,@(compile-as-long (cadr expr))
+       (:call "Runtime.LoopByFixnum")))
     ;; mod/rem: leaves int64 on stack. The helpers carry CL's sign rules
     ;; (MOD follows the divisor, REM truncates); a raw CIL :rem would give REM's
     ;; answer for both.
@@ -1876,6 +2059,13 @@
           `(,@(compile-long-binop-spilled x d)
             (:call ,(if (eq (car expr) 'floor)
                         "Runtime.FloorFixnumL" "Runtime.TruncateFixnumL")))))))
+    ((float-round-int-range expr)
+     (let ((kind (%float-round-arg-kind (car expr) (cdr expr))))
+       `(,@(if (eq kind :single)
+               `(,@(compile-as-single (cadr expr)) (:conv-r8))
+               (compile-as-double (cadr expr)))
+         (:call ,(%float-round-entry (car expr)))
+         (:conv-i8))))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(mod rem))
           (fixnum-exact-p (cadr expr)) (fixnum-exact-p (caddr expr)))
      `(,@(compile-long-binop-spilled (cadr expr) (caddr expr))
@@ -1942,12 +2132,23 @@
     ;; integer the caller wants raw: its last form is compiled as an int64
     ;; instead of being boxed and unboxed again.
     ((compile-as-long-structured expr))
+    ((let ((*in-tail-position* nil) (*in-mv-context* nil))
+       (%funcall-aref-long-plan expr))
+     (let ((*in-tail-position* nil) (*in-mv-context* nil))
+       (compile-funcall-aref (cadr expr) (%funcall-aref-long-plan expr)
+                             (%call-site-mv-mode (cdr expr)) t)))
+    ((let ((*in-tail-position* nil) (*in-mv-context* nil))
+       (%funcall-long-arg-expr-p expr))
+     (let ((*in-tail-position* nil) (*in-mv-context* nil))
+       (compile-funcall-long-arg (cadr expr) (caddr expr)
+                                 (%call-site-mv-mode (cdr expr)) t)))
     (t
-     ;; Fallback: compile as LispObject and unbox. Shouldn't hit this
-     ;; if fixnum-typed-p was checked first.
-     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-           (compile-expr expr))
-       (:unbox-fixnum)))))
+     (multiple-value-bind (code raw) (%compile-raw-typed-call expr :long)
+       (cond (raw code)
+             (code `(,@code (:unbox-fixnum)))
+             (t `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                      (compile-expr expr))
+                  (:unbox-fixnum))))))))
 
 (defun checked-long-arith-p (expr)
   "True for +/-/* (two operands after folding) or 1+/1- whose operands can all be
@@ -2004,6 +2205,15 @@
              (compile-expr expr))
          (:unbox-fixnum)))))
 
+(defun %u64-masked-index-p (expr)
+  "True when EXPR is (LOGAND X M), or an LDB the same as one, with M a literal
+   in [0, 2^63): its value fits an int64 whatever integer X is."
+  (let ((e (fold-typed-operand expr)))
+    (and (consp e) (eq (car e) 'logand) (= (length e) 3)
+         (not (local-function-entry 'logand))
+         (flet ((mask-p (m) (and (integerp m) (<= 0 m +int64-max+))))
+           (or (mask-p (cadr e)) (mask-p (caddr e)))))))
+
 (defun compile-index-to-long (expr)
   "Compile an array subscript leaving a raw int64 on the stack. A fixnum-typed
    subscript lowers natively (COMPILE-EXPR-TO-LONG); anything else is evaluated
@@ -2013,11 +2223,17 @@
    but an element's storage does not depend on the subscript. Requiring it meant
    an undeclared loop variable, the usual shape, (DO ((I 0 (1+ I))) ...), boxed
    every element the loop read."
-  (if (fixnum-long-lowerable-p expr)
-      (compile-expr-to-long expr)
-      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-            (compile-expr expr))
-        (:call "Runtime.IndexL"))))
+  (cond ((fixnum-long-lowerable-p expr)
+         (compile-expr-to-long expr))
+        ;; A subscript computed from (UNSIGNED-BYTE 64) words, such as a byte
+        ;; of one, (LOGAND (ASH W -8) #xFF): its low 64 bits are its value when
+        ;; its range fits an int64.
+        ((and (%u64-masked-index-p expr) (%u64-low-bits-plan expr))
+         (compile-int-slot-init expr))
+        (t
+         `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+               (compile-expr expr))
+           (:call "Runtime.IndexL")))))
 
 (defun compile-fixnum-binop (args op)
   "Emit native int64 binop, boxing result back to LispObject. All of +/-/*

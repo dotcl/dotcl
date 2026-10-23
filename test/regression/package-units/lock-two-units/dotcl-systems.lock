@@ -1,0 +1,13 @@
+(:dotcl-systems-lock
+ :format 1
+ :roots ("pulock2-app")
+ :systems
+ (("pulock2-common" :asd "common/pulock2-common.asd")
+  ("pulock2-x" :asd "x-1/pulock2-x.asd" :version "1.0" :unit "pulock2-x@1")
+  ("pulock2-x" :asd "x-2/pulock2-x.asd" :version "2.0" :unit "pulock2-x@2")
+  ("pulock2-a" :asd "a/pulock2-a.asd" :unit "pulock2-x@1" :boundary t)
+  ("pulock2-b" :asd "b/pulock2-b.asd" :unit "pulock2-x@2" :boundary t)
+  ("pulock2-app" :asd "app/pulock2-app.asd"))
+ :units
+ ((:name "pulock2-x@1" :packages ("PULOCK2-X") :systems ("pulock2-x"))
+  (:name "pulock2-x@2" :packages ("PULOCK2-X") :systems ("pulock2-x"))))

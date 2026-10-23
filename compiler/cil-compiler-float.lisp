@@ -21,6 +21,41 @@
   (or (eq ty 'single-float)
       (and (consp ty) (eq (car ty) 'single-float))))
 
+(defun %optimize-only-declares-p (forms)
+  (every (lambda (f)
+           (and (consp f) (eq (car f) 'declare)
+                (every (lambda (d) (and (consp d) (member (car d) '(optimize ignore ignorable))))
+                       (cdr f))))
+         forms))
+
+(defun strip-value-wrappers (expr &optional (locally t))
+  "EXPR without the wrappers that pass its primary value through unchanged:
+   (VALUES X), (PROGN X), (THE (VALUES TYPE ...) X) as (THE TYPE X), and, when
+   LOCALLY, (LOCALLY (DECLARE (OPTIMIZE ..)) X)."
+  (loop
+    (unless (and (consp expr) (consp (cdr expr)))
+      (return expr))
+    (let ((head (car expr)))
+      (cond
+        ((and (member head '(values progn)) (null (cddr expr)))
+         (setf expr (cadr expr)))
+        ((and (eq head 'the) (consp (cddr expr)) (null (cdddr expr))
+              (consp (cadr expr)) (eq (car (cadr expr)) 'values)
+              (consp (cdr (cadr expr)))
+              (not (member (cadr (cadr expr)) lambda-list-keywords)))
+         (setf expr (list 'the (cadr (cadr expr)) (caddr expr))))
+        ((and locally (eq head 'locally)
+              (let ((forms (member-if-not (lambda (f) (and (consp f) (eq (car f) 'declare)))
+                                          (cdr expr))))
+                (and (consp forms) (null (cdr forms))
+                     (%optimize-only-declares-p (ldiff (cdr expr) forms)))))
+         (setf expr (car (last expr))))
+        (t (return expr))))))
+
+(defun %locally-wrapper-p (expr)
+  (and (consp expr) (eq (car expr) 'locally)
+       (not (eq (strip-value-wrappers expr) expr))))
+
 (defparameter +float-round-ops+
   '((ffloor floor "Math.FloorDouble") (ftruncate truncate "Math.TruncateDouble")
     (fceiling ceiling "Math.CeilingDouble") (fround round "Math.RoundDouble"))
@@ -60,13 +95,18 @@
   ;; (* 2.0d0 z2 aux) was not recognized as double-typed and the enclosing
   ;; + fell off the native path with it. FOLD-NARY-ARITH is what the integer
   ;; side already does for the same reason.
-  (let ((expr (fold-nary-arith expr)))
+  (let ((expr (fold-nary-arith (strip-value-wrappers expr))))
   (cond
     ;; Literal double-float constant: unambiguous (the object is a double).
     ((typep expr 'double-float) t)
+    ((and (symbolp expr) (assoc expr *float-assumed* :test #'eq))
+     (eq (cdr (assoc expr *float-assumed* :test #'eq)) :double))
+    ((and (symbolp expr) (eq (float-native-local-kind expr) :double)) t)
     ;; aref on a proven double-float-backed array local: the element is a
     ;; double, readable as a native r8 (Runtime.ArefNum*D).
-    ((eq (numeric-array-aref-float-kind expr) :double) t)
+    ((and (not (%mentions-assumed-p expr))
+          (eq (numeric-array-aref-float-kind expr) :double))
+     t)
     ((and (symbolp expr)
           (boundp '*double-float-locals*)
           (member (var-name expr) *double-float-locals* :test #'string=)
@@ -100,13 +140,17 @@
      t)
     ((and (consp expr) (= (length expr) 3)
           (member (car expr) '(+ - * /))
-          (double-float-typed-p (cadr expr))
-          (double-float-typed-p (caddr expr)))
+          (let ((a (double-float-typed-p (cadr expr)))
+                (b (double-float-typed-p (caddr expr))))
+            (or (and a b)
+                (and a (%single-fixnum-operand-p (caddr expr)))
+                (and b (%single-fixnum-operand-p (cadr expr))))))
      t)
     ;; (abs x) of a double is a double -- same format, no contagion to consider.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs))
           (double-float-typed-p (cadr expr)))
      t)
+    ((%double-min-max-p expr) t)
     ;; Unary negate: (- x) where x is double-typed -> double.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '-)
           (double-float-typed-p (cadr expr)))
@@ -114,11 +158,41 @@
     ;; (sin x), (exp x), ... of a double, and (float i 1d0) / (coerce i
     ;; 'double-float) of a fixnum or a float: see the predicates.
     ((double-real-unary-form-p expr) t)
-    ((double-convert-form-p expr) t)
+    ((and (not (%mentions-assumed-p expr)) (double-convert-form-p expr)) t)
     ((and (consp expr) (assoc (car expr) +float-round-ops+)
           (eq (%float-round-arg-kind (car expr) (cdr expr)) :double))
      t)
+    ((%float-if-p expr #'double-float-typed-p) t)
+    ((and (consp expr) (member (car expr) '(let let*)) (consp (cdr expr)))
+     (%float-let-value-p expr :double))
     (t nil))))
+
+(defun %float-if-p (expr typed-p)
+  "T when EXPR is (IF TEST A B) with both A and B TYPED-P."
+  (and (consp expr) (eq (car expr) 'if) (consp (cdr expr)) (consp (cddr expr))
+       (consp (cdddr expr)) (null (cddddr expr))
+       (funcall typed-p (caddr expr))
+       (funcall typed-p (cadddr expr))))
+
+(defun %compile-float-if (expr compile-raw)
+  "(IF TEST A B), %FLOAT-IF-P, leaving the raw value COMPILE-RAW leaves for A
+   or B."
+  (let ((else (gen-label "FIFELSE")) (end (gen-label "FIFEND")))
+    `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+          (compile-boolean-branch (cadr expr) else nil))
+      ,@(funcall compile-raw (caddr expr))
+      (:br ,end)
+      (:label ,else)
+      ,@(funcall compile-raw (cadddr expr))
+      (:label ,end))))
+
+(defun %double-min-max-p (expr)
+  "T when EXPR is (MIN A B) or (MAX A B) of two DOUBLE-FLOAT-TYPED-P operands."
+  (and (consp expr) (member (car expr) '(min max)) (consp (cdr expr)) (consp (cddr expr))
+       (null (cdddr expr))
+       (not (local-function-entry (car expr)))
+       (double-float-typed-p (cadr expr))
+       (double-float-typed-p (caddr expr))))
 
 (defparameter +double-real-unary-entries+
   '((sin . "Math.SinDouble") (cos . "Math.CosDouble") (tan . "Math.TanDouble")
@@ -240,12 +314,28 @@
           '(:call "Math.SqrtDouble")
           '(:call "Runtime.SqrtDoubleChecked"))))
 
+(defun %raw-operands (codes il-type)
+  "The instruction lists CODES, each pushing one raw value of IL-TYPE, in order.
+   When one after the first opens or leaves a protected region, which needs an
+   empty evaluation stack, every value goes through a temp first."
+  (if (notany #'%instrs-need-empty-stack-p (cdr codes))
+      (apply #'append codes)
+      (let ((temps (loop repeat (length codes) collect (gen-local "RAWOP"))))
+        (append (loop for code in codes
+                      for tmp in temps
+                      append `((:declare-local ,tmp ,il-type) ,@code (:stloc ,tmp)))
+                (loop for tmp in temps collect `(:ldloc ,tmp))))))
+
 (defun compile-as-double (expr)
   "Compile EXPR leaving a native r8 (double) on the stack.
    Caller must have verified double-float-typed-p."
   ;; Folded the same way DOUBLE-FLOAT-TYPED-P folds it, so what this walks is
   ;; the shape that was approved.
-  (let ((expr (fold-nary-arith expr)))
+  (when (%locally-wrapper-p expr)
+    (return-from compile-as-double
+      (let ((*lexical-decl-frames* (%push-decl-frame :locally nil (cdr expr))))
+        (compile-as-double (car (last expr))))))
+  (let ((expr (fold-nary-arith (strip-value-wrappers expr nil))))
   (cond
     ;; A double-float literal is an IL immediate (ldc.r8). Falling through to
     ;; the generic path instead compiles it as a constant-pool reference and
@@ -256,6 +346,10 @@
     ;; already lowered to ldc.i8.
     ((typep expr 'double-float)
      `((:ldc-r8 ,expr)))
+    ;; The integer operand of a mixed double-float operation, converted as
+    ;; FLOAT converts it.
+    ((and (not (double-float-typed-p expr)) (fixnum-typed-p expr))
+     `(,@(compile-expr-to-long expr) (:conv-r8)))
     ;; A call from a typed body to itself whose result is a DOUBLE-FLOAT.
     ((and (typed-self-call-p expr)
           (eq (car (third (cstate-typed-self))) :double))
@@ -277,11 +371,11 @@
                   '(double-float long-float))
           (struct-slot-ref expr))
      (let* ((ref (struct-slot-ref expr))
-            (hit (struct-backing-entry (car ref) (cdr ref))))
+            (type (struct-slot-ref-type expr))
+            (hit (struct-backing-entry (car ref) (cdr ref) type)))
        (if (and hit (eql (cddr hit) 1))
-           (%struct-backing-read hit (car ref) (cdr ref))
-           `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                 (compile-expr (car ref)))
+           (%struct-backing-read hit (car ref) (cdr ref) type)
+           `(,@(compile-struct-object (car ref) type)
              (:ldc-i4 ,(cdr ref))
              (:call "Runtime.StructRefD")))))
     ;; aref on a double-float-backed array local -> raw r8 read, no box.
@@ -303,11 +397,27 @@
      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
            (compile-expr (caddr expr)))
        (:unbox-double)))
+    ((and (consp expr) (member (car expr) '(let let*)) (consp (cdr expr))
+          (listp (cadr expr))
+          (%boolean-branchable-let-p (cadr expr) (cddr expr)))
+     (let ((*in-tail-position* nil) (*in-mv-context* nil))
+       (compile-let (cadr expr) (cddr expr) (eq (car expr) 'let*)
+                    (lambda (forms)
+                      `(,@(%compile-statements (butlast forms))
+                        ,@(compile-as-double (car (last forms))))))))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - * /)))
      (let ((op (ecase (car expr) (+ :add) (- :sub) (* :mul) (/ :div))))
-       `(,@(compile-as-double (cadr expr))
-         ,@(compile-as-double (caddr expr))
+       `(,@(%raw-operands (list (compile-as-double (cadr expr))
+                                (compile-as-double (caddr expr)))
+                          "Double")
          (,op))))
+    ((%float-if-p expr #'double-float-typed-p)
+     (%compile-float-if expr #'compile-as-double))
+    ((%double-min-max-p expr)
+     `(,@(%raw-operands (list (compile-as-double (cadr expr))
+                              (compile-as-double (caddr expr)))
+                        "Double")
+       (:call ,(if (eq (car expr) 'min) "Runtime.MinDouble" "Runtime.MaxDouble"))))
     ;; (abs x) -> raw magnitude, no box on the way in or out.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs)))
      `(,@(compile-as-double (cadr expr)) (:call "Math.AbsDouble")))
@@ -327,9 +437,12 @@
           (eq (%float-round-arg-kind (car expr) (cdr expr)) :double))
      (compile-float-round-raw (car expr) (cadr expr) :double))
     (t
-     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-           (compile-expr expr))
-       (:unbox-double))))))
+     (multiple-value-bind (code raw) (%compile-raw-typed-call expr :double)
+       (cond (raw code)
+             (code `(,@code (:unbox-double)))
+             (t `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                      (compile-expr expr))
+                  (:unbox-double)))))))))
 
 (defun float-typed-p (expr)
   "T if EXPR is statically known to produce a float, of either format."
@@ -347,8 +460,9 @@
 
 (defun compile-double-binop (args op)
   "Emit: compile-as-double a, compile-as-double b, <op>, newobj DoubleFloat."
-  `(,@(compile-as-double (first args))
-    ,@(compile-as-double (second args))
+  `(,@(%raw-operands (list (compile-as-double (first args))
+                           (compile-as-double (second args)))
+                     "Double")
     (,op)
     (:newobj "DoubleFloat")))
 
@@ -368,8 +482,9 @@
                 (:le (quote ((:cgt-un) (:ldc-i4 0) (:ceq))))
                 (:ge (quote ((:clt-un) (:ldc-i4 0) (:ceq))))
                 (:ne '((:ceq) (:ldc-i4 0) (:ceq))))))
-    `(,@(compile-as-double-widened (first args))
-      ,@(compile-as-double-widened (second args))
+    `(,@(%raw-operands (list (compile-as-double-widened (first args))
+                             (compile-as-double-widened (second args)))
+                       "Double")
       ,@body)))
 
 ;;; ============================================================
@@ -446,7 +561,8 @@
                     (not (member (var-name head)
                                  '("IGNORE" "IGNORABLE" "OPTIMIZE" "SPECIAL"
                                    "DYNAMIC-EXTENT" "INLINE" "NOTINLINE"
-                                   "DECLARATION" "FTYPE" "VALUES")
+                                   "DECLARATION" "FTYPE" "VALUES"
+                                   "%INDUCTION" "%INDUCTION-COMPANION")
                                  :test #'string=)))
                (%warn-if-unknown-type head (null (cdr decl)))))))))))
 
@@ -712,13 +828,14 @@
    its type is already definite."
   ;; See DOUBLE-FLOAT-TYPED-P: a three-argument call means nested two-argument
   ;; ones, and every clause below matches only the two-argument shape.
-  (let ((expr (fold-nary-arith expr)))
+  (let ((expr (fold-nary-arith (strip-value-wrappers expr))))
   (cond
     ;; Literal single-float constant: unambiguous (the object is a single).
     ((typep expr 'single-float) t)
     ((and (consp expr) (member (car expr) *macrolet-shadowed* :test #'eq)) nil)
-    ((and (symbolp expr) (assoc expr *single-assumed* :test #'eq))
-     (cdr (assoc expr *single-assumed* :test #'eq)))
+    ((and (symbolp expr) (assoc expr *float-assumed* :test #'eq))
+     (eq (cdr (assoc expr *float-assumed* :test #'eq)) :single))
+    ((and (symbolp expr) (eq (float-native-local-kind expr) :single)) t)
     ;; aref on a proven single-float-backed array local: element is a single,
     ;; readable via Runtime.ArefNum*D (double) narrowed back with conv.r4.
     ((and (not (%mentions-assumed-p expr))
@@ -771,7 +888,7 @@
           (eq (%float-round-arg-kind (car expr) (cdr expr)) :single))
      t)
     ((and (consp expr) (member (car expr) '(let let*)) (consp (cdr expr)))
-     (%single-let-value-p expr))
+     (%float-let-value-p expr :single))
     ;; MACROLET: the value of its last form, the local macro names shadowing
     ;; whatever they name outside.
     ((and (consp expr) (eq (car expr) 'macrolet) (consp (cdr expr)) (listp (cadr expr))
@@ -780,16 +897,17 @@
                                                 (cadr expr))
                                         *macrolet-shadowed*)))
        (single-float-typed-p (car (last (cddr expr))))))
+    ((%float-if-p expr #'single-float-typed-p) t)
     ((and (consp expr) (symbolp (car expr)) (local-function-entry (car expr)))
      (%local-inline-call-single-p expr))
     (t nil))))
 
 (defun %mentions-assumed-p (x)
-  "True when X names a variable of *SINGLE-ASSUMED* outside QUOTE: the typing
+  "True when X names a variable of *FLOAT-ASSUMED* outside QUOTE: the typing
    predicates that read bindings would see the outer one instead."
-  (and *single-assumed*
+  (and *float-assumed*
        (labels ((walk (y)
-                  (cond ((symbolp y) (and y (assoc y *single-assumed* :test #'eq)))
+                  (cond ((symbolp y) (and y (assoc y *float-assumed* :test #'eq)))
                         ((not (consp y)) nil)
                         ((eq (car y) 'quote) nil)
                         (t (do ((r y (cdr r)))
@@ -843,33 +961,50 @@
                             (member var (cdr spec) :test #'eq))))
           (return-from %single-declared-p t))))))
 
-(defun %single-let-value-p (expr)
-  "SINGLE-FLOAT-TYPED-P of (LET / LET* BINDINGS DECL... FORM... ): its last
-   form, each variable single when declared so or, unassigned, bound to a single."
+(defun %double-declared-p (var decls)
+  (dolist (d decls nil)
+    (when (and (consp d) (eq (car d) 'declare))
+      (dolist (spec (cdr d))
+        (when (and (consp spec)
+                   (if (eq (car spec) 'type)
+                       (and (%double-float-type-spec-p (cadr spec))
+                            (member var (cddr spec) :test #'eq))
+                       (and (%double-float-type-spec-p (car spec))
+                            (member var (cdr spec) :test #'eq))))
+          (return-from %double-declared-p t))))))
+
+(defun %float-let-value-p (expr kind)
+  "Whether (LET / LET* BINDINGS DECL... FORM... ) is a float of KIND (:SINGLE or
+   :DOUBLE): its last form, each variable of KIND when declared so or,
+   unassigned, bound to a value of KIND. Only KIND is asked of the inits, so a
+   nest of LETs costs one walk."
   (let* ((bindings (cadr expr))
          (body (cddr expr))
          (decls (loop for f in body while (and (consp f) (eq (car f) 'declare)) collect f))
-         (forms (nthcdr (length decls) body)))
+         (forms (nthcdr (length decls) body))
+         (typed-p (if (eq kind :single) #'single-float-typed-p #'double-float-typed-p))
+         (declared-p (if (eq kind :single) #'%single-declared-p #'%double-declared-p)))
     (when (and forms (listp bindings))
       (let* ((vars (mapcar (lambda (b) (if (consp b) (car b) b)) bindings))
              (mutated (and (every #'symbolp vars)
                            (values (find-mutated-and-captured-vars
                                     forms (mapcar #'var-name vars)))))
-             (env *single-assumed*)
+             (env *float-assumed*)
              (new '()))
         (dolist (b bindings)
           (let* ((v (if (consp b) (car b) b))
                  (init (and (consp b) (cadr b))))
-            (unless (and (symbolp v) v (not (global-special-p v))) (return-from %single-let-value-p nil))
-            (let ((typed (or (%single-declared-p v decls)
+            (unless (and (symbolp v) v (not (global-special-p v)))
+              (return-from %float-let-value-p nil))
+            (let ((typed (or (funcall declared-p v decls)
                              (and init
                                   (not (member (var-name v) mutated :test #'string=))
-                                  (let ((*single-assumed* (if (eq (car expr) 'let) env
-                                                              (append new env))))
-                                    (single-float-typed-p init))))))
-              (push (cons v (and typed t)) new))))
-        (let ((*single-assumed* (append new env)))
-          (single-float-typed-p (car (last forms))))))))
+                                  (let ((*float-assumed* (if (eq (car expr) 'let) env
+                                                             (append new env))))
+                                    (funcall typed-p init))))))
+              (push (cons v (and typed kind)) new))))
+        (let ((*float-assumed* (append new env)))
+          (funcall typed-p (car (last forms))))))))
 
 (defun %local-inline-call-single-p (expr)
   "T when EXPR is a call of a local function substituted here whose one body
@@ -886,13 +1021,13 @@
                    (consp body) (null (cdr body))
                    (not (and blockp (form-has-return-from-p name (car body))))
                    (= (length params) (length (cdr expr))))
-          (let ((*single-assumed*
+          (let ((*float-assumed*
                   (append (loop for p in params
                                 for a in (cdr expr)
                                 collect (cons p (and (or (%single-declared-p p decls)
                                                          (single-float-typed-p a))
-                                                     t)))
-                          *single-assumed*))
+                                                     :single)))
+                          *float-assumed*))
                 (*inlining-stack* (inline-guard-stack name)))
             (single-float-typed-p (car body))))))))
 
@@ -900,12 +1035,18 @@
   "Compile EXPR leaving a native r4 (float) on the stack.
    Caller must have verified single-float-typed-p."
   ;; Folded the same way SINGLE-FLOAT-TYPED-P folds it.
-  (let ((expr (fold-nary-arith expr)))
+  (when (%locally-wrapper-p expr)
+    (return-from compile-as-single
+      (let ((*lexical-decl-frames* (%push-decl-frame :locally nil (cdr expr))))
+        (compile-as-single (car (last expr))))))
+  (let ((expr (fold-nary-arith (strip-value-wrappers expr nil))))
   (cond
     ;; Literal, as an IL immediate (ldc.r4) -- see the note in
     ;; COMPILE-AS-DOUBLE for what the generic constant-pool path costs.
     ((typep expr 'single-float)
      `((:ldc-r4 ,expr)))
+    ((%float-if-p expr #'single-float-typed-p)
+     (%compile-float-if expr #'compile-as-single))
     ;; Native r4 slot (single-rep local): the raw float is already in the slot.
     ((eq (float-native-local-kind expr) :single)
      `((:ldloc ,(lookup-local expr))))
@@ -949,11 +1090,11 @@
                   '(single-float short-float))
           (struct-slot-ref expr))
      (let* ((ref (struct-slot-ref expr))
-            (hit (struct-backing-entry (car ref) (cdr ref))))
+            (type (struct-slot-ref-type expr))
+            (hit (struct-backing-entry (car ref) (cdr ref) type)))
        (if (and hit (eql (cddr hit) 2))
-           (%struct-backing-read hit (car ref) (cdr ref))
-           `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                 (compile-expr (car ref)))
+           (%struct-backing-read hit (car ref) (cdr ref) type)
+           `(,@(compile-struct-object (car ref) type)
              (:ldc-i4 ,(cdr ref))
              (:call "Runtime.StructRefF")))))
     ;; aref on a single-float-backed array local -> raw r8 read (widened float),
@@ -965,14 +1106,17 @@
     ((and (consp expr) (assoc (car expr) +float-round-ops+)
           (eq (%float-round-arg-kind (car expr) (cdr expr)) :single))
      (compile-float-round-raw (car expr) (cadr expr) :single))
+    ((and (consp expr) (eq (car expr) 'the) (single-float-typed-p (caddr expr)))
+     (compile-as-single (caddr expr)))
     ((and (consp expr) (eq (car expr) 'the))
      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
            (compile-expr (caddr expr)))
        (:unbox-single)))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - * /)))
      (let ((op (ecase (car expr) (+ :add) (- :sub) (* :mul) (/ :div))))
-       `(,@(compile-as-single (cadr expr))
-         ,@(compile-as-single (caddr expr))
+       `(,@(%raw-operands (list (compile-as-single (cadr expr))
+                                (compile-as-single (caddr expr)))
+                          "Single")
          (,op))))
     ;; (abs x) -> raw magnitude, no box on the way in or out.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs)))
@@ -987,8 +1131,9 @@
 
 (defun compile-single-binop (args op)
   "Emit: compile-as-single a, compile-as-single b, <op>, conv.r4, newobj SingleFloat."
-  `(,@(compile-as-single (first args))
-    ,@(compile-as-single (second args))
+  `(,@(%raw-operands (list (compile-as-single (first args))
+                           (compile-as-single (second args)))
+                     "Single")
     (,op)
     (:conv-r4)
     (:newobj "SingleFloat")))
@@ -1005,8 +1150,9 @@
                 (:le (quote ((:cgt-un) (:ldc-i4 0) (:ceq))))
                 (:ge (quote ((:clt-un) (:ldc-i4 0) (:ceq))))
                 (:ne '((:ceq) (:ldc-i4 0) (:ceq))))))
-    `(,@(compile-as-single (first args))
-      ,@(compile-as-single (second args))
+    `(,@(%raw-operands (list (compile-as-single (first args))
+                             (compile-as-single (second args)))
+                       "Single")
       ,@body)))
 
 (defun %nary-fixnum-foldable-p (op args)
@@ -1036,6 +1182,18 @@
        (fixnum-typed-p (second args))
        (every #'fixnum-typed-p (cddr args))))
 
+(defun %mixed-float-binop-kind (args)
+  "For a two-argument +, -, * or / whose arguments are a float of one format
+   and a fixnum: :SINGLE or :DOUBLE, the format the fixnum is converted to and
+   the result has (CLHS 12.1.4.1). NIL otherwise."
+  (let ((a (first args)) (b (second args)))
+    (cond ((or (and (double-float-typed-p a) (fixnum-typed-p b))
+               (and (double-float-typed-p b) (fixnum-typed-p a)))
+           :double)
+          ((or (and (single-float-typed-p a) (%single-fixnum-operand-p b))
+               (and (single-float-typed-p b) (%single-fixnum-operand-p a)))
+           :single))))
+
 (defun compile-add (args)
   (case (length args)
     (0 (emit-fixnum 0))
@@ -1054,11 +1212,16 @@
        ;; Fast path: both args known single-float -> native r4 add
        ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
         (compile-single-binop args :add))
+       ((%mixed-float-binop-kind args)
+        (if (eq (%mixed-float-binop-kind args) :double)
+            (compile-double-binop args :add)
+            (compile-single-binop args :add)))
        ;; Fast path: both args known fixnum AND no intermediate int64 overflow
        ;; provable -> native int64 add. Otherwise fall to the promoting Runtime.Add
        ;; so an overflowing result becomes a bignum.
        ((fixnum-binop-native-p '+ args)
         (compile-fixnum-binop args :add))
+       ((try-compile-spec-arith (cons '+ args)))
        ;; Optimize (+ x 1) and (+ 1 x) to Increment
        ((eql (second args) 1)
         (compile-unary-call (list (first args)) "Runtime.Increment" "1+"))
@@ -1083,6 +1246,11 @@
           `(,@(compile-as-double (first args)) (:neg) (:newobj "DoubleFloat")))
          ((single-float-typed-p (first args))
           `(,@(compile-as-single (first args)) (:neg) (:conv-r4) (:newobj "SingleFloat")))
+         ;; An integer whose negation fits int64.
+         ((fixnum-typed-p (list '- (first args)))
+          `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                (compile-as-long (list '- (first args))))
+            (:call "Fixnum.Make")))
          ;; Unary (- x): Subtract(0, x) would collapse -0.0 (0.0-0.0=+0.0), so use Negate
          ;; (IEEE sign flip). Needed for signed-zero correctness of conjugate/eql.
          (t (compile-unary-call (list (first args)) "Runtime.Negate" "-"))))
@@ -1097,8 +1265,13 @@
         (compile-double-binop args :sub))
        ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
         (compile-single-binop args :sub))
+       ((%mixed-float-binop-kind args)
+        (if (eq (%mixed-float-binop-kind args) :double)
+            (compile-double-binop args :sub)
+            (compile-single-binop args :sub)))
        ((fixnum-binop-native-p '- args)
         (compile-fixnum-binop args :sub))
+       ((try-compile-spec-arith (cons '- args)))
        ((eql (second args) 1)
         (compile-unary-call (list (first args)) "Runtime.Decrement" "1-"))
        (t (compile-binary-call args "Runtime.Subtract"))))
@@ -1121,8 +1294,13 @@
         (compile-double-binop args :mul))
        ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
         (compile-single-binop args :mul))
+       ((%mixed-float-binop-kind args)
+        (if (eq (%mixed-float-binop-kind args) :double)
+            (compile-double-binop args :mul)
+            (compile-single-binop args :mul)))
        ((fixnum-binop-native-p '* args)
         (compile-fixnum-binop args :mul))
+       ((try-compile-spec-arith (cons '* args)))
        (t (compile-binary-call args "Runtime.Multiply"))))
     (t (if (or (<= (length args) 8) (%nary-fixnum-foldable-p '* args))
            (compile-expr (cons '* (cons (list '* (first args) (second args)) (cddr args))))
@@ -1145,6 +1323,10 @@
         (compile-double-binop args :div))
        ((and (single-float-typed-p (first args)) (single-float-typed-p (second args)))
         (compile-single-binop args :div))
+       ((%mixed-float-binop-kind args)
+        (if (eq (%mixed-float-binop-kind args) :double)
+            (compile-double-binop args :div)
+            (compile-single-binop args :div)))
        (t (compile-binary-call args "Runtime.Divide"))))
     (t (if (or (<= (length args) 8) (%nary-fixnum-foldable-p '/ args))
            (compile-expr (cons '/ (cons (list '/ (first args) (second args)) (cddr args))))
@@ -1378,7 +1560,7 @@
         (let* ((decls (loop for f in body while (and (consp f) (eq (car f) 'declare)) collect f))
                (rest (nthcdr (length decls) body))
                (checks (loop for f in rest
-                             while (and (consp f) (member (car f) '(%check-simple-decl %check-arg-decl)))
+                             while (and (consp f) (member (car f) '(%check-simple-decl %check-arg-decl %tco-checks-done)))
                              collect f))
                (rest (nthcdr (length checks) rest))
                (excluded (loop for d in decls

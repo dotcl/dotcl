@@ -1,0 +1,6 @@
+(defpackage :rcommon (:use :cl) (:export #:note #:*notes* #:*loads*))
+(in-package :rcommon)
+(defvar *loads* 0)
+(incf *loads*)
+(defvar *notes* '())
+(defun note (what) (push what *notes*))

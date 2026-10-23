@@ -340,11 +340,77 @@
       <_LastDash>$(_BeforeSha.LastIndexOf('-'))</_LastDash>
       <_Count>$(_BeforeSha.Substring($([MSBuild]::Add($(_LastDash), 1))))</_Count>
       <_Tag>$(_BeforeSha.Substring(0, $(_LastDash)))</_Tag>
-      <_DirtySuffix Condition="'$(_HasDirty)' == 'true'">.dirty</_DirtySuffix>
+      <!-- A dirty build names its tree as well: the ASDF compile cache is keyed by
+           this version, and two worktrees dirty on the same commit must not share it. -->
+      <_DirtySuffix Condition="'$(_HasDirty)' == 'true'">.dirty.t$([MSBuild]::BitwiseAnd($([MSBuild]::StableStringHash('$(MSBuildProjectDirectory)')), 2147483647))</_DirtySuffix>
       <_DirtySuffix Condition="'$(_HasDirty)' == 'false'"></_DirtySuffix>
       <InformationalVersion Condition="'$(_Count)' == '0' And '$(_HasDirty)' == 'false'">$(_Tag)</InformationalVersion>
       <InformationalVersion Condition="'$(_Count)' != '0' Or '$(_HasDirty)' == 'true'">$(_Tag)+$(_Count).g$(_Sha)$(_DirtySuffix)</InformationalVersion>
     </PropertyGroup>
+  </Target>
+
+  <!-- dotcl-runtime-source: a digest of the runtime's C# source, stamped into the
+       assembly. A fasl records it with the compiler generation; one compiled
+       against other runtime source may call members this runtime no longer has.
+       Taken from the source, not the built assembly, so Debug, Release, the
+       emit-free build and the R2R image of one source agree. -->
+  <UsingTask TaskName="DotclSourceDigest" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)/Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Files ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
+      <BaseDir ParameterType="System.String" Required="true" />
+      <Digest ParameterType="System.String" Output="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System.Linq" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        var rel = Files.Select(f => f.GetMetadata("FullPath")).Distinct()
+            .Select(p => p.Substring(BaseDir.Length).Replace('\\', '/'))
+            .OrderBy(p => p, System.StringComparer.Ordinal).ToList();
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        using var ms = new System.IO.MemoryStream();
+        foreach (var r in rel)
+        {
+            var text = System.IO.File.ReadAllText(System.IO.Path.Combine(BaseDir, r)).Replace("\r\n", "\n");
+            var bytes = System.Text.Encoding.UTF8.GetBytes(r + "\0" + text + "\0");
+            ms.Write(bytes, 0, bytes.Length);
+        }
+        Digest = string.Concat(sha.ComputeHash(ms.ToArray()).Take(8).Select(b => b.ToString("x2")));
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <ItemGroup>
+    <_DotclDigestSource Include="*.cs;Emitter/**/*.cs;Diagnostics/**/*.cs"
+                        Exclude="Program.cs;PackRestamp.cs;PackR2r.cs" />
+  </ItemGroup>
+
+  <Target Name="_DotclRuntimeSourceList">
+    <PropertyGroup>
+      <_DotclDigestList>$(IntermediateOutputPath)dotcl-runtime-source.list</_DotclDigestList>
+      <_DotclDigestFile>$(IntermediateOutputPath)dotcl-runtime-source.id</_DotclDigestFile>
+    </PropertyGroup>
+    <MakeDir Directories="$(IntermediateOutputPath)" />
+    <WriteLinesToFile File="$(_DotclDigestList)" Lines="@(_DotclDigestSource)"
+                      Overwrite="true" WriteOnlyWhenDifferent="true" />
+  </Target>
+
+  <Target Name="_DotclRuntimeSourceDigest" DependsOnTargets="_DotclRuntimeSourceList"
+          Inputs="@(_DotclDigestSource);$(_DotclDigestList)" Outputs="$(_DotclDigestFile)">
+    <DotclSourceDigest Files="@(_DotclDigestSource)" BaseDir="$(MSBuildThisFileDirectory)">
+      <Output TaskParameter="Digest" PropertyName="_DotclDigest" />
+    </DotclSourceDigest>
+    <WriteLinesToFile File="$(_DotclDigestFile)" Lines="$(_DotclDigest)" Overwrite="true" />
+  </Target>
+
+  <Target Name="StampRuntimeSourceDigest" DependsOnTargets="_DotclRuntimeSourceDigest"
+          BeforeTargets="GetAssemblyAttributes">
+    <ReadLinesFromFile File="$(_DotclDigestFile)">
+      <Output TaskParameter="Lines" PropertyName="DotclRuntimeSourceDigest" />
+    </ReadLinesFromFile>
+    <ItemGroup>
+      <AssemblyMetadata Include="dotcl-runtime-source" Value="$(DotclRuntimeSourceDigest)" />
+    </ItemGroup>
   </Target>
 
 </Project>

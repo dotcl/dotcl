@@ -159,6 +159,15 @@ public static partial class Runtime
         "KEYWORD" => static o => o is Symbol s && s.HomePackage?.Name == "KEYWORD",
         "FIXNUM" => static o => o is Fixnum,
         "INTEGER" => static o => o is Fixnum || o is Bignum,
+        "UNSIGNED-BYTE" => static o => o is Fixnum f ? f.Value >= 0 : o is Bignum b && b.Value.Sign >= 0,
+        "RATIO" => static o => o is Ratio,
+        "RATIONAL" => static o => o is Fixnum || o is Bignum || o is Ratio,
+        "FLOAT" => static o => o is SingleFloat || o is DoubleFloat,
+        "SINGLE-FLOAT" or "SHORT-FLOAT" => static o => o is SingleFloat,
+        "DOUBLE-FLOAT" or "LONG-FLOAT" => static o => o is DoubleFloat,
+        "REAL" => static o => o is Fixnum || o is Bignum || o is Ratio || o is SingleFloat || o is DoubleFloat
+                              || IsStructFloat(o),
+        "NUMBER" => static o => o is Number || IsStructFloat(o),
         "CHARACTER" => static o => o is LispChar,
         "STRING" => static o => o is LispString || (o is LispVector v && v.IsCharVector && v.Rank == 1),
         "SIMPLE-STRING" => static o => o is LispString || (o is LispVector v && v.IsCharVector && v.IsSimple && v.Rank == 1),
@@ -182,6 +191,8 @@ public static partial class Runtime
             if (obj is LispStruct st)
             {
                 if (ReferenceEquals(st.TypeName, _sym)) return true;
+                for (var p = st.TypeName.StructParent; p != null; p = p.StructParent)
+                    if (ReferenceEquals(p, _sym)) return true;
                 if (st.TypeName.Name != _sym.Name && FindClassOrNil(st.TypeName) is LispClass own)
                 {
                     return ClassIncludes(own, _cls);
@@ -216,7 +227,12 @@ public static partial class Runtime
         private readonly LispObject _spec;
         internal SatisfiesTypeTest(Symbol pred, LispObject spec) { _pred = pred; _spec = spec; }
         internal override bool Test(LispObject obj)
-            => _pred.Function is LispFunction f ? f.Invoke1(obj) is not Nil : TypepGeneral(obj, _spec) is not Nil;
+        {
+            if (_pred.Function is not LispFunction f) return TypepGeneral(obj, _spec) is not Nil;
+            var r = IsTruthy(f.Invoke1(obj));
+            MultipleValues.Reset();
+            return r;
+        }
     }
 
     /// <summary>A DEFTYPE'd symbol outside COMMON-LISP that is not also a
@@ -229,6 +245,40 @@ public static partial class Runtime
         internal DeftypeTypeTest(Symbol sym, TypeTest expansion) { _sym = sym; _expansion = expansion; }
         internal override bool Test(LispObject obj)
             => IsPlainTypepObject(obj) || obj is LispStruct ? _expansion.Test(obj) : TypepGeneral(obj, _sym) is not Nil;
+    }
+
+    /// <summary>(NAME arg...) for a DEFTYPE'd NAME outside COMMON-LISP. The
+    /// general TYPEP calls the expander on every test; here the expansion's test
+    /// is built once and rebuilt after any DEFTYPE or class table change.</summary>
+    private sealed class CompoundDeftypeTypeTest : TypeTest
+    {
+        sealed class Built
+        {
+            internal readonly int ExpanderEpoch, ClassEpoch;
+            internal readonly TypeTest? Test;
+            internal Built(int ee, int ce, TypeTest? test) { ExpanderEpoch = ee; ClassEpoch = ce; Test = test; }
+        }
+        private readonly Symbol _head;
+        private readonly Cons _spec;
+        private readonly int _depth;
+        private Built? _built;
+        internal CompoundDeftypeTypeTest(Symbol head, Cons spec, int depth) { _head = head; _spec = spec; _depth = depth; }
+        internal override bool Test(LispObject obj)
+        {
+            int ee = System.Threading.Volatile.Read(ref TypeExpanderEpoch);
+            int ce = System.Threading.Volatile.Read(ref ClassRegistry.Epoch);
+            var b = _built;
+            if (b == null || b.ExpanderEpoch != ee || b.ClassEpoch != ce)
+            {
+                if (!TryGetTypeExpander(_head, out var expander))
+                    return TypepGeneral(obj, _spec) is not Nil;
+                TypeTest? test;
+                try { test = BuildTypeTest(Funcall(expander, ToList(_spec.Cdr).ToArray()), _depth + 1); }
+                catch (LispErrorException) { test = null; }
+                _built = b = new Built(ee, ce, test);
+            }
+            return b.Test != null ? b.Test.Test(obj) : TypepGeneral(obj, _spec) is not Nil;
+        }
     }
 
     /// <summary>(SIMPLE-ARRAY et (*)) or (SIMPLE-ARRAY et (n)). For a simple
@@ -320,6 +370,9 @@ public static partial class Runtime
         if (spec is Nil) return ConstTypeTest.False;
         if (depth > 32) return new GeneralTypeTest(spec);
         if (spec is Symbol sym) return new SymbolLeafTypeTest(sym);
+        if (spec is Cons dc && dc.Car is Symbol dhead && dhead.HomePackage is Package dpkg
+            && dpkg != Startup.CL && TryGetTypeExpander(dhead, out _))
+            return new CompoundDeftypeTypeTest(dhead, dc, depth);
         if (spec is not Cons c || c.Car is not Symbol head || head.HomePackage != Startup.CL)
             return new GeneralTypeTest(spec);
         switch (head.Name)

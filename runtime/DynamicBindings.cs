@@ -7,22 +7,26 @@ public static class DynamicBindings
     private const int InitialCapacity = 64;
 
     // One object per thread holds the whole binding stack, so an operation
-    // reads one thread-static instead of three (on macOS each thread-static
-    // read is a call into the TLS resolver, which showed in compile profiles).
+    // reads one thread-static instead of several.
     //
-    // COUNTS[sym.BindIndex] is how many entries for that symbol this thread's
-    // stack holds. A read of a symbol that has been bound somewhere but is not
-    // bound on this thread right now -- most reads of the compiler's own
-    // specials, which outer code bound once or not at all -- answers from the
-    // global value without scanning. The stack is deep while compiling (about
-    // 160 entries on average for a library load), and those reads scanned all
-    // of it.
-    private sealed class BindingStack
+    // TOPS[sym.BindIndex] is 1 + the position of SYM's innermost binding on
+    // this thread's stack, or 0 when this thread has none; each entry keeps the
+    // TOPS value it replaced (PREV), so unbinding restores it. A read is one
+    // index, with no scan of the stack.
+    public sealed class BindingStack
     {
-        public Symbol?[] Syms = new Symbol?[InitialCapacity];
-        public LispObject?[] Vals = new LispObject?[InitialCapacity];
-        public int Top;
-        public int[] Counts = new int[256];
+        internal Entry[] E = new Entry[InitialCapacity];
+        internal int Top;
+        internal int[] Tops = new int[256];
+    }
+
+    // A struct array: a store into LispObject?[] goes through the covariant
+    // array-store check, and Push / Pop are on the path of every special LET.
+    internal struct Entry
+    {
+        public Symbol? Sym;
+        public LispObject? Val;
+        public int Prev;
     }
 
     [ThreadStatic] private static BindingStack? _stack;
@@ -30,6 +34,10 @@ public static class DynamicBindings
     private static int _nextBindIndex;
 
     private static BindingStack Current => _stack ??= new BindingStack();
+
+    // The *On entries take this thread's stack from a local the compiled function
+    // fetched once, instead of reading the thread-static at every operation.
+    public static BindingStack Here() => Current;
 
     private static int BindIndexOf(Symbol sym)
     {
@@ -40,152 +48,214 @@ public static class DynamicBindings
         return prior == 0 ? fresh : prior;
     }
 
-    /// <summary>The binding stack of this thread when SYM may be bound on it,
-    /// else null (the symbol's global value is the one in effect).</summary>
-    private static BindingStack? StackBinding(Symbol sym)
+    /// <summary>The binding stack of this thread when SYM is bound on it, with
+    /// POS the position of the innermost binding; else null (the symbol's
+    /// global value is the one in effect).</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static BindingStack? StackBinding(Symbol sym, out int pos)
     {
+        pos = -1;
         if (!sym.EverDynamicallyBound) return null;
         var st = _stack;
         if (st == null) return null;
         int idx = sym.BindIndex;
-        var counts = st.Counts;
-        if ((uint)idx >= (uint)counts.Length || counts[idx] == 0) return null;
-        return st;
+        var tops = st.Tops;
+        if ((uint)idx >= (uint)tops.Length) return null;
+        pos = tops[idx] - 1;
+        return pos < 0 ? null : st;
     }
 
     private static void Grow(BindingStack st)
     {
-        var newSize = st.Syms.Length * 2;
-        var newSyms = new Symbol?[newSize];
-        var newVals = new LispObject?[newSize];
-        Array.Copy(st.Syms, newSyms, st.Top);
-        Array.Copy(st.Vals, newVals, st.Top);
-        st.Syms = newSyms;
-        st.Vals = newVals;
+        var bigger = new Entry[st.E.Length * 2];
+        Array.Copy(st.E, bigger, st.Top);
+        st.E = bigger;
     }
 
-    private static void Uncount(BindingStack st, Symbol sym)
+    /// <summary>Recompute TOPS and PREV from the entries, after an entry was
+    /// removed from below the top.</summary>
+    private static void Rebuild(BindingStack st, Symbol removed)
     {
-        int idx = sym.BindIndex;
-        if ((uint)idx < (uint)st.Counts.Length && st.Counts[idx] > 0) st.Counts[idx]--;
+        var tops = st.Tops;
+        var e = st.E;
+        int r = removed.BindIndex;
+        if ((uint)r < (uint)tops.Length) tops[r] = 0;
+        for (int j = 0; j < st.Top; j++)
+        {
+            var s = e[j].Sym;
+            if (s != null) tops[s.BindIndex] = 0;
+        }
+        for (int j = 0; j < st.Top; j++)
+        {
+            var s = e[j].Sym;
+            if (s == null) continue;
+            e[j].Prev = tops[s.BindIndex];
+            tops[s.BindIndex] = j + 1;
+        }
     }
 
     public static LispObject GetConstant(Symbol sym)
         => sym.Value ?? throw new LispErrorException(new LispUnboundVariable(sym));
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispObject Get(Symbol sym)
     {
-        var st = StackBinding(sym);
-        if (st == null)
+        if (!sym.EverDynamicallyBound && sym.Value is { } g) return g;
+        return GetSlow(sym);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispObject GetSlow(Symbol sym)
+    {
+        var st = StackBinding(sym, out int pos);
+        var v = st == null ? sym.Value : st.E[pos].Val;
+        if (v == null) throw new LispErrorException(new LispUnboundVariable(sym));
+        return v;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static LispObject GetOn(Symbol sym, BindingStack st)
+    {
+        if (sym.EverDynamicallyBound)
         {
-            var v = sym.Value;
-            if (v == null) throw new LispErrorException(new LispUnboundVariable(sym));
-            return v;
+            int idx = sym.BindIndex;
+            var tops = st.Tops;
+            if ((uint)idx < (uint)tops.Length && tops[idx] > 0)
+                return st.E[tops[idx] - 1].Val ?? UnboundError(sym);
         }
-        var syms = st.Syms;
-        var vals = st.Vals;
-        for (int i = st.Top - 1; i >= 0; i--)
+        return sym.Value ?? UnboundError(sym);
+    }
+
+    // For a function that binds nothing: ST is a local of the caller, filled
+    // with this thread's stack at the first read of a variable that has been
+    // bound, so the call reads the thread-static at most once.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static LispObject GetLazy(Symbol sym, ref BindingStack? st)
+    {
+        if (sym.EverDynamicallyBound)
         {
-            if (ReferenceEquals(syms[i], sym))
+            var s = st ??= Here();
+            int idx = sym.BindIndex;
+            var tops = s.Tops;
+            if ((uint)idx < (uint)tops.Length && tops[idx] > 0)
+                return s.E[tops[idx] - 1].Val ?? UnboundError(sym);
+        }
+        return sym.Value ?? UnboundError(sym);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static LispObject SetCheckedLazy(Symbol sym, LispObject value, ref BindingStack? st)
+    {
+        if (sym.IsConstant) return SetCheckedSlow(sym, value);
+        if (sym.EverDynamicallyBound)
+        {
+            var s = st ??= Here();
+            int idx = sym.BindIndex;
+            var tops = s.Tops;
+            if ((uint)idx < (uint)tops.Length && tops[idx] > 0)
             {
-                var val = vals[i];
-                if (val == null)
-                    throw new LispErrorException(new LispUnboundVariable(sym));
-                return val;
+                s.E[tops[idx] - 1].Val = value;
+                return value;
             }
         }
-        if (sym.Value == null)
-            throw new LispErrorException(new LispUnboundVariable(sym));
-        return sym.Value;
+        sym.Value = value;
+        return value;
     }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispObject UnboundError(Symbol sym)
+        => throw new LispErrorException(new LispUnboundVariable(sym));
 
     public static bool TryGet(Symbol sym, out LispObject value)
     {
-        var st = StackBinding(sym);
-        if (st != null)
-        {
-            var syms = st.Syms;
-            var vals = st.Vals;
-            for (int i = st.Top - 1; i >= 0; i--)
-            {
-                if (ReferenceEquals(syms[i], sym))
-                {
-                    var val = vals[i];
-                    if (val != null) { value = val; return true; }
-                    value = null!; return false;
-                }
-            }
-        }
-        if (sym.Value != null) { value = sym.Value; return true; }
-        value = null!;
-        return false;
+        var st = StackBinding(sym, out int pos);
+        var v = st == null ? sym.Value : st.E[pos].Val;
+        value = v!;
+        return v != null;
     }
 
-    public static void Push(Symbol sym, LispObject value)
+    public static void Push(Symbol sym, LispObject value) => PushOn(sym, value, Current);
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static void PushOn(Symbol sym, LispObject value, BindingStack st)
     {
-        var st = Current;
-        int idx = BindIndexOf(sym);
-        if (idx >= st.Counts.Length)
+        int idx = sym.BindIndex;
+        int top = st.Top;
+        var tops = st.Tops;
+        var e = st.E;
+        if ((uint)(idx - 1) < (uint)(tops.Length - 1) && (uint)top < (uint)e.Length
+            && sym.EverDynamicallyBound && value is not UnboundSentinel)
         {
-            var bigger = new int[Math.Max(idx + 1, st.Counts.Length * 2)];
-            Array.Copy(st.Counts, bigger, st.Counts.Length);
-            st.Counts = bigger;
+            ref var slot = ref e[top];
+            slot.Sym = sym;
+            slot.Val = value;
+            slot.Prev = tops[idx];
+            tops[idx] = top + 1;
+            st.Top = top + 1;
+            return;
         }
-        // Counted before the flag is set, both before the entry is visible:
-        // from here on, reads of SYM on this thread must scan.
-        st.Counts[idx]++;
-        sym.EverDynamicallyBound = true;
-        if (st.Top >= st.Syms.Length) Grow(st);
-        st.Syms[st.Top] = sym;
-        st.Vals[st.Top] = value is UnboundSentinel ? null : value;
-        st.Top++;
+        PushSlow(sym, value, st);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void PushSlow(Symbol sym, LispObject value, BindingStack st)
+    {
+        int idx = BindIndexOf(sym);
+        if (idx >= st.Tops.Length)
+        {
+            var bigger = new int[Math.Max(idx + 1, st.Tops.Length * 2)];
+            Array.Copy(st.Tops, bigger, st.Tops.Length);
+            st.Tops = bigger;
+        }
+        if (!sym.EverDynamicallyBound) sym.EverDynamicallyBound = true;
+        int top = st.Top;
+        if (top >= st.E.Length) Grow(st);
+        ref var slot = ref st.E[top];
+        slot.Sym = sym;
+        slot.Val = value is UnboundSentinel ? null : value;
+        slot.Prev = st.Tops[idx];
+        st.Tops[idx] = top + 1;
+        st.Top = top + 1;
     }
 
     public static void Pop(Symbol sym)
     {
-        var st = _stack;
-        if (st == null || st.Top == 0) return;
-        var syms = st.Syms;
-        var vals = st.Vals;
-        for (int i = st.Top - 1; i >= 0; i--)
+        var st = StackBinding(sym, out int pos);
+        if (st == null) return; // Not bound here: defensive no-op (double-pop)
+        PopAt(st, sym, pos);
+    }
+
+    public static void PopOn(Symbol sym, BindingStack st)
+    {
+        int idx = sym.BindIndex;
+        var tops = st.Tops;
+        if ((uint)idx >= (uint)tops.Length || tops[idx] == 0) return;
+        PopAt(st, sym, tops[idx] - 1);
+    }
+
+    private static void PopAt(BindingStack st, Symbol sym, int pos)
+    {
+        var e = st.E;
+        int last = st.Top - 1;
+        if (pos == last)
         {
-            if (ReferenceEquals(syms[i], sym))
-            {
-                // Swap with top entry so we can decrement Top without a shift
-                int last = st.Top - 1;
-                if (i < last)
-                {
-                    syms[i] = syms[last];
-                    vals[i] = vals[last];
-                }
-                st.Top--;
-                // Clear freed slot to prevent GC rooting
-                syms[st.Top] = null;
-                vals[st.Top] = null;
-                Uncount(st, sym);
-                return;
-            }
+            st.Tops[sym.BindIndex] = e[last].Prev;
+            e[last] = default;
+            st.Top = last;
+            return;
         }
-        // Not found: defensive no-op (double-pop)
+        // Out of order (a fasl compiled when frames popped first-pushed first).
+        Array.Copy(e, pos + 1, e, pos, last - pos);
+        e[last] = default;
+        st.Top = last;
+        Rebuild(st, sym);
     }
 
     public static LispObject Set(Symbol sym, LispObject value)
     {
-        var st = StackBinding(sym);
-        if (st != null)
-        {
-            var syms = st.Syms;
-            var vals = st.Vals;
-            for (int i = st.Top - 1; i >= 0; i--)
-            {
-                if (ReferenceEquals(syms[i], sym))
-                {
-                    vals[i] = value;
-                    return value;
-                }
-            }
-        }
-        sym.Value = value;
+        var st = StackBinding(sym, out int pos);
+        if (st != null) st.E[pos].Val = value;
+        else sym.Value = value;
         return value;
     }
 
@@ -196,7 +266,32 @@ public static class DynamicBindings
     /// the old one, and (setq nil 1) / (setq t 1) reported success while doing
     /// nothing. DEFCONSTANT itself goes through Set, not here.
     /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispObject SetChecked(Symbol sym, LispObject value)
+    {
+        if (!sym.EverDynamicallyBound && !sym.IsConstant) { sym.Value = value; return value; }
+        return SetCheckedSlow(sym, value);
+    }
+
+    public static LispObject SetCheckedOn(Symbol sym, LispObject value, BindingStack st)
+    {
+        if (sym.IsConstant) throw Runtime.ConstantAssignmentError(sym, "SETQ");
+        if (sym.EverDynamicallyBound)
+        {
+            int idx = sym.BindIndex;
+            var tops = st.Tops;
+            if ((uint)idx < (uint)tops.Length && tops[idx] > 0)
+            {
+                st.E[tops[idx] - 1].Val = value;
+                return value;
+            }
+        }
+        sym.Value = value;
+        return value;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispObject SetCheckedSlow(Symbol sym, LispObject value)
     {
         if (sym.IsConstant) throw Runtime.ConstantAssignmentError(sym, "SETQ");
         return Set(sym, value);
@@ -211,21 +306,9 @@ public static class DynamicBindings
 
     public static LispObject Makunbound(Symbol sym)
     {
-        var st = StackBinding(sym);
-        if (st != null)
-        {
-            var syms = st.Syms;
-            var vals = st.Vals;
-            for (int i = st.Top - 1; i >= 0; i--)
-            {
-                if (ReferenceEquals(syms[i], sym))
-                {
-                    vals[i] = null; // null = unbound in flat stack
-                    return sym;
-                }
-            }
-        }
-        sym.Value = null;
+        var st = StackBinding(sym, out int pos);
+        if (st != null) st.E[pos].Val = null; // null = unbound in flat stack
+        else sym.Value = null;
         return sym;
     }
 
@@ -256,14 +339,13 @@ public static class DynamicBindings
         var st = _stack;
         if (st == null || st.Top == 0) return null;
         var snap = new Dictionary<Symbol, LispObject>();
-        var syms = st.Syms;
-        var vals = st.Vals;
+        var e = st.E;
         for (int i = st.Top - 1; i >= 0; i--)
         {
-            var sym = syms[i];
+            var sym = e[i].Sym;
             if (sym != null && !snap.ContainsKey(sym))
             {
-                var val = vals[i];
+                var val = e[i].Val;
                 if (val != null) snap[sym] = val;
             }
         }
@@ -297,33 +379,47 @@ public static class DynamicBindings
         var result = new List<(Symbol, LispObject, int)>();
         var st = _stack;
         if (st == null) return result;
-        var syms = st.Syms;
-        var vals = st.Vals;
+        var e = st.E;
         for (int i = st.Top - 1; i >= 0; i--)
         {
-            var sym = syms[i];
-            if (sym != null) result.Add((sym, vals[i] ?? Unbound, i));
+            var sym = e[i].Sym;
+            if (sym != null) result.Add((sym, e[i].Val ?? Unbound, i));
         }
         return result;
     }
 
-    /// <summary>Pop bindings down to DEPTH (no-op if already at or below it).</summary>
-    public static void TruncateTo(int depth)
+    /// <summary>The depth a LET binding specials saves before its pushes, so its
+    /// cleanup is one <see cref="UnbindTo"/> instead of one Pop per symbol.</summary>
+    public static int BindDepth() => _stack?.Top ?? 0;
+
+    public static int BindDepthOn(BindingStack st) => st.Top;
+
+    public static void UnbindTo(int depth)
     {
-        if (depth < 0) depth = 0;
         var st = _stack;
         if (st == null) return;
-        var syms = st.Syms;
-        var vals = st.Vals;
-        while (st.Top > depth)
-        {
-            st.Top--;
-            var sym = syms[st.Top];
-            if (sym != null) Uncount(st, sym);
-            syms[st.Top] = null;
-            vals[st.Top] = null;
-        }
+        UnbindToOn(depth, st);
     }
+
+    public static void UnbindToOn(int depth, BindingStack st)
+    {
+        int top = st.Top;
+        if (top <= depth) return;
+        var e = st.E;
+        var tops = st.Tops;
+        do
+        {
+            top--;
+            ref var slot = ref e[top];
+            var sym = slot.Sym;
+            if (sym != null) tops[sym.BindIndex] = slot.Prev;
+            slot = default;
+        } while (top > depth);
+        st.Top = top;
+    }
+
+    /// <summary>Pop bindings down to DEPTH (no-op if already at or below it).</summary>
+    public static void TruncateTo(int depth) => UnbindTo(depth < 0 ? 0 : depth);
 
     public static LispObject ProgvUnbind(LispObject symsObj)
     {
@@ -338,7 +434,7 @@ public static class DynamicBindings
 }
 
 // Sentinel class for unbound dynamic bindings
-public class UnboundSentinel : LispObject
+public sealed class UnboundSentinel : LispObject
 {
     public override string ToString() => "#<UNBOUND>";
 }

@@ -3,6 +3,144 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.35 -- 2026-10-23
+
+This release adds the server side of two editor integrations, a Debug
+Adapter Protocol server and a Language Server Protocol server (with Coalton
+support). Neither has an editor extension yet and neither has been tried from
+an editor, so treat them as a base to build on. It also adds an experimental
+way to load two versions of one library into the same image, and speeds up
+typed numeric code, `catch`/`throw`, generic function calls and
+`make-instance`. A few checks became stricter; they are listed under Upgrading.
+
+### Upgrading
+
+- **A structure accessor checks its argument.** An accessor applied to an
+  instance of an unrelated structure signals TYPE-ERROR instead of reading the
+  slot. Instances of `:include` children are accepted. `(safety 0)` skips the
+  check.
+- **A local function substituted for `inline` checks its declared argument
+  types**, as a call to the function does.
+- **`compile-file` and `load` bind the optimize policy, `*package*` and
+  `*readtable*`**, so a `declaim` in a file no longer outlasts the call (as in
+  SBCL). Several threads can call `compile-file` at the same time.
+- **A runtime `proclaim` of `optimize` (`safety`, `debug`) applies to later
+  `compile-file` calls**, not only to `declaration-information`.
+- **`compile` evaluates `load-time-value` when it compiles**; `compile-file`
+  still evaluates it at load time.
+- **`warnings-p` and `failure-p` of `compile` and `compile-file` are true when
+  a macro expansion signalled an error**, even if an outer handler muffled the
+  warning.
+- **`compute-restarts` with a condition honours each restart's `:test`**, and
+  without a condition it no longer calls `:test`.
+- **Two structures with the same name in different packages are different
+  types** for `typep`, `typecase` and `equalp`.
+- **A subclass whose `:conc-name` equals its parent's** keeps the parent's
+  accessors for inherited slots instead of redefining them.
+- **Passing a Lisp vector to a .NET `T[]`, `Span<T>`, `ReadOnlySpan<T>` or
+  `Memory<T>` argument shares its storage** instead of copying, so writes by
+  the .NET method are visible in Lisp. A vector with a fill pointer or a
+  displaced vector is a TYPE-ERROR there.
+- **`dotnet:new` picks the constructor whose parameters the arguments convert
+  to**: `(dotnet:new "System.IO.MemoryStream" octets)` wraps the octets.
+
+### Added
+
+- **`dotcl-dap`** (server only): a Debug Adapter Protocol server inside a
+  running dotcl, with breakpoints at function entry and on lines of `.lisp`
+  files, `next` / `stepIn` / `stepOut`, frame variables, evaluation and
+  restarts. It is tested by exchanging DAP messages over a socket; it has not
+  been driven from an editor yet.
+- **`dotcl-lsp` and `dotcl-lsp-coalton`** (server only): a Language Server
+  Protocol server (stdio or TCP) with diagnostics and hover; with Coalton it
+  type-checks an open document without loading it. There is no editor
+  extension for it yet.
+- **Package units (experimental)**: code compiled in a unit sees its own
+  version of a package, so two versions of one library can live in one image.
+  `dotcl-lock` reads a lock file naming the `.asd` of each version and loads
+  the conflicting one into a unit; `resolve.lisp` beside it writes the lock
+  from a directory of system versions. Loading two versions of `swank` and
+  starting one server from each works. The lock format may change. See
+  docs/extensions.md.
+- **`asdf-parallel`** compiles independent systems of an ASDF plan on several
+  threads. **`asdf-version-range`** accepts `(:>= "1.2" :< "2")` as a
+  `:version` dependency. **`asdf-extra-deps`** adds dependencies a `.asd`
+  leaves out.
+- **`dotcl:without-interrupts`, `with-interrupts`, `allow-with-interrupts` and
+  `with-local-interrupts`**, with the SBCL meaning. `interrupt-thread`,
+  `destroy-thread` and Ctrl-C wait until the region ends.
+- **`dotnet:call-out` works on interface members** (cast objects and explicit
+  implementations) **and on COM `IDispatch` members**, returning by-reference
+  arguments after the result. docs/windows.md has a rewritten COM chapter.
+- **docs/gc-latency-report.md** lists the GC settings that can be changed after
+  start-up and what they do.
+
+### Faster
+
+Numbers are from one Mac unless marked Linux (one x86-64 machine), minimum of
+alternating runs.
+
+- Typed calls: a call of a `defun` with declared `fixnum` arguments that only
+  uses checked arithmetic 12.4 to 4.2 ns (Linux); `double` 11.6 to 2.6 ns.
+- `catch`/`throw` across calls does not raise a .NET exception: cl-bench
+  `ctak` 2636 to 81 ms, a `throw` from depth 6 of a tree search 126 to 5 ms
+  (Linux).
+- Counting loops: `(loop for i from k to n ...)` with `fixnum` bounds runs in
+  64-bit integers (20 million iterations 889 to 20.9 ms, Linux). `do` too.
+- Floating-point loops and structures: Coalton `mandel-f64` 6.5 s to 0.53 s
+  (Linux). Nested `+`, `-`, `*` on fixnums and `double` values no longer box
+  intermediate results.
+- Binding special variables: cl-bench `stak` 516 to 268 ms (Linux).
+- Generic functions: a one-argument call 29.8 to 22.3 ns (Linux).
+  `make-instance` of a class without `initialize-instance` methods 150 to
+  65 ms in the `simple-instantiate` test; reader and writer calls through a
+  loaded fasl 16.2 to 7.1 ns and 36.3 to 11.9 ns.
+- `funcall` of a closure from a fasl 7.0 to 4.0 ns.
+- `sort` with a `lambda` predicate 66 to 49 ms; `(find-symbol ...)`,
+  `intern` and other two-value calls leave less work behind.
+- ironclad: SHA-512 over 1 MB 191.6 to 50.8 ms, RIPEMD-160 392.6 to 189.2 ms,
+  AES 32.6 to 19.5 ms, Streebog 583 to 178 ms (Linux).
+- Compiling: with 12000 special variables defined, 300 `compile` calls
+  2031 to 655 ms; 300 nested `let` forms 2.3 s to 0.03 s; a macro whose
+  expansion signals an error is expanded once per `compile-file`, not
+  several times.
+- A closure object is 8 bytes smaller.
+
+### Fixed
+
+- `(coerce base-string '(simple-array character (*)))` returned the base-string
+  itself instead of a new character string (a 0.1.34 regression; it broke
+  babel and xpath).
+- A `return-from` (or `go`) inside a local function that is never called failed
+  to compile ("Undeclared local") when the function around it became a
+  closure, for example one with `&optional` or `&key` arguments.
+- A `flet` function declared `inline` and called from a closure two levels
+  deep signalled UNDEFINED-FUNCTION (a 0.1.34 regression).
+- Several threads compiling at once could lose a `defstruct`, hand two forms
+  the same `load-time-value` slot, drop a `defmethod`, repeat a `gensym` name,
+  lose a `defvar` special declaration or expand a `macrolet` macro for
+  another thread.
+- Functions returning one value could return a second value left behind by an
+  earlier call (`find-symbol`, `intern`, `read-line`, `subtypep`, and C#
+  builtins that call back into Lisp such as `find-if`, `format`,
+  `print-object`).
+- `(dotnet:null)` is a .NET null when passed to an untyped argument.
+  `define-class` methods with by-reference arguments convert the value
+  written back. A COM member that does not exist signals a Lisp ERROR.
+- The runtime can be loaded into an `AssemblyLoadContext` other than the
+  default one (COM host and plugin hosts).
+- A script that loads `asdf`, `uiop` or a system depending on them no longer
+  replaces the running ASDF with the one found on the source registry. This
+  broke `uiop:parse-unix-namestring` on Windows.
+- `(require "quicklisp")` works when the source registry is a `:tree` that
+  includes the `quicklisp-client` directory.
+- Argument-count errors from open-coded builtins name the function.
+- `write-to-string` very rarely returned `(NIL NIL)`.
+
+### Thanks
+
+- Bohong Huang -- for reporting the `inline` `flet` regression.
+
 ## v0.1.34 -- 2026-10-17
 
 This release adds `dotcl-simd`, a contrib with 128-bit SIMD types and

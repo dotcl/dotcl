@@ -22,19 +22,32 @@ internal static unsafe class CallTls
 {
     [ThreadStatic] internal static int MvCount;
     [ThreadStatic] internal static int StackCheck;
-    [ThreadStatic] internal static LispFunction.Frame* Top;
+    // A LispFunction.Frame*, typed nint so that its address can be taken without
+    // a pin (a struct-typed thread static would be boxed on the GC heap).
+    [ThreadStatic] internal static nint TopWord;
+    internal static ref LispFunction.Frame* Top
+    {
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        get => ref *(LispFunction.Frame**)System.Runtime.CompilerServices.Unsafe.AsPointer(ref TopWord);
+    }
     // See LispFunction.LinkOwn.
     [ThreadStatic] internal static int Borrow;
     // See MultipleValues.TakeMode.
     [ThreadStatic] internal static int Mode;
+    // See MultipleValues.CaptureForBind.
+    [ThreadStatic] internal static int BindCount;
+    // Address of element 0 of MultipleValues' bind snapshot (pinned), 0 before the first.
+    [ThreadStatic] internal static nint Snap;
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     internal static void Claim()
     {
         MvCount = 0;
         StackCheck = 0;
-        Top = null;
+        TopWord = 0;
         Borrow = 0;
         Mode = 0;
+        BindCount = 0;
+        Snap = 0;
     }
 }

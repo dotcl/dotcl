@@ -69,8 +69,7 @@ public static class Cltl2
     /// <summary>(values nil nil nil): no information. env is always NIL on dotcl.</summary>
     private static LispObject NoInfo()
     {
-        MultipleValues.Set(Nil.Instance, Nil.Instance, Nil.Instance);
-        return Nil.Instance;
+        return MultipleValues.Values(Nil.Instance, Nil.Instance, Nil.Instance);
     }
 
     // (variable-information variable &optional env) => kind, local-p, decl-alist.
@@ -100,8 +99,7 @@ public static class Cltl2
         var env = args.Length > 1 ? args[1] : Nil.Instance;
         if (CompilerFunction("%CLTL2-VARIABLE-INFORMATION") is LispFunction hook)
             return hook.Invoke(new[] { v, env, kind });
-        MultipleValues.Set(kind, Nil.Instance, Nil.Instance);
-        return kind;
+        return MultipleValues.Values(kind, Nil.Instance, Nil.Instance);
     }
 
     /// <summary>The compiler's implementation of a query, or null before the
@@ -131,11 +129,9 @@ public static class Cltl2
         {
             var pkg = Package.FindPackage(pkgName);
             if (pkg == null) continue;
-            var (listSym, status) = pkg.FindSymbol("*GLOBAL-SPECIALS*");
-            if (listSym == null || status == SymbolStatus.None) continue;
-            for (var cur = DynamicBindings.Get(listSym); cur is Cons c; cur = c.Cdr)
-                if (ReferenceEquals(c.Car, sym)) return true;
-            return false;
+            var (setSym, status) = pkg.FindSymbol("*GLOBAL-SPECIALS*");
+            if (setSym == null || status == SymbolStatus.None) continue;
+            return DynamicBindings.Get(setSym) is LispHashTable set && set.TryGet(sym, out _);
         }
         return false;
     }

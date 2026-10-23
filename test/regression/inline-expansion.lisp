@@ -243,7 +243,8 @@
   (%inl-use-rest)
   (1 2 3))
 
-;; A body over the size limit stays a call.
+;; A body over the small-body limit is substituted in a DEFUN
+;; (inline-large-body.lisp); one over the large-body limit stays a call.
 (declaim (inline %inl-big))
 (defun %inl-big (a)
   (list a a a a a a a a a a a a a a a a a a a a
@@ -253,13 +254,26 @@
         a a a a a a a a a a a a a a a a a a a a))
 (defun %inl-use-big () (length (%inl-big 1)))
 
-(deftest-compiled-only inl-oversize-not-substituted
+(deftest-compiled-only inl-large-substituted
   (%inl-calls-p #'%inl-use-big "%INL-BIG")
+  nil)
+
+(deftest inl-large-value
+  (%inl-use-big)
+  100)
+
+(declaim (inline %inl-huge))
+(defun %inl-huge (a)
+  #.(cons 'progn (loop repeat 1100 collect '(identity a))))
+(defun %inl-use-huge () (%inl-huge 7))
+
+(deftest-compiled-only inl-oversize-not-substituted
+  (%inl-calls-p #'%inl-use-huge "%INL-HUGE")
   t)
 
 (deftest inl-oversize-value
-  (%inl-use-big)
-  100)
+  (%inl-use-huge)
+  7)
 
 ;;; ---- redefinition ----
 

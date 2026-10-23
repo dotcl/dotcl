@@ -4,8 +4,8 @@ using System.Reflection.Emit;
 
 namespace DotCL.Emitter;
 
-// DEFMETHOD-TYPED: a global function whose DECLAIM FTYPE gives every argument and
-// the result a numeric type. Its body is assembled into a method taking and
+// DEFMETHOD-TYPED: a global function whose DECLAIM FTYPE gives some arguments or
+// the result a numeric type with a raw representation. Its body is assembled into a method taking and
 // returning raw values (TypedEntrySig), and the ordinary entries of the
 // LispFunction are a shell over it: convert each argument (checked from safety 1
 // up), call the body, box the result. The body method is also installed as the
@@ -79,6 +79,20 @@ public partial class CilAssembler
         return f;
     }
 
+    /// <summary>The (lo, hi) the shell checks each integer argument against, for
+    /// LispFunction.SetTypedArgRanges: four pairs, the full range where it checks none.</summary>
+    internal static long[] TypedArgRanges(TypedForm f)
+    {
+        var r = new long[2 * TypedEntrySig.MaxNarrowArgs];
+        for (int i = 0; i < TypedEntrySig.MaxNarrowArgs; i++)
+        {
+            bool ranged = i < f.ParamCount && f.Sig[i] == 'L' && f.Checks && f.Ranged[i];
+            r[2 * i] = ranged ? f.Lo[i] : long.MinValue;
+            r[2 * i + 1] = ranged ? f.Hi[i] : long.MaxValue;
+        }
+        return r;
+    }
+
     static readonly MethodInfo TypedArgLMI = typeof(Runtime).GetMethod("TypedArgL")!;
     static readonly MethodInfo TypedArgLRMI = typeof(Runtime).GetMethod("TypedArgLR")!;
     static readonly MethodInfo TypedArgDMI = typeof(Runtime).GetMethod("TypedArgD")!;
@@ -102,19 +116,15 @@ public partial class CilAssembler
             fr = il.DeclareLocal(typeof(LispFunction.Frame));
             il.Emit(OpCodes.Ldloca, fr);
             il.Emit(OpCodes.Ldstr, string.Intern(f.Name));
+            if (unit) il.Emit(OpCodes.Ldarg_0);
             for (int i = 1; i <= n; i++) il.Emit(OpCodes.Ldarg, i);
-            il.Emit(OpCodes.Call, s_enterN[n]);
-            if (unit)
-            {
-                il.Emit(OpCodes.Ldloca, fr);
-                il.Emit(OpCodes.Ldarg_0);
-                il.Emit(OpCodes.Call, s_enterUnit);
-            }
+            il.Emit(OpCodes.Call, (unit ? s_enterNU : s_enterN)[n]);
         }
         il.Emit(OpCodes.Ldarg_0);
         for (int i = 0; i < n; i++)
         {
             il.Emit(OpCodes.Ldarg, i + 1);
+            if (f.Sig[i] == 'O') continue;
             if (f.Sig[i] == 'D')
             {
                 if (f.Checks) il.Emit(OpCodes.Call, TypedArgDMI);
@@ -136,9 +146,126 @@ public partial class CilAssembler
             il.Emit(OpCodes.Call, s_leaveFrame);
         }
         if (f.Sig[n + 1] == 'D') il.Emit(OpCodes.Newobj, DoubleCtorTMI);
-        else il.Emit(OpCodes.Call, FixnumMakeTMI);
+        else if (f.Sig[n + 1] == 'L') il.Emit(OpCodes.Call, FixnumMakeTMI);
         il.Emit(OpCodes.Ret);
     }
+
+    /// <summary>The framed typed entry over a typed body method:
+    /// R Entry(LispFunction self, T1..Tn) links the frame InvokeTypedN would push
+    /// (raw arguments), calls the body and unlinks it.</summary>
+    internal static void EmitTypedFramedEntry(ILGenerator il, TypedForm f, MethodInfo typed, bool unit = false)
+    {
+        int n = f.ParamCount;
+        var fr = il.DeclareLocal(typeof(LispFunction.Frame));
+        var ta = il.DeclareLocal(TypedEntrySig.IsWide(f.Sig) ? typeof(TypedFrameArgsW) : typeof(TypedFrameArgs));
+        il.Emit(OpCodes.Ldloca, fr);
+        il.Emit(OpCodes.Ldloca, ta);
+        il.Emit(OpCodes.Ldstr, string.Intern(f.Name));
+        il.Emit(OpCodes.Ldc_I4, TypedEntrySig.Code(f.Sig));
+        for (int i = 1; i <= n; i++) il.Emit(OpCodes.Ldarg, i);
+        il.Emit(OpCodes.Call, LispFunction.TypedEnterMethod(f.Sig));
+        if (unit)
+        {
+            il.Emit(OpCodes.Ldloca, fr);
+            il.Emit(OpCodes.Ldarg_0);
+            il.Emit(OpCodes.Call, s_enterUnit);
+        }
+        for (int i = 0; i <= n; i++) il.Emit(OpCodes.Ldarg, i);
+        il.Emit(OpCodes.Call, typed);
+        il.Emit(OpCodes.Ldloca, fr);
+        il.Emit(OpCodes.Call, s_leaveFrame);
+        il.Emit(OpCodes.Ret);
+    }
+
+    // Set while assembling the leaf copy of a typed body as its framed entry:
+    // the frame the entry stands for, handed to the LispFunction.LeafX helpers.
+    internal TypedForm? _leafEntry;
+
+    static readonly Dictionary<string, MethodInfo> s_leafOps = BuildLeafOps();
+
+    static Dictionary<string, MethodInfo> BuildLeafOps()
+    {
+        var d = new Dictionary<string, MethodInfo>();
+        foreach (var op in new[] { "AddFixnumChecked", "SubtractFixnumChecked", "MultiplyFixnumChecked",
+                                   "FloorFixnumL", "TruncateFixnumL", "ModFixnumL", "RemFixnumL",
+                                   "CheckLongRange" })
+            d["Runtime." + op] = typeof(LispFunction).GetMethod("Leaf" + op)!;
+        return d;
+    }
+
+    static readonly HashSet<string> s_leafPlainOps = new()
+    {
+        "LDARG", "LDLOC", "STLOC", "DECLARE-LOCAL", "LDC-I4", "LDC-I8", "LDC-R8", "LDC-R4",
+        "POP", "DUP", "RET", "ADD", "SUB", "MUL", "AND", "OR", "XOR", "NOT", "NEG",
+        "SHL", "SHR", "SHR-UN", "CEQ", "CGT", "CLT", "CGT-UN", "CLT-UN",
+        "CONV-I1", "CONV-I2", "CONV-U1", "CONV-U2", "CONV-U4", "CONV-U8", "CONV-I8", "CONV-I",
+        "CONV-I4", "CONV-R4", "CONV-R8", "TYPED-TAIL-SELF",
+    };
+
+    // Calls that cannot signal, kept as they are in a leaf.
+    static readonly HashSet<string> s_leafPureCalls = new() { "Math.MinLong", "Math.MaxLong" };
+
+    static readonly HashSet<string> s_leafBranchOps = new()
+    {
+        "BR", "BRFALSE", "BRTRUE", "BEQ", "BNE", "BGT", "BLT", "BGE", "BLE",
+        "BGE-UN", "BGT-UN", "BLE-UN", "BLT-UN",
+    };
+
+    /// <summary>A typed body that calls nothing but the checked helpers of
+    /// s_leafOps and has no loop: nothing in it can look at the frame list
+    /// except those helpers' slow paths.</summary>
+    internal static bool IsTypedLeaf(LispObject body)
+    {
+        var seen = new HashSet<string>();
+        for (var cur = body; cur is Cons c; cur = c.Cdr)
+        {
+            if (c.Car is not Cons ic || ic.Car is not Symbol s) return false;
+            var op = s.Name;
+            if (op == "LABEL") seen.Add(GetSymbolName(Cadr(ic)));
+            else if (s_leafBranchOps.Contains(op)) { if (seen.Contains(GetSymbolName(Cadr(ic)))) return false; }
+            else if (op == "CALL")
+            {
+                var callee = GetString(Cadr(ic));
+                if (!s_leafOps.ContainsKey(callee) && !s_leafPureCalls.Contains(callee)) return false;
+            }
+            else if (!s_leafPlainOps.Contains(op)) return false;
+        }
+        return true;
+    }
+
+    private bool TryEmitLeafCall(string name)
+    {
+        if (_leafEntry is not { } f || !s_leafOps.TryGetValue(name, out var leaf)) return false;
+        _il.Emit(OpCodes.Ldstr, string.Intern(f.Name));
+        _il.Emit(OpCodes.Ldc_I4, TypedEntrySig.Code(f.Sig));
+        _il.Emit(OpCodes.Ldc_I4, f.ParamCount);
+        for (int i = 1; i <= 4; i++)
+        {
+            if (i > f.ParamCount) { _il.Emit(OpCodes.Ldc_I8, 0L); continue; }
+            _il.Emit(OpCodes.Ldarg, i);
+            if (f.Sig[i - 1] == 'D') _il.Emit(OpCodes.Call, s_doubleBits);
+        }
+        _il.Emit(OpCodes.Call, leaf);
+        return true;
+    }
+
+    static readonly MethodInfo s_doubleBits = typeof(BitConverter).GetMethod("DoubleToInt64Bits", new[] { typeof(double) })!;
+
+    /// <summary>Assemble the leaf copy of F's typed body into IL: the framed
+    /// entry of a leaf.</summary>
+    internal static void EmitLeafEntry(ILGenerator il, TypedForm f, Action<CilAssembler>? setup = null)
+    {
+        var asm = new CilAssembler();
+        asm._il = il;
+        asm._leafEntry = f;
+        setup?.Invoke(asm);
+        asm.Assemble(f.Body);
+    }
+
+    // The framed entry of an in-memory function is reached only by its address:
+    // this keeps its DynamicMethod alive as long as the function.
+    static readonly System.Runtime.CompilerServices.ConditionalWeakTable<LispFunction, DynamicMethod>
+        s_typedEntryOwners = new();
 
     private void HandleDefmethodTyped(Cons instr)
     {
@@ -171,6 +298,17 @@ public partial class CilAssembler
         if (selfFramed) fn.SetSelfFramedEntry(DynamicMethodEntry(shellDm), n);
         fn.SetTypedEntry(typedDm.CreateDelegate(TypedEntrySig.DelegateType(f.Sig)),
             TypedEntrySig.Code(f.Sig));
+        if (selfFramed)
+        {
+            var entryDm = new DynamicMethod(f.Name + "_tentry", TypedEntrySig.ReturnType(f.Sig),
+                TypedEntrySig.ParamTypes(f.Sig), typeof(CilAssembler).Module, true);
+            if (!TypedEntrySig.IsWide(f.Sig) && IsTypedLeaf(f.Body)) EmitLeafEntry(entryDm.GetILGenerator(), f);
+            else EmitTypedFramedEntry(entryDm.GetILGenerator(), f, typedDm, unit: true);
+            s_typedEntryOwners.Add(fn, entryDm);
+            var r = TypedArgRanges(f);
+            fn.SetTypedArgRanges(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+            fn.SetTypedFramedEntry(DynamicMethodEntry(entryDm), TypedEntrySig.Code(f.Sig));
+        }
         FinishInMemoryDefmethod(fn, f.Name, f.Pkg, f.LambdaList, f.NoFrame, f.Body);
     }
 }

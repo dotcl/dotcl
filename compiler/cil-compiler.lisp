@@ -8,7 +8,7 @@
   (:use :cl)
   (:export #:compile-toplevel #:compile-toplevel-eval
            #:*cross-compiling* #:*compile-file-mode* #:*concatenate-build*
-           #:*emit-source-lines* #:*emit-frame-locals*
+           #:*emit-source-lines* #:*emit-frame-locals* #:*emit-form-prefix*
            #:compile-file-concatenated))
 
 ;; %INLINE-CS-SPLICED is the dispatch symbol for the dotnet-cs:inline-cs
@@ -50,6 +50,24 @@
    for out-of-process debuggers; this one is for the CL-native debugger.
    User-visible as DOTCL:*EMIT-FRAME-LOCALS* (the same symbol; Startup imports it).")
 
+
+(defvar *emit-form-prefix* nil
+  "When non-NIL, a function (fn form) -> a form or NIL. COMPILE-EXPR,
+   COMPILE-FOR-SINGLE-VALUE and COMPILE-AND-POP call it per cons form they are
+   given, before compiling it; a returned form is compiled for effect in front of
+   FORM's code. A debugger uses it to plant a call at a source position. NIL by
+   default; output is then unchanged. User-visible as DOTCL:*EMIT-FORM-PREFIX*.")
+
+(defvar *form-prefixed* nil
+  "The form whose prefix is being emitted, so it is not asked for again.")
+
+(defun %form-prefix-code (expr)
+  (when (and *emit-form-prefix* (consp expr) (not (eq expr *form-prefixed*)))
+    (let ((pre (funcall *emit-form-prefix* expr)))
+      (when pre
+        (let ((*emit-form-prefix* nil) (*in-tail-position* nil) (*in-mv-context* nil)
+              (*mv-expect-args* nil))
+          (compile-and-pop pre))))))
 
 (defvar *backing-arm* :both
   "Which arm a hoisted element access emits.
@@ -124,11 +142,18 @@
    of a rank 2 or 3 buffer never declines (it signals instead), so its accesses
    are always :FAST, as are those of a raw array (never null)."
   (cond ((backing-entry-dims entry) :fast)
+        ((eq (tenth entry) :never-null) :fast)
+        ((%backing-never-declines-p entry) :fast)
         ((member (third entry) *raw-array-backings* :test #'eq) :fast)
         ((and (eq *backing-arm* :fast)
               (not (member (third entry) *array-backing-tested* :test #'eq)))
          :both)
         (t *backing-arm*)))
+
+(defun %backing-never-declines-p (entry)
+  "T when ENTRY's buffer was fetched by an entry that signals rather than
+   answering null: a float buffer above (safety 0)."
+  (and (member (fourth entry) '(:f64 :f32)) (eq (sixth entry) :checked)))
 
 (defun %raw-array-entry-p (entry)
   (and entry (member (third entry) *raw-array-backings* :test #'eq) t))
@@ -335,12 +360,13 @@
 
 
 (defvar *specials* '()
-  "List of symbols known to be special (both global and locally declared).")
+  "List of symbols locally declared special (declare (special x)) in the
+   enclosing scopes. Global specials are in *GLOBAL-SPECIALS*.")
 
-(defvar *global-specials* '()
-  "List of symbols that are GLOBALLY special (via defvar/defparameter/proclaim).
-   Used to determine binding classification: only global specials force nested let bindings
-   to be dynamic. Locally-declared specials (declare (special x)) only affect references.")
+(defvar *global-specials* (make-hash-table :test #'eq :synchronized t)
+  "Set (symbol -> T) of the symbols the compiler has seen made GLOBALLY special
+   (defvar/defparameter/defconstant/declaim). Only global specials force nested
+   let bindings to be dynamic. Locally-declared specials only affect references.")
 
 (defvar *macros* (make-hash-table :test #'eq :synchronized t)
   "Global macro table: symbol -> macro-expander-function.
@@ -528,6 +554,91 @@
    large body at every call site trades a call for a large multiple of the code.
    Deliberately generous: the functions people declaim inline are small.")
 
+(defvar *inline-large-body-size-limit* 2000
+  "Maximum cons count of a recorded body substituted in the body of a DEFUN
+   (see *LARGE-INLINE-CELL*) although it is over *INLINE-BODY-SIZE-LIMIT*.")
+
+(defvar *inline-def-il-sizes* (make-hash-table :test #'equal :synchronized t)
+  "Name -> estimated IL bytes of the method its DEFUN compiled to, for the
+   recorded inline definitions over *INLINE-BODY-SIZE-LIMIT*. A body small as
+   written can expand through macros and inline calls into tens of kilobytes.")
+
+(defvar *large-inline-il-budget* 10000
+  "Estimated IL bytes the bodies over *INLINE-BODY-SIZE-LIMIT* may add to one
+   DEFUN, a sixth of the JIT's 60,000-byte limit.")
+
+(define-compile-state *large-inline-cell* nil
+  :doc "While the body of a DEFUN compiles: (USED-BYTES NAME BODY . SITES), NAME
+   and BODY the DEFUN's. Bodies over *INLINE-BODY-SIZE-LIMIT* are substituted
+   only here, up to *LARGE-INLINE-IL-BUDGET* in all; SITES are the call forms
+   already given one. COMPILE-DEFUN compiles the DEFUN again without them when its method
+   would still be past the JIT's limits. NIL in nested function bodies, which
+   are methods of their own and are not checked.")
+
+(defun %large-inline-allowed-p (op expr)
+  "May the body of OP, over *INLINE-BODY-SIZE-LIMIT*, be substituted for the
+   call EXPR here? Charges its size to *LARGE-INLINE-CELL* the first time."
+  (let ((cell *large-inline-cell*)
+        (il (gethash op *inline-def-il-sizes*)))
+    (cond ((null cell) nil)
+          ((member expr (cdddr cell) :test #'eq) t)
+          ((and il
+                (<= (* (max 1 (%count-calls-in op (caddr cell))) il)
+                    *large-inline-il-budget*)
+                (<= (+ (car cell) il) *large-inline-il-budget*))
+           (incf (car cell) (max il 1))
+           (push expr (cdddr cell))
+           t))))
+
+(defun %count-calls-in (op form)
+  "How many forms headed by OP the text of FORM holds, quoted data aside.
+   Substituting only some of a function's calls was measured slower than
+   substituting none, so a function whose calls do not all fit the budget is
+   left a call everywhere."
+  (let ((n 0) (budget 200000))
+    (labels ((walk (x)
+               (loop while (and (consp x) (plusp (decf budget)))
+                     do (let ((y (car x)))
+                          (when (consp y)
+                            (unless (eq (car y) 'quote)
+                              (when (equal (car y) op) (incf n))
+                              (walk y))))
+                        (setf x (cdr x)))))
+      (walk form))
+    n))
+
+(defun %instrs-il-bytes (instrs)
+  "Rough IL bytes of the instruction list INSTRS, nested lists included."
+  (let ((bytes 0) (budget 2000000))
+    (labels ((walk (list)
+               (dolist (i list)
+                 (when (and (consp i) (keywordp (car i)) (plusp (decf budget)))
+                   (incf bytes (case (car i)
+                                 ((:declare-local :label) 0)
+                                 (:ldc-i8 9)
+                                 ((:ldloc :stloc :ldarg :starg) 2)
+                                 ((:call :callvirt :newobj :br :brtrue :brfalse :leave
+                                   :ldc-i4 :ldstr :ldsfld :stsfld :ldfld :stfld
+                                   :castclass :isinst)
+                                  5)
+                                 (t 1)))
+                   (dolist (a (cdr i))
+                     (when (and (consp a) (consp (car a)) (keywordp (caar a)))
+                       (walk a)))))))
+      (walk instrs))
+    bytes))
+
+(defun %note-inline-def-il-size (name instrs)
+  "After NAME's DEFUN compiled to INSTRS: record its size when NAME has a
+   recorded inline definition over *INLINE-BODY-SIZE-LIMIT*."
+  (let ((def (gethash name *inline-defs*)))
+    (if (and def
+             (> (%form-size (%strip-macrolet-defs (cdr def))
+                            (1+ *inline-body-size-limit*))
+                *inline-body-size-limit*))
+        (setf (gethash name *inline-def-il-sizes*) (%instrs-il-bytes instrs))
+        (remhash name *inline-def-il-sizes*))))
+
 ;;; RyuJIT compiles a method without optimization (MinOpts: no inlining, no loop
 ;;; optimization, no register allocation across statements) when it is past any
 ;;; of 60,000 IL bytes, 20,000 IL instructions, 2,000 basic blocks, 2,000 locals
@@ -616,8 +727,10 @@
 (defun %sil-past-jit-limits-p (instrs)
   "True when the method code INSTRS would be past one of the JIT's limits, by an
    estimate from the SIL. The bodies of nested functions, methods of their own,
-   are not counted."
-  (let ((n 0) (bytes 0) (blocks 0) (refs 0))
+   are not counted. Counted after the peephole pass, which removes a good part
+   of a large body (box and unbox pairs, discarded stores, masks)."
+  (let ((instrs (peephole-optimize instrs))
+        (n 0) (bytes 0) (blocks 0) (refs 0))
     (labels ((walk (list)
                (dolist (i list)
                  (when (and (consp i) (keywordp (car i)))
@@ -663,14 +776,14 @@
    MACROEXPAND-1 of VAR in that environment does not expand it. The runtime's
    MACROEXPAND-1 / MACROEXPAND read this variable to recognise the entry.")
 
-(defvar *ltv-counter* 0
-  "Counter for load-time-value slot IDs. Incremented for each load-time-value form.")
-
 (defvar *ltv-hoisted* nil
   "While COMPILE-TOPLEVEL compiles a form for a fasl: a cell whose car collects
    (%SET-LTV-SLOT-IN module id form) for the LOAD-TIME-VALUE forms in it, so
    their forms run when the fasl is loaded, before the top level form, instead
    of when the code first reaches them. NIL everywhere else.")
+
+(defvar *ltv-eval-now* nil
+  "True while compiling LOAD-TIME-VALUE forms to run now, as COMPILE does.")
 
 (defvar *current-module-id* nil
   "Set by compile-file to the current FASL module's unique name.
@@ -697,6 +810,10 @@
   "Hash table: operator symbol -> (lambda (expr) ...) handler.
    Populated in cil-forms-dispatch.lisp after all compile-* helpers are defined.
    Provides O(1) dispatch for ~250+ common operators in compile-form.")
+
+(defvar *handler-op* nil
+  "Operator of the form whose *compile-form-handlers* entry is running; names
+   the function in arity errors the call helpers emit.")
 
 (defvar *macroexpand-cache* nil
   "A cons whose car is the hash table (form -> ((scope . expansion) ...)) for
@@ -911,6 +1028,24 @@
    *EXPANSION-SM-DEPENDENT*: (MARKER EXPANSION . SNAPSHOT), SNAPSHOT from
    %SM-SNAPSHOT.")
 
+(defvar *expansion-failed-marker* (list '#:expansion-failed)
+  "Heads the value of a *MACROEXPAND-CACHE* entry for an expansion whose
+   expander signalled: (MARKER EXPANDER . CONDITION). The condition is signalled
+   again instead of running the expander again.")
+
+(defvar *file-expansion-failures* nil
+  "NIL, or, inside COMPILE-FILE, an EQ hash table from a macro form whose global
+   expansion signalled to the condition, or, for a form in top level MACROLETs,
+   to (SCOPE . CONDITION) with the *MACROEXPAND-SCOPE* it failed in. Unlike *MACROEXPAND-CACHE* it outlives
+   one COMPILE-TOPLEVEL, so the top level processing's trial expansion and the
+   compile-time evaluation of a DEFUN do not run a failing expander again.")
+
+(defvar *macrolet-expanders* nil
+  "NIL, or, inside one COMPILE-TOPLEVEL, a cons whose car is an EQ hash table
+   from the body of a MACROLET binding to ((PARAMS FLET-DEFS ENV . EXPANDER) ...).
+   The walks and the compiler then get the same expander for one binding, so a
+   failed expansion kept in *MACROEXPAND-CACHE* is recognised and not run again.")
+
 (defvar *expansion-unreusable* nil
   "Set to T by a macro expander whose result depends on the type declarations
    in scope where the form is expanded (DOTIMES asks whether its count form is
@@ -1016,22 +1151,53 @@
         (dolist (c by-scope)
           (when (%macroexpand-scope= (car c) *macroexpand-scope*)
             (let ((v (cdr c)))
-              (if (and (consp v) (eq (car v) *sm-dependent-marker*))
-                  (progn
-                    (when (eq sig :unset) (setf sig (%sm-snapshot)))
-                    (when (%sm-snapshot-match-p sig (cddr v))
-                      (setf *expansion-sm-dependent* t)
-                      (return-from cached-macroexpand (cadr v))))
-                  (return-from cached-macroexpand v)))))
+              (cond ((and (consp v) (eq (car v) *sm-dependent-marker*))
+                     (when (eq sig :unset) (setf sig (%sm-snapshot)))
+                     (when (%sm-snapshot-match-p sig (cddr v))
+                       (setf *expansion-sm-dependent* t)
+                       (return-from cached-macroexpand (cadr v))))
+                    ((and (consp v) (eq (car v) *expansion-failed-marker*))
+                     ;; Under a MACROLET the walks and the compiler can hold
+                     ;; different expanders for one name, and only some fail.
+                     (when (or (null *macroexpand-scope*) (eq (cadr v) expander))
+                       (error (cddr v))))
+                    (t (return-from cached-macroexpand v))))))
         (let ((result nil) (uncacheable nil) (unreusable nil) (dependent nil))
           (let ((*expansion-uncacheable* nil)
                 (*expansion-unreusable* nil)
-                (*expansion-sm-dependent* nil))
+                (*expansion-sm-dependent* nil)
+                (earlier (let ((v (and *file-expansion-failures*
+                                       (gethash form *file-expansion-failures*))))
+                           (cond ((null v) nil)
+                                 ((consp v)
+                                  (and *macroexpand-scope*
+                                       (%macroexpand-scope= (car v) *macroexpand-scope*)
+                                       (cdr v)))
+                                 ((null *macroexpand-scope*) v))))
+                (failure nil)
+                (done nil))
             (incf *type-env-epoch*)
-            (setf result (with-phase "macroexpand" (funcall expander form))
-                  uncacheable *expansion-uncacheable*
-                  unreusable *expansion-unreusable*
-                  dependent *expansion-sm-dependent*))
+            (unwind-protect
+                 (progn
+                   (setf result (handler-bind ((error (lambda (c) (setf failure c))))
+                                  (if earlier
+                                      (error earlier)
+                                      (with-phase "macroexpand" (funcall expander form))))
+                         done t)
+                   (setf uncacheable *expansion-uncacheable*
+                         unreusable *expansion-unreusable*
+                         dependent *expansion-sm-dependent*))
+              (when (and failure (not done)
+                         (not (or *expansion-uncacheable* *expansion-unreusable*
+                                  *expansion-sm-dependent*)))
+                (when (and *file-expansion-failures* (null *macroexpand-scope*))
+                  (setf (gethash form *file-expansion-failures*) failure))
+                (setf (gethash form (or (car *macroexpand-cache*)
+                                        (setf (car *macroexpand-cache*)
+                                              (make-hash-table :test #'eq))))
+                      (cons (cons *macroexpand-scope*
+                                  (list* *expansion-failed-marker* expander failure))
+                            by-scope)))))
           ;; An enclosing expansion that embeds this one is just as
           ;; context-dependent, so it must not be cached either.
           (when uncacheable (setf *expansion-uncacheable* t))
@@ -1074,6 +1240,11 @@
    then does not run the stand-in there: the error is reported once, as SBCL does,
    instead of again as an error out of COMPILE-FILE.")
 
+(defvar *compile-errors-detected* nil
+  "Set when a failed expansion is reported. COMPILE and COMPILE-FILE bind it and
+   answer T for FAILURE-P when it is set, even if a handler outside muffled the
+   warning that reported it.")
+
 (defvar *evaluating-at-compile-time* nil
   "True while COMPILE-FILE compiles a form only to evaluate it at compile time
    (EVAL-WHEN :COMPILE-TOPLEVEL without :LOAD-TOPLEVEL). There a failed expansion
@@ -1088,6 +1259,7 @@
                        "#<form>"))
         (message (or (ignore-errors (princ-to-string condition))
                      "#<error>")))
+    (setq *compile-errors-detected* t)
     ;; The wording is SBCL's, so a log reads the same under both.
     (if *compile-file-mode*
         (progn
@@ -1113,6 +1285,13 @@
 ;;; TCO (Tail Call Optimization) state. The TCO-scope values live in the
 ;;; *CSTATE* pack (readers below its section); the two flags that are rebound
 ;;; per expression stay dynamic specials here.
+(define-compile-state *constant-backing-collector* nil
+  :doc "In the body of a DEFUN, a cons: the *array-backing-locals* entries for
+   the constant arrays the body reads although it does not name them (the read
+   came out of a global macro or an INLINE function), and the constant arrays
+   it names. The DEFUN fetches the former's buffers in its prologue. NIL
+   elsewhere.")
+
 (define-compile-state *in-tail-position* nil
   :fresh-init t
   :doc "T when the currently-being-compiled expression is in tail position
@@ -1270,9 +1449,13 @@
 (defparameter +cs-u64-locals+ 28)
 (defparameter +cs-typed-self+ 29)
 (defparameter +cs-simd-locals+ 30)
+(defparameter +cs-float-range-locals+ 31)
+(defparameter +cs-throw-return+ 32)
+(defparameter +cs-proven-type-locals+ 33)
+(defparameter +cs-tco-checked+ 34)
 (defparameter +cstate-empty+
   (vector '() '() '() '() '() '() '() nil nil nil nil nil nil nil nil nil nil nil
-          '() '() '() '() '() nil '() '() '() nil '() nil '()))
+          '() '() '() '() '() nil '() '() '() nil '() nil '() '() nil '() nil))
 
 (defvar *cstate* +cstate-empty+
   "The key-verified table pack; see the section comment above. Participates
@@ -1324,6 +1507,15 @@
   (cstate-with +cstate-empty+
                +cs-tco-self-symbol+ (cstate-tco-self-symbol)
                +cs-tco-local-fn-key+ (cstate-tco-local-fn-key)))
+
+(defvar *throw-return-forward* t
+  "NIL inside a CATCH body, whose own call is armed by the CATCH (ThrowReturn.CallN)
+   instead of forwarding the enclosing function's claim.")
+
+(defun cstate-throw-return ()
+  "In a function body whose THROWs may return to the CATCH that called it: the
+   list (CLAIM-KEY EXIT-LABEL VALUE-KEY USED-CELL); see ThrowReturn."
+  (svref *cstate* +cs-throw-return+))
 
 (defun cstate-locals ()
   "Alist of (symbol . local-key). local-key is a keyword like :v1."
@@ -1504,6 +1696,11 @@
    the closure path. NIL outside speculation. Reset at closure boundaries."
   (svref *cstate* +cs-labels-direct-speculation+))
 
+(defvar *typed-call-raw-request* nil
+  "(FORM . KIND) while %COMPILE-RAW-TYPED-CALL compiles FORM: a call to FORM's
+   function through a typed entry of result KIND leaves the raw result and sets
+   this to :DONE.")
+
 (defun cstate-typed-self ()
   "While compiling the body of a typed entry (see TYPED-ENTRY-SPECS): the list
    (SYMBOL ARG-SPECS RET-SPEC), whose calls from this body to SYMBOL go straight
@@ -1530,14 +1727,31 @@
    locals are excluded; a setf could move the value out of [LO,HI]."
   (svref *cstate* +cs-small-int-locals+))
 
+(defun cstate-proven-type-locals ()
+  "Alist (SLOT-KEY . TYPE) for lexical locals whose value is known to be of
+   TYPE, a symbol, because something already checked it: a parameter whose
+   declared type the entry checks and the body never assigns, or an unassigned
+   LET variable whose init is such a value (see %STATIC-VALUE-TYPE). A type
+   declaration alone does not put a variable here: a LET declaration is not
+   checked, so trusting it would drop the diagnosis of a false one."
+  (svref *cstate* +cs-proven-type-locals+))
+
+(defun cstate-tco-checked ()
+  "(TCO-LOOP-LABEL CHECKED-LABEL . CHECKS) for the function whose self tail
+   call loops to TCO-LOOP-LABEL: CHECKS is (SLOT-KEY . SPEC) for each parameter
+   type its entry checks, and CHECKED-LABEL, once emitted, follows the last of
+   them. A self tail call whose arguments are all known to be of their checked
+   types loops to CHECKED-LABEL instead (see %TCO-CHECKS-DONE)."
+  (svref *cstate* +cs-tco-checked+))
+
 (defvar *double-float-locals* '()
   "Like *fixnum-locals* but for double-float declarations. Enables native
    r8 arithmetic on (declare (double-float x)) locals and references.")
 
-(defvar *single-assumed* nil
-  "Alist (VAR . SINGLE-P) of the variables of the forms SINGLE-FLOAT-TYPED-P is
-   looking inside (a LET's bindings, a substituted local function's
-   parameters), innermost first.")
+(defvar *float-assumed* nil
+  "Alist (VAR . KIND) of the variables of the forms the float typing predicates
+   are looking inside (a LET's bindings, a substituted local function's
+   parameters), innermost first. KIND is :SINGLE, :DOUBLE or NIL (neither).")
 
 (defvar *single-float-locals* '()
   "Like *double-float-locals* but for single-float declarations. Enables native
@@ -1679,6 +1893,12 @@
   "Alist (SLOT-KEY . KIND) of locals whose slots hold a raw Vector128 of the
    DOTCL-SIMD pack type KIND (a +SIMD-KINDS+ entry) instead of a boxed pack."
   (svref *cstate* +cs-simd-locals+))
+
+(defun cstate-float-range-locals ()
+  "Alist (SLOT-KEY . (LO . HI)) of locals whose value is known to be a real in
+   the inclusive rational range [LO,HI]: a (SINGLE-FLOAT LO HI) or (DOUBLE-FLOAT
+   LO HI) declaration, or the range of an unassigned LET's init."
+  (svref *cstate* +cs-float-range-locals+))
 
 (defun simd-native-local (sym)
   "(SLOT-KEY . KIND) when SYM's slot holds a raw Vector128, else NIL."
@@ -1947,7 +2167,7 @@ Uses LOAD-SYM instructions to resolve symbols at assembly time
          `((:load-const ,sym)))
         ((and (not *cross-compiling*)
               (not (string= (package-name (symbol-package sym)) "COMMON-LISP")))
-         `((:load-sym-pkg ,(symbol-name sym) ,(package-name (symbol-package sym)))))
+         `((:load-sym-pkg ,(symbol-name sym) ,(%package-physical-name (symbol-package sym)))))
         (t `((:load-sym ,(symbol-name sym))))))
 
 (defun compile-fn-sym-lookup (sym)
@@ -1968,7 +2188,7 @@ through to compile-sym-lookup."
          ;; Unqualified non-CL call: Startup.SymFn bridges to the
          ;; registered fbound symbol (e.g. class-precedence-list in CL-USER
          ;; -> dotcl-mop:class-precedence-list).
-         `((:load-sym-fn ,(symbol-name sym) ,(package-name (symbol-package sym)))))
+         `((:load-sym-fn ,(symbol-name sym) ,(%package-physical-name (symbol-package sym)))))
         (t (compile-sym-lookup sym))))
 
 (defvar *%symbol-special-p-fn* nil
@@ -2012,6 +2232,7 @@ through to compile-sym-lookup."
    DEFVAR of FOO in one package must not make another package's FOO special."
   (unless (symbolp sym) (return-from special-var-p nil))
   (or (member sym *specials*)
+      (gethash sym *global-specials*)
       (and *cross-compiling* (%standard-special-p sym))
       (%runtime-special-p sym)))
 
@@ -2020,7 +2241,7 @@ through to compile-sym-lookup."
    Used for binding classification: only globally special vars force nested let bindings dynamic.
    By symbol identity, as in SPECIAL-VAR-P."
   (unless (symbolp sym) (return-from global-special-p nil))
-  (or (member sym *global-specials*)
+  (or (gethash sym *global-specials*)
       (and *cross-compiling* (%standard-special-p sym))
       (%runtime-special-p sym)))
 
@@ -2241,7 +2462,7 @@ through to compile-sym-lookup."
                     (key-name (symbol-name key-sym))
                     (key-pkg (when explicit-p
                                (let ((pkg (symbol-package key-sym)))
-                                 (if pkg (package-name pkg) ""))))
+                                 (if pkg (%package-physical-name pkg) ""))))
                     (default (cadr p))
                     (supplied-p (caddr p)))
                (check-binding-name var-name "lambda list")
@@ -2574,17 +2795,43 @@ the literal and the next compilation inherits it."
           (if found
               (compile-expr sm-exp)
               ;; No lexical binding: check special (includes locally declared specials)
-              `(,@(compile-sym-lookup sym)
-                (:castclass "Symbol")
-                (:call ,(if (%global-constant-symbol-p sym)
-                            "DynamicBindings.GetConstant"
-                            "DynamicBindings.Get"))))))))
+              (cond
+                ((%literal-constant-symbol-p sym)
+                 (compile-expr `(quote ,(symbol-value sym))))
+                ;; A constant array whose buffer the DEFUN fetches in its
+                ;; prologue: the prologue also kept the array.
+                ((and *constant-backing-collector*
+                      (nth 10 (find sym (car *constant-backing-collector*)
+                                    :key #'ninth :test #'eq)))
+                 `((:ldloc ,(nth 10 (find sym (car *constant-backing-collector*)
+                                          :key #'ninth :test #'eq)))))
+                (t
+                  `(,@(compile-sym-lookup sym)
+                    (:castclass "Symbol")
+                    (:call ,(if (%global-constant-symbol-p sym)
+                                "DynamicBindings.GetConstant"
+                                "DynamicBindings.Get"))))))))))
 
 (defun %global-constant-symbol-p (sym)
   "A constant variable cannot be bound, so its value is the global one."
   (and sym (symbolp sym) (not (eq sym t)) (not (keywordp sym))
        (not *cross-compiling*)
        (constantp sym)))
+
+(defun %literal-constant-symbol-p (sym)
+  "SYM is a constant variable whose value a literal can stand for: one whose
+   identity is EQL (a number, a character, NIL, T or an interned symbol)."
+  (and (%global-constant-symbol-p sym)
+       (boundp sym)
+       (let ((v (symbol-value sym)))
+         (or (null v) (eq v t) (numberp v) (characterp v)
+             (and (symbolp v) (symbol-package v) t)))))
+
+(defun %nil-operand-p (form)
+  "FORM is NIL, 'NIL, or a constant variable whose value is NIL."
+  (or (null form)
+      (equal form ''nil)
+      (and (symbolp form) (%literal-constant-symbol-p form) (null (symbol-value form)))))
 
 ;;; ============================================================
 ;;; Main expression compiler
@@ -2657,6 +2904,10 @@ the literal and the next compilation inherits it."
    A structure slot read is single-valued too, but it is not recognisable from
    the form alone, so it is settled from the code that was actually emitted
    (STRUCT-SLOT-READ-EMITTED-P)."
+  (let ((prefix (%form-prefix-code expr)))
+    (when prefix
+      (return-from compile-expr
+        (let ((*form-prefixed* expr)) (append prefix (compile-expr expr))))))
   (let ((code (let ((*mv-expect-args*
                       ;; A named call compiled here in single-value position is
                       ;; followed by nothing but the UnwrapMv below.
@@ -2681,6 +2932,10 @@ the literal and the next compilation inherits it."
 (defun compile-for-single-value (expr)
   "Compile expr and ensure result is a single value (unwrap MvReturn).
    Forces unwrap even in MV context. Used at positions that must always be single-valued."
+  (let ((prefix (%form-prefix-code expr)))
+    (when prefix
+      (return-from compile-for-single-value
+        (let ((*form-prefixed* expr)) (append prefix (compile-for-single-value expr))))))
   (if (single-value-form-p expr)
       (compile-expr-raw expr)
       (let ((code (let ((*mv-expect-args* (if (consp expr) (cons (cdr expr) :primary) nil)))
@@ -2914,9 +3169,21 @@ the literal and the next compilation inherits it."
 (defvar *interp-expansion-env* nil
   "The &ENVIRONMENT that goes with *INTERP-EXPANSION-MACROS*.")
 
+(defun %lexical-macro-expander (sym)
+  "The expander of the innermost MACROLET binding of SYM in *LEXICAL-OPERATORS*,
+   or NIL. An FLET entry for SYM in between does not stop the search."
+  (dolist (e *lexical-operators* nil)
+    (when (and (eq (car e) sym) (cdr e))
+      (return (cdr e)))))
+
+(defun %macro-expander-here (sym)
+  "The MACROLET binding of SYM in scope, else SYM's global *MACROS* entry."
+  (or (and *lexical-operators* (%lexical-macro-expander sym))
+      (gethash sym *macros*)))
+
 (defun find-macro-expander (sym)
   "Find macro expander for SYM by symbol identity, with a runtime name bridge.
-   Checks *macros* first, then (at runtime only) the runtime macro table
+   Checks the MACROLET bindings in scope, then *macros*, then (at runtime only) the runtime macro table
    (MACRO-FUNCTION) for macros that reached the C# _macroFunctions table but not
    the Lisp *macros* table.
    Runtime-table entries take (form env); we wrap them to the 1-arg convention.
@@ -2951,7 +3218,7 @@ the literal and the next compilation inherits it."
       (return-from find-macro-expander
         (let ((expander (cdr lexical)) (env *interp-expansion-env*))
           (and expander (lambda (form) (funcall expander form env)))))))
-  (or (gethash sym *macros*)
+  (or (%macro-expander-here sym)
       (and (not *cross-compiling*)
            (symbolp sym)
            (let ((pkg (symbol-package sym)))
@@ -3027,12 +3294,51 @@ the literal and the next compilation inherits it."
    quoted symbol out by name and interns it again on load, so an expansion that
    names an enclosing FLET function or lexical variable came back as a different
    symbol and missed the binding."
-  (let ((form (%macrolet-expander-form params mbody)))
-    (if *cross-compiling*
-        (let ((*cross-compiling* nil))
-          (eval form))
-        (%expander-with-caller-env
-         (%mini-eval form (%compile-scope-mini-env)) params))))
+  (if *cross-compiling*
+      (let ((*cross-compiling* nil))
+        (eval (%macrolet-expander-form params mbody)))
+      (%macrolet-expander params mbody nil)))
+
+(defun %mini-env-same-p (a b)
+  "True when the %COMPILE-SCOPE-MINI-ENV results A and B bind the same names to
+   the same (EQ) expansions and expanders."
+  (flet ((same-item (x y)
+           (or (eq x y)
+               (and (consp x) (consp y) (eq (car x) (car y)) (eq (cdr x) (cdr y))))))
+    (loop
+      (cond ((and (null a) (null b)) (return t))
+            ((or (atom a) (atom b)) (return nil)))
+      (let ((x (pop a)) (y (pop b)))
+        (unless (and (eq (car x) (car y))
+                     (= (length (cdr x)) (length (cdr y)))
+                     (every #'same-item (cdr x) (cdr y)))
+          (return nil))))))
+
+(defun %macrolet-expander (params mbody flet-defs)
+  "The expander for a MACROLET binding of lambda list PARAMS and body MBODY, made
+   in the current scope and wrapped in the FLET definitions FLET-DEFS. Within one
+   COMPILE-TOPLEVEL the same binding, FLET-DEFS and scope give the same function."
+  (let ((env (%compile-scope-mini-env))
+        (table (and *macrolet-expanders*
+                    (or (car *macrolet-expanders*)
+                        (setf (car *macrolet-expanders*)
+                              (make-hash-table :test #'eq))))))
+    (when table
+      (dolist (e (gethash mbody table))
+        (destructuring-bind (p f en . fn) e
+          (when (and (eq p params) (eq f flet-defs)
+                     (%mini-env-same-p en env))
+            (return-from %macrolet-expander fn)))))
+    (let* ((expander-form (%macrolet-expander-form params mbody))
+           (fn (%expander-with-caller-env
+                (%mini-eval (if flet-defs
+                                `(flet ,flet-defs ,expander-form)
+                                expander-form)
+                            env)
+                params)))
+      (when table
+        (push (list* params flet-defs env fn) (gethash mbody table)))
+      fn)))
 
 (defun %expander-with-caller-env (fn params)
   "FN, an expander %MINI-EVAL made from %MACROLET-EXPANDER-FORM, called with the
@@ -3097,11 +3403,12 @@ the literal and the next compilation inherits it."
    recursive call from NAME's own body, or for a call in the same unit
    (COMPILE-FILE, or the core build) as the definition it was inferred from,
    and not when NAME is NOTINLINE (CLHS 3.2.2.3). The caller must still rule out
-   a local function of the same name."
+   a local function of the same name. A declaimed (VALUES X &OPTIONAL) or
+   (VALUES X) answers X; any other VALUES type answers NIL."
   (multiple-value-bind (ty found) (gethash name *function-return-types*)
     (when found
       (multiple-value-bind (unit inferred) (gethash name *inferred-return-type-names*)
-        (cond ((not inferred) ty)
+        (cond ((not inferred) (%single-value-type ty))
               ((or (member name *notinline-functions*)
                    (%global-notinline-p name))
                nil)
@@ -3118,7 +3425,9 @@ the literal and the next compilation inherits it."
    int64. A local function of the same name is a different function."
   (and (consp expr) (car expr) (symbolp (car expr))
        (if (local-function-entry (car expr))
-           (return-from call-int-return-range (%local-inline-call-range expr))
+           (return-from call-int-return-range
+             (let ((r (%local-inline-call-range expr)))
+               (and r (range-fits-int64-p r) r)))
            t)
        (let ((ty (function-return-type (car expr))))
          (if ty
@@ -3179,7 +3488,9 @@ the literal and the next compilation inherits it."
                             (funcall *declaration-name-p-fn* head))))))))
 
 (defun %note-global-proclamation (spec)
-  "Record the TYPE and OPTIMIZE proclamations the CLtL2 queries report."
+  "Record the TYPE and OPTIMIZE proclamations the CLtL2 queries report, and put
+an OPTIMIZE quality's value in force for later compilations in the image: the
+DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
   (cond ((not (consp spec)) nil)
         ((eq (car spec) 'optimize)
          (dolist (q (cdr spec))
@@ -3188,7 +3499,9 @@ the literal and the next compilation inherits it."
              (when (and (symbolp quality) (integerp value))
                (setq *proclaimed-policy*
                      (acons quality value
-                            (remove quality *proclaimed-policy* :key #'car)))))))
+                            (remove quality *proclaimed-policy* :key #'car)))
+               (cond ((eq quality 'debug) (setq *optimize-debug* value))
+                     ((eq quality 'safety) (setq *optimize-safety* value)))))))
         ((%type-declaration-spec-p spec)
          (multiple-value-bind (type vars)
              (if (eq (car spec) 'type)
@@ -3472,6 +3785,10 @@ the literal and the next compilation inherits it."
    (%STRUCT-ACCESSORS name version accessor-names slots): what a DEFSTRUCT
    expansion records for its accessors, as written by
    %STRUCT-ACCESSORS-PROCLAMATION.
+   (%CLOS-ACCESSORS readers writers): the DEFCLASS reader and writer names, as
+   written by %CLOS-ACCESSORS-PROCLAMATION.
+   (%GF-CALL-NAMES name...): names DEFGENERIC / DEFMETHOD defined, as written by
+   %GF-CALL-NAMES-PROCLAMATION.
    Anything else is ignored."
   (when (consp spec)
     (%note-global-proclamation spec)
@@ -3486,13 +3803,20 @@ the literal and the next compilation inherits it."
                  (setf (gethash name *function-arg-types*) (cadr fty))
                  (remhash name *inferred-return-type-names*)))))))
       (%inline-expansion
-       (destructuring-bind (name params body range) (cdr spec)
+       (destructuring-bind (name params body range &optional il-size) (cdr spec)
          (when (and (or (and name (symbolp name)) (%setf-function-name-p name))
                     (listp params) (listp body))
            (setf (gethash name *inline-defs*) (cons params body))
+           (if (integerp il-size)
+               (setf (gethash name *inline-def-il-sizes*) il-size)
+               (remhash name *inline-def-il-sizes*))
            (if (and (consp range) (integerp (car range)) (integerp (cdr range)))
                (setf (gethash name *inline-return-ranges*) range)
                (remhash name *inline-return-ranges*)))))
+      (%gf-call-names (%load-gf-call-names (cdr spec)))
+      (%clos-accessors
+       (destructuring-bind (readers writers) (cdr spec)
+         (%load-clos-accessors readers writers)))
       (%struct-accessors
        (destructuring-bind (name version accessor-names slots) (cdr spec)
          (when (and name (symbolp name) (integerp version)
@@ -3528,11 +3852,13 @@ the literal and the next compilation inherits it."
                   (gethash name *inline-defs*))))
     (when (and def
                (<= (%form-size (%strip-macrolet-defs (cdr def))
-                               (1+ *inline-body-size-limit*))
-                   *inline-body-size-limit*)
+                               (1+ *inline-large-body-size-limit*))
+                   *inline-large-body-size-limit*)
                (%fasl-dumpable-source-p def))
       `(proclaim '(%inline-expansion ,name ,(car def) ,(cdr def)
-                   ,(gethash name *inline-return-ranges*))))))
+                   ,(gethash name *inline-return-ranges*)
+                   ,@(let ((il (gethash name *inline-def-il-sizes*)))
+                       (when il (list il))))))))
 
 (defvar *global-inline-p-fn*
   (ignore-errors
@@ -3690,6 +4016,36 @@ the literal and the next compilation inherits it."
                (walk body '()))
              hit)))))
 
+(defun %inline-apply-rest-var (params body)
+  "R when PARAMS is required parameters then &REST R, and BODY uses R only once,
+   as the last argument of APPLY, with no declaration naming it. Such a body can
+   be substituted with that argument replaced by (LIST extra-args...)."
+  (let ((tail (member '&rest params)))
+    (when (and tail (= (length tail) 2) (symbolp (second tail))
+               (not (member (second tail) lambda-list-keywords))
+               (every (lambda (p) (and (symbolp p) (not (member p lambda-list-keywords))))
+                      (ldiff params tail)))
+      (let ((r (second tail)) (count 0) (in-apply nil))
+        (labels ((walk (x)
+                   (when (and (consp x) (not (eq (car x) 'quote)))
+                     (loop for cell on x
+                           do (cond ((eq (car cell) r)
+                                     (incf count)
+                                     (when (and (eq (car x) 'apply) (not (eq cell x))
+                                                (cddr x) (null (cdr cell)))
+                                       (setf in-apply t)))
+                                    ((consp (car cell)) (walk (car cell))))
+                           while (consp (cdr cell))))))
+          (walk body))
+        (and (= count 1) in-apply r)))))
+
+(defun %subst-rest-apply-arg (body r replacement)
+  (labels ((walk (x)
+             (cond ((eq x r) replacement)
+                   ((or (atom x) (eq (car x) 'quote)) x)
+                   (t (cons (walk (car x)) (walk (cdr x)))))))
+    (walk body)))
+
 (defun maybe-expand-inline (op expr)
   "If OP names a function proclaimed INLINE whose definition was recorded, return
    the call EXPR rewritten as an immediately-applied lambda; else NIL.
@@ -3715,8 +4071,9 @@ the literal and the next compilation inherits it."
    - NOTINLINE is in scope for OP, lexically or globally (CLHS 3.2.2.1.1)
    - OP is already being inlined (recursion would not terminate)
    - the argument count does not match the required parameters, or the lambda
-     list has any non-required parameter (an &optional/&key/&rest expansion has
-     to replicate defaulting rules; left to the normal call for now)
+     list has any non-required parameter (an &optional/&key expansion has to
+     replicate defaulting rules; left to the normal call for now). &REST is
+     taken only when its one use is the last argument of APPLY
    - the body is larger than *INLINE-BODY-SIZE-LIMIT*
    - a local function binding or an active MACROLET at the call site could
      capture one of the body's free names (see %INLINE-BODY-CAPTURABLE-P)
@@ -3731,15 +4088,23 @@ the literal and the next compilation inherits it."
              (not (%global-notinline-p op)))
     (let ((def (gethash op *inline-defs*)))
       (when def
-        (let ((params (car def))
-              (body (cdr def))
-              (args (cdr expr)))
+        (let* ((params (car def))
+               (body (cdr def))
+               (args (cdr expr))
+               (rest-var (%inline-apply-rest-var params body)))
+          (when rest-var
+            (let ((temps (loop repeat (- (length args) (- (length params) 2))
+                               collect (gensym "REST"))))
+              (setf body (%subst-rest-apply-arg body rest-var `(list ,@temps))
+                    params (append (butlast params 2) temps))))
           (when (and (every #'symbolp params)
                      (notany (lambda (p) (member p lambda-list-keywords)) params)
                      (= (length args) (length params))
-                     (< (%form-size (%strip-macrolet-defs body)
-                                    (1+ *inline-body-size-limit*))
-                        (1+ *inline-body-size-limit*))
+                     (let ((size (%form-size (%strip-macrolet-defs body)
+                                             (1+ *inline-large-body-size-limit*))))
+                       (or (<= size *inline-body-size-limit*)
+                           (and (<= size *inline-large-body-size-limit*)
+                                (%large-inline-allowed-p op expr))))
                      (not (%inline-body-capturable-p body params))
                      ;; The global proclamation is asked about last: it crosses
                      ;; into the runtime, and everything above is cheap.
@@ -3828,7 +4193,7 @@ the literal and the next compilation inherits it."
         (assoc sym (cstate-block-tags))
         (assoc sym (cstate-go-tags))
         (assoc sym *symbol-macros*)
-        (gethash sym *macros*)))
+        (%macro-expander-here sym)))
 
 (defvar *local-inline-snapshot-limit* 20000
   "How many conses %LOCAL-INLINE-SNAPSHOT walks, macro expansions included,
@@ -3882,10 +4247,17 @@ the literal and the next compilation inherits it."
                           (note nil))
                         (let ((exp (expansion x)))
                           (when exp (walk (car exp))))
-                        (walk (car x))
-                        (walk (cdr x)))))))
+                        (walk-elements x)))))
+             ;; Element by element: a tail of a form is not a form, and taken
+             ;; for one, (LIST M) would expand a macro M at (M).
+             (walk-elements (l)
+               (do ((r l (cdr r)))
+                   ((atom r) (when (and r (symbolp r)) (note r)))
+                 (when (minusp (decf budget))
+                   (throw '%local-inline-refuse :refuse))
+                 (walk (car r)))))
       (catch '%local-inline-refuse
-        (walk body)
+        (walk-elements body)
         result))))
 
 (defun %local-inline-env-matches-p (snapshot)
@@ -3944,11 +4316,52 @@ the literal and the next compilation inherits it."
             ;; NAME, not OP: entries are matched by mangled name, so the call
             ;; could spell the function with a symbol from another package,
             ;; while the body's RETURN-FROM names the defining symbol.
-            `(let ,(mapcar #'list params args)
-               ,@decls
-               ,@(if blockp
-                     `((block ,name ,@body))
-                     body))))))))
+            (let* ((consts (%local-inline-constant-params params args decls body snapshot))
+                   (forms (if blockp `((block ,name ,@body)) body))
+                   (forms (if consts
+                              `((symbol-macrolet ,(mapcar (lambda (c) (list (car c) (cdr c)))
+                                                          consts)
+                                  ,@forms))
+                              forms))
+                   ;; The substituted LET checks the parameters' declared types, as
+                   ;; the out-of-line entry does.
+                   (seq (insert-simple-decl-checks (append decls forms) params)))
+              `(let ,(loop for p in params
+                           for a in args
+                           unless (assoc p consts :test #'eq)
+                             collect (list p a))
+                 ,@seq))))))))
+
+(defun %local-inline-constant-params (params args decls body snapshot)
+  "(PARAM . NUMBER) for the parameters of a local function substituted at a
+   call whose argument is a literal number, the body never assigns, no
+   declaration names, and that is not a special variable. Such a parameter is
+   made a symbol macro for the number, so the body sees the constant (a shift
+   count, a rotation) where a binding would hide it. None when the body names
+   a macro outside COMMON-LISP (SNAPSHOT, the plan's): its &ENVIRONMENT would
+   see the symbol macro."
+  (let ((cands (loop for p in params
+                     for a in args
+                     when (and (numberp a)
+                               (not (global-special-p p))
+                               (not (constantp p))
+                               (notany (lambda (d) (%decl-form-mentions-p d p)) decls))
+                       collect (cons p a))))
+    (when (and cands
+               (notany (lambda (e)
+                         (and (nth 5 (cdr e))
+                              (let ((pkg (symbol-package (car e))))
+                                (not (and pkg (string= (package-name pkg) "COMMON-LISP"))))))
+                       snapshot))
+      (let ((mutated (find-mutated-and-captured-vars body (mapcar (lambda (c) (var-name (car c)))
+                                                                  cands))))
+        (remove-if (lambda (c) (member (var-name (car c)) mutated :test #'string=))
+                   cands)))))
+
+(defun %decl-form-mentions-p (decl-form sym)
+  "True when the (DECLARE ...) form DECL-FORM mentions SYM anywhere."
+  (labels ((walk (x) (or (eq x sym) (and (consp x) (or (walk (car x)) (walk (cdr x)))))))
+    (walk (cdr decl-form))))
 
 
 (defun maybe-expand-compiler-macro (op expr)
@@ -4074,7 +4487,7 @@ the literal and the next compilation inherits it."
                             (not (macrolet-shadowed-p op))
                             (gethash op *compile-form-handlers*))))
           (if handler
-              (funcall handler expr)
+              (let ((*handler-op* op)) (funcall handler expr))
             ;; Fallback: cons-op cases, string=-based ops, macro expansion, named-call
             (cond
               ;; Direct dispatch for a known-typed dotnet:invoke (typed direct callvirt).
@@ -4161,6 +4574,8 @@ the literal and the next compilation inherits it."
                `(,@(compile-as-long expr) (:call "Fixnum.Make")))
               ((and (eql (%rotate-byte-width expr) 64) (try-compile-u64 expr)))
               ((eq op '%simd-store) (compile-simd-store-form expr))
+              ((eq op '%induction-version) (compile-induction-version expr))
+              ((eq op '%induction-signed) (compile-induction-signed expr))
               ;; String=-based dispatch for ops that may arrive from different packages.
               ;; These are rare (internal/cross-package ops): not in the eq hash table.
               ((string= (symbol-name op) "TRY-EVAL") (compile-unary-call (cdr expr) "Runtime.TryEval"))
@@ -4194,7 +4609,7 @@ the literal and the next compilation inherits it."
                (compile-unary-call (cdr expr) "Runtime.PackageAllSymbolsList"))
               ((string= (symbol-name op) "INTERN")
                `(,@(compile-args-array (cdr expr))
-                 (:call "Runtime.InternSymbolV")))
+                 (:call "Runtime.InternMv")))
               ;; defmacro: string= match to catch cross-package variants (e.g. SB-XC:DEFMACRO),
               ;; but only when the variant has no macro definition of its own.
               ;; SBCL's host build defines SB-XC:DEFMACRO as a REAL host macro

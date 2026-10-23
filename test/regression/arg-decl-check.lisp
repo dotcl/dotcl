@@ -146,3 +146,21 @@
   (((:value 2) (:value 2)) ((:value 2) (:value 2)) ((:type-error 5) (:type-error 5))
    ((:value nil) (:value nil)) ((:type-error 5) (:type-error 5)) ((:value 2) (:value 2))
    ((:value 2) (:value 2))))
+
+;; A simple vector of a fixed length, written out or through a DEFTYPE: the
+;; element type and the length are both checked.
+(deftype %adc-block4 () '(simple-array (unsigned-byte 8) (4)))
+(defun %adc-vec4 (x) (declare (type (simple-array (unsigned-byte 8) (4)) x)) (aref x 3))
+(defun %adc-block (x) (declare (type %adc-block4 x)) (aref x 0))
+
+(deftest arg-decl-check.fixed-length-vector
+  (mapcar (lambda (thunk) (car (%adc-te thunk)))
+          (list (lambda () (%adc-vec4 (make-array 4 :element-type '(unsigned-byte 8))))
+                (lambda () (%adc-vec4 (make-array 5 :element-type '(unsigned-byte 8))))
+                (lambda () (%adc-vec4 (make-array 4 :element-type '(unsigned-byte 16))))
+                (lambda () (%adc-vec4 (make-array 4 :element-type '(unsigned-byte 8) :adjustable t)))
+                (lambda () (%adc-vec4 (make-array 4)))
+                (lambda () (%adc-block (make-array 4 :element-type '(unsigned-byte 8))))
+                (lambda () (%adc-block (make-array 3 :element-type '(unsigned-byte 8))))
+                (lambda () (%adc-block "abcd"))))
+  (:value :type-error :type-error :type-error :type-error :value :type-error :type-error))

@@ -251,6 +251,9 @@
 ;;; but that the hoisted read answers what the un-hoisted read of the same
 ;;; object answers. %SRH-UNDECLARED is the reference: no declaration, so no
 ;;; hoist, so today's path.
+;;;
+;;; Emitting builds only: without an emitter the (SAFETY 0) caller does not
+;;; inline the accessor, and the accessor's own DEFUN checks the object.
 
 (defun %srh-wrong-type (s)
   (declare (type srh s) (optimize (speed 3) (safety 0) (debug 0)))
@@ -260,14 +263,14 @@
   (declare (optimize (speed 3) (safety 0) (debug 0)))
   (srh-a s))
 
-(deftest struct-raw-backing-hoist.false-declaration-reads-what-it-read-before
+(deftest-emitting-only struct-raw-backing-hoist.false-declaration-reads-what-it-read-before
   (let ((other (make-srh-mix :w 1 :q :here :r 3 :s 4)))
     (list (equal (%srh-wrong-type other) (%srh-undeclared other))
           (%srh-wrong-type other)))
   (t 1))
 
 ;; The same question for a structure with no raw storage at all.
-(deftest struct-raw-backing-hoist.false-declaration-no-raw-storage
+(deftest-emitting-only struct-raw-backing-hoist.false-declaration-no-raw-storage
   (let ((other (make-srh-none :x 11 :y 22)))
     (list (equal (%srh-wrong-type other) (%srh-undeclared other))
           (%srh-wrong-type other)))

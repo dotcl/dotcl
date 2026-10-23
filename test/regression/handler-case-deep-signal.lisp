@@ -86,12 +86,14 @@
 ;;; the same as it does without a handler-case in the loop.
 
 (deftest handler-case-deep-signal.interpreted-runaway-is-catchable
-  (let ((dotcl:*evaluator-mode* :interpret))
-    (eval '(progn
-            (defun %hcd-i-rec (n)
-              (handler-case
-                  (if (zerop n) 0 (+ 1 (%hcd-i-rec (- n 1))))
-                (type-error () :wrong-clause)))
-            (handler-case (%hcd-i-rec 10000000)
-              (storage-condition () :caught-storage-condition)))))
+  (call-on-small-stack
+   (lambda ()
+     (let ((dotcl:*evaluator-mode* :interpret))
+       (eval '(progn
+               (defun %hcd-i-rec (n)
+                 (handler-case
+                     (if (zerop n) 0 (+ 1 (%hcd-i-rec (- n 1))))
+                   (type-error () :wrong-clause)))
+               (handler-case (%hcd-i-rec 10000000)
+                 (storage-condition () :caught-storage-condition)))))))
   :caught-storage-condition)

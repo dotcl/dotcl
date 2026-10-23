@@ -224,20 +224,27 @@ public static class MultipleValues
     // MULTIPLE-VALUE-BIND inside the body has already had its outer values
     // copied into ordinary locals by then.
     [ThreadStatic] private static LispObject[]? _bindSnap;
-    [ThreadStatic] private static int _bindCount;
+    private static ref int _bindCount => ref CallTls.BindCount;
 
     /// <summary>Take the values just returned by FORM into the bind snapshot and
     /// answer the primary value. Mirrors MultipleValuesList1's normalisation:
     /// an MvReturn carries them directly, otherwise the thread state is only this
     /// call's when its count is set and its first value is the primary.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispObject CaptureForBind(LispObject primary)
     {
-        if (_count == CountSnap)
-        {
-            // A capture-mode return already put the values here.
-            if (ReferenceEquals(_bindSnap![0], primary)) { _count = -1; return primary; }
-            MaterializeSnap();
-        }
+        // A capture-mode return already put the values here.
+#if NETSTANDARD2_0
+        if (_count == CountSnap && ReferenceEquals(_bindSnap![0], primary)) { _count = -1; return primary; }
+#else
+        if (_count == CountSnap && ReferenceEquals(SnapAt(0), primary)) { _count = -1; return primary; }
+#endif
+        return CaptureForBindSlow(primary);
+    }
+
+    private static LispObject CaptureForBindSlow(LispObject primary)
+    {
+        MaterializeSnap();
         LispObject[]? vals = null;
         MvReturn? mvSrc = null;
         bool fromPair = false;
@@ -278,7 +285,7 @@ public static class MultipleValues
         Reset(); // consume, so an outer binder does not see these
         var snap = _bindSnap;
         if (snap == null || snap.Length < count)
-            snap = _bindSnap = new LispObject[count < 8 ? 8 : count];
+            snap = NewSnap(count);
         if (mvSrc != null)
         {
             for (int i = 0; i < count; i++) snap[i] = mvSrc[i];
@@ -331,7 +338,7 @@ public static class MultipleValues
         for (var p = list; p is Cons c; p = c.Cdr) count++;
         var snap = _bindSnap;
         if (snap == null || snap.Length < count)
-            snap = _bindSnap = new LispObject[count < 8 ? 8 : count];
+            snap = NewSnap(count);
         int i = 0;
         for (var p = list; p is Cons c; p = c.Cdr) snap[i++] = c.Car;
         _bindCount = count;
@@ -349,10 +356,77 @@ public static class MultipleValues
         return snap[(int)i] ?? Nil.Instance;
     }
 
+    /// <summary>BINDNTH with a literal index.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static LispObject BindNthI(int i)
+    {
+        if ((uint)i >= (uint)_bindCount) return Nil.Instance;
+#if NETSTANDARD2_0
+        return _bindSnap![i] ?? Nil.Instance;
+#else
+        return SnapAt(i) ?? Nil.Instance;
+#endif
+    }
+
     public static void Reset()
     {
         _count = -1; // Sentinel: no explicit values call yet
         // Don't null _values: Get() checks _count first, saves a ThreadStatic write
+    }
+
+    /// <summary>RESET on the way out of a BLOCK (RETURN-FROM with a constant or a
+    /// variable). A separate entry so the loop pass that moves RESET in front of a
+    /// loop leaves this one on the exit path, where it runs once.</summary>
+    public static void ResetOnExit() => _count = -1;
+
+    /// <summary>VALUE as the only value of a runtime function that called Lisp code
+    /// (a :TEST, a :KEY, a handler, a method) and returns something of its own: the
+    /// channel still holds whatever that code returned, and a caller would take it
+    /// as this call's values when its first value is VALUE.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static LispObject Alone(LispObject value)
+    {
+        _count = -1;
+        return value;
+    }
+
+    // A runtime entry that publishes its values in the channel and returns the
+    // primary bare is safe only where the values are read at once. Compiled
+    // code calls it through these three, as it calls GETHASH and its twins.
+
+    /// <summary>The values a runtime entry just published for PRIMARY, as an
+    /// MvReturn: what compiled code expects from a call whose values it may pass on.</summary>
+    public static LispObject Boxed(LispObject primary)
+    {
+        if (primary is MvReturn) return primary;
+        if (_count == 2 && _values == null && ReferenceEquals(_pair0, primary))
+            return new MvReturn(primary, _pair1!);
+        int n = OwnCount(primary);
+        if (n == 1 || n < 0) { _count = -1; return primary; }
+        return new MvReturn(Get());
+    }
+
+    /// <summary>BOXED followed by RUNTIME.UNWRAPMV: the primary value, alone.</summary>
+    public static LispObject PrimaryAlone(LispObject primary)
+    {
+        _count = -1;
+        return primary is MvReturn mv ? mv.PrimaryValue : primary;
+    }
+
+    /// <summary>The values a runtime entry just published for PRIMARY, as the
+    /// pair state CAPTUREPAIR and PAIRNTH read.</summary>
+    public static LispObject Paired(LispObject primary)
+    {
+        if (primary is MvReturn mv)
+        {
+            primary = mv.PrimaryValue;
+            SetPair(primary, mv.Count > 1 ? mv[1] : Nil.Instance);
+            return primary;
+        }
+        if (_count == 2 && _values == null && ReferenceEquals(_pair0, primary)) return primary;
+        int n = OwnCount(primary);
+        SetPair(primary, n > 1 ? Get()[1] : Nil.Instance);
+        return primary;
     }
 
     /// <summary>
@@ -406,6 +480,14 @@ public static class MultipleValues
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal static void SetMode(int mode) => CallTls.Mode = mode;
 
+    // A generic function's entry leaves the caller's mode in place for the method
+    // body it calls, and drops it on every other way out. Linking its frame keeps
+    // the mode only when LispFunction.EnterSlow returns normally.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal static int PeekMode() => CallTls.Mode;
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal static void DropMode(int mode) { if (mode != 0) CallTls.Mode = 0; }
+
     /// <summary>Hand MODE on to the body called next, which must take it as its
     /// first instruction: the typed entry of a &amp;key or &amp;optional function
     /// passing its own caller's mode to the shared body it calls directly.</summary>
@@ -419,11 +501,48 @@ public static class MultipleValues
     // (MATERIALIZESNAP), so it is never misread as "no values".
     private const int CountSnap = -4;
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static LispObject[] SnapFor(int n)
     {
         var snap = _bindSnap;
-        if (snap == null || snap.Length < n) snap = _bindSnap = new LispObject[n < 8 ? 8 : n];
+        if (snap == null || snap.Length < n) snap = NewSnap(n);
         return snap;
+    }
+
+    // At least 8 long, so a capture of up to 4 values needs no length check.
+    // Pinned, so that compiled code reads it through the address in CallTls
+    // without looking the GC thread static up.
+    private static unsafe LispObject[] NewSnap(int n)
+    {
+#if NETSTANDARD2_0
+        return _bindSnap = new LispObject[n < 8 ? 8 : n];
+#else
+        var a = GC.AllocateArray<LispObject>(n < 8 ? 8 : n, pinned: true);
+        _bindSnap = a;
+        CallTls.Snap = (nint)System.Runtime.CompilerServices.Unsafe.AsPointer(
+            ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(a));
+        return a;
+#endif
+    }
+
+#if !NETSTANDARD2_0
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static unsafe ref LispObject SnapAt(int i) =>
+        ref System.Runtime.CompilerServices.Unsafe.Add(
+            ref System.Runtime.CompilerServices.Unsafe.AsRef<LispObject>((void*)CallTls.Snap), i);
+#endif
+
+    // The snapshot is only ever a LispObject[], so the covariance check of a
+    // plain element store can only pass.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void SnapSet(LispObject[] snap, int i, LispObject v)
+    {
+#if NETSTANDARD2_0
+        snap[i] = v;
+#else
+        System.Runtime.CompilerServices.Unsafe.Add(
+            ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(snap), i) = v;
+#endif
     }
 
     private static void MaterializeSnap()
@@ -447,16 +566,23 @@ public static class MultipleValues
         return a;
     }
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static LispObject Capture2(LispObject a, LispObject b)
     {
+#if NETSTANDARD2_0
         var snap = SnapFor(2);
         snap[0] = a; snap[1] = b;
+#else
+        if (CallTls.Snap == 0) NewSnap(2);
+        SnapAt(0) = a; SnapAt(1) = b;
+#endif
         _bindCount = 2;
         _count = CountSnap;
         return a;
     }
 
     /// <summary>(VALUES A B) where a value mode applies (see TAKEMODE).</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispObject Values2Mode(LispObject a, LispObject b, int mode)
     {
         if (mode == ModePrimary) return PrimaryOnly(a);
@@ -467,7 +593,7 @@ public static class MultipleValues
     private static LispObject Capture3(LispObject a, LispObject b, LispObject c)
     {
         var snap = SnapFor(3);
-        snap[0] = a; snap[1] = b; snap[2] = c;
+        SnapSet(snap, 0, a); SnapSet(snap, 1, b); SnapSet(snap, 2, c);
         _bindCount = 3;
         _count = CountSnap;
         return a;
@@ -476,7 +602,7 @@ public static class MultipleValues
     private static LispObject Capture4(LispObject a, LispObject b, LispObject c, LispObject d)
     {
         var snap = SnapFor(4);
-        snap[0] = a; snap[1] = b; snap[2] = c; snap[3] = d;
+        SnapSet(snap, 0, a); SnapSet(snap, 1, b); SnapSet(snap, 2, c); SnapSet(snap, 3, d);
         _bindCount = 4;
         _count = CountSnap;
         return a;

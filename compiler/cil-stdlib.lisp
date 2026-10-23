@@ -43,7 +43,7 @@
   (typep x type))
 (defun subtypep (type1 type2 &optional env)
   (declare (ignore env))
-  (subtypep type1 type2))
+  (multiple-value-bind (r known) (subtypep type1 type2) (values r known)))
 (defun aref (array &rest indices)
   ;; #'aref via funcall/apply. Direct (aref a i j ...) is handled rank-aware by the
   ;; compiler; here the rank-0..3 cases route back to that fast path, and rank >=4
@@ -72,8 +72,10 @@
 (defun delete-package (x) (delete-package x))
 (defun make-package (name &key nicknames use) (make-package name :nicknames nicknames :use use))
 (defun rename-package (pkg new-name &optional new-nicknames) (rename-package pkg new-name new-nicknames))
-(defun find-symbol (name &optional (pkg *package*)) (find-symbol name pkg))
-(defun intern (name &optional (pkg *package*)) (intern name pkg))
+(defun find-symbol (name &optional (pkg *package*))
+  (multiple-value-bind (s status) (find-symbol name pkg) (values s status)))
+(defun intern (name &optional (pkg *package*))
+  (multiple-value-bind (s status) (intern name pkg) (values s status)))
 (defun unintern (sym &optional (pkg *package*)) (unintern sym pkg))
 (defun export (symbols &optional (pkg *package*))
   (if (listp symbols)
@@ -273,7 +275,7 @@
 (defun string (x) (string x))
 (defun gethash (key ht &optional default) (gethash key ht default))
 (defun intern (name &optional (pkg *package*))
-  (intern name pkg))
+  (multiple-value-bind (s status) (intern name pkg) (values s status)))
 (defun gensym (&optional (prefix "G")) (gensym prefix))
 
 ;; Arithmetic wrappers (body uses 2-arg inline ops, not self-recursive)
@@ -1431,6 +1433,53 @@ Also expands element types within compound type specifiers like (VECTOR etype si
       (%atomic-delta-expand (cadr form) (if (cddr form) (caddr form) 1) '-)))
   (export (list cas ainc adec) pkg))
 
+;;; WITHOUT-INTERRUPTS and friends, with SBCL's semantics: INTERRUPT-THREAD
+;;; functions and Ctrl-C reaching a thread inside WITHOUT-INTERRUPTS wait
+;;; until it leaves. ALLOW-WITH-INTERRUPTS and WITH-LOCAL-INTERRUPTS are only
+;;; meaningful lexically inside WITHOUT-INTERRUPTS.
+(defun %without-interrupts-expand (body enabled allow awi wli recv)
+  (let ((outer (gensym "OUTER-ALLOW")) (fn (gensym "WITHOUT-INTERRUPTS-BODY")))
+    `(let ((,outer ,allow))
+       (flet ((,fn ()
+                (let ((,enabled nil) (,allow nil))
+                  (macrolet ((,awi (&body forms)
+                               (list* 'let '((,allow ,outer)) forms))
+                             (,wli (&body forms)
+                               (list 'let* '((,allow ,outer) (,enabled ,outer))
+                                     '(when ,outer (,recv))
+                                     (cons 'locally forms))))
+                    ,@body))))
+         (if ,enabled
+             (unwind-protect (,fn) (,recv))
+             (,fn))))))
+
+(defun %with-interrupts-expand (body enabled allow recv)
+  (let ((allowp (gensym "ALLOWP")) (enablep (gensym "ENABLEP")))
+    `(let* ((,allowp ,allow) (,enablep ,enabled) (,enabled (or ,enablep ,allowp)))
+       (when (and ,allowp (not ,enablep)) (,recv))
+       (locally ,@body))))
+
+(let* ((pkg (find-package "DOTCL"))
+       (wo (intern "WITHOUT-INTERRUPTS" pkg))
+       (wi (intern "WITH-INTERRUPTS" pkg))
+       (awi (intern "ALLOW-WITH-INTERRUPTS" pkg))
+       (wli (intern "WITH-LOCAL-INTERRUPTS" pkg))
+       (enabled (intern "*INTERRUPTS-ENABLED*" pkg))
+       (allow (intern "*ALLOW-WITH-INTERRUPTS*" pkg))
+       (recv (intern "%RECEIVE-PENDING-INTERRUPT" pkg)))
+  (%register-macro-function-rt wo
+    (lambda (form env) (declare (ignore env))
+      (%without-interrupts-expand (cdr form) enabled allow awi wli recv)))
+  (%register-macro-function-rt wi
+    (lambda (form env) (declare (ignore env))
+      (%with-interrupts-expand (cdr form) enabled allow recv)))
+  (dolist (name (list awi wli))
+    (let ((name name))
+      (%register-macro-function-rt name
+        (lambda (form env) (declare (ignore env))
+          (error "~S is valid only inside ~S." (car form) wo)))))
+  (export (list wo wi awi wli) pkg))
+
 ;;; --- Missing numeric functions ---
 
 (defun signum (n)
@@ -2174,10 +2223,11 @@ against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
                          (arity (length (%ensure-gf-required-params ll)))
                          ;; AMOP: the name and lambda list reach an instance of
                          ;; the requested class as initargs, as with DEFGENERIC.
-                         (gf (if gf-class
-                                 (make-instance gf-class :name name :lambda-list ll)
-                                 (%make-gf name arity))))
-                    (%register-gf name gf)
+                         (gf (%register-gf-if-absent
+                              name
+                              (if gf-class
+                                  (make-instance gf-class :name name :lambda-list ll)
+                                  (%make-gf name arity)))))
                     (setf (fdefinition name) gf)
                     (when (or lambda-list-p apo-p)
                       (%ensure-gf-apply-lambda-list gf ll apo-params))

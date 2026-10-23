@@ -536,6 +536,106 @@ want "destroy" "$out" "COMPUTING call=ThreadInterruptedException sleep=ok call2=
 want "destroy" "$out" "LISP-SLEEP call=ThreadInterruptedException sleep=ok call2=ok"
 echo "PASS (destroy): destroying a host thread stops only the Lisp it runs"
 
+# -- the runtime in a load context of its own -----------------------------------
+# A plugin host or a COM in-process server loads DotCL.Runtime into a context
+# that is not the default one. The core, fasls and emitted assemblies must bind
+# to that copy of the runtime, not to a second one in the default context. The
+# host does not reference the runtime; it loads it from lib/ by reflection.
+echo "=== runtime in a custom AssemblyLoadContext ==="
+ALC="$WORK2/alc"
+mkdir -p "$ALC/contrib/alc-probe"
+cat > "$ALC/Program.cs" <<'CSEOF8'
+using System.Reflection;
+using System.Runtime.Loader;
+
+var baseDir = AppContext.BaseDirectory;
+string L(string p) => p.Replace('\\', '/');
+var lib = Path.Combine(baseDir, "lib");
+var ctx = new PluginContext(lib, args.Length > 0 && args[0] == "collectible");
+var rt = ctx.LoadFromAssemblyPath(Path.Combine(lib, "DotCL.Runtime.dll"));
+var host = rt.GetType("DotCL.DotclHost", true)!;
+var paths = (List<string>)rt.GetType("DotCL.Runtime", true)!.GetField("ContribExtraSearchPaths")!.GetValue(null)!;
+paths.Add(Path.Combine(baseDir, "contrib"));
+paths.Add(Environment.GetEnvironmentVariable("ALC_REPO_CONTRIB")!);
+var eval = host.GetMethod("EvalString", new[] { typeof(string) })!;
+
+string Eval(string src)
+{
+    try { return eval.Invoke(null, new object[] { src })?.ToString() ?? "null"; }
+    catch (TargetInvocationException e) { return $"ERROR {e.InnerException!.GetType().Name}: {e.InnerException.Message}"; }
+}
+
+try
+{
+    host.GetMethod("Initialize", Type.EmptyTypes)!.Invoke(null, null);
+    host.GetMethod("LoadCore", new[] { typeof(string) })!.Invoke(null, new object[] { Path.Combine(baseDir, "dotcl.core") });
+    Console.WriteLine("ALC-CORE ok");
+}
+catch (TargetInvocationException e) { Console.WriteLine($"ALC-CORE {e.InnerException!.GetType().Name}: {e.InnerException.Message}"); }
+
+Console.WriteLine($"ALC-EVAL {Eval("(+ 1 2)")}");
+Console.WriteLine($"ALC-COMPILE {Eval($"(progn (compile-file \"{L(baseDir)}contrib/alc-probe/alc-probe.lisp\") (compile-file \"{L(baseDir)}user.lisp\") :compiled)")}");
+Console.WriteLine($"ALC-LOAD {Eval($"(progn (load \"{L(baseDir)}user.fasl\") (alc-user-fn 6))")}");
+Console.WriteLine($"ALC-REQUIRE {Eval("(progn (require \"alc-probe\") (funcall (intern \"HELLO\" \"ALC-PROBE\")))")}");
+Console.WriteLine($"ALC-RELOAD {Eval($"(progn (load \"{L(baseDir)}user.fasl\") (alc-user-fn 1))")}");
+Eval("(require \"dotnet-class\")");
+Console.WriteLine($"ALC-CLASS {Eval("(progn (dotnet:define-class \"AlcProbe.Greeter\" () (:methods (\"Greet\" ((n \"System.String\")) :returns \"System.String\" (format nil \"hi-~a\" n)))) (dotnet:invoke (dotnet:new \"AlcProbe.Greeter\") \"Greet\" \"alc\"))")}");
+
+int copies = AppDomain.CurrentDomain.GetAssemblies().Count(a => a.GetName().Name == "DotCL.Runtime");
+Console.WriteLine($"ALC-RUNTIME-COPIES {copies}");
+Console.WriteLine($"ALC-IN-DEFAULT {AssemblyLoadContext.Default.Assemblies.Count(a => a.GetName().Name == "DotCL.Runtime")}");
+
+class PluginContext : AssemblyLoadContext
+{
+    readonly string _dir;
+    public PluginContext(string dir, bool collectible) : base("plugin", collectible) => _dir = dir;
+    protected override Assembly Load(AssemblyName name)
+    {
+        var p = Path.Combine(_dir, name.Name + ".dll");
+        return File.Exists(p) ? LoadFromAssemblyPath(p) : null;
+    }
+}
+CSEOF8
+cat > "$ALC/contrib/alc-probe/alc-probe.lisp" <<'LEOF1'
+(defpackage :alc-probe (:use :cl) (:export #:hello))
+(in-package :alc-probe)
+(defun hello () :contrib-fasl)
+(provide "alc-probe")
+LEOF1
+cat > "$ALC/user.lisp" <<'LEOF2'
+(defun alc-user-fn (x) (* x 7))
+LEOF2
+cat > "$ALC/hostapi.csproj" <<CSPROJEOF
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>hostapi</AssemblyName>
+  </PropertyGroup>
+</Project>
+CSPROJEOF
+( cd "$ALC" && dotnet build hostapi.csproj -c Release -o bin ) > "$ALC/host.log" 2>&1 \
+  || { echo "FAIL (alc): building the host"; tail -20 "$ALC/host.log"; exit 1; }
+cp -R "$WORK/lib" "$ALC/bin/lib"
+cp -R "$ALC/contrib" "$ALC/bin/contrib"
+cp "$ALC/user.lisp" "$ALC/bin/user.lisp"
+cp "$ROOT/compiler/dotcl.core" "$ALC/bin/dotcl.core"
+for mode in plain collectible; do
+  out="$(ALC_REPO_CONTRIB="$(win "$ROOT/contrib")" dotnet "$ALC/bin/hostapi.dll" $mode 2>&1)"
+  want "alc $mode" "$out" "ALC-CORE ok"
+  want "alc $mode" "$out" "ALC-EVAL 3"
+  want "alc $mode" "$out" "ALC-COMPILE :COMPILED"
+  want "alc $mode" "$out" "ALC-LOAD 42"
+  want "alc $mode" "$out" "ALC-REQUIRE :CONTRIB-FASL"
+  want "alc $mode" "$out" "ALC-RELOAD 7"
+  want "alc $mode" "$out" 'ALC-CLASS "hi-alc"'
+  want "alc $mode" "$out" "ALC-RUNTIME-COPIES 1"
+  want "alc $mode" "$out" "ALC-IN-DEFAULT 0"
+done
+echo "PASS (alc): core, compiled and contrib fasls and define-class bind to the runtime's own load context, plain and collectible"
+
 echo "=== host with dynamic code disabled (NativeAOT / file-based app) ==="
 cat > "$WORK/runtimeconfig.template.json" <<'RCEOF'
 {

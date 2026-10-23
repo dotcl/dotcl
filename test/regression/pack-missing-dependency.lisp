@@ -56,12 +56,13 @@
   "Build SYSTEM's fasl the way `dotcl pack` does; return the error message, or
 :NO-ERROR when the build went through."
   (pmd-setup)
-  (handler-case
-      (progn
-        (dotnet:static "DotCL.DotclBuild" "PackFasl"
-                       system (pmd-path (concatenate 'string system ".fasl")) nil nil nil)
-        :no-error)
-    (error (c) (princ-to-string c))))
+  (with-asdf-immutable-systems-restored
+    (handler-case
+        (progn
+          (dotnet:static "DotCL.DotclBuild" "PackFasl"
+                         system (pmd-path (concatenate 'string system ".fasl")) nil nil nil)
+          :no-error)
+      (error (c) (princ-to-string c)))))
 
 ;;; The missing system is named, as not found, together with who needs it.
 (deftest-emitting-only pack-missing-dependency.names-the-missing-system

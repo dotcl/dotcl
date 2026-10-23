@@ -38,7 +38,11 @@
                             (*in-mv-context* t)
                             (*inlining-stack* (inline-guard-stack name)))
                         (compile-progn body))))
-    (if (car needs-catch)
+    (if (or (car needs-catch)
+            ;; The tag can be read without a RETURN-FROM having been compiled:
+            ;; a closure captures it from a local function's body that was
+            ;; never compiled (an unused one deferred for inlining).
+            (sil-references-symbol-p body-instrs tag-key))
         ;; Non-local return detected: need try/catch
         `((:declare-local ,tag-key "LispObject")
           (:ldsfld "Nil.Instance") (:ldsfld "Nil.Instance") (:call "Runtime.MakeCons")
@@ -73,6 +77,14 @@
           (:label ,end-label)
           (:ldloc ,result-key)))))
 
+(defun %reset-before-neutral (instrs)
+  "INSTRS, the value of a form whose values are read, preceded by
+   MultipleValues.Reset when they leave the channel untouched: a call made
+   before them may have left values whose first one is this value."
+  (if (%mv-neutral-instrs-p instrs)
+      (cons '(:call "MultipleValues.ResetOnExit") instrs)
+      instrs))
+
 (defun compile-return-from (name value-expr)
   "Compile (return-from name value).
    Local return (same compilation unit, not in finally block) uses leave.
@@ -88,7 +100,8 @@
         ;; preserve MvReturn wrapping so the block's caller sees MV.
         (if (and local-result-key (not *in-finally-block*))
             ;; Local return: store result and leave to block end
-            `(,@(if value-expr
+            `(,@(%reset-before-neutral
+                 (if value-expr
                     (let ((*in-mv-context* t)
                           ;; The block's value is the body's return value (see
                           ;; compile-block): the returned form is in its tail,
@@ -103,7 +116,7 @@
                           (*mv-mode-local* (and (seventh (cdr entry)) (not *mv-exit-cleanup*)
                                                 *mv-mode-local*)))
                       (compile-expr value-expr))
-                    (emit-nil))
+                    (emit-nil)))
               (:stloc ,local-result-key)
               (:leave ,local-end-label))
             ;; Non-local return: throw BlockReturnException
@@ -127,6 +140,19 @@
 ;;; catch / throw
 ;;; ============================================================
 
+(defun %throw-return-call (instrs)
+  "The ThrowReturn.CallN that replaces INSTRS' last instruction when that is
+   the call whose value is the CATCH body's value, or NIL."
+  (let ((last (car (last instrs))))
+    (and (consp last) (eq (car last) :callvirt)
+         (cdr (assoc (second last)
+                     '(("LispFunction.Invoke0" . "ThrowReturn.Call0")
+                       ("LispFunction.Invoke1" . "ThrowReturn.Call1")
+                       ("LispFunction.Invoke2" . "ThrowReturn.Call2")
+                       ("LispFunction.Invoke3" . "ThrowReturn.Call3")
+                       ("LispFunction.Invoke4" . "ThrowReturn.Call4"))
+                     :test #'equal)))))
+
 (defun compile-catch (tag-expr body)
   "Compile (catch tag body...).
    Uses try/filter/finally for CatchThrowException with EQ tag matching.
@@ -141,20 +167,31 @@
    deep interpreted recursion needed stack proportional to the depth it crossed
    and blew the .NET stack fatally. A filter answers \"not mine\" without touching
    the frame."
-  (let ((tag-key (gen-local "CTAG"))
-        (result-key (gen-local "CRES"))
-        (end-label (gen-label "CEND"))
-        (ex-key (gen-local "CEX")))
+  (let* ((tag-key (gen-local "CTAG"))
+         (result-key (gen-local "CRES"))
+         (end-label (gen-label "CEND"))
+         (ex-key (gen-local "CEX"))
+         ;; Body in MV-propagating position: catch returns body's values (CL spec).
+         (body-instrs (let ((*in-tail-position* nil) (*in-mv-context* t)
+                            (*throw-return-forward* nil))
+                        (compile-progn body)))
+         (call (%throw-return-call body-instrs))
+         (idx-key (and call (gen-local "CIDX"))))
     `((:declare-local ,tag-key "LispObject")
       ,@(compile-expr tag-expr)
       (:stloc ,tag-key)
       ;; Register tag so (throw ...) inside (eval ...) can propagate to this catch
       (:ldloc ,tag-key)
-      (:call "CatchTagStack.Push")
+      ,@(if call
+            `((:declare-local ,idx-key "Int32")
+              (:call "CatchTagStack.PushIndex")
+              (:stloc ,idx-key))
+            '((:call "CatchTagStack.Push")))
       (:declare-local ,result-key "LispObject")
       (:begin-exception-block)
-      ;; Body in MV-propagating position: catch returns body's values (CL spec).
-      ,@(let ((*in-tail-position* nil) (*in-mv-context* t)) (compile-progn body))
+      ,@(if call
+            `(,@(butlast body-instrs) (:ldloc ,idx-key) (:call ,call))
+            body-instrs)
       (:stloc ,result-key)
       (:leave ,end-label)
       ;; Filter: exception on the stack, answer 1 (mine) / 0 (keep unwinding).
@@ -198,6 +235,17 @@
       ,@(let ((*in-tail-position* nil) (*in-mv-context* t))
           (compile-expr result-expr))
       (:stloc ,res-key)
+      ,@(let ((tr (and (not *in-finally-block*) (cstate-throw-return))))
+          (when tr
+            (destructuring-bind (claim-key exit-label value-key used) tr
+              (setf (car used) t)
+              (let ((throw-label (gen-label "TTHROW")))
+                `((:ldloc ,tag-key) (:ldloc ,claim-key)
+                  (:call "ThrowReturn.CanReturn")
+                  (:brfalse ,throw-label)
+                  (:ldloc ,res-key) (:stloc ,value-key)
+                  (:leave ,exit-label)
+                  (:label ,throw-label))))))
       (:ldloc ,tag-key) (:ldloc ,res-key)
       (:call "Runtime.MakeCatchThrow")
       (:throw))))
@@ -1368,6 +1416,24 @@ leave a protected region, and balance means the GO is not inside one."
 ;;; and / or / cond
 ;;; ============================================================
 
+;; What MULTIPLEVALUES.PRIMARY did for the value of FORM, on the stack: make
+;; it the form's only value. A count of -1 already reads as "the primary
+;; value alone", so the published copy PRIMARY made is not needed.
+(defun %only-primary-value (form)
+  `(,@(unless (single-value-form-p form) '((:call "Runtime.UnwrapMv")))
+    (:call "MultipleValues.Reset")))
+
+;; A test COMPILE-BOOLEAN-BRANCH lowers without building its value, and whose
+;; value is T when true: a fused comparison or predicate, or NOT / NULL.
+(defun %t-or-nil-test-form-p (form)
+  (and (consp form)
+       (symbolp (car form))
+       (or (and (compile-if-fused-comparison-p form)
+                (not (eq (car form) '%key-absent-p)))
+           (and (member (car form) '(not null))
+                (consp (cdr form)) (null (cddr form))
+                (not (local-function-entry (car form)))))))
+
 (defun compile-and (args)
   "Compile (and a b c) with short-circuit evaluation."
   (cond
@@ -1378,27 +1444,15 @@ leave a protected region, and balance means the GO is not inside one."
              (result-key (gen-local "AND")))
          `((:declare-local ,result-key "LispObject")
            ,@(loop for (arg . rest) on args
-                   if (and rest (compile-if-fused-comparison-p arg))
-                     ;; A comparison is only tested: when it fails the AND is
-                     ;; NIL, so branch on it directly instead of building its
-                     ;; T/NIL object to ask IsTruthy. On fixnum operands this
-                     ;; is what keeps a raw slot read from being boxed.
+                   if rest
+                     ;; Only tested: when it fails the AND is NIL whatever it
+                     ;; returned, so branch on it instead of keeping its value.
+                     ;; On fixnum operands this is what keeps a raw slot read
+                     ;; from being boxed.
                      append (progn
                               (unless false-label (setq false-label (gen-label "ANDFALSE")))
                               (let ((*in-tail-position* nil) (*in-mv-context* nil))
                                 (compile-boolean-branch arg false-label nil)))
-                   else if rest
-                     ;; Intermediate arg: NOT in tail position: its value is
-                     ;; consumed by the IsTruthy test, not returned. Binding
-                     ;; *in-tail-position* nil prevents a self-call here from
-                     ;; being TCO-rewritten into a value-discarding loop-back
-                     ;; (symmetric with compile-or).
-                     append `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr arg))
-                              (:call "MultipleValues.Primary")
-                              (:stloc ,result-key)
-                              (:ldloc ,result-key)
-                              (:call "Runtime.IsTruthy")
-                              (:brfalse ,end-label))
                    else
                      ;; Last arg: pass through all values
                      append `(,@(compile-expr arg)
@@ -1407,7 +1461,7 @@ leave a protected region, and balance means the GO is not inside one."
                `((:br ,end-label)
                  (:label ,false-label)
                  ,@(emit-nil)
-                 (:call "MultipleValues.Primary")
+                 (:call "MultipleValues.Reset")
                  (:stloc ,result-key)))
            (:label ,end-label)
            (:ldloc ,result-key))))))
@@ -1418,10 +1472,17 @@ leave a protected region, and balance means the GO is not inside one."
     ((null args) (emit-nil))
     ((null (cdr args)) (compile-expr (car args)))
     (t (let ((end-label (gen-label "OREND"))
+             (true-label nil)
              (result-key (gen-local "OR")))
          `((:declare-local ,result-key "LispObject")
            ,@(loop for (arg . rest) on args
-                   if rest
+                   if (and rest (%t-or-nil-test-form-p arg))
+                     ;; A predicate whose true value is T: branch on it.
+                     append (progn
+                              (unless true-label (setq true-label (gen-label "ORTRUE")))
+                              (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                                (compile-boolean-branch arg true-label t)))
+                   else if rest
                      ;; Intermediate arg: NOT in tail position: its value is
                      ;; consumed by the IsTruthy test, not returned. Binding
                      ;; *in-tail-position* nil prevents a self-call here from
@@ -1431,7 +1492,7 @@ leave a protected region, and balance means the GO is not inside one."
                      ;; below keeps tail position so genuine tail self-calls
                      ;; still TCO.
                      append `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr arg))
-                              (:call "MultipleValues.Primary")
+                              ,@(%only-primary-value arg)
                               (:stloc ,result-key)
                               (:ldloc ,result-key)
                               (:call "Runtime.IsTruthy")
@@ -1440,6 +1501,12 @@ leave a protected region, and balance means the GO is not inside one."
                      ;; Last arg: pass through all values (tail position kept)
                      append `(,@(compile-expr arg)
                               (:stloc ,result-key)))
+           ,@(when true-label
+               `((:br ,end-label)
+                 (:label ,true-label)
+                 ,@(emit-t)
+                 (:call "MultipleValues.Reset")
+                 (:stloc ,result-key)))
            (:label ,end-label)
            (:ldloc ,result-key))))))
 
@@ -1457,48 +1524,10 @@ leave a protected region, and balance means the GO is not inside one."
             ;; Normal clause
             (let ((else-label (gen-label "CELSE"))
                   (end-label (gen-label "CEND")))
-              (let ((fused (compile-if-fused-comparison-p test)))
-                (if body
-                    ;; With body: evaluate test, if true evaluate body
-                    (cond
-                      (fused
-                        ;; Fused comparison: skip IsTruthy
-                        `(,@(let ((*in-tail-position* nil))
-                              (ecase (first fused)
-                                (:binary (compile-binary-call (third fused) (second fused)))
-                                (:unary (compile-unary-call (third fused) (second fused)))
-                                (:fixnum-cmp (compile-fixnum-cmp (third fused) (second fused)))
-                                (:char-cmp (compile-char-cmp (third fused) (second fused)))
-                                (:sym-eq (compile-sym-eq (third fused)))
-               (:double-cmp (compile-double-cmp (third fused) (second fused)))))
-                          (:brfalse ,else-label)
-                          ,@(compile-progn body)
-                          (:br ,end-label)
-                          (:label ,else-label)
-                          ,@(compile-cond (cdr clauses) shared-tmp)
-                          (:label ,end-label)))
-                      ;; (cond ((and ...) body) ...): chain boolean branches
-                      ((and (consp test) (member (car test) '(and or)) (cddr test))
-                       `(,@(compile-boolean-branch test else-label nil)
-                         ,@(compile-progn body)
-                         (:br ,end-label)
-                         (:label ,else-label)
-                         ,@(compile-cond (cdr clauses) shared-tmp)
-                         (:label ,end-label)))
-                      (t
-                        ;; Default: normalize MV state, then IsTruthy.
-                        ;; The test is never in tail position (only the body is);
-                        ;; binding *in-tail-position* nil prevents a self-recursive
-                        ;; call in the test from being TCO'd into a jump.
-                        `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr test))
-                          (:call "MultipleValues.Primary")
-                          (:call "Runtime.IsTruthy")
-                          (:brfalse ,else-label)
-                          ,@(compile-progn body)
-                          (:br ,end-label)
-                          (:label ,else-label)
-                          ,@(compile-cond (cdr clauses) shared-tmp)
-                          (:label ,end-label))))
+              (if body
+                    ;; The same test lowering as IF: native comparisons, NOT,
+                    ;; AND / OR chains, inlined predicates.
+                    (compile-if (list test (cons 'progn body) (cons 'cond (cdr clauses))))
                     ;; No body: all no-body arms share one CTMP slot
                     (let ((tmp (or shared-tmp (gen-local "CTMP"))))
                       ;; Test-only arm: the test value becomes the result, but the
@@ -1506,7 +1535,7 @@ leave a protected region, and balance means the GO is not inside one."
                       ;; here must compute a value, not TCO-jump.
                       `(,@(unless shared-tmp `((:declare-local ,tmp "LispObject")))
                         ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr test))
-                        (:call "MultipleValues.Primary")
+                        ,@(%only-primary-value test)
                         (:stloc ,tmp)
                         (:ldloc ,tmp)
                         (:call "Runtime.IsTruthy")
@@ -1515,4 +1544,4 @@ leave a protected region, and balance means the GO is not inside one."
                         (:br ,end-label)
                         (:label ,else-label)
                         ,@(compile-cond (cdr clauses) tmp)
-                        (:label ,end-label))))))))))
+                        (:label ,end-label)))))))))

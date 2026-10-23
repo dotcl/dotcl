@@ -40,8 +40,9 @@
 (declaim (ftype (function (fixnum) fixnum) %te-fib))
 (defun %te-fib (n) (if (< n 2) n (+ (%te-fib (- n 1)) (%te-fib (- n 2)))))
 
-;; Not eligible: an argument type with no raw representation, a lambda list the
-;; FTYPE does not describe, a parameter a closure captures.
+;; An argument type with no raw representation is passed as it is ("O"). Not
+;; eligible: a lambda list the FTYPE does not describe, a parameter a closure
+;; captures.
 (declaim (ftype (function (t fixnum) fixnum) %te-t-arg))
 (defun %te-t-arg (a b) (declare (ignore a)) b)
 (declaim (ftype (function (fixnum &optional fixnum) fixnum) %te-opt))
@@ -51,7 +52,7 @@
 
 (deftest-emitting-only typed-entry.signatures
   (mapcar #'%te-sig '(%te-add %te-addd %te-mix %te-inc8 %te-fib %te-t-arg %te-opt %te-captured))
-  ("LL>L" "DD>D" "LD>D" "L>L" "L>L" nil nil nil))
+  ("LL>L" "DD>D" "LD>D" "L>L" "L>L" "OL>L" nil nil))
 
 (deftest typed-entry.values
   (list (%te-add 1000000000000 7) (%te-addd 1d0 2d0) (%te-mix 3 1d0) (%te-inc8 3)

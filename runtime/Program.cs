@@ -1868,13 +1868,13 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             if (r2r != null)
             {
                 Runtime.R2rFaslsLoaded++;
-                RunUserFaslAssembly(System.Reflection.Assembly.LoadFrom(r2r), r2r);
+                RunUserFaslAssembly(RuntimeLoadContext.LoadFrom(r2r), r2r);
             }
             else
             {
                 // By path, like LOAD: no second (in-memory) antivirus scan on
                 // Windows, and a file-backed module.
-                RunUserFaslAssembly(System.Reflection.Assembly.LoadFrom(loosePath), loosePath);
+                RunUserFaslAssembly(RuntimeLoadContext.LoadFrom(loosePath), loosePath);
             }
             return true;
         }
@@ -1884,7 +1884,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// <summary>Load a user FASL from PE assembly bytes and run it. The embedded
     /// case has no file to load from, so it cannot use a ReadyToRun sibling.</summary>
     static void RunUserFaslBytes(byte[] bytes, string what)
-        => RunUserFaslAssembly(System.Reflection.Assembly.Load(bytes), what);
+        => RunUserFaslAssembly(RuntimeLoadContext.LoadBytes(bytes), what);
 
     /// <summary>Invoke a user FASL's CompiledModule.ModuleInit, preserving
     /// *package* across the run. <paramref name="what"/> names the source for
@@ -1906,10 +1906,14 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// <summary>Load a pre-compiled FASL core (PE assembly) and invoke its ModuleInit.</summary>
     static void RunCoreFasl(string filePath)
     {
-        var asm = System.Reflection.Assembly.LoadFrom(filePath);
+        var asm = RuntimeLoadContext.LoadFrom(filePath);
         // The core's generation stamp is read off this assembly, not off the file:
         // see Startup.CoreGeneration.
         Startup.CoreAssembly = asm;
+        if (Startup.CoreRuntimeMismatch() is string other)
+            Console.Error.WriteLine(
+                $";; warning: {filePath} was built against other runtime source " +
+                $"({other}, this runtime {Startup.RuntimeSource()}); rebuild it from cil-out.sil.");
         var t = asm.GetType("CompiledModule")
             ?? throw new InvalidOperationException($"FASL core {filePath}: CompiledModule type not found");
         var mi = t.GetMethod("ModuleInit",

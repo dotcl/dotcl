@@ -1,0 +1,6 @@
+(defpackage :pulock-x (:use :cl) (:export #:version #:greet #:farewell))
+(in-package :pulock-x)
+(defun version () "2")
+(defun greet (who &key (polite t)) (list (if polite :good-day :hi) who))
+(defun farewell (who) (list :bye who))
+(pulock-common:note "x 2")

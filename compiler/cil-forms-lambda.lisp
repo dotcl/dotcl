@@ -21,6 +21,7 @@
     ((symbolp expr) t)
     ;; (quote ...) or (the type expr)
     ((and (consp expr) (eq (car expr) 'quote)) t)
+    ((and (consp expr) (eq (car expr) 'load-time-value)) t)
     ((and (consp expr) (eq (car expr) 'the))
      (single-value-form-p (caddr expr)))
     ;; Non-local exits (return-from, throw, go) transfer control and
@@ -72,6 +73,39 @@
      t)
     (t nil)))
 
+(defun %induction-overflow-step (var key val-expr up)
+  "The store of (%INDUCTION-NEXT VAR DELTA EXIT) into VAR's Int64 slot KEY when
+   the sum may leave int64 in the direction the loop ends: the wrapped sum is
+   behind VAR exactly when it did, and then EXIT runs instead of the store."
+  (when (and (consp val-expr) (symbolp (car val-expr))
+             (string= (symbol-name (car val-expr)) "%INDUCTION-NEXT")
+             (eq (cadr val-expr) var)
+             (consp (cdddr val-expr)))
+    (let* ((delta (caddr val-expr))
+           (exit (cadddr val-expr))
+           (v (if (consp delta) (cadr delta) delta))
+           (sum (gen-local "STEP"))
+           (ok (gensym "STEPOK")))
+      (when (or (integerp v) (fixnum-typed-p v))
+        `((:declare-local ,sum "Int64")
+          (:ldloc ,key)
+          ,@(compile-expr-to-long v)
+          (,(if (consp delta) :sub :add))
+          (:stloc ,sum)
+          (:ldloc ,sum)
+          (:ldloc ,key)
+          (,(if up :clt :cgt))
+          (:brfalse ,ok)
+          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+              (compile-expr exit))
+          (:pop)
+          (:label ,ok)
+          (:ldloc ,sum)
+          (:dup)
+          (:stloc ,key)
+          ,@(%frame-set-instrs key var :long)
+          (:call "Fixnum.Make"))))))
+
 (defun compile-setq (var val-expr)
   "Compile (setq var value). Returns the assigned value on stack (single value)."
   ;; If var is a symbol-macro, delegate to SETF of the expansion (branch on found-p,
@@ -79,12 +113,23 @@
   (multiple-value-bind (sm-exp found) (lookup-symbol-macro var)
     (when found
       (return-from compile-setq (compile-expr `(setf ,sm-exp ,val-expr)))))
+  ;; An inline call that returns its value with VALUES, stored in a raw integer
+  ;; slot: the store moves into each VALUES tail, so the value is not boxed
+  ;; into the multiple-value record first.
+  (when (and (boundp '*cstate*)
+             (or (native-slot-p var (cstate-long-locals)) (u64-native-local-p var)))
+    (let ((sunk (%mv-setq-sink-inline (list var) val-expr)))
+      (when sunk
+        (return-from compile-setq (compile-expr sunk)))))
   ;; Int64-slot local (long-rep let binding or native body param): store the
   ;; raw long, then box once for the expression value. In statement position
   ;; the peephole pass deletes the box+pop, leaving a pure native store.
   ;; Checked before the generic path because the slot type differs.
   (let ((key (and (boundp '*cstate*)
                   (native-slot-p var (cstate-long-locals)))))
+    (let ((exit (and key (assoc key *induction-overflow-exits* :test #'equal))))
+      (let ((step (and exit (%induction-overflow-step var key val-expr (cdr exit)))))
+        (when step (return-from compile-setq step))))
     (when key
       (return-from compile-setq
         `(,@(compile-expr-to-long val-expr)
@@ -325,12 +370,25 @@
   "The FREE-VARS that hold a local function whose inline plan holds here."
   (loop for e in (cstate-local-functions)
         for name = (first e)
-        for fv = (or (find (concatenate 'string "__LABELFN_" name) free-vars
-                           :key #'var-name :test #'string=)
-                     (find name free-vars :key #'var-name :test #'string=))
+        for fv = (find (concatenate 'string "__LABELFN_" name) free-vars
+                       :key #'var-name :test #'string=)
         when (and fv (nth 5 e) (not (fourth e))
                   (%local-inline-env-matches-p (nth 5 (nth 5 e))))
           collect fv))
+
+(defun %with-inline-only-fn-locals (cstate)
+  "CSTATE with a local for each local function left out of this closure's
+   environment (*CLOSURE-INLINE-ONLY*), so that a closure nested in the body
+   still finds the function free: it captures the absent slot, and the
+   enclosing COMPILE-CLOSURE sees that and captures the function after all."
+  (let ((keys (and *closure-inline-only-keys* (car *closure-inline-only-keys*)))
+        (added '()))
+    (dolist (e (cstate-local-functions))
+      (when (member (second e) keys :test #'eq)
+        (push (cons (%labelfn-local-sym (first e)) (second e)) added)))
+    (if added
+        (cstate-with cstate +cs-locals+ (append (nreverse added) (cstate-locals)))
+        cstate)))
 
 (defun %tree-mentions-p (tree items)
   (let ((seen (make-hash-table :test 'eq)))
@@ -606,6 +664,7 @@
         +cs-tco-self-symbol+ self-tco-name
         +cs-tco-local-fn-key+ self-tco-key
         +cs-tco-loop-label+ tco-loop-label
+        +cs-tco-checked+ nil
         +cs-tco-param-entries+ (loop for p in required
                                      collect (cons (cdr (assoc p param-locals))
                                                    (boxed-var-p p))))
@@ -648,7 +707,11 @@
                              (cstate-small-int-locals))
                      +cs-numeric-array-locals+
                      (append (extract-numeric-array-locals body)
-                             (cstate-numeric-array-locals)))))
+                             (cstate-numeric-array-locals))
+                     +cs-float-range-locals+
+                     (append (rekey-by-param (extract-float-range-locals body)
+                                             params param-locals)
+                             (cstate-float-range-locals)))))
     (funcall thunk))))
 
 (defun closure-mv-mode-key (direct-p special-param-syms)
@@ -810,10 +873,8 @@
                       for captured = (or (find mangled free-vars :key #'var-name :test #'string=)
                                          (find fn-name free-vars :key #'var-name :test #'string=))
                       for inline-only = (and (not captured)
-                                             (find-if (lambda (fv)
-                                                        (member (var-name fv) (list mangled fn-name)
-                                                                :test #'string=))
-                                                      *closure-inline-only*))
+                                             (find mangled *closure-inline-only*
+                                                   :key #'var-name :test #'string=))
                       when inline-only
                         collect (let ((key (gen-local "NOFN")))
                                   (push key (car *closure-inline-only-keys*))
@@ -868,7 +929,8 @@
                                      param-locals)
                           env-locals))
                 (compile-env-boxed-fvs outer-env)))
-             (inline-plans (%carry-inline-plans outer-env env-locals)))
+             (inline-plans (%carry-inline-plans outer-env env-locals))
+             (*cstate* (%with-inline-only-fn-locals *cstate*)))
         (declare (ignore inline-plans))
         (let* ((arity-instrs
                  (if direct-p
@@ -933,12 +995,18 @@
                  ;; closure. Both helpers sit outside this body on purpose: it is
                  ;; one enormous form, and a binding added here costs far more
                  ;; emitted code than the same work called out of line.
+                 (float-plan (%float-param-plan
+                              required body
+                              (append needs-boxing captured-inner
+                                      (mapcar #'var-name special-param-syms))))
+                 (*cstate* (%float-param-cstate float-plan))
                  (self-tco-key (closure-self-tco-key self-tco-name special-param-syms
                                                      optional key rest-param))
                  (tco-loop-label (when self-tco-key (gen-label "TCOLOOP")))
                  (*cstate* (closure-self-tco-cstate self-tco-name self-tco-key
                                                     tco-loop-label required
-                                                    param-locals))
+                                                    (%float-param-keys float-plan
+                                                                       param-locals)))
                  (mv-key (closure-mv-mode-key direct-p special-param-syms))
                  (body-instrs (let ((*mv-mode-local* mv-key))
                                 (call-with-param-type-locals
@@ -951,6 +1019,7 @@
                    ,@key-check-instrs
                    ,@(%frame-enter-instrs fn-name)
                    ,@env-instrs ,@param-instrs
+                   ,@(%float-param-entry-instrs float-plan param-locals)
                    ,@(compile-let-with-specials '() special-push-instrs body-instrs special-param-syms)
                    (:ret))
                  `(,@(%mv-mode-prologue mv-key body-instrs nil)
@@ -958,6 +1027,7 @@
                    ,@key-check-instrs
                    ,@(%frame-enter-instrs fn-name)
                    ,@env-instrs ,@param-instrs
+                   ,@(%float-param-entry-instrs float-plan param-locals)
                    ;; After the env and the parameters are bound: a tail
                    ;; self-call rewrites the parameter locals and branches here,
                    ;; so the captured env must not be re-read.
@@ -1017,6 +1087,11 @@
                (gethash (cadr (cadr fn-expr)) *clos-accessor-writers*))
       (return-from compile-funcall
         (compile-named-call (cadr fn-expr) (cdr args))))
+    ;; (funcall #'f args...) for a local function F is the call (f args...),
+    ;; which can then be substituted when F is inline.
+    (let ((call (%local-funcall-as-call (cons 'funcall args))))
+      (when call
+        (return-from compile-funcall (compile-expr call))))
     (if (and (consp fn-expr)
              (or (eq (car fn-expr) 'quote) (eq (car fn-expr) 'function))
              (symbolp (cadr fn-expr))
@@ -1026,8 +1101,13 @@
         (compile-named-call (cadr fn-expr) (cdr args))
         ;; General case: evaluate fn, coerce symbol to function if needed
         (let ((call-args (cdr args))
-              (n-call-args (length (cdr args))))
-          (if (<= n-call-args 8)
+              (n-call-args (length (cdr args)))
+              (aref-plan (%funcall-aref-plan args)))
+          (cond
+            (aref-plan (compile-funcall-aref fn-expr aref-plan (%call-site-mv-mode args)))
+            ((%funcall-long-arg-p args)
+             (compile-funcall-long-arg fn-expr (cadr args) (%call-site-mv-mode args)))
+            ((<= n-call-args 8)
               (let* ((fn-tmp (gen-local "FNTMP"))
                      (da (compile-direct-call-args call-args))
                      (temps (car da))
@@ -1040,12 +1120,115 @@
                   ,@eval-instrs
                   (:ldloc ,fn-tmp)
                   ,@(loop for tmp in temps append `((:ldloc ,tmp)))
-                  ,@(%invoke-instrs n-call-args (%call-site-mv-mode args))))
+                  ,@(%invoke-instrs n-call-args (%call-site-mv-mode args)))))
+            (t
               `(,@(let ((*in-mv-context* nil) (*in-tail-position* nil))
                     (compile-expr fn-expr))
                 (:call "Runtime.CoerceToFunction")
                 ,@(compile-args-array call-args)
-                (:callvirt "LispFunction.Invoke")))))))
+                (:callvirt "LispFunction.Invoke"))))))))
+
+(defun %funcall-aref-plan (args)
+  "For ARGS = (FN (AREF A S...)) of a FUNCALL whose value is a single value
+   used here, A of rank 1 or 2 with its element storage not known here (or
+   integer storage read without a hoisted buffer) and every subscript lowered
+   to an int64: (A . SUBSCRIPTS). The runtime can then
+   hand the element to a typed entry of FN without boxing it."
+  (let ((arg (cadr args)))
+    (and (consp (cdr args)) (null (cddr args))
+         (consp arg) (eq (car arg) 'aref)
+         (not (eq *in-tail-position* t))
+         (not *in-mv-context*)
+         (not (local-function-entry 'aref))
+         (not (macrolet-shadowed-p 'aref))
+         (consp (cdr arg))
+         (<= 1 (length (cddr arg)) 2)
+         (every #'fixnum-long-lowerable-p (cddr arg))
+         (or (not (numeric-array-aref-entry arg))
+             (and (numeric-array-aref-info arg)
+                  (not (array-backing-entry-for-read arg))))
+         (let ((mode (%call-site-mv-mode args)))
+           (or (null mode) (equal mode `((:ldc-i4 ,+mv-mode-primary+)))))
+         (cons (cadr arg) (cddr arg)))))
+
+(defun compile-funcall-aref (fn-expr plan mode-instrs &optional long-p)
+  "(FUNCALL FN-EXPR (AREF . PLAN)) through Runtime.FuncallAref<rank>L[L][M]: the
+   function, the array and the subscripts are evaluated in source order, the
+   function coerced before the array is read, as for any FUNCALL. LONG-P: the
+   value is left as an int64, unboxed as UNBOX-FIXNUM does."
+  (let* ((arr (car plan))
+         (idxs (cdr plan))
+         (fn-tmp (gen-local "FAF"))
+         (arr-tmp (gen-local "FAA"))
+         (idx-tmps (mapcar (lambda (i) (declare (ignore i)) (gen-local "FAI")) idxs)))
+    `((:declare-local ,fn-tmp "LispFunction")
+      (:declare-local ,arr-tmp "LispObject")
+      ,@(mapcar (lambda (tk) `(:declare-local ,tk "Int64")) idx-tmps)
+      ,@(let ((*in-mv-context* nil) (*in-tail-position* nil))
+          (compile-expr fn-expr))
+      (:call "Runtime.CoerceToFunction")
+      (:stloc ,fn-tmp)
+      ,@(let ((*in-mv-context* nil) (*in-tail-position* nil))
+          (compile-expr arr))
+      (:stloc ,arr-tmp)
+      ,@(loop for idx in idxs
+              for tk in idx-tmps
+              append `(,@(compile-expr-to-long idx) (:stloc ,tk)))
+      (:ldloc ,fn-tmp)
+      (:ldloc ,arr-tmp)
+      ,@(mapcar (lambda (tk) `(:ldloc ,tk)) idx-tmps)
+      ,@mode-instrs
+      (:call ,(format nil "Runtime.FuncallAref~DL~:[~;L~]~:[~;M~]"
+                      (length idxs) long-p mode-instrs)))))
+
+(defun %funcall-long-arg-p (args)
+  "For ARGS = (FN X) of a FUNCALL whose value is a single value used here, X
+   an element of an array whose integer storage is known here: X is read as an
+   int64 and handed to a typed entry of FN without being boxed."
+  (and (consp (cdr args)) (null (cddr args))
+       (not (eq *in-tail-position* t))
+       (not *in-mv-context*)
+       (numeric-array-aref-info (cadr args))
+       (let ((mode (%call-site-mv-mode args)))
+         (or (null mode) (equal mode `((:ldc-i4 ,+mv-mode-primary+)))))))
+
+(defun compile-funcall-long-arg (fn-expr x mode-instrs &optional long-p)
+  "(FUNCALL FN-EXPR X) through Runtime.FuncallLong1[L][M], X compiled as an
+   int64 after the function is coerced. LONG-P: the value is left as an int64,
+   unboxed as UNBOX-FIXNUM does."
+  (let ((fn-tmp (gen-local "FLF"))
+        (x-tmp (gen-local "FLX")))
+    `((:declare-local ,fn-tmp "LispFunction")
+      (:declare-local ,x-tmp "Int64")
+      ,@(let ((*in-mv-context* nil) (*in-tail-position* nil))
+          (compile-expr fn-expr))
+      (:call "Runtime.CoerceToFunction")
+      (:stloc ,fn-tmp)
+      ,@(let ((*in-mv-context* nil) (*in-tail-position* nil))
+          (compile-as-long x))
+      (:stloc ,x-tmp)
+      (:ldloc ,fn-tmp)
+      (:ldloc ,x-tmp)
+      ,@mode-instrs
+      (:call ,(format nil "Runtime.FuncallLong1~:[~;L~]~:[~;M~]" long-p mode-instrs)))))
+
+(defun %funcall-long-arg-expr-p (expr)
+  "For EXPR a (FUNCALL FN X) that COMPILE-FUNCALL would compile with
+   COMPILE-FUNCALL-LONG-ARG, true."
+  (and (consp expr) (eq (car expr) 'funcall)
+       (consp (cdr expr))
+       (let ((fn-expr (cadr expr)))
+         (not (and (consp fn-expr) (member (car fn-expr) '(quote function)))))
+       (%funcall-long-arg-p (cdr expr))))
+
+(defun %funcall-aref-long-plan (expr)
+  "For EXPR a (FUNCALL FN (AREF ...)) that COMPILE-FUNCALL would compile with
+   COMPILE-FUNCALL-AREF, its plan."
+  (and (consp expr) (eq (car expr) 'funcall)
+       (consp (cdr expr))
+       (let ((fn-expr (cadr expr)))
+         (not (and (consp fn-expr) (member (car fn-expr) '(quote function)))))
+       (%funcall-aref-plan (cdr expr))))
 
 ;;; ============================================================
 ;;; function special form + flet / labels

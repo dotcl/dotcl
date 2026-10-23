@@ -746,7 +746,7 @@ public sealed class LispProcess : LispObject
                     var eof = new LispString("eof");
                     while (true)
                     {
-                        var line = CallCl("READ-LINE", source, Nil.Instance, eof);
+                        var line = Runtime.ReadLine(source, Nil.Instance, eof);
                         if (ReferenceEquals(line, eof)) break;
                         var mv = MultipleValues.Get();
                         bool missingNewline = mv.Length > 1 && mv[1] is not Nil;

@@ -16,7 +16,7 @@ public static class Arithmetic
             // Overflow check: sign of result must be consistent
             if (((av ^ bv) < 0) || ((av ^ r) >= 0))
                 return Fixnum.Make(r);
-            return new Bignum((BigInteger)av + bv);
+            return AddIntegers(a, b);
         }
 
         // SingleFloat fast path: common in numeric code
@@ -29,14 +29,7 @@ public static class Arithmetic
 
         // Complex contagion
         if (a is LispComplex || b is LispComplex)
-        {
-            if (TryDoubleParts(a, out double aar, out double aai)
-                && TryDoubleParts(b, out double abr, out double abi))
-                return new DoubleComplex(aar + abr, aai + abi);
-            var ac = AsComplex(a);
-            var bc = AsComplex(b);
-            return MakeComplex(Add(ac.Real, bc.Real), Add(ac.Imaginary, bc.Imaginary));
-        }
+            return AddComplex(a, b);
 
         // Float contagion
         if (a is DoubleFloat || b is DoubleFloat)
@@ -45,6 +38,23 @@ public static class Arithmetic
             return new SingleFloat(ToSingle(a) + ToSingle(b));
 
         // Exact arithmetic
+        return AddExact(a, b);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static Number AddComplex(Number a, Number b)
+    {
+        if (TryDoubleParts(a, out double aar, out double aai)
+            && TryDoubleParts(b, out double abr, out double abi))
+            return new DoubleComplex(aar + abr, aai + abi);
+        var ac = AsComplex(a);
+        var bc = AsComplex(b);
+        return MakeComplex(Add(ac.Real, bc.Real), Add(ac.Imaginary, bc.Imaginary));
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static Number AddExact(Number a, Number b)
+    {
         if (a is Bignum or Fixnum && b is Bignum or Fixnum)
             return Bignum.MakeInteger(IntValue(a) + IntValue(b));
 
@@ -64,7 +74,7 @@ public static class Arithmetic
             long av = fa.Value, bv = fb.Value, r = av - bv;
             if (((av ^ bv) >= 0) || ((av ^ r) >= 0))
                 return Fixnum.Make(r);
-            return new Bignum((BigInteger)av - bv);
+            return SubtractIntegers(a, b);
         }
 
         // SingleFloat fast path
@@ -76,20 +86,30 @@ public static class Arithmetic
             return new DoubleFloat(da.Value - db.Value);
 
         if (a is LispComplex || b is LispComplex)
-        {
-            if (TryDoubleParts(a, out double sar, out double sai)
-                && TryDoubleParts(b, out double sbr, out double sbi))
-                return new DoubleComplex(sar - sbr, sai - sbi);
-            var ac = AsComplex(a);
-            var bc = AsComplex(b);
-            return MakeComplex(Subtract(ac.Real, bc.Real), Subtract(ac.Imaginary, bc.Imaginary));
-        }
+            return SubtractComplex(a, b);
 
         if (a is DoubleFloat || b is DoubleFloat)
             return new DoubleFloat(ToDouble(a) - ToDouble(b));
         if (a is SingleFloat || b is SingleFloat)
             return new SingleFloat(ToSingle(a) - ToSingle(b));
 
+        return SubtractExact(a, b);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static Number SubtractComplex(Number a, Number b)
+    {
+        if (TryDoubleParts(a, out double sar, out double sai)
+            && TryDoubleParts(b, out double sbr, out double sbi))
+            return new DoubleComplex(sar - sbr, sai - sbi);
+        var ac = AsComplex(a);
+        var bc = AsComplex(b);
+        return MakeComplex(Subtract(ac.Real, bc.Real), Subtract(ac.Imaginary, bc.Imaginary));
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static Number SubtractExact(Number a, Number b)
+    {
         if (a is Bignum or Fixnum && b is Bignum or Fixnum)
             return Bignum.MakeInteger(IntValue(a) - IntValue(b));
 
@@ -107,7 +127,7 @@ public static class Arithmetic
         {
             long hi = Compat.BigMul(fa.Value, fb.Value, out long lo);
             if (hi == (lo >> 63)) return Fixnum.Make(lo);
-            return new Bignum((BigInteger)fa.Value * fb.Value);
+            return MultiplyIntegers(a, b);
         }
         if (a is Bignum or Fixnum && b is Bignum or Fixnum)
             return MultiplyIntegers(a, b);
@@ -121,37 +141,48 @@ public static class Arithmetic
             return new DoubleFloat(da.Value * db.Value);
 
         if (a is LispComplex || b is LispComplex)
-        {
-            // A real factor scales each part. Going through the (a+bi)(c+di) form
-            // with an imaginary part of zero instead multiplies that zero by the
-            // other part, and 0 * infinity is NaN: (* 1 #C(inf 0.0)) came back as
-            // #C(inf NaN). It also loses a signed zero, since 0*x + 0*y is +0.0
-            // whatever the signs were. Scaling keeps both.
-            if (a is not LispComplex && b is LispComplex bsc)
-                return MakeComplex(Multiply(a, bsc.Real), Multiply(a, bsc.Imaginary));
-            if (b is not LispComplex && a is LispComplex asc)
-                return MakeComplex(Multiply(asc.Real, b), Multiply(asc.Imaginary, b));
-            // All-double: the general form below boxes each of the four products
-            // and both of the sums, seven allocations to produce one result. It
-            // is the same formula over the same doubles rounded at the same
-            // points, so this answers bit-identically without the intermediates.
-            if (TryDoubleParts(a, out double mar, out double mai)
-                && TryDoubleParts(b, out double mbr, out double mbi))
-                return new DoubleComplex(mar * mbr - mai * mbi,
-                                         mar * mbi + mai * mbr);
-            var ac = AsComplex(a);
-            var bc = AsComplex(b);
-            // (a+bi)(c+di) = (ac-bd) + (ad+bc)i
-            return MakeComplex(
-                Subtract(Multiply(ac.Real, bc.Real), Multiply(ac.Imaginary, bc.Imaginary)),
-                Add(Multiply(ac.Real, bc.Imaginary), Multiply(ac.Imaginary, bc.Real)));
-        }
+            return MultiplyComplex(a, b);
 
         if (a is DoubleFloat || b is DoubleFloat)
             return new DoubleFloat(ToDouble(a) * ToDouble(b));
         if (a is SingleFloat || b is SingleFloat)
             return new SingleFloat(ToSingle(a) * ToSingle(b));
 
+        return MultiplyRational(a, b);
+    }
+
+    // Out of line for the reason given at Divide.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static Number MultiplyComplex(Number a, Number b)
+    {
+        // A real factor scales each part. Going through the (a+bi)(c+di) form
+        // with an imaginary part of zero instead multiplies that zero by the
+        // other part, and 0 * infinity is NaN: (* 1 #C(inf 0.0)) came back as
+        // #C(inf NaN). It also loses a signed zero, since 0*x + 0*y is +0.0
+        // whatever the signs were. Scaling keeps both.
+        if (a is not LispComplex && b is LispComplex bsc)
+            return MakeComplex(Multiply(a, bsc.Real), Multiply(a, bsc.Imaginary));
+        if (b is not LispComplex && a is LispComplex asc)
+            return MakeComplex(Multiply(asc.Real, b), Multiply(asc.Imaginary, b));
+        // All-double: the general form below boxes each of the four products
+        // and both of the sums, seven allocations to produce one result. It
+        // is the same formula over the same doubles rounded at the same
+        // points, so this answers bit-identically without the intermediates.
+        if (TryDoubleParts(a, out double mar, out double mai)
+            && TryDoubleParts(b, out double mbr, out double mbi))
+            return new DoubleComplex(mar * mbr - mai * mbi,
+                                     mar * mbi + mai * mbr);
+        var ac = AsComplex(a);
+        var bc = AsComplex(b);
+        // (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+        return MakeComplex(
+            Subtract(Multiply(ac.Real, bc.Real), Multiply(ac.Imaginary, bc.Imaginary)),
+            Add(Multiply(ac.Real, bc.Imaginary), Multiply(ac.Imaginary, bc.Real)));
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static Number MultiplyRational(Number a, Number b)
+    {
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
         if (BothExact(a, b)) return RationalMultiply(an, ad, bn, bd);
@@ -279,7 +310,7 @@ public static class Arithmetic
             u[0] <<= s;
         }
         ulong d = v[n - 1], d2 = v[n - 2];
-        ulong inv = (ulong)(UInt128.MaxValue / d);
+        ulong inv = Reciprocal(d);
         for (int j = m - n; j >= 0; j--)
         {
             ulong uh = u[j + n], ul = u[j + n - 1];
@@ -341,6 +372,30 @@ public static class Arithmetic
         return new BigInteger(System.Runtime.InteropServices.MemoryMarshal.AsBytes(u.Slice(0, n)), isUnsigned: true);
     }
 
+    /// <summary>floor((2^128 - 1) / d) mod 2^64 for a normalized d, as
+    /// (~d : 2^64 - 1) / d in two 64 by 32 bit steps (Hacker's Delight, divlu).</summary>
+    private static ulong Reciprocal(ulong d)
+    {
+        const ulong b = 1UL << 32;
+        ulong u1 = ~d;
+        ulong vn1 = d >> 32, vn0 = d & 0xFFFFFFFF;
+        ulong q1 = u1 / vn1, rhat = u1 - q1 * vn1;
+        while (q1 >= b || q1 * vn0 > ((rhat << 32) | 0xFFFFFFFF))
+        {
+            q1--; rhat += vn1;
+            if (rhat >= b) break;
+        }
+        ulong un21 = (u1 << 32) + 0xFFFFFFFF - q1 * d;
+        ulong q0 = un21 / vn1;
+        rhat = un21 - q0 * vn1;
+        while (q0 >= b || q0 * vn0 > ((rhat << 32) | 0xFFFFFFFF))
+        {
+            q0--; rhat += vn1;
+            if (rhat >= b) break;
+        }
+        return (q1 << 32) + q0;
+    }
+
     /// <summary>(uh:ul) / d for a normalized d and uh &lt; d, with inv = floor((2^128 - 1) / d) mod 2^64
     /// (Moller and Granlund, "Improved division by invariant integers", algorithm 4).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -359,41 +414,14 @@ public static class Arithmetic
 #endif
 
     // --- Division ---
+    // The complex and rational cases are kept out of line: inlined, their
+    // BigInteger temporaries gave every caller a frame of several KB that the
+    // prolog zeroes on each call, float division included.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Number Divide(Number a, Number b)
     {
         if (a is LispComplex || b is LispComplex)
-        {
-            var ac = AsComplex(a);
-            var bc = AsComplex(b);
-            static bool IsFlt(Number n) => n is SingleFloat || n is DoubleFloat;
-            bool anyFloat = IsFlt(ac.Real) || IsFlt(ac.Imaginary) || IsFlt(bc.Real) || IsFlt(bc.Imaginary);
-            if (anyFloat)
-            {
-                // Float complex division via System.Numerics (Smith's algorithm): the
-                // denominator is scaled, so c^2+d^2 no longer over/underflows for extreme
-                // magnitudes. The naive ((c^2+d^2)) form made (/ z (abs z)) for |z|~1e+/-170
-                // hit divide-by-zero (denom->0) or NaN (denom->inf). Maxima signum(complex)
-                // depends on this.
-                var bcx = ToSystemComplex(bc);
-                if (bcx.Real == 0.0 && bcx.Imaginary == 0.0)
-                    throw new DivideByZeroException("Division by zero");
-                var q = ToSystemComplex(ac) / bcx;
-                bool allSingle = !(ac.Real is DoubleFloat) && !(ac.Imaginary is DoubleFloat)
-                              && !(bc.Real is DoubleFloat) && !(bc.Imaginary is DoubleFloat)
-                              && (ac.Real is SingleFloat || ac.Imaginary is SingleFloat
-                                  || bc.Real is SingleFloat || bc.Imaginary is SingleFloat);
-                return allSingle
-                    ? MakeComplex(new SingleFloat((float)q.Real), new SingleFloat((float)q.Imaginary))
-                    : MakeComplex(new DoubleFloat(q.Real), new DoubleFloat(q.Imaginary));
-            }
-            // Exact (integer/rational) complex division: (a+bi)/(c+di) =
-            // ((ac+bd) + (bc-ad)i) / (c^2+d^2). BigInteger arithmetic: no overflow.
-            var denom = Add(Multiply(bc.Real, bc.Real), Multiply(bc.Imaginary, bc.Imaginary));
-            return MakeComplex(
-                Divide(Add(Multiply(ac.Real, bc.Real), Multiply(ac.Imaginary, bc.Imaginary)), denom),
-                Divide(Subtract(Multiply(ac.Imaginary, bc.Real), Multiply(ac.Real, bc.Imaginary)), denom));
-        }
+            return DivideComplex(a, b);
         // Mixed float/rational division: the result type is a float, so IEEE
         // applies here as it does in Runtime.Divide -- (/ 1 0.0d0) must not
         // answer differently from (/ 1.0d0 0.0d0).
@@ -401,7 +429,46 @@ public static class Arithmetic
             return new DoubleFloat(ToDouble(a) / ToDouble(b));
         if (a is SingleFloat || b is SingleFloat)
             return new SingleFloat(ToSingle(a) / ToSingle(b));
+        return DivideRational(a, b);
+    }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static Number DivideComplex(Number a, Number b)
+    {
+        var ac = AsComplex(a);
+        var bc = AsComplex(b);
+        static bool IsFlt(Number n) => n is SingleFloat || n is DoubleFloat;
+        bool anyFloat = IsFlt(ac.Real) || IsFlt(ac.Imaginary) || IsFlt(bc.Real) || IsFlt(bc.Imaginary);
+        if (anyFloat)
+        {
+            // Float complex division via System.Numerics (Smith's algorithm): the
+            // denominator is scaled, so c^2+d^2 no longer over/underflows for extreme
+            // magnitudes. The naive ((c^2+d^2)) form made (/ z (abs z)) for |z|~1e+/-170
+            // hit divide-by-zero (denom->0) or NaN (denom->inf). Maxima signum(complex)
+            // depends on this.
+            var bcx = ToSystemComplex(bc);
+            if (bcx.Real == 0.0 && bcx.Imaginary == 0.0)
+                throw new DivideByZeroException("Division by zero");
+            var q = ToSystemComplex(ac) / bcx;
+            bool allSingle = !(ac.Real is DoubleFloat) && !(ac.Imaginary is DoubleFloat)
+                          && !(bc.Real is DoubleFloat) && !(bc.Imaginary is DoubleFloat)
+                          && (ac.Real is SingleFloat || ac.Imaginary is SingleFloat
+                              || bc.Real is SingleFloat || bc.Imaginary is SingleFloat);
+            return allSingle
+                ? MakeComplex(new SingleFloat((float)q.Real), new SingleFloat((float)q.Imaginary))
+                : MakeComplex(new DoubleFloat(q.Real), new DoubleFloat(q.Imaginary));
+        }
+        // Exact (integer/rational) complex division: (a+bi)/(c+di) =
+        // ((ac+bd) + (bc-ad)i) / (c^2+d^2). BigInteger arithmetic: no overflow.
+        var denom = Add(Multiply(bc.Real, bc.Real), Multiply(bc.Imaginary, bc.Imaginary));
+        return MakeComplex(
+            Divide(Add(Multiply(ac.Real, bc.Real), Multiply(ac.Imaginary, bc.Imaginary)), denom),
+            Divide(Subtract(Multiply(ac.Imaginary, bc.Real), Multiply(ac.Real, bc.Imaginary)), denom));
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static Number DivideRational(Number a, Number b)
+    {
         var (an, ad) = AsRational(a);
         var (bn, bd) = AsRational(b);
         // Division is multiplication by the reciprocal, which is the divisor
@@ -571,6 +638,10 @@ public static class Arithmetic
         var num = r.Numerator;
         var den = r.Denominator;
         if (num.IsZero) return 0.0;
+        // Both exact as doubles: one IEEE division rounds the quotient correctly.
+        const long Exact = 1L << 53;
+        if (num >= -Exact && num <= Exact && den >= -Exact && den <= Exact)
+            return (double)(long)num / (double)(long)den;
         bool negative = (num.Sign < 0) ^ (den.Sign < 0);
         num = BigInteger.Abs(num);
         den = BigInteger.Abs(den);
@@ -661,11 +732,18 @@ public static class Arithmetic
         if (a is Fixnum fa && b is Fixnum fb) return fa.Value == fb.Value;
         // DoubleFloat fast path
         if (a is DoubleFloat da && b is DoubleFloat db) return da.Value == db.Value;
+        if (b is Fixnum bf)
+        {
+            if (a is SingleFloat asf) return FloatEqualsLong(asf.Value, bf.Value);
+            if (a is DoubleFloat adf) return FloatEqualsLong(adf.Value, bf.Value);
+        }
+        if (a is SingleFloat sa && b is SingleFloat sb) return sa.Value == sb.Value;
         return IsNumericEqualSlow(a, b);
     }
 
     private static bool IsNumericEqualSlow(Number a, Number b)
     {
+        if ((a is Bignum && b is Fixnum) || (a is Fixnum && b is Bignum)) return false;
         if (a is LispComplex ca && b is LispComplex cb)
             return IsNumericEqual(ca.Real, cb.Real) && IsNumericEqual(ca.Imaginary, cb.Imaginary);
         if (a is LispComplex || b is LispComplex)
@@ -827,6 +905,11 @@ public static class Arithmetic
     {
         var r = adjust == 0 ? rem : adjust > 0 ? rem - den : rem + den;
         if (flipped) r = -r;
+        if (bd.IsOne)
+        {
+            // r = an - q*ad*bn (+- ad*bn), so gcd(r, ad) = gcd(an, ad) = 1.
+            return ad.IsOne ? (Number)Bignum.MakeInteger(r) : (Number)Ratio.MakeReduced(r, ad);
+        }
         var scale = ad * bd;
         return scale.IsOne ? (Number)Bignum.MakeInteger(r) : (Number)Ratio.Make(r, scale);
     }
@@ -1199,6 +1282,16 @@ public static class Arithmetic
         if (x.IsOne || y.IsOne) return BigInteger.One;
         if (x.IsZero) return y;
         if (y.IsZero) return x;
+        // Common powers of two come out by shifts: a denominator built from
+        // (expt 16 i) is mostly a power of two, and the odd parts left are small.
+#if !NETSTANDARD2_0
+        if (x.GetBitLength() > 128 && y.GetBitLength() > 128)
+        {
+            int tx = (int)BigInteger.TrailingZeroCount(x), ty = (int)BigInteger.TrailingZeroCount(y);
+            if ((tx | ty) != 0)
+                return BigInteger.GreatestCommonDivisor(x >> tx, y >> ty) << Math.Min(tx, ty);
+        }
+#endif
         return BigInteger.GreatestCommonDivisor(x, y);
     }
 
@@ -1207,6 +1300,10 @@ public static class Arithmetic
                                          BigInteger bn, BigInteger bd, bool subtract)
     {
         if (subtract) bn = -bn;
+        // An integer operand: its multiple of the other denominator keeps that
+        // denominator coprime to the numerator.
+        if (bd.IsOne) return Ratio.MakeReduced(an + bn * ad, ad);
+        if (ad.IsOne) return Ratio.MakeReduced(an * bd + bn, bd);
         var g1 = GcdFast(ad, bd);
         // Denominators with no common factor: the sum over their product is
         // already in lowest terms. This is every integer-plus-fraction, and most
@@ -1228,10 +1325,19 @@ public static class Arithmetic
         // and for coprime operands that would be four such divisions.
         var g1 = GcdFast(BigInteger.Abs(an), bd);
         var g2 = GcdFast(BigInteger.Abs(bn), ad);
-        var num = (g1.IsOne ? an : an / g1) * (g2.IsOne ? bn : bn / g2);
-        var den = (g2.IsOne ? ad : ad / g2) * (g1.IsOne ? bd : bd / g1);
+        var num = MulSkipOne(g1.IsOne ? an : an / g1, g2.IsOne ? bn : bn / g2);
+        var den = MulSkipOne(g2.IsOne ? ad : ad / g2, g1.IsOne ? bd : bd / g1);
         return Ratio.MakeReduced(num, den);
     }
+
+    private static BigInteger MulSkipOne(BigInteger x, BigInteger y) =>
+        x.IsOne ? y : y.IsOne ? x : x * y;
+
+    /// <summary>1/R: the reduced fraction turned over, the sign moved to the numerator.</summary>
+    internal static Number RatioReciprocal(Ratio r) =>
+        r.Numerator.Sign < 0
+            ? Ratio.MakeReduced(-r.Denominator, -r.Numerator)
+            : Ratio.MakeReduced(r.Denominator, r.Numerator);
 
     private static (BigInteger num, BigInteger den) AsRational(Number n) => n switch
     {

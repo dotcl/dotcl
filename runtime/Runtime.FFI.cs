@@ -580,7 +580,7 @@ static class NativeFFI
             if (_delegateModule == null)
             {
                 var ab = AssemblyBuilder.DefineDynamicAssembly(
-                    new AssemblyName("DotclFfiCallbacks"), AssemblyBuilderAccess.Run);
+                    new AssemblyName("DotclFfiCallbacks"), RuntimeLoadContext.RunAccess);
                 _delegateModule = ab.DefineDynamicModule("m");
             }
             var tb = _delegateModule.DefineType(

@@ -7,6 +7,9 @@
 ;;; Call helpers
 ;;; ============================================================
 
+(defun handler-op-name ()
+  (if *handler-op* (symbol-name *handler-op*) ""))
+
 (defun compile-static-program-error (msg)
   "Emit CIL that unconditionally signals PROGRAM-ERROR with MSG."
   `((:ldstr ,msg)
@@ -24,6 +27,12 @@
       ((= n 1)
        ;; (< a) evaluates arg for side effects, returns T
        `(,@(compile-expr (car args)) (:pop) ,@(emit-t)))
+      ((and (= n 2)
+            (or (and (fixnum-typed-p (first args)) (fixnum-typed-p (second args)))
+                (and (float-typed-p (first args)) (float-typed-p (second args)))))
+       ;; The test position compares raw values; the value position used to
+       ;; box them again for the generic entry.
+       (compile-expr `(if (,op ,@args) t nil)))
       ((= n 2) (compile-binary-call args method))
       (t
        ;; Expand (op a b c ...) -> (let* ((t0 a) (t1 b) (t2 c) ...) (and (op t0 t1) (op t1 t2) ...))
@@ -56,7 +65,7 @@
         ((and (consp expr) (eq (car expr) 'quote)) t)
         (t nil)))
 
-(defun compile-binary-call (args method &optional (fn-name ""))
+(defun compile-binary-call (args method &optional (fn-name (handler-op-name)))
   ;; Pre-evaluate both args to temps so the stack is empty
   ;; when each is compiled (CIL requires empty stack at try-block entry).
   ;; Args are single-valued: never in tail position, never in MV context.
@@ -77,7 +86,7 @@
           (:ldloc ,t1) (:ldloc ,t2)
           (:call ,method)))))
 
-(defun compile-ternary-call (args method &optional (fn-name ""))
+(defun compile-ternary-call (args method &optional (fn-name (handler-op-name)))
   (unless (= (length args) 3)
     (return-from compile-ternary-call
       (compile-static-program-error
@@ -97,7 +106,7 @@
           (:ldloc ,t1) (:ldloc ,t2) (:ldloc ,t3)
           (:call ,method)))))
 
-(defun compile-quaternary-call (args method &optional (fn-name ""))
+(defun compile-quaternary-call (args method &optional (fn-name (handler-op-name)))
   (unless (= (length args) 4)
     (return-from compile-quaternary-call
       (compile-static-program-error
@@ -120,7 +129,7 @@
           (:ldloc ,t1) (:ldloc ,t2) (:ldloc ,t3) (:ldloc ,t4)
           (:call ,method)))))
 
-(defun compile-quinary-call (args method &optional (fn-name ""))
+(defun compile-quinary-call (args method &optional (fn-name (handler-op-name)))
   (unless (= (length args) 5)
     (return-from compile-quinary-call
       (compile-static-program-error
@@ -147,14 +156,26 @@
           (:ldloc ,t1) (:ldloc ,t2) (:ldloc ,t3) (:ldloc ,t4) (:ldloc ,t5)
           (:call ,method)))))
 
-(defun compile-unary-call (args method &optional (fn-name ""))
+(defun compile-unary-call (args method &optional (fn-name (handler-op-name)))
   (unless (= (length args) 1)
     (let ((errmsg (format nil "~a: wrong number of arguments: ~a (expected 1)" fn-name (length args))))
       (return-from compile-unary-call
         (compile-static-program-error errmsg))))
   ;; Arg is single-valued: never in tail position, never in MV context
-  `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
-    (:call ,method)))
+  (let ((code (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))))
+    `(,@code (:call ,(%unwrapped-predicate method code)))))
+
+(defun %unwrapped-predicate (method code)
+  "METHOD, or its variant without the multiple-values unwrap when CODE only
+   loads a local or an argument: a variable never holds a values bundle."
+  (let ((plain (and (= (length code) 1)
+                    (consp (car code))
+                    (member (caar code) '(:ldloc :ldarg))
+                    (assoc method '(("Runtime.IsTrueConsp" . "Runtime.IsConsObject")
+                                    ("Runtime.IsTrueAtom" . "Runtime.IsAtomObject")
+                                    ("Runtime.IsTrueListp" . "Runtime.IsListObject"))
+                           :test #'equal))))
+    (if plain (cdr plain) method)))
 
 (defun compile-append (args)
   "Compile (append ...) with 0+ arguments.
@@ -527,7 +548,10 @@
    null test alone. In the slow copy a structure access keeps its per-access
    test, because the copy is taken when ANY buffer was missing, not
    necessarily that one."
-  (let* ((entries (remove-if #'backing-entry-dims entries))
+  (let* ((entries (remove-if (lambda (e) (or (backing-entry-dims e)
+                                             (%backing-never-declines-p e)
+                                             (eq (tenth e) :never-null)))
+                             entries))
          (arrays (and entries
                       (some (lambda (e)
                               (%var-iterated-access-p
@@ -596,25 +620,44 @@
         for dims = (backing-entry-dims e)
         unless (%raw-array-entry-p e)
         append `((:declare-local ,(third e) ,(%backing-slot-type kind))
-                 (:ldloc ,(second e))
+                 ,@(cond
+                     ((second e) `((:ldloc ,(second e))))
+                     ((nth 10 e)
+                      `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                            (compile-expr (ninth e)))
+                        (:declare-local ,(nth 10 e) "LispObject")
+                        (:dup)
+                        (:stloc ,(nth 10 e))))
+                     (t (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                          (compile-expr (ninth e)))))
                  ,@(cond
                      (dims
                       `((:ldc-i4 ,(length dims))
                         ,@(loop for k below 3
                                 for d = (nth k dims)
                                 collect `(:ldc-i4 ,(if (integerp d) d -1)))
-                        (:ldc-i4 ,(if (eq (sixth e) :checked) (or (fifth e) 0) 0))
+                        (:ldc-i4 ,(if (or (eq (sixth e) :checked) (ninth e)) (or (fifth e) 0) 0))
                         (:ldc-i4 ,(if (compiling-at-safety-0-p) 0 1))
                         (:call ,(ecase kind
                                   (1 "Runtime.BackingNDU8") (2 "Runtime.BackingNDU16")
                                   (3 "Runtime.BackingNDI32") (4 "Runtime.BackingNDI64")
                                   (:u64 "Runtime.BackingNDU64")
                                   (:f64 "Runtime.BackingNDF64") (:f32 "Runtime.BackingNDF32")))))
-                     ((eq (sixth e) :checked)
+                     ((and (eq (sixth e) :checked) (not (member kind '(:f64 :f32))))
                        `((:ldc-i4 ,(or (fifth e) 0))
                          (:call ,(%backing-narrow-fetch-call kind))))
+                     ((eq (tenth e) :never-null)
+                      `((:call ,(%backing-fetch-call kind t))))
                      (t `((:call ,(%backing-fetch-call kind)))))
                  (:stloc ,(third e))
+                 ,@(when (and (ninth e) (eq (tenth e) :never-null) (null dims))
+                     (let ((ok (gen-label "ABHAVE")))
+                       `((:ldloc ,(third e))
+                         (:brtrue ,ok)
+                         (:load-const ,(ninth e))
+                         (:call "Runtime.ConstantArrayChanged")
+                         (:throw)
+                         (:label ,ok))))
                  ,@(loop for d in dims
                          for k from 0
                          unless (integerp d)
@@ -664,7 +707,7 @@
    NIL whenever the fetch declined, and declining has to cost speed rather than
    correctness. Everything else compiles to the helper alone."
   (let ((helper (%numeric-aref-helper-as-long arr idxs rank))
-        (back (array-backing-entry (list* 'aref arr idxs))))
+        (back (array-backing-entry-for-read (list* 'aref arr idxs))))
     (if back
         (compile-backing-aref-as-long back idxs helper)
         helper)))
@@ -955,6 +998,9 @@
   (cond
     ;; (values): a shared marker, no array and no wrapper to build.
     ((null args) '((:call "MultipleValues.Values0")))
+    ;; (values x) where only the primary value is taken, nothing reads what is published.
+    ((and (null (cdr args)) (null *in-mv-context*) (null *in-tail-position*))
+     (compile-for-single-value (car args)))
     ;; (values x) is "the primary value of x, published as the only value", which
     ;; is exactly what MULTIPLEVALUES.PRIMARY does -- and it publishes through a
     ;; per-thread cached array, so nothing is allocated. Going through the general
@@ -1070,7 +1116,7 @@
    bits, an int64 on the stack. A hoisted buffer is read with ldelem.i8, with
    the helper as the arm for an array the fetch declined."
   (let ((helper (%u64-aref-helper-bits arr idxs))
-        (back (array-backing-entry (list* 'aref arr idxs))))
+        (back (array-backing-entry-for-read (list* 'aref arr idxs))))
     (if (and back (eq (fourth back) :u64))
         (compile-backing-aref-as-long back idxs helper)
         helper)))

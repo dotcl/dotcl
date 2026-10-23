@@ -170,6 +170,7 @@ public static partial class Runtime
 
     // --- Type predicates ---
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static bool IsNilObj(LispObject obj)
     {
         obj = Primary(obj);
@@ -245,6 +246,13 @@ public static partial class Runtime
     // For compiled code that unboxes with UNBOX-FIXNUM when this is true: the
     // same test that cast makes, so no Primary() here.
     public static bool IsFixnumObject(LispObject obj) => obj is Fixnum;
+    // For compiled code testing a lexical variable, which never holds an MvReturn.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static bool IsConsObject(LispObject obj) => obj is Cons;
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static bool IsAtomObject(LispObject obj) => obj is not Cons;
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static bool IsListObject(LispObject obj) => obj is Cons || obj is Nil;
     public static bool IsTrueSymbolp(LispObject obj) { obj = Primary(obj); return obj is Symbol || obj is T || obj is Nil; }
     public static bool IsTrueStringp(LispObject obj) { obj = Primary(obj); return obj is LispString || (obj is LispVector v && v.IsCharVector && v.Rank == 1); }
     public static bool IsTrueCharacterp(LispObject obj) => Primary(obj) is LispChar;

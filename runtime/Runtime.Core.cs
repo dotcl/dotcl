@@ -384,6 +384,8 @@ public static partial class Runtime
     private static int _ltvNextId;
 
     public static int AllocateLtvSlot() => Interlocked.Increment(ref _ltvNextId);
+    // The compiler's LOAD-TIME-VALUE slot ids (%NEXT-LTV-ID).
+    internal static long _compilerLtvCounter;
     public static int MaxLtvId => _ltvNextId;
 
     // Legacy API (global slots)

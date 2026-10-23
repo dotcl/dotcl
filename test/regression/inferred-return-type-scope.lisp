@@ -139,6 +139,6 @@
 ;; The declaimed type is used from the REPL: the FTYPE gives the callee a
 ;; typed entry, which the call enters with a raw argument and a raw result.
 (deftest-emitting-only inferred-return-type-scope.declaimed-call-is-native
-  (list (%irts-count "CALL-TYPED-ENTRY" (%irts-sil #'%irts-decl-use))
+  (list (%irts-count "CALL-TYPED-SYM" (%irts-sil #'%irts-decl-use))
         (%irts-count "Invoke1" (%irts-sil #'%irts-decl-use)))
   (1 0))

@@ -70,10 +70,10 @@
     (loop (let ((q (search needle s :start2 p)))
             (if q (progn (incf k) (setq p (1+ q))) (return k))))))
 
-;;; Only the value returned is boxed (in each of the two array paths).
+;;; Only the value returned is boxed.
 (deftest-compiled-only single-float-let-inference.no-boxes
   (let ((s (%flat-text (dotcl:function-sil #'%sfl-sum))))
     (+ (%sfl-count "NEWOBJ \"SingleFloat\"" s) (%sfl-count "SingleFloat.Box" s)))
-  2)
+  1)
 
 (setf dotcl:*save-sil* nil)

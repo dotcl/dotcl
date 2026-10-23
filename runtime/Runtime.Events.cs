@@ -11,7 +11,7 @@ internal static class DotNetEvents
     // same Delegate instance for a given (handler, delegateType) pair so
     // bare Lisp lambdas passed to remove-event correctly detach the handler
     // that add-event installed.
-    private static readonly ConditionalWeakTable<LispObject, Dictionary<Type, Delegate>>
+    private static readonly ConditionalWeakTable<LispObject, Dictionary<(Type, Package.Unit?), Delegate>>
         _delegateCache = new();
 
     // (dotnet:add-event obj "Click" (lambda (sender e) ...))
@@ -64,7 +64,7 @@ internal static class DotNetEvents
             del = d;
         }
         else if (_delegateCache.TryGetValue(handler, out var byType)
-                 && byType.TryGetValue(ev.EventHandlerType!, out var cached))
+                 && byType.TryGetValue((ev.EventHandlerType!, Package.CurrentUnit), out var cached))
         {
             del = cached;
         }
@@ -97,10 +97,11 @@ internal static class DotNetEvents
     // delegateType) pair so remove-event can find what add-event installed.
     internal static Delegate MakeDelegate(Type delegateType, LispObject fn)
     {
-        var byType = _delegateCache.GetValue(fn, _ => new Dictionary<Type, Delegate>());
+        var byType = _delegateCache.GetValue(fn, _ => new Dictionary<(Type, Package.Unit?), Delegate>());
+        var key = (delegateType, Package.CurrentUnit);
         lock (byType)
         {
-            if (byType.TryGetValue(delegateType, out var cached))
+            if (byType.TryGetValue(key, out var cached))
                 return cached;
 
             var invokeMethod = delegateType.GetMethod("Invoke")!;
@@ -116,14 +117,14 @@ internal static class DotNetEvents
                 parameters.Select(p => (Expression)Expression.Convert(p, typeof(object))));
 
             // Build: DispatchEvent(fn, args)
-            var fnConst = Expression.Constant(fn, typeof(LispObject));
+            var fnConst = Expression.Constant(Package.BindToCurrentUnit(fn), typeof(LispObject));
             var dispatch = Expression.Call(
                 typeof(DotNetEvents).GetMethod(nameof(DispatchEvent))!,
                 fnConst, argsArray);
 
             var lambda = Expression.Lambda(delegateType, dispatch, parameters);
             var del = lambda.Compile();
-            byType[delegateType] = del;
+            byType[key] = del;
             return del;
         }
     }

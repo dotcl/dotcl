@@ -46,7 +46,6 @@
 
 ;;; find-free-vars-expr: iterative version using explicit worklist.
 ;;; Each worklist entry is (expr bound . mdepth).
-;;; Macrolet restore sentinels: (:restore-macro name . old-entry-or-nil).
 ;;; A unique private object marks the "pop *macroexpand-scope*" sentinel; using an
 ;;; uninterned cons (never EQ to any analyzed source form) avoids the keyword-vs-
 ;;; source-form collision the other sentinels have to guard against.
@@ -112,12 +111,25 @@
               (error () nil))
             *sm-global-hits*)))
 
+(defun %walk-macrolet-lexical-operators (defs)
+  "*LEXICAL-OPERATORS* with the MACROLET definitions DEFS bound, for a walk."
+  (%macrolet-lexical-operators
+   defs
+   (mapcar (lambda (d)
+             (and (consp d) (symbolp (car d)) (consp (cdr d))
+                  (%eval-macrolet-expander (cadr d) (cddr d))))
+           defs)))
+
 (defun find-free-vars-expr (expr bound free-ht)
   "Walk expr finding free variable references. Results accumulated in free-ht.
    Iterative worklist version; no recursion depth limit."
   (let ((worklist (list (cons expr (cons bound 0))))
         (inline-plans-seen '())
-        (*lexical-operators* *lexical-operators*))
+        ;; The walk assigns these as it enters and leaves scopes: bound here,
+        ;; so the assignments stay on this thread.
+        (*lexical-operators* *lexical-operators*)
+        (*macroexpand-scope* *macroexpand-scope*)
+        (*symbol-macros* *symbol-macros*))
     (loop while worklist do
       (let* ((item (pop worklist))
              (e (car item)))
@@ -128,15 +140,6 @@
            (setf *macroexpand-scope* (cdr item)))
           ((eq e *lexops-restore-sentinel*)
            (setf *lexical-operators* (cdr item)))
-          ;; Restore-macro sentinel: restore *macros* entry after macrolet body.
-          ;; Guard symbolp name so that a bare :restore-macro keyword from analyzed
-          ;; source code (where cadr item is a bnd-list, not a symbol) is ignored.
-          ((and (eq e :restore-macro) (symbolp (cadr item)))
-           (let ((name (cadr item))
-                 (old-entry (cddr item)))
-             (if old-entry
-                 (setf (gethash name *macros*) old-entry)
-                 (remhash name *macros*))))
           ;; Restore-symbol-macros sentinel: restore *symbol-macros* after symbol-macrolet body.
           ;; Guard: real sentinels have (cdr item) = old-*symbol-macros* = nil or proper alist,
           ;; so (cddr item) is nil or a list. Collisions (when analyzed code contains the literal
@@ -385,15 +388,11 @@
                              (push (cons (cadr p) (cons bnd mdepth)) worklist)))
                          (dolist (form handler-body)
                            (push (cons form (cons inner-bound mdepth)) worklist)))))
-                    ;; macrolet: register macros, push body, push restore sentinels
+                    ;; macrolet: bind the macros, push body, push restore sentinels
                     ((and (symbolp head) (eq head 'macrolet))
                      (let ((macro-defs (cadr e))
                            (mlbody (cddr e)))
-                       ;; Push restore sentinels FIRST (LIFO: processed LAST, after body)
-                       (dolist (def macro-defs)
-                         (let* ((mname (car def))
-                                (old-entry (gethash mname *macros*)))
-                           (push (cons :restore-macro (cons mname old-entry)) worklist)))
+                       ;; Restore sentinels FIRST (LIFO: processed LAST, after body).
                        ;; Pop-scope sentinel + push this macrolet's scope marker, so a
                        ;; form shared between this shadowing scope and an outer scope is
                        ;; cached per scope and the analysis walk agrees with code-gen.
@@ -401,14 +400,7 @@
                        (push (cons *mscope-restore-sentinel* *macroexpand-scope*) worklist)
                        (push (cons *lexops-restore-sentinel* *lexical-operators*) worklist)
                        (setf *macroexpand-scope* (cons macro-defs *macroexpand-scope*))
-                       ;; Register macros immediately (same as compile-macrolet)
-                       (dolist (def macro-defs)
-                         (let* ((mname (car def))
-                                (mparams (cadr def))
-                                (mbody (cddr def)))
-                           (setf (gethash mname *macros*)
-                                 (%eval-macrolet-expander mparams mbody))))
-                       (setf *lexical-operators* (%macrolet-lexical-operators macro-defs))
+                       (setf *lexical-operators* (%walk-macrolet-lexical-operators macro-defs))
                        ;; Push body forms (LIFO: processed BEFORE restore sentinels)
                        (dolist (form mlbody)
                          (push (cons form (cons bnd mdepth)) worklist))))
@@ -698,10 +690,7 @@
     (case (car kind-value)
       (:symbol-macros (setf *symbol-macros* v))
       (:mscope (setf *macroexpand-scope* v))
-      (:lexops (setf *lexical-operators* v))
-      (:macro (if (cdr v)
-                  (setf (gethash (car v) *macros*) (cdr v))
-                  (remhash (car v) *macros*))))))
+      (:lexops (setf *lexical-operators* v)))))
 
 (defun %fmc-set-step (kind value)
   (cons *fmc-set-step* (cons kind value)))
@@ -838,6 +827,9 @@
   "Walk EXPR and return its summary. Worklist entries are (FORM IN-LAMBDA .
    MDEPTH), IN-LAMBDA relative to EXPR, or a set step."
   (let ((worklist (list (cons expr mdepth0)))
+        (*lexical-operators* *lexical-operators*)
+        (*macroexpand-scope* *macroexpand-scope*)
+        (*symbol-macros* *symbol-macros*)
         (mut '())
         (rin '())
         (rout '())
@@ -1118,16 +1110,10 @@
                        ((and (symbolp head) (eq head 'macrolet))
                         (let ((macro-defs (cadr e))
                               (steps '()))
-                          (dolist (def macro-defs)
-                            (let ((mname (car def)))
-                              (push (%fmc-set-step :macro (cons mname (gethash mname *macros*))) steps)))
                           (push (%fmc-set-step :mscope *macroexpand-scope*) steps)
                           (push (%fmc-set-step :lexops *lexical-operators*) steps)
                           (setf *macroexpand-scope* (cons macro-defs *macroexpand-scope*))
-                          (dolist (def macro-defs)
-                            (setf (gethash (car def) *macros*)
-                                  (%eval-macrolet-expander (cadr def) (cddr def))))
-                          (setf *lexical-operators* (%macrolet-lexical-operators macro-defs))
+                          (setf *lexical-operators* (%walk-macrolet-lexical-operators macro-defs))
                           (dolist (form (cddr e))
                             (push (cons form in-lambda) steps))
                           (run steps mdepth nil)))
@@ -1418,7 +1404,11 @@
     ("Runtime.RoundOp"      . "Runtime.RoundOpPrimary")
     ;; A written (VALUES A B), which is what the tail of every two-value function
     ;; is. In single-value position it is the same call pair as the entries above.
-    ("Runtime.Values2"      . "Runtime.Values2Primary"))
+    ("Runtime.Values2"      . "Runtime.Values2Primary")
+    ("Runtime.FindSymbolMv" . "Runtime.FindSymbolPrimary")
+    ("Runtime.InternMv"     . "Runtime.InternPrimary")
+    ("Runtime.ReadLineMv"   . "Runtime.ReadLinePrimary")
+    ("Runtime.SubtypepMv"   . "Runtime.SubtypepPrimary"))
   "Runtime entries that return two values, paired with an entry that returns only
    the primary. The peephole (P12) swaps in the second when the call is followed
    by Runtime.UnwrapMv, i.e. when the call site is in single-value position.
@@ -1437,7 +1427,11 @@
     ("Runtime.TruncateOp"   . "Runtime.TruncateOpPair")
     ("Runtime.CeilingOp"    . "Runtime.CeilingOpPair")
     ("Runtime.RoundOp"      . "Runtime.RoundOpPair")
-    ("Runtime.Values2"      . "Runtime.Values2Pair"))
+    ("Runtime.Values2"      . "Runtime.Values2Pair")
+    ("Runtime.FindSymbolMv" . "Runtime.FindSymbolL")
+    ("Runtime.InternMv"     . "Runtime.InternSymbolV")
+    ("Runtime.ReadLineMv"   . "Runtime.ReadLine")
+    ("Runtime.SubtypepMv"   . "Runtime.SubtypepPair"))
   "The same entries as +MV-PRIMARY-TWINS+, paired with an entry that publishes
    both values in the thread state and returns the primary without an MvReturn.
    P13 swaps it in when the next instruction reads the values out of the thread
@@ -1473,6 +1467,8 @@
                                           ; store result is dead: pop the raw r8
                                           ; instead. (Float-array setf in
                                           ; statement position.)
+     P7c (:ldc-i8 K) (:call \"Fixnum.Make\") -> (:load-const K)  ; K outside
+                                          ; the small-integer cache
      P8  (:newobj \"LispString\") (:pop)  ->  (:pop)    ; string sibling of P6
      P9  (:ldstr S) (:pop)              -> {}          ; dead string constant.
                                           ; P8+P9 compose to delete a string
@@ -1615,6 +1611,28 @@
                (setf changed t)
                (push i1 out)
                (setf cur (cddr cur)))
+              ;; P14: an int64 masked to its low 8 / 16 / 32 bits by zero
+              ;; extension: 2 bytes of IL where ldc.i8 and AND take 10.
+              ((and (consp i1) (eq (car i1) :ldc-i8)
+                    (member (cadr i1) '(255 65535 4294967295))
+                    (consp i2) (eq (car i2) :and) (null (cdr i2)))
+               (setf changed t)
+               (push (list (case (cadr i1) (255 :conv-u1) (65535 :conv-u2) (t :conv-u4))) out)
+               (push (list :conv-u8) out)
+               (setf cur (cddr cur)))
+              ;; P7c: box a literal outside Fixnum.Make's cache: a load of the
+              ;; constant instead of an allocation on every execution. Not when
+              ;; the next instruction lets P5 / P7 / P10 drop the box.
+              ((and (consp i1) (eq (car i1) :ldc-i8) (integerp (cadr i1))
+                    (not (<= -128 (cadr i1) 65535))
+                    (consp i2) (eq (car i2) :call) (equal (cadr i2) "Fixnum.Make")
+                    (not (and (consp i3)
+                              (or (member (car i3) '(:pop :unbox-fixnum))
+                                  (and (eq (car i3) :call)
+                                       (equal (cadr i3) "Runtime.UnwrapMv"))))))
+               (setf changed t)
+               (push (list :load-const (cadr i1)) out)
+               (setf cur (cddr cur)))
               ;; P8: wrap a raw string only to discard it. The LispString ctor is
               ;; pure, so drop the newobj and pop the raw string instead.
               ((and (consp i1) (eq (car i1) :newobj) (equal (cadr i1) "LispString")
@@ -1737,11 +1755,114 @@
   ;; its own physical slot (a coalesced slot would host several source vars over
   ;; its lifetime, which a method-wide PDB LocalVariable name can't represent).
   ;; The classic "debug builds don't reuse slots" tradeoff. Peephole still runs.
-  (peephole-optimize
-   (%hoist-loop-mv-resets
-    (if *emit-source-lines*
-        (elide-unused-rest-list instrs)
-        (%merge-disjoint-locals (elide-unused-rest-list instrs))))))
+  (%thread-binding-stack
+   (peephole-optimize
+    (%hoist-loop-mv-resets
+     (if *emit-source-lines*
+         (elide-unused-rest-list instrs)
+         (%merge-disjoint-locals (elide-unused-rest-list instrs)))))))
+
+(defparameter +binding-stack-calls+
+  '(("DynamicBindings.Get" . "DynamicBindings.GetOn")
+    ("DynamicBindings.SetChecked" . "DynamicBindings.SetCheckedOn")
+    ("DynamicBindings.Push" . "DynamicBindings.PushOn")
+    ("DynamicBindings.Pop" . "DynamicBindings.PopOn")
+    ("DynamicBindings.BindDepth" . "DynamicBindings.BindDepthOn")
+    ("DynamicBindings.UnbindTo" . "DynamicBindings.UnbindToOn"))
+  "Binding stack operations, each paired with the entry that takes the thread's
+   stack as its last argument.")
+
+(defvar *bound-special-loads* (make-hash-table :test #'equal :synchronized t)
+  "The symbol loads (SIL forms) of the special variables that a body compiled
+   so far binds.")
+
+(defun %sym-load-p (i)
+  (and (consp i) (member (car i) '(:load-sym :load-sym-pkg :load-const))))
+
+(defun %note-bound-specials (instrs)
+  "Record the variables bound by the body: each bind is the symbol load, a
+   castclass, the value from a local and the push."
+  (let (p1 p2 p3)
+    (dolist (i instrs)
+      (when (and (consp i) (eq (car i) :call) (equal (cadr i) "DynamicBindings.Push")
+                 (consp p1) (eq (car p1) :ldloc)
+                 (equal p2 '(:castclass "Symbol"))
+                 (%sym-load-p p3))
+        (setf (gethash p3 *bound-special-loads*) t))
+      (setq p3 p2 p2 p1 p1 i))))
+
+(defun %lazy-bound-special-access (instrs)
+  "Read or SETQ of a variable some compiled body binds: through the stack in a
+   new local, fetched at the first such access. Returns the new instructions
+   and the local, or NIL when there is no such access."
+  (let (p1 p2 p3 out st)
+    (dolist (i instrs)
+      (let ((lazy (and (consp i) (eq (car i) :call)
+                       (cond ((and (equal (cadr i) "DynamicBindings.Get")
+                                   (equal p1 '(:castclass "Symbol"))
+                                   (gethash p2 *bound-special-loads*))
+                              "DynamicBindings.GetLazy")
+                             ((and (equal (cadr i) "DynamicBindings.SetChecked")
+                                   (consp p1) (eq (car p1) :ldloc)
+                                   (equal p2 '(:castclass "Symbol"))
+                                   (gethash p3 *bound-special-loads*))
+                              "DynamicBindings.SetCheckedLazy")))))
+        (cond (lazy
+               (unless st (setq st (gen-local "DSTACK")))
+               (push `(:ldloca ,st) out)
+               (push `(:call ,lazy) out))
+              (t (push i out))))
+      (setq p3 p2 p2 p1 p1 i))
+    (if st (values (nreverse out) st) (values instrs nil))))
+
+(defun %binding-stack-body-start (body)
+  "Position after the parameter stores and the value-mode read, which must stay
+   the body's first call (CilAssembler.BodyReadsMvMode)."
+  (let ((k 0))
+    (loop
+      (let ((i (nth k body)) (next (nth (1+ k) body)))
+        (cond ((and (consp i) (member (car i) '(:declare-local :line)))
+               (incf k))
+              ((and (consp i) (consp next) (eq (car next) :stloc)
+                    (or (eq (car i) :ldarg)
+                        (and (eq (car i) :call)
+                             (equal (cadr i) "MultipleValues.TakeMode"))))
+               (incf k 2))
+              (t (return k)))))))
+
+(defun %thread-binding-stack (instrs)
+  "When a function body binds a special variable, fetch the thread's binding
+   stack once at its start and hand it to every binding operation in the body,
+   which otherwise reads the thread-static at each one. A body that binds
+   nothing reads and SETQs the variables some compiled body binds through a
+   stack fetched at the first such access; other variables keep the global
+   value's inline path. Only the body's own instructions: a closure body
+   nested in it is another method."
+  (if (find-if (lambda (i)
+                 (and (consp i) (eq (car i) :call)
+                      (equal (cadr i) "DynamicBindings.Push")))
+               instrs)
+      (let* ((st (gen-local "DSTACK"))
+             (body (loop for i in instrs
+                         for twin = (and (consp i) (eq (car i) :call) (stringp (cadr i))
+                                         (cdr (assoc (cadr i) +binding-stack-calls+
+                                                     :test #'string=)))
+                         if twin append `((:ldloc ,st) (:call ,twin))
+                         else collect i))
+             (n (%binding-stack-body-start body)))
+        (%note-bound-specials instrs)
+        `(,@(subseq body 0 n)
+          (:declare-local ,st "BindingStack")
+          (:call "DynamicBindings.Here")
+          (:stloc ,st)
+          ,@(nthcdr n body)))
+      (multiple-value-bind (body st) (%lazy-bound-special-access instrs)
+        (if (not st)
+            instrs
+            (let ((n (%binding-stack-body-start body)))
+              `(,@(subseq body 0 n)
+                (:declare-local ,st "BindingStack")
+                ,@(nthcdr n body)))))))
 
 (defparameter +sil-branch-ops+
   '(:br :brtrue :brfalse :leave :beq :bne :blt :bgt :ble :bge
@@ -1752,20 +1873,30 @@
     :load-const :load-const-cached :load-sym :load-sym-keyword :load-sym-pkg
     :ldnull :pop :dup :ceq :clt :cgt :add :sub :and :or :xor :declare-local
     :unbox-fixnum :castclass :isinst :line :nop
-    :br :brtrue :brfalse :leave :beq :bne :blt :bgt :ble :bge))
+    :mul :div :rem :div-un :rem-un :neg :not :shl :shr :shr-un :cgt-un :clt-un
+    :ldc-r4 :conv-i :conv-i4 :conv-i8 :conv-u :conv-u8 :conv-r8 :conv-r4 :conv-r-un
+    :br :brtrue :brfalse :leave :beq :bne :blt :bgt :ble :bge
+    :bne-un :bge-un :bgt-un :ble-un :blt-un))
 
 (defparameter +mv-quiet-calls+
-  '("ConditionSystem.PollInterrupt" "MultipleValues.Reset" "Runtime.IsTruthy"
+  '("ConditionSystem.PollInterrupt" "MultipleValues.Reset" "MultipleValues.ResetOnExit"
+    "Runtime.IsTruthy"
     "Runtime.Car" "Runtime.Cdr" "Runtime.Primary" "Runtime.UnwrapMv"
     "Fixnum.Make" "Runtime.AddFixnumChecked" "Runtime.IsTrueEq" "Runtime.IsTrueEql"
     "Runtime.IsTrueConsp" "Runtime.IsTrueAtom" "Runtime.IsTrueListp"
-    "Runtime.IsTrueSymbolp" "Runtime.Endp" "Runtime.IsTrueEndp" "Runtime.IsNotNil"))
+    "Runtime.IsTrueSymbolp" "Runtime.Endp" "Runtime.IsTrueEndp" "Runtime.IsNotNil"
+    "Runtime.IsNilObj" "Runtime.IsConsObject" "Runtime.IsAtomObject" "Runtime.IsListObject"))
 
 (defun %mv-quiet-instr-p (x)
   (and (consp x)
        (or (member (car x) +mv-quiet-ops+)
+           (and (eq (car x) :newobj)
+                (member (cadr x) '("DoubleFloat" "SingleFloat") :test #'equal))
            (and (eq (car x) :call)
-                (member (cadr x) +mv-quiet-calls+ :test #'equal)))))
+                (or (member (cadr x) +mv-quiet-calls+ :test #'equal)
+                    (let ((name (cadr x)))
+                      (and (stringp name) (> (length name) 5)
+                           (string= name "Math." :end1 5))))))))
 
 (defun %hoist-loop-mv-resets (instrs)
   "A loop whose instructions can neither publish values nor run user code
@@ -2165,26 +2296,14 @@
 
 (defun %uv-macrolet (form env)
   (let* ((defs (if (listp (cadr form)) (cadr form) '()))
-         (saved (mapcar (lambda (d) (cons (car d) (gethash (car d) *macros*)))
-                        (remove-if-not (lambda (d) (and (consp d) (symbolp (car d)))) defs)))
          (*macroexpand-scope* *macroexpand-scope*)
          (*lexical-operators* *lexical-operators*))
     (dolist (d defs)
       (when (and (consp d) (consp (cdr d)))
         (%uv-lambda (cadr d) (cddr d) '() d t)))
-    (unwind-protect
-         (progn
-           (setf *macroexpand-scope* (cons defs *macroexpand-scope*))
-           (dolist (d defs)
-             (when (and (consp d) (symbolp (car d)) (consp (cdr d)))
-               (setf (gethash (car d) *macros*)
-                     (%eval-macrolet-expander (cadr d) (cddr d)))))
-           (setf *lexical-operators* (%macrolet-lexical-operators defs))
-           (%uv-body (cddr form) env '() nil))
-      (dolist (s saved)
-        (if (cdr s)
-            (setf (gethash (car s) *macros*) (cdr s))
-            (remhash (car s) *macros*))))))
+    (setf *macroexpand-scope* (cons defs *macroexpand-scope*))
+    (setf *lexical-operators* (%walk-macrolet-lexical-operators defs))
+    (%uv-body (cddr form) env '() nil)))
 
 (defun %uv-symbol-macrolet (form env)
   (let ((inner env) (sms '()))
@@ -2340,6 +2459,7 @@
         (*mv-exit-cleanup* nil)
         (*macroexpand-scope* '())
         (*macroexpand-cache* (list nil))
+        (*macrolet-expanders* (list nil))
         (*fold-call-memo* (list nil))
         (*bmr-cache* (make-hash-table :test #'eq))
         (*ffv-free-cache* (list nil))
@@ -2389,6 +2509,7 @@
         (*mv-exit-cleanup* nil)
         (*macroexpand-scope* '())
         (*macroexpand-cache* (list nil))
+        (*macrolet-expanders* (list nil))
         (*fold-call-memo* (list nil))
         (*bmr-cache* (make-hash-table :test #'eq))
         (*ffv-free-cache* (list nil))
@@ -2396,5 +2517,6 @@
         ;; Code EVAL (or COMPILE) runs now, also when a macro calls it while
         ;; COMPILE-FILE compiles a top level form: its LOAD-TIME-VALUE forms
         ;; belong to it, not to the fasl being written.
-        (*ltv-hoisted* nil))
+        (*ltv-hoisted* nil)
+        (*ltv-eval-now* t))
     (%close-toplevel-segments (compile-expr expr))))

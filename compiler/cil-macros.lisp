@@ -345,11 +345,13 @@ quietly took every typed slot back off the raw path."
   (let ((cs (remove nil checks)))
     (if cs `(progn ,@cs ,body) body)))
 
-(defun %register-struct-info (name parent conc-prefix base-offset slots)
+(defun %register-struct-info (name parent conc-prefix base-offset slots
+                              &optional accessors)
   "Re-register struct info at load time (called from eval-when in defstruct expansion)."
   (setf (gethash name *struct-info*)
         (list :slots slots
               :parent parent
+              :accessors accessors
               :conc-prefix conc-prefix
               :type-option nil
               :named-p nil
@@ -434,6 +436,10 @@ quietly took every typed slot back off the raw path."
   "Maps accessor symbol to slot index (integer) for compile-time inlining.
    Only populated for standard (non-typed) structs.")
 
+(defvar *struct-accessor-owners* (make-hash-table :test #'eq :synchronized t)
+  "Maps a standard structure's accessor symbol to the structure name its
+   object is checked against.")
+
 (defvar *struct-raw-layouts* (make-hash-table :test #'eq :synchronized t)
   "Structure name -> (VERSION . LAYOUT) for the structures that have raw slot
    storage, where LAYOUT is one (RAW-POSITION . KIND) per slot in slot order
@@ -476,7 +482,7 @@ quietly took every typed slot back off the raw path."
     (if (or (symbolp value) (constantp value))
         (%with-slot-checks
          (list (%slot-check-stmt value slot sname))
-         `(%struct-set ,(cadr place) ,raw-index ,value))
+         `(%struct-set ,(cadr place) ,raw-index ,value ',sname))
         (let ((tmp (gensym "V")))
           `(let ((,tmp ,value))
              ;; A raw slot holds an int64, so the temporary holds one too.
@@ -493,7 +499,7 @@ quietly took every typed slot back off the raw path."
              ,@(unless (eql (%slot-raw-kind slot) 3)
                  (remove nil
                          (list (%slot-check-stmt tmp slot sname))))
-             (%struct-set ,(cadr place) ,raw-index ,tmp)
+             (%struct-set ,(cadr place) ,raw-index ,tmp ',sname)
              ,tmp)))))
 
 (defun %register-standard-struct-accessor (acc raw-index slot sname)
@@ -502,6 +508,7 @@ quietly took every typed slot back off the raw path."
    for SETF. A read-only slot is read like any other, so its reads inline too;
    it only has no SETF expansion."
   (setf (gethash acc *struct-accessors*) raw-index)
+  (setf (gethash acc *struct-accessor-owners*) sname)
   (let ((ty (getf (cddr slot) :type)))
     (if ty
         (setf (gethash acc *struct-accessor-types*) ty)
@@ -538,6 +545,7 @@ quietly took every typed slot back off the raw path."
   (loop for acc in accessor-names
         for s in slots
         for i from 0
+        when acc
         do (%register-standard-struct-accessor
             acc (%pack-slot-index i version) s name)))
 
@@ -571,11 +579,41 @@ quietly took every typed slot back off the raw path."
    GF's SimpleReaderSlot flag at runtime, so a stale/over-broad entry only costs a
    wrapper call, never correctness.")
 
+(defvar *gf-call-names* (make-hash-table :test #'eq :synchronized t)
+  "Symbols named by DEFGENERIC / DEFMETHOD: a compile-time hint that a one-argument
+   call of the name calls a generic function, so compile-named-call emits a call
+   site cache (:GF-IC1). The cache checks at run time that it holds the function
+   the name calls.")
+
 (defvar *clos-accessor-writers* (make-hash-table :test #'eq :synchronized t)
   "Set of symbols named by DEFCLASS :writer/:accessor; the writer twin of
    *clos-accessor-readers*. A compile-time HINT that ((setf NAME) newval obj) is likely a
    simple slot write, so compile-named-call emits the Runtime.WriterIC inline cache.
    Only a hint: WriterIC re-checks the GF's SimpleWriterSlot flag at run time.")
+
+(defun %load-clos-accessors (readers writers)
+  "The load-time half of %CLOS-ACCESSORS-PROCLAMATION."
+  (dolist (r readers) (when (and r (symbolp r)) (setf (gethash r *clos-accessor-readers*) t)))
+  (dolist (w writers) (when (and w (symbolp w)) (setf (gethash w *clos-accessor-writers*) t))))
+
+(defun %load-gf-call-names (names)
+  "The load-time half of %GF-CALL-NAMES-PROCLAMATION."
+  (dolist (n names) (when (and n (symbolp n)) (setf (gethash n *gf-call-names*) t))))
+
+(defun %gf-call-names-proclamation (name)
+  "Under COMPILE-FILE, the form that marks NAME in *GF-CALL-NAMES* again when the
+   fasl is loaded. NIL elsewhere."
+  (when (and name (symbolp name) *compile-file-mode* (not *cross-compiling*))
+    `(proclaim '(%gf-call-names ,name))))
+
+(defun %clos-accessors-proclamation (readers writers)
+  "Under COMPILE-FILE, the form that registers the DEFCLASS reader and writer
+   hints again when the fasl is loaded, so that code compiled later in an image
+   that loaded the fasl gets the same call-site caches. NIL elsewhere."
+  (let ((readers (remove-if-not #'symbolp readers))
+        (writers (remove-if-not #'symbolp writers)))
+    (when (and *compile-file-mode* (not *cross-compiling*) (or readers writers))
+      `(proclaim '(%clos-accessors ,readers ,writers)))))
 
 (defvar *setf-expansion-fns* (make-hash-table :test #'equal :synchronized t)
   "DEFINE-SETF-EXPANDER entries: accessor-name-string -> (lambda (place) -> 5 values)")
@@ -1969,25 +2007,40 @@ quietly took every typed slot back off the raw path."
           `(%simd-store ,(car place) ,@(cdr place) ,value))))
 
 ;;; --- %induction-next ---
-;;; The step of a counting loop's variable, (%INDUCTION-NEXT VAR DELTA): VAR plus
-;;; DELTA. It is an ordinary addition; the name is what lets the compiler tell
-;;; the macro's own step from any other assignment of VAR when it checks an
-;;; %INDUCTION declaration (see %INDUCTION-RANGE).
+;;; The step of a counting loop's variable, (%INDUCTION-NEXT VAR DELTA [EXIT]):
+;;; VAR plus DELTA, where DELTA is an integer, a variable V, or (- V). It is an
+;;; ordinary addition; the name is what lets the compiler tell the macro's own
+;;; step from any other assignment of VAR when it checks an %INDUCTION
+;;; declaration (see %INDUCTION-RANGE). EXIT, when present, is the form that
+;;; leaves the loop: where the compiler has given VAR an int64 slot whose last
+;;; step may leave int64, it evaluates EXIT instead of storing a sum that has
+;;; passed every limit the end test can compare with.
 (setf (gethash '%induction-next *macros*)
       (lambda (form)
         (let ((var (cadr form)) (delta (caddr form)))
           (cond ((eql delta 1) `(1+ ,var))
                 ((eql delta -1) `(1- ,var))
+                ((and (consp delta) (eq (car delta) '-)) `(- ,var ,(cadr delta)))
                 (t `(+ ,var ,delta))))))
 
-(defun %do-induction (var step end-test)
+(defun %induction-delta-var-p (x var others)
+  (and x (symbolp x) (not (eq x t)) (not (keywordp x))
+       (not (eq x var)) (not (member x others :test #'eq))))
+
+(defun %do-induction (var step end-test &optional exit others)
   "The (%INDUCTION ...) declaration and step form for a DO variable VAR stepped
    by STEP and ended by END-TEST, as two values, or NIL when the shape is not a
    counting one: STEP adds or subtracts a positive integer literal to VAR, and
    END-TEST compares VAR against an integer literal or a variable in the
    direction that ends the loop ((>= VAR L) or (> VAR L) going up, (<= VAR L) or
-   (< VAR L) going down). DO tests before every step, which is what the
-   declaration claims. A step wrapped in THE keeps its THE."
+   (< VAR L) going down), or is (= VAR L) (:UNTIL-EQUAL: the compiler accepts it
+   only when VAR provably reaches L), or is an OR with such a comparison among
+   its clauses. DO tests before every step, which is what
+   the declaration claims. A step wrapped in THE keeps its THE.
+   STEP may also add or subtract a variable V that is none of OTHERS (the DO's
+   variables); the declaration then names V, or (- V), and the direction of the
+   test (:UP or :DOWN), and the compiler checks V's sign. EXIT is the step's
+   exit form (see %INDUCTION-NEXT)."
   (let* ((the-type (and (consp step) (eq (car step) 'the)
                         (consp (cdr step)) (consp (cddr step)) (null (cdddr step))
                         (cadr step)))
@@ -2002,25 +2055,112 @@ quietly took every typed slot back off the raw path."
                           ((and (eq (car step) '+) (= (length step) 3)
                                 (eq (caddr step) var)
                                 (integerp (cadr step)) (plusp (cadr step)))
+                           (cadr step))
+                          ((and (member (car step) '(+ -)) (= (length step) 3)
+                                (eq (cadr step) var)
+                                (%induction-delta-var-p (caddr step) var others))
+                           (if (eq (car step) '+) (caddr step) `(- ,(caddr step))))
+                          ((and (eq (car step) '+) (= (length step) 3)
+                                (eq (caddr step) var)
+                                (%induction-delta-var-p (cadr step) var others))
+                           (cadr step)))))
+         (var-delta (and delta (not (integerp delta))))
+         (end-test (flet ((counting-test-p (c)
+                            (and (consp c) (= (length c) 3)
+                                 (eq (cadr c) var)
+                                 (let ((l (caddr c)))
+                                   (or (integerp l)
+                                       (and l (symbolp l) (not (eq l t)) (not (keywordp l))
+                                            (not (eq l var)))))
+                                 (cond (var-delta (member (car c) '(>= > <= <)))
+                                       ((eq (car c) '=) t)
+                                       ((plusp delta) (member (car c) '(>= >)))
+                                       (t (member (car c) '(<= <)))))))
+                     (cond ((not delta) nil)
+                           ((counting-test-p end-test) end-test)
+                           ;; (OR ... (> VAR L) ...) ends the loop at the latest
+                           ;; where the comparison alone would.
+                           ((and (consp end-test) (eq (car end-test) 'or))
+                            (find-if #'counting-test-p (cdr end-test)))))))
+    (when end-test
+      (let ((next (if exit
+                      `(%induction-next ,var ,delta ,exit)
+                      `(%induction-next ,var ,delta))))
+        (values `(%induction ,var ,delta ,(caddr end-test)
+                             ,(if (member (car end-test) '(> <)) t nil)
+                             ,@(when (eq (car end-test) '=) '(:until-equal))
+                             ,@(when var-delta
+                                 (if (member (car end-test) '(> >=)) '(:up) '(:down))))
+                (if the-type `(the ,the-type ,next) next))))))
+
+(defun %do-companion-step (var step)
+  "For a DO variable VAR stepped by STEP alongside a counting variable: the
+   (%INDUCTION-COMPANION VAR DELTA) declaration part and the marked step, as
+   two values, when STEP adds or subtracts an integer literal to VAR; else NIL."
+  (let ((delta (and (consp step)
+                    (cond ((and (eq (car step) '1+) (eq (cadr step) var) (null (cddr step))) 1)
+                          ((and (eq (car step) '1-) (eq (cadr step) var) (null (cddr step))) -1)
+                          ((and (member (car step) '(+ -)) (= (length step) 3)
+                                (eq (cadr step) var)
+                                (integerp (caddr step)) (/= (caddr step) 0))
+                           (if (eq (car step) '+) (caddr step) (- (caddr step))))
+                          ((and (eq (car step) '+) (= (length step) 3)
+                                (eq (caddr step) var)
+                                (integerp (cadr step)) (/= (cadr step) 0))
                            (cadr step))))))
-    (when (and delta
-               (consp end-test) (= (length end-test) 3)
-               (eq (cadr end-test) var)
-               (let ((l (caddr end-test)))
-                 (or (integerp l)
-                     (and l (symbolp l) (not (eq l t)) (not (keywordp l)) (not (eq l var)))))
-               (if (plusp delta)
-                   (member (car end-test) '(>= >))
-                   (member (car end-test) '(<= <))))
-      (values `(%induction ,var ,delta ,(caddr end-test)
-                           ,(if (member (car end-test) '(> <)) t nil))
-              (if the-type
-                  `(the ,the-type (%induction-next ,var ,delta))
-                  `(%induction-next ,var ,delta))))))
+    (when delta
+      (values delta `(%induction-next ,var ,delta)))))
+
+;;; --- %induction-version ---
+;;; (%INDUCTION-VERSION V SIGN TYPED GENERIC): two expansions of one DO whose
+;;; counting variable is stepped by the variable V. TYPED counts only when V has
+;;; SIGN (:NONNEG or :NONPOS) for the whole loop; the compiler chooses between
+;;; them by V's sign at entry (COMPILE-INDUCTION-VERSION). Anything else takes
+;;; GENERIC. (%INDUCTION-SIGNED V SIGN FORM) is FORM, compiled knowing V's sign.
+(setf (gethash '%induction-version *macros*)
+      (lambda (form) (fifth form)))
+(setf (gethash '%induction-signed *macros*)
+      (lambda (form) (fourth form)))
 
 ;;; --- do ---
+(defun %form-size-within-p (x budget)
+  "True when X has at most BUDGET conses (QUOTE not entered)."
+  (let ((n budget))
+    (labels ((walk (x)
+               (when (and (consp x) (not (eq (car x) 'quote)))
+                 (when (minusp (decf n)) (return-from %form-size-within-p nil))
+                 (walk (car x))
+                 (walk (cdr x)))))
+      (walk x)
+      t)))
+
 (setf (gethash 'do *macros*)
       (lambda (form)
+        ;; A counting variable stepped by a variable V counts the way its end
+        ;; test goes only for one sign of V. The compiler picks the copy by
+        ;; V's sign (%INDUCTION-VERSION); the other copy does not count.
+        (multiple-value-bind (exp vdelta) (%expand-do form t)
+          (cond ((null vdelta) exp)
+                ((%form-size-within-p (cdddr form) 400)
+                 `(%induction-version ,(car vdelta) ,(cdr vdelta) ,exp
+                                      ,(%expand-do form nil)))
+                (t (%expand-do form nil))))))
+
+(defun %do-delta-sign (decl)
+  "(V . SIGN) for an (%INDUCTION VAR DELTA LIMIT INCLUSIVE-P ... :UP|:DOWN)
+   declaration DECL whose DELTA is V or (- V); else NIL."
+  (let ((delta (third decl)))
+    (when (and decl (not (integerp delta)))
+      (let ((up (member :up decl))
+            (neg (consp delta)))
+        (cons (if neg (cadr delta) delta)
+              (if (eq (and up t) (not neg)) :nonneg :nonpos))))))
+
+(defun %expand-do (form var-delta-p)
+  "The expansion of the DO FORM, and, when its counting variable is stepped by
+   a variable V (only when VAR-DELTA-P), (V . SIGN): SIGN is :NONNEG or
+   :NONPOS, the sign of V for which the variable goes the way the end test
+   ends it."
         ;; (do ((var init step) ...) (end-test result...) body...)
         ;; var-clause can be: (var init step), (var init), (var), or bare var
         (let* ((var-clauses (mapcar (lambda (vc) (if (symbolp vc) (list vc nil) vc))
@@ -2043,18 +2183,42 @@ quietly took every typed slot back off the raw path."
                ;; compiler to bound, and stepped by its own marked form. Its
                ;; step reads only itself, so it needs no temporary.
                (ind-decl nil)
-               (ind-var nil))
+               (ind-var nil)
+               (comp-vars nil)
+               (comp-decls nil))
           (loop for v in vars for s in steps for hs in has-step
                 when (and hs (not ind-var))
-                  do (multiple-value-bind (decl next) (%do-induction v s end-test)
+                  do (multiple-value-bind (decl next)
+                         (%do-induction v s end-test
+                                        ;; The exit a step past int64 takes,
+                                        ;; when nothing after the loop reads V.
+                                        (unless (%tree-mentions-p result-forms (list v))
+                                          `(return ,(if result-forms
+                                                        `(progn ,@result-forms)
+                                                        nil)))
+                                        vars)
+                       (when (and decl (not var-delta-p) (not (integerp (third decl))))
+                         (setq decl nil))
                        (when decl
                          (setq ind-decl decl ind-var v)
                          (setq steps (substitute next s steps :count 1 :test #'eq)))))
+          ;; A variable stepped by a literal alongside the counting one takes
+          ;; as many steps, so it is bounded too (%INDUCTION-COMPANION-RANGE).
+          ;; Its step reads only itself as well.
+          (when ind-var
+            (loop for v in vars for s in steps for hs in has-step
+                  when (and hs (not (eq v ind-var)) (not (member v comp-vars)))
+                    do (multiple-value-bind (delta next) (%do-companion-step v s)
+                         (when delta
+                           (push v comp-vars)
+                           (push `(%induction-companion ,v ,delta ,ind-var) comp-decls)
+                           (setq steps (substitute next s steps :count 1 :test #'eq))))))
+          (values
           (multiple-value-bind (decls real-body) (extract-declarations body)
             `(block nil
                (let ,(loop for v in vars for i in inits collect (list v i))
                  ,@(when vars `((declare (ignorable ,@vars))))
-                 ,@(when ind-decl `((declare ,ind-decl)))
+                 ,@(when ind-decl `((declare ,ind-decl ,@(reverse comp-decls))))
                  ,@decls
                  (tagbody
                   ,loop-tag
@@ -2075,24 +2239,32 @@ quietly took every typed slot back off the raw path."
                                          for s in steps
                                          for hs in has-step
                                          for tmp in temps
-                                         when (and hs (not (eq v ind-var)))
+                                         when (and hs (not (eq v ind-var))
+                                                   (not (member v comp-vars)))
                                            collect `(,tmp ,s))
                                ,@(let ((tds (loop for v in vars
                                                   for hs in has-step
                                                   for tmp in temps
-                                                  when (and hs (not (eq v ind-var)))
+                                                  when (and hs (not (eq v ind-var))
+                                                            (not (member v comp-vars)))
                                                   append (%step-temp-type-decls
                                                           decls v tmp))))
                                    (when tds `((declare ,@tds))))
+                               ;; The counting variable last: its step
+                               ;; may leave the loop, after the others.
                                ,@(loop for v in vars
                                         for s in steps
                                         for hs in has-step
                                         for tmp in temps
-                                        when hs
-                                          collect (if (eq v ind-var)
+                                        when (and hs (not (eq v ind-var)))
+                                          collect (if (member v comp-vars)
                                                       `(setq ,v ,s)
-                                                      `(setq ,v ,tmp))))))))
-                  (go ,loop-tag))))))))
+                                                      `(setq ,v ,tmp)))
+                               ,@(when ind-var
+                                   `((setq ,ind-var
+                                           ,(nth (position ind-var vars) steps)))))))))
+                  (go ,loop-tag)))))
+          (%do-delta-sign ind-decl))))
 
 ;;; --- do* ---
 (setf (gethash 'do* *macros*)
@@ -2322,12 +2494,13 @@ quietly took every typed slot back off the raw path."
             (let ((fx (gensym "FX")) (ft (gensym "FT"))
                   (fop (car (find (car value-form) +float-round-ops+ :key #'second)))
                   (ty (if (eq kind :single) 'single-float 'double-float)))
-              `(let* ((,fx ,(cadr value-form))
-                      (,ft (,fop ,fx)))
-                 (declare (type ,ty ,fx ,ft))
-                 (let* ((,(first vars) (,(car value-form) ,ft))
-                        (,(second vars) (- ,fx (+ ,ft ,(if (eq kind :single) 0f0 0d0)))))
-                   ,@body))))))))
+              `(let ((,fx ,(cadr value-form)))
+                 (declare (type ,ty ,fx))
+                 (let ((,ft (,fop ,fx)))
+                   (declare (type ,ty ,ft))
+                   (let ((,(first vars) (,(car value-form) ,ft))
+                         (,(second vars) (- ,fx (+ ,ft ,(if (eq kind :single) 0f0 0d0)))))
+                     ,@body)))))))))
 
 ;;; --- dotcl:async / dotcl:await (step B) ---------------------------
 ;;; (dotcl:async BODY...) CPS-transforms BODY into a chain of dotcl:%async-bind /
@@ -3137,6 +3310,22 @@ quietly took every typed slot back off the raw path."
                                            slots))
                ;; All accessor names in order (inherited first, then own)
                (accessor-names (append (or include-accessor-names nil) own-accessor-names))
+               ;; An inherited slot whose accessor name is already an ancestor's
+               ;; accessor of that slot keeps the ancestor's definition, as in
+               ;; SBCL; redefining it would reject the ancestor's other children.
+               (inherited-accessor-p
+                 (loop for acc in accessor-names
+                       for s in all-slots
+                       for i from 0
+                       collect (and (null type-option)
+                                    (< i n-include-slots)
+                                    (loop for anc = include-name
+                                            then (getf info :parent)
+                                          for info = (and anc (gethash anc *struct-info*))
+                                          while info
+                                          thereis (let ((p (position (car s) (getf info :slots)
+                                                                     :key #'car)))
+                                                    (and p (eq acc (nth p (getf info :accessors)))))))))
                ;; A slot named P under the default conc-name gives an accessor with
                ;; the same name as the default predicate. ANSI does not say which
                ;; wins; SBCL keeps the accessor and warns, so we do the same.
@@ -3166,7 +3355,8 @@ quietly took every typed slot back off the raw path."
                 for idx in slot-indices
                 for s in all-slots
                 for i from 0
-                unless (and type-option (getf (cddr s) :read-only))
+                for inherited in inherited-accessor-p
+                unless (or inherited (and type-option (getf (cddr s) :read-only)))
                 do (if (null type-option)
                        ;; The index a call site emits carries the layout
                        ;; version with it, so a caller compiled against an
@@ -3193,6 +3383,7 @@ quietly took every typed slot back off the raw path."
           (setf (gethash name *struct-info*)
                 (list :slots (mapcar #'copy-list all-slots)
                       :parent include-name
+                      :accessors accessor-names
                       :conc-prefix conc-prefix
                       :type-option type-option
                       :named-p named-p
@@ -3230,13 +3421,21 @@ quietly took every typed slot back off the raw path."
                      ;; inherit correct defaults.
                      (dotcl.cil-compiler::%register-struct-info
                        ',name ',(or include-name nil) ',conc-prefix ',base-offset
-                       ',(mapcar #'copy-list all-slots))
+                       ',(mapcar #'copy-list all-slots)
+                       ;; Not in the cross-compiled core: quoting the accessor
+                       ;; names there interns them in DOTCL-INTERNAL, which
+                       ;; shadows the compiler's functions of the same names.
+                       ,@(unless *cross-compiling* `(',accessor-names)))
                      )
                    ;; Load time only: what this expansion recorded about the
                    ;; accessors, for an image that loads the fasl without
                    ;; having expanded the DEFSTRUCT.
                    ,@(let ((form (%struct-accessors-proclamation
-                                  name struct-version accessor-names all-slots)))
+                                  name struct-version
+                                  (loop for acc in accessor-names
+                                        for inherited in inherited-accessor-p
+                                        collect (if inherited nil acc))
+                                  all-slots)))
                        (when form (list form)))
                    ;; Which slots are stored raw. Emitted only when at least
                    ;; one qualifies, so a structure that never used :TYPE
@@ -3370,10 +3569,12 @@ quietly took every typed slot back off the raw path."
                      for acc in accessor-names
                      for idx in slot-indices
                      for i from 0
+                     for inherited in inherited-accessor-p
+                     unless inherited
                      collect (cond
                                ((null type-option)
                                 `(defun ,acc (obj)
-                                   (%struct-ref obj ,(%pack-slot-index i struct-version))))
+                                   (%struct-ref obj ,(%pack-slot-index i struct-version) ',name)))
                                ((eq type-option 'list)
                                 `(defun ,acc (obj) (nth ,idx obj)))
                                (t
@@ -3389,12 +3590,13 @@ quietly took every typed slot back off the raw path."
                      for acc in accessor-names
                      for idx in slot-indices
                      for i from 0
-                     unless (getf (cddr s) :read-only)
+                     for inherited in inherited-accessor-p
+                     unless (or inherited (getf (cddr s) :read-only))
                      collect (cond
                                ((null type-option)
                                 `(defun (setf ,acc) (value obj)
                                    ,@(remove nil (list (%slot-check-stmt 'value s name)))
-                                   (%struct-set obj ,(%pack-slot-index i struct-version) value)
+                                   (%struct-set obj ,(%pack-slot-index i struct-version) value ',name)
                                    value))
                                ((eq type-option 'list)
                                 `(defun (setf ,acc) (value obj) (setf (nth ,idx obj) value)))
@@ -3852,6 +4054,12 @@ quietly took every typed slot back off the raw path."
                  (list default-initargs-form))
              ,@(when class-doc
                  (list `(funcall #'(setf documentation) ,class-doc ',name 'type)))
+             ,@(let ((form (%clos-accessors-proclamation
+                            (loop for ps in parsed-slots
+                                  append (append (fifth ps) (sixth ps)))
+                            (loop for ps in parsed-slots
+                                  append (append (fifth ps) (seventh ps))))))
+                 (when form (list form)))
              ,@accessor-defs
              (find-class ',name)))))
 
@@ -4041,6 +4249,7 @@ quietly took every typed slot back off the raw path."
 (setf (gethash 'defgeneric *macros*)
       (lambda (form)
         (%note-mv-tail-function (cadr form))
+        (when (symbolp (cadr form)) (setf (gethash (cadr form) *gf-call-names*) t))
         ;; (defgeneric name (params...) &optional options...)
         ;; options: (:documentation "..."), (:method-combination ...), (:method qual (params...) body...)
         (let* ((name (cadr form))
@@ -4218,8 +4427,10 @@ quietly took every typed slot back off the raw path."
                                                            :lambda-list ',params)))
                                (%register-gf ',name %new-gf)
                                %new-gf)
-                            ;; No :generic-function-class: reuse existing GF or create standard one.
-                            `(or (%find-gf ',name) (%make-gf ',name ,arity)))))
+                            ;; No :generic-function-class: reuse existing GF or create
+                            ;; standard one, unless another thread registers one first.
+                            `(or (%find-gf ',name)
+                                 (%register-gf-if-absent ',name (%make-gf ',name ,arity))))))
                ;; CLHS: "methods defined by previous defgeneric forms are removed"
                (%clear-defgeneric-inline-methods %gf)
                (%register-gf ',name %gf)
@@ -4270,6 +4481,7 @@ quietly took every typed slot back off the raw path."
                             (%mark-defgeneric-inline-method (%find-gf ',name) %m)
                             %m))
                        method-opts)
+             ,@(let ((form (%gf-call-names-proclamation name))) (when form (list form)))
              (fdefinition ',name)))))
 
 ;;; ---------------------------------------------------------------------------
@@ -4354,8 +4566,9 @@ quietly took every typed slot back off the raw path."
           (lambda (b) (and (consp b) (cdr b) (%next-method-scan (cadr b) depth)))
           (cadr form))
          (%next-method-scan-forms (cddr form) depth)))
-    ((or (macro-function (car form)) (nth-value 1 (gethash (car form) *macros*)))
-     (let ((expander (or (gethash (car form) *macros*)
+    ((or (macro-function (car form)) (%macro-expander-here (car form))
+         (nth-value 1 (gethash (car form) *macros*)))
+     (let ((expander (or (%macro-expander-here (car form))
                          (let ((mf (macro-function (car form))))
                            (and mf (lambda (f) (funcall mf f nil)))))))
        (or (null expander)
@@ -4499,6 +4712,7 @@ quietly took every typed slot back off the raw path."
 (setf (gethash 'defmethod *macros*)
       (lambda (form)
         (%note-mv-tail-function (cadr form))
+        (when (symbolp (cadr form)) (setf (gethash (cadr form) *gf-call-names*) t))
         ;; (defmethod name qualifier* ((param1 class1) param2 ...) body...)
         ;; Qualifiers are the non-NIL atoms before the specialized lambda
         ;; list: none, one (:before, :after, :around, progn, ...) or several
@@ -4670,12 +4884,13 @@ quietly took every typed slot back off the raw path."
                                          (if ignores-next-methods t nil))
                                  ,(and (not *cross-compiling*) docstring))
                 `(progn
-                   ;; Auto-create GF if it doesn't exist. %register-gf installs
-                   ;; both the GF registry entry and sym.Function (so this also
-                   ;; handles extending CL generic functions when CL is locked).
+                   ,@(let ((form (%gf-call-names-proclamation name))) (when form (list form)))
+                   ;; Auto-create GF if it doesn't exist. %register-gf-if-absent
+                   ;; installs both the GF registry entry and sym.Function (so this
+                   ;; also handles extending CL generic functions when CL is
+                   ;; locked), unless another thread registered one first.
                    (if (null (%find-gf ',name))
                        (let ((%gf (%make-gf ',name ,n-params)))
-                         (%register-gf ',name %gf)
                          ;; Auto-created GF takes &key/&rest from the method but NOT
                          ;; specific keyword names: per CLHS, the GF accepts whatever
                          ;; each applicable method accepts (union), so pinning specific
@@ -4685,7 +4900,8 @@ quietly took every typed slot back off the raw path."
                                                    ,(if m-has-rest t nil)
                                                    ,(if m-has-key t nil)
                                                    ,(if m-has-allow-other-keys t nil)
-                                                   nil)))
+                                                   nil)
+                         (%register-gf-if-absent ',name %gf)))
                    ;; defmethod returns the method object (CL spec)
                    (let ((%m (%make-method
                                (list ,@specializers)
@@ -4699,7 +4915,8 @@ quietly took every typed slot back off the raw path."
                                                    ;; The unspecialized lambda list, for
                                                    ;; METHOD-LAMBDA-LIST (AMOP): the list as
                                                    ;; written with each specializer dropped.
-                                                   ',unspec-ll)
+                                                   ',unspec-ll
+                                                   ,(if ignores-next-methods t nil))
                      ;; AMOP: defmethod asks the generic function what class its
                      ;; methods are, and the method is an instance of the answer.
                      (%note-method-class (%find-gf ',name) %m)
@@ -4717,15 +4934,17 @@ quietly took every typed slot back off the raw path."
   (destructuring-bind (n-params req opt rest-p key-p aok-p keyword-names ll
                        &optional ignores-next-methods)
       info
-    ;; Auto-create the GF if it does not exist. %register-gf installs both the
-    ;; GF registry entry and the function (so this also extends CL generic
-    ;; functions while CL is locked). It takes &key/&rest from the method but
+    (%load-gf-call-names (list name))
+    ;; Auto-create the GF if it does not exist and no other thread registers
+    ;; one first. Registering installs both the GF registry entry and the
+    ;; function (so this also extends CL generic functions while CL is
+    ;; locked). It takes &key/&rest from the method but
     ;; not the keyword names: the GF accepts whatever each applicable method
     ;; accepts.
     (when (null (%find-gf name))
       (let ((gf (%make-gf name n-params)))
-        (%register-gf name gf)
-        (%set-gf-lambda-list-info gf req opt rest-p key-p aok-p nil)))
+        (%set-gf-lambda-list-info gf req opt rest-p key-p aok-p nil)
+        (%register-gf-if-absent name gf)))
     (let ((m (%make-method (mapcar #'%specializer-class spec-names)
                            (copy-list qualifiers)
                            fn)))
@@ -5742,6 +5961,86 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
 
 ;;; --- multiple-value-setq (placeholder) ---
 
+(defun %mv-setq-sink (vars form)
+  "FORM, whose values (MULTIPLE-VALUE-SETQ VARS FORM) assigns, with the
+   assignment moved into each VALUES form at its tails: through LET, LET*,
+   PROGN, a BLOCK nothing returns from, IF and COND. A VALUES tail assigns its
+   values from temporaries, another tail is a MULTIPLE-VALUE-SETQ of its own.
+   :FAIL when a binding on the way names one of VARS, or no tail is a VALUES
+   form (nothing to gain)."
+  (let ((found nil))
+    (labels ((mentions-var-p (x)
+               (cond ((symbolp x) (member x vars :test #'eq))
+                     ((consp x) (or (mentions-var-p (car x)) (mentions-var-p (cdr x))))))
+             (fail () (return-from %mv-setq-sink :fail))
+             (tail (f)
+               (cond
+                 ((and (consp f) (eq (car f) 'values) (listp (cdr f)))
+                  (setf found t)
+                  ;; The values past the variables are evaluated for effect only.
+                  (let* ((n (max 1 (min (length vars) (length (cdr f)))))
+                         (temps (loop repeat n collect (gensym "MVT"))))
+                    `(let ,(loop for tmp in temps
+                                 for i from 0
+                                 collect (list tmp (nth i (cdr f))))
+                       ,@(nthcdr n (cdr f))
+                       (setq ,@(loop for v in vars
+                                     for i from 0
+                                     append (list v (if (< i (length (cdr f))) (nth i temps) nil))))
+                       ,(car temps))))
+                 ((and (consp f) (member (car f) '(let let*)) (consp (cdr f)) (listp (cadr f)))
+                  (let ((names (mapcar (lambda (b) (if (consp b) (car b) b)) (cadr f)))
+                        (body (cddr f)))
+                    (when (intersection names vars) (fail))
+                    (let ((decls (loop while (and (consp body) (consp (car body))
+                                                  (eq (caar body) 'declare))
+                                       collect (pop body))))
+                      (when (or (null body) (mentions-var-p decls)) (fail))
+                      `(,(car f) ,(cadr f) ,@decls ,@(butlast body) ,(tail (car (last body)))))))
+                 ((and (consp f) (eq (car f) 'progn) (consp (cdr f)))
+                  `(progn ,@(butlast (cdr f)) ,(tail (car (last f)))))
+                 ((and (consp f) (eq (car f) 'block) (consp (cdr f)) (symbolp (cadr f))
+                       (consp (cddr f)) (not (%block-returns-to-p (cadr f) (cddr f))))
+                  `(block ,(cadr f) ,@(butlast (cddr f)) ,(tail (car (last f)))))
+                 ((and (consp f) (eq (car f) 'if) (<= 3 (length f) 4))
+                  `(if ,(second f) ,(tail (third f)) ,(tail (fourth f))))
+                 ((and (consp f) (eq (car f) 'cond) (not (macrolet-shadowed-p 'cond)))
+                  (let ((clauses (cdr f)))
+                    (if (null clauses)
+                        (tail nil)
+                        (let ((c (car clauses)))
+                          (unless (and (consp c) (consp (cdr c))) (fail))
+                          (if (eq (car c) t)
+                              (tail `(progn ,@(cdr c)))
+                              `(if ,(car c)
+                                   ,(tail `(progn ,@(cdr c)))
+                                   ,(tail `(cond ,@(cdr clauses)))))))))
+                 (t `(multiple-value-setq ,vars ,f)))))
+      (let ((r (tail form)))
+        (if found r :fail)))))
+
+(defun %mv-setq-sink-inline (vars form)
+  "(MULTIPLE-VALUE-SETQ VARS FORM) with FORM a call substituted inline whose
+   tails are VALUES forms, as the expansion with the assignment at each tail
+   (%MV-SETQ-SINK): the values go straight to the variables instead of
+   through the multiple-value record, each boxed. NIL when it does not apply."
+  (when (and (consp vars)
+             (every (lambda (v) (and v (symbolp v) (not (keywordp v))
+                                     (not (nth-value 1 (lookup-symbol-macro v)))))
+                    vars)
+             (= (length vars) (length (remove-duplicates vars)))
+             (consp form) (symbolp (car form)) (car form)
+             (not (macrolet-shadowed-p (car form))))
+    ;; Whether the call is substituted depends on the scope, so the expansion
+    ;; may not be reused elsewhere either way.
+    (setf *expansion-unreusable* t)
+    (let ((exp (if (local-function-entry (car form))
+                   (maybe-expand-local-inline (car form) form)
+                   (maybe-expand-inline (car form) form))))
+      (when exp
+        (let ((r (%mv-setq-sink vars exp)))
+          (unless (eq r :fail) r))))))
+
 (setf (gethash 'multiple-value-setq *macros*)
       (lambda (form)
         ;; (multiple-value-setq (var1 var2 ...) values-form)
@@ -5749,7 +6048,8 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
         ;; then evaluate values-form, then store. This matches (setf (values ...) form).
         (let* ((vars (cadr form))
                (values-form (caddr form))
-               (split (%mv-setq-split-floor vars values-form))
+               (split (or (%mv-setq-split-floor vars values-form)
+                          (%mv-setq-sink-inline vars values-form)))
                (let-bindings '())   ; place temp bindings (evaluated before values-form)
                (store-vars '())     ; store variables for multiple-value-bind
                (setters '()))       ; setters (in order)

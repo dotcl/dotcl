@@ -63,29 +63,45 @@ public static partial class Runtime
     /// dotcl: one with another core generation (restartable: LOAD-AS-IS / CONTINUE
     /// return and the load goes on), or one that needs a newer DotCL.Runtime than
     /// this one (not restartable: .NET cannot bind it). A fasl with no stamp is
-    /// left alone.</summary>
-    private static void CheckFaslGeneration(System.Reflection.Assembly asm, string faslPath,
-        bool warnOnly)
+    /// left alone. Also checks the packages ASM names (CheckFaslUnit): they ride on
+    /// the same stamp, after a newline. CHECKGENERATION is false for an assembly
+    /// compiled in this process.</summary>
+    private static void CheckFaslStamp(System.Reflection.Assembly asm, string faslPath,
+        bool warnOnly, bool checkGeneration = true)
     {
-        var running = typeof(Runtime).Assembly.GetName().Version;
-        foreach (var r in asm.GetReferencedAssemblies())
-            if (r.Name == "DotCL.Runtime" && r.Version != null && running != null
-                && r.Version > running)
-                SignalNewerRuntimeFasl(faslPath, r.Version.ToString(), running.ToString());
+        if (checkGeneration)
+        {
+            var running = typeof(Runtime).Assembly.GetName().Version;
+            foreach (var r in asm.GetReferencedAssemblies())
+                if (r.Name == "DotCL.Runtime" && r.Version != null && running != null
+                    && r.Version > running)
+                    SignalNewerRuntimeFasl(faslPath, r.Version.ToString(), running.ToString());
+        }
 
-        string? current, stamped = null;
+        string? stamped = null;
         try
         {
-            current = Startup.CoreGeneration();
-            if (current == null) return;
             foreach (var a in asm.GetCustomAttributes<System.Reflection.AssemblyMetadataAttribute>())
                 if (a.Key == Startup.CoreGenerationKey) { stamped = a.Value; break; }
         }
         catch { return; }
-        if (stamped == null || stamped == current) return;
+        if (stamped == null) return;
+        int nl = stamped.IndexOf('\n');
+        if (nl >= 0)
+        {
+            var entries = stamped.Substring(nl + 1);
+            stamped = nl == 0 ? null : stamped.Substring(0, nl);
+            if (Package._unitsInUse || entries.IndexOf('\t') >= 0) CheckFaslUnit(faslPath, entries);
+        }
+        if (!checkGeneration || stamped == null) return;
+        string? current;
+        try { current = Startup.CoreGeneration(); }
+        catch { return; }
+        if (current == null || stamped == current) return;
         lock (_staleFaslWarned)
             if (_staleFaslWarned.Contains(faslPath)) return;
-        if (warnOnly)
+        // Only another compiler: the old code still binds, so a contrib loads.
+        if (warnOnly && Startup.RuntimePart(stamped) == Startup.RuntimePart(current))
         {
             lock (_staleFaslWarned) _staleFaslWarned.Add(faslPath);
             Console.Error.WriteLine(
@@ -109,6 +125,34 @@ public static partial class Runtime
         {
             lock (_staleFaslWarned) _staleFaslWarned.Add(faslPath);
         }
+        finally
+        {
+            RestartClusterStack.PopCluster();
+        }
+    }
+
+    /// <summary>Signal DOTCL:FASL-VERSION-MISMATCH (restartable as for another core)
+    /// when a package ASM names would be another package here than where it was
+    /// compiled: a fasl compiled in a package unit and loaded outside it, or the
+    /// other way round.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void CheckFaslUnit(string faslPath, string entries)
+    {
+        if (Package.FaslUnitMismatch(entries) is not { } m) return;
+        var tag = new object();
+        var loadAsIsSym = Startup.DotclPkg.FindSymbol("LOAD-AS-IS").Item1;
+        const string report = "Load the fasl as it is.";
+        RestartClusterStack.PushCluster(new[] {
+            new LispRestart("LOAD-AS-IS", _ => Nil.Instance, report, tag) { NameSymbol = loadAsIsSym },
+            new LispRestart("CONTINUE", _ => Nil.Instance, report, tag) });
+        try
+        {
+            SignalFaslVersionMismatch(faslPath, m.Compiled,
+                "~A was compiled for another package unit: its package ~A is ~A there and ~A here.",
+                new LispString(faslPath), new LispString(m.Text),
+                new LispString(m.Compiled), new LispString(m.Here));
+        }
+        catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, tag)) { }
         finally
         {
             RestartClusterStack.PopCluster();
@@ -145,7 +189,7 @@ public static partial class Runtime
     }
 
     /// <summary>.NET failing to bind DotCL.Runtime, which the reference check in
-    /// CheckFaslGeneration did not foresee.</summary>
+    /// CheckFaslStamp did not foresee.</summary>
     private static bool IsNewerRuntimeBindFailure(Exception ex) =>
         (ex switch { FileLoadException f => f.FileName, FileNotFoundException f => f.FileName, _ => null })
             is string name && name.StartsWith("DotCL.Runtime,", StringComparison.Ordinal);
@@ -312,6 +356,19 @@ public static partial class Runtime
         if (anyOut && (kinds & (GrayCharOut | GrayBinOut)) == 0) kinds |= GrayBinOut;
         cls.GrayKindCache = new LispClass.GrayKindEntry(cpl, kinds);
         return kinds;
+    }
+
+    /// <summary>Call FN (a Gray stream generic, PRINT-OBJECT, a pprint-dispatch
+    /// function) for its primary value only: an MvReturn is opened, and the values
+    /// FN left in the channel are dropped so the caller's caller does not take them
+    /// for its own.</summary>
+    internal static LispObject CallForPrimary(LispFunction? fn, params LispObject[] args)
+    {
+        if (fn == null) return Nil.Instance;
+        var r = fn.Invoke(args);
+        if (r is MvReturn mv) r = mv.PrimaryValue;
+        MultipleValues.Reset();
+        return r;
     }
 
     /// <summary>An instance of FUNDAMENTAL-STREAM, whatever its direction and element classes.</summary>
@@ -688,8 +745,25 @@ public static partial class Runtime
                 cur = c.Cdr;
             }
             DynamicBindings.Set(modulesSym, new Cons(new LispString(name), modules));
+            ProvideShared(modulesSym, name);
             return T.Instance;
         }
+    }
+
+    private static bool ModuleListed(LispObject? modules, string name)
+    {
+        for (var c = modules; c is Cons cc; c = cc.Cdr)
+            if (cc.Car is LispString s && s.Value == name) return true;
+        return false;
+    }
+
+    /// <summary>A module provided in a package unit that keeps its own *MODULES* but
+    /// does not own the module is provided for every unit: loaded once, shared.</summary>
+    private static void ProvideShared(Symbol modulesSym, string name)
+    {
+        if (!Package.SharesRegistryEntry(modulesSym, name)) return;
+        if (!ModuleListed(modulesSym.Value, name))
+            modulesSym.Value = new Cons(new LispString(name), modulesSym.Value ?? Nil.Instance);
     }
 
     /// <summary>
@@ -734,6 +808,11 @@ public static partial class Runtime
 
         // Already in *modules*: nothing to do, empty diff = NIL.
         if (before.Contains(name)) return Nil.Instance;
+        if (Package.SharesRegistryEntry(modulesSym, name) && ModuleListed(modulesSym.Value, name))
+        {
+            DynamicBindings.Set(modulesSym, new Cons(new LispString(name), DynamicBindings.Get(modulesSym)));
+            return Nil.Instance;
+        }
 
         // If pathname-list provided, load them
         if (args.Length > 1 && args[1] is not Nil)
@@ -797,6 +876,7 @@ public static partial class Runtime
         if (!nameInAfter)
             DynamicBindings.Set(modulesSym,
                 new Cons(new LispString(name), DynamicBindings.Get(modulesSym)));
+        ProvideShared(modulesSym, name);
 
         // Collect names added to *modules* during this call. *modules* is
         // prepended newest-first; iterating head->tail and prepending to the
@@ -866,6 +946,9 @@ public static partial class Runtime
         searchDirs.Add(Path.Combine(baseDir, "..", "..", "..", "..", "contrib"));
 
         string[] extensions = { ".fasl", ".sil", ".lisp" };
+        // Fasls built against other runtime source, passed over for a later
+        // candidate; the first is loaded when there is none.
+        var otherRuntime = new List<(string Path, string Built)>();
 
         // OS key for per-OS fasl lookup (runtimes/{os}/name.fasl).
         // dotcl ships a single OS-agnostic asdf.fasl: the .NET IL is portable and all
@@ -878,51 +961,120 @@ public static partial class Runtime
             {
                 // contrib/name/name.ext
                 var path = Path.GetFullPath(Path.Combine(dir, name, name + ext));
-                if (File.Exists(path))
+                if (!File.Exists(path)) continue;
+                // Another implementation's fasl sitting where ours would be:
+                // warn and fall through to the .sil / .lisp candidate instead of
+                // failing the whole (require ...) on a file we cannot read.
+                if (IsForeignFasl(path))
                 {
-                    // Another implementation's fasl sitting where ours would be:
-                    // warn and fall through to the .sil / .lisp candidate instead of
-                    // failing the whole (require ...) on a file we cannot read.
-                    if (IsForeignFasl(path))
-                    {
-                        Console.Error.WriteLine(
-                            $";; warning: ignoring {path}: not a dotcl fasl (foreign Lisp fasl?)");
-                        continue;
-                    }
-                    // The quicklisp client reads asdf: symbols (client.lisp,
-                    // dist.lisp, misc.lisp, setup.lisp). Loading its fasl with
-                    // asdf absent does not fail here: the references are
-                    // resolved lazily and the ASDF package is never even
-                    // created: so the breakage would surface much later as a
-                    // missing-package error inside quickload. Pull asdf in
-                    // first, the way upstream's bootstrap loads asdf.lisp ahead
-                    // of the client. The nested Require re-enters _modulesLock
-                    // on the same thread, which is fine (lock is reentrant).
-                    if (name == "quicklisp")
-                        Require(new LispObject[] { new LispString("asdf") });
-
-                    if (path.EndsWith(".fasl", StringComparison.OrdinalIgnoreCase))
-                        s_nextFaslMismatchWarnsOnly = true;
-                    try { Load(new LispObject[] { new LispString(path) }); }
-                    finally { s_nextFaslMismatchWarnsOnly = false; }
-                    if (name == "quicklisp")
-                        RegisterQuicklispWithAsdf();
-                    if (name == "asdf")
-                    {
-                        RegisterUserAsdSearchPaths();
-                        PatchUiopWindowsPath();
-                        RegisterContribWithAsdf(searchDirs.ToArray());
-                        InstallAsdfModuleProvider();
-                        UseAsdfSourceLoadingWithoutCompiler();
-                        InstallAsdfR2rHook();
-                        InstallAsdfRecompileOnFaslMismatch();
-                        UseErrorOnCompileFileFailure();
-                    }
-                    return T.Instance;
+                    Console.Error.WriteLine(
+                        $";; warning: ignoring {path}: not a dotcl fasl (foreign Lisp fasl?)");
+                    continue;
                 }
+                if (ext != ".lisp" && IsOlderThanContribSource(path, dir, name))
+                    continue;
+                if (ext == ".fasl" && OtherRuntimeFasl(path) is string built)
+                {
+                    otherRuntime.Add((path, built));
+                    continue;
+                }
+                foreach (var (p, b) in otherRuntime)
+                    Console.Error.WriteLine(
+                        $";; warning: ignoring {p}: built against other runtime source " +
+                        $"({b}, this runtime {Startup.RuntimeSource()})");
+                LoadContrib(name, path, searchDirs);
+                return T.Instance;
             }
         }
-        return Nil.Instance;
+        if (otherRuntime.Count == 0) return Nil.Instance;
+        LoadContrib(name, otherRuntime[0].Path, searchDirs);
+        return T.Instance;
+    }
+
+    private static void LoadContrib(string name, string path, List<string> searchDirs)
+    {
+        // The quicklisp client reads asdf: symbols (client.lisp,
+        // dist.lisp, misc.lisp, setup.lisp). Loading its fasl with
+        // asdf absent does not fail here: the references are
+        // resolved lazily and the ASDF package is never even
+        // created: so the breakage would surface much later as a
+        // missing-package error inside quickload. Pull asdf in
+        // first, the way upstream's bootstrap loads asdf.lisp ahead
+        // of the client. The nested Require re-enters _modulesLock
+        // on the same thread, which is fine (lock is reentrant).
+        if (name == "quicklisp")
+            Require(new LispObject[] { new LispString("asdf") });
+
+        if (path.EndsWith(".fasl", StringComparison.OrdinalIgnoreCase))
+            s_nextFaslMismatchWarnsOnly = true;
+        try { Load(new LispObject[] { new LispString(path) }); }
+        finally { s_nextFaslMismatchWarnsOnly = false; }
+        if (name == "quicklisp")
+            RegisterQuicklispWithAsdf();
+        if (name == "asdf")
+        {
+            RegisterUserAsdSearchPaths();
+            PatchUiopWindowsPath();
+            RegisterContribWithAsdf(searchDirs.ToArray());
+            InstallAsdfModuleProvider();
+            UseAsdfSourceLoadingWithoutCompiler();
+            KeepRunningAsdfAndUiop();
+            InstallAsdfR2rHook();
+            InstallAsdfRecompileOnFaslMismatch();
+            UseErrorOnCompileFileFailure();
+        }
+    }
+
+    /// <summary>The runtime digest the fasl at PATH was compiled against, when it
+    /// has one and it is not this runtime's; otherwise null. Read from the
+    /// metadata without loading the assembly.</summary>
+    private static string? OtherRuntimeFasl(string path)
+    {
+#if NETSTANDARD2_0
+        return null;
+#else
+        if (Startup.RuntimeSource() is not string mine) return null;
+        try
+        {
+            using var fs = File.OpenRead(path);
+            using var pe = new System.Reflection.PortableExecutable.PEReader(fs);
+            if (!pe.HasMetadata) return null;
+            var md = System.Reflection.Metadata.PEReaderExtensions.GetMetadataReader(pe);
+            foreach (var h in md.GetAssemblyDefinition().GetCustomAttributes())
+            {
+                var blob = md.GetBlobReader(md.GetCustomAttribute(h).Value);
+                if (blob.Length < 2 || blob.ReadUInt16() != 1) continue;
+                string? key, value;
+                try { key = blob.ReadSerializedString(); value = blob.ReadSerializedString(); }
+                catch { continue; }
+                if (key != Startup.CoreGenerationKey || value == null) continue;
+                int nl = value.IndexOf('\n');
+                var gen = nl < 0 ? value : value.Substring(0, nl);
+                if (gen.Length == 0) return null;
+                var theirs = Startup.RuntimePart(gen) ?? "none";
+                return theirs == mine ? null : theirs;
+            }
+        }
+        catch { }
+        return null;
+#endif
+    }
+
+    /// <summary>Whether BUILTPATH is older than the module's .lisp beside it
+    /// (a source tree edited after the build); warns when it is.</summary>
+    private static bool IsOlderThanContribSource(string builtPath, string dir, string name)
+    {
+        var src = Path.GetFullPath(Path.Combine(dir, name, name + ".lisp"));
+        try
+        {
+            if (!File.Exists(src)
+                || File.GetLastWriteTimeUtc(builtPath) >= File.GetLastWriteTimeUtc(src))
+                return false;
+        }
+        catch { return false; }
+        Console.Error.WriteLine(
+            $";; warning: ignoring {builtPath}: older than its source {src}");
+        return true;
     }
 
     /// <summary>
@@ -1074,6 +1226,59 @@ public static partial class Runtime
                 catch { /* ignore if ASDF symbols not yet available */ }
             }
         }
+        ResolveAsdlessContribsAsRequireSystems(searchDirs);
+    }
+
+    /// <summary>
+    /// A contrib with no .asd of its own (quicklisp, dotnet-ffi) resolves, ahead
+    /// of any same-named .asd in ASDF's configuration, to the system already in
+    /// the image or to a REQUIRE-SYSTEM, as its own .asd would. "asdf" is left to ASDF.
+    /// </summary>
+    private static void ResolveAsdlessContribsAsRequireSystems(IEnumerable<string> searchDirs)
+    {
+        var withAsd = new HashSet<string>();
+        var modules = new HashSet<string>();
+        foreach (var baseContrib in searchDirs)
+        {
+            var contribFull = Path.GetFullPath(baseContrib);
+            if (!Directory.Exists(contribFull)) continue;
+            foreach (var sub in Directory.GetDirectories(contribFull))
+            {
+                var name = Path.GetFileName(sub).ToLowerInvariant();
+                if (File.Exists(Path.Combine(sub, name + ".asd"))) withAsd.Add(name);
+                else if (File.Exists(Path.Combine(sub, name + ".fasl"))
+                         || File.Exists(Path.Combine(sub, name + ".sil"))
+                         || File.Exists(Path.Combine(sub, name + ".lisp")))
+                    modules.Add(name);
+            }
+        }
+        modules.ExceptWith(withAsd);
+        modules.Remove("asdf");
+        if (modules.Count == 0) return;
+        var names = new System.Text.StringBuilder();
+        foreach (var n in modules) names.Append(" \"").Append(n).Append('"');
+        var form = @"
+(let ((sf (find-symbol ""*SYSTEM-DEFINITION-SEARCH-FUNCTIONS*"" ""ASDF""))
+      (reg (find-symbol ""REGISTERED-SYSTEM"" ""ASDF""))
+      (rs (find-symbol ""REQUIRE-SYSTEM"" ""ASDF""))
+      (names '(" + names + @"))
+      (made (make-hash-table :test 'equal)))
+  (when (and sf reg rs (boundp sf) (fboundp reg) (find-class rs nil))
+    (let ((reg-fn (fdefinition reg)))
+      (setf (symbol-value sf)
+            (cons (lambda (name)
+                    (when (member name names :test #'equal)
+                      (or (funcall reg-fn name)
+                          (gethash name made)
+                          (setf (gethash name made) (make-instance rs :name name)))))
+                  (symbol-value sf))))))";
+        try
+        {
+            var read = MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
+            Runtime.Eval(read);
+        }
+        catch { /* ignore if ASDF symbols not yet available */ }
     }
 
     /// <summary>
@@ -1192,6 +1397,51 @@ public static partial class Runtime
         catch { /* ignore if UIOP is not there */ }
     }
 
+    /// <summary>
+    /// A system that depends on "asdf" or "uiop" gets the running ones rather than an
+    /// asdf.asd / uiop.asd seen in the registry: reloading them from source undoes what
+    /// dotcl replaced after loading ASDF. A registry copy whose version file is strictly
+    /// newer is still left to ASDF, which upgrades to it; without a compiler never.
+    /// </summary>
+    private static void KeepRunningAsdfAndUiop()
+    {
+        const string form = @"
+(let ((emit-free (not (find :dotcl-emit *features*)))
+      (self nil))
+  (labels ((found-elsewhere (name)
+             (dolist (f asdf:*system-definition-search-functions*)
+               (unless (eq f self)
+                 (let ((x (funcall f name)))
+                   (when x
+                     (return (if (typep x 'asdf:system) (asdf:system-source-file x) x)))))))
+           (newer-in-registry-p (name)
+             (let ((asd (found-elsewhere name)))
+               (when asd
+                 (let* ((asdfp (equal name ""asdf""))
+                        (file (uiop:subpathname (pathname asd) ""version""
+                                                :type (if asdfp ""lisp-expr"" ""lisp"")))
+                        (v (ignore-errors
+                            (and (uiop:probe-file* file)
+                                 (uiop:read-file-form file :at (if asdfp '(0) '(2 2 2)))))))
+                   (and (stringp v) (uiop:version< (asdf:asdf-version) v)))))))
+    (setf self
+          (lambda (name)
+            (when (and (member name '(""asdf"" ""asdf-package-system"" ""uiop"") :test #'equal)
+                       (or emit-free
+                           (equal name ""asdf-package-system"")
+                           (not (newer-in-registry-p name))))
+              (or (asdf::registered-system name)
+                  (asdf::sysdef-preloaded-system-search name)))))
+    (push self asdf:*system-definition-search-functions*)))";
+        try
+        {
+            var read = MultipleValues.Primary(
+                Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
+            Runtime.Eval(read);
+        }
+        catch { /* ignore if ASDF symbols not yet available */ }
+    }
+
     private static void UseAsdfSourceLoadingWithoutCompiler()
     {
         // A REQUIRE-SYSTEM is exempt: it has no source to load -- its LOAD-OP just
@@ -1223,20 +1473,7 @@ public static partial class Runtime
   ;; Without a compiler the running ASDF cannot be replaced: keep it.
   (let ((up (find-symbol ""UPGRADE-ASDF"" ""ASDF"")))
     (when (and up (fboundp up))
-      (setf (fdefinition up) (lambda () nil))))
-  ;; Systems that depend on ""asdf"" or ""uiop"" get the running ones, never
-  ;; an asdf.asd / uiop.asd from the registry.
-  (let ((sf (find-symbol ""*SYSTEM-DEFINITION-SEARCH-FUNCTIONS*"" ""ASDF""))
-        (reg (find-symbol ""REGISTERED-SYSTEM"" ""ASDF""))
-        (pre (find-symbol ""SYSDEF-PRELOADED-SYSTEM-SEARCH"" ""ASDF"")))
-    (when (and sf reg pre (boundp sf) (fboundp reg) (fboundp pre))
-      (let ((reg-fn (fdefinition reg)) (pre-fn (fdefinition pre)))
-        (setf (symbol-value sf)
-              (cons (lambda (name)
-                      (when (member name '(""asdf"" ""asdf-package-system"" ""uiop"")
-                                    :test #'equal)
-                        (or (funcall reg-fn name) (funcall pre-fn name))))
-                    (symbol-value sf)))))))";
+      (setf (fdefinition up) (lambda () nil)))))";
         try
         {
             var read = MultipleValues.Primary(
@@ -1335,6 +1572,10 @@ public static partial class Runtime
             var readtableSym2 = Startup.Sym("*READTABLE*");
             var oldPackage = DynamicBindings.Get(packageSym);
             var oldReadtable2 = DynamicBindings.Get(readtableSym2);
+            int streamBindDepth = DynamicBindings.Depth;
+            DynamicBindings.Push(packageSym, oldPackage);
+            DynamicBindings.Push(readtableSym2, oldReadtable2);
+            PushPolicyBindings();
 
             try
             {
@@ -1358,8 +1599,7 @@ public static partial class Runtime
             }
             finally
             {
-                DynamicBindings.Set(packageSym, oldPackage);
-                DynamicBindings.Set(readtableSym2, oldReadtable2);
+                DynamicBindings.TruncateTo(streamBindDepth);
             }
         }
 
@@ -1445,8 +1685,6 @@ public static partial class Runtime
         {
             var packageSym = Startup.Sym("*PACKAGE*");
             var readtableSym = Startup.Sym("*READTABLE*");
-            var oldLoadPath = DynamicBindings.Get(loadPathSym);
-            var oldLoadTrue = DynamicBindings.Get(loadTrueSym);
             var oldPackage = DynamicBindings.Get(packageSym);
             var oldReadtable = DynamicBindings.Get(readtableSym);
             var loadInputPath = filespec switch
@@ -1457,8 +1695,12 @@ public static partial class Runtime
             };
             var dpdForLoad = DynamicBindings.Get(Startup.Sym("*DEFAULT-PATHNAME-DEFAULTS*"));
             var mergedLoadPath = MergePathnames(loadInputPath, dpdForLoad is LispPathname ? dpdForLoad : LispPathname.FromString(""));
-            DynamicBindings.Set(loadPathSym, mergedLoadPath);
-            DynamicBindings.Set(loadTrueSym, LispPathname.FromString(Path.GetFullPath(filePath)));
+            int loadBindDepth = DynamicBindings.Depth;
+            DynamicBindings.Push(loadPathSym, mergedLoadPath);
+            DynamicBindings.Push(loadTrueSym, LispPathname.FromString(Path.GetFullPath(filePath)));
+            DynamicBindings.Push(packageSym, oldPackage);
+            DynamicBindings.Push(readtableSym, oldReadtable);
+            PushPolicyBindings();
 
             try
             {
@@ -1545,10 +1787,7 @@ public static partial class Runtime
             finally
             {
                 WhitelistLoadedDefinitionsForCompileFile();
-                DynamicBindings.Set(loadPathSym, oldLoadPath);
-                DynamicBindings.Set(loadTrueSym, oldLoadTrue);
-                DynamicBindings.Set(packageSym, oldPackage);
-                DynamicBindings.Set(readtableSym, oldReadtable);
+                DynamicBindings.TruncateTo(loadBindDepth);
             }
         }
     }
@@ -1703,14 +1942,14 @@ public static partial class Runtime
             System.Reflection.Assembly part;
             try
             {
-                part = System.Reflection.Assembly.Load(bytes);
+                part = RuntimeLoadContext.LoadBytes(bytes);
             }
             catch (BadImageFormatException)
             {
                 throw FaslFileError(
                     $"LOAD: bundle part {n} is not a .NET assembly: {filePath}", filespec);
             }
-            CheckFaslGeneration(part, filePath, warnOnly);
+            CheckFaslStamp(part, filePath, warnOnly);
             RunFaslModuleInit(part, $"{filePath} [{n}]", filespec);
         }
         return true;
@@ -2077,14 +2316,13 @@ public static partial class Runtime
             var pdbPath = Path.ChangeExtension(faslFull, ".pdb");
             if (File.Exists(pdbPath))
             {
-                try { return System.Reflection.Assembly.Load(bytes, File.ReadAllBytes(pdbPath)); }
+                try { return RuntimeLoadContext.LoadBytes(bytes, File.ReadAllBytes(pdbPath)); }
                 catch (BadImageFormatException) { throw; }
                 catch { } // mismatched or unreadable pdb: load without it
             }
-            return System.Reflection.Assembly.Load(bytes);
+            return RuntimeLoadContext.LoadBytes(bytes);
         }
-        var context = new System.Runtime.Loader.AssemblyLoadContext(
-            "fasl " + Path.GetFileName(faslFull), isCollectible: false);
+        var context = RuntimeLoadContext.NewContext("fasl " + Path.GetFileName(faslFull));
         return context.LoadFromAssemblyPath(faslFull);
     }
 #endif
@@ -2170,8 +2408,6 @@ public static partial class Runtime
         var loadTrueSym = Startup.Sym("*LOAD-TRUENAME*");
         var packageSym = Startup.Sym("*PACKAGE*");
         var readtableSym = Startup.Sym("*READTABLE*");
-        var oldLoadPath = DynamicBindings.Get(loadPathSym);
-        var oldLoadTrue = DynamicBindings.Get(loadTrueSym);
         var oldPackage = DynamicBindings.Get(packageSym);
         var oldReadtable = DynamicBindings.Get(readtableSym);
         var loadInputPath = filespec switch
@@ -2183,8 +2419,12 @@ public static partial class Runtime
         var dpdForLoad = DynamicBindings.Get(Startup.Sym("*DEFAULT-PATHNAME-DEFAULTS*"));
         var mergedLoadPath = MergePathnames(loadInputPath,
             dpdForLoad is LispPathname ? dpdForLoad : LispPathname.FromString(""));
-        DynamicBindings.Set(loadPathSym, mergedLoadPath);
-        DynamicBindings.Set(loadTrueSym, LispPathname.FromString(Path.GetFullPath(filePath)));
+        int faslBindDepth = DynamicBindings.Depth;
+        DynamicBindings.Push(loadPathSym, mergedLoadPath);
+        DynamicBindings.Push(loadTrueSym, LispPathname.FromString(Path.GetFullPath(filePath)));
+        DynamicBindings.Push(packageSym, oldPackage);
+        DynamicBindings.Push(readtableSym, oldReadtable);
+        PushPolicyBindings();
 
         try
         {
@@ -2213,7 +2453,7 @@ public static partial class Runtime
                 }
                 else if (r2rPath != null)
                 {
-                    asm = System.Reflection.Assembly.LoadFrom(r2rPath);
+                    asm = RuntimeLoadContext.LoadFrom(r2rPath);
                     R2rFaslsLoaded++;
                 }
                 else if (peFile!.ReadyToRun)
@@ -2223,7 +2463,7 @@ public static partial class Runtime
                     // Read into a byte array, its native code was ignored and
                     // every top level form of ASDF was JIT-compiled on each
                     // (require "asdf"); by path the code is used.
-                    asm = System.Reflection.Assembly.LoadFrom(faslFull);
+                    asm = RuntimeLoadContext.LoadFrom(faslFull);
                     R2rFaslsLoaded++;
                 }
                 else
@@ -2237,12 +2477,12 @@ public static partial class Runtime
                     var pdbPath = Path.ChangeExtension(faslFull, ".pdb");
                     if (File.Exists(pdbPath))
                     {
-                        try { asm = System.Reflection.Assembly.Load(faslBytes, File.ReadAllBytes(pdbPath)); }
-                        catch { asm = System.Reflection.Assembly.Load(faslBytes); } // mismatched/locked pdb
+                        try { asm = RuntimeLoadContext.LoadBytes(faslBytes, File.ReadAllBytes(pdbPath)); }
+                        catch { asm = RuntimeLoadContext.LoadBytes(faslBytes); } // mismatched/locked pdb
                     }
                     else
                     {
-                        asm = System.Reflection.Assembly.Load(faslBytes);
+                        asm = RuntimeLoadContext.LoadBytes(faslBytes);
                     }
 #else
                     asm = LoadFaslFromPath(faslFull);
@@ -2259,10 +2499,11 @@ public static partial class Runtime
             FaslsLoaded++;
             if (compiled != null)
             {
+                CheckFaslStamp(asm, faslFull, warnOnly, checkGeneration: false);
                 RunFaslModuleInit(asm, filePath, filespec);
                 return T.Instance;
             }
-            CheckFaslGeneration(asm, faslFull, warnOnly);
+            CheckFaslStamp(asm, faslFull, warnOnly);
             // A bundle (uiop bundle-op / dotcl:combine-fasls) is an assembly with
             // no code whose parts ride along as resources. Run each part in the
             // order they were bundled; a later part may depend on an earlier one.
@@ -2276,10 +2517,7 @@ public static partial class Runtime
         }
         finally
         {
-            DynamicBindings.Set(loadPathSym, oldLoadPath);
-            DynamicBindings.Set(loadTrueSym, oldLoadTrue);
-            DynamicBindings.Set(packageSym, oldPackage);
-            DynamicBindings.Set(readtableSym, oldReadtable);
+            DynamicBindings.TruncateTo(faslBindDepth);
         }
     }
 
@@ -2537,18 +2775,25 @@ public static partial class Runtime
     /// <summary>MACROEXPAND-1 of FORM in the lexical scope of SCOPES: evaluates
     /// (macrolet* SCOPES (macrolet ((#:g (&amp;environment #:e) ...)) (#:g))), whose
     /// inner macro hands back the expansion. Null when it does not expand or the
-    /// expansion fails (the form is then left whole, as before).</summary>
+    /// expansion fails (the form is then left whole, as before). A failure is
+    /// left in *FILE-EXPANSION-FAILURES* for the compiler to signal again.</summary>
     private static LispObject? LocalMacroexpand1(LispObject form, List<LocalMacroScope> scopes)
     {
         try
         {
             var g = new Symbol("LOCAL-EXPAND", null);
             var e = new Symbol("ENV", null);
+            var c = new Symbol("C", null);
             var quote = Startup.Sym("QUOTE");
-            // (list 'quote (multiple-value-list (macroexpand-1 'FORM e)))
-            var expandCall = Runtime.List(Startup.Sym("LIST"), Runtime.List(quote, quote),
-                Runtime.List(Startup.Sym("MULTIPLE-VALUE-LIST"),
-                    Runtime.List(Startup.Sym("MACROEXPAND-1"), Runtime.List(quote, form), e)));
+            // (handler-case (list 'quote (multiple-value-list (macroexpand-1 'FORM e)))
+            //   (error (c) (list 'quote (list nil c))))
+            var expandCall = Runtime.List(Startup.Sym("HANDLER-CASE"),
+                Runtime.List(Startup.Sym("LIST"), Runtime.List(quote, quote),
+                    Runtime.List(Startup.Sym("MULTIPLE-VALUE-LIST"),
+                        Runtime.List(Startup.Sym("MACROEXPAND-1"), Runtime.List(quote, form), e))),
+                Runtime.List(Startup.Sym("ERROR"), Runtime.List(c),
+                    Runtime.List(Startup.Sym("LIST"), Runtime.List(quote, quote),
+                        Runtime.List(Startup.Sym("LIST"), Nil.Instance, c))));
             var def = Runtime.List(g, Runtime.List(Startup.Sym("&ENVIRONMENT"), e), expandCall);
             LispObject probe = Runtime.List(Startup.Sym("MACROLET"), Runtime.List(def), Runtime.List(g));
             for (int i = scopes.Count - 1; i >= 0; i--)
@@ -2560,7 +2805,19 @@ public static partial class Runtime
             }
             var result = Runtime.Eval(probe);
             if (result is Cons rc && rc.Cdr is Cons flag && flag.Car is not Nil)
-                return rc.Car;
+            {
+                if (flag.Car is T) return rc.Car;
+                var failure = flag.Car;
+                // Keyed by the scope the compiler will see: the binding lists,
+                // innermost first.
+                if (DynamicBindings.TryGet(Startup.Sym("*FILE-EXPANSION-FAILURES*"), out var failures)
+                    && failures is LispHashTable failuresTable)
+                {
+                    LispObject scope = Nil.Instance;
+                    foreach (var s in scopes) scope = new Cons(s.Bindings, scope);
+                    failuresTable.Set(form, new Cons(scope, failure));
+                }
+            }
             return null;
         }
         catch (Exception) { return null; }
@@ -3616,6 +3873,11 @@ public static partial class Runtime
                 }
                 catch (HandlerCaseInvocationException ex) when (ReferenceEquals(ex.Tag, tag))
                 {
+                    // The compiler signals this condition again for the same form
+                    // instead of running the expander a second time.
+                    if (DynamicBindings.TryGet(Startup.Sym("*FILE-EXPANSION-FAILURES*"), out var failures)
+                        && failures is LispHashTable failuresTable)
+                        failuresTable.Set(form, ex.Condition);
                     return null;
                 }
                 finally
@@ -4450,6 +4712,17 @@ public static partial class Runtime
         throw new RestartInvocationException(restart.Tag, Array.Empty<LispObject>());
     });
 
+    /// <summary>Bind the compiler's OPTIMIZE policy to its current values, so a
+    /// DECLAIM in the file being compiled or loaded is in force to the end of
+    /// that file only (as in SBCL).</summary>
+    private static void PushPolicyBindings()
+    {
+        foreach (var policyName in new[] { "*OPTIMIZE-SAFETY*", "*OPTIMIZE-DEBUG*", "*PROCLAIMED-POLICY*" })
+            if (Startup.Sym(policyName) is var policySym
+                && DynamicBindings.TryGet(policySym, out var policyVal))
+                DynamicBindings.Push(policySym, policyVal);
+    }
+
     public static LispObject CompileFile(LispObject[] args)
     {
 #if DOTCL_EMIT
@@ -4583,8 +4856,6 @@ public static partial class Runtime
         var cftSym = Startup.Sym("*COMPILE-FILE-TRUENAME*");
         var packageSym = Startup.Sym("*PACKAGE*");
         var readtableSym = Startup.Sym("*READTABLE*");
-        var oldCfp = DynamicBindings.Get(cfpSym);
-        var oldCft = DynamicBindings.Get(cftSym);
         var oldPackage = DynamicBindings.Get(packageSym);
         var oldReadtable = DynamicBindings.Get(readtableSym);
         var cfpInputPath = inputSpec switch
@@ -4595,19 +4866,28 @@ public static partial class Runtime
         };
         var dpd2 = DynamicBindings.Get(Startup.Sym("*DEFAULT-PATHNAME-DEFAULTS*"));
         var mergedCfp = MergePathnames(cfpInputPath, dpd2 is LispPathname ? dpd2 : LispPathname.FromString(""));
-        DynamicBindings.Set(cfpSym, mergedCfp);
         var cftPath = LispPathname.FromString(Path.GetFullPath(inputPath));
-        DynamicBindings.Set(cftSym, cftPath);
+        // Bound on this thread, not assigned: another thread compiling a file at
+        // the same time must not see these.
+        int bindDepth = DynamicBindings.Depth;
+        DynamicBindings.Push(cfpSym, mergedCfp);
+        DynamicBindings.Push(cftSym, cftPath);
+        DynamicBindings.Push(packageSym, oldPackage);
+        DynamicBindings.Push(readtableSym, oldReadtable);
 
         // Set *compile-file-mode* so the Lisp compiler handles eval-when
         // per CLHS 3.2.3.1 (eval :compile-toplevel, emit :load-toplevel).
         // Use Startup.Sym (not SymInPkg) to match the compiled code's LOAD-SYM resolution.
         var compileFileModeSym = Startup.Sym("*COMPILE-FILE-MODE*");
-        var oldCompileFileMode = DynamicBindings.Get(compileFileModeSym);
-        DynamicBindings.Set(compileFileModeSym, Startup.Sym("T"));
+        DynamicBindings.Push(compileFileModeSym, Startup.Sym("T"));
         var sameFileSym = Startup.Sym("*SAME-FILE-FUNCTIONS*");
-        var oldSameFile = DynamicBindings.TryGet(sameFileSym, out var osf) ? osf : Nil.Instance;
-        DynamicBindings.Set(sameFileSym, new LispHashTable("EQ"));
+        DynamicBindings.Push(sameFileSym, new LispHashTable("EQ"));
+        // Compared around each form below: only this file's failures may count.
+        var cfFailuresSym = Startup.Sym("*MACROEXPANSION-FAILURES*");
+        DynamicBindings.Push(cfFailuresSym, DynamicBindings.Get(cfFailuresSym));
+        DynamicBindings.Push(Startup.Sym("*FILE-EXPANSION-FAILURES*"), new LispHashTable("EQ"));
+        var cfErrorsSym = Startup.Sym("*COMPILE-ERRORS-DETECTED*");
+        DynamicBindings.Push(cfErrorsSym, Nil.Instance);
 
         // Snapshot *modules*. A compile-time (require "x") (e.g. eval-when
         // :compile-toplevel) loads a contrib whose defuns are reverted by the
@@ -4620,14 +4900,14 @@ public static partial class Runtime
         // require becomes fully transient and the load-time require re-loads for real.
         var modulesSym2 = Startup.Sym("*MODULES*");
         var oldModules = DynamicBindings.Get(modulesSym2);
+        DynamicBindings.Push(modulesSym2, oldModules);
 
         // :target-features: rebind *features* so reader conditionals (#+/#-) and
         // os-cond macro expansions see the target platform, not the host.
         // Used for cross-compiling asdf.fasl for Linux/Win/macOS from any host.
         var featuresSym = Startup.Sym("*FEATURES*");
-        var oldFeatures = DynamicBindings.Get(featuresSym);
         if (targetFeaturesArg != null && targetFeaturesArg is not Nil)
-            DynamicBindings.Set(featuresSym, targetFeaturesArg);
+            DynamicBindings.Push(featuresSym, targetFeaturesArg);
 
         // Snapshot Function / SetfFunction state for all symbols. compile-file
         // may evaluate defun / (defun (setf x) ...) at compile-time so that
@@ -4677,6 +4957,7 @@ public static partial class Runtime
         var faslCorlibSym = Startup.Sym("*FASL-CORLIB*");
         DynamicBindings.Push(faslCorlibSym,
             corlibNameArg is LispString corlibStr && corlibStr.Value.Length > 0 ? corlibStr : Nil.Instance);
+        PushPolicyBindings();
 
         try
         {
@@ -4955,6 +5236,7 @@ public static partial class Runtime
                 }
             }
 
+            if (IsTruthy(DynamicBindings.Get(cfErrorsSym))) warningsP = failureP = true;
             // Return (values output-truename warnings-p failure-p)
             var outPathname = LispPathname.FromString(Path.GetFullPath(outputPath));
             return MultipleValues.Values(outPathname,
@@ -5022,22 +5304,9 @@ public static partial class Runtime
                     }
             }
 
-            // Restore *modules* so a compile-time (require ...) doesn't leak a
-            // marked-loaded-but-undefined module (its defuns were stripped above).
-            DynamicBindings.Set(modulesSym2, oldModules);
-
-            // Restore *compile-file-mode* and dynamic bindings
-            DynamicBindings.Set(compileFileModeSym, oldCompileFileMode);
-            DynamicBindings.Set(sameFileSym, oldSameFile);
-            if (targetFeaturesArg != null && targetFeaturesArg is not Nil)
-                DynamicBindings.Set(featuresSym, oldFeatures);
-            DynamicBindings.Set(cfpSym, oldCfp);
-            DynamicBindings.Set(cftSym, oldCft);
-            DynamicBindings.Set(packageSym, oldPackage);
-            DynamicBindings.Set(readtableSym, oldReadtable);
-            DynamicBindings.Pop(faslCorlibSym);
-            if (moduleIdSym != null)
-                DynamicBindings.Pop(moduleIdSym);
+            // Unbinding *modules* drops a compile-time (require ...), which would
+            // otherwise leave a module marked loaded whose defuns were stripped above.
+            DynamicBindings.TruncateTo(bindDepth);
         }
 #else
         throw new LispErrorException(new LispProgramError(
@@ -6502,6 +6771,20 @@ public static partial class Runtime
             val <= long.MaxValue ? (LispObject)Fixnum.Make((long)val) : new Bignum(val));
     }
 
+    private static readonly object s_gensymLock = new();
+
+    /// <summary>The value of *GENSYM-COUNTER*, which is then incremented. Two threads
+    /// sharing the global value get different numbers.</summary>
+    private static System.Numerics.BigInteger NextGensymCounter()
+    {
+        lock (s_gensymLock)
+        {
+            var counter = GetGensymCounter();
+            SetGensymCounter(counter + 1);
+            return counter;
+        }
+    }
+
     public static LispObject Gensym(LispObject prefix)
     {
         // prefix must be a string or non-negative integer (unsigned-byte).
@@ -6520,10 +6803,7 @@ public static partial class Runtime
         if (prefixStr != null)
         {
             ValidateGensymCounter();
-            var counter = GetGensymCounter();
-            var name = $"{prefixStr}{counter}";
-            SetGensymCounter(counter + 1);
-            return new Symbol(name);
+            return new Symbol($"{prefixStr}{NextGensymCounter()}");
         }
         // Invalid type: signal type-error
         var expected = new Cons(Startup.Sym("OR"),
@@ -6558,10 +6838,7 @@ public static partial class Runtime
     public static LispObject Gensym0()
     {
         ValidateGensymCounter();
-        var counter = GetGensymCounter();
-        var name = $"G{counter}";
-        SetGensymCounter(counter + 1);
-        return new Symbol(name);
+        return new Symbol($"G{NextGensymCounter()}");
     }
 
     // --- Gentemp ---
@@ -8252,6 +8529,20 @@ public static partial class Runtime
                 return MacroexpandOnceOrSelf(args[0], args.Length > 1 ? args[1] : Nil.Instance);
             }, "%MACROEXPAND-1-OR-SELF", -1));
 
+        // The name compiled code finds a package by: the same in every package
+        // unit, unlike PACKAGE-NAME.
+        Emitter.CilAssembler.RegisterFunction("%PACKAGE-PHYSICAL-NAME",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%PACKAGE-PHYSICAL-NAME", args, 1);
+                return ((Package)args[0]).NameString;
+            }, "%PACKAGE-PHYSICAL-NAME", 1));
+
+        Emitter.CilAssembler.RegisterFunction("%NEXT-LTV-ID",
+            new LispFunction(args => {
+                Runtime.CheckArityExact("%NEXT-LTV-ID", args, 0);
+                return Fixnum.Make(System.Threading.Interlocked.Increment(ref _compilerLtvCounter));
+            }, "%NEXT-LTV-ID", 0));
+
         // The tree-walk evaluator's memo of what it works out once per list: a
         // lambda list's shape, a HANDLER-CASE form's rewrite (see %MINI-SHAPE in
         // cil-forms-interp.lisp). Keyed weakly by the list itself. Read on every
@@ -8626,16 +8917,24 @@ public static partial class Runtime
                         if (full) failureP = true;
                     });
                     LispObject fn;
+                    var errorsSym = Startup.Sym("*COMPILE-ERRORS-DETECTED*");
+                    var ltvEvalNowSym = Startup.Sym("*LTV-EVAL-NOW*");
+                    DynamicBindings.Push(errorsSym, Nil.Instance);
+                    // COMPILE evaluates LOAD-TIME-VALUE forms while compiling.
+                    DynamicBindings.Push(ltvEvalNowSym, T.Instance);
                     HandlerClusterStack.PushCluster(new HandlerBinding[] {
                         new HandlerBinding(Startup.Sym("WARNING"), warningHandler) });
                     try
                     {
                         var instrList = Runtime.CompileTopLevel(args[1]);
                         fn = Emitter.CilAssembler.AssembleAndRun(instrList);
+                        if (IsTruthy(DynamicBindings.Get(errorsSym))) warningsP = failureP = true;
                     }
                     finally
                     {
                         HandlerClusterStack.PopCluster();
+                        DynamicBindings.Pop(ltvEvalNowSym);
+                        DynamicBindings.Pop(errorsSym);
                     }
                     LispObject wP = warningsP ? T.Instance : Nil.Instance;
                     LispObject fP = failureP ? T.Instance : Nil.Instance;
@@ -9400,6 +9699,16 @@ public static partial class Runtime
 
     public static LispObject FunctionLambdaList(LispObject arg)
     {
+        var ll = StoredLambdaListOf(arg);
+        return ll == null
+            ? MultipleValues.Values2(Nil.Instance, Nil.Instance)
+            : MultipleValues.Values2(ll, T.Instance);
+    }
+
+    /// <summary>FUNCTION-LAMBDA-LIST's primary value, without publishing values:
+    /// a runtime caller returns something else, and left values could pass for its own.</summary>
+    internal static LispObject? StoredLambdaListOf(LispObject arg)
+    {
         LispObject target = arg;
         if (arg is Symbol sym)
         {
@@ -9437,12 +9746,6 @@ public static partial class Runtime
             // rather than on itself (see LispLambdaListAttribute).
             if (ll == null && lf.BodyDelegate is { } body) ll = SiteLambdaList(lf, body);
         }
-        if (ll == null)
-        {
-            MultipleValues.SetPair(Nil.Instance, Nil.Instance);
-            return Nil.Instance;
-        }
-        MultipleValues.SetPair(ll, T.Instance);
         return ll;
     }
 

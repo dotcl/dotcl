@@ -51,6 +51,9 @@
     <PackageId Condition="'$(DotclToolPackageId)' != ''">$(DotclToolPackageId)</PackageId>
     <ToolCommandName Condition="'$(DotclToolCommandName)' != ''">$(DotclToolCommandName)</ToolCommandName>
     <RuntimeIdentifiers Condition="'$(DotclToolNoAndroid)' == 'true'">win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64;any</RuntimeIdentifiers>
+    <!-- DotclToolRid=<rid>: that one RID's package and the any-RID one only (the
+         CI walk of the pack path, which R2Rs one RID and installs that one). -->
+    <RuntimeIdentifiers Condition="'$(DotclToolRid)' != ''">$(DotclToolRid);any</RuntimeIdentifiers>
     <!-- Empty unless DotclAppBundle is set. The item globs below reference THIS, never
          "$(DotclAppBundle)/**" directly: with the bundle unset the latter evaluates to
          the drive-root glob "/**" which MSBuild rejects at load with MSB5029 even under a
@@ -204,7 +207,9 @@
       <_LastDash>$(_BeforeSha.LastIndexOf('-'))</_LastDash>
       <_Count>$(_BeforeSha.Substring($([MSBuild]::Add($(_LastDash), 1))))</_Count>
       <_Tag>$(_BeforeSha.Substring(0, $(_LastDash)))</_Tag>
-      <_DirtySuffix Condition="'$(_HasDirty)' == 'true'">.dirty</_DirtySuffix>
+      <!-- A dirty build names its tree as well: the ASDF compile cache is keyed by
+           this version, and two worktrees dirty on the same commit must not share it. -->
+      <_DirtySuffix Condition="'$(_HasDirty)' == 'true'">.dirty.t$([MSBuild]::BitwiseAnd($([MSBuild]::StableStringHash('$(MSBuildProjectDirectory)')), 2147483647))</_DirtySuffix>
       <_DirtySuffix Condition="'$(_HasDirty)' == 'false'"></_DirtySuffix>
       <InformationalVersion Condition="'$(_Count)' == '0' And '$(_HasDirty)' == 'false'">$(_Tag)</InformationalVersion>
       <InformationalVersion Condition="'$(_Count)' != '0' Or '$(_HasDirty)' == 'true'">$(_Tag)+$(_Count).g$(_Sha)$(_DirtySuffix)</InformationalVersion>

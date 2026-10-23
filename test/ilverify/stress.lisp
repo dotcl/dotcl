@@ -200,3 +200,30 @@
 
 (defun simd-convert-down (a)
   (dotcl-simd:s64.2-from-f64.2 (dotcl-simd:f64.2* a 2d0)))
+
+;; Typed entries: an FTYPE with raw numeric arguments and result gives the
+;; function a typed body, a boxed shell and a framed typed entry; callers that
+;; know the FTYPE enter it with raw values, in and out of tail position.
+(declaim (ftype (function (fixnum fixnum) fixnum) typed-add))
+(defun typed-add (a b) (+ a b))
+(declaim (ftype (function (double-float fixnum) double-float) typed-scale))
+(defun typed-scale (x n) (* x n))
+(declaim (ftype (function ((unsigned-byte 8)) (unsigned-byte 8)) typed-inc8))
+(defun typed-inc8 (x) (logand (1+ x) 255))
+(declaim (ftype (function (fixnum) fixnum) typed-quiet))
+(defun typed-quiet (n) (declare (optimize (debug 0))) (1+ n))
+(declaim (ftype (function (fixnum fixnum) fixnum) typed-ev typed-od))
+(defun typed-ev (n acc) (if (= n 0) acc (typed-od (1- n) (typed-add acc 1))))
+(defun typed-od (n acc) (if (= n 0) acc (typed-ev (1- n) (+ acc (typed-quiet 0)))))
+;; A leaf (checked arithmetic only) whose typed entry links its frame only on
+;; the slow path.
+(declaim (ftype (function (fixnum fixnum double-float) fixnum) typed-leaf))
+(defun typed-leaf (a b x) (declare (ignore x)) (if (> a b) (mod a b) (* a (- b 1))))
+(defun typed-caller (n)
+  (declare (fixnum n))
+  (list (typed-add n 1) (typed-scale 0.5d0 n) (typed-inc8 7) (typed-ev n 0)
+        (typed-leaf n 3 1d0)))
+
+;; A lambda that closes over nothing, passed as a value: its function object is
+;; cached in a LispFunction-typed static field after its direct entry is set.
+(defun lambda-arg (x l) (member x l :test (lambda (n e) (eq n e))))

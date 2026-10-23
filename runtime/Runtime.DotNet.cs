@@ -1034,6 +1034,14 @@ public static partial class Runtime
             }
         }
 
+        if (targetType.IsGenericType && LispToMemoryTarget(arg, targetType) is { } memory)
+            return memory;
+
+        // The vector's own storage, not a copy, when it is this array type.
+        if ((targetType.IsArray || targetType == typeof(Array))
+            && VectorAsArray(arg, targetType, out _) is { } own)
+            return own;
+
         // Lisp sequence (list or vector) -> typed array T[]. Lets a Lisp list or
         // vector be passed where an array-typed parameter or property is expected
         // (e.g. set_FileTypeFilter with FilePickerFileType[], Patterns with
@@ -1252,7 +1260,7 @@ public static partial class Runtime
         // directory resolve automatically. Required for contribs that ship
         // their own lib/ directory with multiple interdependent DLLs (e.g.
         // dotnet-cs loading Roslyn).
-        var asm = System.Reflection.Assembly.LoadFrom(System.IO.Path.GetFullPath(path));
+        var asm = RuntimeLoadContext.LoadFrom(System.IO.Path.GetFullPath(path));
         return new LispString(asm.FullName ?? path);
     }
 
@@ -1702,6 +1710,7 @@ public static partial class Runtime
     {
         if (rt == typeof(void)) return false;
         if (rt.IsByRef || rt.IsPointer || rt.IsGenericParameter) return false;
+        if (IsByRefLikeType(rt)) return false;
         if (rt.IsInterface) return false;
         if (rt == typeof(object) || rt == typeof(ValueType) || rt == typeof(Enum))
             return false;
@@ -1721,6 +1730,7 @@ public static partial class Runtime
             LispDotNetBoxed b => b.Value,
             LispDotNetObject d => d.Value,
             Nil => null,
+            LispDotNetNull => null,
             T => true,
             Fixnum fx => (fx.Value >= int.MinValue && fx.Value <= int.MaxValue)
                             ? (object)(int)fx.Value : fx.Value,
@@ -2004,6 +2014,7 @@ public static partial class Runtime
                         !ReferenceEquals(c, selected) &&
                         c.GetParameters().Count(p => p.ParameterType == typeof(object)) < selObj))
                     return null;
+                if (NeedsSpanStub(selected)) return null;
             }
             return selected;
         }
@@ -2042,22 +2053,23 @@ public static partial class Runtime
         // all of arity 2), and picking by arity alone lands on whichever reflection
         // returned first, then reports "method not found" when the supplied argument
         // does not convert to that one.
-        foreach (var m in candidates.OrderBy(m => m.GetParameters().Length))
+        foreach (var m in candidates.OrderBy(m => m.GetParameters().Length).ThenBy(SpanOverloadRank))
         {
+            if (!SpanParamsFit(m, lispArgs)) continue;
             var bps = m.GetParameters();
             var full = new object?[bps.Length];
             bool ok = true;
             try
             {
                 for (int i = 0; i < lispArgs.Length; i++)
-                    full[i] = LispToDotNet(lispArgs[i], bps[i].ParameterType);
+                    full[i] = LispToDotNetParam(lispArgs[i], bps[i].ParameterType);
             }
             catch { ok = false; }   // supplied args not convertible to this overload
             if (!ok) continue;
             for (int i = lispArgs.Length; i < bps.Length; i++)
                 full[i] = bps[i].HasDefaultValue ? bps[i].DefaultValue : Type.Missing;
 
-            try { result = m.Invoke(target, full); return true; }
+            try { result = InvokeMethod(m, target, full); return true; }
             catch (System.Reflection.TargetInvocationException tie)
             {
                 throw DotNetInvokeError($"DOTNET:{(isStatic ? "STATIC" : "INVOKE")} {type.Name}.{name}", tie);
@@ -2110,12 +2122,13 @@ public static partial class Runtime
             // Consider only fully-typed overloads; if none convert, defer to the
             // normal path rather than forcing an object overload here.
             if (m.GetParameters().Any(p => p.ParameterType == typeof(object))) break;
+            if (!SpanParamsFit(m, lispArgs)) continue;
             var ps = m.GetParameters();
             var converted = new object?[ps.Length];
             bool ok = true;
             for (int i = 0; i < ps.Length; i++)
             {
-                try { converted[i] = LispToDotNet(lispArgs[i], ps[i].ParameterType); }
+                try { converted[i] = LispToDotNetParam(lispArgs[i], ps[i].ParameterType); }
                 catch { ok = false; break; }
             }
             if (!ok) continue;
@@ -2169,31 +2182,39 @@ public static partial class Runtime
             m.GetParameters().Count(p => p.ParameterType == typeof(object));
         bool hasArrayParam(System.Reflection.MethodInfo m) =>
             m.GetParameters().Any(p => p.ParameterType.IsArray);
+        var spanCandidates = candidates.Where(c => SpanOverloadRank(c) > 0).OrderBy(SpanOverloadRank).ToList();
+        candidates.RemoveAll(spanCandidates.Contains);
         candidates.Sort((a, b) =>
         {
             int byObj = objParamCount(a) - objParamCount(b);
             if (byObj != 0) return byObj;
             return (hasArrayParam(b) ? 1 : 0) - (hasArrayParam(a) ? 1 : 0);
         });
+        candidates.AddRange(spanCandidates);
 
+        (LispObject arg, Type type)? nonSimple = null;
         foreach (var m in candidates)
         {
+            if (nonSimple == null && NonSimpleArrayArg(m, lispArgs) is int j and >= 0)
+                nonSimple = (lispArgs[j], m.GetParameters()[j].ParameterType);
+            if (!SpanParamsFit(m, lispArgs)) continue;
             var ps = m.GetParameters();
             var converted = new object?[ps.Length];
             bool converall = true;
             for (int i = 0; i < ps.Length; i++)
             {
-                try { converted[i] = LispToDotNet(lispArgs[i], ps[i].ParameterType); }
+                try { converted[i] = LispToDotNetParam(lispArgs[i], ps[i].ParameterType); }
                 catch { converall = false; break; }
             }
             if (!converall) continue;
-            try { result = m.Invoke(target, converted); return true; }
+            try { result = InvokeMethod(m, target, converted); return true; }
             catch (System.Reflection.TargetInvocationException tie)
             {
                 throw DotNetInvokeError($"DOTNET:{(isStatic ? "STATIC" : "INVOKE")} {type.Name}.{name}", tie);
             }
             catch (ArgumentException) { /* wrong overload; try next */ }
         }
+        if (nonSimple is var (nsArg, nsType)) throw NonSimpleArrayArgError(nsArg, nsType);
         return false;
     }
 
@@ -2264,6 +2285,13 @@ public static partial class Runtime
             if (args.Length >= 3 && LispToDotNetGeneric(args[2]) is object recv
                 && TryInvokeExtensionMethod(recv.GetType(), memberName, recv, rest, out var r3, type))
                 return DotNetToLisp(r3);
+            throw;
+        }
+        catch (NotSupportedException)
+        {
+            // Reflection cannot call a method that takes or returns a Span.
+            if (TryInvokeWithMarshalledArgs(type, memberName, null, args.Skip(2).ToArray(), true, out var rs))
+                return DotNetToLisp(rs);
             throw;
         }
         catch (System.Reflection.TargetInvocationException tie)
@@ -2396,6 +2424,14 @@ public static partial class Runtime
 
         try
         {
+            // A COM object cast to a vtable interface (IConnectionPoint) may have no
+            // IDispatch at all, so the cast interface goes first.
+            if (type.IsCOMObject
+                && (args[0] as LispDotNetBoxed)?.HintType is { IsInterface: true } comHint
+                && (TryInvokeWithMarshalledArgs(comHint, memberName, target, args.Skip(2).ToArray(), false, out var viaIface)
+                    || (args.Length == 2
+                        && TryInvokeWithMarshalledArgs(comHint, "get_" + memberName, target, args.Skip(2).ToArray(), false, out viaIface))))
+                return DotNetToLisp(viaIface);
             if (TryCachedInvoke(type, memberName, target, callArgs, false, out var cached))
                 return DotNetToLisp(cached);
             var result = type.InvokeMember(memberName, InstanceReadFlags, null, target, callArgs);
@@ -2429,9 +2465,21 @@ public static partial class Runtime
             }
             throw;
         }
+        catch (NotSupportedException)
+        {
+            if (TryInvokeWithMarshalledArgs(type, memberName, target, args.Skip(2).ToArray(), false, out var rs))
+                return DotNetToLisp(rs);
+            throw;
+        }
         catch (System.Reflection.TargetInvocationException tie)
         {
             throw DotNetInvokeError($"DOTNET:INVOKE {type.Name}.{memberName}", tie);
+        }
+        catch (System.Runtime.InteropServices.COMException ce) when (type.IsCOMObject)
+        {
+            // IDispatch reports an unknown name or a bad argument count directly,
+            // not wrapped in TargetInvocationException.
+            throw DotNetInvokeError($"DOTNET:INVOKE {type.Name}.{memberName}", ce, ce);
         }
     }
 
@@ -2829,6 +2877,12 @@ public static partial class Runtime
         {
             throw DotNetInvokeError($"DOTNET:%SET-INVOKE {type.Name}.{memberName}", tie);
         }
+        catch (System.Runtime.InteropServices.COMException ce) when (type.IsCOMObject)
+        {
+            // IDispatch reports an unknown name or a bad argument count directly,
+            // not wrapped in TargetInvocationException.
+            throw DotNetInvokeError($"DOTNET:%SET-INVOKE {type.Name}.{memberName}", ce, ce);
+        }
     }
 
     /// <summary>Assign a property by marshalling each argument to the setter's declared
@@ -2956,8 +3010,12 @@ public static partial class Runtime
             if (lispArgs.Length > ps.Length) return false;
             for (int i = lispArgs.Length; i < ps.Length; i++)
                 if (!ps[i].IsOptional) return false;
-            return true;
+            return !ps.Any(p => IsByRefLikeType(p.ParameterType) || p.ParameterType.IsPointer);
         }).ToArray();
+        // Ones the arguments can convert to, when there are any: without this a
+        // vector went to MemoryStream(int) as readily as to MemoryStream(byte[]).
+        var plausible = ctors.Where(c => PlausibleOverload(c, lispArgs, outAware: false)).ToArray();
+        if (plausible.Length > 0) ctors = plausible;
 
         if (ctors.Length == 0)
             throw new LispErrorException(new LispError(
@@ -2975,6 +3033,8 @@ public static partial class Runtime
                 if (lispArgs[i] is Fixnum) { if (pt == typeof(int) || pt == typeof(long)) score += 10; }
                 else if (lispArgs[i] is DoubleFloat || lispArgs[i] is SingleFloat) { if (pt == typeof(double)) score += 10; }
                 else if (StringValueOrNull(lispArgs[i]) != null) { if (pt == typeof(string)) score += 10; }
+                else if (lispArgs[i] is LispVector && (pt.IsArray || pt == typeof(Array)))
+                    score += VectorAsArray(lispArgs[i], pt, out _) != null ? 20 : 10;
                 else if (lispArgs[i] is LispDotNetObject dno)
                 {
                     // A wrapped .NET instance (value-type struct or reference type):
@@ -2993,7 +3053,7 @@ public static partial class Runtime
         var paramTypes = ctor.GetParameters();
         var convertedArgs = new object?[paramTypes.Length];
         for (int i = 0; i < lispArgs.Length; i++)
-            convertedArgs[i] = LispToDotNet(lispArgs[i], paramTypes[i].ParameterType);
+            convertedArgs[i] = LispToDotNetParam(lispArgs[i], paramTypes[i].ParameterType);
         for (int i = lispArgs.Length; i < paramTypes.Length; i++)
             convertedArgs[i] = paramTypes[i].HasDefaultValue ? paramTypes[i].DefaultValue : Type.Missing;
 
@@ -4325,7 +4385,7 @@ public static partial class Runtime
         var invokeForeign = typeof(Runtime).GetMethod(nameof(InvokeForeignCallback))!;
         var callFn = System.Linq.Expressions.Expression.Call(
             invokeForeign,
-            System.Linq.Expressions.Expression.Constant(fn, typeof(LispObject)),
+            System.Linq.Expressions.Expression.Constant(Package.BindToCurrentUnit(fn), typeof(LispObject)),
             argsArray);
 
         System.Linq.Expressions.Expression body;
@@ -4460,7 +4520,7 @@ public static partial class Runtime
     }
 
     /// <summary>
-    /// <lispdoc>(dotnet:call-out type-or-obj "Method" &amp;rest in-args) -- Call a .NET method that has out/ref parameters. type-or-obj is a type-name string for static calls, or a .NET object for instance calls. in-args supplies every parameter except the out ones; a ref parameter is in-out, so pass its initial value (e.g. the EndPoint for Socket.ReceiveFrom). Returns multiple values: the method's return value (T for void), followed by each out/ref parameter value in declaration order. Example: (multiple-value-bind (ok n) (dotnet:call-out "System.Int32" "TryParse" "42") ...)</lispdoc>
+    /// <lispdoc>(dotnet:call-out type-or-obj "Method" &amp;rest in-args) -- Call a .NET method that has out/ref parameters. type-or-obj is a type-name string for static calls, or a .NET object for instance calls. in-args supplies every parameter except the out ones; a ref parameter is in-out, so pass its initial value (e.g. the EndPoint for Socket.ReceiveFrom). Returns multiple values: the method's return value (T for void), followed by each out/ref parameter value in declaration order. Example: (multiple-value-bind (ok n) (dotnet:call-out "System.Int32" "TryParse" "42") ...). On a COM object reached through IDispatch there is no signature: pass every argument, out positions too; all go by reference and each one's value after the call follows the return value.</lispdoc>
     /// Invoke a .NET static or instance method that has <c>out</c>/<c>ref</c> parameters.
     /// Supply every argument except <c>out</c> positions from Lisp (a <c>ref</c>
     /// parameter is in-out: pass its initial value); out positions are filled automatically.
@@ -4476,7 +4536,7 @@ public static partial class Runtime
         string memberName = NameArg(args[1]);
         var lispInArgs   = args.Skip(2).ToArray();
 
-        System.Reflection.MethodInfo method;
+        List<System.Reflection.MethodInfo> methods;
         object? target;
         Type    type;
 
@@ -4485,9 +4545,16 @@ public static partial class Runtime
             // Instance call
             target = dno.Value;
             type   = target.GetType();
-            method = FindOutMethod(type, memberName, lispInArgs.Length,
-                         System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
-                     ?? throw new LispErrorException(new LispError(
+            methods = FindOutMethods(type, memberName, lispInArgs.Length,
+                          System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+            if (methods.Count == 0
+                && FindOutMethodOnInterfaces(type, (dno as LispDotNetBoxed)?.HintType,
+                       target, memberName, lispInArgs.Length) is { } viaIface)
+                methods.Add(viaIface);
+            if (methods.Count == 0 && type.IsCOMObject)
+                return ComCallOut(type, target, memberName, lispInArgs);
+            if (methods.Count == 0)
+                throw new LispErrorException(new LispError(
                          $"DOTNET:CALL-OUT: no instance method {type.Name}.{memberName} " +
                          $"with {lispInArgs.Length} in-parameter(s)"));
         }
@@ -4497,38 +4564,22 @@ public static partial class Runtime
             string typeName = NameArg(args[0]);
             type   = ResolveDotNetType(typeName);
             target = null;
-            method = FindOutMethod(type, memberName, lispInArgs.Length,
-                         System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
-                     ?? throw new LispErrorException(new LispError(
+            methods = FindOutMethods(type, memberName, lispInArgs.Length,
+                          System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+            if (methods.Count == 0)
+                throw new LispErrorException(new LispError(
                          $"DOTNET:CALL-OUT: no static method {typeName}.{memberName} " +
                          $"with {lispInArgs.Length} in-parameter(s)"));
         }
 
+        var method = methods.FirstOrDefault(m => PlausibleOverload(m, lispInArgs, outAware: true)) ?? methods[0];
+        var callArgs = CallOutArgs(method, lispInArgs);
         var paramInfos = method.GetParameters();
-        var callArgs   = new object?[paramInfos.Length];
-        int inIdx = 0;
-        for (int i = 0; i < paramInfos.Length; i++)
-        {
-            var p = paramInfos[i];
-            // Only a true `out` param is caller-invisible. A plain `ref` param is
-            // in-out: the caller must supply its initial value (Socket.ReceiveFrom's
-            // ref EndPoint). Treating ref as out shifted the remaining in-args into
-            // the wrong parameter slots -> "Object must implement IConvertible".
-            if (p.IsOut)
-            {
-                callArgs[i] = null; // placeholder; filled by .NET on return
-            }
-            else
-            {
-                var elemType = p.ParameterType.IsByRef ? p.ParameterType.GetElementType()! : p.ParameterType;
-                callArgs[i] = LispToDotNet(lispInArgs[inIdx++], elemType);
-            }
-        }
 
         object? returnVal;
         try
         {
-            returnVal = method.Invoke(target, callArgs);
+            returnVal = InvokeMethod(method, target, callArgs);
         }
         catch (System.Reflection.TargetInvocationException tie)
         {
@@ -4544,6 +4595,115 @@ public static partial class Runtime
         }
         return MultipleValues.Values(mvVals.ToArray());
     }
+
+    /// <summary>An interface member: the one a dotnet:cast named first, else any
+    /// interface the type implements (an explicit implementation is private on the
+    /// type itself).</summary>
+    private static System.Reflection.MethodInfo? FindOutMethodOnInterfaces(
+        Type type, Type? hint, object target, string name, int inArgCount)
+    {
+        var flags = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance;
+        bool cast = hint != null && hint.IsInterface && hint.IsInstanceOfType(target);
+        var pools = cast
+            ? new[] { new[] { hint! }, hint!.GetInterfaces() }
+            : new[] { type.GetInterfaces() };
+        foreach (var pool in pools)
+            foreach (var iface in pool)
+                if (FindOutMethod(iface, name, inArgCount, flags) is { } m) return m;
+        return null;
+    }
+
+    /// <summary>call-out on a COM object reached through IDispatch, which carries no
+    /// signature to tell the out positions apart: the caller passes every argument,
+    /// all of them go by reference, and each one's value after the call follows the
+    /// return value.</summary>
+    private static LispObject ComCallOut(Type type, object target, string name, LispObject[] lispArgs)
+    {
+        var callArgs = LispArgsToDotNetGeneric(lispArgs);
+        System.Reflection.ParameterModifier[]? mods = null;
+        if (callArgs.Length > 0)
+        {
+            var mod = new System.Reflection.ParameterModifier(callArgs.Length);
+            for (int i = 0; i < callArgs.Length; i++) mod[i] = true;
+            mods = new[] { mod };
+        }
+        object? ret;
+        try
+        {
+            ret = type.InvokeMember(name, System.Reflection.BindingFlags.InvokeMethod,
+                                    null, target, callArgs, mods, null, null);
+        }
+        catch (System.Reflection.TargetInvocationException tie)
+        {
+            throw DotNetInvokeError($"DOTNET:CALL-OUT {type.Name}.{name}", tie);
+        }
+        catch (System.Runtime.InteropServices.COMException ce)
+        {
+            throw DotNetInvokeError($"DOTNET:CALL-OUT {type.Name}.{name}", ce, ce);
+        }
+        var vals = new LispObject[callArgs.Length + 1];
+        vals[0] = DotNetToLisp(ret);
+        for (int i = 0; i < callArgs.Length; i++) vals[i + 1] = DotNetToLisp(callArgs[i]);
+        return MultipleValues.Values(vals);
+    }
+
+    private static object?[] CallOutArgs(System.Reflection.MethodInfo method, LispObject[] lispInArgs)
+    {
+        var paramInfos = method.GetParameters();
+        var callArgs   = new object?[paramInfos.Length];
+        int inIdx = 0;
+        for (int i = 0; i < paramInfos.Length; i++)
+        {
+            var p = paramInfos[i];
+            // Only a true `out` param is caller-invisible. A plain `ref` param is
+            // in-out: the caller must supply its initial value (Socket.ReceiveFrom's
+            // ref EndPoint). Treating ref as out shifted the remaining in-args into
+            // the wrong parameter slots -> "Object must implement IConvertible".
+            if (p.IsOut)
+                callArgs[i] = null; // placeholder; filled by .NET on return
+            else
+            {
+                var elemType = p.ParameterType.IsByRef ? p.ParameterType.GetElementType()! : p.ParameterType;
+                callArgs[i] = LispToDotNetParam(lispInArgs[inIdx++], elemType);
+            }
+        }
+        return callArgs;
+    }
+
+    /// <summary>DEFS instantiated with TYPEARGS, the first plausible one for the
+    /// arguments (in SpanOverloadRank order), and its
+    /// converted arguments.</summary>
+    private static (System.Reflection.MethodInfo, object?[]) SelectGenericOverload(
+        List<System.Reflection.MethodInfo> defs, Type[] typeArgs, LispObject[] lispArgs, bool outAware, string context)
+    {
+        var concrete = new List<System.Reflection.MethodInfo>();
+        string? makeError = null;
+        foreach (var d in defs)
+        {
+            try { concrete.Add(d.MakeGenericMethod(typeArgs)); }
+            catch (ArgumentException e) { makeError ??= e.Message; }
+        }
+        if (concrete.Count == 0)
+            throw new LispErrorException(new LispError($"{context}: MakeGenericMethod failed: {makeError}"));
+        var ordered = concrete.OrderBy(SpanOverloadRank).ToList();
+        var m = ordered.FirstOrDefault(c => PlausibleOverload(c, lispArgs, outAware)) ?? ordered[0];
+        if (outAware) return (m, CallOutArgs(m, lispArgs));
+        var ps = m.GetParameters();
+        var callArgs = new object?[ps.Length];
+        for (int i = 0; i < ps.Length; i++)
+            callArgs[i] = LispToDotNetParam(lispArgs[i], ps[i].ParameterType);
+        return (m, callArgs);
+    }
+
+    /// <summary>Every NAME overload taking INARGCOUNT in-args, in declaration order,
+    /// ordered by SpanOverloadRank.</summary>
+    private static List<System.Reflection.MethodInfo> FindOutMethods(
+        Type type, string name, int inArgCount, System.Reflection.BindingFlags flags)
+        => type.GetMethods(flags)
+            .Where(m => m.Name == name && !m.IsGenericMethodDefinition
+                        && m.GetParameters().Count(p => !p.IsOut) == inArgCount)
+            .OrderBy(SpanOverloadRank)
+            .ToList();
 
     private static System.Reflection.MethodInfo? FindOutMethod(
         Type type, string name, int inArgCount, System.Reflection.BindingFlags flags)
@@ -4607,49 +4767,26 @@ public static partial class Runtime
         // in-param count excludes only true out parameters (same rule as call-out:
         // a ref parameter is in-out and consumes an in-arg), and is computed on
         // the OPEN definition (IsByRef/IsOut are visible there).
-        var methodDef = type.GetMethods(flags)
+        var methodDefs = type.GetMethods(flags)
             .Where(m => m.Name == memberName
                      && m.IsGenericMethodDefinition
-                     && m.GetGenericArguments().Length == typeArgNames.Count)
-            .FirstOrDefault(m => {
-                var ps = m.GetParameters();
-                var inCount = ps.Count(p => !p.IsOut);
-                return inCount == lispInArgs.Length;
-            })
-            ?? throw new LispErrorException(new LispError(
+                     && m.GetGenericArguments().Length == typeArgNames.Count
+                     && m.GetParameters().Count(p => !p.IsOut) == lispInArgs.Length)
+            .ToList();
+        if (methodDefs.Count == 0)
+            throw new LispErrorException(new LispError(
                 $"DOTNET:CALL-OUT-GENERIC: no generic method {type.Name}.{memberName} " +
                 $"with {typeArgNames.Count} type arg(s) and {lispInArgs.Length} in-parameter(s)"));
 
         var concreteTypes = typeArgNames.Select(ResolveDotNetType).ToArray();
-        System.Reflection.MethodInfo method;
-        try { method = methodDef.MakeGenericMethod(concreteTypes); }
-        catch (Exception e)
-        {
-            throw new LispErrorException(new LispError(
-                $"DOTNET:CALL-OUT-GENERIC {type.Name}.{memberName}: MakeGenericMethod failed: {e.Message}"));
-        }
-
+        var (method, callArgs) = SelectGenericOverload(methodDefs, concreteTypes, lispInArgs, true,
+            $"DOTNET:CALL-OUT-GENERIC {type.Name}.{memberName}");
         var paramInfos = method.GetParameters();
-        var callArgs   = new object?[paramInfos.Length];
-        int inIdx = 0;
-        for (int i = 0; i < paramInfos.Length; i++)
-        {
-            var p = paramInfos[i];
-            // Same rule as call-out: only true out params are placeholders; a
-            // plain ref param is in-out and takes the supplied initial value.
-            if (p.IsOut)
-                callArgs[i] = null; // placeholder; filled by .NET on return
-            else
-            {
-                var elemType = p.ParameterType.IsByRef ? p.ParameterType.GetElementType()! : p.ParameterType;
-                callArgs[i] = LispToDotNet(lispInArgs[inIdx++], elemType);
-            }
-        }
 
         object? returnVal;
         try
         {
-            returnVal = method.Invoke(target, callArgs);
+            returnVal = InvokeMethod(method, target, callArgs);
         }
         catch (System.Reflection.TargetInvocationException tie)
         {
@@ -4699,28 +4836,25 @@ public static partial class Runtime
         int typeArgCount = typeArgForms.Count;
 
         // Find the generic method definition matching name + arity
-        var methodDef = type.GetMethods(
+        var methodDefs = type.GetMethods(
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
             .Where(m => m.Name == memberName
                      && m.IsGenericMethodDefinition
                      && m.GetGenericArguments().Length == typeArgCount
                      && m.GetParameters().Length == lispArgs.Length)
-            .FirstOrDefault()
-            ?? throw new LispErrorException(new LispError(
+            .ToList();
+        if (methodDefs.Count == 0)
+            throw new LispErrorException(new LispError(
                 $"DOTNET:STATIC-GENERIC: no generic static method {typeName}.{memberName} " +
                 $"with {typeArgCount} type arg(s) and {lispArgs.Length} parameter(s)"));
 
         var concreteTypes  = typeArgForms.Select(ResolveElementTypeArg).ToArray();
-        var concreteMethod = methodDef.MakeGenericMethod(concreteTypes);
-        var paramInfos     = concreteMethod.GetParameters();
-
-        var callArgs = new object?[lispArgs.Length];
-        for (int i = 0; i < lispArgs.Length; i++)
-            callArgs[i] = LispToDotNet(lispArgs[i], paramInfos[i].ParameterType);
+        var (concreteMethod, callArgs) = SelectGenericOverload(methodDefs, concreteTypes, lispArgs, false,
+            $"DOTNET:STATIC-GENERIC {typeName}.{memberName}");
 
         try
         {
-            var result = concreteMethod.Invoke(null, callArgs);
+            var result = InvokeMethod(concreteMethod, null, callArgs);
             return DotNetToLisp(result);
         }
         catch (System.Reflection.TargetInvocationException tie)
@@ -4758,33 +4892,32 @@ public static partial class Runtime
         }
 
         // Find the generic instance method matching name + type-arg arity + param count
-        var methodDef = type.GetMethods(
+        var methodDefs = type.GetMethods(
                 System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
             .Where(m => m.Name == memberName
                      && m.IsGenericMethodDefinition
                      && m.GetGenericArguments().Length == typeArgNames.Count
                      && m.GetParameters().Length == lispArgs.Length)
-            .FirstOrDefault()
-            // Not on the concrete type: it may be implemented explicitly for an
-            // interface, where the method is private and only reachable through the
-            // interface (IFeatureCollection.Get<TFeature> is the shape).
-            ?? FindInterfaceGenericMethod(type, (args[0] as LispDotNetBoxed)?.HintType,
-                                          target, memberName, typeArgNames.Count, lispArgs.Length)
-            ?? throw new LispErrorException(new LispError(
+            .ToList();
+        // Not on the concrete type: it may be implemented explicitly for an
+        // interface, where the method is private and only reachable through the
+        // interface (IFeatureCollection.Get<TFeature> is the shape).
+        if (methodDefs.Count == 0
+            && FindInterfaceGenericMethod(type, (args[0] as LispDotNetBoxed)?.HintType,
+                                          target, memberName, typeArgNames.Count, lispArgs.Length) is { } viaIface)
+            methodDefs.Add(viaIface);
+        if (methodDefs.Count == 0)
+            throw new LispErrorException(new LispError(
                 $"DOTNET:INVOKE-GENERIC: no generic instance method {type.Name}.{memberName} " +
                 $"with {typeArgNames.Count} type arg(s) and {lispArgs.Length} parameter(s)"));
 
         var concreteTypes  = typeArgNames.Select(ResolveDotNetType).ToArray();
-        var concreteMethod = methodDef.MakeGenericMethod(concreteTypes);
-        var paramInfos     = concreteMethod.GetParameters();
-
-        var callArgs = new object?[lispArgs.Length];
-        for (int i = 0; i < lispArgs.Length; i++)
-            callArgs[i] = LispToDotNet(lispArgs[i], paramInfos[i].ParameterType);
+        var (concreteMethod, callArgs) = SelectGenericOverload(methodDefs, concreteTypes, lispArgs, false,
+            $"DOTNET:INVOKE-GENERIC {type.Name}.{memberName}");
 
         try
         {
-            var result = concreteMethod.Invoke(target, callArgs);
+            var result = InvokeMethod(concreteMethod, target, callArgs);
             return DotNetToLisp(result);
         }
         catch (System.Reflection.TargetInvocationException tie)

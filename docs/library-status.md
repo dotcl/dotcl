@@ -7,9 +7,9 @@ edit this file by hand.
 - Quicklisp dist: quicklisp 2026-01-01
 - Dists measured with: quicklisp 2026-01-01, dotcl 2026-10-12 (every measured row)
 - Runtime build measured with: Release (every measured row)
-- dotcl: v0.1.33-200-ga586c49d
+- dotcl: v0.1.34-267-ge06e1aac
 - Compared with: SBCL 2.6.8.roswell
-- Seconds, dotcl / SBCL, summed over the rows measured on both: load 1469 s / 335 s (425 rows), tests 2337 s / 845 s (403 rows)
+- Seconds, dotcl / SBCL, summed over the rows measured on both: load 3491 s / 335 s (425 rows), tests 4124 s / 840 s (400 rows)
 - Rows: 425
 
 Order is how many other Quicklisp projects are built on a
@@ -70,429 +70,429 @@ times include its start-up, about a second per process.
 
 | system | status | tests | with forks | seconds, dotcl / SBCL | issue | checked | why | note |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| alexandria | `ok` | rt: 500 passed (2026-10-15) |  | load 4.1 / 1.6; tests 4.6 / 0.9 |  | 2026-10-15 |  |  |
-| trivial-gray-streams | `patched` | defines no tests (2026-10-15) |  | load 2.3 / 0.3; tests 2.8 / 0.3 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| trivial-features | `ok` | rt: 10 passed (2026-10-15) |  | load 2.0 / 0.3; tests 3.9 / 1.3 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| flexi-streams | `ok` | with-test-suite: 9 passed (2026-10-15) |  | load 5.0 / 2.0; tests 22.9 / 7.3 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| cl-ppcre | `ok` | cl-ppcre: 3 passed (2026-10-15) |  | load 4.3 / 1.1; tests 6.7 / 2.1 |  | 2026-10-15 |  |  |
-| cl-unicode | `ok` | cl-ppcre: 4 passed (2026-10-15) |  | load 4.5 / 2.6; tests 5.5 / 0.9 |  | 2026-10-15 |  |  |
-| uiop | `load-only` | defines no tests (2026-10-15) |  | load 2.0 / 0.2; tests 2.3 / 0.3 |  | 2026-10-15 |  |  |
-| babel | `patched` | stefil: 2 of 509 failed (2026-10-15) | same (babel): stefil: 2 of 509 failed | load 5.5 / 2.1; tests 5.3 / 0.9 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| trivial-garbage | `ok` | rt: 11 passed (2026-10-15) |  | load 2.2 / 0.3; tests 2.9 / 0.4 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| global-vars | `load-only` | ran; no recognised result (2026-10-15) |  | load 2.2 / 0.3; tests 2.7 / 0.3 |  | 2026-10-15 |  |  |
-| bordeaux-threads | `ok` | fiveam: 121 passed (2026-10-15) |  | load 3.2 / 0.4; tests 62.6 / 55.5 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| cl-json | `load-only` | fiveam: 1 of 160 failed (2026-10-15) | same (trivial-backtrace): fiveam: 1 of 160 failed | load 3.3 / 0.5; tests 5.1 / 0.6 |  | 2026-10-15 |  |  |
-| cffi | `patched` | rt: 16 of 688 failed (2026-10-15) | same (babel bordeaux-threads cffi): rt: 16 of 688 failed | load 5.0 / 1.2; tests 46.3 / 73.3 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| split-sequence | `ok` | fiveam: 102 passed (2026-10-15) |  | load 2.6 / 0.5; tests 13.3 / 2.5 |  | 2026-10-15 |  |  |
-| cl-base64 | `ok` | ptester: 11603 passed (2026-10-15) |  | load 3.0 / 0.4; tests 4.0 / 0.4 |  | 2026-10-15 |  |  |
-| closer-mop | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.3; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| usocket | `patched` | rt: 1 of 33 failed (2026-10-15) | same (babel usocket bordeaux-threads): rt: 1 of 33 failed | load 3.4 / 0.5; tests 90.6 / 91.9 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| trivial-backtrace | `load-only` | lift: 1 of 2 failed (2026-10-15) | same (lift trivial-backtrace): lift: 1 of 2 failed | load 2.5 / 0.3; tests 3.2 / 0.4 |  | 2026-10-15 |  |  |
-| md5 | `load-only` | defines no tests (2026-10-15) |  | load 3.2 / 0.3; tests 2.7 / 0.2 |  | 2026-10-15 |  |  |
-| puri | `ok` | ptester: 128 passed (2026-10-15) |  | load 2.8 / 0.4; tests 3.1 / 0.3 |  | 2026-10-15 |  |  |
-| cl+ssl | `patched` | test system did not load (2026-10-15) | pending-fork (babel usocket bordeaux-threads trivial-backtrace trivial-sockets cffi): ok, fiveam: 77 passed | load 4.4 / 0.8; tests 3.7 / 24.6 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| chipz | `patched` | defines no tests (2026-10-15) |  | load 4.2 / 0.7; tests 2.5 / 0.3 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| chunga | `load-only` | defines no tests (2026-10-15) |  | load 2.8 / 0.3; tests 2.3 / 0.2 |  | 2026-10-15 |  |  |
-| cl-fad | `patched` | error (2026-10-15) | pending-fork (bordeaux-threads cl-fad): ok, unit-test: 9 passed | load 2.9 / 0.3; tests 3.6 / 0.5 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| drakma | `ok` | fiveam: 50 passed (2026-10-15) |  | load 4.1 / 0.7; tests 19.0 / 10.2 |  | 2026-10-15 |  |  |
-| swank | `patched` | defines no tests (2026-10-15) |  | load 4.5 / 1.1; tests 2.5 / 0.3 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| parse-number | `load-only` | ran; no recognised result (2026-10-15) |  | load 2.4 / 0.3; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| closure-common | `load-only` | defines no tests (2026-10-15) |  | load 3.8 / 0.6; tests 2.8 / 0.4 |  | 2026-10-15 |  |  |
-| cxml | `load-only` | defines no tests (2026-10-15) |  | load 5.4 / 1.5; tests 3.9 / 0.7 |  | 2026-10-15 |  |  |
-| yacc | `load-only` | defines no tests (2026-10-15) |  | load 3.1 / 0.4; tests 2.3 / 0.3 |  | 2026-10-15 |  |  |
-| cl-who | `ok` | cl-ppcre: 1 passed (2026-10-15) |  | load 2.6 / 0.3; tests 3.4 / 0.4 |  | 2026-10-15 |  |  |
-| xpath | `patched` | ran; no recognised result (2026-10-15) |  | load 5.2 / 1.0; tests 5.4 / 1.1 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| cxml-stp | `load-only` | rt: 3 of 246 failed (2026-10-15) | same (babel plexippus-xpath): rt: 3 of 246 failed | load 4.4 / 0.9; tests 6.5 / 1.1 |  | 2026-10-15 |  |  |
-| rfc2388 | `patched` | defines no tests (2026-10-15) |  | load 2.6 / 0.3; tests 2.3 / 0.3 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| trivial-with-current-source-form | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.2; tests 2.3 / 0.3 |  | 2026-10-15 |  |  |
-| hunchentoot | `ok` | hunchentoot: 1 passed (2026-10-15) |  | load 4.8 / 1.0; tests 9.0 / 3.3 |  | 2026-10-15 | The failing checks are uploaded files coming back larger than they were sent: rfc2388, which parses the upload, writes the file as `latin-1` only on the implementations it lists and in the default external format (UTF-8) elsewhere, so every byte above 127 is written as two. With a fork of rfc2388 that adds dotcl to that list, the suite passes. | `loaded from the dotcl dist overlay` |
-| esrap | `ok` | fiveam: 6085 passed (2026-10-15) |  | load 3.8 / 0.7; tests 8.7 / 1.0 |  | 2026-10-15 |  |  |
-| html-encode | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 2.3 / 0.3 |  | 2026-10-15 |  |  |
-| iterate | `load-only` | rt: 6 of 290 failed (2026-10-15) |  | load 3.6 / 0.7; tests 4.0 / 0.5 |  | 2026-10-15 |  |  |
-| colorize | `load-only` | defines no tests (2026-10-15) |  | load 3.6 / 0.5; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| 3bmd | `ok` | fiasco: 192 passed (2026-10-15) |  | load 3.4 / 0.6; tests 8.8 / 2.6 |  | 2026-10-15 |  |  |
-| trivial-utf-8 | `load-only` | defines no tests (2026-10-15) |  | load 2.9 / 0.3; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| pythonic-string-reader | `load-only` | defines no tests (2026-10-15) |  | load 3.2 / 0.4; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| mgl-pax | `load-only` | try: 52 of 1479 failed (2026-10-15) | same (hunchentoot bordeaux-threads trivial-backtrace slime try cl-fad): try: 52 of 1479 failed | load 3.5 / 0.6; tests 16.7 / 5.9 |  | 2026-10-15 |  |  |
-| named-readtables | `ok` | try: 58 passed (2026-10-15) |  | load 2.1 / 0.3; tests 5.1 / 0.6 |  | 2026-10-15 |  |  |
-| trivial-indent | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.3; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| documentation-utils | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| language-codes | `load-only` | defines no tests (2026-10-15) |  | load 2.3 / 0.3; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| multilang-documentation | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| system-locale | `load-only` | defines no tests (2026-10-15) |  | load 2.1 / 0.3; tests 2.3 / 0.2 |  | 2026-10-15 |  |  |
-| ironclad | `ok` | rt: 468 passed (2026-10-15) |  | load 16.0 / 14.1; tests 15.7 / 5.0 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| net.didierverna.asdf-flv | `load-only` | defines no tests (2026-10-15) |  | load 2.1 / 0.2; tests 2.3 / 0.2 |  | 2026-10-15 |  |  |
-| fiveam | `ok` | fiveam: 57 passed (2026-10-15) |  | load 3.3 / 0.4; tests 3.3 / 0.3 |  | 2026-10-15 |  |  |
-| float-features | `ok` | parachute: 34 passed (2026-10-15) |  | load 2.6 / 0.3; tests 5.3 / 0.6 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| trivial-octet-streams | `patched` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 2.3 / 0.2 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| uax-15 | `ok` | parachute: 343339 passed (2026-10-15) |  | load 4.0 / 0.6; tests 10.9 / 1.6 |  | 2026-10-15 |  |  |
-| postmodern | `fail` |  | pending-fork (bordeaux-threads trivial-backtrace postmodern): test system did not load | load 5.9 / 2.1; tests - / 3.9 |  | 2026-10-15 | `cl-postgres.asd` pulls usocket in through an allowlist of implementations but its code reaches for usocket through a denylist, so every implementation missing from that allowlist hits this; quickloading usocket first makes postmodern load unchanged. | `Package USOCKET not found` |
-| com.inuoe.jzon | `load-only` | fiveam: 5 of 591 failed (2026-10-15) | same (trivial-backtrace): fiveam: 5 of 591 failed | load 4.8 / 1.0; tests 6.8 / 0.8 |  | 2026-10-15 |  |  |
-| trivial-cltl2 | `patched` | defines no tests (2026-10-15) |  | load 2.1 / 0.2; tests 2.4 / 0.3 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| local-time | `ok` | fiasco: 58 passed (2026-10-15) |  | load 3.5 / 0.5; tests 13.1 / 2.2 |  | 2026-10-15 |  |  |
-| mt19937 | `load-only` | defines no tests (2026-10-15) |  | load 2.6 / 0.2; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| fset | `patched` | error (2026-10-15) |  | load 12.2 / 8.5; tests 4.9 / 1.2 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| misc-extensions | `load-only` | ran; no recognised result (2026-10-15) |  | load 2.0 / 0.2; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| introspect-environment | `patched` | fiveam: 8 of 32 failed (2026-10-15) | pending-fork (trivial-backtrace introspect-environment): ok, fiveam: 32 passed | load 2.3 / 0.2; tests 3.2 / 0.4 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| fare-utils | `ok` | stefil: 16 passed (2026-10-15) |  | load 3.7 / 0.5; tests 3.2 / 0.4 |  | 2026-10-15 |  |  |
-| fare-quasiquote | `load-only` | test system did not load (2026-10-15) |  | load 2.9 / 0.4; tests 3.2 / 0.4 |  | 2026-10-15 |  |  |
-| lisp-namespace | `ok` | fiveam: 20 passed (2026-10-15) |  | load 2.6 / 0.3; tests 3.2 / 0.4 |  | 2026-10-15 |  |  |
-| trivia | `ok` | fiveam: 490 passed (2026-10-15) |  | load 5.0 / 0.8; tests 7.9 / 1.5 |  | 2026-10-15 |  |  |
-| type-i | `ok` | fiveam: 17 passed (2026-10-15) |  | load 2.3 / 0.3; tests 3.2 / 0.4 |  | 2026-10-15 |  |  |
-| anaphora | `ok` | rt: 60 passed (2026-10-15) |  | load 2.3 / 0.2; tests 2.8 / 0.3 |  | 2026-10-15 |  |  |
-| static-vectors | `ok` | fiveam: 30 passed (2026-10-15) |  | load 2.8 / 0.4; tests 3.5 / 0.5 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| idna | `load-only` | defines no tests (2026-10-15) |  | load 2.6 / 0.3; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| cl-utilities | `load-only` | defines no tests (2026-10-15) |  | load 2.9 / 0.4; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| fast-io | `load-only` | defines no tests (2026-10-15) |  | load 3.3 / 0.6; tests 2.8 / 0.4 |  | 2026-10-15 |  |  |
-| cl-interpol | `ok` | cl-ppcre: 4 passed (2026-10-15) |  | load 3.5 / 0.5; tests 33.7 / 8.2 |  | 2026-10-15 |  |  |
-| parse-declarations-1.0 | `load-only` | defines no tests (2026-10-15) |  | load 2.8 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| string-case | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.2; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| quri | `ok` | rove/prove: 130 passed (2026-10-15) |  | load 3.9 / 2.2; tests 5.0 / 0.9 |  | 2026-10-15 |  |  |
-| trivial-macroexpand-all | `load-only` | defines no tests (2026-10-15) |  | load 2.1 / 0.3; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| metabang-bind | `load-only` | lift: 4 of 54 failed (2026-10-15) | same (lift): lift: 4 of 54 failed | load 2.8 / 0.4; tests 4.7 / 0.8 |  | 2026-10-15 |  |  |
-| trivial-types | `load-only` | defines no tests (2026-10-15) |  | load 2.3 / 0.3; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| trivial-mimes | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| salza2 | `ok` | parachute: 3 passed (2026-10-15) |  | load 3.1 / 0.3; tests 3.5 / 0.4 |  | 2026-10-15 |  |  |
-| uffi | `patched` | defines no tests (2026-10-15) |  | load 3.1 / 0.4; tests 3.8 / 0.7 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| clsql | `patched` | ran; no recognised result (2026-10-15) |  | load 5.3 / 1.5; tests 4.8 / 1.3 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| trivial-file-size | `ok` | fiveam: 4 passed (2026-10-15) |  | load 2.2 / 0.3; tests 2.9 / 0.4 |  | 2026-10-15 |  |  |
-| serapeum | `ok` | fiveam: 1873 passed (2026-10-15) |  | load 13.3 / 3.2; tests 10.5 / 2.5 |  | 2026-10-15 |  |  |
-| proc-parse | `ok` | rove/prove: 17 passed (2026-10-15) |  | load 2.8 / 0.4; tests 5.6 / 1.0 |  | 2026-10-15 |  |  |
-| cl-markup | `ok` | rove/prove: 5 passed (2026-10-15) |  | load 2.3 / 0.3; tests 3.7 / 0.5 |  | 2026-10-15 |  |  |
-| cl-annot | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| yason | `ok` | unit-test: 62 passed (2026-10-15) |  | load 3.0 / 0.3; tests 3.3 / 0.5 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| smart-buffer | `load-only` | defines no tests (2026-10-15) |  | load 2.8 / 0.3; tests 3.8 / 0.6 |  | 2026-10-15 |  |  |
-| xsubseq | `ok` | rove/prove: 6 passed (2026-10-15) |  | load 2.0 / 0.2; tests 3.9 / 0.5 |  | 2026-10-15 |  |  |
-| cl-anonfun | `load-only` | defines no tests (2026-10-15) |  | load 2.3 / 0.2; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| cl-syntax | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| fast-http | `load-only` | rove/prove: 3 of 142 failed (2026-10-15) | same (babel): rove/prove: 3 of 142 failed | load 8.3 / 4.6; tests 6.3 / 1.0 |  | 2026-10-15 |  |  |
-| moptilities | `patched` | lift: 4 of 37 failed (2026-10-15) | same (lift moptilities): lift: 4 of 37 failed | load 2.6 / 0.3; tests 3.9 / 0.6 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| asdf-system-connections | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.2; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| metatilities-base | `ok` | lift: 9 passed (2026-10-15) |  | load 3.5 / 0.4; tests 3.4 / 0.4 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| cl-containers | `ok` | lift: 19 passed (2026-10-15) |  | load 4.6 / 1.0; tests 4.4 / 0.7 |  | 2026-10-15 |  |  |
-| cl-change-case | `ok` | fiveam: 97 passed (2026-10-15) |  | load 2.8 / 0.4; tests 3.6 / 0.5 |  | 2026-10-15 |  |  |
-| trivial-shell | `load-only` | lift: 1 of 1 failed (2026-10-15) | pending-fork (lift trivial-shell): ok, lift: 1 passed | load 2.4 / 0.3; tests 5.2 / 1.4 |  | 2026-10-15 |  |  |
-| cl-cookie | `ok` | rove/prove: 1 passed (2026-10-15) |  | load 4.9 / 3.0; tests 5.6 / 1.0 |  | 2026-10-15 |  |  |
-| parse-float | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.3; tests 2.8 / 0.3 |  | 2026-10-15 |  |  |
-| dexador | `patched` | test system did not load (2026-10-15) | improved (hunchentoot usocket babel bordeaux-threads trivial-backtrace slime dexador cl-fad cffi): rove/prove: 1 of 1 failed | load 4.2 / 1.0; tests 7.5 / 15.3 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| str | `ok` | fiveam: 400 passed (2026-10-15) |  | load 3.1 / 0.5; tests 4.7 / 0.6 |  | 2026-10-15 |  |  |
-| let-plus | `ok` | lift: 26 passed (2026-10-15) |  | load 2.8 / 0.3; tests 4.4 / 0.5 |  | 2026-10-15 |  |  |
-| slynk | `patched` | defines no tests (2026-10-15) |  | load 4.6 / 1.1; tests 2.7 / 0.3 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| array-utils | `ok` | parachute: 100 passed (2026-10-15) |  | load 2.7 / 0.3; tests 3.2 / 0.5 |  | 2026-10-15 |  |  |
-| plump | `load-only` | defines no tests (2026-10-15) |  | load 3.5 / 0.7; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| log4cl | `ok` | stefil: 773 passed (2026-10-15) |  | load 4.6 / 0.9; tests 17.3 / 10.5 |  | 2026-10-15 |  |  |
-| swap-bytes | `ok` | fiveam: 84 passed (2026-10-15) |  | load 2.4 / 0.3; tests 3.1 / 0.4 |  | 2026-10-15 |  |  |
-| ieee-floats | `ok` | fiveam: 50 passed (2026-10-15) |  | load 2.3 / 0.3; tests 3.1 / 0.4 |  | 2026-10-15 |  |  |
-| lift | `load-only` | error (2026-10-15) | improved (lift): lift: 2 of 107 failed | load 4.3 / 0.9; tests 7.1 / 2.4 |  | 2026-10-15 |  |  |
-| nibbles | `ok` | rt: 134 passed (2026-10-15) |  | load 3.1 / 0.4; tests 8.5 / 1.5 |  | 2026-10-15 |  |  |
-| parenscript | `load-only` | defines no tests (2026-10-15) |  | load 4.7 / 1.0; tests 6.3 / 1.5 |  | 2026-10-15 |  |  |
-| cl-difflib | `load-only` | rove/prove: error after 36 passed (2026-10-15) |  | load 2.7 / 0.3; tests 2.9 / 0.3 |  | 2026-10-15 |  |  |
-| cl-html-diff | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.2; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| kmrcl | `ok` | rt: 161 passed (2026-10-15) |  | load 4.0 / 0.8; tests 5.6 / 2.3 |  | 2026-10-15 |  |  |
-| lml2 | `load-only` | ran; no recognised result (2026-10-15) |  | load 3.1 / 0.5; tests 2.9 / 0.4 |  | 2026-10-15 |  |  |
-| cl-markdown | `load-only` | error (2026-10-15) | improved (lift trivial-shell): lift: 57 of 189 failed | load 4.3 / 0.8; tests 7.3 / 34.6 |  | 2026-10-15 |  |  |
-| dynamic-classes | `load-only` | defines no tests (2026-10-15) |  | load 2.1 / 0.2; tests 3.1 / 0.3 |  | 2026-10-15 |  |  |
-| jonathan | `load-only` | rove/prove: 1 of 72 failed (2026-10-15) | same (babel bordeaux-threads cffi): rove/prove: 1 of 72 failed | load 6.1 / 0.8; tests 9.0 / 1.5 |  | 2026-10-15 |  |  |
-| sqlite | `ok` | fiveam: 19 passed (2026-10-15) |  | load 3.5 / 0.5; tests 15.7 / 12.4 |  | 2026-10-15 |  |  |
-| cl-mysql | `fail` |  | same (babel slime cffi): does not load | load 2.8 / 0.5 |  | 2026-10-15 |  | `Unable to load any of the alternatives: (libmysqlclient.20.dylib libmysqlclient.dylib)` |
-| command-line-arguments | `load-only` | error (2026-10-15) |  | load 2.7 / 0.3; tests 3.0 / 0.4 |  | 2026-10-15 |  |  |
-| dissect | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| pathname-utils | `ok` | parachute: 254 passed (2026-10-15) |  | load 2.8 / 0.4; tests 3.6 / 0.7 |  | 2026-10-15 |  |  |
-| rutils | `load-only` | should-test: 5 of 122 failed (2026-10-15) | same (babel cffi): should-test: 5 of 122 failed | load 5.3 / 1.2; tests 6.3 / 1.6 |  | 2026-10-15 |  |  |
-| trivial-arguments | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.2; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| cl-opengl | `load-only` | defines no tests (2026-10-15) |  | load 15.3 / 12.1; tests 4.0 / 0.5 |  | 2026-10-15 |  |  |
-| zpng | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 2.6 / 0.2 |  | 2026-10-15 |  |  |
-| lparallel | `ok` | 1am: 63224 passed (2026-10-15) |  | load 4.8 / 1.0; tests 97.0 / 127.8 |  | 2026-10-15 |  |  |
-| optima | `ok` | fiveam: 202 passed (2026-10-15) |  | load 3.1 / 0.4; tests 4.9 / 0.7 |  | 2026-10-15 |  |  |
-| cl-speedy-queue | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| cl-colors2 | `ok` | clunit: 973 passed (2026-10-15) |  | load 3.9 / 0.6; tests 5.3 / 1.1 |  | 2026-10-15 |  |  |
-| acclimation | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.4; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| cl-redis | `fail` |  | pending-fork (usocket babel cl-redis bordeaux-threads cffi): error | load 3.6 / 1.8; tests - / 5.8 |  | 2026-10-15 |  | `Package SB-SYS not found` |
-| symbol-munger | `ok` | lisp-unit2: 37 passed (2026-10-15) |  | load 2.6 / 0.3; tests 4.9 / 0.9 |  | 2026-10-15 |  |  |
-| marshal | `load-only` | defines no tests (2026-10-15) |  | load 2.6 / 0.3; tests 3.1 / 0.4 |  | 2026-10-15 |  |  |
-| in-nomine | `load-only` | fiveam: 2 of 173 failed (2026-10-15) | pending-fork (trivial-arguments trivial-backtrace introspect-environment): ok, fiveam: 186 passed | load 3.0 / 0.4; tests 3.7 / 0.7 |  | 2026-10-15 |  |  |
-| vom | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| cl-ansi-text | `load-only` | defines no tests (2026-10-15) |  | load 3.0 / 0.4; tests 3.4 / 0.5 |  | 2026-10-15 |  |  |
-| collectors | `ok` | lisp-unit2: 80 passed (2026-10-15) |  | load 2.9 / 0.4; tests 4.1 / 0.8 |  | 2026-10-15 |  |  |
-| cl-dbi | `load-only` | defines no tests (2026-10-15) |  | load 3.1 / 0.5; tests 2.7 / 0.4 |  | 2026-10-15 |  |  |
-| trivial-rfc-1123 | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.4; tests 2.6 / 0.4 |  | 2026-10-15 |  |  |
-| cl-octet-streams | `ok` | fiveam: 280 passed (2026-10-15) |  | load 2.7 / 0.3; tests 3.7 / 0.5 |  | 2026-10-15 |  |  |
-| zstd | `ok` | fiveam: 35 passed (2026-10-15) |  | load 3.3 / 0.5; tests 4.0 / 0.6 |  | 2026-10-15 |  |  |
-| common-doc | `load-only` | fiveam: 1 of 92 failed (2026-10-15) | same (babel trivial-backtrace trivial-shell): fiveam: 1 of 92 failed | load 3.5 / 0.6; tests 4.5 / 0.8 |  | 2026-10-15 |  |  |
-| common-html | `ok` | fiveam: 43 passed (2026-10-15) |  | load 3.2 / 0.5; tests 4.1 / 0.7 |  | 2026-10-15 |  |  |
-| contextl | `load-only` | defines no tests (2026-10-15) |  | load 3.4 / 0.7; tests 2.5 / 0.4 |  | 2026-10-15 |  |  |
-| lw-compat | `load-only` | defines no tests (2026-10-15) |  | load 2.0 / 0.3; tests 2.3 / 0.2 |  | 2026-10-15 |  |  |
-| spinneret | `ok` | fiveam: 91 passed (2026-10-15) |  | load 12.3 / 1.0; tests 7.1 / 1.2 |  | 2026-10-15 |  |  |
-| path-parse | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.3; tests 3.0 / 0.3 |  | 2026-10-15 |  |  |
-| which | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.3; tests 3.2 / 0.4 |  | 2026-10-15 |  |  |
-| do-urlencode | `load-only` | defines no tests (2026-10-15) |  | load 2.8 / 0.4; tests 2.8 / 0.4 |  | 2026-10-15 |  |  |
-| lass | `load-only` | defines no tests (2026-10-15) |  | load 3.2 / 0.5; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| iolib | `fail` |  | same (babel bordeaux-threads trivial-backtrace iolib cffi): does not load | load 3.7 / 1.1 |  | 2026-10-15 |  | `iolib.asd: USE-PACKAGE: no package named IOLIB/COMMON-LISP` |
-| blackbird | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 4.4 / 0.7 |  | 2026-10-15 |  |  |
-| anypool | `load-only` | rove/prove: 1 of 1 failed (2026-10-15) | same (bordeaux-threads): rove/prove: 1 of 1 failed | load 2.9 / 0.4; tests 4.9 / 1.8 |  | 2026-10-15 |  |  |
-| circular-streams | `ok` | rove/prove: 15 passed (2026-10-15) |  | load 2.6 / 0.4; tests 3.9 / 0.6 |  | 2026-10-15 |  |  |
-| http-body | `ok` | rove/prove: 13 passed (2026-10-15) |  | load 3.3 / 0.5; tests 4.9 / 0.8 |  | 2026-10-15 |  |  |
-| lack | `load-only` | test system did not load (2026-10-15) | pending-fork (hunchentoot usocket babel cl-redis bordeaux-threads trivial-backtrace slime dexador cl-fad cffi): ok, rove/prove: 13 passed | load 2.9 / 0.4; tests 6.5 / 5.7 |  | 2026-10-15 |  |  |
-| tmpdir | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 3.8 / 0.6 |  | 2026-10-15 |  |  |
-| xml-emitter | `ok` | 1am: 2 passed (2026-10-15) |  | load 2.5 / 0.3; tests 2.8 / 0.3 |  | 2026-10-15 |  |  |
-| mmap | `ok` | parachute: 8 passed (2026-10-15) |  | load 3.0 / 0.4; tests 3.8 / 0.6 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| stem | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| zpb-ttf | `load-only` | defines no tests (2026-10-15) |  | load 3.2 / 0.5; tests 2.6 / 0.2 |  | 2026-10-15 |  |  |
-| 3bz | `load-only` | defines no tests (2026-10-15) |  | load 4.9 / 1.8; tests 3.3 / 0.4 |  | 2026-10-15 |  |  |
-| cl-async | `load-only` | defines no tests (2026-10-15) |  | load 5.7 / 2.8; tests 6.5 / 1.3 |  | 2026-10-15 |  |  |
-| cl-libuv | `load-only` | defines no tests (2026-10-15) |  | load 2.8 / 0.5; tests 3.7 / 0.6 |  | 2026-10-15 |  |  |
-| toot | `load-only` | defines no tests (2026-10-15) |  | load 4.4 / 0.9; tests 3.9 / 0.6 |  | 2026-10-15 |  |  |
-| atomics | `ok` | parachute: 93 passed (2026-10-15) |  | load 2.2 / 0.3; tests 3.2 / 0.5 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| cl-jpeg | `load-only` | defines no tests (2026-10-15) |  | load 4.1 / 2.4; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| trivial-do | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| osicat | `load-only` | rt: 4 of 93 failed (2026-10-15) | same (babel cffi): rt: 4 of 93 failed | load 5.3 / 3.5; tests 5.1 / 0.8 |  | 2026-10-15 |  |  |
-| wookie | `load-only` | defines no tests (2026-10-15) |  | load 4.9 / 1.0; tests 4.4 / 0.8 |  | 2026-10-15 |  |  |
-| zpb-exif | `load-only` | defines no tests (2026-10-15) |  | load 3.0 / 0.4; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| cl-colors | `load-only` | defines no tests (2026-10-15) |  | load 3.3 / 0.4; tests 3.3 / 0.5 |  | 2026-10-15 |  |  |
-| pngload | `load-only` | defines no tests (2026-10-15) |  | load 6.4 / 1.7; tests 5.6 / 1.0 |  | 2026-10-15 |  |  |
-| trivial-open-browser | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| clack | `load-only` | defines no tests (2026-10-15) |  | load 3.3 / 0.5; tests 6.7 / 1.3 |  | 2026-10-15 |  |  |
-| shasht | `load-only` | parachute: 6 of 391 failed (2026-10-15) | same (trivial-custom-debugger): parachute: 6 of 391 failed | load 2.9 / 0.3; tests 5.4 / 1.3 |  | 2026-10-15 |  |  |
-| trivial-timeout | `load-only` | lift: 1 of 2 failed (2026-10-15) |  | load 2.2 / 0.2; tests 4.1 / 1.0 |  | 2026-10-15 |  |  |
-| cl-l10n | `load-only` | stefil: 2 of 331 failed (2026-10-15) | same (babel bordeaux-threads cl-fad): stefil: 2 of 331 failed | load 6.1 / 1.2; tests 6.7 / 1.0 |  | 2026-10-15 |  |  |
-| cl-l10n-cldr | `load-only` | defines no tests (2026-10-15) |  | load 2.0 / 0.2; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| concrete-syntax-tree | `ok` | fiveam: 40 passed (2026-10-15) |  | load 3.0 / 0.4; tests 24.1 / 6.0 |  | 2026-10-15 |  |  |
-| cl-vectors | `load-only` | defines no tests (2026-10-15) |  | load 3.4 / 0.5; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| deflate | `load-only` | test system did not load (2026-10-15) | improved (deflate): no-result | load 2.8 / 0.3; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| eclector | `ok` | fiveam: 4591 passed (2026-10-15) |  | load 4.2 / 0.9; tests 9.9 / 1.3 |  | 2026-10-15 |  |  |
-| uuid | `load-only` | defines no tests (2026-10-15) |  | load 3.6 / 0.5; tests 4.0 / 0.5 |  | 2026-10-15 |  |  |
-| cl-autowrap | `load-only` | defines no tests (2026-10-15) |  | load 4.0 / 0.8; tests 3.6 / 0.6 |  | 2026-10-15 |  |  |
-| defpackage-plus | `load-only` | defines no tests (2026-10-15) |  | load 2.1 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| arnesi | `load-only` | ran; no recognised result (2026-10-15) |  | load 5.0 / 1.0; tests 4.2 / 0.6 |  | 2026-10-15 |  |  |
-| skippy | `load-only` | defines no tests (2026-10-15) |  | load 3.3 / 0.4; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| asdf-package-system | `load-only` | defines no tests (2026-10-15) |  | load 2.0 / 0.2; tests 2.3 / 0.2 |  | 2026-10-15 |  |  |
-| cl-store | `ok` | rt: 115 passed (2026-10-15) |  | load 3.4 / 0.4; tests 4.1 / 0.5 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| com.gigamonkeys.binary-data | `load-only` | defines no tests (2026-10-15) |  | load 2.9 / 0.4; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| clx | `load-only` | fiasco: 4 of 4 failed (2026-10-15) |  | load 9.9 / 5.3; tests 4.8 / 0.7 |  | 2026-10-15 | Loads. Its tests connect to an X server, and the measuring machine has none (`DISPLAY` is not set); SBCL fails the same four. `dependent.lisp` still warns at compile time that `buffer-input-wait-default` falls back to polling on an implementation it has no code for. |  |
-| access | `ok` | lisp-unit2: 186 passed (2026-10-15) |  | load 3.1 / 0.5; tests 4.5 / 1.1 |  | 2026-10-15 |  |  |
-| prove | `load-only` | defines no tests (2026-10-15) |  | load 3.5 / 0.6; tests 3.6 / 0.5 |  | 2026-10-15 |  |  |
-| trivial-channels | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.4; tests 2.8 / 0.3 |  | 2026-10-15 |  |  |
-| flexichain | `load-only` | defines no tests (2026-10-15) |  | load 2.8 / 0.4; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| cl-dot | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| cl-tga | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.3; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| glsl-toolkit | `load-only` | defines no tests (2026-10-15) |  | load 4.6 / 1.0; tests 2.9 / 0.4 |  | 2026-10-15 |  |  |
-| cl-pdf | `load-only` | defines no tests (2026-10-15) |  | load 4.5 / 0.9; tests 3.0 / 0.4 |  | 2026-10-15 |  |  |
-| form-fiddle | `load-only` | defines no tests (2026-10-15) |  | load 2.3 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| opticl-core | `load-only` | defines no tests (2026-10-15) |  | load 3.0 / 0.4; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| retrospectiff | `ok` | fiveam: 38 passed (2026-10-15) |  | load 3.9 / 0.7; tests 5.6 / 0.8 |  | 2026-10-15 |  |  |
-| vas-string-metrics | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.2; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| cl-strings | `load-only` | rove/prove: 1 of 20 failed (2026-10-15) |  | load 2.8 / 0.3; tests 4.1 / 0.8 |  | 2026-10-15 |  |  |
-| opticl | `ok` | fiveam: 134 passed (2026-10-15) |  | load 6.7 / 1.9; tests 6.8 / 1.2 |  | 2026-10-15 |  |  |
-| cl-reexport | `ok` | rove/prove: 17 passed (2026-10-15) |  | load 2.2 / 0.2; tests 3.6 / 0.5 |  | 2026-10-15 |  |  |
-| lambda-fiddle | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| trivial-package-local-nicknames | `ok` | tpln: 17 passed (2026-10-15) |  | load 2.4 / 0.3; tests 2.5 / 0.2 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| cl-indentify | `ok` | rove/prove: 1 passed (2026-10-15) |  | load 2.7 / 0.3; tests 4.1 / 0.5 |  | 2026-10-15 |  |  |
-| parser-combinators | `load-only` | defines no tests (2026-10-15) |  | load 3.5 / 0.5; tests 4.8 / 0.6 |  | 2026-10-15 |  |  |
-| sdl2 | `fail` |  | same (babel bordeaux-threads cffi): does not load | load 5.0 / 0.9 |  | 2026-10-15 | Not a dotcl failure: this host has no SDL2 library, so the loader finds neither the framework nor libSDL2. SBCL 2.6.8 stops at the same place. | `Unable to load any of the alternatives: ((:FRAMEWORK SDL2) (:DEFAULT libSDL2))` |
-| lorem-ipsum | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.2; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| spatial-trees | `ok` | fiveam: 12 passed (2026-10-15) |  | load 3.0 / 0.3; tests 217.4 / 30.5 |  | 2026-10-15 | The result varies from run to run: the suites build their trees from `random` rectangles and points, and of four runs with the same dotcl and dists, one failed 3 of 18 checks and three passed all of theirs (the run shown is one of these). |  |
-| cl-dejavu | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.2; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| cl-locale | `ok` | rove/prove: 13 passed (2026-10-15) |  | load 3.2 / 0.4; tests 4.7 / 0.8 |  | 2026-10-15 |  |  |
-| cluffer | `load-only` | ran; no recognised result (2026-10-15) |  | load 3.6 / 0.6; tests 22.8 / 14.0 |  | 2026-10-15 |  |  |
-| clump | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.3; tests 3.0 / 0.4 |  | 2026-10-15 |  |  |
-| gettext | `ok` | stefil: 100 passed (2026-10-15) |  | load 3.2 / 0.4; tests 3.9 / 0.5 |  | 2026-10-15 |  |  |
-| pzmq | `fail` |  | same (babel bordeaux-threads trivial-backtrace cffi): does not load | load 2.8 / 0.6 |  | 2026-10-15 |  | `Subprocess #<PROCESS-INFO> with command (cc -o <path> -c -I /opt/local/include/ -fPIC -I<path> <path>) exited with error code 1` |
-| sha1 | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.2; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| with-output-to-stream | `ok` | parachute: 11 passed (2026-10-15) |  | load 2.1 / 0.2; tests 2.9 / 0.3 |  | 2026-10-15 |  |  |
-| alexandria+ | `ok` | clunit: 35 passed (2026-10-15) |  | load 2.6 / 0.2; tests 3.5 / 0.5 |  | 2026-10-15 |  |  |
-| cl-cont | `ok` | rt: 132 passed (2026-10-15) |  | load 2.7 / 0.3; tests 4.0 / 0.4 |  | 2026-10-15 |  |  |
-| cl-package-locks | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.2; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| routes | `ok` | lift: 35 passed (2026-10-15) |  | load 2.6 / 0.3; tests 4.2 / 0.8 |  | 2026-10-15 |  |  |
-| cl-slice | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 3.5 / 0.5 |  | 2026-10-15 |  |  |
-| lisp-unit | `load-only` | defines no tests (2026-10-15) |  | load 3.1 / 0.4; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| mcclim | `fail` |  | pending-fork (babel deflate bordeaux-threads trivial-backtrace slime cffi mcclim): fiveam: 9 of 2246 failed | load 14.0 / 11.7; tests - / 5.9 |  | 2026-10-15 |  | `DEFUN: package COMMON-LISP is locked; cannot redefine READ` |
-| s-xml | `load-only` | defines no tests (2026-10-15) |  | load 2.8 / 0.3; tests 2.9 / 0.3 |  | 2026-10-15 |  |  |
-| translate | `ok` | fiveam: 15 passed (2026-10-15) |  | load 2.3 / 0.2; tests 3.0 / 0.3 |  | 2026-10-15 |  |  |
-| array-operations | `ok` | clunit: 219 passed (2026-10-15) |  | load 3.4 / 0.4; tests 6.4 / 2.2 |  | 2026-10-15 |  |  |
-| arrows | `ok` | stefil: 29 passed (2026-10-15) |  | load 2.3 / 0.2; tests 3.4 / 0.4 |  | 2026-10-15 |  |  |
-| cl-cpus | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.4; tests 2.9 / 0.4 |  | 2026-10-15 |  |  |
-| find-port | `ok` | fiveam: 3 passed (2026-10-15) |  | load 2.6 / 0.4; tests 3.4 / 0.4 |  | 2026-10-15 |  |  |
-| hu.dwim.asdf | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| cl-unification | `load-only` | ptester: 3 of 52 failed (2026-10-15) |  | load 3.2 / 0.5; tests 3.2 / 0.4 |  | 2026-10-15 |  |  |
-| event-emitter | `ok` | rove/prove: 13 passed (2026-10-15) |  | load 2.3 / 0.3; tests 4.1 / 0.6 |  | 2026-10-15 |  |  |
-| external-program | `ok` | fiveam: 31 passed (2026-10-15) |  | load 2.4 / 0.3; tests 8.3 / 7.3 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| fast-websocket | `load-only` | rove/prove: 4 of 24 failed (2026-10-15) | same (babel cffi): rove/prove: 4 of 24 failed | load 3.0 / 0.4; tests 4.8 / 0.8 |  | 2026-10-15 |  |  |
-| map-set | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.2; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| metacopy | `ok` | lift: 8 passed (2026-10-15) |  | load 2.5 / 0.3; tests 3.3 / 0.4 |  | 2026-10-15 |  |  |
-| nontrivial-gray-streams | `load-only` | test system did not load (2026-10-15) | same (trivial-custom-debugger): test system did not load | load 1.9 / 0.3; tests 2.7 / 5.1 |  | 2026-10-15 |  |  |
-| websocket-driver | `load-only` | defines no tests (2026-10-15) |  | load 3.9 / 0.7; tests 4.0 / 0.6 |  | 2026-10-15 |  |  |
-| xmls | `ok` | fiveam: 36 passed (2026-10-15) |  | load 2.8 / 0.4; tests 4.1 / 0.4 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| cl-emb | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.4; tests 2.6 / 0.4 |  | 2026-10-15 |  |  |
-| clss | `load-only` | defines no tests (2026-10-15) |  | load 3.1 / 0.4; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| djula | `ok` | fiveam: 211 passed (2026-10-15) |  | load 4.9 / 0.9; tests 5.9 / 1.0 |  | 2026-10-15 |  |  |
-| hu.dwim.common | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 2.8 / 0.3 |  | 2026-10-15 |  |  |
-| hu.dwim.common-lisp | `load-only` | defines no tests (2026-10-15) |  | load 2.1 / 0.3; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| hu.dwim.def | `ok` | stefil: 86 passed (2026-10-15) |  | load 3.5 / 0.5; tests 4.5 / 0.6 |  | 2026-10-15 |  |  |
-| hu.dwim.defclass-star | `load-only` | stefil: 4 of 23 failed (2026-10-15) | same (slime): stefil: 4 of 23 failed | load 2.7 / 0.3; tests 4.2 / 0.6 |  | 2026-10-15 |  |  |
-| hu.dwim.delico | `fail` |  | same (slime hu.dwim.util): does not load | load 6.3 / 1.7; tests - / 1.4 |  | 2026-10-15 |  | `LIBSTATUS-FAIL This is not implemented for your lisp, sorry. You may try to continue, but...` |
-| hu.dwim.logger | `load-only` | defines no tests (2026-10-15) |  | load 3.7 / 0.5; tests 4.3 / 0.6 |  | 2026-10-15 |  |  |
-| hu.dwim.partial-eval | `fail` |  | same (bordeaux-threads slime hu.dwim.util): does not load | load 3.8 / 0.9; tests - / 0.6 |  | 2026-10-15 |  | `Package SB-PCL not found` |
-| hu.dwim.quasi-quote | `load-only` | defines no tests (2026-10-15) |  | load 4.7 / 1.0; tests 3.6 / 0.6 |  | 2026-10-15 |  |  |
-| hu.dwim.syntax-sugar | `load-only` | defines no tests (2026-10-15) |  | load 2.3 / 0.3; tests 5.1 / 0.8 |  | 2026-10-15 |  |  |
-| hu.dwim.util | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.4; tests 3.0 / 0.4 |  | 2026-10-15 | Loads; `source/place.lisp` warns at read time (`#.(warn ...)`) that `symbol-global-value` has no implementation outside SBCL and falls back to `symbol-value`. |  |
-| hu.dwim.walker | `load-only` | test system did not load (2026-10-15) | same (slime hu.dwim.util): test system did not load | load 2.7 / 0.5; tests 4.3 / 1.2 |  | 2026-10-15 | Loads. Its test system needs iolib, which has no branch for dotcl's Gray streams, and, as on SBCL, the C library libfixposix, which the measuring machine does not have. |  |
-| metatilities | `ok` | lift: 6 passed (2026-10-15) |  | load 3.9 / 0.7; tests 3.9 / 0.5 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| zip | `load-only` | defines no tests (2026-10-15) |  | load 3.6 / 0.6; tests 3.1 / 0.4 |  | 2026-10-15 |  |  |
-| zlib | `load-only` | defines no tests (2026-10-15) |  | load 3.0 / 0.4; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| closure-html | `load-only` | defines no tests (2026-10-15) |  | load 5.4 / 1.2; tests 4.0 / 0.6 |  | 2026-10-15 |  |  |
-| common-lisp-jupyter | `fail` |  | same (babel bordeaux-threads cffi): does not load | load 4.3 / 1.0 |  | 2026-10-15 |  | `Subprocess #<PROCESS-INFO> with command (cc -o <path> -c -I /opt/local/include/ -fPIC -I<path> <path>) exited with error code 1` |
-| fare-mop | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.3; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| jpeg-turbo | `ok` | fiveam: 14 passed (2026-10-15) |  | load 3.5 / 1.3; tests 4.9 / 0.6 |  | 2026-10-15 |  |  |
-| trivial-extensible-sequences | `load-only` | defines no tests (2026-10-15) |  | load 3.1 / 0.2; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| trivial-main-thread | `load-only` | defines no tests (2026-10-15) |  | load 2.6 / 0.3; tests 2.7 / 0.3 |  | 2026-10-15 |  |  |
-| docparser | `load-only` | defines no tests (2026-10-15) |  | load 3.2 / 0.5; tests 4.0 / 0.5 |  | 2026-10-15 |  |  |
-| inferior-shell | `ok` | fiveam: 16 passed (2026-10-15) |  | load 5.2 / 0.5; tests 4.1 / 3.8 |  | 2026-10-15 |  |  |
-| local-time-duration | `load-only` | defines no tests (2026-10-15) |  | load 3.2 / 0.4; tests 2.8 / 0.3 |  | 2026-10-15 |  |  |
-| lquery | `load-only` | fiveam: 4 of 176 failed (2026-10-15) | same (trivial-backtrace): fiveam: 4 of 176 failed | load 3.2 / 0.4; tests 4.5 / 0.4 |  | 2026-10-15 |  |  |
-| myway | `ok` | rove/prove: 23 passed (2026-10-15) |  | load 3.1 / 0.5; tests 4.5 / 0.7 |  | 2026-10-15 |  |  |
-| ningle | `ok` | rove/prove: 33 passed (2026-10-15) |  | load 3.6 / 0.6; tests 5.9 / 1.2 |  | 2026-10-15 |  |  |
-| st-json | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| vecto | `load-only` | defines no tests (2026-10-15) |  | load 3.4 / 0.4; tests 2.9 / 0.4 |  | 2026-10-15 |  |  |
-| cl-inflector | `ok` | lisp-unit2: 62 passed (2026-10-15) |  | load 2.6 / 0.3; tests 3.9 / 0.8 |  | 2026-10-15 |  |  |
-| curry-compose-reader-macros | `load-only` | ran; no recognised result (2026-10-15) |  | load 2.6 / 0.3; tests 3.0 / 0.4 |  | 2026-10-15 |  |  |
-| piping | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| aserve | `fail` |  | pending-fork (bordeaux-threads portableaserve cl-fad): error | load 2.0 / 2.1; tests - / 0.7 |  | 2026-10-15 |  | `acl-compat.asd: The acl-compat library is not yet supported on this lisp implementation.` |
-| sha3 | `load-only` | defines no tests (2026-10-15) |  | load 3.6 / 0.4; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| verbose | `load-only` | defines no tests (2026-10-15) |  | load 3.4 / 0.5; tests 2.9 / 0.3 |  | 2026-10-15 |  |  |
-| chronicity | `ok` | lisp-unit: 447 passed (2026-10-15) |  | load 3.7 / 0.7; tests 7.6 / 1.6 |  | 2026-10-15 |  |  |
-| cl-base32 | `ok` | lisp-unit: 5 passed (2026-10-15) |  | load 2.4 / 0.3; tests 2.8 / 0.2 |  | 2026-10-15 |  |  |
-| cl-isaac | `ok` | parachute: 35 passed (2026-10-15) |  | load 2.8 / 0.4; tests 6.4 / 1.0 |  | 2026-10-15 |  |  |
-| cl-libyaml | `fail` |  | same (babel trivial-backtrace cffi): does not load | load 2.6 / 0.4 |  | 2026-10-15 |  | `Unable to load any of the alternatives: (libyaml.dylib libyaml-0.2.dylib)` |
-| cl-pattern | `load-only` | defines no tests (2026-10-15) |  | load 2.9 / 0.3; tests 2.9 / 0.4 |  | 2026-10-15 |  |  |
-| cl-yaml | `fail` |  | same (babel cffi): does not load | load 2.5 / 0.4 |  | 2026-10-15 |  | `Unable to load any of the alternatives: (libyaml.dylib libyaml-0.2.dylib)` |
-| imago | `ok` | fiveam: 80 passed (2026-10-15) |  | load 4.9 / 1.0; tests 79.2 / 22.3 |  | 2026-10-15 |  |  |
-| mathkit | `load-only` | defines no tests (2026-10-15) |  | load 4.0 / 0.5; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| more-conditions | `load-only` | fiveam: 22 of 133 failed (2026-10-15) | same (trivial-backtrace): fiveam: 22 of 133 failed | load 2.8 / 0.3; tests 3.8 / 0.5 |  | 2026-10-15 |  |  |
-| plump-sexp | `load-only` | defines no tests (2026-10-15) |  | load 2.6 / 0.2; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| plump-tex | `load-only` | fiveam: 10 of 17 failed (2026-10-15) | same (trivial-backtrace): fiveam: 10 of 17 failed | load 2.8 / 0.3; tests 3.4 / 0.4 |  | 2026-10-15 |  |  |
-| policy-cond | `load-only` | defines no tests (2026-10-15) |  | load 4.1 / 0.3; tests 2.9 / 0.2 |  | 2026-10-15 |  |  |
-| s-base64 | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| agnostic-lizard | `load-only` | defines no tests (2026-10-15) |  | load 3.0 / 0.4; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| net.didierverna.clon.core | `load-only` | defines no tests (2026-10-15) |  | load 4.0 / 0.8; tests 2.8 / 0.3 |  | 2026-10-15 |  |  |
-| frugal-uuid | `ok` | fiveam: 137 passed (2026-10-15) |  | load 2.8 / 0.4; tests 3.2 / 0.4 |  | 2026-10-15 |  |  |
-| cl-gendoc | `load-only` | defines no tests (2026-10-15) |  | load 3.2 / 0.6; tests 3.0 / 0.5 |  | 2026-10-15 |  |  |
-| cl-slug | `ok` | rove/prove: 6 passed (2026-10-15) |  | load 2.6 / 0.4; tests 3.7 / 0.5 |  | 2026-10-15 |  |  |
-| trivial-clock | `ok` | fiveam: 6 passed (2026-10-15) |  | load 2.6 / 0.4; tests 3.5 / 0.5 |  | 2026-10-15 |  |  |
-| gzip-stream | `load-only` | defines no tests (2026-10-15) |  | load 3.0 / 0.4; tests 2.8 / 0.4 |  | 2026-10-15 |  |  |
-| jsown | `load-only` | defines no tests (2026-10-15) |  | load 3.1 / 0.3; tests 3.0 / 0.3 |  | 2026-10-15 |  |  |
-| prometheus | `load-only` | defines no tests (2026-10-15) |  | load 3.5 / 0.5; tests 4.7 / 0.7 |  | 2026-10-15 |  |  |
-| quantile-estimator | `load-only` | defines no tests (2026-10-15) |  | load 2.1 / 0.2; tests 3.8 / 0.5 |  | 2026-10-15 |  |  |
-| assoc-utils | `ok` | rove/prove: 1 passed (2026-10-15) |  | load 2.4 / 0.2; tests 4.0 / 0.5 |  | 2026-10-15 |  |  |
-| binding-arrows | `ok` | stefil: 93 passed (2026-10-15) |  | load 2.5 / 0.3; tests 4.0 / 0.3 |  | 2026-10-15 |  |  |
-| chanl | `load-only` | fiveam: 1 of 256 failed (2026-10-15) | same (bordeaux-threads trivial-backtrace): fiveam: 1 of 256 failed | load 3.3 / 0.4; tests 29.9 / 27.3 |  | 2026-10-15 | The one failing check is `STUMBLERS` in `DEADLOCK`, and SBCL fails it the same way: it asks `yes-or-no-p`, and a test run with no terminal gets `END-OF-FILE` there instead of an answer. |  |
-| abstract-classes | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.2; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| cl-freetype2 | `fail` |  | same (babel trivial-backtrace cffi): does not load | load 2.9 / 0.6 |  | 2026-10-15 |  | `Subprocess #<PROCESS-INFO> with command (cc -o <path> -c -I<path> -I /opt/local/include/ -I/opt/local/include/freetype2 -I/opt/local/include/freetype2/freetype ` |
-| cl-readline | `load-only` | defines no tests (2026-10-15) |  | load 3.2 / 0.5; tests 3.1 / 0.4 |  | 2026-10-15 |  |  |
-| sdl2-ttf | `fail` |  | same (babel bordeaux-threads cffi): does not load | load 4.1 / 0.7 |  | 2026-10-15 |  | `Unable to load any of the alternatives: ((:FRAMEWORK SDL2) (:DEFAULT libSDL2))` |
-| cl-template | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 3.1 / 0.3 |  | 2026-10-15 |  |  |
-| clsql-helper | `load-only` | error (2026-10-15) | same (clsql): error | load 4.9 / 0.9; tests 5.7 / 1.2 |  | 2026-10-15 |  |  |
-| fn | `load-only` | defines no tests (2026-10-15) |  | load 2.9 / 0.3; tests 2.7 / 0.3 |  | 2026-10-15 |  |  |
-| interface | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.3; tests 2.6 / 0.2 |  | 2026-10-15 |  |  |
-| kebab | `ok` | rove/prove: 5 passed (2026-10-15) |  | load 3.1 / 0.5; tests 4.7 / 0.7 |  | 2026-10-15 |  |  |
-| precise-time | `ok` | parachute: 7 passed (2026-10-15) |  | load 2.8 / 0.4; tests 5.7 / 2.6 |  | 2026-10-15 |  |  |
-| queues | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.2; tests 2.3 / 0.2 |  | 2026-10-15 |  |  |
-| secret-values | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.2; tests 2.3 / 0.2 |  | 2026-10-15 |  |  |
-| slynk-macrostep | `load-only` | defines no tests (2026-10-15) |  | load 2.6 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| slynk-named-readtables | `load-only` | defines no tests (2026-10-15) |  | load 2.3 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| archive | `load-only` | defines no tests (2026-10-15) |  | load 3.5 / 0.5; tests 2.8 / 0.3 |  | 2026-10-15 |  |  |
-| arrow-macros | `ok` | fiveam: 82 passed (2026-10-15) |  | load 2.3 / 0.2; tests 3.1 / 0.3 |  | 2026-10-15 |  |  |
-| binary-structures | `load-only` | defines no tests (2026-10-15) |  | load 4.5 / 0.9; tests 3.1 / 0.5 |  | 2026-10-15 |  |  |
-| bobbin | `ok` | 1am: 24 passed (2026-10-15) |  | load 2.3 / 0.2; tests 2.8 / 0.3 |  | 2026-10-15 |  |  |
-| cl-ascii-table | `load-only` | defines no tests (2026-10-15) |  | load 2.3 / 0.2; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| cl-cairo2 | `load-only` | defines no tests (2026-10-15) |  | load 4.5 / 0.9; tests 3.4 / 0.5 |  | 2026-10-15 |  |  |
-| data-format-validation | `load-only` | defines no tests (2026-10-15) |  | load 3.3 / 0.6; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| docutils | `load-only` | defines no tests (2026-10-15) |  | load 5.2 / 1.5; tests 2.8 / 0.4 |  | 2026-10-15 |  |  |
-| cl-environments | `ok` | fiveam: 171 passed (2026-10-15) |  | load 2.3 / 0.4; tests 4.3 / 0.6 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| cl-hash-util | `ok` | fiveam: 21 passed (2026-10-15) |  | load 2.5 / 0.3; tests 2.8 / 0.4 |  | 2026-10-15 |  |  |
-| cl-pass | `load-only` | defines no tests (2026-10-15) |  | load 3.5 / 0.5; tests 4.6 / 0.8 |  | 2026-10-15 |  |  |
-| codex | `load-only` | test system did not load (2026-10-15) | same (babel bordeaux-threads trivial-backtrace trivial-shell cl-fad cffi): test system did not load | load 5.5 / 1.2; tests 5.8 / 1.2 |  | 2026-10-15 |  |  |
-| common-doc-plump | `ok` | fiveam: 108 passed (2026-10-15) |  | load 3.0 / 0.5; tests 4.3 / 0.7 |  | 2026-10-15 |  |  |
-| org.tfeb.conduit-packages | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| definitions | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.4; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| f-underscore | `load-only` | defines no tests (2026-10-15) |  | load 2.1 / 0.2; tests 2.3 / 0.2 |  | 2026-10-15 |  |  |
-| glsl-spec | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| html-template | `load-only` | defines no tests (2026-10-15) |  | load 2.8 / 0.4; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| let-over-lambda | `load-only` | error (2026-10-15) |  | load 3.6 / 0.5; tests 4.1 / 0.6 |  | 2026-10-15 |  |  |
-| lispbuilder-sdl | `fail` |  | same (babel cffi): does not load | load 2.3 / 0.2 |  | 2026-10-15 |  | `System cocoahelper not found` |
-| pandocl | `load-only` | defines no tests (2026-10-15) |  | load 3.2 / 0.5; tests 3.5 / 0.5 |  | 2026-10-15 |  |  |
-| parenml | `ok` | fiveam: 4 passed (2026-10-15) |  | load 3.1 / 0.5; tests 4.2 / 0.7 |  | 2026-10-15 |  |  |
-| print-licenses | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.2; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| rtg-math | `load-only` | defines no tests (2026-10-15) |  | load 4.9 / 1.0; tests 3.2 / 0.3 |  | 2026-10-15 |  |  |
-| scriba | `load-only` | fiveam: 6 of 97 failed (2026-10-15) | same (babel trivial-backtrace): fiveam: 6 of 97 failed | load 3.1 / 0.5; tests 6.3 / 0.8 |  | 2026-10-15 |  |  |
-| series | `patched` | error (2026-10-15) |  | load 5.5 / 1.1; tests 3.3 / 0.5 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| sxql | `ok` | rove/prove: 8 passed (2026-10-15) |  | load 4.2 / 1.1; tests 7.4 / 1.4 |  | 2026-10-15 |  |  |
-| thorn | `ok` | fiveam: 5 passed (2026-10-15) |  | load 2.7 / 0.4; tests 3.9 / 0.6 |  | 2026-10-15 |  |  |
-| varjo | `load-only` | defines no tests (2026-10-15) |  | load 7.8 / 2.5; tests 7.2 / 1.6 |  | 2026-10-15 |  |  |
-| vertex | `ok` | fiveam: 25 passed (2026-10-15) |  | load 3.1 / 0.5; tests 4.5 / 0.7 |  | 2026-10-15 |  |  |
-| agutil | `load-only` | defines no tests (2026-10-15) |  | load 2.8 / 0.3; tests 2.8 / 0.3 |  | 2026-10-15 |  |  |
-| binascii | `ok` | rt: 18 passed (2026-10-15) |  | load 3.1 / 0.5; tests 3.5 / 0.4 |  | 2026-10-15 |  |  |
-| cl-base58 | `ok` | rove/prove: 8 passed (2026-10-15) |  | load 2.3 / 0.3; tests 4.0 / 0.6 |  | 2026-10-15 |  |  |
-| cl-conspack | `ok` | fiveam: 46 passed (2026-10-15) |  | load 3.6 / 0.7; tests 3.7 / 0.6 |  | 2026-10-15 |  |  |
-| cl-css | `load-only` | defines no tests (2026-10-15) |  | load 2.4 / 0.3; tests 2.5 / 0.2 |  | 2026-10-15 |  |  |
-| cl-cuda | `load-only` | test system did not load (2026-10-15) | same (babel external-program cffi): test system did not load | load 4.7 / 1.0; tests 5.3 / 0.9 |  | 2026-10-15 |  |  |
-| cl-custom-hash-table | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.3; tests 3.2 / 0.3 |  | 2026-10-15 |  |  |
-| cl-html5-parser | `fail` |  | same (slime): does not load | load 2.7 / 1.3; tests - / 1.2 |  | 2026-10-15 |  | `COERCE: list element not a character` |
-| cl-messagepack | `load-only` | fiveam: 1 of 88 failed (2026-10-15) | pending-fork (babel trivial-backtrace cl-messagepack): ok, fiveam: 96 passed | load 3.2 / 0.6; tests 6.2 / 1.1 |  | 2026-10-15 |  |  |
-| cl-project | `load-only` | rove/prove: 1 of 2 failed (2026-10-15) | same (babel bordeaux-threads cffi): rove/prove: 1 of 2 failed | load 3.1 / 0.4; tests 8.3 / 1.8 |  | 2026-10-15 |  |  |
-| sdl2-image | `fail` |  | same (babel bordeaux-threads cffi): does not load | load 4.2 / 0.7 |  | 2026-10-15 |  | `Unable to load any of the alternatives: ((:FRAMEWORK SDL2) (:DEFAULT libSDL2))` |
-| clavier | `ok` | stefil: 100 passed (2026-10-15) |  | load 4.2 / 0.6; tests 5.0 / 0.7 |  | 2026-10-15 |  |  |
-| com.google.base | `ok` | stefil: 14 passed (2026-10-15) |  | load 2.7 / 0.3; tests 3.3 / 0.3 |  | 2026-10-15 |  |  |
-| commondoc-markdown | `ok` | rove/prove: 1 passed (2026-10-15) |  | load 5.2 / 1.2; tests 8.1 / 1.6 |  | 2026-10-15 |  |  |
-| crypto-shortcuts | `load-only` | defines no tests (2026-10-15) |  | load 4.2 / 0.7; tests 4.1 / 0.6 |  | 2026-10-15 |  |  |
-| damn-fast-priority-queue | `load-only` | ran; no recognised result (2026-10-15) |  | load 2.9 / 0.3; tests 25.1 / 6.0 |  | 2026-10-15 |  |  |
-| deploy | `load-only` | defines no tests (2026-10-15) |  | load 3.4 / 0.7; tests 5.0 / 0.9 |  | 2026-10-15 |  |  |
-| 40ants-doc | `load-only` | rove/prove: 2 of 6 failed (2026-10-15) | same (babel serapeum bordeaux-threads introspect-environment): rove/prove: 2 of 6 failed | load 3.9 / 0.6; tests 15.6 / 3.5 |  | 2026-10-15 |  |  |
-| docs-builder | `load-only` | defines no tests (2026-10-15) |  | load 3.8 / 0.6; tests 4.4 / 0.6 |  | 2026-10-15 |  |  |
-| duologue | `ok` | stefil: 5 passed (2026-10-15) |  | load 4.9 / 0.6; tests 5.0 / 0.7 |  | 2026-10-15 |  |  |
-| fare-memoization | `ok` | stefil: 34 passed (2026-10-15) |  | load 2.5 / 0.3; tests 3.3 / 0.4 |  | 2026-10-15 |  |  |
-| ltk | `load-only` | defines no tests (2026-10-15) |  | load 4.1 / 1.2; tests 2.6 / 0.4 |  | 2026-10-15 |  |  |
-| osc | `load-only` | defines no tests (2026-10-15) |  | load 3.1 / 0.5; tests 2.9 / 0.4 |  | 2026-10-15 |  |  |
-| pileup | `ok` | stefil: 316 passed (2026-10-15) |  | load 2.9 / 0.3; tests 3.8 / 0.4 |  | 2026-10-15 |  |  |
-| quasiquote-2.0 | `load-only` | error (2026-10-15) | same (trivial-backtrace): error | load 2.6 / 0.3; tests 3.3 / 0.4 |  | 2026-10-15 |  |  |
-| timer-wheel | `load-only` | defines no tests (2026-10-15) |  | load 2.6 / 0.3; tests 2.8 / 0.3 |  | 2026-10-15 |  |  |
-| trivial-package-locks | `ok` | parachute: 40 passed (2026-10-15) |  | load 2.2 / 0.3; tests 3.0 / 0.4 |  | 2026-10-15 |  |  |
-| with-user-abort | `load-only` | defines no tests (2026-10-15) |  | load 2.2 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| wu-decimal | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 2.5 / 0.3 |  | 2026-10-15 |  |  |
-| bit-smasher | `ok` | rove/prove: 5 passed (2026-10-15) |  | load 3.0 / 0.5; tests 4.6 / 1.1 |  | 2026-10-15 |  |  |
-| bt-semaphore | `ok` | clunit: 5 passed (2026-10-15) |  | load 2.6 / 0.3; tests 7.0 / 4.3 |  | 2026-10-15 |  |  |
-| closure-template | `ok` | lift: 143 passed (2026-10-15) |  | load 4.0 / 0.7; tests 6.7 / 2.5 |  | 2026-10-15 |  |  |
-| cl-csv | `load-only` | error (2026-10-15) |  | load 3.7 / 0.5; tests 4.3 / 0.9 |  | 2026-10-15 |  |  |
-| cl-devil | `fail` |  | same (babel cffi): does not load | load 3.2 / 0.4 |  | 2026-10-15 |  | `Unable to load any of the alternatives: (libIL.dylib libIL.1.dylib)` |
-| cl-heap | `load-only` | defines no tests (2026-10-15) |  | load 2.9 / 0.3; tests 3.1 / 0.3 |  | 2026-10-15 |  |  |
-| jpl-util | `load-only` | defines no tests (2026-10-15) |  | load 3.5 / 0.5; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| cl-log | `load-only` | defines no tests (2026-10-15) |  | load 2.6 / 0.3; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| cl-mustache | `load-only` | defines no tests (2026-10-15) |  | load 2.8 / 0.4; tests 3.2 / 0.4 |  | 2026-10-15 |  |  |
-| cl-pcg | `ok` | 1am: 1607 passed (2026-10-15) |  | load 2.8 / 0.2; tests 5.7 / 0.7 |  | 2026-10-15 |  |  |
-| data-table | `ok` | lisp-unit2: 93 passed (2026-10-15) |  | load 3.6 / 0.5; tests 4.2 / 0.8 |  | 2026-10-15 |  |  |
-| exit-hooks | `patched` | defines no tests (2026-10-15) |  | load 2.2 / 0.2; tests 2.4 / 0.2 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| file-attributes | `load-only` | defines no tests (2026-10-15) |  | load 3.0 / 0.4; tests 3.1 / 0.4 |  | 2026-10-15 |  |  |
-| getopt | `ok` | ptester: 26 passed (2026-10-15) |  | load 2.3 / 0.2; tests 2.7 / 0.3 |  | 2026-10-15 |  |  |
-| glop | `fail` |  | same (babel cffi): does not load | load 3.0 / 0.4 |  | 2026-10-15 |  | `Unable to load foreign library (BRIDGE). Unable to load shared library '<path>' or one of its dependencies. In order to help diagnose loading problems, consider` |
-| graph | `ok` | stefil: 93 passed (2026-10-15) |  | load 3.6 / 0.5; tests 6.3 / 0.9 |  | 2026-10-15 |  | `loaded from the dotcl dist overlay` |
-| hu.dwim.rdbms | `load-only` | defines no tests (2026-10-15) |  | load 6.5 / 1.7; tests 7.5 / 1.5 |  | 2026-10-15 |  |  |
-| hu.dwim.serializer | `load-only` | defines no tests (2026-10-15) |  | load 4.2 / 0.6; tests 4.9 / 0.7 |  | 2026-10-15 |  |  |
-| hunchensocket | `load-only` | defines no tests (2026-10-15) |  | load 4.0 / 0.7; tests 5.0 / 0.8 |  | 2026-10-15 |  |  |
-| json-mop | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 3.3 / 0.4 |  | 2026-10-15 |  |  |
-| lisp-binary | `load-only` | defines no tests (2026-10-15) |  | load 4.8 / 1.0; tests 4.5 / 1.1 |  | 2026-10-15 |  |  |
-| log5 | `load-only` | lift: 1 of 21 failed (2026-10-15) |  | load 2.9 / 0.4; tests 4.4 / 0.4 |  | 2026-10-15 |  |  |
-| magicl | `load-only` | fiasco: error after 16 passed (2026-10-15) | same (magicl babel cffi): error | load 23.4 / 28.1; tests 8.7 / 2.6 |  | 2026-10-15 | Loads, but `with-array-pointers` signals an error while expanding on an implementation it does not know, so the tests stop at the first BLAS call. With a dotcl branch there the tests get as far as on SBCL, which stops in the LAPACK examples on `zuncsd_`, a routine the measuring machine's LAPACK does not export. |  |
-| com.gigamonkeys.macro-utilities | `load-only` | defines no tests (2026-10-15) |  | load 2.1 / 0.3; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| com.gigamonkeys.utilities | `load-only` | defines no tests (2026-10-15) |  | load 3.2 / 0.4; tests 2.6 / 0.3 |  | 2026-10-15 |  |  |
-| num-utils | `load-only` | fiveam: 8 of 239 failed (2026-10-15) | same (trivial-backtrace): fiveam: 8 of 239 failed | load 4.7 / 1.0; tests 5.2 / 0.6 |  | 2026-10-15 |  |  |
-| priority-queue | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.3; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| protobuf | `load-only` | test system did not load (2026-10-15) |  | load 3.0 / 0.5; tests 3.2 / 0.5 |  | 2026-10-15 |  |  |
-| select | `ok` | clunit: 87 passed (2026-10-15) |  | load 2.2 / 0.3; tests 4.5 / 0.9 |  | 2026-10-15 |  |  |
-| text-draw | `load-only` | defines no tests (2026-10-15) |  | load 3.0 / 0.5; tests 2.4 / 0.3 |  | 2026-10-15 |  |  |
-| trivial-download | `load-only` | defines no tests (2026-10-15) |  | load 3.7 / 0.7; tests 3.9 / 0.6 |  | 2026-10-15 |  |  |
-| trivial-http | `load-only` | error (2026-10-15) | improved (babel usocket lift): lift: 7 of 9 failed | load 3.0 / 0.4; tests 5.8 / 4.7 |  | 2026-10-15 |  |  |
-| unix-opts | `load-only` | defines no tests (2026-10-15) |  | load 2.7 / 0.3; tests 2.9 / 0.3 |  | 2026-10-15 |  |  |
-| url-rewrite | `load-only` | defines no tests (2026-10-15) |  | load 2.5 / 0.3; tests 2.4 / 0.2 |  | 2026-10-15 |  |  |
-| zs3 | `load-only` | defines no tests (2026-10-15) |  | load 6.0 / 1.4; tests 5.5 / 1.0 |  | 2026-10-15 |  |  |
+| alexandria | `ok` | rt: 500 passed (2026-10-23) |  | load 8.4 / 1.6; tests 9.4 / 0.9 |  | 2026-10-23 |  |  |
+| trivial-gray-streams | `patched` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.9 / 0.3 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| trivial-features | `ok` | rt: 10 passed (2026-10-23) |  | load 7.2 / 0.3; tests 9.0 / 1.3 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| flexi-streams | `ok` | with-test-suite: 9 passed (2026-10-23) |  | load 9.6 / 2.0; tests 25.5 / 7.3 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| cl-ppcre | `ok` | cl-ppcre: 3 passed (2026-10-23) |  | load 8.5 / 1.1; tests 10.4 / 2.1 |  | 2026-10-23 |  |  |
+| cl-unicode | `ok` | cl-ppcre: 4 passed (2026-10-23) |  | load 8.7 / 2.6; tests 9.5 / 0.9 |  | 2026-10-23 |  |  |
+| uiop | `load-only` | defines no tests (2026-10-23) |  | load 7.2 / 0.2; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| babel | `patched` | stefil: 3 of 509 failed (2026-10-23) | same (babel): stefil: 2 of 509 failed | load 9.5 / 2.1; tests 9.6 / 0.9 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| trivial-garbage | `ok` | rt: 11 passed (2026-10-23) |  | load 7.5 / 0.3; tests 8.4 / 0.4 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| global-vars | `load-only` | ran; no recognised result (2026-10-23) |  | load 7.5 / 0.3; tests 8.1 / 0.3 |  | 2026-10-23 |  |  |
+| bordeaux-threads | `ok` | fiveam: 120 passed (2026-10-23) |  | load 7.8 / 0.4; tests 66.8 / 55.5 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| cl-json | `load-only` | fiveam: 1 of 160 failed (2026-10-23) | same (trivial-backtrace): fiveam: 1 of 160 failed | load 7.7 / 0.5; tests 10.3 / 0.6 |  | 2026-10-23 |  |  |
+| cffi | `patched` | rt: 16 of 688 failed (2026-10-23) | same (babel bordeaux-threads cffi): rt: 16 of 688 failed | load 8.9 / 1.2; tests 61.4 / 73.3 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| split-sequence | `ok` | fiveam: 102 passed (2026-10-23) |  | load 7.6 / 0.5; tests 15.8 / 2.5 |  | 2026-10-23 |  |  |
+| cl-base64 | `ok` | ptester: 11603 passed (2026-10-23) |  | load 7.7 / 0.4; tests 9.5 / 0.4 |  | 2026-10-23 |  |  |
+| closer-mop | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.8 / 0.3 |  | 2026-10-23 |  |  |
+| usocket | `patched` | rt: 1 of 33 failed (2026-10-23) | same (babel usocket bordeaux-threads): rt: 1 of 33 failed | load 7.9 / 0.5; tests 95.7 / 91.9 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| trivial-backtrace | `load-only` | lift: 1 of 2 failed (2026-10-23) | same (lift trivial-backtrace): lift: 1 of 2 failed | load 7.5 / 0.3; tests 7.9 / 0.4 |  | 2026-10-23 |  |  |
+| md5 | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.3; tests 7.6 / 0.2 |  | 2026-10-23 |  |  |
+| puri | `ok` | ptester: 128 passed (2026-10-23) |  | load 7.5 / 0.4; tests 7.9 / 0.3 |  | 2026-10-23 |  |  |
+| cl+ssl | `patched` | test system did not load (2026-10-23) | pending-fork (babel usocket bordeaux-threads trivial-backtrace trivial-sockets cffi): ok, fiveam: 77 passed | load 8.5 / 0.8; tests 8.3 / 24.6 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| chipz | `patched` | defines no tests (2026-10-23) |  | load 8.2 / 0.7; tests 7.5 / 0.3 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| chunga | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| cl-fad | `patched` | error (2026-10-23) | pending-fork (bordeaux-threads cl-fad): ok, unit-test: 9 passed | load 7.7 / 0.3; tests 8.2 / 0.5 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| drakma | `ok` | fiveam: 50 passed (2026-10-23) |  | load 8.6 / 0.7; tests 19.3 / 10.2 |  | 2026-10-23 |  |  |
+| swank | `patched` | defines no tests (2026-10-23) |  | load 8.6 / 1.1; tests 7.5 / 0.3 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| parse-number | `load-only` | ran; no recognised result (2026-10-23) |  | load 7.5 / 0.3; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| closure-common | `load-only` | defines no tests (2026-10-23) |  | load 8.1 / 0.6; tests 7.7 / 0.4 |  | 2026-10-23 |  |  |
+| cxml | `load-only` | defines no tests (2026-10-23) |  | load 9.3 / 1.5; tests 8.5 / 0.7 |  | 2026-10-23 |  |  |
+| yacc | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.3 / 0.3 |  | 2026-10-23 |  |  |
+| cl-who | `ok` | cl-ppcre: 1 passed (2026-10-23) |  | load 7.5 / 0.3; tests 8.0 / 0.4 |  | 2026-10-23 |  |  |
+| xpath | `patched` | error (2026-10-23) |  | load 9.4 / 1.0; tests 9.5 / 1.1 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| cxml-stp | `load-only` | rt: 3 of 246 failed (2026-10-23) | same (babel plexippus-xpath): rt: 3 of 246 failed | load 8.6 / 0.9; tests 10.6 / 1.1 |  | 2026-10-23 |  |  |
+| rfc2388 | `patched` | defines no tests (2026-10-23) |  | load 8.3 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| trivial-with-current-source-form | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| hunchentoot | `ok` | hunchentoot: 1 passed (2026-10-23) |  | load 9.2 / 1.0; tests 13.0 / 3.3 |  | 2026-10-23 | The failing checks are uploaded files coming back larger than they were sent: rfc2388, which parses the upload, writes the file as `latin-1` only on the implementations it lists and in the default external format (UTF-8) elsewhere, so every byte above 127 is written as two. With a fork of rfc2388 that adds dotcl to that list, the suite passes. | `loaded from the dotcl dist overlay` |
+| esrap | `ok` | fiveam: 6085 passed (2026-10-23) |  | load 8.2 / 0.7; tests 12.5 / 1.0 |  | 2026-10-23 |  |  |
+| html-encode | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.3 / 0.3 |  | 2026-10-23 |  |  |
+| iterate | `load-only` | rt: 6 of 290 failed (2026-10-23) |  | load 8.2 / 0.7; tests 8.4 / 0.5 |  | 2026-10-23 |  |  |
+| colorize | `load-only` | defines no tests (2026-10-23) |  | load 7.9 / 0.5; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| 3bmd | `ok` | fiasco: 192 passed (2026-10-23) |  | load 8.0 / 0.6; tests 12.4 / 2.6 |  | 2026-10-23 |  |  |
+| trivial-utf-8 | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| pythonic-string-reader | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| mgl-pax | `load-only` | try: 52 of 1479 failed (2026-10-23) | same (hunchentoot bordeaux-threads trivial-backtrace slime try cl-fad): try: 52 of 1479 failed | load 8.0 / 0.6; tests 20.0 / 5.9 |  | 2026-10-23 |  |  |
+| named-readtables | `ok` | try: 58 passed (2026-10-23) |  | load 7.4 / 0.3; tests 9.4 / 0.6 |  | 2026-10-23 |  |  |
+| trivial-indent | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| documentation-utils | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| language-codes | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| multilang-documentation | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| system-locale | `load-only` | defines no tests (2026-10-23) |  | load 7.3 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| ironclad | `ok` | rt: 468 passed (2026-10-23) |  | load 20.6 / 14.1; tests 17.1 / 5.0 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| net.didierverna.asdf-flv | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.5 / 0.2 |  | 2026-10-23 |  |  |
+| fiveam | `ok` | fiveam: 57 passed (2026-10-23) |  | load 7.9 / 0.4; tests 8.0 / 0.3 |  | 2026-10-23 |  |  |
+| float-features | `ok` | parachute: 34 passed (2026-10-23) |  | load 7.6 / 0.3; tests 9.2 / 0.6 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| trivial-octet-streams | `patched` | defines no tests (2026-10-23) |  | load 8.3 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| uax-15 | `ok` | parachute: 343339 passed (2026-10-23) |  | load 8.4 / 0.6; tests 14.3 / 1.6 |  | 2026-10-23 |  |  |
+| postmodern | `fail` |  | pending-fork (bordeaux-threads trivial-backtrace postmodern): test system did not load | load 9.7 / 2.1; tests - / 3.9 |  | 2026-10-23 | `cl-postgres.asd` pulls usocket in through an allowlist of implementations but its code reaches for usocket through a denylist, so every implementation missing from that allowlist hits this; quickloading usocket first makes postmodern load unchanged. | `Package USOCKET not found` |
+| com.inuoe.jzon | `load-only` | fiveam: 5 of 591 failed (2026-10-23) | same (trivial-backtrace): fiveam: 5 of 591 failed | load 8.7 / 1.0; tests 10.5 / 0.8 |  | 2026-10-23 |  |  |
+| trivial-cltl2 | `patched` | defines no tests (2026-10-23) |  | load 7.5 / 0.2; tests 7.4 / 0.3 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| local-time | `ok` | fiasco: 58 passed (2026-10-23) |  | load 8.0 / 0.5; tests 16.0 / 2.2 |  | 2026-10-23 |  |  |
+| mt19937 | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.2; tests 7.3 / 0.2 |  | 2026-10-23 |  |  |
+| fset | `patched` | error (2026-10-23) |  | load 15.7 / 8.5; tests 9.7 / 1.2 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| misc-extensions | `load-only` | ran; no recognised result (2026-10-23) |  | load 7.3 / 0.2; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| introspect-environment | `patched` | fiveam: 8 of 32 failed (2026-10-23) | pending-fork (trivial-backtrace introspect-environment): ok, fiveam: 32 passed | load 7.4 / 0.2; tests 7.9 / 0.4 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| fare-utils | `ok` | stefil: 16 passed (2026-10-23) |  | load 8.0 / 0.5; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| fare-quasiquote | `load-only` | test system did not load (2026-10-23) |  | load 7.7 / 0.4; tests 7.9 / 0.4 |  | 2026-10-23 |  |  |
+| lisp-namespace | `ok` | fiveam: 20 passed (2026-10-23) |  | load 7.6 / 0.3; tests 7.9 / 0.4 |  | 2026-10-23 |  |  |
+| trivia | `ok` | fiveam: 490 passed (2026-10-23) |  | load 9.1 / 0.8; tests 11.7 / 1.5 |  | 2026-10-23 |  |  |
+| type-i | `ok` | fiveam: 17 passed (2026-10-23) |  | load 7.4 / 0.3; tests 8.0 / 0.4 |  | 2026-10-23 |  |  |
+| anaphora | `ok` | rt: 60 passed (2026-10-23) |  | load 7.5 / 0.2; tests 7.7 / 0.3 |  | 2026-10-23 |  |  |
+| static-vectors | `ok` | fiveam: 30 passed (2026-10-23) |  | load 7.8 / 0.4; tests 8.3 / 0.5 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| idna | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| cl-utilities | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.4; tests 7.3 / 0.3 |  | 2026-10-23 |  |  |
+| fast-io | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.6; tests 7.6 / 0.4 |  | 2026-10-23 |  |  |
+| cl-interpol | `ok` | cl-ppcre: 4 passed (2026-10-23) |  | load 8.0 / 0.5; tests 38.2 / 8.2 |  | 2026-10-23 |  |  |
+| parse-declarations-1.0 | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| string-case | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.3 / 0.3 |  | 2026-10-23 |  |  |
+| quri | `ok` | rove/prove: 130 passed (2026-10-23) |  | load 8.2 / 2.2; tests 9.2 / 0.9 |  | 2026-10-23 |  |  |
+| trivial-macroexpand-all | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| metabang-bind | `load-only` | lift: 4 of 54 failed (2026-10-23) | same (lift): lift: 4 of 54 failed | load 7.5 / 0.4; tests 9.0 / 0.8 |  | 2026-10-23 |  |  |
+| trivial-types | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| trivial-mimes | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| salza2 | `ok` | parachute: 3 passed (2026-10-23) |  | load 7.8 / 0.3; tests 8.1 / 0.4 |  | 2026-10-23 |  |  |
+| uffi | `patched` | defines no tests (2026-10-23) |  | load 7.9 / 0.4; tests 8.3 / 0.7 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| clsql | `patched` | ran; no recognised result (2026-10-23) |  | load 9.3 / 1.5; tests 9.0 / 1.3 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| trivial-file-size | `ok` | fiveam: 4 passed (2026-10-23) |  | load 7.4 / 0.3; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| serapeum | `ok` | fiveam: 1873 passed (2026-10-23) |  | load 15.6 / 3.2; tests 13.2 / 2.5 |  | 2026-10-23 |  |  |
+| proc-parse | `ok` | rove/prove: 17 passed (2026-10-23) |  | load 7.7 / 0.4; tests 9.4 / 1.0 |  | 2026-10-23 |  |  |
+| cl-markup | `ok` | rove/prove: 5 passed (2026-10-23) |  | load 7.5 / 0.3; tests 8.4 / 0.5 |  | 2026-10-23 |  |  |
+| cl-annot | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| yason | `ok` | unit-test: 62 passed (2026-10-23) |  | load 7.7 / 0.3; tests 8.0 / 0.5 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| smart-buffer | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 8.3 / 0.6 |  | 2026-10-23 |  |  |
+| xsubseq | `ok` | rove/prove: 6 passed (2026-10-23) |  | load 7.3 / 0.2; tests 8.4 / 0.5 |  | 2026-10-23 |  |  |
+| cl-anonfun | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.2; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| cl-syntax | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| fast-http | `load-only` | rove/prove: 3 of 142 failed (2026-10-23) | same (babel): rove/prove: 3 of 142 failed | load 10.8 / 4.6; tests 10.1 / 1.0 |  | 2026-10-23 |  |  |
+| moptilities | `patched` | lift: 2 of 37 failed (2026-10-23) | same (lift moptilities): lift: 4 of 37 failed | load 7.6 / 0.3; tests 8.6 / 0.6 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| asdf-system-connections | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| metatilities-base | `ok` | lift: 9 passed (2026-10-23) |  | load 7.8 / 0.4; tests 8.1 / 0.4 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| cl-containers | `ok` | lift: 19 passed (2026-10-23) |  | load 9.0 / 1.0; tests 8.7 / 0.7 |  | 2026-10-23 |  |  |
+| cl-change-case | `ok` | fiveam: 97 passed (2026-10-23) |  | load 7.8 / 0.4; tests 8.3 / 0.5 |  | 2026-10-23 |  |  |
+| trivial-shell | `load-only` | lift: 1 of 1 failed (2026-10-23) | pending-fork (lift trivial-shell): ok, lift: 1 passed | load 7.5 / 0.3; tests 10.1 / 1.4 |  | 2026-10-23 |  |  |
+| cl-cookie | `ok` | rove/prove: 1 passed (2026-10-23) |  | load 8.8 / 3.0; tests 9.5 / 1.0 |  | 2026-10-23 |  |  |
+| parse-float | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.7 / 0.3 |  | 2026-10-23 |  |  |
+| dexador | `patched` | test system did not load (2026-10-23) | improved (hunchentoot usocket babel bordeaux-threads trivial-backtrace slime dexador cl-fad cffi): rove/prove: 1 of 1 failed | load 8.6 / 1.0; tests 11.2 / 15.3 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| str | `ok` | fiveam: 400 passed (2026-10-23) |  | load 7.9 / 0.5; tests 9.0 / 0.6 |  | 2026-10-23 |  |  |
+| let-plus | `ok` | lift: 26 passed (2026-10-23) |  | load 7.6 / 0.3; tests 8.6 / 0.5 |  | 2026-10-23 |  |  |
+| slynk | `patched` | defines no tests (2026-10-23) |  | load 8.6 / 1.1; tests 7.5 / 0.3 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| array-utils | `ok` | parachute: 100 passed (2026-10-23) |  | load 7.5 / 0.3; tests 7.9 / 0.5 |  | 2026-10-23 |  |  |
+| plump | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.7; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| log4cl | `ok` | stefil: 773 passed (2026-10-23) |  | load 8.5 / 0.9; tests 20.1 / 10.5 |  | 2026-10-23 |  |  |
+| swap-bytes | `ok` | fiveam: 84 passed (2026-10-23) |  | load 7.5 / 0.3; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| ieee-floats | `ok` | fiveam: 50 passed (2026-10-23) |  | load 7.5 / 0.3; tests 7.9 / 0.4 |  | 2026-10-23 |  |  |
+| lift | `load-only` | error (2026-10-23) | improved (lift): lift: 2 of 107 failed | load 8.3 / 0.9; tests 11.3 / 2.4 |  | 2026-10-23 |  |  |
+| nibbles | `ok` | rt: 134 passed (2026-10-23) |  | load 7.7 / 0.4; tests 12.1 / 1.5 |  | 2026-10-23 |  |  |
+| parenscript | `load-only` | defines no tests (2026-10-23) |  | load 8.9 / 1.0; tests 10.9 / 1.5 |  | 2026-10-23 |  |  |
+| cl-difflib | `load-only` | rove/prove: error after 36 passed (2026-10-23) |  | load 7.5 / 0.3; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| cl-html-diff | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| kmrcl | `ok` | rt: 161 passed (2026-10-23) |  | load 8.2 / 0.8; tests 10.4 / 2.3 |  | 2026-10-23 |  |  |
+| lml2 | `load-only` | ran; no recognised result (2026-10-23) |  | load 7.9 / 0.5; tests 7.7 / 0.4 |  | 2026-10-23 |  |  |
+| cl-markdown | `load-only` | error (2026-10-23) | improved (lift trivial-shell): lift: 57 of 189 failed | load 8.6 / 0.8; tests 11.6 / 34.6 |  | 2026-10-23 |  |  |
+| dynamic-classes | `load-only` | defines no tests (2026-10-23) |  | load 7.3 / 0.2; tests 8.0 / 0.3 |  | 2026-10-23 |  |  |
+| jonathan | `load-only` | rove/prove: 1 of 72 failed (2026-10-23) | same (babel bordeaux-threads cffi): rove/prove: 1 of 72 failed | load 9.3 / 0.8; tests 12.4 / 1.5 |  | 2026-10-23 |  |  |
+| sqlite | `ok` | fiveam: 19 passed (2026-10-23) |  | load 8.1 / 0.5; tests 21.1 / 12.4 |  | 2026-10-23 |  |  |
+| cl-mysql | `fail` |  | same (babel slime cffi): does not load | load 7.8 / 0.5 |  | 2026-10-23 |  | `Unable to load any of the alternatives: (libmysqlclient.20.dylib libmysqlclient.dylib)` |
+| command-line-arguments | `load-only` | error (2026-10-23) |  | load 7.6 / 0.3; tests 7.7 / 0.4 |  | 2026-10-23 |  |  |
+| dissect | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 7.3 / 0.3 |  | 2026-10-23 |  |  |
+| pathname-utils | `ok` | parachute: 254 passed (2026-10-23) |  | load 7.6 / 0.4; tests 8.3 / 0.7 |  | 2026-10-23 |  |  |
+| rutils | `load-only` | should-test: 5 of 122 failed (2026-10-23) | same (babel cffi): should-test: 5 of 122 failed | load 9.2 / 1.2; tests 10.2 / 1.6 |  | 2026-10-23 |  |  |
+| trivial-arguments | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.2; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| cl-opengl | `load-only` | defines no tests (2026-10-23) |  | load 19.4 / 12.1; tests 8.8 / 0.5 |  | 2026-10-23 |  |  |
+| zpng | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 7.5 / 0.2 |  | 2026-10-23 |  |  |
+| lparallel | `ok` | 1am: 63224 passed (2026-10-23) |  | load 8.7 / 1.0; tests 101.5 / 127.8 |  | 2026-10-23 |  |  |
+| optima | `ok` | fiveam: 202 passed (2026-10-23) |  | load 7.8 / 0.4; tests 8.7 / 0.7 |  | 2026-10-23 |  |  |
+| cl-speedy-queue | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| cl-colors2 | `ok` | clunit: 973 passed (2026-10-23) |  | load 8.3 / 0.6; tests 9.2 / 1.1 |  | 2026-10-23 |  |  |
+| acclimation | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.4; tests 7.5 / 0.2 |  | 2026-10-23 |  |  |
+| cl-redis | `fail` |  | pending-fork (usocket babel cl-redis bordeaux-threads cffi): error | load 8.5 / 1.8; tests - / 5.8 |  | 2026-10-23 |  | `Package SB-SYS not found` |
+| symbol-munger | `ok` | lisp-unit2: 37 passed (2026-10-23) |  | load 7.7 / 0.3; tests 8.9 / 0.9 |  | 2026-10-23 |  |  |
+| marshal | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.9 / 0.4 |  | 2026-10-23 |  |  |
+| in-nomine | `load-only` | fiveam: 2 of 173 failed (2026-10-23) | pending-fork (trivial-arguments trivial-backtrace introspect-environment): ok, fiveam: 186 passed | load 7.7 / 0.4; tests 8.2 / 0.7 |  | 2026-10-23 |  |  |
+| vom | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| cl-ansi-text | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.4; tests 8.2 / 0.5 |  | 2026-10-23 |  |  |
+| collectors | `ok` | lisp-unit2: 80 passed (2026-10-23) |  | load 7.7 / 0.4; tests 8.7 / 0.8 |  | 2026-10-23 |  |  |
+| cl-dbi | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.5; tests 7.7 / 0.4 |  | 2026-10-23 |  |  |
+| trivial-rfc-1123 | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.4; tests 7.6 / 0.4 |  | 2026-10-23 |  |  |
+| cl-octet-streams | `ok` | fiveam: 280 passed (2026-10-23) |  | load 7.5 / 0.3; tests 8.2 / 0.5 |  | 2026-10-23 |  |  |
+| zstd | `ok` | fiveam: 35 passed (2026-10-23) |  | load 8.0 / 0.5; tests 8.6 / 0.6 |  | 2026-10-23 |  |  |
+| common-doc | `load-only` | fiveam: 1 of 92 failed (2026-10-23) | same (babel trivial-backtrace trivial-shell): fiveam: 1 of 92 failed | load 8.1 / 0.6; tests 8.9 / 0.8 |  | 2026-10-23 |  |  |
+| common-html | `ok` | fiveam: 43 passed (2026-10-23) |  | load 8.0 / 0.5; tests 8.6 / 0.7 |  | 2026-10-23 |  |  |
+| contextl | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.7; tests 7.4 / 0.4 |  | 2026-10-23 |  |  |
+| lw-compat | `load-only` | defines no tests (2026-10-23) |  | load 7.2 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| spinneret | `ok` | fiveam: 91 passed (2026-10-23) |  | load 15.2 / 1.0; tests 11.1 / 1.2 |  | 2026-10-23 |  |  |
+| path-parse | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.8 / 0.3 |  | 2026-10-23 |  |  |
+| which | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 8.0 / 0.4 |  | 2026-10-23 |  |  |
+| do-urlencode | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.4; tests 7.6 / 0.4 |  | 2026-10-23 |  |  |
+| lass | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.5; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| iolib | `fail` |  | same (babel bordeaux-threads trivial-backtrace iolib cffi): does not load | load 8.1 / 1.1 |  | 2026-10-23 |  | `iolib.asd: USE-PACKAGE: no package named IOLIB/COMMON-LISP` |
+| blackbird | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 8.7 / 0.7 |  | 2026-10-23 |  |  |
+| anypool | `load-only` | rove/prove: 1 of 1 failed (2026-10-23) | same (bordeaux-threads): rove/prove: 1 of 1 failed | load 7.7 / 0.4; tests 9.5 / 1.8 |  | 2026-10-23 |  |  |
+| circular-streams | `ok` | rove/prove: 15 passed (2026-10-23) |  | load 7.6 / 0.4; tests 8.5 / 0.6 |  | 2026-10-23 |  |  |
+| http-body | `ok` | rove/prove: 13 passed (2026-10-23) |  | load 8.1 / 0.5; tests 9.2 / 0.8 |  | 2026-10-23 |  |  |
+| lack | `load-only` | test system did not load (2026-10-23) | pending-fork (hunchentoot usocket babel cl-redis bordeaux-threads trivial-backtrace slime dexador cl-fad cffi): ok, rove/prove: 13 passed | load 7.8 / 0.4; tests 10.3 / 5.7 |  | 2026-10-23 |  |  |
+| tmpdir | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 8.5 / 0.6 |  | 2026-10-23 |  |  |
+| xml-emitter | `ok` | 1am: 2 passed (2026-10-23) |  | load 7.4 / 0.3; tests 7.7 / 0.3 |  | 2026-10-23 |  |  |
+| mmap | `ok` | parachute: 8 passed (2026-10-23) |  | load 7.9 / 0.4; tests 8.2 / 0.6 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| stem | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| zpb-ttf | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.5; tests 7.5 / 0.2 |  | 2026-10-23 |  |  |
+| 3bz | `load-only` | defines no tests (2026-10-23) |  | load 8.8 / 1.8; tests 8.0 / 0.4 |  | 2026-10-23 |  |  |
+| cl-async | `load-only` | defines no tests (2026-10-23) |  | load 10.2 / 2.8; tests 10.3 / 1.3 |  | 2026-10-23 |  |  |
+| cl-libuv | `load-only` | defines no tests (2026-10-23) |  | load 7.9 / 0.5; tests 8.3 / 0.6 |  | 2026-10-23 |  |  |
+| toot | `load-only` | defines no tests (2026-10-23) |  | load 8.8 / 0.9; tests 8.5 / 0.6 |  | 2026-10-23 |  |  |
+| atomics | `ok` | parachute: 93 passed (2026-10-23) |  | load 7.4 / 0.3; tests 7.8 / 0.5 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| cl-jpeg | `load-only` | defines no tests (2026-10-23) |  | load 9.2 / 2.4; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| trivial-do | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| osicat | `load-only` | rt: 4 of 93 failed (2026-10-23) | same (babel cffi): rt: 4 of 93 failed | load 10.0 / 3.5; tests 9.0 / 0.8 |  | 2026-10-23 |  |  |
+| wookie | `load-only` | defines no tests (2026-10-23) |  | load 9.1 / 1.0; tests 8.8 / 0.8 |  | 2026-10-23 |  |  |
+| zpb-exif | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.4; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| cl-colors | `load-only` | defines no tests (2026-10-23) |  | load 8.1 / 0.4; tests 8.1 / 0.5 |  | 2026-10-23 |  |  |
+| pngload | `load-only` | defines no tests (2026-10-23) |  | load 10.0 / 1.7; tests 10.3 / 1.0 |  | 2026-10-23 |  |  |
+| trivial-open-browser | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| clack | `load-only` | defines no tests (2026-10-23) |  | load 8.2 / 0.5; tests 10.6 / 1.3 |  | 2026-10-23 |  |  |
+| shasht | `load-only` | parachute: 6 of 391 failed (2026-10-23) | same (trivial-custom-debugger): parachute: 6 of 391 failed | load 7.5 / 0.3; tests 9.6 / 1.3 |  | 2026-10-23 |  |  |
+| trivial-timeout | `load-only` | lift: 1 of 2 failed (2026-10-23) |  | load 7.4 / 0.2; tests 8.9 / 1.0 |  | 2026-10-23 |  |  |
+| cl-l10n | `load-only` | stefil: 2 of 331 failed (2026-10-23) | same (babel bordeaux-threads cl-fad): stefil: 2 of 331 failed | load 10.1 / 1.2; tests 10.7 / 1.0 |  | 2026-10-23 |  |  |
+| cl-l10n-cldr | `load-only` | defines no tests (2026-10-23) |  | load 7.3 / 0.2; tests 7.3 / 0.3 |  | 2026-10-23 |  |  |
+| concrete-syntax-tree | `ok` | fiveam: 40 passed (2026-10-23) |  | load 7.7 / 0.4; tests 22.3 / 6.0 |  | 2026-10-23 |  |  |
+| cl-vectors | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.5; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| deflate | `load-only` | test system did not load (2026-10-23) | improved (deflate): no-result | load 7.7 / 0.3; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| eclector | `ok` | fiveam: 4591 passed (2026-10-23) |  | load 8.5 / 0.9; tests 12.7 / 1.3 |  | 2026-10-23 |  |  |
+| uuid | `load-only` | defines no tests (2026-10-23) |  | load 8.2 / 0.5; tests 8.4 / 0.5 |  | 2026-10-23 |  |  |
+| cl-autowrap | `load-only` | defines no tests (2026-10-23) |  | load 8.4 / 0.8; tests 8.3 / 0.6 |  | 2026-10-23 |  |  |
+| defpackage-plus | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| arnesi | `load-only` | ran; no recognised result (2026-10-23) |  | load 8.7 / 1.0; tests 8.4 / 0.6 |  | 2026-10-23 |  |  |
+| skippy | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| asdf-package-system | `load-only` | defines no tests (2026-10-23) |  | load 7.3 / 0.2; tests 7.2 / 0.2 |  | 2026-10-23 |  |  |
+| cl-store | `ok` | rt: 115 passed (2026-10-23) |  | load 7.8 / 0.4; tests 8.6 / 0.5 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| com.gigamonkeys.binary-data | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| clx | `load-only` | fiasco: 4 of 4 failed (2026-10-23) |  | load 13.3 / 5.3; tests 8.8 / 0.7 |  | 2026-10-23 | Loads. Its tests connect to an X server, and the measuring machine has none (`DISPLAY` is not set); SBCL fails the same four. `dependent.lisp` still warns at compile time that `buffer-input-wait-default` falls back to polling on an implementation it has no code for. |  |
+| access | `ok` | lisp-unit2: 186 passed (2026-10-23) |  | load 7.9 / 0.5; tests 8.9 / 1.1 |  | 2026-10-23 |  |  |
+| prove | `load-only` | defines no tests (2026-10-23) |  | load 8.1 / 0.6; tests 8.2 / 0.5 |  | 2026-10-23 |  |  |
+| trivial-channels | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.4; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| flexichain | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.4; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| cl-dot | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| cl-tga | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| glsl-toolkit | `load-only` | defines no tests (2026-10-23) |  | load 8.8 / 1.0; tests 7.7 / 0.4 |  | 2026-10-23 |  |  |
+| cl-pdf | `load-only` | defines no tests (2026-10-23) |  | load 8.5 / 0.9; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| form-fiddle | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| opticl-core | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| retrospectiff | `ok` | fiveam: 38 passed (2026-10-23) |  | load 8.2 / 0.7; tests 9.4 / 0.8 |  | 2026-10-23 |  |  |
+| vas-string-metrics | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| cl-strings | `load-only` | rove/prove: 1 of 20 failed (2026-10-23) |  | load 7.5 / 0.3; tests 8.7 / 0.8 |  | 2026-10-23 |  |  |
+| opticl | `ok` | fiveam: 134 passed (2026-10-23) |  | load 10.2 / 1.9; tests 10.8 / 1.2 |  | 2026-10-23 |  |  |
+| cl-reexport | `ok` | rove/prove: 17 passed (2026-10-23) |  | load 7.5 / 0.2; tests 8.3 / 0.5 |  | 2026-10-23 |  |  |
+| lambda-fiddle | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| trivial-package-local-nicknames | `ok` | tpln: 17 passed (2026-10-23) |  | load 7.5 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| cl-indentify | `ok` | rove/prove: 1 passed (2026-10-23) |  | load 7.6 / 0.3; tests 8.6 / 0.5 |  | 2026-10-23 |  |  |
+| parser-combinators | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.5; tests 8.9 / 0.6 |  | 2026-10-23 |  |  |
+| sdl2 | `fail` |  | same (babel bordeaux-threads cffi): does not load | load 9.5 / 0.9 |  | 2026-10-23 | Not a dotcl failure: this host has no SDL2 library, so the loader finds neither the framework nor libSDL2. SBCL 2.6.8 stops at the same place. | `Unable to load any of the alternatives: ((:FRAMEWORK SDL2) (:DEFAULT libSDL2))` |
+| lorem-ipsum | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| spatial-trees | `ok` | fiveam: 12 passed (2026-10-23) |  | load 7.6 / 0.3; tests 213.2 / 30.5 |  | 2026-10-23 | The result varies from run to run: the suites build their trees from `random` rectangles and points, and of four runs with the same dotcl and dists, one failed 3 of 18 checks and three passed all of theirs (the run shown is one of these). |  |
+| cl-dejavu | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| cl-locale | `ok` | rove/prove: 13 passed (2026-10-23) |  | load 8.0 / 0.4; tests 8.9 / 0.8 |  | 2026-10-23 |  |  |
+| cluffer | `load-only` | ran; no recognised result (2026-10-23) |  | load 8.0 / 0.6; tests 26.6 / 14.0 |  | 2026-10-23 |  |  |
+| clump | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| gettext | `ok` | stefil: 100 passed (2026-10-23) |  | load 8.0 / 0.4; tests 8.4 / 0.5 |  | 2026-10-23 |  |  |
+| pzmq | `fail` |  | same (babel bordeaux-threads trivial-backtrace cffi): does not load | load 8.1 / 0.6 |  | 2026-10-23 |  | `Subprocess #<PROCESS-INFO> with command (cc -o <path> -c -I /opt/local/include/ -fPIC -I<path> <path>) exited with error code 1` |
+| sha1 | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| with-output-to-stream | `ok` | parachute: 11 passed (2026-10-23) |  | load 7.4 / 0.2; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| alexandria+ | `ok` | clunit: 35 passed (2026-10-23) |  | load 7.7 / 0.2; tests 8.0 / 0.5 |  | 2026-10-23 |  |  |
+| cl-cont | `ok` | rt: 132 passed (2026-10-23) |  | load 7.6 / 0.3; tests 8.5 / 0.4 |  | 2026-10-23 |  |  |
+| cl-package-locks | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| routes | `ok` | lift: 35 passed (2026-10-23) |  | load 7.7 / 0.3; tests 8.7 / 0.8 |  | 2026-10-23 |  |  |
+| cl-slice | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 8.0 / 0.5 |  | 2026-10-23 |  |  |
+| lisp-unit | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| mcclim | `fail` |  | pending-fork (babel deflate bordeaux-threads trivial-backtrace slime cffi mcclim): fiveam: 9 of 2246 failed | load 17.0 / 11.7; tests - / 5.9 |  | 2026-10-23 |  | `DEFUN: package COMMON-LISP is locked; cannot redefine READ` |
+| s-xml | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| translate | `ok` | fiveam: 15 passed (2026-10-23) |  | load 7.4 / 0.2; tests 7.8 / 0.3 |  | 2026-10-23 |  |  |
+| array-operations | `ok` | clunit: 219 passed (2026-10-23) |  | load 7.8 / 0.4; tests 10.2 / 2.2 |  | 2026-10-23 |  |  |
+| arrows | `ok` | stefil: 29 passed (2026-10-23) |  | load 7.5 / 0.2; tests 7.9 / 0.4 |  | 2026-10-23 |  |  |
+| cl-cpus | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| find-port | `ok` | fiveam: 3 passed (2026-10-23) |  | load 7.7 / 0.4; tests 8.1 / 0.4 |  | 2026-10-23 |  |  |
+| hu.dwim.asdf | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.3 / 0.3 |  | 2026-10-23 |  |  |
+| cl-unification | `load-only` | ptester: 3 of 52 failed (2026-10-23) |  | load 7.8 / 0.5; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| event-emitter | `ok` | rove/prove: 13 passed (2026-10-23) |  | load 7.4 / 0.3; tests 8.5 / 0.6 |  | 2026-10-23 |  |  |
+| external-program | `ok` | fiveam: 31 passed (2026-10-23) |  | load 7.5 / 0.3; tests 13.0 / 7.3 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| fast-websocket | `load-only` | rove/prove: 4 of 24 failed (2026-10-23) | same (babel cffi): rove/prove: 4 of 24 failed | load 7.8 / 0.4; tests 9.1 / 0.8 |  | 2026-10-23 |  |  |
+| map-set | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| metacopy | `ok` | lift: 8 passed (2026-10-23) |  | load 7.4 / 0.3; tests 8.1 / 0.4 |  | 2026-10-23 |  |  |
+| nontrivial-gray-streams | `load-only` | test system did not load (2026-10-23) | same (trivial-custom-debugger): test system did not load | load 7.2 / 0.3; tests 7.7 / 5.1 |  | 2026-10-23 |  |  |
+| websocket-driver | `load-only` | defines no tests (2026-10-23) |  | load 8.5 / 0.7; tests 8.5 / 0.6 |  | 2026-10-23 |  |  |
+| xmls | `ok` | fiveam: 36 passed (2026-10-23) |  | load 8.5 / 0.4; tests 8.4 / 0.4 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| cl-emb | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.5 / 0.4 |  | 2026-10-23 |  |  |
+| clss | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| djula | `ok` | fiveam: 211 passed (2026-10-23) |  | load 9.1 / 0.9; tests 10.0 / 1.0 |  | 2026-10-23 |  |  |
+| hu.dwim.common | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 7.7 / 0.3 |  | 2026-10-23 |  |  |
+| hu.dwim.common-lisp | `load-only` | defines no tests (2026-10-23) |  | load 7.3 / 0.3; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| hu.dwim.def | `ok` | stefil: 86 passed (2026-10-23) |  | load 8.1 / 0.5; tests 8.8 / 0.6 |  | 2026-10-23 |  |  |
+| hu.dwim.defclass-star | `load-only` | stefil: 4 of 23 failed (2026-10-23) | same (slime): stefil: 4 of 23 failed | load 7.5 / 0.3; tests 8.5 / 0.6 |  | 2026-10-23 |  |  |
+| hu.dwim.delico | `fail` |  | same (slime hu.dwim.util): does not load | load 9.8 / 1.7; tests - / 1.4 |  | 2026-10-23 |  | `LIBSTATUS-FAIL This is not implemented for your lisp, sorry. You may try to continue, but...` |
+| hu.dwim.logger | `load-only` | defines no tests (2026-10-23) |  | load 8.2 / 0.5; tests 8.7 / 0.6 |  | 2026-10-23 |  |  |
+| hu.dwim.partial-eval | `fail` |  | same (bordeaux-threads slime hu.dwim.util): does not load | load 8.6 / 0.9; tests - / 0.6 |  | 2026-10-23 |  | `Package SB-PCL not found` |
+| hu.dwim.quasi-quote | `fail` |  |  | load 8.8 / 1.0; tests - / 0.6 |  | 2026-10-23 | Does not load: `hu.dwim.walker` has no dotcl branch for its lexical-environment code (`source/lexenv.lisp` signals `This is not implemented for your lisp`), so macroexpanding `lambda-with-bang-args-expander` in `source/generic/string.lisp` errors and the compile fails. | `COMPILE-FILE-ERROR while compiling #<HU.DWIM.CL-SOURCE-FILE hu.dwim.quasi-quote source generic string>` |
+| hu.dwim.syntax-sugar | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 8.9 / 0.8 |  | 2026-10-23 |  |  |
+| hu.dwim.util | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.8 / 0.4 |  | 2026-10-23 | Loads; `source/place.lisp` warns at read time (`#.(warn ...)`) that `symbol-global-value` has no implementation outside SBCL and falls back to `symbol-value`. |  |
+| hu.dwim.walker | `load-only` | test system did not load (2026-10-23) | same (slime hu.dwim.util): test system did not load | load 7.9 / 0.5; tests 8.8 / 1.2 |  | 2026-10-23 | Loads. Its test system needs iolib, which has no branch for dotcl's Gray streams, and, as on SBCL, the C library libfixposix, which the measuring machine does not have. |  |
+| metatilities | `ok` | lift: 6 passed (2026-10-23) |  | load 8.2 / 0.7; tests 8.6 / 0.5 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| zip | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.6; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| zlib | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.4; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| closure-html | `load-only` | defines no tests (2026-10-23) |  | load 9.6 / 1.2; tests 8.4 / 0.6 |  | 2026-10-23 |  |  |
+| common-lisp-jupyter | `fail` |  | same (babel bordeaux-threads cffi): does not load | load 9.1 / 1.0 |  | 2026-10-23 |  | `Subprocess #<PROCESS-INFO> with command (cc -o <path> -c -I /opt/local/include/ -fPIC -I<path> <path>) exited with error code 1` |
+| fare-mop | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| jpeg-turbo | `ok` | fiveam: 14 passed (2026-10-23) |  | load 8.5 / 1.3; tests 9.1 / 0.6 |  | 2026-10-23 |  |  |
+| trivial-extensible-sequences | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.2; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| trivial-main-thread | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| docparser | `load-only` | defines no tests (2026-10-23) |  | load 7.9 / 0.5; tests 8.4 / 0.5 |  | 2026-10-23 |  |  |
+| inferior-shell | `ok` | fiveam: 16 passed (2026-10-23) |  | load 9.0 / 0.5; tests 8.6 / 3.8 |  | 2026-10-23 |  |  |
+| local-time-duration | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.4; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| lquery | `load-only` | fiveam: 4 of 176 failed (2026-10-23) | same (trivial-backtrace): fiveam: 4 of 176 failed | load 7.8 / 0.4; tests 8.6 / 0.4 |  | 2026-10-23 |  |  |
+| myway | `ok` | rove/prove: 23 passed (2026-10-23) |  | load 8.0 / 0.5; tests 8.8 / 0.7 |  | 2026-10-23 |  |  |
+| ningle | `ok` | rove/prove: 33 passed (2026-10-23) |  | load 8.3 / 0.6; tests 9.9 / 1.2 |  | 2026-10-23 |  |  |
+| st-json | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| vecto | `load-only` | defines no tests (2026-10-23) |  | load 7.9 / 0.4; tests 7.7 / 0.4 |  | 2026-10-23 |  |  |
+| cl-inflector | `ok` | lisp-unit2: 62 passed (2026-10-23) |  | load 7.7 / 0.3; tests 8.6 / 0.8 |  | 2026-10-23 |  |  |
+| curry-compose-reader-macros | `load-only` | ran; no recognised result (2026-10-23) |  | load 7.6 / 0.3; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| piping | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| aserve | `fail` |  | pending-fork (bordeaux-threads portableaserve cl-fad): error | load 7.3 / 2.1; tests - / 0.7 |  | 2026-10-23 |  | `acl-compat.asd: The acl-compat library is not yet supported on this lisp implementation.` |
+| sha3 | `load-only` | defines no tests (2026-10-23) |  | load 8.2 / 0.4; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| verbose | `load-only` | defines no tests (2026-10-23) |  | load 7.9 / 0.5; tests 7.7 / 0.3 |  | 2026-10-23 |  |  |
+| chronicity | `ok` | lisp-unit: 447 passed (2026-10-23) |  | load 8.3 / 0.7; tests 11.2 / 1.6 |  | 2026-10-23 |  |  |
+| cl-base32 | `ok` | lisp-unit: 5 passed (2026-10-23) |  | load 7.4 / 0.3; tests 7.7 / 0.2 |  | 2026-10-23 |  |  |
+| cl-isaac | `ok` | parachute: 35 passed (2026-10-23) |  | load 7.6 / 0.4; tests 10.4 / 1.0 |  | 2026-10-23 |  |  |
+| cl-libyaml | `fail` |  | same (babel trivial-backtrace cffi): does not load | load 7.8 / 0.4 |  | 2026-10-23 |  | `Unable to load any of the alternatives: (libyaml.dylib libyaml-0.2.dylib)` |
+| cl-pattern | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.3; tests 7.7 / 0.4 |  | 2026-10-23 |  |  |
+| cl-yaml | `fail` |  | same (babel cffi): does not load | load 7.8 / 0.4 |  | 2026-10-23 |  | `Unable to load any of the alternatives: (libyaml.dylib libyaml-0.2.dylib)` |
+| imago | `ok` | fiveam: 80 passed (2026-10-23) |  | load 9.0 / 1.0; tests 72.6 / 22.3 |  | 2026-10-23 |  |  |
+| mathkit | `load-only` | defines no tests (2026-10-23) |  | load 8.3 / 0.5; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| more-conditions | `load-only` | fiveam: 22 of 133 failed (2026-10-23) | same (trivial-backtrace): fiveam: 22 of 133 failed | load 7.6 / 0.3; tests 8.2 / 0.5 |  | 2026-10-23 |  |  |
+| plump-sexp | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.2; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| plump-tex | `load-only` | fiveam: 10 of 17 failed (2026-10-23) | same (trivial-backtrace): fiveam: 10 of 17 failed | load 7.7 / 0.3; tests 8.0 / 0.4 |  | 2026-10-23 |  |  |
+| policy-cond | `load-only` | defines no tests (2026-10-23) |  | load 8.5 / 0.3; tests 7.7 / 0.2 |  | 2026-10-23 |  |  |
+| s-base64 | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.3 / 0.2 |  | 2026-10-23 |  |  |
+| agnostic-lizard | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| net.didierverna.clon.core | `load-only` | defines no tests (2026-10-23) |  | load 8.3 / 0.8; tests 7.7 / 0.3 |  | 2026-10-23 |  |  |
+| frugal-uuid | `ok` | fiveam: 137 passed (2026-10-23) |  | load 7.6 / 0.4; tests 7.9 / 0.4 |  | 2026-10-23 |  |  |
+| cl-gendoc | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.6; tests 7.8 / 0.5 |  | 2026-10-23 |  |  |
+| cl-slug | `ok` | rove/prove: 6 passed (2026-10-23) |  | load 7.6 / 0.4; tests 8.3 / 0.5 |  | 2026-10-23 |  |  |
+| trivial-clock | `ok` | fiveam: 6 passed (2026-10-23) |  | load 7.8 / 0.4; tests 8.1 / 0.5 |  | 2026-10-23 |  |  |
+| gzip-stream | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.6 / 0.4 |  | 2026-10-23 |  |  |
+| jsown | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.3; tests 7.7 / 0.3 |  | 2026-10-23 |  |  |
+| prometheus | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.5; tests 9.0 / 0.7 |  | 2026-10-23 |  |  |
+| quantile-estimator | `load-only` | defines no tests (2026-10-23) |  | load 7.3 / 0.2; tests 8.5 / 0.5 |  | 2026-10-23 |  |  |
+| assoc-utils | `ok` | rove/prove: 1 passed (2026-10-23) |  | load 7.4 / 0.2; tests 8.5 / 0.5 |  | 2026-10-23 |  |  |
+| binding-arrows | `ok` | stefil: 93 passed (2026-10-23) |  | load 7.5 / 0.3; tests 8.3 / 0.3 |  | 2026-10-23 |  |  |
+| chanl | `load-only` | fiveam: 1 of 256 failed (2026-10-23) | same (bordeaux-threads trivial-backtrace): fiveam: 1 of 256 failed | load 7.8 / 0.4; tests 31.6 / 27.3 |  | 2026-10-23 | The one failing check is `STUMBLERS` in `DEADLOCK`, and SBCL fails it the same way: it asks `yes-or-no-p`, and a test run with no terminal gets `END-OF-FILE` there instead of an answer. |  |
+| abstract-classes | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.3 / 0.2 |  | 2026-10-23 |  |  |
+| cl-freetype2 | `fail` |  | same (babel trivial-backtrace cffi): does not load | load 7.9 / 0.6 |  | 2026-10-23 |  | `Subprocess #<PROCESS-INFO> with command (cc -o <path> -c -I<path> -I /opt/local/include/ -I/opt/local/include/freetype2 -I/opt/local/include/freetype2/freetype ` |
+| cl-readline | `load-only` | defines no tests (2026-10-23) |  | load 8.1 / 0.5; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| sdl2-ttf | `fail` |  | same (babel bordeaux-threads cffi): does not load | load 9.1 / 0.7 |  | 2026-10-23 |  | `Unable to load any of the alternatives: ((:FRAMEWORK SDL2) (:DEFAULT libSDL2))` |
+| cl-template | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.3; tests 7.8 / 0.3 |  | 2026-10-23 |  |  |
+| clsql-helper | `load-only` | error (2026-10-23) | same (clsql): error | load 9.3 / 0.9; tests 9.8 / 1.2 |  | 2026-10-23 |  |  |
+| fn | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.3; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| interface | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| kebab | `ok` | rove/prove: 5 passed (2026-10-23) |  | load 8.0 / 0.5; tests 8.8 / 0.7 |  | 2026-10-23 |  |  |
+| precise-time | `ok` | parachute: 7 passed (2026-10-23) |  | load 7.9 / 0.4; tests 10.3 / 2.6 |  | 2026-10-23 |  |  |
+| queues | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.2; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| secret-values | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.3 / 0.2 |  | 2026-10-23 |  |  |
+| slynk-macrostep | `load-only` | defines no tests (2026-10-23) |  | load 7.5 / 0.3; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| slynk-named-readtables | `load-only` | defines no tests (2026-10-23) |  | load 7.6 / 0.3; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| archive | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.5; tests 7.7 / 0.3 |  | 2026-10-23 |  |  |
+| arrow-macros | `ok` | fiveam: 82 passed (2026-10-23) |  | load 7.4 / 0.2; tests 7.9 / 0.3 |  | 2026-10-23 |  |  |
+| binary-structures | `load-only` | defines no tests (2026-10-23) |  | load 8.5 / 0.9; tests 8.0 / 0.5 |  | 2026-10-23 |  |  |
+| bobbin | `ok` | 1am: 24 passed (2026-10-23) |  | load 7.5 / 0.2; tests 7.7 / 0.3 |  | 2026-10-23 |  |  |
+| cl-ascii-table | `load-only` | defines no tests (2026-10-23) |  | load 7.4 / 0.2; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| cl-cairo2 | `load-only` | defines no tests (2026-10-23) |  | load 8.9 / 0.9; tests 8.1 / 0.5 |  | 2026-10-23 |  |  |
+| data-format-validation | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.6; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| docutils | `load-only` | defines no tests (2026-10-23) |  | load 9.1 / 1.5; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| cl-environments | `ok` | fiveam: 171 passed (2026-10-23) |  | load 7.5 / 0.4; tests 8.8 / 0.6 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| cl-hash-util | `ok` | fiveam: 21 passed (2026-10-23) |  | load 7.4 / 0.3; tests 7.9 / 0.4 |  | 2026-10-23 |  |  |
+| cl-pass | `load-only` | defines no tests (2026-10-23) |  | load 8.1 / 0.5; tests 9.1 / 0.8 |  | 2026-10-23 |  |  |
+| codex | `load-only` | test system did not load (2026-10-23) | same (babel bordeaux-threads trivial-backtrace trivial-shell cl-fad cffi): test system did not load | load 9.8 / 1.2; tests 10.2 / 1.2 |  | 2026-10-23 |  |  |
+| common-doc-plump | `ok` | fiveam: 108 passed (2026-10-23) |  | load 8.1 / 0.5; tests 8.8 / 0.7 |  | 2026-10-23 |  |  |
+| org.tfeb.conduit-packages | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| definitions | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.4; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| f-underscore | `load-only` | defines no tests (2026-10-23) |  | load 8.6 / 0.2; tests 7.5 / 0.2 |  | 2026-10-23 |  |  |
+| glsl-spec | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| html-template | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.4; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| let-over-lambda | `load-only` | error (2026-10-23) |  | load 8.7 / 0.5; tests 8.6 / 0.6 |  | 2026-10-23 |  |  |
+| lispbuilder-sdl | `fail` |  | same (babel cffi): does not load | load 8.0 / 0.2 |  | 2026-10-23 |  | `System cocoahelper not found` |
+| pandocl | `load-only` | defines no tests (2026-10-23) |  | load 8.7 / 0.5; tests 8.3 / 0.5 |  | 2026-10-23 |  |  |
+| parenml | `ok` | fiveam: 4 passed (2026-10-23) |  | load 8.6 / 0.5; tests 8.8 / 0.7 |  | 2026-10-23 |  |  |
+| print-licenses | `load-only` | defines no tests (2026-10-23) |  | load 8.1 / 0.2; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| rtg-math | `load-only` | defines no tests (2026-10-23) |  | load 9.6 / 1.0; tests 7.7 / 0.3 |  | 2026-10-23 |  |  |
+| scriba | `load-only` | fiveam: 6 of 97 failed (2026-10-23) | same (babel trivial-backtrace): fiveam: 6 of 97 failed | load 8.6 / 0.5; tests 9.2 / 0.8 |  | 2026-10-23 |  |  |
+| series | `patched` | error (2026-10-23) |  | load 10.2 / 1.1; tests 7.8 / 0.5 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| sxql | `ok` | rove/prove: 8 passed (2026-10-23) |  | load 9.1 / 1.1; tests 11.0 / 1.4 |  | 2026-10-23 |  |  |
+| thorn | `ok` | fiveam: 5 passed (2026-10-23) |  | load 8.3 / 0.4; tests 8.5 / 0.6 |  | 2026-10-23 |  |  |
+| varjo | `load-only` | defines no tests (2026-10-23) |  | load 12.2 / 2.5; tests 10.5 / 1.6 |  | 2026-10-23 |  |  |
+| vertex | `ok` | fiveam: 25 passed (2026-10-23) |  | load 8.5 / 0.5; tests 8.7 / 0.7 |  | 2026-10-23 |  |  |
+| agutil | `load-only` | defines no tests (2026-10-23) |  | load 8.1 / 0.3; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| binascii | `ok` | rt: 18 passed (2026-10-23) |  | load 8.1 / 0.5; tests 7.9 / 0.4 |  | 2026-10-23 |  |  |
+| cl-base58 | `ok` | rove/prove: 8 passed (2026-10-23) |  | load 7.9 / 0.3; tests 8.4 / 0.6 |  | 2026-10-23 |  |  |
+| cl-conspack | `ok` | fiveam: 46 passed (2026-10-23) |  | load 8.4 / 0.7; tests 8.2 / 0.6 |  | 2026-10-23 |  |  |
+| cl-css | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.3; tests 7.5 / 0.2 |  | 2026-10-23 |  |  |
+| cl-cuda | `load-only` | test system did not load (2026-10-23) | same (babel external-program cffi): test system did not load | load 9.6 / 1.0; tests 9.4 / 0.9 |  | 2026-10-23 |  |  |
+| cl-custom-hash-table | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.3; tests 7.7 / 0.3 |  | 2026-10-23 |  |  |
+| cl-html5-parser | `fail` |  | same (slime): does not load | load 8.2 / 1.3; tests - / 1.2 |  | 2026-10-23 |  | `COERCE: list element not a character` |
+| cl-messagepack | `load-only` | fiveam: 1 of 88 failed (2026-10-23) | pending-fork (babel trivial-backtrace cl-messagepack): ok, fiveam: 96 passed | load 9.3 / 0.6; tests 9.8 / 1.1 |  | 2026-10-23 |  |  |
+| cl-project | `load-only` | rove/prove: 1 of 2 failed (2026-10-23) | same (babel bordeaux-threads cffi): rove/prove: 1 of 2 failed | load 8.6 / 0.4; tests 11.9 / 1.8 |  | 2026-10-23 |  |  |
+| sdl2-image | `fail` |  | same (babel bordeaux-threads cffi): does not load | load 9.5 / 0.7 |  | 2026-10-23 |  | `Unable to load any of the alternatives: ((:FRAMEWORK SDL2) (:DEFAULT libSDL2))` |
+| clavier | `ok` | stefil: 100 passed (2026-10-23) |  | load 8.7 / 0.6; tests 9.3 / 0.7 |  | 2026-10-23 |  |  |
+| com.google.base | `ok` | stefil: 14 passed (2026-10-23) |  | load 7.9 / 0.3; tests 7.9 / 0.3 |  | 2026-10-23 |  |  |
+| commondoc-markdown | `ok` | rove/prove: 1 passed (2026-10-23) |  | load 9.7 / 1.2; tests 11.5 / 1.6 |  | 2026-10-23 |  |  |
+| crypto-shortcuts | `load-only` | defines no tests (2026-10-23) |  | load 9.1 / 0.7; tests 8.5 / 0.6 |  | 2026-10-23 |  |  |
+| damn-fast-priority-queue | `load-only` | ran; no recognised result (2026-10-23) |  | load 8.0 / 0.3; tests 30.0 / 6.0 |  | 2026-10-23 |  |  |
+| deploy | `load-only` | defines no tests (2026-10-23) |  | load 8.4 / 0.7; tests 9.0 / 0.9 |  | 2026-10-23 |  |  |
+| 40ants-doc | `load-only` | rove/prove: 2 of 6 failed (2026-10-23) | same (babel serapeum bordeaux-threads introspect-environment): rove/prove: 2 of 6 failed | load 8.7 / 0.6; tests 17.5 / 3.5 |  | 2026-10-23 |  |  |
+| docs-builder | `load-only` | defines no tests (2026-10-23) |  | load 8.9 / 0.6; tests 8.6 / 0.6 |  | 2026-10-23 |  |  |
+| duologue | `ok` | stefil: 5 passed (2026-10-23) |  | load 9.0 / 0.6; tests 9.3 / 0.7 |  | 2026-10-23 |  |  |
+| fare-memoization | `ok` | stefil: 34 passed (2026-10-23) |  | load 7.9 / 0.3; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| ltk | `load-only` | defines no tests (2026-10-23) |  | load 8.5 / 1.2; tests 7.5 / 0.4 |  | 2026-10-23 |  |  |
+| osc | `load-only` | defines no tests (2026-10-23) |  | load 8.1 / 0.5; tests 7.7 / 0.4 |  | 2026-10-23 |  |  |
+| pileup | `ok` | stefil: 316 passed (2026-10-23) |  | load 8.0 / 0.3; tests 8.2 / 0.4 |  | 2026-10-23 |  |  |
+| quasiquote-2.0 | `load-only` | error (2026-10-23) | same (trivial-backtrace): error | load 7.9 / 0.3; tests 7.8 / 0.4 |  | 2026-10-23 |  |  |
+| timer-wheel | `load-only` | defines no tests (2026-10-23) |  | load 7.9 / 0.3; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| trivial-package-locks | `ok` | parachute: 40 passed (2026-10-23) |  | load 7.7 / 0.3; tests 7.7 / 0.4 |  | 2026-10-23 |  |  |
+| with-user-abort | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.3; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| wu-decimal | `load-only` | defines no tests (2026-10-23) |  | load 7.8 / 0.3; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| bit-smasher | `ok` | rove/prove: 5 passed (2026-10-23) |  | load 8.0 / 0.5; tests 8.8 / 1.1 |  | 2026-10-23 |  |  |
+| bt-semaphore | `ok` | clunit: 5 passed (2026-10-23) |  | load 7.9 / 0.3; tests 11.9 / 4.3 |  | 2026-10-23 |  |  |
+| closure-template | `ok` | lift: 143 passed (2026-10-23) |  | load 8.8 / 0.7; tests 10.9 / 2.5 |  | 2026-10-23 |  |  |
+| cl-csv | `load-only` | error (2026-10-23) |  | load 8.7 / 0.5; tests 8.8 / 0.9 |  | 2026-10-23 |  |  |
+| cl-devil | `fail` |  | same (babel cffi): does not load | load 8.3 / 0.4 |  | 2026-10-23 |  | `Unable to load any of the alternatives: (libIL.dylib libIL.1.dylib)` |
+| cl-heap | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.3; tests 7.8 / 0.3 |  | 2026-10-23 |  |  |
+| jpl-util | `load-only` | defines no tests (2026-10-23) |  | load 8.1 / 0.5; tests 7.4 / 0.3 |  | 2026-10-23 |  |  |
+| cl-log | `load-only` | defines no tests (2026-10-23) |  | load 7.9 / 0.3; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| cl-mustache | `load-only` | defines no tests (2026-10-23) |  | load 7.9 / 0.4; tests 8.1 / 0.4 |  | 2026-10-23 |  |  |
+| cl-pcg | `ok` | 1am: 1607 passed (2026-10-23) |  | load 7.7 / 0.2; tests 9.1 / 0.7 |  | 2026-10-23 |  |  |
+| data-table | `ok` | lisp-unit2: 93 passed (2026-10-23) |  | load 8.5 / 0.5; tests 8.7 / 0.8 |  | 2026-10-23 |  |  |
+| exit-hooks | `patched` | defines no tests (2026-10-23) |  | load 8.6 / 0.2; tests 7.5 / 0.2 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| file-attributes | `load-only` | defines no tests (2026-10-23) |  | load 8.3 / 0.4; tests 7.9 / 0.4 |  | 2026-10-23 |  |  |
+| getopt | `ok` | ptester: 26 passed (2026-10-23) |  | load 7.9 / 0.2; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| glop | `fail` |  | same (babel cffi): does not load | load 8.3 / 0.4 |  | 2026-10-23 |  | `Unable to load foreign library (BRIDGE). Unable to load shared library '<path>' or one of its dependencies. In order to help diagnose loading problems, consider` |
+| graph | `ok` | stefil: 93 passed (2026-10-23) |  | load 9.3 / 0.5; tests 10.3 / 0.9 |  | 2026-10-23 |  | `loaded from the dotcl dist overlay` |
+| hu.dwim.rdbms | `fail` |  |  | load 9.9 / 1.7; tests - / 1.5 |  | 2026-10-23 | Does not load, for the same reason as `hu.dwim.quasi-quote`: `hu.dwim.walker` has no dotcl branch for its lexical-environment code, so the macroexpansion of `lambda-with-bang-args-expander` in `source/generic/cursor.lisp` errors and the compile fails. | `COMPILE-FILE-ERROR while compiling #<HU.DWIM.CL-SOURCE-FILE hu.dwim.rdbms source generic cursor>` |
+| hu.dwim.serializer | `load-only` | defines no tests (2026-10-23) |  | load 8.7 / 0.6; tests 8.9 / 0.7 |  | 2026-10-23 |  |  |
+| hunchensocket | `load-only` | defines no tests (2026-10-23) |  | load 9.0 / 0.7; tests 9.1 / 0.8 |  | 2026-10-23 |  |  |
+| json-mop | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.3; tests 8.0 / 0.4 |  | 2026-10-23 |  |  |
+| lisp-binary | `load-only` | defines no tests (2026-10-23) |  | load 9.2 / 1.0; tests 8.8 / 1.1 |  | 2026-10-23 |  |  |
+| log5 | `load-only` | lift: 1 of 21 failed (2026-10-23) |  | load 8.0 / 0.4; tests 8.8 / 0.4 |  | 2026-10-23 |  |  |
+| magicl | `fail` |  | same (magicl babel cffi): error | load 16.0 / 28.1; tests - / 2.6 |  | 2026-10-23 | Does not load: `magicl/ext-blas` expands `with-array-pointers`, which signals an error on an implementation it has no branch for, and the expansion error makes the compile of `blas-cffi` fail. With a dotcl branch there the system loads and the tests get as far as on SBCL, which stops in the LAPACK examples on `zuncsd_`, a routine the measuring machine's LAPACK does not export. | `COMPILE-FILE-ERROR while compiling #<CL-SOURCE-FILE magicl/ext-blas bindings blas-cffi>` |
+| com.gigamonkeys.macro-utilities | `load-only` | defines no tests (2026-10-23) |  | load 8.2 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| com.gigamonkeys.utilities | `load-only` | defines no tests (2026-10-23) |  | load 8.0 / 0.4; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| num-utils | `load-only` | fiveam: 8 of 239 failed (2026-10-23) | same (trivial-backtrace): fiveam: 8 of 239 failed | load 9.1 / 1.0; tests 9.2 / 0.6 |  | 2026-10-23 |  |  |
+| priority-queue | `load-only` | defines no tests (2026-10-23) |  | load 7.9 / 0.3; tests 7.3 / 0.2 |  | 2026-10-23 |  |  |
+| protobuf | `load-only` | test system did not load (2026-10-23) |  | load 8.1 / 0.5; tests 8.0 / 0.5 |  | 2026-10-23 |  |  |
+| select | `ok` | clunit: 87 passed (2026-10-23) |  | load 8.0 / 0.3; tests 8.7 / 0.9 |  | 2026-10-23 |  |  |
+| text-draw | `load-only` | defines no tests (2026-10-23) |  | load 7.9 / 0.5; tests 7.5 / 0.3 |  | 2026-10-23 |  |  |
+| trivial-download | `load-only` | defines no tests (2026-10-23) |  | load 8.9 / 0.7; tests 8.5 / 0.6 |  | 2026-10-23 |  |  |
+| trivial-http | `load-only` | error (2026-10-23) | improved (babel usocket lift): lift: 7 of 9 failed | load 8.1 / 0.4; tests 12.0 / 4.7 |  | 2026-10-23 |  |  |
+| unix-opts | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.3; tests 7.6 / 0.3 |  | 2026-10-23 |  |  |
+| url-rewrite | `load-only` | defines no tests (2026-10-23) |  | load 7.7 / 0.3; tests 7.4 / 0.2 |  | 2026-10-23 |  |  |
+| zs3 | `load-only` | defines no tests (2026-10-23) |  | load 10.4 / 1.4; tests 9.7 / 1.0 |  | 2026-10-23 |  |  |
 
 ## Hand-picked
 
@@ -503,5 +503,5 @@ ranks nowhere. The order in this table means nothing.
 
 | system | status | tests | with forks | seconds, dotcl / SBCL | issue | checked | why | note |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| coalton | `fail` |  | pending-fork (coalton): ok, fiasco: 698 passed | load 20.8 / 20.1; tests - / 1.7 |  | 2026-10-15 | The released Coalton (2026-01-01) implements its hashing only for SBCL, Allegro and CCL and stops with `#.(error ...)` elsewhere, so it does not load. Coalton's upstream main supports dotcl, and the with forks column is measured from it: it loads in 51 seconds and its suite passes (698 checks), but building the test system takes 201 seconds and running the suite 481 (SBCL 2.6.8 on the same machine: 20, 70 and 53 seconds, with 757 checks including the thread tests dotcl does not run). | `error: Reader error --> <path> \| 105 \| (define (== _ _) True)) \| ____________________________^ 106 \| \| ... 121 \| \| #-(or sbcl allegro ccl) 122 \| \| #.(cl:error h` |
-| april | `fail` |  | same (serapeum bordeaux-threads introspect-environment): does not load | load 2.4 / 0.3 |  | 2026-10-15 | The Quicklisp dist's april release ships cape/cape.asd in its tarball but does not index it, so `(ql:quickload "april")` fails with `System "cape" not found` on SBCL as well. Loaded from the unpacked release tree instead, `(april (test))` passes 1140 of 1140 here. | `System cape not found` |
+| coalton | `fail` |  | pending-fork (coalton): ok, fiasco: 698 passed | load 15.0 / 20.1; tests - / 1.7 |  | 2026-10-23 | The released Coalton (2026-01-01) implements its hashing only for SBCL, Allegro and CCL and stops with `#.(error ...)` elsewhere, so it does not load. Coalton's upstream main supports dotcl, and the with forks column is measured from it: it loads in 51 seconds and its suite passes (698 checks), but building the test system takes 201 seconds and running the suite 481 (SBCL 2.6.8 on the same machine: 20, 70 and 53 seconds, with 757 checks including the thread tests dotcl does not run). | `error: Reader error --> <path> \| 105 \| (define (== _ _) True)) \| ____________________________^ 106 \| \| ... 121 \| \| #-(or sbcl allegro ccl) 122 \| \| #.(cl:error h` |
+| april | `fail` |  | same (serapeum bordeaux-threads introspect-environment): does not load | load 8.8 / 0.3 |  | 2026-10-23 | The Quicklisp dist's april release ships cape/cape.asd in its tarball but does not index it, so `(ql:quickload "april")` fails with `System "cape" not found` on SBCL as well. Loaded from the unpacked release tree instead, `(april (test))` passes 1140 of 1140 here. | `System cape not found` |

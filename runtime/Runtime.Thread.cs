@@ -231,6 +231,7 @@ public partial class Runtime
             RestartClusterStack.PushCluster(new[] {
                 new LispRestart("ABORT", _ => Nil.Instance,
                     description: "Abort this thread.", tag: abortTag) });
+            Package.EnterInheritedUnit();
             try
             {
                 if (fn is LispFunction lfn)
@@ -263,6 +264,7 @@ public partial class Runtime
             }
             finally
             {
+                Package.LeaveThreadUnit();
                 RestartClusterStack.PopCluster();
                 if (lispThread != null)
                 {
@@ -383,7 +385,7 @@ public partial class Runtime
     internal static LispThread? EnterInterruptibleWait()
     {
         var self = SelfLispThread();
-        if (self == null) return null;
+        if (self == null || InterruptsDeferred()) return null;
         Interlocked.Exchange(ref self.WaitState, 1);
         if (!self.PendingInterrupts.IsEmpty) Thread.CurrentThread.Interrupt();
         return self;
@@ -415,7 +417,7 @@ public partial class Runtime
     internal static void RunPendingInterruptsAtSafepoint()
     {
         var self = SelfLispThread();
-        if (self == null || self.PendingInterrupts.IsEmpty) return;
+        if (self == null || self.PendingInterrupts.IsEmpty || InterruptsDeferred()) return;
         while (self.PendingInterrupts.TryDequeue(out var fn))
         {
             Interlocked.Decrement(ref SafepointInterruptsPending);
@@ -445,6 +447,14 @@ public partial class Runtime
         // it up rather than creating a fresh (empty) one here.
         var self = SelfLispThread();
         if (self == null) return false;
+        if (InterruptsDeferred())
+        {
+            // Only DESTROY-THREAD pokes a wait inside WITHOUT-INTERRUPTS. The
+            // wait cannot be resumed, so the thread ends. The rest of the
+            // queue runs when the unwind leaves WITHOUT-INTERRUPTS.
+            DropDestroyRequests(self);
+            return false;
+        }
         bool ran = false;
         while (self.PendingInterrupts.TryDequeue(out var fn))
         {
@@ -493,6 +503,17 @@ public partial class Runtime
         return T.Instance;
     }
 
+    internal static Symbol? InterruptsEnabledSym;
+
+    /// <summary>True inside WITHOUT-INTERRUPTS: DOTCL:*INTERRUPTS-ENABLED* is
+    /// NIL on this thread. Read only where an interrupt is about to be
+    /// delivered.</summary>
+    internal static bool InterruptsDeferred()
+    {
+        var sym = InterruptsEnabledSym;
+        return sym != null && DynamicBindings.TryGet(sym, out var v) && v is Nil;
+    }
+
     /// <summary>Around the outermost host call: a destroy that did not land
     /// while the host thread ran Lisp must not fire in a later call.</summary>
     internal static void DropPendingDestroy()
@@ -500,6 +521,11 @@ public partial class Runtime
         if (Volatile.Read(ref SafepointInterruptsPending) == 0) return;
         var self = SelfLispThread();
         if (self == null || self.MadeByLisp || self.PendingInterrupts.IsEmpty) return;
+        DropDestroyRequests(self);
+    }
+
+    private static void DropDestroyRequests(LispThread self)
+    {
         int n = self.PendingInterrupts.Count;
         for (int i = 0; i < n && self.PendingInterrupts.TryDequeue(out var fn); i++)
         {

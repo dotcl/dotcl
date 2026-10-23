@@ -144,7 +144,9 @@ public static partial class Runtime
 
     // --- Typep ---
 
-    public static bool IsTrueTypep(LispObject obj, LispObject typeSpec) => Typep(obj, typeSpec) is not Nil;
+    public static bool IsTrueTypep(LispObject obj, LispObject typeSpec) =>
+        (obj is LispStruct st && ReferenceEquals(st.TypeName, typeSpec))
+        || Typep(obj, typeSpec) is not Nil;
 
     /// <summary>Whether a generic function object is one because its class says so.
     /// A funcallable instance of a user class shares the representation without being
@@ -159,6 +161,7 @@ public static partial class Runtime
 
     public static LispObject Typep(LispObject obj, LispObject typeSpec)
     {
+        if (obj is LispStruct st && ReferenceEquals(st.TypeName, typeSpec)) return T.Instance;
         if (typeSpec is Symbol sym && SymbolTypeTest(sym) is { } test)
             return test.Test(obj) ? T.Instance : Nil.Instance;
         return TypepGeneral(obj, typeSpec);
@@ -225,7 +228,7 @@ public static partial class Runtime
                 // built-in type, not a structure that shadows it (a structure
                 // named FOO::ARRAY is not a CL:ARRAY).
                 if (ReferenceEquals(st.TypeName, typeSym)
-                    || (st.TypeName.Name == typeSym.Name && typeSym.HomePackage != Startup.CL))
+                    || (typeSym.HomePackage != Startup.CL && StructNameMatches(st.TypeName, typeSym)))
                     return T.Instance;
                 // Check :include hierarchy
                 var stCls = FindClassOrNil(st.TypeName) as LispClass;
@@ -448,7 +451,7 @@ public static partial class Runtime
                     var pred = Car(Cdr(typeSpec));
                     if (pred is Symbol predSym)
                     {
-                        try { return IsTruthy(Funcall(predSym, obj)) ? T.Instance : Nil.Instance; }
+                        try { return MultipleValues.Alone(IsTruthy(Funcall(predSym, obj)) ? T.Instance : Nil.Instance); }
                         catch (LispErrorException) { }
                     }
                     return Nil.Instance;
@@ -1780,6 +1783,13 @@ public static partial class Runtime
                 s_expandingTypes?.Clear(); // Reset for next subtypep call
         }
     }
+
+    public static LispObject SubtypepMv(LispObject type1, LispObject type2)
+        => MultipleValues.Boxed(Subtypep(type1, type2));
+    public static LispObject SubtypepPrimary(LispObject type1, LispObject type2)
+        => MultipleValues.PrimaryAlone(Subtypep(type1, type2));
+    public static LispObject SubtypepPair(LispObject type1, LispObject type2)
+        => MultipleValues.Paired(Subtypep(type1, type2));
 
     private static LispObject SubtypepImpl(LispObject type1, LispObject type2)
     {

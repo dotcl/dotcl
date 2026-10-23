@@ -7,12 +7,14 @@
 ;;; defvar / defparameter
 ;;; ============================================================
 
+(defun note-global-special (sym)
+  (setf (gethash sym *global-specials*) t))
+
 (defun compile-defvar (name init-form has-init-p &optional (is-defvar t) (is-defconstant nil) docstring)
   "Compile (defvar name value [doc]) or (defparameter name value [doc]) or (defconstant name value [doc]).
    Returns the symbol name. Stores docstring if provided."
   ;; Register as globally special at compile time
-  (pushnew name *specials*)
-  (pushnew name *global-specials*)
+  (note-global-special name)
   (let ((val-local (gen-local "DEFVAR-VAL"))
         (sym-local (gen-local "DEFVAR-SYM")))
     `((:declare-local ,val-local "LispObject")
@@ -241,9 +243,9 @@
     ((and (symbolp (car form))
           (%compiler-let-symbol-p (car form))
           (< depth *macro-expand-depth-limit*)
-          (gethash (car form) *macros*))
+          (%macro-expander-here (car form)))
      (handler-case
-         (let ((expanded (%return-from-scan-macroexpand form (gethash (car form) *macros*))))
+         (let ((expanded (%return-from-scan-macroexpand form (%macro-expander-here (car form)))))
            (form-macroexpands-to-return-from-p name expanded (1+ depth)))
        (error () t)))
     ;; A global macro call may expand to a return-from (possibly after more
@@ -255,9 +257,9 @@
     ;; side effects (warnings), which the compilation itself never does.
     ((and (symbolp (car form))
           (< depth *macro-expand-depth-limit*)
-          (gethash (car form) *macros*))
+          (%macro-expander-here (car form)))
      (handler-case
-         (let ((expanded (%return-from-scan-macroexpand form (gethash (car form) *macros*))))
+         (let ((expanded (%return-from-scan-macroexpand form (%macro-expander-here (car form)))))
            (if (equal expanded form)
                (%scan-code-forms (lambda (f) (form-macroexpands-to-return-from-p name f depth))
                                  (cdr form))
@@ -295,7 +297,7 @@
                       ((and (consp name) (eq (car name) 'setf) (symbolp (cadr name)))
                        (cadr name)))))
     (when (and target (symbol-package target))
-      `(:pkg ,(package-name (symbol-package target))))))
+      `(:pkg ,(%package-physical-name (symbol-package target))))))
 
 (defvar *sil-dump-pattern* :unread
   "Cached upcased DOTCL_DUMP_SIL_FOR value (or NIL if unset); :UNREAD before the
@@ -901,17 +903,20 @@
 ;;; ------------------------------------------------------------
 ;;; Typed entries
 ;;; ------------------------------------------------------------
-;;; A global function whose DECLAIM FTYPE gives every argument and the result a
-;;; numeric type that has a raw representation -- an integer type that fits
-;;; int64 (a Fixnum holds any of them) or DOUBLE-FLOAT -- is compiled into a
-;;; method taking and returning the raw values, (:DEFMETHOD-TYPED ...). Its
+;;; A global function whose DECLAIM FTYPE gives some of its (at most six
+;;; required) arguments or its result a numeric type that has a raw
+;;; representation -- an integer type that fits int64 (a Fixnum holds any of
+;;; them) or DOUBLE-FLOAT -- is compiled into a method taking and returning those
+;;; values raw and the others as objects, (:DEFMETHOD-TYPED ...). Its
 ;;; ordinary entry is a shell the assembler builds: convert the arguments, call
 ;;; the method, box the result. From (safety 1) up the declaration is an
 ;;; assertion: the shell checks each argument and the body checks its result.
 ;;; At (safety 0) both are trusted.
 ;;;
-;;; A kind spec is (:LONG LO HI), LO / HI NIL for the whole int64 range, or
-;;; (:DOUBLE).
+;;; A kind spec is (:LONG LO HI), LO / HI NIL for the whole int64 range,
+;;; (:DOUBLE), or (:OBJECT) for an argument or result of any other type, passed
+;;; as it is. A function gets a typed entry when at least one of its arguments or
+;;; its result is :LONG or :DOUBLE.
 
 (defvar *typed-entry-request* nil
   "The (ARG-SPECS . RET-SPEC) DEFUN-DIRECT-INSTRS asks the next
@@ -919,6 +924,21 @@
    a body taking and returning objects even where a native body would do (see
    DEFUN-DIRECT-INSTRS). That body takes it and rebinds this to NIL, so nothing
    compiled inside sees it.")
+
+(defvar *typed-entry-ranges* nil
+  "While the body of a typed entry is compiled: (KEY LO . HI) for each integer
+   parameter, its slot KEY and the range its value is known to lie in at the top
+   of the body (the entry checked it, and a tail self-call checks its arguments
+   the same way before looping back).")
+
+(defun %typed-entry-ranges (required local-keys arg-specs)
+  (loop for p in required
+        for spec in arg-specs
+        for key = (cdr (assoc p local-keys))
+        when (and key (eq (car spec) :long))
+          collect (list* key
+                         (or (second spec) +int64-min+)
+                         (or (third spec) +int64-max+))))
 
 (defun %typed-kind-spec (type)
   "The kind spec of TYPE, the declared type of an argument or result, or NIL
@@ -943,13 +963,18 @@
              (car rest)))
       type))
 
+(defvar *typed-entry-denied* (make-hash-table :test #'eq :synchronized t)
+  "Names whose last DEFUN asked for a typed entry and was compiled without one.
+   A call compiled after it goes through the ordinary entry.")
+
 (defun typed-entry-specs (name required)
   "(ARG-SPECS . RET-SPEC) when a DEFUN of NAME with the required parameters
    REQUIRED can have a typed entry: NAME has a declaimed (not inferred) FTYPE
-   whose arguments are exactly as many plain types as REQUIRED, at most four, and
-   every one of them and the single result type has a kind spec. Else NIL."
+   whose arguments are exactly as many plain types as REQUIRED, at most six, and
+   one of them or the result has a raw kind (:LONG or :DOUBLE); the others are
+   :OBJECT. Else NIL."
   (when (and name (symbolp name) (not *cross-compiling*)
-             required (<= (length required) 4))
+             required (<= (length required) 6))
     (multiple-value-bind (args found) (gethash name *function-arg-types*)
       (multiple-value-bind (ret rfound) (gethash name *function-return-types*)
         (when (and found rfound
@@ -957,11 +982,12 @@
                    (listp args)
                    (= (length args) (length required))
                    (notany (lambda (a) (member a lambda-list-keywords)) args))
-          (let ((arg-specs (mapcar #'%typed-kind-spec args))
-                (ret-spec (let ((ty (%single-value-type ret)))
+          (let* ((raw-args (mapcar #'%typed-kind-spec args))
+                 (raw-ret (let ((ty (%single-value-type ret)))
                             (and ty (%typed-kind-spec ty)))))
-            (when (and ret-spec (every #'identity arg-specs))
-              (cons arg-specs ret-spec))))))))
+            (when (or raw-ret (some #'identity raw-args))
+              (cons (mapcar (lambda (s) (or s (list :object))) raw-args)
+                    (or raw-ret (list :object))))))))))
 
 (defun %declared-param-type (param body)
   "The type the leading declarations of BODY give the parameter PARAM: from
@@ -1009,7 +1035,7 @@
 
 (defun %typed-sig-string (arg-specs ret-spec)
   "The signature the assembler reads (see TypedEntrySig): \"LD>L\"."
-  (flet ((ch (s) (if (eq (car s) :double) #\D #\L)))
+  (flet ((ch (s) (case (car s) (:double #\D) (:object #\O) (t #\L))))
     (coerce (append (mapcar #'ch arg-specs) (list #\> (ch ret-spec))) 'string)))
 
 (defun %typed-param-conflict-p (required arg-specs body)
@@ -1025,12 +1051,15 @@
     (loop for p in required
           for spec in arg-specs
           for n = (var-name p)
-          thereis (if (eq (car spec) :double)
+          thereis (case (car spec)
+                    (:object nil)
+                    (:double
                       (or (member n fx :test #'string=) (member n sml :test #'string=)
                           (member n sgl :test #'string=) (member n dec :test #'string=)
-                          (member n chr :test #'string=))
+                          (member n chr :test #'string=)))
+                    (t
                       (or (member n dbl :test #'string=) (member n sgl :test #'string=)
-                          (member n dec :test #'string=) (member n chr :test #'string=))))))
+                          (member n dec :test #'string=) (member n chr :test #'string=)))))))
 
 (defun %typed-checks-p ()
   "Are typed-entry declarations checked in the body being compiled: (safety 1)
@@ -1055,18 +1084,21 @@
    when it was compiled to (a call from another function: the callee's safety
    decides, as it does for a boxed caller)."
   (let ((*in-tail-position* nil) (*in-mv-context* nil))
-    (if (eq (car spec) :double)
+    (case (car spec)
+      (:object (compile-expr expr))
+      (:double
         (cond ((typed-self-call-p expr) (compile-typed-self-call expr))
               ((double-float-typed-p expr) (compile-as-double expr))
               (t `(,@(compile-expr expr)
-                   ,(if (%typed-checks-p) '(:call "Runtime.TypedArgD") '(:unbox-double)))))
+                   ,(if (%typed-checks-p) '(:call "Runtime.TypedArgD") '(:unbox-double))))))
+      (t
         (if (typed-self-call-p expr)
             (compile-typed-self-call expr)
             `(,@(cond ((fixnum-arith-unboxed-safe-p expr) (compile-as-long expr))
                       ((checked-long-arith-p expr) (compile-checked-long-arith expr))
                       (t `(,@(compile-expr expr)
                            ,(if (%typed-checks-p) '(:call "Runtime.TypedArgL") '(:unbox-fixnum)))))
-              ,@(when range-check (%long-range-check expr spec)))))))
+              ,@(when range-check (%long-range-check expr spec))))))))
 
 (defun %self-call-in-tail-p (x self)
   "Might X reach a call to SELF in its tail position? Looks through the control
@@ -1114,14 +1146,26 @@
             '((:call "Runtime.TypedRetD"))
             `((:call "Runtime.TypedRetL") ,@(%long-range-check nil spec))))))
 
+(defun self-call-shortcut-p (name)
+  "May a call to NAME from NAME's own body skip the global definition (a TCO
+   loop, the cached self function, a typed or native self call)? Not when NAME
+   is NOTINLINE, lexically or globally (CLHS 3.2.2.3)."
+  (not (or (member name *notinline-functions* :test #'equal)
+           (and (symbolp name) (%global-notinline-p name)))))
+
 (defun typed-self-call-p (expr)
   "True for a call, from the body of a typed entry, to that same function with
    as many arguments as it takes."
   (let ((ts (and (boundp '*cstate*) (cstate-typed-self))))
     (and ts (consp expr) (symbolp (car expr))
          (eq (car expr) (first ts))
+         (self-call-shortcut-p (car expr))
          (not (local-function-entry (car expr)))
          (= (length (cdr expr)) (length (second ts))))))
+
+(defun %typed-slot-type (spec)
+  "The local type a raw value of kind SPEC is kept in."
+  (case (car spec) (:double "Double") (:object "LispObject") (t "Int64")))
 
 (defun compile-typed-self-call (expr)
   "A call to the typed entry being compiled, leaving its raw result: the
@@ -1132,7 +1176,7 @@
     `(,@(loop for a in (cdr expr)
               for spec in (second ts)
               for tmp in temps
-              append `((:declare-local ,tmp ,(if (eq (car spec) :double) "Double" "Int64"))
+              append `((:declare-local ,tmp ,(%typed-slot-type spec))
                        ,@(compile-typed-value a spec)
                        (:stloc ,tmp)))
       (:ldarg 0)
@@ -1142,43 +1186,75 @@
 (defun typed-call-specs (name args)
   "(ARG-SPECS . RET-SPEC) when a call of the global function NAME with the
    argument forms ARGS can go through its typed entry: the entry a DEFUN of NAME
-   gets under the same declaimed FTYPE (TYPED-ENTRY-SPECS). Else NIL."
-  (and args (typed-entry-specs name args)))
+   gets under the same declaimed FTYPE (TYPED-ENTRY-SPECS), unless its DEFUN was
+   compiled without one. Else NIL."
+  (and args
+       (not (gethash name *typed-entry-denied*))
+       (typed-entry-specs name args)))
 
 (defun compile-typed-call (name args specs)
   "A call of the global function NAME through its typed entry of SPECS, leaving
    the raw result: the arguments go into typed temporaries first (checked
    against the declaration from (safety 1) up, as the boxed entry checks them),
-   then the function is fetched from the name on every call. A function there
-   without that entry is called the ordinary way by the runtime."
+   then the call goes through the typed entry the name's symbol keeps for its
+   function. A function there without that entry is called the ordinary way
+   by the runtime."
   (let ((temps (loop for nil in args collect (gen-local "TCA"))))
     `(,@(loop for a in args
               for spec in (car specs)
               for tmp in temps
-              append `((:declare-local ,tmp ,(if (eq (car spec) :double) "Double" "Int64"))
+              append `((:declare-local ,tmp ,(%typed-slot-type spec))
                        ,@(compile-typed-value a spec nil)
                        (:stloc ,tmp)))
+      ,@(when (and (eq (car (cdr specs)) :object)
+                   (not (single-value-form-p (cons name args))))
+          '((:call "MultipleValues.Reset")))
       ,@(compile-fn-sym-lookup name)
       (:castclass "Symbol")
-      (:call "CilAssembler.GetFunctionBySymbol")
       ,@(loop for tmp in temps collect `(:ldloc ,tmp))
-      (:call-typed-entry ,(%typed-sig-string (car specs) (cdr specs))))))
+      (:call-typed-sym ,(%typed-sig-string (car specs) (cdr specs))))))
+
+(defun %compile-raw-typed-call (expr kind)
+  "When EXPR is a call that may go through a typed entry with a raw result of
+   KIND (:LONG or :DOUBLE): EXPR compiled, and whether it left the raw value
+   (else it left the object, as COMPILE-EXPR would). NIL otherwise."
+  (when (and (consp expr) (symbolp (car expr)) (cdr expr)
+             (not (local-function-entry (car expr)))
+             (let ((specs (typed-call-specs (car expr) (cdr expr))))
+               (and specs (eq (car (cdr specs)) kind))))
+    (let* ((*typed-call-raw-request* (cons expr kind))
+           (*in-tail-position* nil) (*in-mv-context* nil)
+           (code (let ((*mv-expect-args* (cons (cdr expr) :primary)))
+                   (compile-expr-raw expr))))
+      (if (eq *typed-call-raw-request* :done)
+          (values code t)
+          (values (if (or (single-value-form-p expr)
+                          (struct-slot-read-emitted-p expr code)
+                          (code-ends-unwrapped-p code))
+                      code
+                      `(,@code (:call "Runtime.UnwrapMv")))
+                  nil)))))
 
 (defun %box-typed-result (spec)
   "The instruction boxing a raw value of kind SPEC."
-  (if (eq (car spec) :double) '((:newobj "DoubleFloat")) '((:call "Fixnum.Make"))))
+  (case (car spec)
+    (:double '((:newobj "DoubleFloat")))
+    (:object nil)
+    (t '((:call "Fixnum.Make")))))
 
 (defun compile-typed-progn (forms spec)
   "FORMS (leading declarations skipped) as the body of a typed entry: all but
    the last for effect, the last through COMPILE-TYPED-TAIL."
   (let ((forms (nth-value 1 (%split-leading-declares forms))))
+    (when (eq (car spec) :object)
+      (return-from compile-typed-progn (compile-progn forms)))
     (if (null forms)
         (compile-typed-tail nil spec)
         `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
               (%join-statements
                (loop for form in (butlast forms)
                      collect (cons (compile-and-pop form)
-                                   (if (and (consp form) (member (car form) '(%check-simple-decl %check-arg-decl)))
+                                   (if (and (consp form) (member (car form) '(%check-simple-decl %check-arg-decl %tco-checks-done)))
                                        t
                                        :default)))))
           ,@(compile-typed-tail (car (last forms)) spec)))))
@@ -1239,6 +1315,66 @@
               thereis (and (= (aref depth i) 0)
                            (invoke-p (aref cells i))
                            (follows-to-typed-ret-p i)))))))
+
+(defun %typed-object-body-loses-tail-call-p (instrs)
+  "True when the typed body INSTRS, whose result is an object, makes a call that
+   the ordinary body would make as a tail call (an InvokeN / InvokeNM or a
+   same-file call whose value goes to the RET, see the assembler's
+   FindTailSites), or a call through another typed entry whose raw result is
+   boxed on its way to the RET. Such calls return here instead. A body without
+   the (:typed-tail-self) mark makes no tail calls anyway."
+  (when (find :typed-tail-self instrs :key (lambda (i) (and (consp i) (car i))))
+    (let* ((cells (coerce instrs 'vector))
+           (n (length cells))
+           (depth (make-array n))
+           (label-at (make-hash-table :test #'equal))
+           (d 0))
+      (dotimes (i n)
+        (let ((ins (aref cells i)))
+          (when (consp ins)
+            (case (car ins)
+              (:label (setf (gethash (string (cadr ins)) label-at) i))
+              (:begin-exception-block (incf d))
+              (:end-exception-block (decf d)))))
+        (setf (aref depth i) d))
+      (flet ((call-kind (ins)
+               (when (consp ins)
+                 (case (car ins)
+                   (:callvirt
+                    (let ((s (cadr ins)))
+                      (and (stringp s) (> (length s) 19) (string= "LispFunction.Invoke" s :end2 19)
+                           (digit-char-p (char s 19))
+                           (or (= (length s) 20)
+                               (and (= (length s) 21) (char= (char s 20) #\M)))
+                           :plain)))
+                   (:call-same-file :plain)
+                   (:call-typed-sym
+                    (let ((sig (cadr ins)))
+                      (and (stringp sig) (char/= (char sig (1- (length sig))) #\O) :boxed))))))
+             (reaches-ret-p (i boxed)
+               (let ((j (1+ i)) (steps 0) (held nil))
+                 (loop
+                   (when (or (>= j n) (> (incf steps) 64)) (return nil))
+                   (let* ((ins (aref cells j)) (op (and (consp ins) (car ins))))
+                     (cond
+                       ((member op '(:label :line :declare-local)) (incf j))
+                       ((and boxed (null held)
+                             (or (equal ins '(:call "Fixnum.Make")) (equal ins '(:newobj "DoubleFloat"))))
+                        (setq boxed nil) (incf j))
+                       ((and (or (eq op :br)
+                                 (and (eq op :leave) held (= (aref depth j) 0)))
+                             (gethash (string (cadr ins)) label-at))
+                        (setq j (gethash (string (cadr ins)) label-at)))
+                       ((null held)
+                        (cond ((eq op :ret) (return (and (not boxed) (= (aref depth j) 0))))
+                              ((eq op :stloc) (setq held (cadr ins)) (incf j))
+                              (t (return nil))))
+                       ((and (eq op :ldloc) (eq (cadr ins) held))
+                        (setq held nil) (incf j))
+                       (t (return nil))))))))
+        (loop for i below n
+              for kind = (and (= (aref depth i) 0) (call-kind (aref cells i)))
+              thereis (and kind (reaches-ret-p i (eq kind :boxed))))))))
 
 (defun compile-typed-tail (x spec)
   "X, in tail position of a typed entry's body, leaving the raw result SPEC
@@ -1354,11 +1490,17 @@
       ;; body is compiled again, taking and returning objects (not the native
       ;; body either, which returns a raw value too). Callers that know the
       ;; FTYPE then reach it through the boxed entry, and check the result.
-      (when (and typed (%typed-body-boxed-tail-call-p direct-body))
+      (when (and typed (if (eq (car (cdr typed)) :object)
+                           (%typed-object-body-loses-tail-call-p direct-body)
+                           (%typed-body-boxed-tail-call-p direct-body)))
         (setq native-eligible nil)
         (multiple-value-setq (direct-body direct-self-p typed)
           (let ((*typed-entry-request* :boxed-only))
             (compile-function-body-direct params direct-wrapped-body mangled pkg-name name))))
+      (when (and (symbolp name) name (not *cross-compiling*))
+        (if (and (not typed) (typed-entry-specs name required))
+            (setf (gethash name *typed-entry-denied*) t)
+            (remhash name *typed-entry-denied*)))
       `(,(cond
            (typed
             `(:defmethod-typed ,mangled
@@ -1433,8 +1575,23 @@
                             (or (and (symbolp name) (symbol-package name) name)
                                 (and (consp name) (eq (car name) 'setf) name))))
         (*xref-edges* '()))
-    (let* ((instrs (let ((*return-type-self* (and (symbolp name) name)))
-                     (%compile-defun-1 name params body)))
+    (let* ((instrs (let* ((*return-type-self* (and (symbolp name) name))
+                          (cell (list* 0 name body nil))
+                          (instrs (let ((*large-inline-cell* cell))
+                                    (%compile-defun-1 name params body))))
+                     ;; Past the JIT's limits the whole method is compiled
+                     ;; without optimization, which costs more than the calls
+                     ;; the large substitutions saved.
+                     (if (and (plusp (car cell)) (%sil-past-jit-limits-p instrs))
+                         (progn
+                           (setf *xref-edges* '())
+                           (let ((*large-inline-cell* nil))
+                             (%compile-defun-1 name params body)))
+                         instrs)))
+           (instrs (progn
+                     (unless *cross-compiling*
+                       (%note-inline-def-il-size name instrs))
+                     instrs))
            ;; An inline definition recorded by this DEFUN is also written into
            ;; the fasl, so an image that loads it can substitute calls too.
            (inline-note (let ((form (%inline-expansion-proclamation name)))
@@ -1471,6 +1628,7 @@
   (when (symbolp name)
     (record-inferred-return-type
      name (infer-body-return-type body (mangle-name name))))
+  (setq body (%ftype-arg-declarations name params body))
   ;; Keep the definition for substitution at call sites when the name is
   ;; proclaimed INLINE. Recorded here, at the point the DEFUN is compiled,
   ;; which is what makes the proclamation have to come first (CLHS 3.2.2.1.3).
@@ -1492,7 +1650,6 @@
           ;; NOTINLINE (or a plain redefinition after the proclamation was taken
           ;; back) must not leave a stale body behind for later call sites.
           (remhash name *inline-defs*))))
-  (setq body (%ftype-arg-declarations name params body))
   (multiple-value-bind (required optional key) (parse-lambda-list params)
     (declare (ignore required))
     (when (or optional key)
@@ -2659,6 +2816,69 @@
                        (:ldarg ,i) (:stloc ,key)
                        ,@(%local-var-marker key p)))))
 
+(defun %declared-float-param-kind (p body)
+  "Whether BODY's leading declarations declare P exactly DOUBLE-FLOAT (:DOUBLE)
+   or SINGLE-FLOAT (:SINGLE)."
+  (dolist (form body nil)
+    (unless (and (consp form) (eq (car form) 'declare)) (return nil))
+    (dolist (d (cdr form))
+      (when (consp d)
+        (multiple-value-bind (ty vars)
+            (if (eq (car d) 'type) (values (cadr d) (cddr d)) (values (car d) (cdr d)))
+          (when (and (symbolp ty) (member p vars :test #'eq))
+            (case ty
+              ((double-float long-float) (return-from %declared-float-param-kind :double))
+              ((single-float short-float) (return-from %declared-float-param-kind :single)))))))))
+
+(defun %float-param-plan (required body excluded-names)
+  "(PARAM RAW-KEY KIND) for each of REQUIRED declared DOUBLE-FLOAT or
+   SINGLE-FLOAT and read in float arithmetic: the parameter lives in a raw r8 /
+   r4 slot, RAW-KEY, filled once from its argument. EXCLUDED-NAMES (boxed,
+   captured, special) keep the object slot."
+  (loop for p in required
+        for kind = (%declared-float-param-kind p body)
+        when (and kind
+                  (not (member (var-name p) excluded-names :test #'string=))
+                  (%native-float-use-p p body))
+          collect (list p (gen-local (var-name p)) kind)))
+
+(defun %float-param-entry-instrs (plan local-keys)
+  "Fill each raw slot of PLAN from the parameter's object slot, checking its type."
+  (loop for (p raw kind) in plan
+        for key = (cdr (assoc p local-keys))
+        append `((:declare-local ,raw ,(if (eq kind :double) "Double" "Single"))
+                 ,@(if (eq kind :double)
+                       `((:ldloc ,key) (:call "Runtime.TypedArgD"))
+                       `((:ldloc ,key) (:call "Runtime.CheckArgSingle")
+                         (:ldloc ,key) (:unbox-single)))
+                 (:stloc ,raw)
+                 ,@(%local-var-marker raw p kind))))
+
+(defun %float-param-cstate (plan)
+  "*CSTATE* with the parameters of PLAN resolving to their raw slots."
+  (if plan
+      (cstate-with *cstate*
+        +cs-locals+ (append (mapcar (lambda (e) (cons (first e) (second e))) plan)
+                            (cstate-locals))
+        +cs-native-double-locals+ (append (loop for e in plan
+                                                when (eq (third e) :double)
+                                                  collect (second e))
+                                          (cstate-native-double-locals))
+        +cs-native-single-locals+ (append (loop for e in plan
+                                                when (eq (third e) :single)
+                                                  collect (second e))
+                                          (cstate-native-single-locals)))
+      *cstate*))
+
+(defun %float-param-keys (plan local-keys)
+  "LOCAL-KEYS with the parameters of PLAN mapped to their raw slots."
+  (if plan
+      (mapcar (lambda (e)
+                (let ((hit (assoc (car e) plan :test #'eq)))
+                  (if hit (cons (car e) (second hit)) e)))
+              local-keys)
+      local-keys))
+
 (defun direct-self-fn-prelude (self-fn-local fn-name fn-pkg setf-fn-p setf-target-name)
   "Prologue caching the current function's LispFunction in SELF-FN-LOCAL for
    non-tail self-calls. (SETF NAME) functions look up SetfFunction on the
@@ -2667,14 +2887,14 @@
       `((:declare-local ,self-fn-local "LispFunction")
         ,@(if fn-pkg
               `((:load-sym-pkg ,setf-target-name ,fn-pkg))
-              `((:load-sym-fn ,setf-target-name ,(package-name *package*))))
+              `((:load-sym-fn ,setf-target-name ,(%package-physical-name *package*))))
         (:castclass "Symbol")
         (:call "CilAssembler.GetSetfFunctionBySymbol")
         (:stloc ,self-fn-local))
       `((:declare-local ,self-fn-local "LispFunction")
         ,@(if fn-pkg
               `((:load-sym-pkg ,fn-name ,fn-pkg))
-              `((:load-sym-fn ,fn-name ,(package-name *package*))))
+              `((:load-sym-fn ,fn-name ,(%package-physical-name *package*))))
         (:castclass "Symbol")
         (:call "CilAssembler.GetFunctionBySymbol")
         (:stloc ,self-fn-local))))
@@ -2744,6 +2964,20 @@
           (when r
             (setf (gethash name *inline-return-ranges*) r)))))))
 
+(defun %mentions-throw-p (form)
+  "Whether FORM has the symbol THROW outside quoted data. Macros that expand
+   into a THROW are not seen."
+  (let ((budget 20000))
+    (labels ((walk (x)
+               (cond ((<= (decf budget) 0) nil)
+                     ((eq x 'throw) t)
+                     ((atom x) nil)
+                     ((eq (car x) 'quote) nil)
+                     (t (loop for tail = x then (cdr tail)
+                              while (and (consp tail) (> budget 0))
+                              thereis (walk (car tail)))))))
+      (walk form))))
+
 (defun compile-function-body-direct (params body &optional (fn-name "") fn-pkg fn-symbol)
   "Compile function body with direct parameter passing (no args array).
    Only for functions with exactly required params, no optional/key/rest.
@@ -2788,6 +3022,10 @@
            ;; NOTINLINE in this body disables matching compiler macros (CLHS 3.2.2.1.1).
            ;; One made around this function (LOCALLY, an enclosing body) still holds.
            (*notinline-functions* (append (extract-notinline body) *notinline-functions*))
+           (*constant-backing-collector* nil)
+           (*large-inline-cell* (and *large-inline-cell* fn-symbol
+                                     (equal fn-symbol (cadr *large-inline-cell*))
+                                     *large-inline-cell*))
            ;; The rest of the closure-boundary reset set. Bound AFTER
            ;; *local-functions* above, which is the one deliberate reader of
            ;; the labels-direct-speculation slot: the speculation is consulted
@@ -2806,7 +3044,8 @@
                                   +cs-simd-locals+ nil
                                   +cs-dotnet-typed-locals+ nil
                                   +cs-tco-in-try-catch+ nil
-                                  +cs-tco-leave-instrs+ nil))
+                                  +cs-tco-leave-instrs+ nil
+                                  +cs-throw-return+ nil))
            ;; Try-region context belongs to the enclosing method.
            (*in-finally-block* nil)
            (local-keys (gen-param-local-keys all-params))
@@ -2824,6 +3063,8 @@
                        (null (remove-if-not #'global-special-p all-params))
                        (not (%typed-param-conflict-p required (car typed-req) body))
                        typed-req))
+           (*typed-entry-ranges*
+             (and typed (%typed-entry-ranges required local-keys (car typed))))
            ;; Pre-check native eligibility: all fixnum params, fixnum return, no captures
            ;; Full check (including no specials) happens after special-param-syms is computed,
            ;; but we need this early for param-instrs type selection.
@@ -2887,7 +3128,15 @@
                                    (or (member (var-name p) mutated-params
                                                :test #'string=)
                                        (%native-int-use-p p body)))
-                           collect key))))))
+                           collect key)))))
+           (float-param-plan
+             (unless (or pre-native-eligible typed)
+               (%float-param-plan
+                required body
+                (append needs-boxing captured-params
+                        (mapcar #'var-name
+                                (%union-eq (fn-body-special-params body all-params)
+                                           (remove-if-not #'global-special-p all-params))))))))
       ;; During labels self-TCO speculation the box is also a *locals* entry,
       ;; under the same __LABELFN_ name the enclosing body used, after the
       ;; parameters so a same-named parameter still shadows it. Free-variable
@@ -2924,10 +3173,16 @@
                          for spec in (car typed)
                          for key = (cdr (assoc p local-keys))
                          for i from 1
-                         append (if (eq (car spec) :double)
+                         append (case (car spec)
+                                  (:object
+                                    `((:declare-local ,key "LispObject")
+                                      (:ldarg ,i) (:stloc ,key)
+                                      ,@(%local-var-marker key p)))
+                                  (:double
                                     `((:declare-local ,key "Double")
                                       (:ldarg ,i) (:stloc ,key)
-                                      ,@(%local-var-marker key p :double))
+                                      ,@(%local-var-marker key p :double)))
+                                  (t
                                     `((:declare-local ,key "Int64")
                                       (:ldarg ,i)
                                       ;; The declared range, checked here from
@@ -2937,7 +3192,7 @@
                                       ;; error message).
                                       ,@(%long-range-check nil spec)
                                       (:stloc ,key)
-                                      ,@(%local-var-marker key p :long)))))
+                                      ,@(%local-var-marker key p :long))))))
                   (pre-native-eligible
                    (direct-param-instrs required local-keys 1 t))
                   (t (direct-param-instrs required local-keys 0 nil long-param-keys)))))
@@ -2974,6 +3229,7 @@
                    (*cstate* (cstate-with *cstate*
                                +cs-tco-self-name+ (if use-tco fn-name nil)
                                +cs-tco-loop-label+ (if use-tco tco-loop-label nil)
+                               +cs-tco-checked+ nil
                                +cs-labels-mutual-tco+ nil
                                +cs-self-fn-local+
                                (cond ((and (or pre-native-eligible typed) use-tco) :arg0)
@@ -2988,15 +3244,32 @@
                                    (string= fn-name "(SETF " :end1 6)))
                    (setf-target-name (when setf-fn-p
                                        (subseq fn-name 6 (1- (length fn-name)))))
+                   ;; Its THROWs may return to the CATCH that called it when the
+                   ;; method gets the self LispFunction as arg0 (see ThrowReturn).
+                   (throw-return
+                     (when (and (cstate-self-fn-local)
+                                (not (eq (cstate-self-fn-local) :arg0))
+                                (not pre-native-eligible)
+                                (not typed)
+                                (null special-param-syms)
+                                (%mentions-throw-p body))
+                       (list (gen-local "TRCLAIM") (gen-label "TREXIT")
+                             (gen-local "TRVAL") (list nil))))
+                   (*cstate* (if throw-return
+                                 (cstate-with *cstate* +cs-throw-return+ throw-return)
+                                 *cstate*))
                    (self-fn-prelude
                      (when (and (cstate-self-fn-local)
                                 (not (eq (cstate-self-fn-local) :arg0)))
                        (direct-self-fn-prelude (cstate-self-fn-local) fn-name fn-pkg
                                                setf-fn-p setf-target-name)))
+                   (*cstate* (%float-param-cstate float-param-plan))
                    (*cstate* (cstate-with *cstate* +cs-tco-param-entries+
                                           (if use-tco
-                                              (loop for p in required
-                                                    for key = (cdr (assoc p local-keys))
+                                              (loop with keys = (%float-param-keys
+                                                                 float-param-plan local-keys)
+                                                    for p in required
+                                                    for key = (cdr (assoc p keys))
                                                     collect (cons key (boxed-var-p p)))
                                               nil)))
                    (*cstate* (if (and use-tco key-shared)
@@ -3039,7 +3312,12 @@
                                           (append (rekey-by-param
                                                    (extract-small-int-locals body)
                                                    all-params local-keys)
-                                                  (cstate-small-int-locals))))
+                                                  (cstate-small-int-locals))
+                                          +cs-float-range-locals+
+                                          (append (rekey-by-param
+                                                   (extract-float-range-locals body)
+                                                   all-params local-keys)
+                                                  (cstate-float-range-locals))))
                    ;; Double-float type declarations on params, and the
                    ;; DOUBLE-FLOAT parameters of a typed body.
                    (*double-float-locals* (append (and typed
@@ -3069,7 +3347,8 @@
                                                   (cstate-numeric-array-locals))))
                    ;; (simple-array <integer type> (*)) declarations whose element
                    ;; buffer can be fetched once here instead of per element.
-                   (backing-entries (extract-array-backing-locals body))
+                   (backing-entries (append (extract-array-backing-locals body)
+                                            (extract-constant-array-backing-locals body)))
                    (*cstate* (cstate-with *cstate* +cs-array-backing-locals+
                                           (append backing-entries
                                                   (cstate-array-backing-locals))))
@@ -3126,7 +3405,8 @@
                    ;; the `.tail` prefix (illegal in CIL inside try) and TCO
                    ;; branches don't try to cross the try boundary.
                    (*in-try-block* (or *in-try-block* (not (null special-param-syms))))
-                   (body-instrs (progn
+                   (constant-backings (cons '() (%written-constant-arrays body)))
+                   (body-instrs (let ((*constant-backing-collector* constant-backings))
                                   (when (and fn-symbol (not *cross-compiling*))
                                     (%record-inline-return-range fn-symbol body))
                                   (unswitch-array-backing backing-entries body
@@ -3150,10 +3430,12 @@
                    ;; is dead. It cannot be dropped by the JIT (GetFunctionBySymbol
                    ;; is an opaque call), so it has to be dropped here.
                    (mv-prologue (%mv-mode-prologue mv-mode-key body-instrs fn-symbol))
+                   (throw-return-used-p (and throw-return (car (fourth throw-return))))
                    (self-fn-used-p (and (cstate-self-fn-local)
                                         (not (eq (cstate-self-fn-local) :arg0))
-                                        (%sil-references-local-p body-instrs
-                                                                 (cstate-self-fn-local))))
+                                        (or throw-return-used-p
+                                            (%sil-references-local-p body-instrs
+                                                                     (cstate-self-fn-local)))))
                    (self-arg0-p (and (not pre-native-eligible)
                                      self-fn-used-p
                                      (null special-param-syms)))
@@ -3174,18 +3456,28 @@
                 (if special-param-syms
                     `(,@(%frame-enter-instrs fn-name)
                       ,@param-instrs
+                      ,@(%float-param-entry-instrs float-param-plan local-keys)
                       ,@(if self-fn-used-p self-fn-prelude '())
                       ,@(when use-tco `((:label ,tco-loop-label)))
-                      ,@(array-backing-prologue backing-entries)
+                      ,@(array-backing-prologue
+                         (append backing-entries (reverse (car constant-backings))))
                       ,@(struct-backing-prologue struct-backing-entries)
                       ,@(compile-let-with-specials '() special-push-instrs body-instrs special-param-syms)
                       (:ret))
-                    `(,@mv-prologue
+                    `(,@(when throw-return-used-p
+                          (destructuring-bind (claim-key exit-label value-key used) throw-return
+                            (declare (ignore exit-label used))
+                            `((:declare-local ,claim-key "Int32")
+                              (:declare-local ,value-key "LispObject")
+                              (:ldarg 0) (:call "ThrowReturn.Claim") (:stloc ,claim-key))))
+                      ,@mv-prologue
                       ,@(%frame-enter-instrs fn-name)
                       ,@eff-param-instrs
+                      ,@(%float-param-entry-instrs float-param-plan local-keys)
                       ,@eff-self-fn-prelude
                       ,@(when use-tco `((:label ,tco-loop-label)))
-                      ,@(array-backing-prologue backing-entries)
+                      ,@(array-backing-prologue
+                         (append backing-entries (reverse (car constant-backings))))
                       ,@(struct-backing-prologue struct-backing-entries)
                       ,@(cond ((not typed) (%tail-self-instrs fn-name body eff-body-instrs))
                               ;; A self-call whose value is the result is made a
@@ -3200,7 +3492,12 @@
                                        nil
                                        fn-name)))))
                       ,@eff-body-instrs
-                      (:ret))))
+                      (:ret)
+                      ,@(when throw-return-used-p
+                          `((:label ,(second throw-return))
+                            (:ldloc ,(third throw-return))
+                            (:call "ThrowReturn.Return")
+                            (:ret))))))
                self-arg0-p
                typed))))))))
 
@@ -3252,6 +3549,8 @@
            ;; its own regions, so a TCO branch in it needs no suppression.
            (*in-try-block* nil)
            (*in-finally-block* nil)
+           (*constant-backing-collector* nil)
+           (*large-inline-cell* nil)
            (local-keys (gen-param-local-keys all-params))
            (needs-boxing (params-needs-boxing body all-params))
            (n-required (length required))

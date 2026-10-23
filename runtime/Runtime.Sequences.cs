@@ -778,7 +778,9 @@ public static partial class Runtime
             for (int i = 0; i < n; i++) keys[i] = ApplyKeyFn(keyFn, items[i]);
             tmpKeys = new LispObject[tmpItems.Length];
         }
-        MergeSortRange(items, keys, tmpItems, tmpKeys, 0, n, fn);
+        var top = LispFunction.CurrentTop;
+        try { MergeSortRange(items, keys, tmpItems, tmpKeys, 0, n, fn); }
+        finally { LispFunction.RestoreTop(top); }
     }
 
     private const int SortInsertionThreshold = 12;
@@ -788,6 +790,7 @@ public static partial class Runtime
     private static void MergeSortRange(LispObject[] items, LispObject[] keys,
         LispObject[] tmpItems, LispObject[] tmpKeys, int lo, int hi, LispFunction fn)
     {
+        bool sep = !ReferenceEquals(keys, items);
         if (hi - lo <= SortInsertionThreshold)
         {
             for (int i = lo + 1; i < hi; i++)
@@ -795,14 +798,14 @@ public static partial class Runtime
                 var x = items[i];
                 var kx = keys[i];
                 int j = i;
-                while (j > lo && IsTruthy(fn.Invoke2(kx, keys[j - 1])))
+                while (j > lo && IsTruthy(LispFunction.Call2(fn, kx, keys[j - 1])))
                 {
-                    items[j] = items[j - 1];
-                    keys[j] = keys[j - 1];
+                    SortStore(items, j, items[j - 1]);
+                    if (sep) SortStore(keys, j, keys[j - 1]);
                     j--;
                 }
-                items[j] = x;
-                keys[j] = kx;
+                SortStore(items, j, x);
+                if (sep) SortStore(keys, j, kx);
             }
             return;
         }
@@ -810,37 +813,55 @@ public static partial class Runtime
         MergeSortRange(items, keys, tmpItems, tmpKeys, lo, mid, fn);
         MergeSortRange(items, keys, tmpItems, tmpKeys, mid, hi, fn);
         // Already in order across the boundary: nothing to merge.
-        if (!IsTruthy(fn.Invoke2(keys[mid], keys[mid - 1]))) return;
+        if (!IsTruthy(LispFunction.Call2(fn, keys[mid], keys[mid - 1]))) return;
         int nl = mid - lo;
         Array.Copy(items, lo, tmpItems, 0, nl);
-        if (!ReferenceEquals(keys, items)) Array.Copy(keys, lo, tmpKeys, 0, nl);
+        if (sep) Array.Copy(keys, lo, tmpKeys, 0, nl);
         int l = 0, r = mid, d = lo;
         while (l < nl && r < hi)
         {
-            if (IsTruthy(fn.Invoke2(keys[r], tmpKeys[l])))
+            if (IsTruthy(LispFunction.Call2(fn, keys[r], tmpKeys[l])))
             {
-                items[d] = items[r];
-                keys[d] = keys[r];
+                SortStore(items, d, items[r]);
+                if (sep) SortStore(keys, d, keys[r]);
                 r++;
             }
             else
             {
-                items[d] = tmpItems[l];
-                keys[d] = tmpKeys[l];
+                SortStore(items, d, tmpItems[l]);
+                if (sep) SortStore(keys, d, tmpKeys[l]);
                 l++;
             }
             d++;
         }
         while (l < nl)
         {
-            items[d] = tmpItems[l];
-            keys[d] = tmpKeys[l];
+            SortStore(items, d, tmpItems[l]);
+            if (sep) SortStore(keys, d, tmpKeys[l]);
             l++;
             d++;
         }
     }
 
+    // A store into a LispObject[] of an element read from a LispObject[] needs
+    // no covariance check; the checked store took the slow path for every
+    // element whose class is not exactly LispObject.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void SortStore(LispObject[] a, int i, LispObject v)
+    {
+#if NET5_0_OR_GREATER
+        if ((uint)i >= (uint)a.Length) throw new IndexOutOfRangeException();
+        System.Runtime.CompilerServices.Unsafe.Add(
+            ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(a), i) = v;
+#else
+        a[i] = v;
+#endif
+    }
+
     private static LispObject SortImpl(LispObject seq, LispObject predicate, LispFunction? keyFn, bool stable = false)
+        => MultipleValues.Alone(SortScan(seq, predicate, keyFn, stable));
+
+    private static LispObject SortScan(LispObject seq, LispObject predicate, LispFunction? keyFn, bool stable)
     {
         // Accept symbol as function designator (ANSI CL: function designator can be symbol or function)
         if (predicate is Symbol psym && psym.Function is LispFunction pf)
@@ -950,7 +971,10 @@ public static partial class Runtime
                 if (elemTypeName is "BASE-CHAR")
                     result = Coerce(obj, Startup.Sym("SIMPLE-BASE-STRING"));
                 else if (elemTypeName is "CHARACTER")
-                    result = Coerce(obj, Startup.Sym("SIMPLE-STRING"));
+                    // A base string is a SIMPLE-STRING too, but not of element type CHARACTER.
+                    result = obj is LispVector { IsBaseCharVector: true } bcv
+                        ? new LispString(bcv.ToCharString())
+                        : Coerce(obj, Startup.Sym("SIMPLE-STRING"));
                 else
                 {
                     LispObject[] items = obj switch
@@ -1333,7 +1357,7 @@ public static partial class Runtime
     // returning (values a b ...) hands an MvReturn to :test otherwise (SBCL's
     // %find-position with :key #'parse-optional-arg-spec hit STRING= with an
     // MvReturn at make-host-2 stem 8).
-    private static LispObject ApplySeqKey(SeqKwArgs kw, LispObject elem)
+    private static LispObject ApplySeqKey(in SeqKwArgs kw, LispObject elem)
         => kw.Key != null ? UnwrapMv(kw.Key.Invoke1(elem)) : elem;
 
     private static LispObject ApplyKeyFn(LispFunction? keyFn, LispObject elem)
@@ -1342,7 +1366,74 @@ public static partial class Runtime
     private static LispObject ApplySeqKey(ListKwArgs kw, LispObject elem)
         => kw.Key != null ? UnwrapMv(kw.Key.Invoke1(elem)) : elem;
 
-    private static bool SeqTestMatch(LispObject item, LispObject elem, SeqKwArgs kw)
+    static Symbol? s_charEqSym, s_charEqualSym;
+
+    /// <summary>For a character ITEM searched for in a string (a LispString or a
+    /// character vector): 1 when the test is
+    /// EQL or CHAR= (or absent), 2 when it is CHAR-EQUAL, both with no :KEY or
+    /// :TEST-NOT; 0 when the test has to be called.</summary>
+    private static int StringCharTestKind(LispObject item, in SeqKwArgs kw)
+    {
+        if (item is not LispChar || kw.Key != null || kw.TestNot != null) return 0;
+        var t = kw.Test;
+        if (t == null) return 1;
+        if (ReferenceEquals(t, (s_eqlSym ??= Startup.CL.FindSymbol("EQL").symbol)?.Function)
+            || ReferenceEquals(t, (s_charEqSym ??= Startup.CL.FindSymbol("CHAR=").symbol)?.Function)) return 1;
+        if (ReferenceEquals(t, (s_charEqualSym ??= Startup.CL.FindSymbol("CHAR-EQUAL").symbol)?.Function)) return 2;
+        return 0;
+    }
+
+    private static int CharVectorIndex(LispVector vec, char c, bool foldCase, int start, int end, bool fromEnd)
+    {
+        if (foldCase) c = char.ToUpperInvariant(c);
+        if (vec._displacedTo == null && vec._numData is char[] chars)
+            return CharSpanIndex(chars, c, foldCase, start, end, fromEnd);
+        int step = fromEnd ? -1 : 1;
+        for (int i = fromEnd ? end - 1 : start; fromEnd ? i >= start : i < end; i += step)
+        {
+            if (vec[i] is not LispChar e) continue;
+            if ((foldCase ? char.ToUpperInvariant(e.Value) : e.Value) == c) return i;
+        }
+        return -1;
+    }
+
+    private static int StringCharIndex(LispString str, char c, bool foldCase, int start, int end, bool fromEnd)
+    {
+        if (foldCase)
+        {
+            c = char.ToUpperInvariant(c);
+            if (fromEnd)
+            {
+                for (int i = end - 1; i >= start; i--) if (char.ToUpperInvariant(str[i]) == c) return i;
+                return -1;
+            }
+            for (int i = start; i < end; i++) if (char.ToUpperInvariant(str[i]) == c) return i;
+            return -1;
+        }
+        if (fromEnd)
+        {
+            for (int i = end - 1; i >= start; i--) if (str[i] == c) return i;
+            return -1;
+        }
+        for (int i = start; i < end; i++) if (str[i] == c) return i;
+        return -1;
+    }
+
+    /// <summary>C already case-folded when FOLDCASE.</summary>
+    private static int CharSpanIndex(char[] chars, char c, bool foldCase, int start, int end, bool fromEnd)
+    {
+        if (fromEnd)
+        {
+            for (int i = end - 1; i >= start; i--)
+                if ((foldCase ? char.ToUpperInvariant(chars[i]) : chars[i]) == c) return i;
+            return -1;
+        }
+        for (int i = start; i < end; i++)
+            if ((foldCase ? char.ToUpperInvariant(chars[i]) : chars[i]) == c) return i;
+        return -1;
+    }
+
+    private static bool SeqTestMatch(LispObject item, LispObject elem, in SeqKwArgs kw)
     {
         var val = ApplySeqKey(kw, elem);
         if (kw.TestNot != null)
@@ -1373,6 +1464,12 @@ public static partial class Runtime
 
     private static LispObject FindCore(LispObject item, LispObject seq, in SeqKwArgs kw)
     {
+        var r = FindScan(item, seq, kw);
+        return kw.Test != null || kw.TestNot != null || kw.Key != null ? MultipleValues.Alone(r) : r;
+    }
+
+    private static LispObject FindScan(LispObject item, LispObject seq, in SeqKwArgs kw)
+    {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
@@ -1384,6 +1481,12 @@ public static partial class Runtime
         // this way; FIND did not.
         if (seq is LispVector vec)
         {
+            int ck = vec.IsCharVector ? StringCharTestKind(item, kw) : 0;
+            if (ck != 0)
+            {
+                int at = CharVectorIndex(vec, ((LispChar)item).Value, ck == 2, start, end, kw.FromEnd);
+                return at < 0 ? Nil.Instance : vec[at];
+            }
             if (kw.FromEnd)
             {
                 for (int i = end - 1; i >= start; i--)
@@ -1396,6 +1499,12 @@ public static partial class Runtime
         }
         if (seq is LispString str)
         {
+            int ck = StringCharTestKind(item, kw);
+            if (ck != 0)
+            {
+                int at = StringCharIndex(str, ((LispChar)item).Value, ck == 2, start, end, kw.FromEnd);
+                return at < 0 ? Nil.Instance : LispChar.Make(str[at]);
+            }
             if (kw.FromEnd)
             {
                 for (int i = end - 1; i >= start; i--)
@@ -1453,6 +1562,9 @@ public static partial class Runtime
     }
 
     private static LispObject FindIfCore(LispFunction predFn, LispObject seq, in SeqKwArgs kw)
+        => MultipleValues.Alone(FindIfScan(predFn, seq, kw));
+
+    private static LispObject FindIfScan(LispFunction predFn, LispObject seq, in SeqKwArgs kw)
     {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
@@ -1541,6 +1653,12 @@ public static partial class Runtime
 
     private static LispObject PositionCore(LispObject item, LispObject seq, in SeqKwArgs kw)
     {
+        var r = PositionScan(item, seq, kw);
+        return kw.Test != null || kw.TestNot != null || kw.Key != null ? MultipleValues.Alone(r) : r;
+    }
+
+    private static LispObject PositionScan(LispObject item, LispObject seq, in SeqKwArgs kw)
+    {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
@@ -1548,6 +1666,12 @@ public static partial class Runtime
 
         if (seq is LispVector vec)
         {
+            int ck = vec.IsCharVector ? StringCharTestKind(item, kw) : 0;
+            if (ck != 0)
+            {
+                int at = CharVectorIndex(vec, ((LispChar)item).Value, ck == 2, start, end, kw.FromEnd);
+                return at < 0 ? Nil.Instance : Fixnum.Make(at);
+            }
             if (kw.FromEnd)
             {
                 for (int i = end - 1; i >= start; i--)
@@ -1560,6 +1684,12 @@ public static partial class Runtime
         }
         if (seq is LispString str)
         {
+            int ck = StringCharTestKind(item, kw);
+            if (ck != 0)
+            {
+                int at = StringCharIndex(str, ((LispChar)item).Value, ck == 2, start, end, kw.FromEnd);
+                return at < 0 ? Nil.Instance : Fixnum.Make(at);
+            }
             if (kw.FromEnd)
             {
                 for (int i = end - 1; i >= start; i--)
@@ -1609,6 +1739,9 @@ public static partial class Runtime
     }
 
     private static LispObject PositionIfCore(LispFunction predFn, LispObject seq, in SeqKwArgs kw)
+        => MultipleValues.Alone(PositionIfScan(predFn, seq, kw));
+
+    private static LispObject PositionIfScan(LispFunction predFn, LispObject seq, in SeqKwArgs kw)
     {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
@@ -1708,6 +1841,12 @@ public static partial class Runtime
 
     private static LispObject CountCore(LispObject item, LispObject seq, in SeqKwArgs kw)
     {
+        var r = CountScan(item, seq, kw);
+        return kw.Test != null || kw.TestNot != null || kw.Key != null ? MultipleValues.Alone(r) : r;
+    }
+
+    private static LispObject CountScan(LispObject item, LispObject seq, in SeqKwArgs kw)
+    {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
         int end = kw.End ?? len;
@@ -1774,6 +1913,9 @@ public static partial class Runtime
     }
 
     private static LispObject CountIfCore(LispFunction predFn, LispObject seq, in SeqKwArgs kw)
+        => MultipleValues.Alone(CountIfScan(predFn, seq, kw));
+
+    private static LispObject CountIfScan(LispFunction predFn, LispObject seq, in SeqKwArgs kw)
     {
         int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
         int start = kw.Start;
@@ -1943,6 +2085,12 @@ public static partial class Runtime
 
     private static LispObject MemberCore(LispObject item, LispObject list, in ListKwArgs kw)
     {
+        var r = MemberScan(item, list, kw);
+        return kw.Test != null || kw.TestNot != null || kw.Key != null ? MultipleValues.Alone(r) : r;
+    }
+
+    private static LispObject MemberScan(LispObject item, LispObject list, in ListKwArgs kw)
+    {
         if (list is Nil) return Nil.Instance;
         if (list is not Cons)
             throw new LispErrorException(new LispTypeError("MEMBER: not a proper list", list, Startup.Sym("LIST")));
@@ -2021,10 +2169,10 @@ public static partial class Runtime
         for (; cur2 is Cons c; cur2 = c.Cdr)
         {
             var elem = key != null ? key.Invoke1(c.Car) : c.Car;
-            if (IsTruthy(predFn.Invoke1(elem))) return c;
+            if (IsTruthy(predFn.Invoke1(elem))) return MultipleValues.Alone(c);
         }
         if (cur2 is not Nil) throw new LispErrorException(new LispTypeError("MEMBER-IF: not a proper list", cur2));
-        return Nil.Instance;
+        return MultipleValues.Alone(Nil.Instance);
     }
 
     // ADJOIN: (adjoin item list &key key test test-not);
@@ -2050,6 +2198,12 @@ public static partial class Runtime
         AdjoinCore(item, list, ParseListKwPairs(k1, v1, k2, v2, true, "ADJOIN"));
 
     private static LispObject AdjoinCore(LispObject item, LispObject list, in ListKwArgs kw)
+    {
+        var r = AdjoinScan(item, list, kw);
+        return kw.Test != null || kw.TestNot != null || kw.Key != null ? MultipleValues.Alone(r) : r;
+    }
+
+    private static LispObject AdjoinScan(LispObject item, LispObject list, in ListKwArgs kw)
     {
         if (list is not Nil && list is not Cons)
             throw new LispErrorException(new LispTypeError("ADJOIN: not a proper list", list));
@@ -2094,6 +2248,12 @@ public static partial class Runtime
     }
 
     private static LispObject AssocCore(LispObject item, LispObject alist, in ListKwArgs kw)
+    {
+        var r = AssocScan(item, alist, kw);
+        return kw.Test != null || kw.TestNot != null || kw.Key != null ? MultipleValues.Alone(r) : r;
+    }
+
+    private static LispObject AssocScan(LispObject item, LispObject alist, in ListKwArgs kw)
     {
         if (alist is Nil) return Nil.Instance;
 
@@ -2165,10 +2325,10 @@ public static partial class Runtime
             if (c.Car is not Cons pair)
                 throw new LispErrorException(new LispTypeError("ASSOC-IF: alist entry is not a cons or nil", c.Car));
             var elem = ApplySeqKey(kw, pair.Car);
-            if (IsTruthy(predFn.Invoke1(elem))) return pair;
+            if (IsTruthy(predFn.Invoke1(elem))) return MultipleValues.Alone(pair);
         }
         if (cur2 is not Nil) throw new LispErrorException(new LispTypeError("ASSOC-IF: not a proper list", cur2));
-        return Nil.Instance;
+        return MultipleValues.Alone(Nil.Instance);
     }
 
     // RASSOC: (rassoc item alist &key test test-not key)
@@ -2193,6 +2353,12 @@ public static partial class Runtime
         RassocCore(item, alist, ParseListKwPairs(k1, v1, k2, v2, true, "RASSOC"));
 
     private static LispObject RassocCore(LispObject item, LispObject alist, in ListKwArgs kw)
+    {
+        var r = RassocScan(item, alist, kw);
+        return kw.Test != null || kw.TestNot != null || kw.Key != null ? MultipleValues.Alone(r) : r;
+    }
+
+    private static LispObject RassocScan(LispObject item, LispObject alist, in ListKwArgs kw)
     {
         if (alist is Nil) return Nil.Instance;
 
@@ -2241,10 +2407,10 @@ public static partial class Runtime
             if (c.Car is not Cons pair)
                 throw new LispErrorException(new LispTypeError("RASSOC-IF: alist entry is not a cons or nil", c.Car));
             var elem = ApplySeqKey(kw, pair.Cdr);
-            if (IsTruthy(predFn.Invoke1(elem))) return pair;
+            if (IsTruthy(predFn.Invoke1(elem))) return MultipleValues.Alone(pair);
         }
         if (cur2 is not Nil) throw new LispErrorException(new LispTypeError("RASSOC-IF: not a proper list", cur2));
-        return Nil.Instance;
+        return MultipleValues.Alone(Nil.Instance);
     }
 
     // REDUCE: (reduce function sequence &key key from-end start end initial-value)
@@ -2301,6 +2467,11 @@ public static partial class Runtime
     }
 
     private static LispObject ReduceCore(LispFunction fn, LispObject seq, LispFunction? keyFn,
+                                         bool fromEnd, bool hasIV, LispObject iv,
+                                         int? startOpt, int? endOpt)
+        => MultipleValues.Alone(ReduceScan(fn, seq, keyFn, fromEnd, hasIV, iv, startOpt, endOpt));
+
+    private static LispObject ReduceScan(LispFunction fn, LispObject seq, LispFunction? keyFn,
                                          bool fromEnd, bool hasIV, LispObject iv,
                                          int? startOpt, int? endOpt)
     {
@@ -2572,13 +2743,7 @@ public static partial class Runtime
 
     private static LispObject RemoveIfCore(LispFunction predFn, LispObject seq, SeqKwArgs kw, bool negate = false)
     {
-        var result = RemoveCore(seq, kw, new PredMatch(predFn, kw, negate));
-        // The last predicate call may have left secondary values in the MV register
-        // (e.g. a predicate calling SUBTYPEP, which returns two values). REMOVE-IF
-        // yields exactly one value, so install the result as the primary, clearing
-        // the stale secondaries that would otherwise leak to our caller (ANSI NIL.1
-        // via check-predicate's remove-if).
-        return MultipleValues.Primary(result);
+        return RemoveCore(seq, kw, new PredMatch(predFn, kw, negate));
     }
 
     // DELETE: like REMOVE but destructive on list arguments (in-place splice).
@@ -2630,8 +2795,7 @@ public static partial class Runtime
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("DELETE-IF: not a sequence", seq));
         var kw = ParseSeqKwArgs(args, 2, "DELETE-IF");
-        var result = RemoveCore(seq, kw, new PredMatch(predFn, kw, false), destructive: true);
-        return MultipleValues.Primary(result);
+        return RemoveCore(seq, kw, new PredMatch(predFn, kw, false), destructive: true);
     }
 
     public static LispObject DeleteIf4(LispObject pred, LispObject seq, LispObject k1, LispObject v1)
@@ -2639,7 +2803,7 @@ public static partial class Runtime
         var predFn = CoerceToFunction(pred);
         CheckSequenceArg(seq, "DELETE-IF");
         var kw = ParseSeqKwPairs(k1, v1, "DELETE-IF");
-        return MultipleValues.Primary(RemoveCore(seq, kw, new PredMatch(predFn, kw, false), destructive: true));
+        return RemoveCore(seq, kw, new PredMatch(predFn, kw, false), destructive: true);
     }
 
     public static LispObject DeleteIf6(LispObject pred, LispObject seq,
@@ -2648,7 +2812,7 @@ public static partial class Runtime
         var predFn = CoerceToFunction(pred);
         CheckSequenceArg(seq, "DELETE-IF");
         var kw = ParseSeqKwPairs(k1, v1, k2, v2, "DELETE-IF");
-        return MultipleValues.Primary(RemoveCore(seq, kw, new PredMatch(predFn, kw, false), destructive: true));
+        return RemoveCore(seq, kw, new PredMatch(predFn, kw, false), destructive: true);
     }
 
     // Core remove logic shared by REMOVE/REMOVE-IF (destructive=false) and
@@ -2668,6 +2832,11 @@ public static partial class Runtime
 
     private static LispObject RemoveCore<TMatch>(LispObject seq, SeqKwArgs kw, TMatch matches,
                                                 bool destructive = false)
+        where TMatch : struct, IElemMatch
+        => MultipleValues.Alone(RemoveScan(seq, kw, matches, destructive));
+
+    private static LispObject RemoveScan<TMatch>(LispObject seq, SeqKwArgs kw, TMatch matches,
+                                                bool destructive)
         where TMatch : struct, IElemMatch
     {
         if (seq is Nil) return Nil.Instance;
@@ -2982,6 +3151,11 @@ public static partial class Runtime
     private static LispObject SubstituteCore<TMatch>(LispObject newitem, LispObject seq,
                                                      SeqKwArgs kw, TMatch matches)
         where TMatch : struct, IElemMatch
+        => MultipleValues.Alone(SubstituteScan(newitem, seq, kw, matches));
+
+    private static LispObject SubstituteScan<TMatch>(LispObject newitem, LispObject seq,
+                                                     SeqKwArgs kw, TMatch matches)
+        where TMatch : struct, IElemMatch
     {
         if (seq is Nil) return Nil.Instance;
 
@@ -3117,6 +3291,11 @@ public static partial class Runtime
     private static LispObject NsubstituteCore<TMatch>(LispObject newitem, LispObject seq,
                                                       SeqKwArgs kw, TMatch matches)
         where TMatch : struct, IElemMatch
+        => MultipleValues.Alone(NsubstituteScan(newitem, seq, kw, matches));
+
+    private static LispObject NsubstituteScan<TMatch>(LispObject newitem, LispObject seq,
+                                                      SeqKwArgs kw, TMatch matches)
+        where TMatch : struct, IElemMatch
     {
         if (seq is Nil) return Nil.Instance;
 
@@ -3212,6 +3391,12 @@ public static partial class Runtime
         RemoveDuplicatesCore(seq, ParseSeqKwPairs(k1, v1, k2, v2, "REMOVE-DUPLICATES"));
 
     private static LispObject RemoveDuplicatesCore(LispObject seq, in SeqKwArgs kw)
+    {
+        var r = RemoveDuplicatesScan(seq, kw);
+        return kw.Test != null || kw.TestNot != null || kw.Key != null ? MultipleValues.Alone(r) : r;
+    }
+
+    private static LispObject RemoveDuplicatesScan(LispObject seq, in SeqKwArgs kw)
     {
         if (seq is not Nil && seq is not Cons && seq is not LispVector && seq is not LispString)
             throw new LispErrorException(new LispTypeError("REMOVE-DUPLICATES: not a sequence", seq));
@@ -3554,6 +3739,15 @@ public static partial class Runtime
                                            LispFunction? keyFn,
                                            int s1, int? e1opt, int s2, int? e2opt, bool fromEnd)
     {
+        var r = MismatchScan(seq1, seq2, testFn, testNotFn, keyFn, s1, e1opt, s2, e2opt, fromEnd);
+        return testFn != null || testNotFn != null || keyFn != null ? MultipleValues.Alone(r) : r;
+    }
+
+    private static LispObject MismatchScan(LispObject seq1, LispObject seq2,
+                                           LispFunction? testFn, LispFunction? testNotFn,
+                                           LispFunction? keyFn,
+                                           int s1, int? e1opt, int s2, int? e2opt, bool fromEnd)
+    {
         int len1 = SeqLengthChecked(seq1, "MISMATCH");
         int len2 = SeqLengthChecked(seq2, "MISMATCH");
         int e1 = e1opt ?? len1;
@@ -3828,6 +4022,14 @@ public static partial class Runtime
          : IsTrueEql(a, b);
 
     private static LispObject SearchCore(LispObject seq1, LispObject seq2, bool fromEnd,
+                                         LispFunction? testFn, LispFunction? testNotFn, LispFunction? keyFn,
+                                         int start1, int? end1, int start2, int? end2)
+    {
+        var r = SearchScan(seq1, seq2, fromEnd, testFn, testNotFn, keyFn, start1, end1, start2, end2);
+        return testFn != null || testNotFn != null || keyFn != null ? MultipleValues.Alone(r) : r;
+    }
+
+    private static LispObject SearchScan(LispObject seq1, LispObject seq2, bool fromEnd,
                                          LispFunction? testFn, LispFunction? testNotFn, LispFunction? keyFn,
                                          int start1, int? end1, int start2, int? end2)
     {

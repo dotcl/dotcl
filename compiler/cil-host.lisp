@@ -8,6 +8,21 @@
 
 (in-package :dotcl.cil-compiler)
 
+(defun %package-physical-name (package) (package-name package))
+
+;; Locks and compare-and-swap on a special variable. The host compiles on one
+;; thread.
+(defun %make-lock (name) name)
+(defun %cas-symbol-value (lock symbol old new)
+  (declare (ignore lock))
+  (let ((cur (symbol-value symbol)))
+    (when (eql cur old) (setf (symbol-value symbol) new))
+    cur))
+
+;; LOAD-TIME-VALUE slot ids. The runtime's increments atomically.
+(defvar *ltv-counter* 0)
+(defun %next-ltv-id () (incf *ltv-counter*))
+
 ;; The tree-walk evaluator's single-value MACROEXPAND-1 (COMPILE-MACROLET runs
 ;; %MINI-EVAL on the host too): the expansion, or FORM itself when it does not
 ;; expand.

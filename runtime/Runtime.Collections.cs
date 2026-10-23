@@ -539,7 +539,7 @@ public static partial class Runtime
         if (table is not LispHashTable ht)
             throw new LispErrorException(new LispTypeError("MAPHASH: not a hash table", table, Startup.Sym("HASH-TABLE")));
         ht.ForEachLisp(func);
-        return Nil.Instance;
+        return MultipleValues.Alone(Nil.Instance);
     }
 
     // CL spec: type-of returns the most specific type.

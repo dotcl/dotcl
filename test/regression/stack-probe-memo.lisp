@@ -9,7 +9,9 @@
                         (storage-condition () :caught)))
 
 (deftest stack-probe-memo.after-shallow-checks
-  (progn
-    (dotimes (i 2000) (spm-deep 50))
-    (list (spm-runaway) (spm-deep 1000) (spm-runaway)))
+  (call-on-small-stack
+   (lambda ()
+     (progn
+       (dotimes (i 2000) (spm-deep 50))
+       (list (spm-runaway) (spm-deep 1000) (spm-runaway)))))
   (:caught 1000 :caught))

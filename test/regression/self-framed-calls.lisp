@@ -180,10 +180,12 @@
 (defun %sf-no-bottom (n) (1+ (%sf-no-bottom (1+ n))))
 
 (deftest-emitting-only self-framed.stack-overflow-is-a-condition
-  (let ((base (%sf-depth)))
-    (list (handler-case (%sf-no-bottom 0) (storage-condition () :overflow))
-          (- (%sf-depth) base)
-          (- (%sf-after-handler-case 30) base)))
+  (call-on-small-stack
+   (lambda ()
+     (let ((base (%sf-depth)))
+       (list (handler-case (%sf-no-bottom 0) (storage-condition () :overflow))
+             (- (%sf-depth) base)
+             (- (%sf-after-handler-case 30) base)))))
   (:overflow 0 1))
 
 ;;; --- a borrowed frame --------------------------------------------------------

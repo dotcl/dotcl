@@ -246,12 +246,16 @@ on the same machine), not with the numbers on this page.
 ## Regression suite time
 
 `make regression-time` runs the compiled regression suite the way
-`make test-regression` does and records its wall time in `bench-state.json` as
-`regression/compiled`. The suite compiles thousands of small forms and runs
-them, so the number is mostly compile time, which none of the measurements
-above looks at. `bench/gate/regression-time.sh` judges it against
-`<platform>/regression/compiled-seconds` in `bench/gate/ratio-baseline.json`, with
-the limit `regression_threshold` times the baseline. It is a time in seconds,
-not a ratio, so only a baseline from the same machine says anything; a machine
-without one gets UNJUDGED, as in the ratio check. The suite has to pass for its
-time to be judged.
+`make test-regression` does, one file at a time, and records its wall time in
+`bench-state.json` as `regression/compiled`. The suite compiles thousands of
+small forms and runs them, so the number is mostly compile time, which none of
+the measurements above looks at. `bench/gate/regression-time.sh` judges the time
+of each file against the table `bench/gate/regression-file-times.tsv`: a file
+that became more than 2 s and 1.5 times slower fails, and so does the whole
+suite when its time per test is over 1.15 times what the table predicts (new
+files are counted at their own measured time). A new file over 10 s gets a
+warning. The times are in seconds, not ratios, so only a table from the same
+machine says anything; a machine without rows gets UNJUDGED, as in the ratio
+check. The suite has to pass for its time to be judged.
+`make regression-time-baseline` runs the suite twice on the machine and writes
+the smaller time of each file into the table.

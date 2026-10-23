@@ -11,7 +11,7 @@
 ;;;   ros run --load bench/cl-bench-runner/run.lisp --eval '(quit)'
 
 (defvar *bench-suite* nil "Suite to run: :gabriel :math :bignum :hash :arrays :clos :richards, or NIL for all")
-(defvar *bench-name* nil  "Specific benchmark name to run (string), or NIL for all in suite")
+(defvar *bench-name* nil  "Specific benchmark name to run (string), a list of names, or NIL for all in suite")
 (defvar *bench-runs* nil  "If non-nil integer N, survey mode: emit N samples as JSON array. NIL = scalar output (default).")
 (defvar *bench-warmup* 1  "Number of warmup iterations to discard before recording N samples. Ignored in scalar mode.")
 (defvar *bench-consed* t  "When true, also measure bytes allocated per benchmark (emitted as \"<name>/consed\").")
@@ -109,7 +109,10 @@
 (defmacro bench (name times &body body)
   ;; The allocation counter is read outside the timed region on both ends, so
   ;; reading it (which itself conses a little) is not charged to the benchmark.
-  `(when (or (null *bench-name*) (string-equal *bench-name* ,name))
+  `(when (or (null *bench-name*)
+             (if (listp *bench-name*)
+                 (member ,name *bench-name* :test #'string-equal)
+                 (string-equal *bench-name* ,name)))
      (handler-case
        (if (and *bench-runs* (> *bench-runs* 0))
            (let (samples consed)

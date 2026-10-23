@@ -50,6 +50,34 @@
     (reverse log))
   (1 2 3))
 
+;;; The new array takes A's element type exactly, and a store outside it is the
+;;; TYPE-ERROR of that type also when the storage is wider than the type.
+(deftest make-array-like.narrow-types
+  (mapcar (lambda (row)
+            (destructuring-bind (type bad) row
+              (let ((v (%mal-like 2 (make-array 1 :element-type type))))
+                (list (equal (array-element-type v)
+                             (array-element-type (make-array 1 :element-type type)))
+                      (aref v 1)
+                      (handler-case (progn (setf (aref v 0) bad) :stored)
+                        (type-error () :type-error))))))
+          '(((unsigned-byte 32) #x100000000)
+            ((signed-byte 8) 128)
+            ((unsigned-byte 7) 128)
+            ((unsigned-byte 15) -1)
+            ((unsigned-byte 64) -1)
+            (fixnum 1.0)
+            (double-float :x)))
+  ((t 0 :type-error) (t 0 :type-error) (t 0 :type-error) (t 0 :type-error)
+   (t 0 :type-error) (t 0 :type-error) (t 0d0 :type-error)))
+
+(deftest make-array-like.displaced-source
+  (let* ((base (make-array 4 :element-type '(unsigned-byte 32)))
+         (d (make-array 2 :element-type '(unsigned-byte 32) :displaced-to base))
+         (v (%mal-like 3 d)))
+    (list (array-element-type v) (coerce v 'list) (array-displacement v)))
+  ((unsigned-byte 32) (0 0 0) nil))
+
 (deftest-compiled-only make-array-like.direct
   (search "GetFunctionBySymbol" (%flat-text (dotcl:function-sil #'%mal-like)))
   nil)

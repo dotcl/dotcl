@@ -241,12 +241,13 @@
 
 (deftest-compiled-only naf-param-daxpy-sil
   (let ((sil (%flat-text (dotcl:function-sil #'%naf-param-daxpy))))
-    (list (notnot (search "ArefNumD" sil))
-          (notnot (search "ArefSetNumD" sil))
+    (list (notnot (search "LDELEM-R8" sil))
+          (notnot (search "STELEM-R8" sil))
+          (search "ArefNumD" sil)
           (search "Runtime.Add" sil)
           ;; no surviving DoubleFloat box (whole flow is statement-position)
           (search "DoubleFloat" sil)))
-  (t t nil nil))
+  (t t nil nil nil))
 
 (deftest naf-param-daxpy-result
   (let ((a (make-array 3 :element-type 'double-float :initial-contents '(1d0 2d0 3d0)))
@@ -264,9 +265,10 @@
 
 (deftest-compiled-only naf-param-single-sil
   (let ((sil (%flat-text (dotcl:function-sil #'%naf-param-single))))
-    (list (notnot (search "ArefNumD" sil))
-          (notnot (search "ArefSetNumD" sil))))
-  (t t))
+    (list (notnot (search "LDELEM-R4" sil))
+          (notnot (search "STELEM-R4" sil))
+          (search "ArefNumD" sil)))
+  (t t nil))
 
 (deftest naf-param-single-result
   (let ((a (make-array 1025 :element-type 'single-float :initial-element 3.0)))
@@ -288,9 +290,10 @@
 
 (deftest-compiled-only naf-alias-sil
   (let ((sil (%flat-text (dotcl:function-sil #'%naf-alias))))
-    (list (notnot (search "ArefNumD" sil))
-          (notnot (search "ArefSetNumD" sil))))
-  (t t))
+    (list (notnot (search "LDELEM-R8" sil))
+          (notnot (search "STELEM-R8" sil))
+          (search "ArefNumD" sil)))
+  (t t nil))
 
 (deftest naf-alias-result
   (let ((a (make-array 3 :element-type 'double-float :initial-contents '(5d0 6d0 7d0))))

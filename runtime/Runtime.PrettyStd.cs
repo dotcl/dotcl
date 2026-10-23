@@ -880,7 +880,7 @@ public static partial class Runtime
         {
             if (MacroFunction(head) is not LispFunction mf) return false;
             LispObject lambdaList;
-            try { lambdaList = FunctionLambdaList(mf); }
+            try { lambdaList = StoredLambdaListOf(mf) ?? Nil.Instance; }
             catch (LispErrorException) { return false; }
             int? indentation = MacroIndentation(lambdaList);
             if (indentation == null) return false;

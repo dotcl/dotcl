@@ -1945,6 +1945,47 @@
   (nth-value 0 (%call-byref "Untouched" "kept"))
   "kept")
 
+;;; A Lisp integer lands in the cell as Int32 or Int64 by magnitude; the
+;;; write-back converts it to the parameter's own type (IntPtr is what
+;;; ICustomQueryInterface.GetInterface's out ppv needs).
+(dotnet:define-class "DotclTest.ByRefWiden" ()
+  (:methods ("Ptr" ((p "System.IntPtr&")) :returns "System.Void" :static t
+              (setf (dotnet:deref p) #x7fff12345678)
+              nil)
+            ("Long" ((n "System.Int64&")) :returns "System.Void" :static t
+              (setf (dotnet:deref n) 7)
+              nil)
+            ("Day" ((d "System.DayOfWeek&")) :returns "System.Void" :static t
+              (setf (dotnet:deref d) 3)
+              nil)
+            ("Flag" ((b "System.Boolean&")) :returns "System.Void" :static t
+              (setf (dotnet:deref b) nil)
+              nil)))
+
+(defun %call-byref-widen (method-name initial)
+  (let* ((ty (dotnet:resolve-type "DotclTest.ByRefWiden"))
+         (mi (dotnet:invoke ty "GetMethod" method-name))
+         (args (dotnet:make-array "System.Object" 1)))
+    (dotnet:invoke args "SetValue" initial 0)
+    (dotnet:invoke mi "Invoke" nil args)
+    (dotnet:invoke args "GetValue" 0)))
+
+(deftest net-class-byref-intptr-from-integer
+  (%call-byref-widen "Ptr" (dotnet:box 0 "System.IntPtr"))
+  #x7fff12345678)
+
+(deftest net-class-byref-int64-from-small-integer
+  (%call-byref-widen "Long" (dotnet:box 1 "System.Int64"))
+  7)
+
+(deftest net-class-byref-enum-from-integer
+  (dotnet:invoke (%call-byref-widen "Day" (dotnet:static "System.DayOfWeek" "Monday")) "ToString")
+  "Wednesday")
+
+(deftest net-class-byref-bool-from-nil
+  (%call-byref-widen "Flag" t)
+  nil)
+
 (deftest net-class-byref-parameter-is-byref-in-metadata
   (let* ((ty (dotnet:resolve-type "DotclTest.ByRefParams"))
          (p (dotnet:invoke (dotnet:invoke (dotnet:invoke ty "GetMethod" "Stamp")

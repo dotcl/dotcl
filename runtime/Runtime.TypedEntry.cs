@@ -178,7 +178,14 @@ public static partial class Runtime
             CheckArgType(v, sym);
     }
 
-    static bool IsStructSubclass(Symbol name, LispObject sym) =>
+    static bool IsStructSubclass(Symbol name, LispObject sym)
+    {
+        for (var p = name.StructParent; p != null; p = p.StructParent)
+            if (ReferenceEquals(p, sym)) return true;
+        return IsStructSubclassByClass(name, sym);
+    }
+
+    static bool IsStructSubclassByClass(Symbol name, LispObject sym) =>
         FindClassOrNil(name) is LispClass own && own.IsStructureClass
         && FindClassOrNil(sym) is LispClass cls && cls.IsStructureClass
         && ReferenceEquals(cls.Name, sym) && ClassIncludes(own, cls);
@@ -188,6 +195,14 @@ public static partial class Runtime
     {
         if (!(v is LispVector lv && lv._dimensions == null && lv.IsSimple
               && lv.ElementTypeName == et))
+            CheckArgType(v, spec);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgSimpleVectorN(LispObject v, LispObject spec, string et, int length)
+    {
+        if (!(v is LispVector lv && lv._dimensions == null && lv.IsSimple
+              && lv.Length == length && lv.ElementTypeName == et))
             CheckArgType(v, spec);
     }
 }

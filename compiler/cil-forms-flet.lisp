@@ -3,14 +3,16 @@
 
 (in-package :dotcl.cil-compiler)
 
-(defun %macrolet-lexical-operators (macro-defs)
+(defun %macrolet-lexical-operators (macro-defs expanders)
   "*LEXICAL-OPERATORS* extended with the MACROLET bindings of MACRO-DEFS, whose
-   expanders have just been registered in *MACROS*."
+   expanders are EXPANDERS, one per definition (NIL: the definition is skipped).
+   Of two definitions of one name the later wins."
   (let ((new '()))
-    (dolist (def macro-defs)
-      (when (symbolp (car def))
-        (push (cons (car def) (gethash (car def) *macros*)) new)))
-    (nreconc new *lexical-operators*)))
+    (loop for def in macro-defs
+          for fn in expanders
+          when (and fn (consp def) (symbolp (car def)))
+            do (push (cons (car def) fn) new))
+    (nconc new *lexical-operators*)))
 
 (defun %flet-lexical-operators (names)
   "*LEXICAL-OPERATORS* extended with the FLET / LABELS names NAMES that hide a
@@ -45,66 +47,43 @@
         (push (cons '%mini-macros (nreverse macros)) env)))
     (nreverse env)))
 
-(defun compile-macrolet (macro-defs body)
-  "Compile (macrolet ((name (params) body...) ...) body...).
-   Temporarily registers local macros in *macros*, compiles body, then restores."
-  (let ((saved '()))
-    ;; Save existing macro entries and register local macros
-    (dolist (def macro-defs)
-      (let* ((name (car def))
-             (params (cadr def))
-             (mbody (cddr def))
-             (old-entry (gethash name *macros*)))
-        (push (cons name old-entry) saved)
-        ;; Build a macro expander lambda and eval it. &whole / &environment are
-        ;; handled by the shared %macrolet-expander-form (same builder the
-        ;; %mini-eval MACROLET case uses) so the compiled and interpreted paths
-        ;; never diverge.
-        (progn
-          (progn
-            (let* ((expander-form (%macrolet-expander-form params mbody))
-                   ;; Wrap with surrounding flet so macrolet body can call
-                   ;; enclosing locally-defined functions at expansion time.
-                   ;; Use %mini-eval instead of eval: no Reflection.Emit needed.
-                   (eval-form (if *compile-time-flet-defs*
-                                  `(flet ,*compile-time-flet-defs* ,expander-form)
-                                  expander-form))
-                   (expander-fn (%expander-with-caller-env
-                                 (%mini-eval eval-form (%compile-scope-mini-env))
-                                 params)))
-              (setf (gethash name *macros*) expander-fn))))))
-    ;; Compile body with local macros active
+(defun compile-macrolet (macro-defs body &optional (compile-body #'compile-progn))
+  "Compile (macrolet ((name (params) body...) ...) body...): the local macros are
+   bound in *LEXICAL-OPERATORS* while the body is compiled (by COMPILE-BODY,
+   given the forms after the declarations)."
+  (let ((expanders
+          (mapcar (lambda (def)
+                    ;; The surrounding flet, so the expander can call
+                    ;; enclosing local functions at expansion time.
+                    (%macrolet-expander (cadr def) (cddr def) *compile-time-flet-defs*))
+                  macro-defs)))
     ;; Handle (declare (special ...)) in body: remove those vars from *locals*
     ;; so they use dynamic binding (like locally does)
     (multiple-value-bind (declared-specials real-body) (extract-specials body)
-    (let* ((*cstate* (if declared-specials
-                         (cstate-with *cstate* +cs-locals+
-                                      (remove-locals-shadowed-by declared-specials
-                                                                 (cstate-locals)))
-                         *cstate*)))
-      (unwind-protect
-          ;; Push this macrolet onto *macroexpand-scope* so a form shared (by a
-          ;; splicing macro) between this shadowing scope and an outer scope is
-          ;; cached separately per scope. MACRO-DEFS is the source
-          ;; cons the analysis walk pushes too, keeping the two passes in sync.
-          ;; *macrolet-shadowed* carries the same names to COMPILE-FORM's
-          ;; dispatcher, which would otherwise reach the built-in handler for a
-          ;; name like WHEN before ever looking for this binding.
-          (let ((*macroexpand-scope* (cons macro-defs *macroexpand-scope*))
-                (*lexical-decl-frames* (%push-decl-frame :macrolet macro-defs body))
-                (*macrolet-source-defs* (cons macro-defs *macrolet-source-defs*))
-                (*macrolet-shadowed* (append (mapcar #'car macro-defs)
-                                             *macrolet-shadowed*))
-                (*lexical-operators* (%macrolet-lexical-operators macro-defs)))
-            (compile-progn real-body))
-        (dolist (entry saved)
-          (if (cdr entry)
-              (setf (gethash (car entry) *macros*) (cdr entry))
-              (remhash (car entry) *macros*))))))))
+      (let* ((*cstate* (if declared-specials
+                           (cstate-with *cstate* +cs-locals+
+                                        (remove-locals-shadowed-by declared-specials
+                                                                   (cstate-locals)))
+                           *cstate*))
+             ;; Push this macrolet onto *macroexpand-scope* so a form shared (by a
+             ;; splicing macro) between this shadowing scope and an outer scope is
+             ;; cached separately per scope. MACRO-DEFS is the source
+             ;; cons the analysis walk pushes too, keeping the two passes in sync.
+             ;; *macrolet-shadowed* carries the same names to COMPILE-FORM's
+             ;; dispatcher, which would otherwise reach the built-in handler for a
+             ;; name like WHEN before ever looking for this binding.
+             (*macroexpand-scope* (cons macro-defs *macroexpand-scope*))
+             (*lexical-decl-frames* (%push-decl-frame :macrolet macro-defs body))
+             (*macrolet-source-defs* (cons macro-defs *macrolet-source-defs*))
+             (*macrolet-shadowed* (append (mapcar #'car macro-defs)
+                                          *macrolet-shadowed*))
+             (*lexical-operators* (%macrolet-lexical-operators macro-defs expanders)))
+        (funcall compile-body real-body)))))
 
-(defun compile-symbol-macrolet (bindings body)
+(defun compile-symbol-macrolet (bindings body &optional (compile-body #'compile-progn))
   "Compile (symbol-macrolet ((sym expansion)...) body...).
-   Temporarily extends *symbol-macros* with new bindings."
+   Temporarily extends *symbol-macros* with new bindings. COMPILE-BODY compiles
+   the body forms without the declarations."
   ;; Validate (constant / globally special name, or a body (declare (special n))
   ;; naming one of them). The predicate is shared with the %MINI-EVAL case so the
   ;; two evaluators cannot drift apart on what is a program error.
@@ -135,12 +114,12 @@
     ;; Process free special declarations (like locally does)
     (multiple-value-bind (declared-specials real-body) (extract-specials body)
       (if (null declared-specials)
-          (compile-progn real-body)
+          (funcall compile-body real-body)
           (let* ((*specials* (append declared-specials *specials*))
                  (*cstate* (cstate-with *cstate* +cs-locals+
                                         (remove-locals-shadowed-by declared-specials
                                                                    (cstate-locals)))))
-            (compile-progn real-body))))))
+            (funcall compile-body real-body))))))
 
 ;;; --- FLET/LABELS capture lifting ---
 ;;;
@@ -359,18 +338,77 @@
   "Largest local function body, in conses, substituted only because it returns
    from an outer block.")
 
-(defun %implicit-inline-names (fn-defs body)
+(defvar *small-local-inline-body-size* 32
+  "Largest local function body, in conses, substituted without an INLINE
+   declaration (%SMALL-LOCAL-FN-P).")
+
+(defun %small-local-fn-p (fdef)
+  "True when FDEF, an FLET definition, is substituted at its calls without being
+   declared INLINE: a required-only lambda list and a body of at most
+   *SMALL-LOCAL-INLINE-BODY-SIZE* conses that declares nothing."
+  (let ((params (cadr fdef))
+        (fn-body (cddr fdef)))
+    (and (listp params)
+         (every (lambda (p) (and p (symbolp p) (not (member p lambda-list-keywords))))
+                params)
+         (consp fn-body)
+         (notany (lambda (f) (and (consp f) (eq (car f) 'declare))) fn-body)
+         (not (stringp (car fn-body)))
+         (<= (%form-size fn-body (1+ *small-local-inline-body-size*))
+             *small-local-inline-body-size*))))
+
+(defun %form-may-have-ltv-p (form depth)
+  "T when FORM, after its macros are expanded, may contain LOAD-TIME-VALUE (or a
+   macro expander signals). A copy per call site would evaluate it once per copy."
+  (cond
+    ((atom form) nil)
+    ((eq (car form) 'quote) nil)
+    ((eq (car form) 'load-time-value) t)
+    ((member (car form) '(lambda named-lambda))
+     (let* ((namedp (eq (car form) 'named-lambda))
+            (rest (if namedp (cddr form) (cdr form))))
+       (and (consp rest)
+            (or (%scan-code-forms (lambda (f) (%form-may-have-ltv-p f depth))
+                                  (%lambda-list-init-forms (car rest)))
+                (%scan-code-forms (lambda (f) (%form-may-have-ltv-p f depth))
+                                  (cdr rest))))))
+    ((member (car form) '(flet labels))
+     (or (%scan-code-forms
+          (lambda (fdef)
+            (and (consp fdef)
+                 (%form-may-have-ltv-p (cons 'lambda (cdr fdef)) depth)))
+          (cadr form))
+         (%scan-code-forms (lambda (f) (%form-may-have-ltv-p f depth)) (cddr form))))
+    ((member (car form) '(let let*))
+     (or (%scan-code-forms (lambda (b) (and (consp b) (%form-may-have-ltv-p (cadr b) depth)))
+                           (cadr form))
+         (%scan-code-forms (lambda (f) (%form-may-have-ltv-p f depth)) (cddr form))))
+    ((and (symbolp (car form)) (%macro-expander-here (car form)))
+     (or (>= depth *macro-expand-depth-limit*)
+         (handler-case
+             (let ((expanded (%return-from-scan-macroexpand
+                              form (%macro-expander-here (car form)))))
+               (if (equal expanded form)
+                   (%scan-code-forms (lambda (f) (%form-may-have-ltv-p f depth)) (cdr form))
+                   (%form-may-have-ltv-p expanded (1+ depth))))
+           (error () t))))
+    (t (%scan-code-forms (lambda (f) (%form-may-have-ltv-p f depth)) form))))
+
+(defun %implicit-inline-names (fn-defs body &optional small)
   "The names of FN-DEFS to substitute at their call sites: those BODY declares
-   INLINE, and those %NLX-LOCAL-FN-P picks unless BODY declares them NOTINLINE."
+   INLINE, and those %NLX-LOCAL-FN-P picks unless BODY declares them NOTINLINE.
+   With SMALL, also the %SMALL-LOCAL-FN-P ones."
   (let ((names (extract-inline body))
         (notinline (extract-notinline body)))
     (dolist (d fn-defs names)
       (when (and (symbolp (car d)) (car d)
                  (not (member (car d) names :test #'eq))
                  (not (member (car d) notinline :test #'eq))
-                 (< (%form-size (cddr d) *nlx-inline-body-size-limit*)
-                    *nlx-inline-body-size-limit*)
-                 (%nlx-local-fn-p (car d) (cddr d)))
+                 (or (and small (%small-local-fn-p d))
+                     (and (< (%form-size (cddr d) *nlx-inline-body-size-limit*)
+                             *nlx-inline-body-size-limit*)
+                          (%nlx-local-fn-p (car d) (cddr d))))
+                 (not (%form-may-have-ltv-p (cons 'progn (cddr d)) 0)))
         (push (car d) names)))))
 
 (defun local-fn-block-name (name)
@@ -406,7 +444,7 @@
         ;; The names this body declared INLINE. Read here rather than at the
         ;; call site: the declaration is about the binding, and the plan it
         ;; enables has to snapshot the environment the definition sits in.
-        (inline-names (%implicit-inline-names fn-defs body)))
+        (inline-names (%implicit-inline-names fn-defs body t)))
     ;; Compile each function definition in OUTER scope (flet functions can't see each other)
     (dolist (fdef fn-defs)
       (let* ((name (car fdef))
@@ -628,6 +666,11 @@
          (if (eq result :labels-demote-aborted)
              (compile-labels-boxed fn-defs body)
              result)))
+      ((and (= n-fns 1)
+            (eq *in-tail-position* t)
+            (not *in-try-block*)
+            (%labels-loop-call (first fn-defs) body)
+            (%compile-labels-as-loop (first fn-defs) (%labels-loop-call (first fn-defs) body))))
       ((and (>= n-fns 2) (%labels-inline-nest-order fn-defs body))
        (let* ((tag (list '#:labels-demote))
               (result (let ((*labels-demoted*
@@ -641,6 +684,135 @@
              (compile-labels-1-closures fn-defs body)
              result)))
       (t (compile-labels-1-closures fn-defs body)))))
+
+;; A LABELS of one function F whose body is one call of F, compiled where the
+;; call is in tail position: F's body runs in this method as a loop, with F's
+;; parameters bound like a LET and each tail self-call storing the next
+;; arguments into them and branching back. No closure is made.
+(defun %labels-loop-call (fdef body)
+  "The call (F ARG...) when BODY is that one form, F the function FDEF defines
+   with a lambda list of as many required lexical parameters, and F not named
+   in the arguments."
+  (let ((name (car fdef)) (params (cadr fdef)))
+    (and (symbolp name) name
+         (listp params)
+         (labels-required-only-params-p params)
+         (every (lambda (p) (and (symbolp p) p (not (global-special-p p)))) params)
+         (consp body) (null (cdr body))
+         (consp (car body)) (eq (caar body) name)
+         (= (length (cdar body)) (length params))
+         (not (%tree-mentions-p (cdar body) (list name)))
+         (car body))))
+
+;; Walked before the loop is compiled, so the common shape that cannot be one
+;; (a self-call as an argument of a standard function: (+ (fib ..) (fib ..)))
+;; is not compiled twice. Anything else that is not a tail call is found by the
+;; compile itself.
+(defun %self-call-in-argument-p (name forms)
+  "True when FORMS call NAME as an argument of a standard function, or name
+   #'NAME."
+  (labels ((walk (form tail)
+             (when (consp form)
+               (let ((head (car form)))
+                 (cond
+                   ((eq head 'quote) nil)
+                   ((eq head 'function)
+                    (let ((f (cadr form)))
+                      (or (eq f name)
+                          (and (consp f) (eq (car f) 'lambda)
+                               (walk-list (cddr f) nil)))))
+                   ((eq head name)
+                    (or (not tail) (walk-list (cdr form) nil)))
+                   ((and (symbolp head)
+                         (eq (symbol-package head) (find-package "COMMON-LISP"))
+                         (fboundp head)
+                         (not (macro-function head))
+                         (not (special-operator-p head)))
+                    (walk-list (cdr form) nil))
+                   (t (walk-list (cdr form) tail))))))
+           (walk-list (forms tail)
+             (do ((r forms (cdr r)))
+                 ((not (consp r)) nil)
+               (when (walk (car r) tail) (return t)))))
+    (walk-list forms t)))
+
+(defun %compile-labels-as-loop (fdef call)
+  "The instructions of the LABELS with the one definition FDEF and the body CALL
+   as a loop (see %LABELS-LOOP-CALL), or NIL when that is not possible: a
+   parameter declared special, a parameter a closure captures (each call needs
+   its own binding), a slot of a kind a tail call cannot store, or a reference
+   to F left that is not a tail self-call."
+  (destructuring-bind (name params &rest fbody) fdef
+    (when (and (stringp (car fbody)) (cdr fbody))
+      (setf fbody (cdr fbody)))
+    (let* ((decls (loop for f in fbody while (and (consp f) (eq (car f) 'declare)) collect f))
+           (forms (nthcdr (length decls) fbody)))
+      (when (%self-call-in-argument-p name forms)
+        (return-from %compile-labels-as-loop nil))
+      (when (some (lambda (d)
+                    (some (lambda (spec) (and (consp spec) (eq (car spec) 'special)))
+                          (cdr d)))
+                  decls)
+        (return-from %compile-labels-as-loop nil))
+      (let* ((name-str (mangle-name name))
+             (key (gen-local name-str))
+             (label (gen-label "LABELSLOOP"))
+             (entry (list name-str key t nil nil nil name))
+             (forms (if (form-has-return-from-p name `(progn ,@forms))
+                        `((block ,name ,@forms))
+                        forms))
+             ;; Never compiled: it tells the binding analyses that the loop
+             ;; assigns every parameter, with values nothing is known about.
+             (assigned `(if nil (setq ,@(loop for p in params
+                                              append (list p (list (gensym "LOOPARG")))))))
+             ;; The checks are worked out without ASSIGNED: the loop's own
+             ;; stores go through them again or through a proven argument.
+             (body (let* ((checked (insert-simple-decl-checks (append decls forms) params))
+                          (n (- (length checked) (length forms))))
+                     (append (subseq checked 0 n) (list assigned) forms)))
+             (tag (list '#:labels-loop))
+             (instrs
+               (catch tag
+                 (let* ((new-locals (compile-labels-build-new-locals (list entry)))
+                        (*cstate* (cstate-with *cstate*
+                                    +cs-local-functions+ (cons entry (cstate-local-functions))
+                                    +cs-locals+ (append new-locals (cstate-locals))
+                                    +cs-boxed-vars+ (append (mapcar #'car new-locals)
+                                                            (cstate-boxed-vars)))))
+                   (compile-let
+                    (mapcar #'list params (cdr call)) body nil
+                    (lambda (real-body)
+                      (let ((entries (loop for p in params
+                                           for k = (lookup-local p)
+                                           collect (cons k (boxed-var-p p)))))
+                        (when (some (lambda (e)
+                                      (let ((k (car e)))
+                                        (or (null k) (cdr e)
+                                            (member k (cstate-u64-locals) :test #'equal)
+                                            (assoc k (cstate-simd-locals) :test #'equal)
+                                            (member k (cstate-native-decimal-locals) :test #'equal)
+                                            (member k (cstate-native-char-locals) :test #'equal))))
+                                    entries)
+                          (throw tag :abort))
+                        (let ((*cstate* (cstate-with *cstate*
+                                          +cs-tco-self-name+ name-str
+                                          +cs-tco-self-symbol+ name
+                                          +cs-tco-local-fn-key+ key
+                                          +cs-tco-loop-label+ label
+                                          +cs-tco-checked+ nil
+                                          +cs-tco-param-entries+ entries
+                                          +cs-tco-key-shared+ nil
+                                          +cs-tco-in-try-catch+ nil
+                                          +cs-tco-leave-instrs+ nil
+                                          +cs-labels-mutual-tco+ nil
+                                          +cs-self-fn-local+ nil
+                                          +cs-typed-self+ nil
+                                          +cs-native-self-name+ nil)))
+                          `((:label ,label)
+                            ,@(compile-progn (remove assigned real-body :test #'eq)))))))))))
+        (and (not (eq instrs :abort))
+             (not (%instr-tree-contains-symbol-p instrs key))
+             instrs)))))
 
 (defun compile-labels-1-closures (fn-defs body)
   (let ((first-arity (length (cadr (first fn-defs)))))

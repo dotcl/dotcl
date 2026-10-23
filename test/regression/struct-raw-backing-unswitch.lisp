@@ -157,13 +157,15 @@
 ;; A false declaration: another structure, same slot indices. Undefined
 ;; behaviour, but what dotcl does with it must not change: the slow copy reads
 ;; by slot index, as the code before this did.
-(deftest struct-raw-backing-unswitch.other-structure
+;; Emitting builds only, as in struct-raw-backing-hoist.lisp: there the accessor
+;; is not inlined and its own DEFUN checks the object.
+(deftest-emitting-only struct-raw-backing-unswitch.other-structure
   (let ((o (make-sru-other :a 1 :b 2)))
     (list (%sru-rmw o 4) (sru-other-a o) (sru-other-b o)))
   (12 3 2))
 
 ;; Two bindings where only one gets its array.
-(deftest struct-raw-backing-unswitch.two-bindings-one-missing
+(deftest-emitting-only struct-raw-backing-unswitch.two-bindings-one-missing
   (%sru-two (make-sru :a 0 :b 0) (make-sru-other :a 0 :b 3) 4)
   (12 3))
 

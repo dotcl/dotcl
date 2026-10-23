@@ -26,6 +26,8 @@ public class SlotDefinition : LispObject
     /// SLOT-DEFINITION-INITFORM has to hand back, and a thunk cannot be turned
     /// back into the form it came from.</summary>
     public LispObject Initform { get; set; } = Nil.Instance;
+    /// <summary>What InitformThunk always returns, when DEFCLASS saw a literal initform.</summary>
+    internal LispObject? ConstantInitValue;
     /// <summary>True when :allocation :class was specified (shared slot stored on class, not instance).</summary>
     public bool IsClassAllocation { get; set; }
 
@@ -362,6 +364,9 @@ public class LispClass : LispObject
     // discarded, not published).
     public LispInstance Prototype
         => _prototype ?? System.Threading.Interlocked.CompareExchange(ref _prototype, new LispInstance(this), null) ?? _prototype;
+    /// <summary>Make-instance plan for the custom-method-free path; null until the first
+    /// such make-instance, stale once the method epoch moves.</summary>
+    internal CtorPlan? Ctor;
     /// <summary>Cached result of HasCustomInitMethods check. Null = not yet computed.</summary>
     internal bool? CachedHasCustomInitMethods;
     /// <summary>Cached result of IsConditionClass check. Null = not yet computed.</summary>
@@ -785,12 +790,14 @@ public class LispClass : LispObject
         // the source form that AMOP reports come from the same slot definition.
         LispFunction? initform = null;
         LispObject initformSource = Nil.Instance;
+        LispObject? constantInit = null;
         foreach (var d in defs)
         {
             if (d.InitformThunk != null)
             {
                 initform = d.InitformThunk;
                 initformSource = d.Initform;
+                constantInit = d.ConstantInitValue;
                 break;
             }
         }
@@ -852,6 +859,7 @@ public class LispClass : LispObject
             initform,
             primary.IsClassAllocation) { IsEffective = true, SlotType = slotType,
                                          Initform = initformSource,
+                                         ConstantInitValue = constantInit,
                                          Allocation = primary.Allocation,
                                          Documentation = documentation };
     }
@@ -950,6 +958,97 @@ public sealed class ClassLayout
     }
 }
 
+/// <summary>What MAKE-INSTANCE does for a class whose only initialization methods of its
+/// own are :AFTER methods on INITIALIZE-INSTANCE: the slot each validated initarg fills
+/// (-1: valid, fills none), the initforms and those methods. Keys are matched by
+/// identity; an unseen key takes the full path.</summary>
+internal sealed class CtorPlan
+{
+    public readonly int Epoch;
+    public readonly LispClass Class;
+    public readonly ClassLayout Layout;
+    public readonly int[] InitformSlots;
+    public readonly LispFunction[] Initforms;
+    public readonly LispObject?[] InitformValues;
+    /// <summary>The :AFTER methods of INITIALIZE-INSTANCE to run, least specific first.</summary>
+    public readonly LispMethod[] Afters;
+    public volatile (Symbol Key, int Slot)[] Keys = Array.Empty<(Symbol, int)>();
+
+    public CtorPlan(LispClass cls, int epoch, LispMethod[] afters)
+    {
+        Epoch = epoch;
+        Afters = afters;
+        Class = cls;
+        Layout = cls.Layout;
+        var slots = new List<int>();
+        var thunks = new List<LispFunction>();
+        var values = new List<LispObject?>();
+        for (int i = 0; i < cls.EffectiveSlots.Length; i++)
+            if (cls.EffectiveSlots[i].InitformThunk is { } t)
+            {
+                slots.Add(i); thunks.Add(t); values.Add(cls.EffectiveSlots[i].ConstantInitValue);
+            }
+        InitformSlots = slots.ToArray();
+        Initforms = thunks.ToArray();
+        InitformValues = values.ToArray();
+    }
+
+    public void AddKey(Symbol key, int slot)
+    {
+        var keys = Keys;
+        foreach (var k in keys) if (ReferenceEquals(k.Key, key)) return;
+        var grown = new (Symbol, int)[keys.Length + 1];
+        Array.Copy(keys, grown, keys.Length);
+        grown[keys.Length] = (key, slot);
+        Keys = grown;
+    }
+
+    /// <summary>The new instance, or null when an initarg has not been seen yet.</summary>
+    [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization (not in netstandard2.0)
+    public LispInstance? TryMake(LispObject[] initargs)
+    {
+        var keys = Keys;
+        for (int i = 0; i < initargs.Length; i += 2)
+        {
+            bool found = false;
+            foreach (var k in keys)
+                if (ReferenceEquals(k.Key, initargs[i])) { found = true; break; }
+            if (!found) return null;
+        }
+        var inst = new LispInstance(Class, Layout);
+        var slotv = inst.Slots;
+        for (int i = 0; i < initargs.Length; i += 2)
+        {
+            foreach (var k in keys)
+                if (ReferenceEquals(k.Key, initargs[i]))
+                {
+                    if (k.Slot >= 0 && slotv[k.Slot] == null) Store(slotv, k.Slot, initargs[i + 1]);
+                    break;
+                }
+        }
+        var forms = Initforms;
+        for (int j = 0; j < forms.Length; j++)
+        {
+            int s = InitformSlots[j];
+            if (slotv[s] == null) Store(slotv, s, InitformValues[j] ?? LispFunction.Call0(forms[j]));
+        }
+        return inst;
+    }
+
+    // Slots is exactly LispObject?[], so the covariance check of a plain store is dead weight.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static void Store(LispObject?[] a, int i, LispObject v)
+    {
+#if NET5_0_OR_GREATER
+        if ((uint)i >= (uint)a.Length) throw new IndexOutOfRangeException();
+        System.Runtime.CompilerServices.Unsafe.Add(
+            ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(a), i) = v;
+#else
+        a[i] = v;
+#endif
+    }
+}
+
 /// <summary>
 /// CLOS instance: class pointer + slot array.
 /// </summary>
@@ -968,6 +1067,15 @@ public sealed class LispInstance : LispObject
         Layout = cls.Layout;
         Slots = new LispObject?[cls.EffectiveSlots.Length];
         // null = unbound
+        DotCL.Diagnostics.AllocCounter.Inc("LispInstance");
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal LispInstance(LispClass cls, ClassLayout layout)
+    {
+        Class = cls;
+        Layout = layout;
+        Slots = new LispObject?[cls.EffectiveSlots.Length];
         DotCL.Diagnostics.AllocCounter.Inc("LispInstance");
     }
 
@@ -1310,6 +1418,47 @@ public sealed class ReaderCache
     }
 }
 
+/// <summary>A per-call-site cache for a one-argument call of a generic function,
+/// read and filled by <see cref="Runtime.GFCallIC1"/>: the generic function, the
+/// loose-cache slot of the first argument class the site saw, and the
+/// <see cref="GenericFunction.MethodEpoch"/> it was found under. Other classes go
+/// through the generic function's own loose cache. A site that keeps finding
+/// nothing to cache gives up and calls the generic function as usual.</summary>
+public sealed class GFCallCache
+{
+    internal const int MaxFails = 4;
+    internal const int KindFixnum = 1, KindInstance = 2, KindStruct = 3;
+    internal volatile Entry? E;
+    internal const int RefillMask = 255;
+    internal int Fails, Misses;
+    public GFCallCache(Symbol sym) { }
+
+    internal void GiveUp() { Fails = MaxFails; E = null; }
+
+    internal sealed class Entry
+    {
+        internal readonly GenericFunction Gf;
+        internal readonly int Epoch;
+        internal readonly string Name;
+        internal readonly GenericFunction.LooseSlot Slot;
+        internal readonly LispClass? C0;
+        // How the argument is known to be of C0: its type (KindFixnum), its class
+        // (KindInstance), its structure name under ClassEpoch (KindStruct). Other
+        // arguments go through the generic function's loose cache.
+        internal readonly int Kind;
+        internal readonly Symbol? StructName;
+        internal readonly int ClassEpoch;
+
+        internal Entry(GenericFunction gf, GenericFunction.LooseSlot slot, LispObject arg, int epoch, int classEpoch, string name)
+        {
+            Gf = gf; Slot = slot; C0 = slot.C0; Epoch = epoch; Name = name; ClassEpoch = classEpoch;
+            if (arg is Fixnum) Kind = KindFixnum;
+            else if (arg is LispInstance) Kind = KindInstance;
+            else if (arg is LispStruct st) { Kind = KindStruct; StructName = st.TypeName; }
+        }
+    }
+}
+
 /// <summary>The writer twin of <see cref="ReaderCache"/>: a per-call-site monomorphic
 /// inline cache for a simple slot writer, baked once per <c>(setf (accessor obj) v)</c>
 /// call site and read/filled by <see cref="Runtime.WriterIC"/>. Same publication and
@@ -1375,7 +1524,13 @@ public class GenericFunction : LispFunction
     internal object MethodsLock => _methodsLock;
     /// <summary>Publish a new method array (volatile write). Call under MethodsLock.</summary>
     internal void ReplaceMethods(LispMethod[] methods) => _methods = methods;
-    public LispFunction? DispatchFunction { get; set; }
+    public LispFunction? DispatchFunction
+    {
+        get => _dispatchFunction;
+        // Call-site caches (GFCallCache) run methods without asking for it.
+        set { _dispatchFunction = value; BumpMethodEpoch(); }
+    }
+    private LispFunction? _dispatchFunction;
 
     /// <summary>Whether this generic function's invocation goes through
     /// COMPUTE-APPLICABLE-METHODS and friends, i.e. whether a method on one of those
@@ -1422,7 +1577,7 @@ public class GenericFunction : LispFunction
     // is keyed on, or 0 when the call must take the full dispatcher. 0 = not computed.
     private volatile int _looseShape;
 
-    private void LambdaListChanged() { _looseShape = 0; LooseCache = null; }
+    private void LambdaListChanged() { _looseShape = 0; LooseCache = null; LooseFront = null; }
 
     internal int LooseKnown(int argc)
     {
@@ -1482,6 +1637,20 @@ public class GenericFunction : LispFunction
     /// function, keyed on the classes of the first one or two arguments.</summary>
     internal volatile LooseSlot?[]? LooseCache;
 
+    /// <summary>The slot of the first class a one-argument call found in LOOSECACHE,
+    /// tried before the hash probe. Null whenever LOOSECACHE is.</summary>
+    internal volatile LooseSlot? LooseFront;
+
+    /// <summary>Make SL, found in LC, the front slot, unless LC has been dropped meanwhile.</summary>
+    internal void SetLooseFront(LooseSlot sl, LooseSlot?[] lc)
+    {
+#pragma warning disable CS0420
+        if (System.Threading.Interlocked.CompareExchange(ref LooseFront, sl, null) == null
+            && !ReferenceEquals(LooseCache, lc))
+            System.Threading.Interlocked.CompareExchange(ref LooseFront, null, sl);
+#pragma warning restore CS0420
+    }
+
     internal sealed class LooseSlot
     {
         internal readonly LispClass? C0, C1;
@@ -1493,6 +1662,39 @@ public class GenericFunction : LispFunction
             C0 = c0; C1 = c1; Fn = fn;
             Entry1 = StaticEntry(fn.PlainFunc1);
             Entry2 = StaticEntry(fn.PlainFunc2);
+        }
+
+        // An EQL-specialized one-argument generic function: the slot for the
+        // argument's class picks among the EQL methods by the argument itself.
+        // The keys are fixnums and symbols, compared as EQL. FN is the method run
+        // when no key matches; with NoDefault there is none, and the caller falls
+        // back to DISPATCHGF, which reports no applicable method.
+        internal readonly LispObject[]? EqlKeys;
+        internal readonly LooseSlot[]? EqlHits;
+        internal readonly bool NoDefault;
+
+        internal LooseSlot(LispClass? c0, LispFunction fn, bool noDefault, LispObject[] keys, LooseSlot[] hits)
+            : this(c0, null, fn)
+        {
+            NoDefault = noDefault; EqlKeys = keys; EqlHits = hits;
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        internal LooseSlot? PickEql(LispObject a)
+        {
+            var keys = EqlKeys!;
+            if (a is Fixnum fa)
+            {
+                long v = fa.Value;
+                for (int i = 0; i < keys.Length; i++)
+                    if (keys[i] is Fixnum fk && fk.Value == v) return EqlHits![i];
+            }
+            else
+            {
+                for (int i = 0; i < keys.Length; i++)
+                    if (ReferenceEquals(keys[i], a)) return EqlHits![i];
+            }
+            return NoDefault ? null : this;
         }
 
         private static nint StaticEntry(Delegate? d)
@@ -1727,7 +1929,7 @@ public class GenericFunction : LispFunction
     /// <summary>Invalidate dispatch cache when methods are added/removed.</summary>
     internal void InvalidateCache()
     {
-        DispatchCache = null; DispatchByClasses = null; LooseCache = null; BumpMethodEpoch();
+        DispatchCache = null; DispatchByClasses = null; LooseCache = null; LooseFront = null; BumpMethodEpoch();
     }
 
     /// <summary>Global method-system epoch. Bumped on any method add/remove (via

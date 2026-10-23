@@ -50,9 +50,9 @@
                                (%tc-inc8 a)))
 
 (deftest-emitting-only typed-call.uses-typed-entry
-  (list (%tc-count "CALL-TYPED-ENTRY" #'%tc-sum)
-        (%tc-count "CALL-TYPED-ENTRY" #'%tc-dsum)
-        (%tc-count "CALL-TYPED-ENTRY" #'%tc-generic)
+  (list (%tc-count "CALL-TYPED-SYM" #'%tc-sum)
+        (%tc-count "CALL-TYPED-SYM" #'%tc-dsum)
+        (%tc-count "CALL-TYPED-SYM" #'%tc-generic)
         (%tc-count "Invoke2" #'%tc-sum))
   (1 1 4 0))
 
@@ -150,7 +150,7 @@
 (defun %tc-tail (n) (%tc-add n 1))
 
 (deftest-emitting-only typed-call.tail-position-keeps-ordinary-call
-  (list (%tc-tail 41) (%tc-count "CALL-TYPED-ENTRY" #'%tc-tail))
+  (list (%tc-tail 41) (%tc-count "CALL-TYPED-SYM" #'%tc-tail))
   (42 0))
 
 ;;; Across fasls: the callee's FTYPE comes to the caller's file through the

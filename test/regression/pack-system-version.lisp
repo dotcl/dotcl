@@ -61,7 +61,8 @@ file it was found in, and the warning is noise the suite does not need."
 (defun psv-meta (system)
   "Read SYSTEM's nuspec metadata the way `dotcl pack` does."
   (psv-setup)
-  (dotnet:static "DotCL.DotclBuild" "ReadSystemMeta" system nil))
+  (with-asdf-immutable-systems-restored
+    (dotnet:static "DotCL.DotclBuild" "ReadSystemMeta" system nil)))
 
 ;;; The whole point: a system that states :version needs no --version.
 (deftest pack-system-version.version-is-read-from-the-asd

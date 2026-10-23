@@ -600,7 +600,10 @@
         unless (handler-case (typep val spec) (error () t))
           do (error 'type-error :datum val :expected-type spec)))
 
-(defun %check-arg-decl (value spec)
+(defun %tco-checks-done () nil)
+
+(defun %check-arg-decl (value spec &optional proven)
+  (declare (ignore proven))
   (unless (typep value spec)
     (error 'type-error :datum value :expected-type spec))
   nil)
@@ -610,13 +613,29 @@
     (symbol . "Runtime.CheckArgSymbol") (function . "Runtime.CheckArgFunction")
     (character . "Runtime.CheckArgCharacter") (integer . "Runtime.CheckArgInteger")))
 
+(defun %arg-checked-at-entry-p (var range)
+  "True when VAR is a parameter of the typed entry being compiled whose entry
+   has already confined it to RANGE."
+  (let ((e (and *typed-entry-ranges* (lookup-local var)
+                (assoc (lookup-local var) *typed-entry-ranges* :test #'equal))))
+    (and e (<= (car range) (cadr e)) (<= (cddr e) (cdr range)))))
+
 (defun %arg-check-instrs (var spec)
   (let* ((ty (%typexpand-for-range spec))
          (long-slot (native-slot-p var (cstate-long-locals)))
          (dbl-slot (native-slot-p var (cstate-native-double-locals)))
-         (range (and (or long-slot (not (and (consp ty) (eq (car ty) 'and))))
+         (range (and (or long-slot
+                         (not (and (consp ty) (eq (car ty) 'and)))
+                         (%exact-integer-type-p ty))
                      (declared-integer-range ty))))
     (cond
+      ((and long-slot range (range-fits-int64-p range)
+            (%arg-checked-at-entry-p var range))
+        nil)
+      ;; A u64 slot was range-checked when it was filled.
+      ((and (u64-native-local-p var) range
+            (eql (car range) 0) (eql (cdr range) (1- (expt 2 64))))
+       nil)
       ((eq ty 'fixnum)
        (unless long-slot `(,@(compile-expr var) (:call "Runtime.CheckArgFixnum"))))
       ((and range (range-fits-int64-p range))
@@ -628,6 +647,9 @@
       ((and range (eql (car range) 0) (eql (cdr range) (1- (expt 2 64))) (not long-slot))
        `(,@(compile-expr var) (:call "Runtime.CheckArgU64")))
       ((and (member ty '(double-float long-float)) dbl-slot) nil)
+      ((and (member ty '(single-float short-float))
+            (native-slot-p var (cstate-native-single-locals)))
+       nil)
       ((and (member ty '(double-float long-float)) (not long-slot))
        `(,@(compile-expr var) (:call "Runtime.CheckArgDouble")))
       ((and (member ty '(single-float short-float)) (not long-slot) (not dbl-slot))
@@ -648,14 +670,33 @@
            (:label ,ok))))
       ((and (symbolp ty) (assoc ty +arg-check-calls+))
        `(,@(compile-expr var) (:call ,(cdr (assoc ty +arg-check-calls+)))))
+      ((%member-symbol-literals ty)
+       (let ((ok (gen-label "ACOK")))
+         `(,@(loop for s in (%member-symbol-literals ty)
+                   append `(,@(compile-expr var) ,@(compile-expr `(quote ,s)) (:beq ,ok)))
+           ,@(compile-expr var) ,@(compile-quoted-cached spec) (:call "Runtime.CheckArgType")
+           (:label ,ok))))
       ((member ty '(string simple-string))
        `(,@(compile-expr var) ,@(compile-quoted-cached spec) (:call "Runtime.CheckArgString")))
       ((%simple-vector-et-hint ty)
        `(,@(compile-expr var) ,@(compile-quoted-cached spec)
          (:ldstr ,(%simple-vector-et-hint ty)) (:call "Runtime.CheckArgSimpleVector")))
+      ((%simple-vector-et-hint ty t)
+       `(,@(compile-expr var) ,@(compile-quoted-cached spec)
+         (:ldstr ,(%simple-vector-et-hint ty t)) (:ldc-i4 ,(car (third ty)))
+         (:call "Runtime.CheckArgSimpleVectorN")))
       ((and (symbolp ty) (not (eq (symbol-package ty) (find-package "COMMON-LISP"))))
        `(,@(compile-expr var) ,@(compile-quoted-cached spec) (:call "Runtime.CheckArgStructSym")))
       (t `(,@(compile-expr var) ,@(compile-quoted-cached spec) (:call "Runtime.CheckArgType"))))))
+
+(defun %member-symbol-literals (ty)
+  "For (MEMBER ...) or (EQL sym), the symbols other than T and NIL that a
+   reference comparison can accept outright (at most 8). NIL otherwise."
+  (when (and (consp ty) (member (car ty) '(member eql)) (consp (cdr ty))
+             (or (eq (car ty) 'member) (null (cddr ty))))
+    (let ((syms (remove-if (lambda (s) (or (null s) (eq s t))) (cdr ty))))
+      (and syms (<= (length syms) 8) (every #'symbolp syms)
+           (remove-duplicates syms)))))
 
 (defun %float-range-bounds (ty)
   "(:SINGLE LO HI) / (:DOUBLE LO HI) for (SINGLE-FLOAT LO HI) / (DOUBLE-FLOAT LO
@@ -676,8 +717,14 @@
                   (if single most-positive-single-float most-positive-double-float)
                   hi))))))
 
-(defun %simple-vector-et-hint (ty)
-  (when (and (consp ty) (eq (car ty) 'simple-array) (= (length ty) 3) (equal (third ty) '(*)))
+(defun %simple-vector-et-hint (ty &optional fixed-length)
+  "The element type name of TY, (SIMPLE-ARRAY et (*)), or with FIXED-LENGTH
+   (SIMPLE-ARRAY et (n)); else NIL."
+  (when (and (consp ty) (eq (car ty) 'simple-array) (= (length ty) 3)
+             (if fixed-length
+                 (and (consp (third ty)) (null (cdr (third ty)))
+                      (typep (car (third ty)) '(integer 0 #.(1- (expt 2 31)))))
+                 (equal (third ty) '(*))))
     (let ((u (ignore-errors (upgraded-array-element-type (second ty)))))
       (cond ((null u) nil)
             ((symbolp u) (symbol-name u))
@@ -1528,6 +1575,13 @@
                                       (%mini-eval (fourth form) env)
                                       (%mini-eval (fifth form) env))))
                (locally (%mini-eval-progn (cdr form) env nil tailp))
+               ;; Once per form, in a null lexical environment. Kept in a list
+               ;; so a NIL value is told apart from "not yet evaluated".
+               (load-time-value
+                (let ((kept (%mini-memo form)))
+                  (if kept
+                      (car kept)
+                      (car (%set-mini-memo form (list (%mini-eval (cadr form) nil)))))))
                (eval-when
                 ;; In an evaluator (not compile-file), eval the body iff :execute
                 ;; is among the situations (CLHS 3.2.3.1).

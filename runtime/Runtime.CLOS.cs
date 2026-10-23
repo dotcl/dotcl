@@ -298,6 +298,7 @@ public static partial class Runtime
         // class-defining operator lands here: defclass, defstruct and
         // define-condition all register a class.
         CheckTypeNameAvailable(lc.Name, "DEFCLASS");
+        if (!lc.IsStructureClass) lc.Name.StructParent = null;
         // Prevent redefining built-in classes (CLHS 4.3.7)
         if (_classRegistry.TryGetValue(lc.Name, out var existing) && existing.IsBuiltIn)
             throw new LispErrorException(new LispError(
@@ -1705,9 +1706,20 @@ public static partial class Runtime
             sd.Writers = ListToArray(writers);
             sd.SlotType = slotType is Nil ? T.Instance : slotType;
             sd.Initform = initform;
+            sd.ConstantInitValue = sd.InitformThunk != null ? LiteralInitformValue(initform) : null;
         }
         return slotdObj;
     }
+
+    // The value of an initform whose every evaluation yields the same object.
+    private static LispObject? LiteralInitformValue(LispObject form) => form switch
+    {
+        Number or LispChar or Nil or T => form,
+        Symbol s when s.HomePackage?.Name == "KEYWORD" => form,
+        Cons { Car: Symbol q, Cdr: Cons { Car: Symbol v, Cdr: Nil } }
+            when ReferenceEquals(q, Startup.Sym("QUOTE")) => v,
+        _ => null,
+    };
 
     /// <summary>The slot :documentation, attached by its own call rather than as a
     /// sixth argument to SetSlotDefAttrs: a compiled FASL names the runtime method it
@@ -2352,8 +2364,8 @@ public static partial class Runtime
                     $"SLOT-UNBOUND: slot {name} is unbound in instance of {ccls.Name.Name}"));
             }
             if (Startup.Sym("SLOT-MISSING").Function is LispFunction csm)
-                return csm.Invoke(new LispObject[] { ccls ?? (LispObject)Nil.Instance, cond,
-                    slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SLOT-VALUE") });
+                return CallForPrimary(csm, ccls ?? (LispObject)Nil.Instance, cond,
+                    slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SLOT-VALUE"));
             throw new LispErrorException(new LispError(
                 $"SLOT-VALUE: no slot named {name} in condition {cond.ConditionTypeName}"));
         }
@@ -2465,13 +2477,13 @@ public static partial class Runtime
         if (!inst.Class.TryGetSlotIndex(slotName, name, out int idx))
         {
             if (Startup.Sym("SLOT-MISSING").Function is LispFunction slotMissing)
-                return slotMissing.Invoke(new LispObject[] { inst.Class, inst, slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SLOT-VALUE") });
+                return CallForPrimary(slotMissing, inst.Class, inst, slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SLOT-VALUE"));
             throw new LispErrorException(new LispError(
                 $"SLOT-VALUE: no slot named {name} in class {inst.Class.Name.Name}"));
         }
         // AMOP 5.4: dispatch through slot-value-using-class for custom metaclasses
         if (UsesSlotProtocol(inst.Class) && Startup.Sym("SLOT-VALUE-USING-CLASS").Function is LispFunction svucFn)
-            return svucFn.Invoke(new LispObject[] { inst.Class, inst, inst.Class.EffectiveSlots[idx] });
+            return CallForPrimary(svucFn, inst.Class, inst, inst.Class.EffectiveSlots[idx]);
         return SlotValueDirect(inst, idx, slotName, name);
     }
 
@@ -2656,8 +2668,8 @@ public static partial class Runtime
                 return value;
             if (Startup.Sym("SLOT-MISSING").Function is LispFunction csm)
             {
-                csm.Invoke(new LispObject[] { ccls ?? (LispObject)Nil.Instance, cond,
-                    slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SETF"), value });
+                CallForPrimary(csm, ccls ?? (LispObject)Nil.Instance, cond,
+                    slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SETF"), value);
                 return value;
             }
             throw new LispErrorException(new LispError(
@@ -2676,7 +2688,7 @@ public static partial class Runtime
         {
             if (Startup.Sym("SLOT-MISSING").Function is LispFunction slotMissing)
             {
-                slotMissing.Invoke(new LispObject[] { inst.Class, inst, slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SETF"), value });
+                CallForPrimary(slotMissing, inst.Class, inst, slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SETF"), value);
                 return value;
             }
             throw new LispErrorException(new LispError(
@@ -2684,7 +2696,7 @@ public static partial class Runtime
         }
         // AMOP 5.4: dispatch through (setf slot-value-using-class) for custom metaclasses
         if (UsesSlotProtocol(inst.Class) && Startup.Sym("SLOT-VALUE-USING-CLASS").SetfFunction is LispFunction setfSvucFn)
-            return setfSvucFn.Invoke(new LispObject[] { value, inst.Class, inst, inst.Class.EffectiveSlots[idx] });
+            return CallForPrimary(setfSvucFn, value, inst.Class, inst, inst.Class.EffectiveSlots[idx]);
         return SetSlotValueDirect(inst, idx, name, value);
     }
 
@@ -2859,8 +2871,8 @@ public static partial class Runtime
             }
             if (Startup.Sym("SLOT-MISSING").Function is LispFunction csm)
             {
-                var r = Primary(csm.Invoke(new LispObject[] { ccls ?? (LispObject)Nil.Instance, cond,
-                    slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SLOT-BOUNDP") }));
+                var r = CallForPrimary(csm, ccls ?? (LispObject)Nil.Instance, cond,
+                    slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SLOT-BOUNDP"));
                 LispObject cb = IsTruthy(r) ? T.Instance : (LispObject)Nil.Instance;
                 MultipleValues.SetOne(cb);
                 return cb;
@@ -2881,7 +2893,7 @@ public static partial class Runtime
         {
             if (Startup.Sym("SLOT-MISSING").Function is LispFunction slotMissing)
             {
-                var result = Primary(slotMissing.Invoke(new LispObject[] { inst.Class, inst, slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SLOT-BOUNDP") }));
+                var result = CallForPrimary(slotMissing, inst.Class, inst, slotName is Symbol ? slotName : Startup.Sym(name), Startup.Sym("SLOT-BOUNDP"));
                 // slot-boundp returns a SINGLE generalized boolean: explicitly install
                 // exactly one value so any secondary values slot-missing returned (it may
                 // legally return (values nil x)) do not leak to the caller. ANSI SLOT-MISSING.8.
@@ -2894,7 +2906,7 @@ public static partial class Runtime
         }
         // AMOP 5.4: dispatch through slot-boundp-using-class for custom metaclasses.
         if (UsesSlotProtocol(inst.Class) && Startup.Sym("SLOT-BOUNDP-USING-CLASS").Function is LispFunction sbucFn)
-            return IsTruthy(Primary(sbucFn.Invoke(new LispObject[] { inst.Class, inst, inst.Class.EffectiveSlots[idx] })))
+            return IsTruthy(CallForPrimary(sbucFn, inst.Class, inst, inst.Class.EffectiveSlots[idx]))
                 ? T.Instance : Nil.Instance;
         return SlotBoundpDirect(inst, idx, name) ? T.Instance : Nil.Instance;
     }
@@ -3514,7 +3526,70 @@ public static partial class Runtime
         return instArg; // return original instance (possibly wrapped)
     }
 
+    [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization (not in netstandard2.0)
     public static LispObject MakeInstanceWithInitargs(LispObject classSpec, params LispObject[] initargs)
+    {
+        if (classSpec is Symbol sym && (initargs.Length & 1) == 0
+            && (sym.ClassMemo is { } memo && memo.Epoch == ClassRegistry.Epoch
+                    ? memo.AsClass : FindClassOrNil(sym) as LispClass) is { } cls
+            && LivePlan(cls) is { } plan && MakeFromPlan(plan, initargs) is { } made)
+            return MultipleValues.Alone(made);
+        return MultipleValues.Alone(MakeInstanceOf(classSpec, initargs));
+    }
+
+    // Method changes and class finalization move MethodEpoch; :DEFAULT-INITARGS set
+    // without a finalization clear HasSimpleInitialization.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static CtorPlan? LivePlan(LispClass cls)
+        => cls.Ctor is { } plan && plan.Epoch == GenericFunction.MethodEpoch
+           && cls.HasSimpleInitialization && cls.Metaclass == null ? plan : null;
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static LispInstance? MakeFromPlan(CtorPlan plan, LispObject[] initargs)
+    {
+        var inst = plan.TryMake(initargs);
+        if (inst == null || plan.Afters.Length == 0) return inst;
+        return RunAfters(plan, inst, initargs);
+    }
+
+    private static LispInstance RunAfters(CtorPlan plan, LispInstance inst, LispObject[] initargs)
+    {
+        var args = new LispObject[initargs.Length + 1];
+        args[0] = inst;
+        Array.Copy(initargs, 0, args, 1, initargs.Length);
+        foreach (var m in plan.Afters) InvokeAux(m, args);
+        return inst;
+    }
+
+    /// <summary>The :AFTER methods of INITIALIZE-INSTANCE applicable to instances of CLS,
+    /// least specific first, when they are all it has besides the default method and
+    /// SHARED-INITIALIZE has none of its own for CLS; null otherwise.</summary>
+    private static LispMethod[]? InitAfterMethodsOnly(LispClass cls)
+    {
+        _initializeInstanceSym ??= Startup.Sym("INITIALIZE-INSTANCE");
+        if (_initializeInstanceSym.Function is not GenericFunction gf || gf.MethodCombination != null
+            || gf.DispatchFunction != null
+            || (AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf))
+            || !SharedInitializeIsDefault(cls))
+            return null;
+        var cpl = cls.ClassPrecedenceList;
+        var afters = new List<LispMethod>();
+        foreach (var m in gf.Methods)
+        {
+            if (AllTSpecializers(m) && m.Qualifiers.Length == 0) continue;
+            if (m.Specializers.Length != 1 || m.Specializers[0] is not LispClass sc) return null;
+            if (Array.IndexOf(cpl, sc) < 0) continue;
+            if (m.Qualifiers.Length != 1 || m.Qualifiers[0] is not Symbol q || q.Name != "AFTER"
+                || q.HomePackage?.Name != "KEYWORD")
+                return null;
+            afters.Add(m);
+        }
+        afters.Sort((a, b) => Array.IndexOf(cpl, (LispClass)b.Specializers[0])
+                                  .CompareTo(Array.IndexOf(cpl, (LispClass)a.Specializers[0])));
+        return afters.ToArray();
+    }
+
+    private static LispObject MakeInstanceOf(LispObject classSpec, LispObject[] initargs)
     {
         // Validate: initargs must be even (key-value pairs)
         if (initargs.Length % 2 != 0)
@@ -3534,6 +3609,9 @@ public static partial class Runtime
         }
         else
             throw new LispErrorException(new LispTypeError("MAKE-INSTANCE: invalid class specifier", classSpec));
+
+        if (LivePlan(cls) is { } plan && MakeFromPlan(plan, initargs) is { } made)
+            return made;
 
         // A class metaobject class makes a class, not an ordinary instance. Checked
         // before the initarg validation below: :DIRECT-SUPERCLASSES and :DIRECT-SLOTS
@@ -3603,7 +3681,9 @@ public static partial class Runtime
         if (!customMeta && cls.HasSimpleInitialization && CanUseSimplePath(cls))
         {
             // Validate initargs even on fast path (CLHS 7.1.2)
+            int epoch = GenericFunction.MethodEpoch;
             ValidateInitargs(cls, initargs, 0);
+            RecordCtorKeys(cls, initargs, epoch, Array.Empty<LispMethod>());
 
             var fastInst = new LispInstance(cls);
             // Inline shared-initialize: apply initargs then initforms
@@ -3629,7 +3709,11 @@ public static partial class Runtime
         }
 
         // Per CLHS 7.1.2: Validate initargs
+        int slowEpoch = GenericFunction.MethodEpoch;
         ValidateInitargs(cls, initargs, 0);
+        if (!customMeta && cls.HasSimpleInitialization && !IsConditionClass(cls)
+            && InitAfterMethodsOnly(cls) is { Length: > 0 } afters)
+            RecordCtorKeys(cls, initargs, slowEpoch, afters);
 
         // Custom metaclass: allocate through the ALLOCATE-INSTANCE GF so user overrides run.
         var inst = customMeta ? AllocateViaGF(cls, initargs) : new LispInstance(cls);
@@ -3705,6 +3789,26 @@ public static partial class Runtime
         }
 
         return inst;
+    }
+
+    // After ValidateInitargs accepted INITARGS under EPOCH: remember each key's slot.
+    // :ALLOW-OTHER-KEYS is never remembered, so a call that passes it keeps validating.
+    private static void RecordCtorKeys(LispClass cls, LispObject[] initargs, int epoch, LispMethod[] afters)
+    {
+        var plan = cls.Ctor;
+        if (plan == null || plan.Epoch != epoch)
+        {
+            if (GenericFunction.MethodEpoch != epoch) return;
+            cls.Ctor = plan = new CtorPlan(cls, epoch, afters);
+        }
+        var map = cls.InitargToSlotIndex;
+        for (int i = 0; i < initargs.Length; i += 2)
+            if (initargs[i] is Symbol s && s.Name == "ALLOW-OTHER-KEYS") return;
+        for (int i = 0; i < initargs.Length; i += 2)
+        {
+            if (initargs[i] is not Symbol s) return;
+            plan.AddKey(s, map != null && map.TryGetValue(s.Name, out int idx) ? idx : -1);
+        }
     }
 
     /// <summary>
@@ -4098,11 +4202,31 @@ public static partial class Runtime
         return m;
     }
 
+    private static readonly object s_gfRegisterLock = new();
+
+    /// <summary>DEFMETHOD's auto-creation: register GF under NAME unless a generic
+    /// function is there already, and return the one that is registered.</summary>
+    public static LispObject RegisterGFIfAbsent(LispObject name, LispObject gfObj)
+    {
+        lock (s_gfRegisterLock)
+        {
+            if (FindGF(name) is GenericFunction existing) return existing;
+            return RegisterGF(name, gfObj);
+        }
+    }
+
     public static LispObject RegisterGF(LispObject name, LispObject gfObj)
     {
         var sym = ToFunctionNameSymbol(name, "REGISTER-GF");
         if (gfObj is not GenericFunction gf)
             throw new LispErrorException(new LispTypeError("REGISTER-GF: not a generic function", gfObj));
+        lock (s_gfRegisterLock)
+            RegisterGFLocked(name, sym, gf);
+        return gfObj;
+    }
+
+    private static void RegisterGFLocked(LispObject name, Symbol sym, GenericFunction gf)
+    {
         _gfRegistry[sym] = gf;
         // When replacing an ordinary function, save it as a fallback so the GF
         // dispatcher can call the original C# implementation for types that have no
@@ -4121,7 +4245,6 @@ public static partial class Runtime
         {
             accessor.SetfFunction = gf;
         }
-        return gfObj;
     }
 
     /// <summary>
@@ -5283,7 +5406,8 @@ public static partial class Runtime
             }
         }
         gf.DispatchCache = list.ToArray();
-        if (entry.PlainPrimaryChain && entry.Primary[0].IgnoresNextMethodState && entry.ArgTypes.Length <= 2)
+        if ((entry.PlainPrimaryChain && entry.Primary[0].IgnoresNextMethodState && entry.ArgTypes.Length <= 2)
+            || (entry.HasEqlSpecializers && EqlLooseEligible(entry)))
             gf.LooseCache ??= new GenericFunction.LooseSlot?[8];
 
         if (entry.ArgTypes.Length >= 1)
@@ -5399,25 +5523,124 @@ public static partial class Runtime
     // every other path drops it.
     private static unsafe LispObject GFEntry1(LispFunction self, LispObject a)
     {
-        int mode = MultipleValues.TakeMode();
+        int mode = MultipleValues.PeekMode();
         var n = self.FrameNameField;
-        if (n == null) { LispFunction.DropBorrow(); return DispatchGF1(Unsafe.As<GenericFunction>(self), a, mode); }
+        if (n == null) { MultipleValues.DropMode(mode); LispFunction.DropBorrow(); return DispatchGF1(Unsafe.As<GenericFunction>(self), a, mode); }
         Unsafe.SkipInit(out LispFunction.Frame fr);
         LispFunction.Enter1(ref fr, n, a);
         var gf = Unsafe.As<GenericFunction>(self);
         LispObject r;
-        if (gf.DispatchFunction == null && !AnyInvocationProtocolCustomized && LooseFast(gf, a, null, 1) is { } sl)
+        if (gf.DispatchFunction == null && !AnyInvocationProtocolCustomized && LooseFast1(gf, a) is { } sl)
         {
             if (fr.Depth >= 0 && sl.Entry1 != 0)
             {
-                if (mode != 0 && sl.Fn.MvModeEntry(1)) MultipleValues.SetMode(mode);
+                if (mode != 0 && !sl.Fn.MvModeEntry(1)) MultipleValues.DropMode(mode);
                 r = ((delegate*<LispObject, LispObject>)sl.Entry1)(a); GC.KeepAlive(sl);
             }
-            else r = mode != 0 ? sl.Fn.InvokeFast1M(a, mode) : sl.Fn.InvokeArgc(1, a, null, null, null);
+            else
+            {
+                MultipleValues.DropMode(mode);
+                r = mode != 0 ? sl.Fn.InvokeFast1M(a, mode) : sl.Fn.InvokeArgc(1, a, null, null, null);
+            }
         }
-        else r = DispatchGF1(gf, a, mode);
+        else { MultipleValues.DropMode(mode); r = DispatchGF1(gf, a, mode); }
         LispFunction.Leave(ref fr);
         return r;
+    }
+
+    /// <summary>A one-argument call of a generic function through the call site's
+    /// cache CELL. An argument of the class the site first saw runs its method body
+    /// on a frame of the caller's (FR), as GFENTRY1 runs it on its own; another class
+    /// goes through the generic function's loose cache, as in GFENTRY1. MODE is the
+    /// caller's value mode, or -1 when the call passes none. Null when neither
+    /// applies; the caller then calls FN as usual.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe LispObject? GFCallIC1(GFCallCache cell, LispFunction fn, LispObject a, int mode,
+                                               ref LispFunction.Frame fr)
+    {
+        var e = cell.E;
+        if (e != null && ReferenceEquals(e.Gf, fn) && e.Epoch == GenericFunction.MethodEpoch
+            && (e.Kind == GFCallCache.KindFixnum ? a is Fixnum
+                : e.Kind == GFCallCache.KindInstance ? a is LispInstance inst && ReferenceEquals(inst.Class, e.C0)
+                : e.Kind == GFCallCache.KindStruct && a is LispStruct st && ReferenceEquals(st.TypeName, e.StructName)
+                  && e.ClassEpoch == ClassRegistry.Epoch))
+        {
+            var sl = e.Slot;
+            if (sl.EqlKeys != null && (sl = sl.PickEql(a)) == null) return null;
+            LispObject r;
+            LispFunction.Enter1(ref fr, e.Name, a);
+            if (fr.Depth >= 0 && sl.Entry1 != 0)
+            {
+                if (mode >= 0 && sl.Fn.MvModeEntry(1)) MultipleValues.SetMode(mode);
+                r = ((delegate*<LispObject, LispObject>)sl.Entry1)(a); GC.KeepAlive(sl);
+            }
+            else r = GFCallIC1Invoke(sl, a, mode);
+            LispFunction.Leave(ref fr);
+            return r;
+        }
+        return GFCallIC1Miss(cell, fn, a, mode);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject GFCallIC1Invoke(GenericFunction.LooseSlot sl, LispObject a, int mode) =>
+        mode >= 0 ? sl.Fn.InvokeFast1M(a, mode) : sl.Fn.InvokeArgc(1, a, null, null, null);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static unsafe LispObject? GFCallIC1Miss(GFCallCache cell, LispFunction fn, LispObject a, int mode)
+    {
+        var e = cell.E;
+        if (e != null && ReferenceEquals(e.Gf, fn) && e.Epoch == GenericFunction.MethodEpoch)
+        {
+            var gf = e.Gf;
+            int classEpoch = ClassRegistry.Epoch;
+            var ca = LooseArgClass(a, classEpoch);
+            var sl = gf.LooseFront;
+            if (sl == null || !ReferenceEquals(sl.C0, ca))
+            {
+                sl = LooseProbe1(gf, ca);
+                if (sl == null) return null;
+            }
+            // Now and then the class at hand takes the entry, so that a site whose
+            // first class was not its usual one still ends up with the usual one.
+            if ((++cell.Misses & GFCallCache.RefillMask) == 0)
+                cell.E = new GFCallCache.Entry(gf, sl, a, e.Epoch, classEpoch, e.Name);
+            if (sl.EqlKeys != null && (sl = sl.PickEql(a)) == null) return null;
+            Unsafe.SkipInit(out LispFunction.Frame fr);
+            LispFunction.Enter1(ref fr, e.Name, a);
+            LispObject r;
+            if (fr.Depth >= 0 && sl.Entry1 != 0)
+            {
+                if (mode >= 0 && sl.Fn.MvModeEntry(1)) MultipleValues.SetMode(mode);
+                r = ((delegate*<LispObject, LispObject>)sl.Entry1)(a); GC.KeepAlive(sl);
+            }
+            else r = mode >= 0 ? sl.Fn.InvokeFast1M(a, mode) : sl.Fn.InvokeArgc(1, a, null, null, null);
+            LispFunction.Leave(ref fr);
+            return r;
+        }
+        if (cell.Fails < GFCallCache.MaxFails) GFCallIC1Fill(cell, fn, a);
+        return null;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void GFCallIC1Fill(GFCallCache cell, LispFunction fn, LispObject a)
+    {
+        if (fn is not GenericFunction gf || gf.DispatchFunction != null || AnyInvocationProtocolCustomized
+            || gf.FrameNameField is not { } name)
+        {
+            cell.GiveUp();
+            return;
+        }
+        int epoch = GenericFunction.MethodEpoch, classEpoch = ClassRegistry.Epoch;
+        var ca = LooseArgClass(a, classEpoch);
+        var sl = gf.LooseFront;
+        if (sl == null || !ReferenceEquals(sl.C0, ca)) sl = LooseProbe1(gf, ca);
+        if (sl == null)
+        {
+            if (++cell.Fails >= GFCallCache.MaxFails) cell.GiveUp();
+            return;
+        }
+        cell.Fails = 0;
+        cell.E = new GFCallCache.Entry(gf, sl, a, epoch, classEpoch, name);
     }
 
     private static unsafe LispObject GFEntry2(LispFunction self, LispObject a, LispObject b)
@@ -5495,7 +5718,7 @@ public static partial class Runtime
         // static bool read until someone specialises one of the three.
         if (AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf))
             return DispatchGFCore(gf, new[] { a });
-        if (LooseFast(gf, a, null, 1) is { } sl)
+        if (LooseFast1(gf, a) is { } sl)
             return mode != 0 ? sl.Fn.InvokeFast1M(a, mode) : sl.Fn.InvokeArgc(1, a, null, null, null);
         var entry = LooseEntry(gf, a, null, null, null, 1);
         if (entry != null)
@@ -5512,6 +5735,7 @@ public static partial class Runtime
             // argument, so this is the only arity that can take them without an array.
             if (entry.HasEqlSpecializers)
             {
+                NoteLooseEql(gf, entry);
                 var eqlChain = EqlLooseChain(entry, a);
                 if (eqlChain != null) return InvokeChainLoose(eqlChain, a, null, null, null, 1);
             }
@@ -5750,9 +5974,83 @@ public static partial class Runtime
         {
             var sl = lc[i];
             if (sl == null) return null;
-            if (ReferenceEquals(sl.C0, ca) && ReferenceEquals(sl.C1, cb)) return sl;
+            if (ReferenceEquals(sl.C0, ca) && ReferenceEquals(sl.C1, cb))
+                return sl.EqlKeys == null ? sl : sl.PickEql(a);
         }
         return null;
+    }
+
+    /// <summary>LOOSEFAST for one argument. The slot of the first class looked up
+    /// in the cache is tried before the hash probe.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static GenericFunction.LooseSlot? LooseFast1(GenericFunction gf, LispObject a)
+    {
+        var ca = LooseArgClass(a, ClassRegistry.Epoch);
+        var sl = gf.LooseFront;
+        if (sl == null || !ReferenceEquals(sl.C0, ca))
+        {
+            sl = LooseProbe1(gf, ca);
+            if (sl == null) return null;
+        }
+        return sl.EqlKeys == null ? sl : sl.PickEql(a);
+    }
+
+    private static GenericFunction.LooseSlot? LooseProbe1(GenericFunction gf, LispClass? ca)
+    {
+        var lc = gf.LooseCache;
+        if (lc == null || gf.LooseKnown(1) != 1) return null;
+        int mask = lc.Length - 1;
+        int i = GenericFunction.LooseIndex(ca, null, mask);
+        for (int n = 0; n < GenericFunction.LooseProbes; n++, i = (i + 1) & mask)
+        {
+            var sl = lc[i];
+            if (sl == null) return null;
+            if (ReferenceEquals(sl.C0, ca) && sl.C1 == null)
+            {
+                if (gf.LooseFront == null) gf.SetLooseFront(sl, lc);
+                return sl;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>Whether a warm EQL-specialized entry can live in the loose cache: the
+    /// shape EQLLOOSECHAIN takes, every chain's first method called as it is, and
+    /// EQL values whose EQL is identity or a fixnum compare.</summary>
+    private static bool EqlLooseEligible(CachedDispatch entry)
+    {
+        if (entry.EqlValues == null || entry.EqlChains == null || entry.ArgTypes.Length != 1) return false;
+        if (entry.IsBuiltinCombination || entry.Around.Count != 0
+            || entry.Before.Count != 0 || entry.After.Count != 0
+            || entry.ReaderSlotIndex >= 0 || entry.WriterSlotIndex >= 0
+            || entry.EffectiveMethodFunction != null)
+            return false;
+        if (entry.Primary.Count > 0 && !entry.Primary[0].IgnoresNextMethodState) return false;
+        if (entry.Primary.Count == 0 && entry.EqlChains.Length == 0) return false;
+        foreach (var v in entry.EqlValues)
+            if (!(v is Fixnum || (v is Symbol && !ReferenceEquals(v, Startup.T_SYM)
+                                  && !ReferenceEquals(v, Startup.NIL_SYM))))
+                return false;
+        foreach (var chain in entry.EqlChains)
+            if (!chain[0].IgnoresNextMethodState) return false;
+        return true;
+    }
+
+    private static void NoteLooseEql(GenericFunction gf, CachedDispatch entry)
+    {
+        if (entry.Loose != null || gf.LooseCache == null || gf.LooseKnown(1) != 1
+            || !EqlLooseEligible(entry))
+            return;
+        var c0 = entry.ArgTypes[0];
+        var chains = entry.EqlChains!;
+        var hits = new GenericFunction.LooseSlot[chains.Length];
+        for (int i = 0; i < chains.Length; i++)
+            hits[i] = new GenericFunction.LooseSlot(c0, null, chains[i][0].Function);
+        bool noDefault = entry.Primary.Count == 0;
+        var fn = noDefault ? chains[0][0].Function : entry.Primary[0].Function;
+        var sl = new GenericFunction.LooseSlot(c0, fn, noDefault, (LispObject[])entry.EqlValues!.Clone(), hits);
+        entry.Loose = sl;
+        gf.AddLoose(sl);
     }
 
     private static void NoteLoose(GenericFunction gf, CachedDispatch entry, int argc)
@@ -5775,6 +6073,19 @@ public static partial class Runtime
         if (obj is LispInstance inst) return inst.Class;
         if (obj is LispStruct st && st.TypeName.ClassMemo is { } memo && memo.Epoch == epoch)
             return memo.AsClass;
+        if (obj is Fixnum && _dcFixnum is { } fc) return fc;
+        return LooseBuiltinClass(obj);
+    }
+
+    // The common built-in arguments from ArgDispatchClass's memos, without its type
+    // switch. Kept out of line so the instance and structure tests above stay small.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispClass? LooseBuiltinClass(LispObject obj)
+    {
+        if (obj is Cons) { if (_dcCons is { } c) return c; }
+        else if (obj is Nil) { if (_dcNull is { } c) return c; }
+        else if (obj is Symbol) { if (_dcSymbol is { } c) return c; }
+        else if (obj is Fixnum) { if (_dcFixnum is { } c) return c; }
         return ArgDispatchClass(obj);
     }
 
@@ -6493,7 +6804,9 @@ public static partial class Runtime
                     LispObject quals = Nil.Instance;
                     for (int i = m.Qualifiers.Length - 1; i >= 0; i--)
                         quals = new Cons(m.Qualifiers[i], quals);
-                    if (pf.Invoke(new[] { quals }) is not Nil) return true;
+                    var groupOk = Runtime.IsTruthy(pf.Invoke(new[] { quals }));
+                    MultipleValues.Reset();
+                    if (groupOk) return true;
                     continue;
                 }
                 // Not a predicate: read as the name of a single qualifier, as
@@ -7472,7 +7785,7 @@ public static partial class Runtime
             uifdcFn.Invoke(uifdcArgs);
         }
 
-        return instance;
+        return MultipleValues.Alone(instance);
     }
 
     public static LispObject SlotExists(LispObject obj, LispObject slotName)
@@ -7950,8 +8263,8 @@ public static partial class Runtime
                     return args[0];
                 if (Startup.Sym("SLOT-MISSING").Function is LispFunction csm)
                 {
-                    csm.Invoke(new LispObject[] { ccls ?? (LispObject)Nil.Instance, cond,
-                        args[1] is Symbol ? args[1] : Startup.Sym(name), Startup.Sym("SLOT-MAKUNBOUND") });
+                    Runtime.CallForPrimary(csm, ccls ?? (LispObject)Nil.Instance, cond,
+                        args[1] is Symbol ? args[1] : Startup.Sym(name), Startup.Sym("SLOT-MAKUNBOUND"));
                     return args[0];
                 }
                 throw new LispErrorException(new LispError(
@@ -7963,7 +8276,7 @@ public static partial class Runtime
             {
                 if (Startup.Sym("SLOT-MISSING").Function is LispFunction slotMissing)
                 {
-                    slotMissing.Invoke(new LispObject[] { inst.Class, inst, args[1] is Symbol ? args[1] : Startup.Sym(name), Startup.Sym("SLOT-MAKUNBOUND") });
+                    Runtime.CallForPrimary(slotMissing, inst.Class, inst, args[1] is Symbol ? args[1] : Startup.Sym(name), Startup.Sym("SLOT-MAKUNBOUND"));
                     return args[0];
                 }
                 throw new LispErrorException(new LispError(
@@ -7972,7 +8285,7 @@ public static partial class Runtime
             // AMOP 5.4: dispatch through slot-makunbound-using-class for custom metaclasses.
             if (UsesSlotProtocol(inst.Class) && Startup.Sym("SLOT-MAKUNBOUND-USING-CLASS").Function is LispFunction smucFn)
             {
-                smucFn.Invoke(new LispObject[] { inst.Class, inst, inst.Class.EffectiveSlots[idx] });
+                Runtime.CallForPrimary(smucFn, inst.Class, inst, inst.Class.EffectiveSlots[idx]);
                 return args[0];
             }
             Runtime.SlotMakunboundDirect(inst, idx, name);
@@ -8221,6 +8534,7 @@ public static partial class Runtime
         RegClos("%MAKE-GF", a => Runtime.MakeGF(a[0], a[1]), 2);
         RegClos("%REGISTER-GF", a => Runtime.RegisterGF(a[0], a[1]), 2);
         RegClos("%FIND-GF", a => Runtime.FindGF(a[0]), 1);
+        RegClos("%REGISTER-GF-IF-ABSENT", a => Runtime.RegisterGFIfAbsent(a[0], a[1]), 2);
         RegClos("%SET-GF-LAMBDA-LIST-INFO", Runtime.SetGFLambdaListInfo);
         RegClos("%SET-METHOD-LAMBDA-LIST-INFO", Runtime.SetMethodLambdaListInfo);
         RegClos("%MAKE-METHOD", a => Runtime.MakeMethod(a[0], a[1], a[2]), 3);
@@ -8244,8 +8558,8 @@ public static partial class Runtime
         RegClos("%CAPTURED-NEXT-METHOD-P", a => Runtime.CapturedNmp(), 0);
         // defstruct intrinsics (same rationale).
         RegClos("%MAKE-STRUCT", a => Runtime.MakeStruct(a[0], a.SubArray(1)));
-        RegClos("%STRUCT-REF", a => Runtime.StructRef(a[0], a[1]), 2);
-        RegClos("%STRUCT-SET", a => Runtime.StructSet(a[0], a[1], a[2]), 3);
+        RegClos("%STRUCT-REF", a => Runtime.StructRef(a.Length > 2 ? Runtime.StructOf(a[0], a[2]) : a[0], a[1]));
+        RegClos("%STRUCT-SET", a => Runtime.StructSet(a.Length > 3 ? Runtime.StructOf(a[0], a[3]) : a[0], a[1], a[2]));
         RegClos("%CHECK-SLOT-TYPE",
                 a => Runtime.CheckSlotType(a[0], a[1], a[2], a[3]), 4);
         // Two arguments as well as three: a FASL compiled before layouts carried
@@ -8345,7 +8659,8 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("%REGISTER-STRUCT-CLASS", new LispFunction(args => {
             var name = (Symbol)args[0];
             LispClass? parentCls = null;
-            if (args.Length > 1 && args[1] is Symbol parentSym && parentSym.Name != "NIL") {
+            var parentSym = args.Length > 1 && args[1] is Symbol ps && ps.Name != "NIL" ? ps : null;
+            if (parentSym != null) {
                 parentCls = Runtime.FindClassOrNil(parentSym) as LispClass;
             }
             if (parentCls == null) {
@@ -8373,6 +8688,7 @@ public static partial class Runtime
             cls.StructSlotNames = slotNames;
             cls.FinalizeClass();
             Runtime.RegisterClass(cls);
+            name.StructParent = parentSym ?? Startup.Sym("STRUCTURE-OBJECT");
             return name;
         }));
 

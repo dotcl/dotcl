@@ -35,9 +35,30 @@ public sealed class Symbol : LispObject
         set
         {
             if (DefinitionJournal.Depth != 0) DefinitionJournal.Note(this);
+            _typedCode = 0;
             _function = value;
+            _callee = value as LispFunction;
+            if (value is LispFunction f && f._typedEntry != 0 && f.TypedEntryCode != 0)
+            {
+                System.Threading.Volatile.Write(ref _typedEntry, f._typedEntry);
+                _typedCode = f.TypedEntryCode;
+            }
+            if (FunctionWatched) FunctionWatch.Notify(this, value);
         }
     }
+
+    /// <summary>Set while DOTCL:WATCH-FDEFINITION has a watcher on this symbol.</summary>
+    internal volatile bool FunctionWatched;
+
+    // The typed entry of the function in _function and its signature code, or
+    // a code of 0: a typed call site compares the code and calls the entry
+    // (LispFunction.CallTypedSymN).
+    internal nint _typedEntry;
+    internal volatile int _typedCode;
+    internal LispObject? FunctionRaw => _function;
+    // _function when it is a LispFunction, else null: a call site takes it
+    // without the type check (CilAssembler.GetFunctionBySymbol).
+    internal volatile LispFunction? _callee;
     /// <summary>
     /// The (setf name) function for this symbol.
     /// E.g. for symbol CAR, SetfFunction holds the function defined by (defun (setf car) ...).
@@ -93,6 +114,15 @@ public sealed class Symbol : LispObject
 
     /// <summary>The TYPEP test built for this symbol (Runtime.SymbolTypeTest).</summary>
     internal volatile Runtime.SymbolTypeTestMemo? TypeTestMemo;
+
+    private volatile Symbol? _structParent;
+
+    /// <summary>This structure type's :INCLUDE parent, or null if not a structure.</summary>
+    public Symbol? StructParent
+    {
+        get => _structParent;
+        set => _structParent = value;
+    }
     public bool IsSpecial { get; set; }
 
     // True once this symbol has ever been dynamically bound (LET of a special,
@@ -178,6 +208,41 @@ public sealed class Symbol : LispObject
 /// a function another thread defines meanwhile (a REPL next to a SLIME or SLY
 /// worker that compiles a file) is not part of that and has to stay.
 /// </summary>
+/// <summary>Watchers of a symbol's global function definition
+/// (DOTCL:WATCH-FDEFINITION): each one is called with the symbol and the new
+/// definition (NIL when it was removed) after every change.</summary>
+internal static class FunctionWatch
+{
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Symbol, LispObject>
+        s_watchers = new(ReferenceEqualityComparer.Instance);
+
+    internal static LispObject Watch(LispObject[] args)
+    {
+        if (args.Length != 2) throw new LispErrorException(new LispProgramError(
+            "WATCH-FDEFINITION: expects a symbol and a function or NIL"));
+        if (args[0] is not Symbol sym)
+            throw new LispErrorException(new LispTypeError(
+                "WATCH-FDEFINITION: not a symbol", args[0]));
+        if (args[1] is Nil)
+        {
+            sym.FunctionWatched = false;
+            s_watchers.TryRemove(sym, out _);
+        }
+        else
+        {
+            s_watchers[sym] = args[1];
+            sym.FunctionWatched = true;
+        }
+        return args[1];
+    }
+
+    internal static void Notify(Symbol sym, LispObject? value)
+    {
+        if (s_watchers.TryGetValue(sym, out var watcher))
+            Runtime.Funcall(watcher, sym, value ?? Nil.Instance);
+    }
+}
+
 internal static class DefinitionJournal
 {
     internal sealed class Window

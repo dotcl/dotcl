@@ -42,7 +42,7 @@ internal static class DotNetNuGet
         int loaded = 0;
         foreach (var dll in FindDlls(versionDir))
         {
-            System.Reflection.Assembly.LoadFrom(dll);
+            RuntimeLoadContext.LoadFrom(dll);
             loaded++;
         }
 

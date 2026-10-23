@@ -207,7 +207,7 @@ public static class DotclHost
             throw new ArgumentException("LoadCore: the core image is empty", nameof(coreImage));
 
         if (coreImage.Length >= 2 && coreImage[0] == 0x4D && coreImage[1] == 0x5A)
-            RunCoreModuleInit(System.Reflection.Assembly.Load(coreImage), "FASL core (in memory)");
+            RunCoreModuleInit(RuntimeLoadContext.LoadBytes(coreImage), "FASL core (in memory)");
         else
             RunCoreSil(System.Text.Encoding.UTF8.GetString(coreImage), "core (in memory)");
 
@@ -216,7 +216,7 @@ public static class DotclHost
     }
 
     private static void LoadCoreFasl(string filePath)
-        => RunCoreModuleInit(System.Reflection.Assembly.LoadFrom(filePath), $"FASL core {filePath}");
+        => RunCoreModuleInit(RuntimeLoadContext.LoadFrom(filePath), $"FASL core {filePath}");
 
     /// <summary>Call a loaded core assembly's CompiledModule.ModuleInit, restoring
     /// *PACKAGE* afterwards. WHAT names the core in errors.</summary>

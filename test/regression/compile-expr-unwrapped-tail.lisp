@@ -45,3 +45,30 @@
    (let ((r (car (%ceut-nested 1))))
      (values r (%ceut-if-tail nil))))
   (7 (1)))
+
+;;; Compiling a chain of nested LETs analyses each level without walking the
+;;; levels below it again: doubling the depth does not quadruple the work.
+(defun %ceut-id (x) x)
+
+(defun %ceut-chain (n read-p)
+  (let* ((vars (loop repeat n collect (gensym)))
+         (form (if read-p `(%ceut-id ,(car (last vars))) '(%ceut-two))))
+    (loop for (v prev) on (reverse vars)
+          do (setq form `(let ((,v ,(if (and read-p prev) `(%ceut-id ,prev) 0))) ,form)))
+    `(lambda () (list ,form))))
+
+(defun %ceut-normalize-calls (n read-p)
+  (let* ((name (find-symbol "%LET-SUBST-NORMALIZE" "DOTCL.CIL-COMPILER"))
+         (orig (symbol-function name))
+         (calls 0))
+    (setf (symbol-function name) (lambda (form) (incf calls) (funcall orig form)))
+    (unwind-protect (compile nil (%ceut-chain n read-p))
+      (setf (symbol-function name) orig))
+    calls))
+
+(deftest-emitting-only compile-expr-unwrapped-tail.deep-linear
+  (loop for read-p in '(nil t)
+        collect (let ((a (%ceut-normalize-calls 100 read-p))
+                      (b (%ceut-normalize-calls 200 read-p)))
+                  (<= b (+ 10 (* 3 a)))))
+  (t t))

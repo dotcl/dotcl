@@ -48,15 +48,18 @@ bench-state.json
 !scripts/fasl-shape-check.sh
 !scripts/build-quicklisp.sh
 !scripts/contrib-resolve.sh
+!scripts/drop-stale-fasls.sh
 !scripts/check-host-defs.sh
 !scripts/dist-package.sh
 !ci/d-number.sh
 !ci/mirror-scrub-workflows.sh
+!ci/windows-ci.sh
 !test/ansi-failures.sh
 !test/ansi-gate.sh
 !bench/cl-bench-runner/make-state.sh
 !bench/gate/check-ratios.sh
 !bench/il-parity/check-counts.sh
+!bench/coalton/compare.sh
 !bench/sil-shapes/count-sil.sh
 !bench/csharp-parity/make-parity-state.sh
 !bench/gate/process-modes.sh
@@ -72,6 +75,8 @@ bench-state.json
 !bench/library-status/dists.sh
 !bench/library-status/runtime.sh
 !bench/library-status/ffi/run.sh
+!bench/ledger/run.sh
+!bench/ledger/remote.sh
 !samples/**/*.sh
 !test/*/check.sh
 !test/pack-nuspec/tool-deps.sh

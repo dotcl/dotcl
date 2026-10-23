@@ -62,3 +62,38 @@
         (%idm-count "%IDM-F" (%idm-sil #'%idm-inside))
         (%idm-count "%IDM-ADD32" (%idm-sil #'%idm-outside)))
   (0 0 0))
+
+;; Wanted as a raw integer (an operand of LOGXOR assigned to a typed local),
+;; the substituted body, MACROLET and all, gives its value unboxed.
+(defun %idm-mix (n s)
+  (declare (fixnum n) (type (simple-array (unsigned-byte 32) (*)) s))
+  (let ((l 1) (r 2))
+    (declare (type (unsigned-byte 32) l r))
+    (dotimes (i n)
+      (setf r (logxor r (%idm-f l s))
+            l (logxor l (%idm-f r s))))
+    (+ l r)))
+
+(defun %idm-mix-called (n s)
+  (declare (notinline %idm-f))
+  (let ((l 1) (r 2))
+    (dotimes (i n)
+      (setf r (logxor r (%idm-f l s))
+            l (logxor l (%idm-f r s))))
+    (+ l r)))
+
+(deftest inline-defun-in-macrolet.raw-value
+  (list (%idm-mix 3 *idm-s*) (%idm-mix 7 *idm-s*)
+        (%idm-mix-called 3 *idm-s*) (%idm-mix-called 7 *idm-s*))
+  (83 319 83 319))
+
+(defparameter *idm-big*
+  (make-array 8 :element-type '(unsigned-byte 32)
+                :initial-contents '(#x80000001 #x90000002 #xa0000003 #xb0000004
+                                    #xc0000005 #xd0000006 #xe0000007 #xf0000008)))
+
+;; The values are past the small-integer cache, so a boxed result would cost an
+;; allocation per call.
+(deftest-compiled-only inline-defun-in-macrolet.raw-value-no-consing
+  (< (bytes-per-op (lambda (n) (%idm-mix n *idm-big*))) 4)
+  t)
