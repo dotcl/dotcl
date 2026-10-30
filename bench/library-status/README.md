@@ -102,9 +102,10 @@ and why, since each rule below came from something that went wrong:
 - **Use a checkout dedicated to the run.** dotcl keeps a separate worktree for
   library bring-up precisely so that a build in the main tree cannot fight it
   over the same runtime DLLs. Build it first (`make cross-compile build
-  bench-build compile-core-fasl compile-contrib-fasls`) so that the FASLs and the runtime come
+  bench-build compile-core-fasl refresh-fasls`) so that the FASLs and the runtime come
   from the same commit -- a stale `cil-out.sil` against a fresh `runtime.dll`
-  produces failures that belong to neither.
+  produces failures that belong to neither. `make library-status` and
+  `make library-status-tests` run `refresh-fasls` themselves.
 - **Measure the Release runtime.** That is the build a user runs, and a Debug
   build of the runtime is several times slower on the same work (the JIT
   treats a Debug assembly as debuggable), enough to turn a library that loads
@@ -149,10 +150,15 @@ and why, since each rule below came from something that went wrong:
 - Clear the FASL cache and any cached ASDF output between versions of dotcl, or
   a rebuilt compiler will be measured through yesterday's FASLs. Three places
   hold them: the ASDF cache (keyed by dotcl version, so it takes care of
-  itself), FASLs sitting next to dist sources, and `contrib/*/*.fasl` -- the
-  last is the one that bites, because dotcl only *warns* that a contrib FASL
-  came from another core and then uses it anyway. `make compile-contrib-fasls`
-  before a run.
+  itself), FASLs sitting next to dist sources, and `contrib/*/*.fasl`, which
+  includes `contrib/asdf/asdf.fasl` and `contrib/quicklisp/quicklisp.fasl`.
+  A contrib FASL built against other runtime source is passed over with a
+  warning (`;; warning: ignoring ...: built against other runtime source`) and
+  the source is loaded instead, so every row compiles ASDF and the Quicklisp
+  client again and its time roughly doubles. `make refresh-fasls` rebuilds
+  exactly those (`compile-asdf-fasl`, `compile-quicklisp-fasl` and
+  `compile-contrib-fasls` go by file dates only and miss a runtime-only
+  change). The three measuring scripts stop when one is left (`runtime.sh`).
 
 Write one JSON object per system tried:
 
@@ -163,7 +169,8 @@ Write one JSON object per system tried:
    "status": "load-only",
    "issue": null,
    "checked": "2026-09-14",
-   "note": ""}
+   "note": "",
+   "native": null}
 ]
 ```
 
@@ -175,6 +182,7 @@ Write one JSON object per system tried:
 | `issue` | the issue tracking the failure, or `null` |
 | `checked` | the date of the measurement, `YYYY-MM-DD` |
 | `note` | one short line: what failed, which test framework ran, why it is patched |
+| `native` | optional: the native library or header the log named, when that is what stopped the system, otherwise `null` |
 
 The table is published, so **`issue` must name an issue in the public
 `dotcl/dotcl` repository**. Anything tracked where a reader of the table cannot
@@ -183,6 +191,16 @@ open it leaves the field `null` and explains itself in `note` instead.
 `note` is a **machine field**: every run rewrites it from what that run saw. Do
 not put a worked-out reason there -- the next measurement erases it. Reasons go
 in `annotations.json` (below), which no run opens.
+
+`native` is written from the whole log, not from the shortened note. CFFI says
+`Unable to load any of the alternatives: (libyaml.dylib libyaml-0.2.dylib)` or
+`Unable to load foreign library (BRIDGE)`, a cffi-grovel C compile names a
+missing header (`fatal error: ft2build.h: No such file or directory`), and
+`native.sh` turns those into a name such as `libyaml.dylib`, `BRIDGE` or
+`ft2build.h`. A grovel compile that failed without the compiler line left in
+the log is recorded as `C compiler`. The table shows such a row as `native`
+instead of `fail`, so a package missing on the measuring host does not read as
+a dotcl failure.
 
 Error text carries whatever path the failure happened under, which is the
 measuring machine's home directory and checkout, and sometimes the build that
@@ -286,6 +304,11 @@ Each system gets one verdict in `tests.json`:
 | `no-tests` | the run finished and there was nothing to run: neither `test-op` nor the test systems it depends on have a primary `perform` method of the library's own (only ASDF's empty default; `:around` methods such as the one LIFT adds to every system do not count), a test system it names is in no dist and has no `.asd` in the release, or hu.dwim.asdf reported that no tests were run |
 | `timeout` | the bound (`LIBRARY_STATUS_TEST_TIMEOUT`, default 900 s) was hit |
 | `load-fail` | the system or one of its test systems did not load |
+
+A test entry also carries the optional `native` field described in stage 2 when
+the log shows a missing foreign library or header. The row is then shown as
+`native` rather than `load-only`, and the tests column says which native library
+or header was missing.
 
 **Only `pass` turns a row into `ok`.** `no-result` is the verdict this stage
 exists to keep separate: a `test-op` that runs nothing, or a framework with no
@@ -419,6 +442,17 @@ The `note` column is rendered as a code span, because it holds raw error text
 and Markdown reads raw error text: `Unbound variable: *SYSDEP-FILES*` came out
 as "Unbound variable: SYSDEP-FILES" in italics until it did. The `why` column
 beside it is the hand-written sentence from `annotations.json`.
+
+A failure whose log shows a missing foreign library or header is rendered as
+`native`, not `fail`, and the status cell names the library (or says
+`library not named`). The native field is used when the entry has one; entries
+written before it existed are classified from `note`, so the committed results
+did not have to be measured again. When the SBCL result for the same system
+failed at the same stage for the same native reason, the cell says `SBCL too`,
+which is the quickest way to see that the measuring machine, not dotcl, is what
+is missing. A test suite blocked this way is shown in the tests column as
+`native: ...`. The summary line printed after rendering counts `native`
+separately from `fail`.
 
 Inputs and outputs all have defaults relative to this directory and can be
 overridden: `LIBRARY_STATUS_JSON`, `LIBRARY_STATUS_TARGETS`,

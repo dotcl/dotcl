@@ -360,6 +360,13 @@ public static partial class Runtime
             || inner is HandlerCaseInvocationException || inner is RestartInvocationException
             || inner is LispErrorException)
             System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(inner).Throw();
+        // Signalled already, inside a callback this call made.
+        var signalled = inner != null ? AlreadySignalled(inner) : null;
+        if (signalled != null)
+        {
+            if (signalled is LispErrorException lee) return lee;
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(signalled).Throw();
+        }
         return new LispErrorException(new LispError($"{context}: {inner?.Message ?? outer.Message}")
         {
             ClrExceptionType = inner?.GetType(),
@@ -1528,6 +1535,15 @@ public static partial class Runtime
             return elem?.MakeByRefType();
         }
 
+        // A name with type arguments, array ranks or pointer marks whose parts
+        // Type.GetType cannot all find (it looks only in corelib and the calling
+        // assembly): resolve each part by this same search.
+        if (typeName.IndexOf('[') >= 0)
+        {
+            var structured = ResolveStructuredTypeName(typeName);
+            if (structured != null) return structured;
+        }
+
         // Strip ", AssemblyName" suffix before searching loaded assemblies with GetType(),
         // which only accepts unqualified type names.
         string bareTypeName = typeName;
@@ -1612,6 +1628,125 @@ public static partial class Runtime
         return null;
     }
 
+    private static Type? ResolveStructuredTypeName(string s)
+    {
+        try
+        {
+            int i = 0;
+            var t = ParseTypeName(s, ref i, true, false);
+            while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+            return i == s.Length ? t : null;
+        }
+        catch (Exception e) when (e is ArgumentException || e is InvalidOperationException
+                                  || e is NotSupportedException || e is TypeLoadException
+                                  || e is System.IO.IOException || e is BadImageFormatException)
+        {
+            return null;
+        }
+    }
+
+    private static Type? ParseTypeName(string s, ref int i, bool allowAssembly, bool inBracket)
+    {
+        while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+        int start = i;
+        while (i < s.Length && "[],&*".IndexOf(s[i]) < 0) i++;
+        string name = s.Substring(start, i - start).Trim();
+        if (name.Length == 0) return null;
+
+        List<Type?>? genericArgs = null;
+        var marks = new List<int>();   // -1 byref, 0 pointer, 1 vector, n>1 array rank
+        while (i < s.Length)
+        {
+            char c = s[i];
+            if (c == '&') { marks.Add(-1); i++; }
+            else if (c == '*') { marks.Add(0); i++; }
+            else if (c == '[')
+            {
+                int j = i + 1;
+                while (j < s.Length && char.IsWhiteSpace(s[j])) j++;
+                if (j < s.Length && (s[j] == ']' || s[j] == ','))
+                {
+                    int rank = 1;
+                    while (j < s.Length && s[j] == ',') { rank++; j++; }
+                    if (j >= s.Length || s[j] != ']') return null;
+                    i = j + 1;
+                    marks.Add(rank);
+                }
+                else
+                {
+                    if (genericArgs != null || marks.Count > 0) return null;
+                    i++;
+                    genericArgs = new List<Type?>();
+                    while (true)
+                    {
+                        while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+                        bool wrapped = i < s.Length && s[i] == '[';
+                        if (wrapped) i++;
+                        genericArgs.Add(ParseTypeName(s, ref i, wrapped, wrapped));
+                        if (wrapped)
+                        {
+                            while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+                            if (i >= s.Length || s[i] != ']') return null;
+                            i++;
+                        }
+                        while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+                        if (i < s.Length && s[i] == ',') { i++; continue; }
+                        break;
+                    }
+                    if (i >= s.Length || s[i] != ']') return null;
+                    i++;
+                }
+            }
+            else break;
+        }
+
+        string? assembly = null;
+        if (allowAssembly && i < s.Length && s[i] == ',')
+        {
+            int a = i + 1;
+            int end = a;
+            while (end < s.Length && !(inBracket && s[end] == ']')) end++;
+            assembly = s.Substring(a, end - a).Trim();
+            i = end;
+        }
+
+        Type? t;
+        if (genericArgs != null)
+        {
+            foreach (var ga in genericArgs) if (ga == null) return null;
+            string def = name.IndexOf('`') >= 0 ? name : name + "`" + genericArgs.Count;
+            var open = ResolveTypeNamePart(def, assembly);
+            if (open == null || !open.IsGenericTypeDefinition
+                || open.GetGenericArguments().Length != genericArgs.Count) return null;
+            t = open.MakeGenericType(genericArgs.ToArray()!);
+        }
+        else t = ResolveTypeNamePart(name, assembly);
+        if (t == null) return null;
+
+        foreach (int m in marks)
+            t = m == -1 ? t.MakeByRefType()
+              : m == 0 ? t.MakePointerType()
+              : m == 1 ? t.MakeArrayType()
+              : t.MakeArrayType(m);
+        return t;
+    }
+
+    private static Type? ResolveTypeNamePart(string name, string? assembly)
+    {
+        if (!string.IsNullOrEmpty(assembly))
+        {
+            try
+            {
+                var asm = System.Reflection.Assembly.Load(new System.Reflection.AssemblyName(assembly));
+                var t = asm.GetType(name);
+                if (t != null) return t;
+            }
+            catch (Exception e) when (e is System.IO.IOException || e is ArgumentException
+                                      || e is BadImageFormatException) { }
+        }
+        return SearchDotNetType(name, out _);
+    }
+
     [ThreadStatic] private static bool _inTypeAliasLookup;
 
     /// <summary>
@@ -1659,7 +1794,8 @@ public static partial class Runtime
     /// could itself be a string or boxed primitive (which would NOT be a
     /// LispDotNetObject). The compiler macro uses this to lower a method chain
     /// (dotnet:invoke (dotnet:invoke r "Inner" ...) "Outer" ...) without an explicit
-    /// THE on the inner result. Args: (typeName methodName paramTypeList).
+    /// THE on the inner result. Args: (typeName methodName paramTypeList [static]);
+    /// a true STATIC resolves a static member (method, getter or field) instead.
     /// </summary>
     public static LispObject DotNetMethodReturnType(LispObject[] args)
     {
@@ -1686,14 +1822,77 @@ public static partial class Runtime
             paramTypes[i] = pt;
         }
 
-        System.Reflection.MethodInfo? m;
-        try { m = t.GetMethod(methodName, paramTypes); }
-        catch { return Nil.Instance; }          // ambiguous overload, etc.
-        if (m == null) return Nil.Instance;
-
-        var rt = m.ReturnType;
+        bool isStatic = args.Length >= 4 && args[3] is not Nil;
+        var rt = (isStatic ? ResolveTypedStaticMember(t, methodName, paramTypes)
+                           : ResolveTypedInstanceMember(t, methodName, paramTypes)) switch
+        {
+            System.Reflection.MethodInfo mi => mi.ReturnType,
+            System.Reflection.FieldInfo fi => fi.FieldType,
+            _ => null,
+        };
+        if (rt == null) return Nil.Instance;
         if (!IsDirectableReturnType(rt) || rt.FullName == null) return Nil.Instance;
         return new LispString(rt.FullName);
+    }
+
+    /// <summary>The instance method a typed DOTNET:INVOKE on static type T names, or
+    /// null. NAME is a method, or a property or indexer (its getter) as the dynamic
+    /// path accepts it without a get_ prefix. An interface type also answers for the
+    /// members of the interfaces it extends, when exactly one of them has the member:
+    /// reflection on an interface type does not look there.</summary>
+    internal static System.Reflection.MethodInfo? ResolveTypedInstanceMember(Type t, string name, Type[] paramTypes)
+    {
+        var m = TypedMemberOn(t, name, paramTypes);
+        if (m != null || !t.IsInterface) return m;
+        foreach (var i in t.GetInterfaces())
+        {
+            var found = TypedMemberOn(i, name, paramTypes);
+            if (found == null) continue;
+            if (m != null && m != found) return null;
+            m = found;
+        }
+        return m;
+    }
+
+    /// <summary>The static member a typed DOTNET:STATIC on type T names, or null:
+    /// a method, a property or indexer getter named without get_, or (with no
+    /// arguments) a field. Only T's own statics, as the dynamic path finds them.</summary>
+    internal static System.Reflection.MemberInfo? ResolveTypedStaticMember(Type t, string name, Type[] paramTypes)
+    {
+        const System.Reflection.BindingFlags flags =
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static;
+        // A type defined at run time can be redefined; the dynamic path looks
+        // it up again at each call.
+        if (t.ContainsGenericParameters || t.Assembly.IsDynamic) return null;
+        try
+        {
+            var m = t.GetMethod(name, flags, null, paramTypes, null);
+            if (m == null)
+            {
+                var getter = t.GetMethod("get_" + name, flags, null, paramTypes, null);
+                if (getter is { IsSpecialName: true }) m = getter;
+            }
+            if (m != null) return m.ContainsGenericParameters ? null : m;
+            if (paramTypes.Length == 0) return t.GetField(name, flags);
+        }
+        catch (System.Reflection.AmbiguousMatchException) { }
+        return null;
+    }
+
+    private static System.Reflection.MethodInfo? TypedMemberOn(Type t, string name, Type[] paramTypes)
+    {
+        System.Reflection.MethodInfo? m;
+        try
+        {
+            m = t.GetMethod(name, paramTypes);
+            if (m == null)
+            {
+                var getter = t.GetMethod("get_" + name, paramTypes);
+                if (getter is { IsSpecialName: true }) m = getter;
+            }
+        }
+        catch (System.Reflection.AmbiguousMatchException) { return null; }
+        return m is { IsStatic: false } ? m : null;
     }
 
     /// <summary>
@@ -1774,6 +1973,20 @@ public static partial class Runtime
             SingleFloat sf => sf.Value,
             _ => null
         };
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static object? DirectReceiver(LispObject recv, Type type)
+        => recv is LispDotNetObject d ? d.Value : DirectReceiverSlow(recv, type);
+
+    private static object? DirectReceiverSlow(LispObject recv, Type type)
+    {
+        var value = LispToDotNet(recv, type);
+        if (value == null)
+            throw new LispErrorException(new LispTypeError(
+                "DOTNET:INVOKE: first argument must be a .NET object, string, character or number",
+                recv));
+        return value;
+    }
 
     private static object?[] LispArgsToDotNetGeneric(LispObject[] lispArgs)
     {
@@ -1907,24 +2120,36 @@ public static partial class Runtime
         Type type, string name, object? target, object?[] callArgs, bool isStatic, out object? result)
     {
         result = null;
+        return InvokeKeyFor(type, name, callArgs) is { } key
+            && TryCachedInvoke(key, target, callArgs, isStatic, out result);
+    }
 
-        // COM IDispatch: every __ComObject shares one Type but resolves members
-        // per-object. Caching by Type would serve another object's dispatch.
-        if (type.IsCOMObject) return false;
-
-        // A null arg has no runtime type -> can't key it or overload-resolve it; let
-        // InvokeMember's binder handle null matching.
+    /// <summary>The cache key for a call, or null when the call cannot be cached.
+    /// COM IDispatch: every __ComObject shares one Type but resolves members
+    /// per-object, so caching by Type would serve another object's dispatch. A
+    /// null arg has no runtime type, so it can't key or overload-resolve the call;
+    /// InvokeMember's binder handles null matching.</summary>
+    private static InvokeKey? InvokeKeyFor(Type type, string name, object?[] callArgs)
+    {
+        if (type.IsCOMObject) return null;
         var argTypes = new Type[callArgs.Length];
         for (int i = 0; i < callArgs.Length; i++)
         {
-            if (callArgs[i] is null) return false;
+            if (callArgs[i] is null) return null;
             argTypes[i] = callArgs[i]!.GetType();
         }
+        return new InvokeKey(type, name, argTypes);
+    }
 
-        var key = new InvokeKey(type, name, argTypes);
+    private static bool TryCachedInvoke(
+        InvokeKey key, object? target, object?[] callArgs, bool isStatic, out object? result)
+    {
+        result = null;
+        var type = key.Owner;
+        var name = key.Name;
         if (!_invokeMethodCache.TryGetValue(key, out var method))
         {
-            method = ResolveCacheableMethod(type, name, argTypes, isStatic);
+            method = ResolveCacheableMethod(type, name, key.ArgTypes, isStatic);
             _invokeMethodCache[key] = method;
         }
         if (method is null) return false;
@@ -1971,19 +2196,30 @@ public static partial class Runtime
 
     /// <summary>Pick the method InvokeMember's default binder would select, but only
     /// when it is a plain fixed-arity method (no params / by-ref params, not a
-    /// generic definition). Returns null otherwise so the caller keeps the
-    /// InvokeMember path (which also handles property/field access and #24 optional
-    /// defaults).</summary>
+    /// generic definition). With no method of that name, the same for the getter
+    /// of a property or indexer of that name, which InvokeMember tries next.
+    /// Returns null otherwise so the caller keeps the InvokeMember path (which
+    /// also handles field access and #24 optional defaults).</summary>
     private static System.Reflection.MethodInfo? ResolveCacheableMethod(
         Type type, string name, Type[] argTypes, bool isStatic)
     {
         var flags = System.Reflection.BindingFlags.Public
             | (isStatic ? System.Reflection.BindingFlags.Static : System.Reflection.BindingFlags.Instance);
+        var methods = type.GetMethods(flags);
+        if (!methods.Any(m => m.Name == name))
+            return SelectCacheableMethod(methods, "get_" + name, argTypes, flags, getter: true);
+        return SelectCacheableMethod(methods, name, argTypes, flags, getter: false);
+    }
 
+    private static System.Reflection.MethodInfo? SelectCacheableMethod(
+        System.Reflection.MethodInfo[] methods, string name, Type[] argTypes,
+        System.Reflection.BindingFlags flags, bool getter)
+    {
         System.Collections.Generic.List<System.Reflection.MethodBase>? candidates = null;
-        foreach (var m in type.GetMethods(flags))
+        foreach (var m in methods)
         {
             if (m.Name != name || m.IsGenericMethodDefinition) continue;
+            if (getter && !m.IsSpecialName) continue;
             var ps = m.GetParameters();
             if (ps.Length != argTypes.Length) continue;          // omitted optionals -> InvokeMember
             bool ok = true;
@@ -2422,6 +2658,13 @@ public static partial class Runtime
             && TryInvokeWithMarshalledArgs(type, memberName, target, args.Skip(2).ToArray(), false, out var pre))
             return DotNetToLisp(pre);
 
+        // A call InvokeMember has already failed to find goes straight to the
+        // fallbacks instead of throwing MissingMethodException again.
+        InvokeKey? missKey = InvokeKeyFor(type, memberName, callArgs);
+        if (missKey is { } seen && _invokeMemberMisses.ContainsKey(seen)
+            && TryInvokeAfterMiss(type, memberName, target, args, callArgs, out var again))
+            return again;
+
         try
         {
             // A COM object cast to a vtable interface (IConnectionPoint) may have no
@@ -2432,37 +2675,16 @@ public static partial class Runtime
                     || (args.Length == 2
                         && TryInvokeWithMarshalledArgs(comHint, "get_" + memberName, target, args.Skip(2).ToArray(), false, out viaIface))))
                 return DotNetToLisp(viaIface);
-            if (TryCachedInvoke(type, memberName, target, callArgs, false, out var cached))
+            if (missKey is { } key && TryCachedInvoke(key, target, callArgs, false, out var cached))
                 return DotNetToLisp(cached);
             var result = type.InvokeMember(memberName, InstanceReadFlags, null, target, callArgs);
             return DotNetToLisp(result);
         }
         catch (MissingMethodException)
         {
-            // No exact overload: retry allowing omitted C# optional parameters (#24).
-            if (TryInvokeWithOptionalDefaults(type, memberName, target, args.Skip(2).ToArray(), false, out var r))
-                return DotNetToLisp(r);
-            // Or retry marshalling each arg to a candidate's declared param types
-            // (e.g. Lisp list -> T[]), which the binder's runtime-type match misses.
-            if (TryInvokeWithMarshalledArgs(type, memberName, target, args.Skip(2).ToArray(), false, out var r2))
-                return DotNetToLisp(r2);
-            // A member of an interface the type implements explicitly. Tried before
-            // extension methods: it is the object's own member, where an extension
-            // method is someone else's static function that happens to accept it.
-            if (TryInvokeInterfaceMember(type, (args[0] as LispDotNetBoxed)?.HintType,
-                                         memberName, target, callArgs, InstanceReadFlags, out var iface))
-                return DotNetToLisp(iface);
-            // Last resort: an extension method (e.g. LINQ's Enumerable.Where);
-            // a static method elsewhere whose first parameter accepts the receiver.
-            try
-            {
-                if (TryInvokeExtensionMethod(type, memberName, target, args.Skip(2).ToArray(), out var ext))
-                    return DotNetToLisp(ext);
-            }
-            catch (System.Reflection.TargetInvocationException etie)
-            {
-                throw DotNetInvokeError($"DOTNET:INVOKE {type.Name}.{memberName} (extension)", etie);
-            }
+            if (missKey is { } k) _invokeMemberMisses.TryAdd(k, 0);
+            if (TryInvokeAfterMiss(type, memberName, target, args, callArgs, out var r))
+                return r;
             throw;
         }
         catch (NotSupportedException)
@@ -2481,6 +2703,45 @@ public static partial class Runtime
             // not wrapped in TargetInvocationException.
             throw DotNetInvokeError($"DOTNET:INVOKE {type.Name}.{memberName}", ce, ce);
         }
+    }
+
+    // Keys (type, name, argument types) for which InvokeMember raised
+    // MissingMethodException. A type's members do not change, so the answer does
+    // not either.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<InvokeKey, byte>
+        _invokeMemberMisses = new();
+
+    /// <summary>The ways DOTNET:INVOKE tries a member once InvokeMember has not
+    /// found it, in order. False when none applies.</summary>
+    private static bool TryInvokeAfterMiss(Type type, string memberName, object target,
+        LispObject[] args, object?[] callArgs, out LispObject result)
+    {
+        result = Nil.Instance;
+        // No exact overload: retry allowing omitted C# optional parameters (#24).
+        if (TryInvokeWithOptionalDefaults(type, memberName, target, args.Skip(2).ToArray(), false, out var r))
+        { result = DotNetToLisp(r); return true; }
+        // Or retry marshalling each arg to a candidate's declared param types
+        // (e.g. Lisp list -> T[]), which the binder's runtime-type match misses.
+        if (TryInvokeWithMarshalledArgs(type, memberName, target, args.Skip(2).ToArray(), false, out var r2))
+        { result = DotNetToLisp(r2); return true; }
+        // A member of an interface the type implements explicitly. Tried before
+        // extension methods: it is the object's own member, where an extension
+        // method is someone else's static function that happens to accept it.
+        if (TryInvokeInterfaceMember(type, (args[0] as LispDotNetBoxed)?.HintType,
+                                     memberName, target, callArgs, InstanceReadFlags, out var iface))
+        { result = DotNetToLisp(iface); return true; }
+        // Last resort: an extension method (e.g. LINQ's Enumerable.Where);
+        // a static method elsewhere whose first parameter accepts the receiver.
+        try
+        {
+            if (TryInvokeExtensionMethod(type, memberName, target, args.Skip(2).ToArray(), out var ext))
+            { result = DotNetToLisp(ext); return true; }
+        }
+        catch (System.Reflection.TargetInvocationException etie)
+        {
+            throw DotNetInvokeError($"DOTNET:INVOKE {type.Name}.{memberName} (extension)", etie);
+        }
+        return false;
     }
 
     // --- Extension-method fallback (dotcl/dotcl#45) ---
@@ -3236,6 +3497,16 @@ public static partial class Runtime
     /// <see cref="ParsedClassSpec"/>. Behavior-preserving extraction of the old
     /// inline parsing so %save-library can reuse it per class.
     /// </summary>
+    [ThreadStatic] private static HashSet<string>? _libraryTypeNames;
+
+    /// <summary>A member type of a class spec. A name that is one of the classes
+    /// of the library being saved stands for that class, which does not exist
+    /// yet: the emitter binds it once the type is being built.</summary>
+    private static Type ResolveClassSpecType(string name)
+        => _libraryTypeNames != null && _libraryTypeNames.Contains(name)
+            ? new Emitter.DynamicClassBuilder.LibraryTypeRef(name)
+            : ResolveDotNetType(name);
+
     private static ParsedClassSpec ParseClassSpec(LispObject[] a)
     {
         string fullName = NameArg(a[0]);
@@ -3263,7 +3534,7 @@ public static partial class Runtime
 
                 string fname = NameArg(nameObj);
                 string tname = NameArg(typeObj);
-                fields.Add((fname, ResolveDotNetType(tname)));
+                fields.Add((fname, ResolveClassSpecType(tname)));
                 cur = c.Cdr;
             }
         }
@@ -3312,7 +3583,7 @@ public static partial class Runtime
 
                 string mname = NameArg(nameObj);
                 string rname = NameArg(retObj);
-                Type rtype = rname == "System.Void" ? typeof(void) : ResolveDotNetType(rname);
+                Type rtype = rname == "System.Void" ? typeof(void) : ResolveClassSpecType(rname);
 
                 var paramTypes = new List<Type>();
                 var pcur = paramListObj;
@@ -3320,11 +3591,11 @@ public static partial class Runtime
                 {
                     var ptObj = pc.Car;
                     string ptname = NameArg(ptObj);
-                    paramTypes.Add(ResolveDotNetType(ptname));
+                    paramTypes.Add(ResolveClassSpecType(ptname));
                     pcur = pc.Cdr;
                 }
 
-                if (lambdaObj is not LispFunction)
+                if (lambdaObj is not LispFunction && lambdaObj is not Symbol)
                     throw new LispErrorException(new LispTypeError(
                         "DOTNET:%DEFINE-CLASS: method body must be a function",
                         lambdaObj));
@@ -3419,7 +3690,7 @@ public static partial class Runtime
                 string pname = NameArg(nameObj);
                 string tname = NameArg(typeObj);
                 bool notify = notifyObj != Nil.Instance;
-                propertySpecs.Add((pname, ResolveDotNetType(tname), notify));
+                propertySpecs.Add((pname, ResolveClassSpecType(tname), notify));
                 cur = c.Cdr;
             }
         }
@@ -3454,7 +3725,7 @@ public static partial class Runtime
 
                 string ename = NameArg(nameObj);
                 string tname = NameArg(typeObj);
-                eventSpecs.Add((ename, ResolveDotNetType(tname)));
+                eventSpecs.Add((ename, ResolveClassSpecType(tname)));
                 cur = c.Cdr;
             }
         }
@@ -3506,7 +3777,7 @@ public static partial class Runtime
                 var paramTypesObj = rest1 is Cons r1 ? r1.Car : Nil.Instance;
                 var baseIndicesObj = (rest1 is Cons r1b && r1b.Cdr is Cons r2b) ? r2b.Car : Nil.Instance;
 
-                if (lambdaObj is not LispFunction && lambdaObj != Nil.Instance)
+                if (lambdaObj is not LispFunction && lambdaObj is not Symbol && lambdaObj != Nil.Instance)
                     throw new LispErrorException(new LispTypeError(
                         "DOTNET:%DEFINE-CLASS: ctor-spec body must be a function or nil", lambdaObj));
 
@@ -3517,7 +3788,7 @@ public static partial class Runtime
                 while (pcur is Cons pc)
                 {
                     string ptname = NameArg(pc.Car);
-                    paramTypes.Add(ResolveDotNetType(ptname));
+                    paramTypes.Add(ResolveClassSpecType(ptname));
                     pcur = pc.Cdr;
                 }
 
@@ -3592,6 +3863,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:%DEFINE-CLASS: requires 1-13 arguments (full-name &optional base-type-name field-specs attr-specs method-specs ctor-body property-specs interface-specs event-specs ctor-param-types base-ctor-arg-indices ctor-specs-list save-to-path)"));
 
+        _libraryTypeNames = null;
         var s = ParseClassSpec(args);
         string fullName = s.FullName;
 
@@ -3740,6 +4012,9 @@ public static partial class Runtime
     ///       a public interface of abstract method signatures.
     ///   (:delegate full-name return-type-name (param-type-name...)): a public
     ///       delegate (callback) type of the given signature.
+    ///   (:bake (defun name ...)...): functions compiled into the library. A
+    ///       static method-spec whose body is NAME (a symbol, not a function)
+    ///       calls it, and the library then needs no Lisp at run time.
     /// Unlike class facades, enums / const holders / structs / interfaces /
     /// delegates are pure metadata: standalone, needing no runtime/Lisp. Returns
     /// the save-path on success. The saved CLASS types are facades dispatching to
@@ -3782,6 +4057,16 @@ public static partial class Runtime
         // (docCommentId, summary) for the sidecar XML doc. Each tagged member is
         // (KIND DOC . rest): DOC is a type-level <summary> string, or nil.
         var docs = new List<(string Id, string Summary)>();
+        // (defun ...) forms compiled into the library itself (dotnet:library
+        // functions named by a symbol).
+        var bakeForms = new List<LispObject>();
+
+        var libraryTypeNames = new HashSet<string>(StringComparer.Ordinal);
+        for (var pre = args[3]; pre is Cons pc0; pre = pc0.Cdr)
+            if (pc0.Car is Cons ps && ps.Car is Symbol { Name: "CLASS" or "DELEGATE" }
+                && ps.Cdr is Cons ps1 && ps1.Cdr is Cons ps2 && ps2.Car is LispString pname)
+                libraryTypeNames.Add(pname.Value);
+        _libraryTypeNames = libraryTypeNames;
 
         var cur = args[3];
         while (cur is Cons c)
@@ -3808,6 +4093,12 @@ public static partial class Runtime
                     var parsed = ParseClassSpec(slots.ToArray());
                     classes.Add(parsed);
                     memberFull = parsed.FullName;
+                    break;
+                }
+                case "BAKE":
+                {
+                    for (var bcur = rest; bcur is Cons bc; bcur = bc.Cdr)
+                        bakeForms.Add(bc.Car);
                     break;
                 }
                 case "ENUM":
@@ -3929,14 +4220,35 @@ public static partial class Runtime
             cur = c.Cdr;
         }
 
+        _libraryTypeNames = null;
+
         if (classes.Count == 0 && enums.Count == 0 && constHolders.Count == 0
             && structs.Count == 0 && interfaces.Count == 0 && delegates.Count == 0)
             throw new LispErrorException(new LispProgramError(
                 "DOTNET:%SAVE-LIBRARY: nothing to emit (member-spec-list is empty)"));
 
+        CheckLibraryDelegates(classes, delegates);
+
+        bool abi = false;
         try
         {
-            var lib = Emitter.DynamicClassBuilder.BeginLibrary(savePath, asmName, version);
+            Emitter.DynamicClassBuilder.LibraryBuilder lib;
+            var bakedStatics = classes.SelectMany(k =>
+                    (k.Methods ?? new()).Where(m => m.LispBody is Symbol)
+                        .Select(m => ($"{k.FullName}.{m.Name}", (Symbol)m.LispBody))
+                    .Concat((k.CtorSpecs ?? new()).Where(cs => cs.Body is Symbol)
+                        .Select(cs => ($"{k.FullName} constructor", (Symbol)cs.Body!))))
+                .ToList();
+            if (bakeForms.Count > 0 || bakedStatics.Count > 0)
+            {
+                Emitter.LibraryAbiIL.Begin();
+                abi = true;
+                lib = Emitter.DynamicClassBuilder.BeginBakedLibrary(savePath, asmName, version,
+                    out var fasl);
+                BakeLibraryForms(lib, fasl, bakeForms, bakedStatics, asmName);
+            }
+            else
+                lib = Emitter.DynamicClassBuilder.BeginLibrary(savePath, asmName, version);
             // Interfaces first so a :class implementing one can resolve it in-module.
             foreach (var it in interfaces)
                 lib.AddInterface(it.FullName, it.Methods.Select(m =>
@@ -3968,8 +4280,694 @@ public static partial class Runtime
             throw new LispErrorException(new LispError(
                 $"DOTNET:%SAVE-LIBRARY: {pnse.Message}"));
         }
+        finally
+        {
+            if (abi) Emitter.LibraryAbiIL.End();
+        }
 #endif
     }
+
+#if DOTCL_EMIT && NET9_0_OR_GREATER
+    /// <summary>
+    /// A delegate crosses to Lisp as a function and back as a delegate, so its
+    /// signature has to be one the marshalling can carry. The delegate types a
+    /// compiled-in method takes or returns, and the types of the events of a
+    /// class, are checked here, so the library build fails instead of the call.
+    /// </summary>
+    private static void CheckLibraryDelegates(List<ParsedClassSpec> classes,
+        List<(string FullName, Type ReturnType, List<Type> ParamTypes)> libraryDelegates)
+    {
+        static string? SignatureProblem(Type ret, IReadOnlyList<Type> ps)
+        {
+            static string? Bad(Type t, string what)
+            {
+                if (t.IsByRef) return $"{what} is passed by reference (ref, out or in)";
+                if (t.IsPointer) return $"{what} is a pointer";
+                if (t.IsByRefLike) return $"{what} is a ref struct ({t.Name})";
+                return null;
+            }
+            for (int i = 0; i < ps.Count; i++)
+                if (Bad(ps[i], $"parameter {i + 1}") is string r) return r;
+            return Bad(ret, "the return value");
+        }
+
+        string? DelegateProblem(Type t, bool isReturn)
+        {
+            if (t is Emitter.DynamicClassBuilder.LibraryTypeRef lr)
+            {
+                foreach (var d in libraryDelegates)
+                    if (d.FullName == lr.LibraryName) return SignatureProblem(d.ReturnType, d.ParamTypes);
+                return null;
+            }
+            if (!typeof(Delegate).IsAssignableFrom(t)) return null;
+            if (t == typeof(Delegate) || t == typeof(MulticastDelegate))
+                return isReturn ? "a Lisp function cannot become a plain System.Delegate; name a delegate type such as System.Func`2[System.Int32,System.Int32]" : null;
+            if (t.IsGenericTypeDefinition)
+                return "it is an open generic type; give its type arguments, for example System.Func`2[System.Int32,System.Int32]";
+            var inv = t.GetMethod("Invoke");
+            if (inv == null) return "it has no Invoke method";
+            return SignatureProblem(inv.ReturnType, inv.GetParameters().Select(p => p.ParameterType).ToArray());
+        }
+
+        var problems = new List<string>();
+        void Check(string owner, string what, Type t, bool isReturn)
+        {
+            if (DelegateProblem(t, isReturn) is string reason)
+                problems.Add($"{owner}: {what} has delegate type {(t is Emitter.DynamicClassBuilder.LibraryTypeRef ? t.FullName : t.ToString())}, which cannot be marshalled to Lisp: {reason}");
+        }
+        foreach (var k in classes)
+        {
+            foreach (var m in k.Methods ?? new())
+            {
+                if (m.LispBody is not Symbol) continue;
+                for (int i = 0; i < m.ParamTypes.Count; i++)
+                    Check($"{k.FullName}.{m.Name}", $"parameter {i + 1}", m.ParamTypes[i], false);
+                Check($"{k.FullName}.{m.Name}", "the return value", m.ReturnType, true);
+            }
+            foreach (var (name, dt) in k.Events ?? new())
+                Check($"{k.FullName} event {name}", "the event", dt, false);
+        }
+        if (problems.Count > 0)
+            throw new LispErrorException(new LispProgramError(
+                "DOTNET:%SAVE-LIBRARY: " + string.Join("; ", problems)));
+    }
+
+    /// <summary>
+    /// Compile the (defun NAME ...) FORMS of a dotnet:library into its fasl.
+    /// A body may call the library's own functions and the functions DotCL.Runtime
+    /// itself provides, since a consumer has those and nothing else: no core, no
+    /// Lisp source. A call to anything else is an error here rather than an
+    /// undefined function in the consumer.
+    /// </summary>
+    private static void BakeLibraryForms(Emitter.DynamicClassBuilder.LibraryBuilder lib,
+        Emitter.FaslAssembler fasl, List<LispObject> forms,
+        List<(string Owner, Symbol Name)> statics, string asmName)
+    {
+        const string who = "DOTNET:LIBRARY";
+        var defined = new HashSet<Symbol>();
+        foreach (var f in forms)
+        {
+            if (f is not Cons fc || fc.Car is not Symbol op || op.Name != "DEFUN"
+                || fc.Cdr is not Cons nc || nc.Car is not Symbol name
+                || name.HomePackage == null)
+                throw new LispErrorException(new LispProgramError(
+                    $"{who}: only (defun <interned symbol> ...) can be compiled into a library, not {f}"));
+            if (!defined.Add(name))
+                throw new LispErrorException(new LispProgramError(
+                    $"{who}: {name.HomePackage.Name}::{name.Name} is defined twice"));
+        }
+        var deniedUses = new List<string>();
+        foreach (var f in forms)
+            if (CoreShake.DeniedUse(((Cons)((Cons)f).Cdr).Cdr) is Symbol d)
+                deniedUses.Add($"{((Cons)((Cons)f).Cdr).Car} uses {d.Name}: {CoreShake.DeniedReason(d, false)}");
+        if (deniedUses.Count > 0)
+            throw new LispErrorException(new LispProgramError(
+                $"{who}: cannot compile into the library: " + string.Join("; ", deniedUses)));
+        foreach (var (owner, fn) in statics)
+            if (!defined.Contains(fn))
+                throw new LispErrorException(new LispProgramError(
+                    $"{who}: {owner} names {fn}, which the library does not define"));
+
+        var packages = new List<Package>();
+        void NotePackage(Package? p)
+        {
+            if (p == null || packages.Contains(p)) return;
+            packages.Add(p);
+        }
+        foreach (var sym in defined) NotePackage(sym.HomePackage);
+
+        // Core functions the bodies reach are compiled in too, each under a
+        // name in a package of this library's own, so the core's definition
+        // (when a core is loaded) is neither needed nor touched.
+        LispObject sourceFiles;
+        try { sourceFiles = DynamicBindings.Get(Startup.SymInPkg("*LIBRARY-SOURCE-FILES*", "DOTNET")); }
+        catch (LispErrorException) { sourceFiles = Nil.Instance; }
+        var shake = new CoreShake(asmName, defined, sourceFiles);
+
+        var problems = new List<string>();
+        var sinkSym = Startup.Sym("*XREF-SINK*");
+        var sink = new LispFunction(a =>
+        {
+            var caller = a[0];
+            for (var e = a[1]; e is Cons ec; e = ec.Cdr)
+            {
+                var callee = ec.Car;
+                Symbol? cs = callee as Symbol;
+                bool setf = false;
+                if (cs == null && callee is Cons sc && sc.Cdr is Cons sc2 && sc2.Car is Symbol ss)
+                { cs = ss; setf = true; }
+                if (cs == null) continue;
+                if (!setf && defined.Contains(cs)) continue;
+                if (setf && (shake.IsPrivate(cs) || shake.IsBakedSetf(cs))) continue;
+                var fn = setf ? cs.SetfFunction as LispFunction : cs._callee;
+                string? denied = CoreShake.DeniedReason(cs, setf);
+                if (denied == null && fn != null && fn is not GenericFunction
+                    && IsRuntimeProvidedFunction(fn)) continue;
+                var hp = cs.HomePackage?.Name ?? "";
+                bool user = hp.Length > 0 && hp != "COMMON-LISP"
+                    && !hp.StartsWith("DOTCL", StringComparison.Ordinal)
+                    && !hp.StartsWith("DOTNET", StringComparison.Ordinal);
+                string where = denied
+                    ?? shake.DeclinedReason(callee)
+                    ?? (fn is GenericFunction ? CoreShake.GenericFunctionReason : null)
+                    ?? (user
+                        ? shake.OutsideSourcesReason(callee)
+                        : fn == null ? "it is not defined"
+                        : "it is implemented in the Lisp core, which a consumer of the library does not load");
+                problems.Add($"{shake.PathTo(caller)} calls {callee}: {where}");
+            }
+            return Nil.Instance;
+        }, "%LIBRARY-XREF-SINK", 2);
+
+        var compileFileModeSym = Startup.Sym("*COMPILE-FILE-MODE*");
+        var renameSym = Startup.Sym("*CALL-RENAME-HOOK*");
+        DynamicBindings.Push(compileFileModeSym, T.Instance);
+        DynamicBindings.Push(sinkSym, sink);
+        DynamicBindings.Push(renameSym, new LispFunction(a => shake.Rename(a[0]),
+            "%LIBRARY-CALL-RENAME", 1));
+        try
+        {
+            void Compile(LispObject f)
+            {
+                var instrs = CompileTopLevel(f);
+                if (problems.Count > 0) return;
+                fasl.AddTopLevelForm(instrs);
+                fasl.FlushInitForms();
+            }
+            foreach (var f in forms) Compile(f);
+            while (shake.Next() is LispObject coreDefun) Compile(coreDefun);
+        }
+        finally
+        {
+            DynamicBindings.Pop(renameSym);
+            DynamicBindings.Pop(sinkSym);
+            DynamicBindings.Pop(compileFileModeSym);
+        }
+        if (problems.Count > 0)
+            throw new LispErrorException(new LispProgramError(
+                $"{who}: cannot compile into the library: " + string.Join("; ", problems.Distinct())));
+
+        foreach (var p in shake.ReferencedPackages) NotePackage(p);
+        // A package is made before the packages that use it.
+        var ordered = new List<Package>();
+        var placing = new HashSet<Package>();
+        void Place(Package p)
+        {
+            if (ordered.Contains(p) || !placing.Add(p)) return;
+            foreach (var u in p.UseList)
+                if (packages.Contains(u)) Place(u);
+            ordered.Add(p);
+        }
+        foreach (var pkg in packages) Place(pkg);
+        foreach (var pkg in ordered)
+            lib.AddBakedPackage(pkg.Name, pkg.UseList.Select(u => u.Name).ToArray());
+        DynamicBindings.Set(Startup.SymInPkg("*LIBRARY-CORE-FUNCTIONS*", "DOTNET"),
+            Runtime.List(shake.Baked.ToArray()));
+        DynamicBindings.Set(Startup.SymInPkg("*LIBRARY-SOURCE-FUNCTIONS*", "DOTNET"),
+            Runtime.List(shake.BakedFromSources.ToArray()));
+    }
+
+    /// <summary>
+    /// The core functions a dotnet:library body reaches, found by following
+    /// the calls (and #' references) of each body as it is compiled. A core
+    /// function written in Lisp in the core's cil-stdlib.lisp is recompiled
+    /// from that source under a private name; one that cannot work without the
+    /// rest of the core is left alone, and the library build then fails naming
+    /// the reason and the chain of calls that reached it.
+    /// </summary>
+    private sealed class CoreShake
+    {
+        private static Dictionary<string, LispObject>? _sourceIndex;
+        private static string? _sourceIndexError;
+
+        private readonly HashSet<Symbol> _libraryDefined;
+        private readonly string _privatePackageName;
+        private Package? _privatePackage;
+        private readonly Dictionary<string, LispObject> _renamed = new();
+        private readonly Dictionary<Symbol, LispObject> _originalOf = new();
+        private readonly Dictionary<string, string> _declined = new();
+        private readonly Dictionary<string, LispObject> _parentOf = new();
+        private readonly Queue<LispObject> _pending = new();
+        private readonly HashSet<Package> _referenced = new();
+        internal readonly List<LispObject> Baked = new();
+
+        // The source files whose functions are compiled in when a body reaches
+        // them (dotcl:build-library: its files, or an ASDF system and the
+        // systems it depends on). Empty: only the library's own (:defun ...)s.
+        private readonly HashSet<string> _sourceFiles = new(StringComparer.Ordinal);
+        private readonly HashSet<Symbol> _bakedSetf = new();
+        private readonly Dictionary<string, List<(int Line, LispObject Form)>> _fileForms = new();
+        internal readonly List<LispObject> BakedFromSources = new();
+
+        internal CoreShake(string asmName, HashSet<Symbol> libraryDefined, LispObject sourceFiles)
+        {
+            _libraryDefined = libraryDefined;
+            _privatePackageName = asmName + "/CORE";
+            for (var x = sourceFiles; x is Cons c; x = c.Cdr)
+                if (c.Car is LispString ls) _sourceFiles.Add(NormalizeFile(ls.Value));
+        }
+
+        internal bool IsBakedSetf(Symbol s) => _bakedSetf.Contains(s);
+
+        private static string NormalizeFile(string path)
+        {
+            var full = System.IO.Path.GetFullPath(path).Replace("\\", "/");
+            // macOS: /var and /tmp are links into /private.
+            if (full.StartsWith("/private/", StringComparison.Ordinal)) full = full.Substring(8);
+            return OperatingSystem.IsWindows() ? full.ToUpperInvariant() : full;
+        }
+
+        /// <summary>Where NAME was last defined as a function, from the
+        /// definition records LOAD and COMPILE-FILE keep.</summary>
+        private static (string File, int Line)? FunctionDefinition(LispObject name)
+        {
+            for (var x = DefinitionSources(new[] { name }); x is Cons c; x = c.Cdr)
+            {
+                string? file = null; int line = 0; bool fn = false;
+                for (var p = c.Car; p is Cons pc && pc.Cdr is Cons pv; p = pv.Cdr)
+                {
+                    var k = ((Symbol)pc.Car).Name;
+                    if (k == "KIND") fn = pv.Car is Symbol { Name: "FUNCTION" };
+                    else if (k == "FILE" && pv.Car is LispString f) file = f.Value;
+                    else if (k == "LINE" && pv.Car is Fixnum n) line = (int)n.Value;
+                }
+                if (fn && file != null) return (file, line);
+            }
+            return null;
+        }
+
+        internal string OutsideSourcesReason(LispObject callee)
+        {
+            if (_sourceFiles.Count > 0 && FunctionDefinition(callee) is { } def)
+                return $"it is defined in {def.File}, which is not one of the sources the library is built from";
+            return _sourceFiles.Count > 0
+                ? "it is not defined in the sources the library is built from (nor in the library with (:defun ...))"
+                : "it is not part of the library (define it there with (:defun ...))";
+        }
+
+        /// <summary>The top-level forms of FILE with the line each starts on,
+        /// read the way LOAD reads them: IN-PACKAGE forms change the package
+        /// the following forms are read in.</summary>
+        private List<(int Line, LispObject Form)> FileForms(string file)
+        {
+            if (_fileForms.TryGetValue(file, out var hit)) return hit;
+            var forms = new List<(int, LispObject)>();
+            var source = System.IO.File.ReadAllText(file);
+            var tracking = new PositionTrackingReader(new System.IO.StringReader(source));
+            var reader = new Reader(tracking) { LineSource = source };
+            var stream = new LispStringInputStream(tracking, 0, source, source.Length);
+            reader.LispStreamRef = stream;
+            stream.CachedReader = reader;
+            reader.AdoptStreamShareTables(stream);
+            var pkgSym = Startup.Sym("*PACKAGE*");
+            DynamicBindings.Push(pkgSym, Package.FindPackage("COMMON-LISP-USER")!);
+            try
+            {
+                while (reader.TryRead(out var form))
+                {
+                    forms.Add((reader.LastFormLine, form));
+                    if (form is Cons { Car: Symbol { Name: "IN-PACKAGE" } ip, Cdr: Cons { Car: var designator } }
+                        && ip.HomePackage?.Name == "COMMON-LISP"
+                        && Package.FindPackage(designator switch
+                        {
+                            LispString s => s.Value,
+                            Symbol s => s.Name,
+                            _ => "",
+                        }) is Package p)
+                        DynamicBindings.Set(pkgSym, p);
+                }
+            }
+            finally
+            {
+                DynamicBindings.Pop(pkgSym);
+            }
+            _fileForms[file] = forms;
+            return forms;
+        }
+
+        /// <summary>The (defun NAME ...) the top-level FORM is, holds or
+        /// expands into.</summary>
+        private static LispObject? FindDefun(LispObject form, LispObject name, int depth = 0)
+        {
+            if (depth > 32 || form is not Cons { Car: Symbol op } c) return null;
+            bool cl = op.HomePackage?.Name == "COMMON-LISP";
+            if (cl && op.Name == "DEFUN")
+                return c.Cdr is Cons { Car: var n } && Equal(n, name) is not Nil ? form : null;
+            if (cl && op.Name is "PROGN" or "LOCALLY" or "EVAL-WHEN")
+            {
+                for (var x = op.Name == "EVAL-WHEN" && c.Cdr is Cons ec ? ec.Cdr : c.Cdr; x is Cons xc; x = xc.Cdr)
+                    if (FindDefun(xc.Car, name, depth + 1) is { } d) return d;
+                return null;
+            }
+            // A defining macro expands to (EVAL-WHEN ... (EVAL 'FORM)).
+            if (cl && op.Name == "EVAL"
+                && c.Cdr is Cons { Car: Cons { Car: Symbol { Name: "QUOTE" }, Cdr: Cons { Car: var quoted } } })
+                return FindDefun(quoted, name, depth + 1);
+            if (cl && op.Name == "MACROLET" && c.Cdr is Cons { Car: var bindings } mc)
+            {
+                // A defun made by a local macro is compiled inside the same
+                // MACROLET, since its body may use the local macros too.
+                for (var x = mc.Cdr; x is Cons xc; x = xc.Cdr)
+                    if (ExpandWithLocalMacros(bindings, xc.Car) is { } e
+                        && FindDefun(e, name, depth + 1) is { } d)
+                        return Runtime.List(op, bindings, d);
+                return null;
+            }
+            if (cl || Runtime.MacroFunction(op) is not LispFunction) return null;
+            LispObject expanded;
+            try { expanded = MultipleValues.Primary(Runtime.Funcall(Startup.Sym("MACROEXPAND-1"), form)); }
+            catch (Exception) { return null; }
+            return ReferenceEquals(expanded, form) ? null : FindDefun(expanded, name, depth + 1);
+        }
+
+        /// <summary>FORM macroexpanded where the local macros BINDINGS are defined.</summary>
+        private static LispObject? ExpandWithLocalMacros(LispObject bindings, LispObject form)
+        {
+            var env = Startup.Sym("&ENVIRONMENT");
+            var e = new Symbol("ENV");
+            var here = new Symbol("EXPAND-HERE");
+            var macrolet = Startup.Sym("MACROLET");
+            // (macrolet BINDINGS (macrolet ((here (&environment e) (list 'quote (macroexpand 'FORM e)))) (here)))
+            var expander = Runtime.List(here, Runtime.List(env, e),
+                Runtime.List(Startup.Sym("LIST"), Runtime.List(Startup.Sym("QUOTE"), Startup.Sym("QUOTE")),
+                    Runtime.List(Startup.Sym("MACROEXPAND"), Runtime.List(Startup.Sym("QUOTE"), form), e)));
+            var probe = Runtime.List(macrolet, bindings,
+                Runtime.List(macrolet, Runtime.List(expander), Runtime.List(here)));
+            try { return MultipleValues.Primary(Runtime.Eval(probe)); }
+            catch (Exception) { return null; }
+        }
+
+        /// <summary>A function defined in the library's source files: compile
+        /// its defun into the library under its own name. Returns why it
+        /// cannot be, or null.</summary>
+        private string? TakeFromSources(LispObject name, Symbol sym, bool setf, string key)
+        {
+            if (FunctionDefinition(name) is not { } def || !_sourceFiles.Contains(NormalizeFile(def.File)))
+                return null;
+            LispObject? defun = null;
+            string? reason = null;
+            try
+            {
+                // A definition nested in a top level form (a MACROLET body, say)
+                // is recorded at its own line, inside the form that starts earlier.
+                foreach (var (line, form) in FileForms(def.File))
+                    if (line <= def.Line && FindDefun(form, name) is { } d) { defun = d; break; }
+            }
+            catch (Exception e) when (e is LispErrorException or System.IO.IOException)
+            {
+                reason = $"reading its source {def.File} failed: {e.Message}";
+            }
+            var caller = DynamicBindings.Get(Startup.Sym("*XREF-CALLER*"));
+            if (caller is Symbol cs0 && _originalOf.TryGetValue(cs0, out var corig)) caller = corig;
+            if (caller is not Nil && !_parentOf.ContainsKey(key)) _parentOf[key] = caller;
+            if (reason == null && defun == null)
+                reason = $"its definition at {def.File}:{def.Line} is not a top-level defun";
+            var inner = defun;
+            while (inner is Cons { Car: Symbol { Name: "MACROLET" }, Cdr: Cons { Cdr: Cons { Car: var wrapped } } })
+                inner = wrapped;
+            var body = inner is Cons dc && dc.Cdr is Cons dn ? dn.Cdr : Nil.Instance;
+            if (reason == null && DeniedUse(body) is Symbol denied)
+                reason = $"it uses {denied.Name}, which needs the compiler and the package state of the core at run time";
+            if (reason == null && FirstSpecial(body) is Symbol special)
+                reason = $"it reads the special variable {special}, whose global state a library does not carry";
+            if (reason != null)
+            {
+                _declined[key] = reason;
+                return reason;
+            }
+            if (setf) _bakedSetf.Add(sym); else _libraryDefined.Add(sym);
+            BakedFromSources.Add(name);
+            NoteReferencedPackages(defun!);
+            _pending.Enqueue(defun!);
+            return null;
+        }
+
+        internal IEnumerable<Package> ReferencedPackages => _referenced;
+
+        internal bool IsPrivate(Symbol s) => _privatePackage != null && s.HomePackage == _privatePackage;
+
+        private static string Key(LispObject name) => name switch
+        {
+            Symbol s => (s.HomePackage?.Name ?? "#") + "::" + s.Name,
+            Cons { Cdr: Cons { Car: Symbol s } } => "(SETF " + (s.HomePackage?.Name ?? "#") + "::" + s.Name + ")",
+            _ => name.ToString() ?? "",
+        };
+
+        internal const string GenericFunctionReason =
+            "it is a generic function, whose methods and dispatch live in the core";
+
+        internal string? DeclinedReason(LispObject callee) =>
+            _declined.TryGetValue(Key(callee), out var r) ? r : null;
+
+        private static readonly HashSet<string> Denied = new()
+        {
+            "EVAL", "COMPILE", "COMPILE-FILE", "LOAD", "INTERN", "REQUIRE",
+            "MACROEXPAND", "MACROEXPAND-1",
+        };
+
+        internal static string? DeniedReason(Symbol s, bool setf)
+        {
+            if (setf || s.HomePackage?.Name != "COMMON-LISP" || !Denied.Contains(s.Name)) return null;
+            return "it needs the compiler and the package state of the core at run time";
+        }
+
+        /// <summary>The chain of calls from a library function to NAME.</summary>
+        internal string PathTo(LispObject name)
+        {
+            if (name is Symbol s && _originalOf.TryGetValue(s, out var orig)) name = orig;
+            var chain = new List<string> { name.ToString() ?? "" };
+            var seen = new HashSet<string> { Key(name) };
+            while (_parentOf.TryGetValue(Key(name), out var parent) && seen.Add(Key(parent)))
+            {
+                chain.Add(parent.ToString() ?? "");
+                name = parent;
+            }
+            chain.Reverse();
+            return string.Join(" -> ", chain);
+        }
+
+        internal LispObject Rename(LispObject name)
+        {
+            var key = Key(name);
+            if (_renamed.TryGetValue(key, out var hit)) return hit;
+            if (_declined.ContainsKey(key)) return Nil.Instance;
+            Symbol? sym = name as Symbol;
+            bool setf = false;
+            if (sym == null && name is Cons { Car: Symbol { Name: "SETF" }, Cdr: Cons { Car: Symbol ss } })
+            { sym = ss; setf = true; }
+            if (sym == null || sym.HomePackage == null) return Nil.Instance;
+            if (!setf && _libraryDefined.Contains(sym)) return Nil.Instance;
+            if (IsPrivate(sym) || (setf && _bakedSetf.Contains(sym))) return Nil.Instance;
+            var fn = setf ? sym.SetfFunction as LispFunction : sym._callee;
+            if (fn == null || fn is GenericFunction || IsRuntimeProvidedFunction(fn)) return Nil.Instance;
+            if (DeniedReason(sym, setf) != null) return Nil.Instance;
+            var hp = sym.HomePackage.Name;
+            if (hp != "COMMON-LISP" && !hp.StartsWith("DOTCL", StringComparison.Ordinal))
+            {
+                if (_sourceFiles.Count > 0) TakeFromSources(name, sym, setf, key);
+                return Nil.Instance;
+            }
+
+            string? reason = null;
+            LispObject? source = null;
+            if (SourceIndex() is not { } index)
+                reason = "it is implemented in the Lisp core, and the core's source to compile it from cannot be used: " + _sourceIndexError;
+            else if (!index.TryGetValue(key, out source))
+                reason = "it is implemented in the Lisp core outside the functions a library can take a copy of (cil-stdlib.lisp)";
+            else if (DeniedUse(((Cons)((Cons)source).Cdr).Cdr) is Symbol denied)
+                reason = $"it uses {denied.Name}, which needs the compiler and the package state of the core at run time";
+            else if (FirstSpecial(((Cons)((Cons)source).Cdr).Cdr) is Symbol special)
+                reason = $"it reads the special variable {special}, whose global state a library does not carry";
+
+            var caller = DynamicBindings.Get(Startup.Sym("*XREF-CALLER*"));
+            if (caller is Symbol cs0 && _originalOf.TryGetValue(cs0, out var corig)) caller = corig;
+            if (caller is not Nil && !_parentOf.ContainsKey(key)) _parentOf[key] = caller;
+
+            if (reason != null)
+            {
+                _declined[key] = reason;
+                return Nil.Instance;
+            }
+
+            var privName = setf ? "(SETF " + hp + ":" + sym.Name + ")" : hp + ":" + sym.Name;
+            if (_privatePackage == null)
+            {
+                _privatePackage = Package.FindPackage(_privatePackageName) ?? new Package(_privatePackageName);
+                _referenced.Add(_privatePackage);
+            }
+            var (priv, _) = _privatePackage.Intern(privName);
+            _originalOf[priv] = name;
+            if (!setf) _libraryDefined.Add(priv);
+            LispObject privFn = setf ? Runtime.List(((Cons)name).Car, priv) : priv;
+            _renamed[key] = privFn;
+            Baked.Add(name);
+            NoteReferencedPackages(source!);
+            // (defun NAME lambda-list . body) under the private name.
+            var rest = ((Cons)((Cons)source!).Cdr).Cdr;
+            _pending.Enqueue(new Cons(((Cons)source).Car, new Cons(privFn, rest)));
+            return privFn;
+        }
+
+        internal LispObject? Next() => _pending.Count > 0 ? _pending.Dequeue() : null;
+
+        private void NoteReferencedPackages(LispObject form)
+        {
+            var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+            void Walk(LispObject x)
+            {
+                while (x is Cons c && seen.Add(c)) { Walk(c.Car); x = c.Cdr; }
+                if (x is Symbol s && s.HomePackage is Package p
+                    && p.Name is not ("KEYWORD" or "COMMON-LISP"))
+                    _referenced.Add(p);
+            }
+            Walk(form);
+        }
+
+        /// <summary>A denied CL function FORM calls or takes as #'.</summary>
+        internal static Symbol? DeniedUse(LispObject form)
+        {
+            var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+            Symbol? found = null;
+            void Walk(LispObject x)
+            {
+                if (x is Cons { Car: Symbol op } oc && DeniedReason(op, false) != null)
+                { found = op; return; }
+                // Binding lists name variables and local functions, not calls.
+                if (x is Cons { Car: Symbol bop, Cdr: Cons { Car: var bindings } after }
+                    && bop.HomePackage?.Name == "COMMON-LISP"
+                    && bop.Name is "LET" or "LET*" or "FLET" or "LABELS" or "MACROLET")
+                {
+                    bool fns = bop.Name is not ("LET" or "LET*");
+                    for (var b = bindings; found == null && b is Cons bc; b = bc.Cdr)
+                        if (bc.Car is Cons binding && binding.Cdr is Cons init)
+                            Walk(fns ? init.Cdr : init);
+                    x = after.Cdr;
+                }
+                if (x is Cons { Car: Symbol { Name: "FUNCTION" } fop, Cdr: Cons { Car: Symbol fs } }
+                    && fop.HomePackage?.Name == "COMMON-LISP" && DeniedReason(fs, false) != null)
+                { found = fs; return; }
+                while (found == null && x is Cons c && seen.Add(c)) { Walk(c.Car); x = c.Cdr; }
+            }
+            Walk(form);
+            return found;
+        }
+
+        private static Symbol? FirstSpecial(LispObject form)
+        {
+            var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+            Symbol? found = null;
+            void Walk(LispObject x)
+            {
+                if (x is Cons { Car: Symbol { Name: "QUOTE" or "FUNCTION" } q }
+                    && q.HomePackage?.Name == "COMMON-LISP")
+                    return;
+                // An operator's name is not a variable reference.
+                if (x is Cons head && head.Car is Symbol) x = head.Cdr;
+                while (found == null && x is Cons c && seen.Add(c)) { Walk(c.Car); x = c.Cdr; }
+                if (found == null && x is Symbol s && s.IsSpecial && !s.IsConstant
+                    && s.HomePackage?.Name != "KEYWORD")
+                    found = s;
+            }
+            Walk(form);
+            return found;
+        }
+
+        // The core was compiled with unqualified calls bound at the call site
+        // to whichever package defines the name. Reading its source back
+        // interns such a name afresh in DOTCL.CIL-COMPILER, without a function;
+        // point it at the DOTCL-INTERNAL / DOTCL function the core calls.
+        private static LispObject Bridge(LispObject x, Package src)
+        {
+            if (x is Cons c)
+            {
+                var car = Bridge(c.Car, src);
+                var cdr = Bridge(c.Cdr, src);
+                return ReferenceEquals(car, c.Car) && ReferenceEquals(cdr, c.Cdr) ? c : new Cons(car, cdr);
+            }
+            if (x is Symbol s && s.HomePackage == src && !s.IsFBound)
+                foreach (var name in new[] { "DOTCL-INTERNAL", "DOTCL" })
+                    if (Package.FindPackage(name) is Package p
+                        && p.FindSymbol(s.Name) is var (t, st) && st != SymbolStatus.None && t.IsFBound)
+                        return t;
+            return x;
+        }
+
+        /// <summary>The core's top-level (defun ...) forms by name, read once
+        /// from the cil-stdlib.lisp beside the loaded core.</summary>
+        private static Dictionary<string, LispObject>? SourceIndex()
+        {
+            if (_sourceIndex != null || _sourceIndexError != null) return _sourceIndex;
+            var dir = Startup.CorePath != null
+                ? System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(Startup.CorePath))
+                : null;
+            var path = dir != null ? System.IO.Path.Combine(dir, "cil-stdlib.lisp") : null;
+            if (path == null || !System.IO.File.Exists(path))
+            {
+                _sourceIndexError = path == null ? "no core is loaded" : $"{path} does not exist";
+                return null;
+            }
+            var stamp = System.IO.Path.Combine(dir!, "cil-stdlib.generation");
+            if (System.IO.File.Exists(stamp))
+            {
+                var theirs = System.IO.File.ReadAllText(stamp).Trim();
+                var mine = Startup.CoreGeneration();
+                if (mine != null && theirs != mine)
+                {
+                    _sourceIndexError = $"{path} is from core generation {theirs}, but the loaded core is {mine}";
+                    return null;
+                }
+            }
+            var pkg = Package.FindPackage("DOTCL.CIL-COMPILER");
+            if (pkg == null) { _sourceIndexError = "package DOTCL.CIL-COMPILER does not exist"; return null; }
+            var index = new Dictionary<string, LispObject>();
+            void Add(LispObject form)
+            {
+                if (form is not Cons c || c.Car is not Symbol op) return;
+                switch (op.Name)
+                {
+                    case "DEFUN" when op.HomePackage?.Name == "COMMON-LISP":
+                        if (c.Cdr is Cons nc && nc.Cdr is Cons) index[Key(nc.Car)] = Bridge(form, pkg);
+                        break;
+                    case "PROGN" when op.HomePackage?.Name == "COMMON-LISP":
+                        for (var x = c.Cdr; x is Cons xc; x = xc.Cdr) Add(xc.Car);
+                        break;
+                    case "EVAL-WHEN" when op.HomePackage?.Name == "COMMON-LISP":
+                        if (c.Cdr is Cons ec)
+                            for (var x = ec.Cdr; x is Cons xc; x = xc.Cdr) Add(xc.Car);
+                        break;
+                }
+            }
+            DynamicBindings.Push(Startup.Sym("*PACKAGE*"), pkg);
+            try
+            {
+                using var text = new System.IO.StreamReader(path);
+                var reader = new Reader(text);
+                while (reader.TryRead(out var form)) Add(form);
+            }
+            catch (LispErrorException e)
+            {
+                _sourceIndexError = $"reading {path} failed: {e.Message}";
+                return null;
+            }
+            finally
+            {
+                DynamicBindings.Pop(Startup.Sym("*PACKAGE*"));
+            }
+            return _sourceIndex = index;
+        }
+    }
+
+    /// <summary>True when FN's code is in DotCL.Runtime itself, so it exists in a
+    /// process that has initialized the runtime without loading a core.</summary>
+    private static bool IsRuntimeProvidedFunction(LispFunction fn)
+    {
+        // A compiled function of no arguments is entered through its 0-arity
+        // delegate; its general entry is the runtime's adapter.
+        var m = fn.TailDirect0 is { } f0 ? f0.Method : fn.GetJitDelegate().Delegate.Method;
+        return m.DeclaringType != null && m.DeclaringType.Assembly == typeof(Runtime).Assembly
+               && m.DeclaringType != typeof(LispFunction);
+    }
+#endif
 
 #if DOTCL_EMIT
     // Cache: (selfType, methodName, paramTypeSig) -> DynamicMethod for non-virtual base call.
@@ -4354,7 +5352,8 @@ public static partial class Runtime
     /// marshals the return value back to the delegate's return type.
     /// Uses Expression.Lambda: no raw IL required.
     /// </summary>
-    internal static Delegate CreateLispDelegate(LispFunction fn, Type delegateType)
+    internal static Delegate CreateLispDelegate(LispFunction fn, Type delegateType,
+        bool propagate = false)
     {
         var invokeMethod = delegateType.GetMethod("Invoke")
             ?? throw new InvalidOperationException(
@@ -4382,7 +5381,8 @@ public static partial class Runtime
         // (dotcl:*foreign-callback-handler*) instead of crashing the .NET caller.
         var argsArray = System.Linq.Expressions.Expression.NewArrayInit(
             typeof(LispObject), lispArgs);
-        var invokeForeign = typeof(Runtime).GetMethod(nameof(InvokeForeignCallback))!;
+        var invokeForeign = typeof(Runtime).GetMethod(
+            propagate ? nameof(InvokeLibraryCallback) : nameof(InvokeForeignCallback))!;
         var callFn = System.Linq.Expressions.Expression.Call(
             invokeForeign,
             System.Linq.Expressions.Expression.Constant(Package.BindToCurrentUnit(fn), typeof(LispObject)),
@@ -4410,6 +5410,68 @@ public static partial class Runtime
 
         return System.Linq.Expressions.Expression.Lambda(delegateType, body, parameters)
             .Compile();
+    }
+
+    /// <summary>Call FN from the C# side of a library: an ERROR it does not handle
+    /// leaves as a LispErrorException carrying the condition, without entering the
+    /// debugger, and the primary value is returned.</summary>
+    public static LispObject InvokeLibraryCallback(LispObject fn, LispObject[] args)
+    {
+        var tag = new object();
+        var handler = new LispFunction(
+            h => throw new HandlerCaseInvocationException(tag, 0, h.Length > 0 ? h[0] : Nil.Instance),
+            "%LIBRARY-BOUNDARY", -1);
+        HandlerClusterStack.PushCluster(new[] { new HandlerBinding(Startup.Sym("ERROR"), handler) });
+        LispObject result;
+        LispObject? failed = null;
+        try { result = UnwrapMv(Funcall(fn, args)); }
+        catch (HandlerCaseInvocationException ex) when (ReferenceEquals(ex.Tag, tag))
+        {
+            failed = ex.Condition;
+            result = Nil.Instance;
+        }
+        finally { HandlerClusterStack.PopCluster(); }
+        // Constructed outside the handler: a LispErrorException signals its
+        // condition, which would land back in the handler above.
+        if (failed != null)
+            throw new LispErrorException(failed as LispCondition
+                ?? new LispError(failed.ToString() ?? "error"));
+        return result;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Delegate, LispFunction>
+        _delegateFunctions = new();
+
+    /// <summary>A .NET delegate as a callable Lisp function: arguments are marshalled
+    /// to the delegate's parameter types, the result back with DotNetToLisp (NIL for
+    /// a void delegate). An exception the delegate throws reaches the caller as it
+    /// was thrown.</summary>
+    internal static LispFunction DelegateAsFunction(Delegate d)
+        => _delegateFunctions.GetValue(d, MakeDelegateFunction);
+
+    private static LispFunction MakeDelegateFunction(Delegate d)
+    {
+        var type = d.GetType();
+        var invoke = type.GetMethod("Invoke")!;
+        var ps = invoke.GetParameters();
+        bool isVoid = invoke.ReturnType == typeof(void);
+        return new LispFunction(args =>
+        {
+            if (args.Length != ps.Length)
+                throw new LispErrorException(new LispProgramError(
+                    $"{type.Name}: called with {args.Length} arguments, expects {ps.Length}"));
+            var converted = new object?[ps.Length];
+            for (int i = 0; i < ps.Length; i++)
+                converted[i] = LispToDotNetParam(args[i], ps[i].ParameterType);
+            object? result;
+            try { result = d.DynamicInvoke(converted); }
+            catch (System.Reflection.TargetInvocationException tie) when (tie.InnerException != null)
+            {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
+                throw;
+            }
+            return isVoid ? Nil.Instance : DotNetToLisp(result);
+        }, type.Name, ps.Length);
     }
 
     private static Symbol? _foreignCbHandlerSym;
@@ -4448,9 +5510,12 @@ public static partial class Runtime
         // entering the debugger there would hang. The handler unwinds to the catch
         // below carrying the ORIGINAL condition.
         var tag = new object();
+        // A raw .NET exception is left to propagate to the .NET caller.
         var handler = new LispFunction(
-            hargs => throw new HandlerCaseInvocationException(
-                tag, 0, hargs.Length > 0 ? hargs[0] : Nil.Instance),
+            hargs => hargs.Length > 0 && IsRawExceptionCondition(hargs[0])
+                ? Nil.Instance
+                : throw new HandlerCaseInvocationException(
+                    tag, 0, hargs.Length > 0 ? hargs[0] : Nil.Instance),
             "%FOREIGN-CALLBACK-BOUNDARY", -1);
         HandlerClusterStack.PushCluster(new[] { new HandlerBinding(Startup.Sym("ERROR"), handler) });
         // Set when dotcl:*foreign-callback-propagate* asks for the caller to see the

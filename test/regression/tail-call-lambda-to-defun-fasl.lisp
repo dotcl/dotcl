@@ -14,7 +14,7 @@
         *tclf-to-even* (lambda (n) (%tclf-even n))))
 (defun %tclf-two (a b) (values b a))
 (defun %tclf-swap (a b) (funcall (lambda (x y) (%tclf-two x y)) a b))
-(defun %tclf-leaf (a) (declare (ignore a)) (dotcl:backtrace-with-args))
+(defun %tclf-leaf (a) (declare (ignore a) (optimize (debug 3))) (dotcl:backtrace-with-args))
 (defun %tclf-via-lambda (x) (funcall (lambda (y) (%tclf-leaf y)) (list x)))
 (defstruct (tclf-dict (:constructor tclf-dict (cmp))) (cmp nil :read-only t))
 (defun %tclf-cmp (a b) (cond ((< a b) :lt) ((> a b) :gt) (t :eq)))

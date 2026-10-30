@@ -125,3 +125,23 @@
              :no-error)
     (error () :error))
   :error)
+
+;;; --- adding and removing at run time ---------------------------------------
+
+;;; A package whose only nickname is removed stops resolving it, and one added
+;;; afterwards resolves again.
+(defpackage #:pln-runtime-user (:use #:cl))
+
+(deftest pln-add-remove-add
+  (let* ((user (find-package "PLN-RUNTIME-USER"))
+         (target (find-package "PLN-PHYSICAL-B"))
+         (seen (lambda () (let ((*package* user)) (find-package "RB")))))
+    (list (funcall seen)
+          (progn (dotcl:add-package-local-nickname "RB" target user)
+                 (eq (funcall seen) target))
+          (progn (dotcl:remove-package-local-nickname "RB" user)
+                 (funcall seen))
+          (progn (dotcl:add-package-local-nickname "RB" target user)
+                 (prog1 (eq (funcall seen) target)
+                   (dotcl:remove-package-local-nickname "RB" user)))))
+  (nil t nil t))

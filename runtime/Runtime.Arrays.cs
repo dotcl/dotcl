@@ -80,7 +80,10 @@ public static partial class Runtime
     public static LispObject MakeArrayOfTypeInit(LispObject dims, LispObject spec, LispObject init, string name)
     {
         if (dims is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue)
+        {
+            CheckInitialElement(init, spec);
             return new LispVector((int)f.Value, init, name);
+        }
         return MakeArray(new[] { dims, Startup.Keyword("ELEMENT-TYPE"), spec,
                                  Startup.Keyword("INITIAL-ELEMENT"), init });
     }
@@ -162,6 +165,8 @@ public static partial class Runtime
         // The element type as written, before upgrading: only the default fill
         // looks at it (an INTEGER array is general storage but starts out as 0s).
         string requestedType = "T";
+        LispObject? elementTypeSpec = null;
+        LispObject? fillPointerArg = null;
         int? fillPointer = null;
         LispObject? displacedTo = null;
         int displacedOffset = 0;
@@ -188,6 +193,7 @@ public static partial class Runtime
                     case "ELEMENT-TYPE":
                         if (!etSet)
                         {
+                            elementTypeSpec = args[i + 1];
                             requestedType = ParseRequestedElementTypeName(args[i + 1]);
                             elementType = UpgradeElementTypeName(requestedType);
                             etSet = true;
@@ -195,8 +201,16 @@ public static partial class Runtime
                         break;
                     case "FILL-POINTER":
                         if (!fpSet) {
-                            if (args[i + 1] is Fixnum fp) fillPointer = (int)fp.Value;
-                            else if (args[i + 1] is T) fillPointer = size;
+                            fillPointerArg = args[i + 1];
+                            if (fillPointerArg is Fixnum fp && fp.Value >= 0 && fp.Value <= size)
+                                fillPointer = (int)fp.Value;
+                            else if (fillPointerArg is T) fillPointer = size;
+                            else if (fillPointerArg is not Nil)
+                                throw new LispErrorException(new LispTypeError(
+                                    $"MAKE-ARRAY: fill pointer {fillPointerArg} is not NIL, T or an integer from 0 to {size}",
+                                    fillPointerArg,
+                                    List(Startup.Sym("OR"), Startup.Sym("BOOLEAN"),
+                                         List(Startup.Sym("INTEGER"), Fixnum.Make(0), Fixnum.Make(size)))));
                             fpSet = true;
                         }
                         break;
@@ -214,6 +228,16 @@ public static partial class Runtime
             }
         }
 
+        if (fillPointer.HasValue && rank != 1)
+            throw new LispErrorException(new LispError(
+                $"MAKE-ARRAY: only a vector can have a fill pointer, not an array of rank {rank}"));
+        if (ieSet && icSet)
+            throw new LispErrorException(new LispError(
+                "MAKE-ARRAY: :INITIAL-ELEMENT and :INITIAL-CONTENTS are both given"));
+        if (ieSet && elementTypeSpec != null && elementType != "T")
+            CheckInitialElement(initialElement!, elementTypeSpec);
+        if (initialContents != null && displacedTo == null)
+            CheckContentsShape(initialContents, dimArray, size, rank, 0);
 
         LispVector vec;
         if (displacedTo != null)
@@ -290,6 +314,105 @@ public static partial class Runtime
         return vec;
     }
 
+    private static Symbol? s_fixnumSym, s_doubleSym, s_singleSym, s_charSym;
+
+    /// <summary>Signals unless INIT is of the element type SPEC as written: the
+    /// storage may be wider than SPEC, e.g. (INTEGER 0 100) is
+    /// kept as (UNSIGNED-BYTE 7).</summary>
+    private static void CheckInitialElement(LispObject init, LispObject spec)
+    {
+        bool fits;
+        if (init is Fixnum fi)
+            fits = IntegerSpecBounds(spec, out long lo, out long hi)
+                ? fi.Value >= lo && fi.Value <= hi
+                : spec == (s_fixnumSym ??= Startup.Sym("FIXNUM")) || Typep(init, spec) is not Nil;
+        else if (init is DoubleFloat)
+            fits = spec == (s_doubleSym ??= Startup.Sym("DOUBLE-FLOAT")) || Typep(init, spec) is not Nil;
+        else if (init is SingleFloat)
+            fits = spec == (s_singleSym ??= Startup.Sym("SINGLE-FLOAT")) || Typep(init, spec) is not Nil;
+        else if (init is LispChar)
+            fits = spec == (s_charSym ??= Startup.Sym("CHARACTER")) || Typep(init, spec) is not Nil;
+        else fits = Typep(init, spec) is not Nil;
+        if (!fits)
+            throw new LispErrorException(new LispTypeError(
+                $"MAKE-ARRAY: the initial element {init} is not of the element type {spec}", init, spec));
+    }
+
+    private static Symbol? s_ubSym, s_sbSym, s_intSym, s_starSym;
+
+    /// <summary>The bounds of SPEC when it is (UNSIGNED-BYTE n), (SIGNED-BYTE n) or
+    /// (INTEGER lo hi) with fixnum bounds or *.</summary>
+    private static bool IntegerSpecBounds(LispObject spec, out long lo, out long hi)
+    {
+        var ub = s_ubSym ??= Startup.Sym("UNSIGNED-BYTE");
+        var sb = s_sbSym ??= Startup.Sym("SIGNED-BYTE");
+        lo = long.MinValue; hi = long.MaxValue;
+        if (spec is not Cons c || c.Cdr is not Cons a1) return false;
+        if (c.Car == ub || c.Car == sb)
+        {
+            if (a1.Car is not Fixnum n || n.Value < 1 || a1.Cdr is not Nil) return false;
+            if (c.Car == ub)
+            {
+                lo = 0;
+                if (n.Value < 63) hi = (1L << (int)n.Value) - 1;
+            }
+            else if (n.Value < 64)
+            {
+                lo = -(1L << (int)(n.Value - 1));
+                hi = (1L << (int)(n.Value - 1)) - 1;
+            }
+            return true;
+        }
+        if (c.Car == (s_intSym ??= Startup.Sym("INTEGER")) && a1.Cdr is Cons a2 && a2.Cdr is Nil)
+        {
+            var star = s_starSym ??= Startup.Sym("*");
+            if (a1.Car is Fixnum l) lo = l.Value; else if (a1.Car != star) return false;
+            if (a2.Car is Fixnum h) hi = h.Value; else if (a2.Car != star) return false;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>Signals unless CONTENTS has the shape of the array: a sequence of
+    /// DIMS[DEPTH] elements at each of the RANK levels.</summary>
+    private static void CheckContentsShape(LispObject contents, int[]? dims, int size, int rank, int depth)
+    {
+        if (depth == rank) return;
+        int expected = dims == null ? size : dims[depth];
+        int n;
+        if (contents is Nil) n = 0;
+        else if (contents is Cons)
+        {
+            n = 0;
+            var cur = contents;
+            while (cur is Cons c)
+            {
+                if (depth + 1 < rank) CheckContentsShape(c.Car, dims, size, rank, depth + 1);
+                n++;
+                cur = c.Cdr;
+            }
+            if (cur is not Nil)
+                throw new LispErrorException(new LispTypeError(
+                    $"MAKE-ARRAY: :INITIAL-CONTENTS is not a proper list: {contents}", contents, Startup.Sym("LIST")));
+        }
+        else if (contents is LispString str) n = str.Length;
+        else if (contents is LispVector v && v.Rank == 1)
+        {
+            n = v.Length;
+            if (depth + 1 < rank)
+                for (int j = 0; j < n; j++) CheckContentsShape(v[j], dims, size, rank, depth + 1);
+        }
+        else
+            throw new LispErrorException(new LispTypeError(
+                $"MAKE-ARRAY: :INITIAL-CONTENTS {contents} is not a sequence", contents, Startup.Sym("SEQUENCE")));
+        if (n != expected)
+            throw new LispErrorException(new LispError(
+                $"MAKE-ARRAY: :INITIAL-CONTENTS {contents} has {n} elements where the dimension is {expected}"));
+        if (contents is LispString && n > 0 && depth + 1 < rank)
+            throw new LispErrorException(new LispError(
+                $"MAKE-ARRAY: :INITIAL-CONTENTS {contents} has characters where sequences are expected"));
+    }
+
     /// <summary>A displaced array has to fit in its target: the offset plus the
     /// new array's total size may not exceed the target's total size (CLHS
     /// MAKE-ARRAY). Without this the array is made, and the first access past the
@@ -362,6 +485,11 @@ public static partial class Runtime
         }
         else throw new LispErrorException(new LispTypeError($"ADJUST-ARRAY: unsupported dimensions: {dims}", dims));
 
+        // CLHS ADJUST-ARRAY: the result keeps the rank of ARRAY.
+        if (dimArray.Length != vec.Rank)
+            throw new LispErrorException(new LispError(
+                $"ADJUST-ARRAY: expected {vec.Rank} new dimension{(vec.Rank == 1 ? "" : "s")} for array, but received {dimArray.Length}"));
+
         LispObject? initialElement = null;
         LispObject? initialContents = null;
         LispObject? displacedTo = null;
@@ -376,23 +504,37 @@ public static partial class Runtime
         for (int i = 2; i < args.Length - 1; i += 2)
             if (args[i] is Symbol aks2 && aks2.Name == "ALLOW-OTHER-KEYS")
             { adjAllowOtherKeys = args[i + 1] is not Nil; break; }
+        bool adjIeSet = false, adjIcSet = false, adjEtSet = false, adjFpSet = false,
+             adjDtSet = false, adjDioSet = false;
         for (int i = 2; i < args.Length - 1; i += 2)
         {
             if (args[i] is Symbol ks)
             {
                 switch (ks.Name)
                 {
-                    case "INITIAL-ELEMENT": initialElement = args[i + 1]; break;
-                    case "INITIAL-CONTENTS": initialContents = args[i + 1]; break;
-                    case "ELEMENT-TYPE": elementType = ParseElementTypeName(args[i + 1]); break;
+                    case "INITIAL-ELEMENT":
+                        if (!adjIeSet) { initialElement = args[i + 1]; adjIeSet = true; }
+                        break;
+                    case "INITIAL-CONTENTS":
+                        if (!adjIcSet) { initialContents = args[i + 1]; adjIcSet = true; }
+                        break;
+                    case "ELEMENT-TYPE":
+                        if (!adjEtSet) { elementType = ParseElementTypeName(args[i + 1]); adjEtSet = true; }
+                        break;
                     case "FILL-POINTER":
+                        if (adjFpSet) break;
+                        adjFpSet = true;
                         if (args[i + 1] is Fixnum fp) fillPointer = (int)fp.Value;
                         else if (args[i + 1] is T) fillPointer = size;
                         else if (args[i + 1] is Nil) { } // :fill-pointer nil = no fill pointer (keep as-is)
                         break;
-                    case "DISPLACED-TO": displacedTo = args[i + 1]; break;
+                    case "DISPLACED-TO":
+                        if (!adjDtSet) { displacedTo = args[i + 1]; adjDtSet = true; }
+                        break;
                     case "DISPLACED-INDEX-OFFSET":
-                        if (args[i + 1] is Fixnum dio) displacedOffset = (int)dio.Value; break;
+                        if (!adjDioSet && args[i + 1] is Fixnum dio)
+                        { displacedOffset = (int)dio.Value; adjDioSet = true; }
+                        break;
                     case "ALLOW-OTHER-KEYS": break;
                     default:
                         if (!adjAllowOtherKeys)
@@ -434,7 +576,7 @@ public static partial class Runtime
             else
             {
                 var newItems = new LispObject[size];
-                LispObject fill = initialElement ?? Nil.Instance;
+                LispObject fill = initialElement ?? LispVector.DefaultElement(et);
                 if (initialContents != null)
                     FlattenContents(initialContents, newItems, 0, dimArray.Length);
                 else
@@ -1130,6 +1272,7 @@ public static partial class Runtime
         => LispFunction.TryTypedLongOnLongElement(fn, a, i, out long r)
             ? r : FuncallAref1LLSlow(fn, a, i);
 
+    // The compiler no longer emits this; kept so .fasl files compiled by earlier releases still load.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long FuncallAref1LLM(LispFunction fn, LispObject a, long i, int mode)
         => LispFunction.TryTypedLongOnLongElement(fn, a, i, out long r)
@@ -1155,6 +1298,7 @@ public static partial class Runtime
     public static long FuncallLong1L(LispFunction fn, long e)
         => LispFunction.TryTypedLongOnLong(fn, e, out long r) ? r : FuncallLong1LSlow(fn, e);
 
+    // The compiler no longer emits this; kept so .fasl files compiled by earlier releases still load.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long FuncallLong1LM(LispFunction fn, long e, int mode)
         => LispFunction.TryTypedLongOnLong(fn, e, out long r) ? r : FuncallLong1LMSlow(fn, e, mode);
@@ -1170,6 +1314,7 @@ public static partial class Runtime
     public static long FuncallAref2LL(LispFunction fn, LispObject a, long i0, long i1)
         => ((Fixnum)UnwrapMv(FuncallAref2L(fn, a, i0, i1))).Value;
 
+    // The compiler no longer emits this; kept so .fasl files compiled by earlier releases still load.
     public static long FuncallAref2LLM(LispFunction fn, LispObject a, long i0, long i1, int mode)
         => ((Fixnum)UnwrapMv(FuncallAref2LM(fn, a, i0, i1, mode))).Value;
 
@@ -1352,7 +1497,7 @@ public static partial class Runtime
     private static Exception BackingTypeError(LispObject array, string elementType)
     {
         var expected = new Cons(Startup.Sym("SIMPLE-ARRAY"),
-            new Cons(Startup.Sym(elementType),
+            new Cons(Startup.SymValue(elementType),
                 new Cons(new Cons(Startup.Sym("*"), Nil.Instance), Nil.Instance)));
         return new LispErrorException(new LispTypeError(
             $"declared (SIMPLE-ARRAY {elementType} (*)), got {Typep2Name(array)}",
@@ -1968,6 +2113,34 @@ public static partial class Runtime
     public static double[] BackingNDF64(LispObject a, int rank, int d0, int d1, int d2, int narrow, int check)
         => (double[])BackingND(a, 6, rank, d0, d1, d2, 0, check);
 
+    /// <summary>The storage of a simple array of rank RANK, storage KIND and
+    /// narrow width NARROW, or null for anything else. Never signals: the
+    /// accesses keep the per-element helper as their other arm.</summary>
+    private static Array? BackingIf(LispObject array, int kind, int rank, int narrow)
+    {
+        if (array is LispVector v && v._numKind == kind && v._numData is Array data && v.IsSimple
+            && (rank == 1 ? v._dimensions == null
+                          : v._dimensions is int[] dims && dims.Length == rank)
+            && (kind == 5 || kind == 6 || kind == 11 || v._numNarrow == narrow))
+            return data;
+        return null;
+    }
+
+    public static byte[]? BackingIfU8(LispObject a, int rank, int narrow)
+        => BackingIf(a, 1, rank, narrow) as byte[];
+    public static ushort[]? BackingIfU16(LispObject a, int rank, int narrow)
+        => BackingIf(a, 2, rank, narrow) as ushort[];
+    public static int[]? BackingIfI32(LispObject a, int rank, int narrow)
+        => BackingIf(a, 3, rank, narrow) as int[];
+    public static long[]? BackingIfI64(LispObject a, int rank, int narrow)
+        => BackingIf(a, 4, rank, narrow) as long[];
+    public static long[]? BackingIfU64(LispObject a, int rank, int narrow)
+        => (long[]?)BackingIf(a, 11, rank, 0);
+    public static float[]? BackingIfF32(LispObject a, int rank, int narrow)
+        => BackingIf(a, 5, rank, 0) as float[];
+    public static double[]? BackingIfF64(LispObject a, int rank, int narrow)
+        => BackingIf(a, 6, rank, 0) as double[];
+
     public static long ArrayAxisOrZero(LispObject array, int axis)
         => array is LispVector v && v._dimensions is int[] d && axis < d.Length ? d[axis] : 0;
 
@@ -2233,6 +2406,23 @@ public static partial class Runtime
         return LispStruct.MakeRaw(sym, slots, raws, version, kinds, slotCount);
     }
 
+    /// <summary>MakeStructRaw for at most four raw values, passed by raw position
+    /// (unused ones 0): no Int64[] when the instance keeps them in its fields.</summary>
+    public static LispObject MakeStructRawInline(LispObject typeName, LispObject[]? slots,
+                                                 long r0, long r1, long r2, long r3,
+                                                 int version, long kinds, int slotCount, int nraw)
+    {
+        if (typeName is Symbol sym
+            && LispStruct.TryMakeRawInline(sym, slots, r0, r1, r2, r3, version, slotCount, nraw) is { } s)
+            return s;
+        var raws = new long[nraw];
+        if (nraw > 0) raws[0] = r0;
+        if (nraw > 1) raws[1] = r1;
+        if (nraw > 2) raws[2] = r2;
+        if (nraw > 3) raws[3] = r3;
+        return MakeStructRaw(typeName, slots, raws, version, kinds, slotCount);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long DoubleBits(double d) => BitConverter.DoubleToInt64Bits(d);
 
@@ -2243,8 +2433,35 @@ public static partial class Runtime
     {
         if (typeName is not Symbol sym)
             throw new LispErrorException(new LispTypeError("MAKE-STRUCT: type name must be a symbol", typeName));
-        return new LispStruct(sym, slots);
+        return LispStruct.Create(sym, slots);
     }
+
+    // The compiled %MAKE-STRUCT of 1 to 4 slots: no argument array when the slots
+    // all go into the instance's fields.
+    public static LispObject MakeStruct1(LispObject typeName, LispObject a)
+        => typeName is Symbol sym && LispStruct.BuildsInline(sym)
+            ? new LispStruct1(sym, a)
+            : (typeName is Symbol rs ? LispStruct.TryCreateAllRaw(rs, 1, a, a, a, a) : null)
+              ?? MakeStruct(typeName, new[] { a });
+
+    public static LispObject MakeStruct2(LispObject typeName, LispObject a, LispObject b)
+        => typeName is Symbol sym && LispStruct.BuildsInline(sym)
+            ? new LispStruct2(sym, a, b)
+            : (typeName is Symbol rs ? LispStruct.TryCreateAllRaw(rs, 2, a, b, b, b) : null)
+              ?? MakeStruct(typeName, new[] { a, b });
+
+    public static LispObject MakeStruct3(LispObject typeName, LispObject a, LispObject b, LispObject c)
+        => typeName is Symbol sym && LispStruct.BuildsInline(sym)
+            ? new LispStruct3(sym, a, b, c)
+            : (typeName is Symbol rs ? LispStruct.TryCreateAllRaw(rs, 3, a, b, c, c) : null)
+              ?? MakeStruct(typeName, new[] { a, b, c });
+
+    public static LispObject MakeStruct4(LispObject typeName, LispObject a, LispObject b, LispObject c,
+                                         LispObject d)
+        => typeName is Symbol sym && LispStruct.BuildsInline(sym)
+            ? new LispStruct4(sym, a, b, c, d)
+            : (typeName is Symbol rs ? LispStruct.TryCreateAllRaw(rs, 4, a, b, c, d) : null)
+              ?? MakeStruct(typeName, new[] { a, b, c, d });
 
     /// <summary>
     /// Fast struct slot access with raw int index (avoids Fixnum boxing).
@@ -2311,7 +2528,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject StructRefI(LispObject obj, int packed)
     {
-        if (obj is LispStruct s && s.BoxedSlotOrNull(packed) is LispObject v) return v;
+        if (LispStruct.TryAs(obj, out var s) && s.BoxedSlotOrNull(packed) is LispObject v) return v;
         return StructRefISlow(obj, packed);
     }
 
@@ -2320,7 +2537,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject StructRefIT(LispObject obj, int packed, LispObject type)
     {
-        if (obj is LispStruct s && ReferenceEquals(s.TypeName, type)
+        if (LispStruct.TryAs(obj, out var s) && ReferenceEquals(s.TypeName, type)
             && s.BoxedSlotOrNull(packed) is LispObject v) return v;
         return StructRefITSlow(obj, packed, type);
     }
@@ -2329,10 +2546,19 @@ public static partial class Runtime
     private static LispObject StructRefITSlow(LispObject obj, int packed, LispObject type)
         => StructRefI(StructOf(obj, type), packed);
 
+    /// <summary>StructRefIT for a type whose representations are in MASK.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject StructRefITMasked(LispObject obj, int packed, LispObject type, int mask)
+    {
+        if (LispStruct.IsKnown(obj, mask, out var s) && ReferenceEquals(s.TypeName, type)
+            && s.BoxedSlotOrNull(packed) is LispObject v) return v;
+        return StructRefITSlow(obj, packed, type);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject StructSetIT(LispObject obj, int packed, LispObject value, LispObject type)
     {
-        if (obj is LispStruct s && ReferenceEquals(s.TypeName, type)
+        if (LispStruct.TryAs(obj, out var s) && ReferenceEquals(s.TypeName, type)
             && s.TrySetBoxedSlot(packed, value)) return value;
         return StructSetITSlow(obj, packed, value, type);
     }
@@ -2341,12 +2567,30 @@ public static partial class Runtime
     private static LispObject StructSetITSlow(LispObject obj, int packed, LispObject value, LispObject type)
         => StructSetI(StructOf(obj, type), packed, value);
 
+    /// <summary>StructSetIT for a type whose representations are in MASK.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject StructSetITMasked(LispObject obj, int packed, LispObject value,
+                                               LispObject type, int mask)
+    {
+        if (LispStruct.IsKnown(obj, mask, out var s) && ReferenceEquals(s.TypeName, type)
+            && s.TrySetBoxedSlot(packed, value)) return value;
+        return StructSetITSlow(obj, packed, value, type);
+    }
+
     /// <summary>OBJ, when it is a structure of TYPE or of a type that includes
     /// TYPE; else a TYPE-ERROR.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject StructOf(LispObject obj, LispObject type)
     {
-        if (obj is LispStruct s && ReferenceEquals(s.TypeName, type)) return obj;
+        if (LispStruct.TryAs(obj, out var s) && ReferenceEquals(s.TypeName, type)) return obj;
+        return StructOfSlow(obj, type);
+    }
+
+    /// <summary>StructOf for a type whose representations are in MASK.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject StructOfMasked(LispObject obj, LispObject type, int mask)
+    {
+        if (LispStruct.IsKnown(obj, mask, out var s) && ReferenceEquals(s.TypeName, type)) return obj;
         return StructOfSlow(obj, type);
     }
 
@@ -2371,7 +2615,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static LispObject StructRefISlow(LispObject obj, int packed)
     {
-        if (obj is LispStruct s)
+        if (LispStruct.TryAs(obj, out var s))
         {
             return s.GetSlot(SlotIndex(s, packed));
         }
@@ -2409,20 +2653,30 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static double StructRefD(LispObject obj, int packed)
     {
-        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
+        if (LispStruct.TryAsArrayBacked(obj, out var s) && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
             && s.TryRawLong(RawPosOf(s, packed, LispStruct.SlotKindDouble), out long bits))
             return BitConverter.Int64BitsToDouble(bits);
-        return ((DoubleFloat)StructRefI(obj, packed)).Value;
+        return StructRefDSlow(obj, packed);
     }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static double StructRefDSlow(LispObject obj, int packed)
+        => ((DoubleFloat)StructRefI(obj, packed)).Value;
 
     /// <summary>A double stored into a structure slot without boxing it.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static double StructSetD(LispObject obj, int packed, double value)
     {
-        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
+        if (LispStruct.TryAsArrayBacked(obj, out var s) && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
             && s.TrySetRaw(RawPosOf(s, packed, LispStruct.SlotKindDouble),
                            BitConverter.DoubleToInt64Bits(value)))
             return value;
+        return StructSetDSlow(obj, packed, value);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static double StructSetDSlow(LispObject obj, int packed, double value)
+    {
         StructSetI(obj, packed, new DoubleFloat(value));
         return value;
     }
@@ -2432,20 +2686,30 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static float StructRefF(LispObject obj, int packed)
     {
-        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
+        if (LispStruct.TryAsArrayBacked(obj, out var s) && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
             && s.TryRawLong(RawPosOf(s, packed, LispStruct.SlotKindSingle), out long bits))
             return Compat.Int32BitsToSingle((int)bits);
-        return ((SingleFloat)StructRefI(obj, packed)).Value;
+        return StructRefFSlow(obj, packed);
     }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static float StructRefFSlow(LispObject obj, int packed)
+        => ((SingleFloat)StructRefI(obj, packed)).Value;
 
     /// <summary>A single-float stored into a structure slot without boxing it.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static float StructSetF(LispObject obj, int packed, float value)
     {
-        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
+        if (LispStruct.TryAsArrayBacked(obj, out var s) && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
             && s.TrySetRaw(RawPosOf(s, packed, LispStruct.SlotKindSingle),
                            Compat.SingleToInt32Bits(value)))
             return value;
+        return StructSetFSlow(obj, packed, value);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static float StructSetFSlow(LispObject obj, int packed, float value)
+    {
         StructSetI(obj, packed, new SingleFloat(value));
         return value;
     }
@@ -2455,34 +2719,146 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long StructRefU64(LispObject obj, int packed)
     {
-        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
+        if (LispStruct.TryAsArrayBacked(obj, out var s) && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
             && s.TryRawLong(RawPosOf(s, packed, LispStruct.SlotKindU64), out long bits))
             return bits;
-        return U64Bits(StructRefI(obj, packed));
+        return StructRefU64Slow(obj, packed);
     }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static long StructRefU64Slow(LispObject obj, int packed)
+        => U64Bits(StructRefI(obj, packed));
 
     /// <summary>The bits of an (UNSIGNED-BYTE 64) stored into a structure slot
     /// without boxing it, returning the bits.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long StructSetU64(LispObject obj, int packed, long bits)
     {
-        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
+        if (LispStruct.TryAsArrayBacked(obj, out var s) && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount
             && s.TrySetRaw(RawPosOf(s, packed, LispStruct.SlotKindU64), bits))
             return bits;
+        return StructSetU64Slow(obj, packed, bits);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static long StructSetU64Slow(LispObject obj, int packed, long bits)
+    {
         StructSetI(obj, packed, BoxU64(bits));
         return bits;
     }
 
+    // The raw slot accessors for a structure whose representations are in MASK,
+    // emitted when MASK includes LispStructR: that is one compare and a field
+    // read; everything else is the accessor without K.
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double StructRefDK(LispObject obj, int packed, int mask)
+    {
+        if (LispStruct.TryRawInline(obj, mask, packed, LispStruct.SlotKindDouble, out int pos))
+            return BitConverter.Int64BitsToDouble(LispStruct.RawInlineCell(obj, pos));
+        return (mask & 1) != 0 ? StructRefD(obj, packed) : StructRefDSlow(obj, packed);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double StructSetDK(LispObject obj, int packed, double value, int mask)
+    {
+        if (LispStruct.TryRawInline(obj, mask, packed, LispStruct.SlotKindDouble, out int pos))
+        {
+            LispStruct.RawInlineCell(obj, pos) = BitConverter.DoubleToInt64Bits(value);
+            return value;
+        }
+        return (mask & 1) != 0 ? StructSetD(obj, packed, value) : StructSetDSlow(obj, packed, value);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float StructRefFK(LispObject obj, int packed, int mask)
+    {
+        if (LispStruct.TryRawInline(obj, mask, packed, LispStruct.SlotKindSingle, out int pos))
+            return Compat.Int32BitsToSingle((int)LispStruct.RawInlineCell(obj, pos));
+        return (mask & 1) != 0 ? StructRefF(obj, packed) : StructRefFSlow(obj, packed);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float StructSetFK(LispObject obj, int packed, float value, int mask)
+    {
+        if (LispStruct.TryRawInline(obj, mask, packed, LispStruct.SlotKindSingle, out int pos))
+        {
+            LispStruct.RawInlineCell(obj, pos) = Compat.SingleToInt32Bits(value);
+            return value;
+        }
+        return (mask & 1) != 0 ? StructSetF(obj, packed, value) : StructSetFSlow(obj, packed, value);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long StructRefU64K(LispObject obj, int packed, int mask)
+    {
+        if (LispStruct.TryRawInline(obj, mask, packed, LispStruct.SlotKindU64, out int pos))
+            return LispStruct.RawInlineCell(obj, pos);
+        return (mask & 1) != 0 ? StructRefU64(obj, packed) : StructRefU64Slow(obj, packed);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long StructSetU64K(LispObject obj, int packed, long bits, int mask)
+    {
+        if (LispStruct.TryRawInline(obj, mask, packed, LispStruct.SlotKindU64, out int pos))
+        {
+            LispStruct.RawInlineCell(obj, pos) = bits;
+            return bits;
+        }
+        return (mask & 1) != 0 ? StructSetU64(obj, packed, bits) : StructSetU64Slow(obj, packed, bits);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long StructRefLK(LispObject obj, int packed, int mask)
+    {
+        if (LispStruct.TryRawInline(obj, mask, packed, LispStruct.RawLong, out int pos))
+            return LispStruct.RawInlineCell(obj, pos);
+        return (mask & 31) != 0 ? StructRefL(obj, packed) : StructRefLSlow(obj, packed);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static long StructRefLSlow(LispObject obj, int packed) => StructRefL(obj, packed);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long StructSetLK(LispObject obj, int packed, long value, int mask)
+    {
+        if (LispStruct.TryRawInline(obj, mask, packed, LispStruct.RawLong, out int pos))
+        {
+            LispStruct.RawInlineCell(obj, pos) = value;
+            return value;
+        }
+        return (mask & 31) != 0 ? StructSetL(obj, packed, value) : StructSetLSlow(obj, packed, value);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static long StructSetLSlow(LispObject obj, int packed, long value) => StructSetL(obj, packed, value);
+
+    /// <summary>StructRawBacking for a structure that keeps its K raw slots in its
+    /// fields: OBJ itself when it is such an instance of NAME at VERSION, else null.
+    /// RawInlineAt / RawInlineSet then read and write its cells.</summary>
+    public static LispObject? StructRawInline(LispObject obj, LispObject name, int version, int k)
+        => LispStruct.IsRawInline(obj, LispStruct.RawInlineMask) && k <= LispStruct.MaxInlineRawSlots
+           && ReferenceEquals(Unsafe.As<LispStruct>(obj).TypeName, name)
+           && Unsafe.As<LispStruct>(obj).LayoutVersion == version
+            ? obj
+            : null;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long RawInlineAt(LispObject s, int pos) => LispStruct.RawInlineCell(s, pos);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void RawInlineSet(LispObject s, int pos, long bits) => LispStruct.RawInlineCell(s, pos) = bits;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long StructRefL(LispObject obj, int packed)
     {
-        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount)
+        if (LispStruct.TryAs(obj, out var s) && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount)
         {
             // A raw slot is already an int64: no Fixnum in between, which is the
             // whole point of the raw storage.
             if (s.TryRawLong(RawPosOf(s, packed, LispStruct.RawLong), out long raw))
                 return raw;
-            if (s.GetSlot(SlotIndex(s, packed)) is Fixnum f) return f.Value;
+            if (s.BoxedSlotOrNull(packed) is Fixnum f) return f.Value;
         }
         return ((Fixnum)StructRefI(obj, packed)).Value;
     }
@@ -2503,12 +2879,13 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long StructSetL(LispObject obj, int packed, long value)
     {
-        if (obj is LispStruct s && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount)
+        if (LispStruct.TryAs(obj, out var s) && (uint)(packed & SlotIndexMask) < (uint)s.SlotCount)
         {
             // Into a raw slot the value goes as it is. The Fixnum.Make below is
             // what a declared-fixnum slot used to pay on every store even
             // though nothing ever looked at the object.
-            if (s.TrySetRaw(RawPosOf(s, packed, LispStruct.RawLong), value))
+            if (s.TrySetRaw(RawPosOf(s, packed, LispStruct.RawLong), value)
+                || s.TrySetBoxedSlot(packed, Fixnum.Make(value)))
                 return value;
             s.SetSlot(SlotIndex(s, packed), Fixnum.Make(value));
             return value;
@@ -2556,7 +2933,7 @@ public static partial class Runtime
     /// what reports the errors it reported before.
     /// </summary>
     public static long[]? StructRawBacking(LispObject obj, LispObject name, int version)
-        => obj is LispStruct s
+        => LispStruct.TryAsArrayBacked(obj, out var s)
            && ReferenceEquals(s.TypeName, name)
            && s.LayoutVersion == version
             ? s._longs
@@ -2773,14 +3150,14 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject StructSetI(LispObject obj, int packed, LispObject value)
     {
-        if (obj is LispStruct s && s.TrySetBoxedSlot(packed, value)) return value;
+        if (LispStruct.TryAs(obj, out var s) && s.TrySetBoxedSlot(packed, value)) return value;
         return StructSetISlow(obj, packed, value);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static LispObject StructSetISlow(LispObject obj, int packed, LispObject value)
     {
-        if (obj is LispStruct s)
+        if (LispStruct.TryAs(obj, out var s))
         {
             s.SetSlot(SlotIndex(s, packed), value);
             return value;
@@ -2804,7 +3181,7 @@ public static partial class Runtime
         // refuse.
         int packed = (int)f.Value;
         int idx = packed & SlotIndexMask;
-        if (obj is LispStruct s)
+        if (LispStruct.TryAs(obj, out var s))
         {
             if (idx < 0 || idx >= s.SlotCount)
                 throw IndexError("STRUCT-REF", idx, s.SlotCount, "structure");
@@ -2826,7 +3203,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("STRUCT-SET: index must be integer", index));
         int packed = (int)f.Value;
         int idx = packed & SlotIndexMask;
-        if (obj is LispStruct s)
+        if (LispStruct.TryAs(obj, out var s))
         {
             if (idx < 0 || idx >= s.SlotCount)
                 throw IndexError("STRUCT-SET", idx, s.SlotCount, "structure");
@@ -2854,7 +3231,7 @@ public static partial class Runtime
 
     public static LispObject StructTypep(LispObject obj, LispObject typeName)
     {
-        if (obj is LispStruct s && typeName is Symbol sym)
+        if (LispStruct.TryAs(obj, out var s) && typeName is Symbol sym)
         {
             // Fast path: exact symbol reference equality
             if (ReferenceEquals(s.TypeName, sym)) return T.Instance;
@@ -2870,16 +3247,9 @@ public static partial class Runtime
 
     public static LispObject CopyStruct(LispObject obj)
     {
-        if (obj is not LispStruct s)
+        if (!LispStruct.TryAs(obj, out var s))
             throw new LispErrorException(new LispTypeError("COPY-STRUCT: not a structure", obj));
-        // Array.Clone goes through MemberwiseClone, which is a runtime call that
-        // reads the array's type at run time; allocating and copying is the same
-        // work with none of that. COPY-STRUCTURE of a four-slot structure spent
-        // 0.60 s per 3M copies through Clone and 0.37 s this way.
-        var src = s.SlotsSnapshot();
-        var dst = new LispObject[src.Length];
-        Array.Copy(src, dst, src.Length);
-        return new LispStruct(s, dst);
+        return LispStruct.Copy(s);
     }
 
 

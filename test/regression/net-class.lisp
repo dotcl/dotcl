@@ -1686,6 +1686,156 @@
     (%file-nonempty-p path))
   t)
 
+;;; dotnet:library: a :functions entry named by a symbol is compiled into the
+;;; DLL itself, so calling it needs no Lisp handler. Loaded back here, the
+;;; static method runs the compiled body; a Lisp error in it comes out as one.
+(defun %baked-outside (x) (* 2 x))
+
+(deftest library-baked-function-runs
+  (let ((path (%savelib-temp-path "dotcl-library-baked")))
+    (dotnet:library ("BakedLibTest" :path path)
+      (:defun %baked-square (x) (* x x))
+      (:module "BakedLibTest.Ops"
+        (:functions
+          (baked-fib ((n Int64)) :returns Int64
+            (if (< n 2) n (+ (baked-fib (- n 1)) (baked-fib (- n 2)))))
+          (baked-sum-squares ((a Int64) (b Int64)) :returns Int64
+            (+ (%baked-square a) (%baked-square b)))
+          (baked-greet ((who String)) :returns String :name "Hello"
+            (concatenate 'string "Hi " who))
+          (baked-check ((n Int64)) :returns Int64
+            (if (minusp n) (error "negative: ~a" n) n)))))
+    (dotnet:load-assembly path)
+    (list (dotnet:static "BakedLibTest.Ops" "BakedFib" 20)
+          (dotnet:static "BakedLibTest.Ops" "BakedSumSquares" 3 4)
+          (dotnet:static "BakedLibTest.Ops" "Hello" "you")
+          (handler-case (dotnet:static "BakedLibTest.Ops" "BakedCheck" -1)
+            (error () :signaled))))
+  (6765 25 "Hi you" :signaled))
+
+;;; A body that calls a function the library does not define cannot be
+;;; compiled into it: a consumer would have no definition to call.
+(deftest library-baked-outside-call-error
+  (handler-case
+      (progn (dotnet:library ("BakedLibOutside"
+                              :path (%savelib-temp-path "dotcl-library-outside"))
+               (:module "BakedLibOutside.Ops"
+                 (:functions (f ((n Int64)) :returns Int64 (%baked-outside n)))))
+             :emitted)
+    (program-error (e)
+      (and (search "%BAKED-OUTSIDE" (princ-to-string e)) :refused)))
+  :refused)
+
+;;; A body that calls a CL function written in Lisp in the core gets a copy of
+;;; it (and of what it calls) under a name of the library's own. Loading the
+;;; library leaves the core's own definitions as they were.
+(deftest library-baked-core-functions-run
+  (let ((path (%savelib-temp-path "dotcl-library-core"))
+        (signum-before (symbol-function 'signum))
+        (union-before (symbol-function 'union)))
+    (dotnet:library ("BakedLibCore" :path path)
+      (:module "BakedLibCore.Ops"
+        (:functions
+          (core-sign ((n Int64)) :returns Int64 (funcall #'signum n))
+          (core-union-sum ((n Int64)) :returns Int64
+            (reduce #'+ (union (list 1 2 3) (list n 3))))
+          (core-odd-count ((n Int64)) :returns Int64
+            (length (remove-if (complement #'evenp) (loop for i below n collect i)))))))
+    (let ((copied (copy-list dotnet::*library-core-functions*)))
+      (dotnet:load-assembly path)
+      (list (dotnet:static "BakedLibCore.Ops" "CoreSign" -4)
+            (dotnet:static "BakedLibCore.Ops" "CoreUnionSum" 9)
+            (dotnet:static "BakedLibCore.Ops" "CoreOddCount" 10)
+            (and (member 'signum copied) (member 'union copied) t)
+            (eq (symbol-function 'signum) signum-before)
+            (eq (symbol-function 'union) union-before)
+            (signum -2.5)
+            (fboundp (find-symbol "COMMON-LISP:SIGNUM" "BakedLibCore/CORE")))))
+  (-1 15 5 t t t -1.0 t))
+
+;;; A core function that reads a special variable is not copied: the error
+;;; names it and the calls that reached it.
+(deftest library-baked-core-special-error
+  (handler-case
+      (progn (dotnet:library ("BakedLibCoreSpecial"
+                              :path (%savelib-temp-path "dotcl-library-core-special"))
+               (:module "BakedLibCoreSpecial.Ops"
+                 (:functions (f ((n Int64)) :returns Int64 (if (y-or-n-p) n 0)))))
+             :emitted)
+    (program-error (e)
+      (let ((m (princ-to-string e)))
+        (and (search "F -> Y-OR-N-P" m) (search "*QUERY-IO*" m) :refused))))
+  :refused)
+
+;;; Nor EVAL / INTERN, nor a generic function.
+(deftest library-baked-core-denied-error
+  (mapcar (lambda (body)
+            (handler-case
+                (progn (eval `(dotnet:library ("BakedLibCoreDenied"
+                                               :path ,(%savelib-temp-path "dotcl-library-core-denied"))
+                                (:module "BakedLibCoreDenied.Ops"
+                                  (:functions (f ((n Int64)) :returns Int64 ,body n)))))
+                       :emitted)
+              (program-error (e)
+                (let ((m (princ-to-string e)))
+                  (cond ((search "generic function" m) :generic)
+                        ((search "needs the compiler" m) :denied)
+                        (t m))))))
+          '((eval n) (intern "X") (funcall 'eval n) (shared-initialize n nil)))
+  (:denied :denied :denied :generic))
+
+;;; A symbol-named method outside dotnet:library has nowhere to be compiled to.
+(deftest define-class-symbol-method-error
+  (handler-case
+      (progn (macroexpand-1 '(dotnet:define-class "BakedDc.T" ()
+                              (:methods (foo ((n Int64)) :returns Int64 :static t n))))
+             :expanded)
+    (error () :signaled))
+  :signaled)
+
+;;; An instance method and a constructor named / written in dotnet:library are
+;;; compiled in too: the public method calls the function with self first.
+(deftest library-baked-class-runs
+  (let ((path (%savelib-temp-path "dotcl-library-baked-class")))
+    (dotnet:library ("BakedClsTest" :path path)
+      (:class "BakedClsTest.Acc" ()
+        (:fields ("Total" Int32))
+        (:ctor ((start Int32))
+          (dotnet:%set-invoke self "Total" start))
+        (:methods
+          (bump ((n Int32)) :returns Int32
+            (dotnet:%set-invoke self "Total" (+ (dotnet:invoke self "Total") n))
+            (dotnet:invoke self "Total"))
+          (same-as ((other "BakedClsTest.Acc")) :returns Boolean
+            (= (dotnet:invoke self "Total") (dotnet:invoke other "Total"))))))
+    (dotnet:load-assembly path)
+    (let ((a (dotnet:new "BakedClsTest.Acc" 10))
+          (b (dotnet:new "BakedClsTest.Acc" 12)))
+      (list (dotnet:invoke a "Bump" 5)
+            (dotnet:invoke a "Total")
+            (dotnet:invoke a "SameAs" b)
+            (progn (dotnet:invoke b "Bump" 3) (dotnet:invoke a "SameAs" b)))))
+  (15 15 nil t))
+
+(deftest library-baked-class-outside-call-error
+  (handler-case
+      (progn (dotnet:library ("BakedClsOutside"
+                              :path (%savelib-temp-path "dotcl-library-cls-outside"))
+               (:class "BakedClsOutside.T" ()
+                 (:methods (f ((n Int64)) :returns Int64 (%baked-outside n)))))
+             :emitted)
+    (program-error (e)
+      (and (search "%BAKED-OUTSIDE" (princ-to-string e)) :refused)))
+  :refused)
+
+(deftest define-class-symbol-instance-method-error
+  (handler-case
+      (progn (macroexpand-1 '(dotnet:define-class "BakedDc.U" ()
+                              (:methods (foo ((n Int64)) :returns Int64 n))))
+             :expanded)
+    (error () :signaled))
+  :signaled)
+
 ;;; %save-library tagged :enum members: an enum-only library (no classes) is
 ;;; valid: enums are standalone metadata. Underlying nil defaults to Int32.
 (deftest savelib-enum-only
@@ -1994,3 +2144,160 @@
     (list (dotnet:invoke p "Name")
           (dotnet:invoke (dotnet:invoke p "ParameterType") "IsByRef")))
   ("__state" t))
+
+;;; dotcl:build-library: the entry `dotcl build-library` and the SDK's
+;;; LispLibrary items run. The dotnet:library form in the loaded file writes to
+;;; :output instead of its own :path; the library has to be named after the file.
+(defun %build-library-source (name text)
+  (let ((path (concatenate 'string (regression-temp-dir) "/" name ".lisp")))
+    (with-open-file (s path :direction :output :if-exists :supersede)
+      (write-string text s))
+    path))
+
+(deftest build-library-writes-output
+  (let* ((src (%build-library-source
+               "build-library-src"
+               "(dotnet:library (\"BuildLibOut\" :path \"/nonexistent/ignored.dll\")
+                  (:module \"BuildLibOut.Ops\"
+                    (:functions (twice ((n Int64)) :returns Int64 (* 2 n)))))"))
+         (out (%savelib-temp-path "BuildLibOut")))
+    (dotcl:build-library :files src :output out)
+    (dotnet:load-assembly out)
+    (dotnet:static "BuildLibOut.Ops" "Twice" 21))
+  42)
+
+(deftest build-library-name-must-match-output
+  (let ((src (%build-library-source
+              "build-library-mismatch"
+              "(dotnet:library (\"BuildLibA\")
+                 (:module \"BuildLibA.Ops\"
+                   (:functions (one () :returns Int64 1))))")))
+    (handler-case
+        (progn (dotcl:build-library :files src :output (%savelib-temp-path "BuildLibB")) :written)
+      (error (e) (and (search "BuildLibB.dll" (princ-to-string e)) :refused))))
+  :refused)
+
+(deftest build-library-needs-a-library-form
+  (let ((src (%build-library-source "build-library-none" "(defun %build-library-none () 1)")))
+    (handler-case
+        (progn (dotcl:build-library :files src :output (%savelib-temp-path "BuildLibNone")) :written)
+      (error (e) (and (search "No dotnet:library form" (princ-to-string e)) :refused))))
+  :refused)
+
+;;; A call with no arguments to a function the library does not define is
+;;; refused like any other: a function of no arguments is not taken for one
+;;; DotCL.Runtime provides.
+(defun %baked-outside-0 () 7)
+
+(deftest library-baked-outside-call-no-args-error
+  (handler-case
+      (progn (dotnet:library ("BakedLibOutside0"
+                              :path (%savelib-temp-path "dotcl-library-outside0"))
+               (:module "BakedLibOutside0.Ops"
+                 (:functions (f () :returns Int64 (%baked-outside-0)))))
+             :emitted)
+    (program-error (e)
+      (and (search "%BAKED-OUTSIDE-0" (princ-to-string e)) :refused)))
+  :refused)
+
+;;; dotcl:build-library compiles in each function of its files that a body
+;;; reaches, and what those reach, from the source: the files define the
+;;; library's code, not only its face.
+(deftest build-library-compiles-in-source-functions
+  (let* ((util (%build-library-source
+                "build-library-util"
+                "(defpackage :bl-util (:use :cl) (:export #:twice-all))
+                 (in-package :bl-util)
+                 (defun twice (x) (* 2 x))
+                 (defun twice-all (xs) (mapcar #'twice xs))
+                 (macrolet ((def (name k) `(defun ,name (x) (* ,k x))))
+                   (def thrice 3))
+                 (defun not-reached () (eval 1))"))
+         (lib (%build-library-source
+               "build-library-uses-util"
+               "(dotnet:library (\"BuildLibSrc\")
+                  (:module \"BuildLibSrc.Ops\"
+                    (:functions (sum-twice ((n Int64)) :returns Int64
+                                  (reduce #'+ (bl-util:twice-all (list n n (bl-util::thrice 1))))))))"))
+         (out (%savelib-temp-path "BuildLibSrc")))
+    (dotcl:build-library :files (list util lib) :output out)
+    (let ((baked (sort (mapcar #'symbol-name dotnet::*library-source-functions*) #'string<)))
+      (dotnet:load-assembly out)
+      (list (dotnet:static "BuildLibSrc.Ops" "SumTwice" 5) baked)))
+  (26 ("THRICE" "TWICE" "TWICE-ALL")))
+
+;;; A function of the files that reads a special variable is refused, naming
+;;; the calls that reached it; so is one whose definition is not a top-level
+;;; DEFUN (a closure over a LET).
+(deftest build-library-source-function-refused
+  (let ((util (%build-library-source
+               "build-library-util2"
+               "(defpackage :bl-util2 (:use :cl))
+                (in-package :bl-util2)
+                (defvar *base* 10)
+                (defun base () *base*)
+                (defun plus-base (x) (+ x (base)))
+                (let ((k 3)) (defun plus-k (x) (+ x k)))")))
+    (mapcar (lambda (body)
+              (let ((lib (%build-library-source
+                          "build-library-uses-util2"
+                          (format nil "(dotnet:library (\"BuildLibSrc2\")
+                                         (:module \"BuildLibSrc2.Ops\"
+                                           (:functions (f ((n Int64)) :returns Int64 ~a))))"
+                                  body))))
+                (handler-case
+                    (progn (dotcl:build-library :files (list util lib)
+                                                :output (%savelib-temp-path "BuildLibSrc2"))
+                           :written)
+                  (error (e)
+                    (let ((m (princ-to-string e)))
+                      (cond ((and (search "F -> PLUS-BASE calls BASE" m) (search "*BASE*" m)) :special)
+                            ((search "not a top-level defun" m) :not-defun)
+                            (t m)))))))
+            '("(bl-util2::plus-base n)" "(bl-util2::plus-k n)")))
+  (:special :not-defun))
+
+;;; dotcl:build-library :system: the ASDF system is loaded, then the file of
+;;; its (:dotnet-library ...) component; the functions of the system and of
+;;; the system it depends on that the bodies reach are compiled in. Loading
+;;; the system alone does not write the library.
+(defun %build-library-system-dir ()
+  (let ((dir (concatenate 'string (regression-temp-dir) "/build-library-system/")))
+    (flet ((put (name text)
+             (let ((path (concatenate 'string dir name)))
+               (ensure-directories-exist path)
+               (with-open-file (s path :direction :output :if-exists :supersede)
+                 (write-string text s)))))
+      (put "dep/bl-dep.asd" "(defsystem \"bl-dep\" :components ((:file \"dep\")))")
+      (put "dep/dep.lisp" "(defpackage :bl-dep (:use :cl) (:export #:square))
+                           (in-package :bl-dep)
+                           (defun square (x) (* x x))")
+      (put "main/bl-main.asd"
+           "(defsystem \"bl-main\"
+              :defsystem-depends-on (\"dotnet-library\")
+              :build-operation \"dotnet-library-op\"
+              :depends-on (\"bl-dep\")
+              :serial t
+              :components ((:file \"package\") (:file \"sums\")
+                           (:dotnet-library \"library\")))")
+      (put "main/package.lisp" "(defpackage :bl-main (:use :cl :bl-dep))")
+      (put "main/sums.lisp" "(in-package :bl-main)
+                             (defun sum-squares (n) (loop for i from 1 to n sum (square i)))")
+      (put "main/library.lisp" "(in-package :bl-main)
+                                (dotnet:library (\"BuildLibSys\" :path \"/nonexistent/ignored.dll\")
+                                  (:module \"BuildLibSys.Ops\"
+                                    (:functions (sum-squares-of ((n Int64)) :returns Int64
+                                                  (sum-squares n)))))"))
+    dir))
+
+(deftest-emitting-only build-library-from-system
+  (let* ((dir (%build-library-system-dir))
+         (out (%savelib-temp-path "BuildLibSys")))
+    (with-asdf-immutable-systems-restored
+      (dotcl:build-library :system (concatenate 'string dir "main/bl-main.asd")
+                           :search-paths (list (concatenate 'string dir "dep/"))
+                           :output out))
+    (let ((baked (sort (mapcar #'symbol-name dotnet::*library-source-functions*) #'string<)))
+      (dotnet:load-assembly out)
+      (list (dotnet:static "BuildLibSys.Ops" "SumSquaresOf" 3) baked)))
+  (14 ("SQUARE" "SUM-SQUARES")))

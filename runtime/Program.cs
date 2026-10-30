@@ -147,9 +147,11 @@ class Program
         var utf8NoBom = new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
         Console.InputEncoding  = utf8NoBom;
         Console.OutputEncoding = utf8NoBom;
-        Console.SetIn(new StdinReader(
-            new System.IO.StreamReader(Console.OpenStandardInput(), utf8NoBom, detectEncodingFromByteOrderMarks: false, bufferSize: 4096, leaveOpen: true),
-            consoleEndMark: OperatingSystem.IsWindows() && !Console.IsInputRedirected));
+        var stdinReader = new StdinReader(
+            new StdinDecoder(Console.OpenStandardInput(), utf8NoBom),
+            consoleEndMark: OperatingSystem.IsWindows() && !Console.IsInputRedirected);
+        Console.SetIn(stdinReader);
+        Runtime.StdinDataReady = stdinReader.DataReady;
 
         // Enable ANSI VT100 escape sequences on Windows legacy conhost (cmd.exe).
         // Modern .NET enables this implicitly via Console.Out, but redirected
@@ -216,30 +218,39 @@ class Program
         // cursor-report fragments) and requires `stty sane` after a crash.
         // We emit the reset ourselves on ProcessExit. Best-effort, TTY only,
         // opt-out via DOTCL_NO_TTY_RESTORE=1.
-        if (!OperatingSystem.IsWindows() &&
-            Environment.GetEnvironmentVariable("DOTCL_NO_TTY_RESTORE") != "1")
-        {
+        bool restoreTty = !OperatingSystem.IsWindows() &&
+            Environment.GetEnvironmentVariable("DOTCL_NO_TTY_RESTORE") != "1";
+        if (restoreTty)
             AppDomain.CurrentDomain.ProcessExit += (_, _) => RestoreTerminal();
 
-            // ProcessExit does NOT fire when the process is killed by a signal
-            // (SIGTERM from `kill`, SIGHUP on terminal close, SIGQUIT): the
-            // terminal is then left in application mode and needs `stty sane`
-            // (public dotcl/dotcl#37 symptom 2, signal path). Trap the catchable
-            // termination signals, restore the terminal, then let the default
-            // action run (Cancel stays false) so exit semantics are unchanged.
-            // SIGKILL is uncatchable by design and cannot be handled.
+        // SIGTERM / SIGHUP end the process through Environment.Exit, which
+        // runs ProcessExit (dotcl:*exit-hooks*) like dotcl:quit, with the
+        // conventional 128+signal status. A library that handles SIGTERM
+        // itself (Kestrel's console lifetime) cancels the default action, so
+        // without this the process would outlive its server. SIGQUIT only
+        // restores the terminal and then takes the default action. SIGKILL
+        // cannot be caught.
+        if (!OperatingSystem.IsWindows())
+        {
             foreach (var sig in new[] { System.Runtime.InteropServices.PosixSignal.SIGTERM,
                                         System.Runtime.InteropServices.PosixSignal.SIGHUP,
                                         System.Runtime.InteropServices.PosixSignal.SIGQUIT })
             {
+                int status = sig == System.Runtime.InteropServices.PosixSignal.SIGTERM ? 143
+                           : sig == System.Runtime.InteropServices.PosixSignal.SIGHUP ? 129 : 0;
                 try
                 {
-                    // Keep the registration alive: PosixSignalRegistration is
-                    // IDisposable and unregisters when GC'd, so the handle must
-                    // be rooted for the process lifetime.
                     _signalRegistrations.Add(
                         System.Runtime.InteropServices.PosixSignalRegistration.Create(
-                            sig, _ => RestoreTerminal()));
+                            sig, ctx =>
+                            {
+                                if (restoreTty) RestoreTerminal();
+                                if (status != 0)
+                                {
+                                    ctx.Cancel = true;
+                                    Environment.Exit(status);
+                                }
+                            }));
                 }
                 catch { /* signal not supported on this platform; best-effort */ }
             }
@@ -379,6 +390,15 @@ Subcommands:
                                [--dry-run] [--verbose]
                                [--keep-current: compile cache only]
   build <asd> --output <fasl>  Compile an ASDF system to a fasl
+  build-library <file>... --output <dll> [--reference <dll>]...
+                               Write the .NET library the dotnet:library
+                               form in the files defines to <dll>, after
+                               loading each --reference assembly so the
+                               files can name its types
+  build-library --system <name|asd> [--search-path <dir>]... [--output <dll>]
+                               The library an ASDF system defines in its
+                               (:dotnet-library ...) component; what
+                               (asdf:make ...) writes
   pack --system <name> ...     Package an ASDF system as a dotnet tool nupkg,
                                built by restamping the published dotcl tool
                                packages in --from
@@ -512,6 +532,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             try
             {
                 RunCore(args[1]);
+                CallCoverage.CoreLoaded();
                 // A bare file among the arguments makes this a script run, the
                 // run `--core <core> file.lisp` is, and it starts with the same
                 // *debugger-hook*: an unhandled error prints and exits 1. With
@@ -653,6 +674,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         // restamp the published dotcl tool packages in --from into the app's
         // own base pointer + per-RID packages with that fasl injected.
         bool packMode = !hasUserFasl && rest.Count > 0 && rest[0] == "pack";
+        // `build-library FILE... [--reference DLL]... --output PATH`: write the
+        // .NET library DLL the dotnet:library form in FILE defines.
+        bool buildLibraryMode = !hasUserFasl && rest.Count > 0 && rest[0] == "build-library";
         var pack = new PackOptions();
         if (packMode)
         {
@@ -735,7 +759,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         // reads it; a script run is never painted. Only the spelling with `=`:
         // a separate value would be read as a script name by the bare-token rule
         // below, which is a worse surprise than being told how to spell it.
-        for (int i = 0; !hasUserFasl && !buildMode && !packMode && i < rest.Count; i++)
+        for (int i = 0; !hasUserFasl && !buildMode && !packMode && !buildLibraryMode && i < rest.Count; i++)
         {
             if (rest[i] == "--color" || rest[i].StartsWith("--color="))
             {
@@ -779,7 +803,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         var actions = new List<(string kind, string value)>();
         string? positionalScript = null;
         List<string> positionalArgv = new();
-        for (int i = 0; !hasUserFasl && !buildMode && !packMode && i < rest.Count; i++)
+        for (int i = 0; !hasUserFasl && !buildMode && !packMode && !buildLibraryMode && i < rest.Count; i++)
         {
             if (rest[i] == "--load" || rest[i] == "--eval")
             {
@@ -830,7 +854,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         // as the program only when nothing else is, so `... | dotcl --eval`
         // still reads it as data and `... | dotcl repl` is still a REPL. From a
         // terminal nothing changes: the usage message below and exit 2.
-        if (!hasUserFasl && !buildMode && !packMode && !explicitRepl
+        if (!hasUserFasl && !buildMode && !packMode && !buildLibraryMode && !explicitRepl
             && positionalScript == null && actions.Count == 0
             && Console.IsInputRedirected)
             positionalScript = StdinScript;
@@ -852,7 +876,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 Console.Error.WriteLine($"Error: core file not found: {corePath}");
                 Environment.Exit(2);
             }
-            try { RunCore(corePath); }
+            try { RunCore(corePath); CallCoverage.CoreLoaded(); }
             catch (LispSourceException lse)
             {
                 Console.Error.WriteLine(lse.FormatTrace());
@@ -916,6 +940,9 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             }
             return;
         }
+
+        if (buildLibraryMode)
+            Environment.Exit(DotclBuild.RunBuildLibraryCommand(rest.GetRange(1, rest.Count - 1), Console.Error));
 
         // `pack` subcommand dispatch: build the user fasl, then restamp.
         if (packMode)
@@ -1159,7 +1186,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     {
         int at = FirstNonGlobalArg(args);
         if (at < 0) return null;
-        return args[at] is "repl" or "build" or "pack" ? args[at] : null;
+        return args[at] is "repl" or "build" or "build-library" or "pack" ? args[at] : null;
     }
 
     /// <summary>Load and execute a compiled core (.sil text or .fasl PE assembly).</summary>
@@ -2207,6 +2234,7 @@ sealed class StdinReader : System.IO.TextReader
     private const int None = -2;
     private const char EndMark = '\u001A';
     private readonly System.IO.TextReader _in;
+    private readonly StdinDecoder? _dec;
     private readonly bool _endMark;
     private bool _started;
     // Only tracked when _endMark is on: the next character begins a line.
@@ -2217,8 +2245,11 @@ sealed class StdinReader : System.IO.TextReader
     public StdinReader(System.IO.TextReader inner, bool consoleEndMark = false)
     {
         _in = inner;
+        _dec = inner as StdinDecoder;
         _endMark = consoleEndMark;
     }
+
+    private bool CanLookAhead() => _dec == null || _dec.CanLookAhead();
 
     private void Start()
     {
@@ -2231,8 +2262,15 @@ sealed class StdinReader : System.IO.TextReader
     private int Next()
     {
         int c = _in.Read();
-        if (c == '\r' && _in.Peek() == '\n') c = _in.Read();
+        if (c == '\r' && CanLookAhead() && _in.Peek() == '\n') c = _in.Read();
         return c;
+    }
+
+    // False when a read now would wait; null when that is not known.
+    public bool? DataReady()
+    {
+        if (_dec == null || _pending != None || _dec.Buffered > 0 || _dec.AtEof) return true;
+        return StdinPoll.Ready();
     }
 
     // Next, with a Ctrl+Z that begins a line read as the end of input.
@@ -2304,7 +2342,7 @@ sealed class StdinReader : System.IO.TextReader
             if (c == '\r')
             {
                 // A CR whose LF is in this block, or the next one, is dropped.
-                if (r + 1 < end ? buffer[r + 1] == '\n' : _in.Peek() == '\n')
+                if (r + 1 < end ? buffer[r + 1] == '\n' : CanLookAhead() && _in.Peek() == '\n')
                     continue;
             }
             buffer[w++] = c;
@@ -2341,5 +2379,151 @@ sealed class StdinReader : System.IO.TextReader
     {
         if (disposing) _in.Dispose();
         base.Dispose(disposing);
+    }
+}
+
+// Decodes standard input itself so that the characters already read from the
+// OS are known; a StreamReader keeps them to itself.
+sealed class StdinDecoder : System.IO.TextReader
+{
+    private readonly System.IO.Stream _s;
+    private readonly System.Text.Decoder _d;
+    private readonly byte[] _b = new byte[4096];
+    private readonly char[] _c;
+    private int _pos, _len;
+    private bool _eof;
+
+    public StdinDecoder(System.IO.Stream s, System.Text.Encoding enc)
+    {
+        _s = s;
+        _d = enc.GetDecoder();
+        _c = new char[enc.GetMaxCharCount(_b.Length)];
+    }
+
+    public int Buffered => _len - _pos;
+    public bool AtEof => _eof && _pos >= _len;
+
+    // Whether looking at the next character can be done without waiting.
+    public bool CanLookAhead() => Buffered > 0 || _eof || StdinPoll.Ready() != false;
+
+    private void Fill()
+    {
+        while (_pos >= _len && !_eof)
+        {
+            int n = _s.Read(_b, 0, _b.Length);
+            if (n <= 0) { _eof = true; break; }
+            _len = _d.GetChars(_b, 0, n, _c, 0, false);
+            _pos = 0;
+        }
+    }
+
+    public override int Peek()
+    {
+        Fill();
+        return _pos < _len ? _c[_pos] : -1;
+    }
+
+    public override int Read()
+    {
+        Fill();
+        return _pos < _len ? _c[_pos++] : -1;
+    }
+
+    public override int Read(char[] buffer, int index, int count)
+    {
+        if (count == 0) return 0;
+        Fill();
+        int n = System.Math.Min(count, _len - _pos);
+        if (n <= 0) return 0;
+        System.Array.Copy(_c, _pos, buffer, index, n);
+        _pos += n;
+        return n;
+    }
+}
+
+// Non-blocking "is there input" for the process's standard input.
+static class StdinPoll
+{
+    public static bool? Ready()
+    {
+        try
+        {
+            return OperatingSystem.IsWindows() ? WindowsReady() : UnixReady();
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private struct PollFd { public int Fd; public short Events; public short Revents; }
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "poll")]
+    private static extern int poll_(ref PollFd fds, nuint n, int timeout);
+
+    private static bool? UnixReady()
+    {
+        var fd = new PollFd { Fd = 0, Events = 1 /* POLLIN */ };
+        int r = poll_(ref fd, 1, 0);
+        if (r < 0) return null;
+        return r > 0;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit, Size = 20)]
+    private struct InputRecord
+    {
+        [System.Runtime.InteropServices.FieldOffset(0)] public ushort EventType;
+        [System.Runtime.InteropServices.FieldOffset(4)] public int KeyDown;
+        [System.Runtime.InteropServices.FieldOffset(14)] public ushort Char;
+    }
+
+    private const int StdInputHandle = -10;
+    private const uint FileTypeChar = 2, FileTypePipe = 3;
+    private const uint EnableLineInput = 2;
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern System.IntPtr GetStdHandle(int which);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern uint GetFileType(System.IntPtr h);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool GetConsoleMode(System.IntPtr h, out uint mode);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool PeekNamedPipe(System.IntPtr h, System.IntPtr buf, uint size, System.IntPtr read, out uint avail, System.IntPtr left);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool PeekConsoleInputW(System.IntPtr h, [System.Runtime.InteropServices.Out] InputRecord[] recs, uint n, out uint read);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool ReadConsoleInputW(System.IntPtr h, [System.Runtime.InteropServices.Out] InputRecord[] recs, uint n, out uint read);
+
+    private static bool? WindowsReady()
+    {
+        var h = GetStdHandle(StdInputHandle);
+        uint type = GetFileType(h);
+        if (type == FileTypePipe)
+            return !PeekNamedPipe(h, System.IntPtr.Zero, 0, System.IntPtr.Zero, out uint avail, System.IntPtr.Zero) || avail > 0;
+        if (type == FileTypeChar && GetConsoleMode(h, out uint mode))
+            return ConsoleReady(h, (mode & EnableLineInput) != 0);
+        return true;
+    }
+
+    // A key press that produces a character is input; other records (key
+    // release, focus, resize, mouse) would only make a read wait, so they are
+    // dropped. In line mode a read waits for the Enter key as well.
+    private static bool? ConsoleReady(System.IntPtr h, bool line)
+    {
+        const int N = 256;
+        var recs = new InputRecord[N];
+        while (true)
+        {
+            if (!PeekConsoleInputW(h, recs, N, out uint n)) return null;
+            if (n == 0) return false;
+            for (uint i = 0; i < n; i++)
+            {
+                if (recs[i].EventType != 1 || recs[i].KeyDown == 0 || recs[i].Char == 0) continue;
+                if (!line || recs[i].Char == '\r') return true;
+            }
+            if (line) return false;
+            if (!ReadConsoleInputW(h, recs, n, out _)) return null;
+        }
     }
 }

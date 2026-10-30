@@ -15,24 +15,33 @@ public static partial class Runtime
         return obj;
     }
 
+#if DEBUG
+    /// <summary>Debug builds: throw when the package-table entry for T or NIL
+    /// (Startup.T_SYM / NIL_SYM) shows up as a Lisp value. Only T.Instance and
+    /// Nil.Instance may be values.</summary>
+    internal static void AssertNotTableTNil(LispObject? obj)
+    {
+        if (obj != null && (ReferenceEquals(obj, Startup.T_SYM) || ReferenceEquals(obj, Startup.NIL_SYM)))
+            throw new InvalidOperationException(
+                "The package-table symbol " + ((Symbol)obj).Name + " was observed as a value\n"
+                + System.Environment.StackTrace);
+    }
+#endif
+
     // --- Equality ---
 
     /// <summary>
-    /// Reference-level eq test that handles T.Instance/T_SYM and Nil.Instance/NIL_SYM equivalence.
-    /// Use this instead of ReferenceEquals when implementing eq-equivalent comparisons.
+    /// Reference-level eq test. T and NIL have one object each as values, so this
+    /// is identity. The arguments are single values: callers unwrap a values bundle first.
     /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static bool IsEqRef(LispObject a, LispObject b)
     {
-        a = Primary(a); b = Primary(b);
-        if (ReferenceEquals(a, b)) return true;
-        if ((a is T && ReferenceEquals(b, Startup.T_SYM)) ||
-            (b is T && ReferenceEquals(a, Startup.T_SYM)))
-            return true;
-        if ((a is Nil && ReferenceEquals(b, Startup.NIL_SYM)) ||
-            (b is Nil && ReferenceEquals(a, Startup.NIL_SYM)))
-            return true;
-        return false;
+#if DEBUG
+        if (a is MvReturn || b is MvReturn) throw new InvalidOperationException("EQ: a values bundle as an argument");
+        AssertNotTableTNil(a); AssertNotTableTNil(b);
+#endif
+        return ReferenceEquals(a, b);
     }
 
     public static LispObject Eq(LispObject a, LispObject b)
@@ -44,14 +53,6 @@ public static partial class Runtime
     {
         a = Primary(a); b = Primary(b);
         if (ReferenceEquals(a, b)) return T.Instance;
-        // T.Instance and T_SYM are the same symbol in CL
-        if ((a is T && ReferenceEquals(b, Startup.T_SYM)) ||
-            (b is T && ReferenceEquals(a, Startup.T_SYM)))
-            return T.Instance;
-        // Nil.Instance and NIL_SYM are the same symbol in CL
-        if ((a is Nil && ReferenceEquals(b, Startup.NIL_SYM)) ||
-            (b is Nil && ReferenceEquals(a, Startup.NIL_SYM)))
-            return T.Instance;
         if (a is Fixnum fa && b is Fixnum fb && fa.Value == fb.Value) return T.Instance;
         if (a is LispChar ca && b is LispChar cb && ca.Value == cb.Value) return T.Instance;
         if (a is LispSimdPack pa && b is LispSimdPack pb && pa.SameBits(pb)) return T.Instance;
@@ -174,11 +175,14 @@ public static partial class Runtime
     public static bool IsNilObj(LispObject obj)
     {
         obj = Primary(obj);
+#if DEBUG
+        AssertNotTableTNil(obj);
+#endif
         // NIL has a private constructor and a single Instance, so identity IS the
         // type test: and a pointer compare, unlike `is Nil`, does not go through
         // CastHelpers.IsInstanceOfClass (which a profile of precompiled code shows
         // near the top).
-        return ReferenceEquals(obj, Nil.Instance) || ReferenceEquals(obj, Startup.NIL_SYM);
+        return ReferenceEquals(obj, Nil.Instance);
     }
     public static LispObject Null(LispObject obj) => IsNilObj(obj) ? T.Instance : Nil.Instance;
     public static LispObject Not(LispObject obj) => IsNilObj(obj) ? T.Instance : Nil.Instance;
@@ -294,9 +298,9 @@ public static partial class Runtime
             {
                 'S' => Runtime.List(Startup.Sym("COMPLEX"), Startup.Sym("SINGLE-FLOAT")),
                 'D' => Runtime.List(Startup.Sym("COMPLEX"), Startup.Sym("DOUBLE-FLOAT")),
-                _ => Startup.Sym("T")
+                _ => T.Instance
             };
-        return Startup.Sym(et);
+        return Startup.SymValue(et);
     }
 
     /// <summary>Which complex array an element type name stands for: 'S' for

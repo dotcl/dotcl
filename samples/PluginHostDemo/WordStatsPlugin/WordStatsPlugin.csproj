@@ -1,0 +1,7 @@
+<Project Sdk="DotCL.Sdk">
+  <ItemGroup>
+    <LispSystem Include="word-stats.asd" />
+    <DotclAsdSearchPath Include="../text-util/" />
+    <ProjectReference Include="../PluginHost.Abstractions/PluginHost.Abstractions.csproj" />
+  </ItemGroup>
+</Project>

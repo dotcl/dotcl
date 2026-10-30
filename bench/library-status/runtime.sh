@@ -75,6 +75,21 @@ select_runtime() {
     echo "$1: $core is missing or older than compiler/cil-out.sil; run make compile-core-fasl first" >&2
     exit 1
   fi
+  # (require "asdf") passes over a contrib fasl built against other runtime
+  # source and loads the source instead: every row then pays for compiling
+  # ASDF and the Quicklisp client, and its seconds roughly double.
+  idfile="$root/runtime/obj/$config/net10.0/dotcl-runtime-source.id"
+  if [ -f "$idfile" ]; then
+    id=$(head -n 1 "$idfile" | tr -d '\r\n ')
+    for d in "$root"/contrib/*/; do
+      f="$d$(basename "$d").fasl"
+      [ -f "$f" ] || continue
+      if ! LC_ALL=C grep -q -a -F -- "-$id" "$f"; then
+        echo "$1: $f was built against other runtime source; run make refresh-fasls first" >&2
+        exit 1
+      fi
+    done
+  fi
   runtime_desc="$config"
   echo "$1: runtime $runtime_desc ($exe, core $core)"
 }

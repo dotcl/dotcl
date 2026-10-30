@@ -54,6 +54,50 @@
     (prin1-to-string (list x y)))
   "((1 #1=(3 4)) (2 #1#))")
 
+;;; *print-level* with *print-circle*: the label scan stops at the level, so an
+;;; object gets a label only when it is reached twice within the levels that
+;;; are printed (a truncated object still counts as one reference). Expected
+;;; strings are SBCL's.
+(defun circle-level-string (obj level)
+  (let ((*print-circle* t) (*print-pretty* nil) (*print-level* level))
+    (write-to-string obj)))
+
+(deftest printer-cons.circle-print-level-nested
+  (list (circle-level-string '(a (b (c (d)))) 2)
+        (let ((x (list 'a (list 'b)))) (setf (cdr (cadr x)) x)
+          (list (circle-level-string x 0) (circle-level-string x 1)
+                (circle-level-string x 2))))
+  ("(A (B #))" ("#" "(A #)" "#1=(A (B . #1#))")))
+
+(deftest printer-cons.circle-print-level-shared
+  (let* ((tail (list 2 3)) (x (list tail tail)))
+    (mapcar (lambda (l) (circle-level-string x l)) '(0 1 2)))
+  ("#" "(#1=# #1#)" "(#1=(2 3) #1#)"))
+
+(deftest printer-cons.circle-print-level-hidden-share
+  (let* ((s (list 1)) (x (list s (list s))) (tail (list 2 3))
+         (y (list (list 1 tail) tail)))
+    (list (circle-level-string x 1) (circle-level-string x 2)
+          (circle-level-string y 1) (circle-level-string y 2)))
+  ("(# #)" "(#1=(1) (#1#))" "(# #)" "((1 #1=#) #1#)"))
+
+(deftest printer-cons.circle-print-level-circular-list
+  (let ((x (list 'a 'b)))
+    (setf (cddr x) x)
+    (mapcar (lambda (l) (circle-level-string x l)) '(0 1 2)))
+  ("#" "#1=(A B . #1#)" "#1=(A B . #1#)"))
+
+(deftest printer-cons.circle-print-level-vector
+  (let ((v (make-array 2 :initial-element nil)))
+    (setf (aref v 0) v (aref v 1) v)
+    (mapcar (lambda (l) (circle-level-string v l)) '(0 1 2)))
+  ("#" "#1=#(#1# #1#)" "#1=#(#1# #1#)"))
+
+(deftest printer-cons.circle-print-level-dotted-cdr
+  (let* ((tail (list 2 3)) (x (cons 1 tail)) (y (cons 4 tail)))
+    (mapcar (lambda (l) (circle-level-string (list x y) l)) '(1 2 3)))
+  ("(# #)" "((1 . #1=#) (4 . #1#))" "((1 . #1=(2 3)) (4 . #1#))"))
+
 ;;; With *print-circle* off, printing a circular list is outside the standard;
 ;;; what has to hold is that it terminates.
 (deftest printer-cons.circular-without-print-circle-terminates

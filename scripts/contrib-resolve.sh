@@ -9,7 +9,7 @@
 # compiler edit everything under contrib/ is older; what matters is which single
 # candidate wins and whether something fresher lost.
 #
-# Search order mirrors ModuleProvideContrib (runtime/Runtime.Misc.cs): for each
+# Search order mirrors ModuleProvideContrib (runtime/Runtime.Modules.cs): for each
 # directory in order, try .fasl, then .sil, then .lisp, at <dir>/<name>/<name><ext>.
 # With the dev runner's base directory being runtime/bin/<cfg>/<tfm>/, the
 # directories are that one, then runtime/, then the project root.

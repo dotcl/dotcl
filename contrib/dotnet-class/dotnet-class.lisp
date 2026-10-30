@@ -133,7 +133,7 @@
     ((null spec) nil)
     (t (error "dotnet:define-class: type spec must be a symbol or string: ~S" spec))))
 
-(defun dotnet::%process-ctor-form (ctor-form)
+(defun dotnet::%process-ctor-form (ctor-form &optional bake-index)
   "Process one (:ctor params body...) form and return a list-generating form
    suitable for the ctor-specs-list arg of dotnet:%define-class.
    Each result is (list lambda-or-nil param-types base-arg-indices).
@@ -164,11 +164,20 @@
          ;; package. *package* here is the caller's, since this runs at the
          ;; caller's macroexpansion time (robust even from a prebuilt fasl).
          (self-sym (intern "SELF" *package*)))
-    `(list ,(if ctor-body
-                `(lambda (,self-sym ,@ctor-param-names)
-                   (declare (ignorable ,self-sym))
-                   ,@ctor-body)
-                'nil)  ; no body => base-forwarding-only ctor, no Lisp dispatch
+    (when (and bake-index ctor-body)
+      (let ((fn (dotnet::%baked-name (format nil "NEW~D" bake-index))))
+        (push `(defun ,fn (,self-sym ,@ctor-param-names)
+                 (declare (ignorable ,self-sym))
+                 ,@ctor-body)
+              dotnet::*library-defuns*)
+        (setf ctor-body `(quote ,fn))))
+    `(list ,(cond
+              ((and bake-index ctor-body) ctor-body)
+              (ctor-body
+               `(lambda (,self-sym ,@ctor-param-names)
+                  (declare (ignorable ,self-sym))
+                  ,@ctor-body))
+              (t 'nil))  ; no body => base-forwarding-only ctor, no Lisp dispatch
            (list ,@ctor-param-types)
            (list ,@base-arg-indices))))
 
@@ -183,6 +192,33 @@
   (let ((s (symbol-name sym)))
     (if (some #'lower-case-p s) s (string-downcase s))))
 
+(defvar dotnet::*library-core-functions* nil
+  "The core functions the last dotnet:library build copied into its .dll.")
+
+(defvar dotnet::*library-defuns* :none
+  "Inside a dotnet:library expansion, the (defun ...) forms to compile into the
+   library, most recent first. :NONE elsewhere.")
+
+(defvar dotnet::*class-full-name* nil
+  "Full name of the class whose options are being expanded.")
+
+(defun dotnet::%baked-name (&rest parts)
+  "A symbol, in the caller's package, for a function compiled into a library
+   for a member of the current class."
+  (let* ((full (or dotnet::*class-full-name* "Anon"))
+         (dot (position #\. full :from-end t))
+         (short (if dot (subseq full (1+ dot)) full)))
+    (intern (format nil "~A~{.~A~}" (string-upcase short) parts) *package*)))
+
+(defun dotnet::%pascal-case-name (sym)
+  "FAST-FIB -> \"FastFib\"."
+  (let ((out (make-string-output-stream)) (up t))
+    (loop for ch across (symbol-name sym)
+          do (cond ((char= ch #\-) (setf up t))
+                   (up (write-char (char-upcase ch) out) (setf up nil))
+                   (t (write-char (char-downcase ch) out))))
+    (get-output-stream-string out)))
+
 (defun dotnet::%method-spec-form (m &optional force-static)
   "Return a form producing one method-spec list for dotnet:%define-class /
    dotnet:%save-library. M is (name params &rest tail); tail begins with
@@ -196,6 +232,7 @@
     (let ((return-type (second tail))
           (override nil)
           (method-attrs nil)
+          (cs-name nil)
           (static force-static)
           (body (cddr tail))
           ;; SELF interned in the CALLER's package (see %process-ctor-form).
@@ -206,22 +243,40 @@
                  (:override (setf override (second body)))
                  (:attributes (setf method-attrs (second body)))
                  (:static (setf static (second body)))
+                 (:name (setf cs-name (second body)))
                  (otherwise
                   (error "dotnet: unknown method option ~S in ~S"
                          (first body) name)))
                (setf body (cddr body)))
-      (let ((param-names (mapcar #'first params))
-            (param-types (mapcar (lambda (p) (dotnet::%resolve-type (second p)))
-                                 params)))
-        `(list ,name ,(dotnet::%resolve-type return-type)
+      (let* ((param-names (mapcar #'first params))
+             (param-types (mapcar (lambda (p) (dotnet::%resolve-type (second p)))
+                                  params))
+             ;; A symbol name is a function compiled into the library: the
+             ;; method calls (NAME ...) directly, no Lisp needed at run time.
+             (baked (symbolp name)))
+        (when baked
+          (when (eq dotnet::*library-defuns* :none)
+            (error "dotnet: ~S: a function named by a symbol is compiled into a library, so it belongs in dotnet:library" name))
+          (if static
+              (push `(defun ,name ,param-names ,@body) dotnet::*library-defuns*)
+              (let ((fn (dotnet::%baked-name (symbol-name name))))
+                (push `(defun ,fn (,self-sym ,@param-names) (declare (ignorable ,self-sym)) ,@body)
+                      dotnet::*library-defuns*)
+                (setf cs-name (or cs-name (dotnet::%pascal-case-name name))
+                      name fn))))
+        `(list ,(if baked (or cs-name (dotnet::%pascal-case-name name)) name)
+               ,(dotnet::%resolve-type return-type)
                (list ,@param-types)
-               ,(if static
+               ,(cond
+                  (baked `(quote ,name))
+                  (static
                     ;; static -> no self (DispatchLispStatic funcalls with just
                     ;; the declared params).
-                    `(lambda (,@param-names) ,@body)
-                    `(lambda (,self-sym ,@param-names)
-                       (declare (ignorable ,self-sym))
-                       ,@body))
+                   `(lambda (,@param-names) ,@body))
+                  (t
+                   `(lambda (,self-sym ,@param-names)
+                      (declare (ignorable ,self-sym))
+                      ,@body)))
                ,override
                ,(if method-attrs
                     `(list ,@(mapcar (lambda (a) `(list ,@a)) method-attrs))
@@ -230,13 +285,23 @@
                (list ,@(mapcar (function dotnet::%param-name-string)
                                param-names)))))))
 
+(defun dotnet::%baked-class-p (options)
+  "True when a class in a dotnet:library has its bodies compiled into the
+   library: it has a method named by a symbol, or says (:bake t)."
+  (and (not (eq dotnet::*library-defuns* :none))
+       (or (second (assoc :bake options))
+           (some (lambda (m) (and (consp m) (symbolp (first m))))
+                 (cdr (assoc :methods options))))))
+
 (defun dotnet::%class-spec-args (full-name supers options)
   "Return a LIST of 12 forms = the positional dotnet:%define-class args 0-11
    (full-name .. ctor-specs) for a class/module described by SUPERS + OPTIONS.
    Shared by dotnet:define-class (single type) and dotnet:library (one entry
    per type). OPTIONS accepts the define-class option forms plus :functions
    (methods emitted as `public static', i.e. defun exports)."
-  (let* ((base-type (when supers (dotnet::%resolve-type (first supers))))
+  (let* ((dotnet::*class-full-name* full-name)
+         (bake (dotnet::%baked-class-p options))
+         (base-type (when supers (dotnet::%resolve-type (first supers))))
          (fields-opt (cdr (assoc :fields options)))
          (attrs-opt  (cdr (assoc :attributes options)))
          (methods-opt (cdr (assoc :methods options)))
@@ -295,7 +360,10 @@
      'nil   ; arg 10: base-ctor-arg-indices (unused; ctors go via arg 11)
      ;; arg 11: ctor-specs-list: one entry per :ctor form
      (if ctor-forms
-         `(list ,@(mapcar #'dotnet::%process-ctor-form ctor-forms))
+         (let ((i 0))
+           `(list ,@(mapcar (lambda (c)
+                              (dotnet::%process-ctor-form c (and bake (incf i))))
+                            ctor-forms)))
          'nil))))
 
 (defmacro dotnet:define-class (full-name supers &body options)
@@ -357,6 +425,11 @@
 ;;;
 ;;; The :class/:module types are facades (bodies dispatch to their Lisp
 ;;; lambdas), so running THEIR methods needs DotCL.Runtime + the Lisp loaded.
+;;; The exception is a :functions entry (or a :static method) named by a
+;;; symbol, as in (fib ((n Int64)) :returns Int64 ...): its body is compiled
+;;; into the .dll as (defun fib ...), and the C# method (Fib, or :name "...")
+;;; calls it with only DotCL.Runtime present. (:defun name lambda-list body...)
+;;; adds such a function without exporting it.
 (defun dotnet::%enum-member-name (x)
   (if (stringp x) x (symbol-name x)))
 
@@ -463,19 +536,98 @@
      (destructuring-bind (kw full-name &rest opts) m
        (declare (ignore kw))
        `(list :class ,(cadr (assoc :doc opts)) ,@(dotnet::%class-spec-args full-name '() opts))))
+    (:defun
+     (when (eq dotnet::*library-defuns* :none)
+       (error "dotnet: (:defun ~S ...) belongs in dotnet:library" (second m)))
+     (push `(defun ,@(rest m)) dotnet::*library-defuns*)
+     nil)
     (:enum       (dotnet::%enum-spec-form m))
     (:constants  (dotnet::%constants-spec-form m))
     (:struct     (dotnet::%struct-spec-form m))
     (:interface  (dotnet::%interface-spec-form m))
     (:delegate   (dotnet::%delegate-spec-form m))))
 
+(export 'dotnet::pack-library (find-package :dotnet))
+
+(defun dotnet::pack-library (dll &key id version authors description output)
+  "Write a NuGet package for the library DLL: the DLL, its XML doc, and a
+   dependency on the DotCL.Runtime of this process. Returns the .nupkg path."
+  (dotnet:%pack-library (namestring dll) id version authors description
+                        (and output (namestring output))))
+
+(defvar dotnet::*library-output* nil
+  "When non-NIL, a dotnet:library form is being built by dotcl:build-library:
+   the path every dotnet:library form writes its DLL to instead of its :path,
+   or :OWN to keep each form's :path.")
+
+(defvar dotnet::*library-written* nil
+  "Inside dotcl:build-library, (assembly-name . path) of the library written.")
+
+(defvar dotnet::*library-source-files* nil
+  "Inside dotcl:build-library, the source files (truenames as strings) whose
+   functions a library body may reach: each one it reaches, and each one those
+   reach, is compiled into the library from its source.")
+
+(defvar dotnet::*library-source-functions* nil
+  "The functions of the source files the last dotnet:library build compiled
+   into its .dll.")
+
+(defun dotnet::%library-path (path asm-name)
+  (let ((out dotnet::*library-output*))
+    (cond ((null out) path)
+          (dotnet::*library-written*
+           (error "dotnet:library ~S: ~A already defines the library written to ~A; one build writes one library"
+                  asm-name (car dotnet::*library-written*) (cdr dotnet::*library-written*)))
+          ((and (not (eq out :own)) (string/= asm-name (pathname-name out)))
+           (error "dotnet:library ~S is being written to ~A: the assembly name has to match the file name (rename the library, or set the project's AssemblyName to ~S)"
+                  asm-name (file-namestring out) asm-name))
+          (t (let ((written (if (eq out :own) path out)))
+               (setf dotnet::*library-written* (cons asm-name written))
+               written)))))
+
+(defun dotnet::%source-truename (f)
+  (namestring (truename f)))
+
+(defun dotnet::%build-library (files output &optional source-files)
+  "Load FILES in order with every dotnet:library form writing to OUTPUT (to its
+   own :path when OUTPUT is NIL). A function defined in FILES or SOURCE-FILES
+   that a library body reaches is compiled into the library. Returns the path
+   written."
+  (let ((dotnet::*library-output* (or output :own))
+        (dotnet::*library-written* nil)
+        (dotnet::*library-source-files*
+          (remove-duplicates (mapcar #'dotnet::%source-truename (append files source-files))
+                             :test #'string= :from-end t)))
+    (dolist (f files)
+      (load f))
+    (unless dotnet::*library-written*
+      (error "No dotnet:library form was evaluated while loading ~{~A~^, ~}; nothing was written~@[ to ~A~]"
+             files output))
+    (cdr dotnet::*library-written*)))
+
 (defmacro dotnet:library (spec &body members)
   (destructuring-bind (asm-name &key version
-                                (path (concatenate 'string asm-name ".dll")))
+                                (path (concatenate 'string asm-name ".dll"))
+                                package package-id package-version authors description)
       spec
-    `(dotnet:%save-library
-      ,path ,asm-name ,version
-      (list ,@(mapcar #'dotnet::%member-spec-form members)))))
+    (let* ((dotnet::*library-defuns* '())
+           (specs (remove nil (mapcar #'dotnet::%member-spec-form members)))
+           (out (gensym "PATH"))
+           (save `(dotnet:%save-library
+                   ,out ,asm-name ,version
+                   (list ,@specs
+                         ,@(when dotnet::*library-defuns*
+                             `((list :bake nil ,@(mapcar (lambda (d) `(quote ,d))
+                                                         (reverse dotnet::*library-defuns*)))))))))
+      `(let ((,out (dotnet::%library-path ,path ,asm-name)))
+         ,(if package
+              `(progn ,save
+                      (dotnet::pack-library ,out
+                                            :id ,(or package-id asm-name)
+                                            :version ,package-version
+                                            :authors ,authors :description ,description
+                                            :output ,(and (stringp package) package)))
+              save)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; dotnet:ref: indexer sugar (get_Item / set_Item)
@@ -492,7 +644,8 @@
   (apply #'dotnet:invoke obj "get_Item" keys))
 
 (defsetf dotnet::ref (obj &rest keys) (val)
-  `(dotnet:invoke ,obj "set_Item" ,@keys ,val))
+  `(progn (dotnet:invoke ,obj "set_Item" ,@keys ,val)
+          ,val))
 
 ;;; ---------------------------------------------------------------------------
 ;;; dotnet:using: IDisposable resource cleanup macro

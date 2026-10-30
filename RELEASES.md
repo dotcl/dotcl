@@ -3,6 +3,135 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.36 -- 2026-10-31
+
+This release lets you write a .NET library in Common Lisp: the function and
+method bodies are compiled into a DLL that needs only the `DotCL.Runtime`
+package at run time. The debugger server gains conditional breakpoints and
+logpoints, compiler warnings carry their source position, and cross references
+cover more of the code. Many built-in functions now check their arguments as
+the standard requires, so code that passed wrong arguments without an error may
+now signal one; see Upgrading.
+
+### Upgrading
+
+- **Built-in functions check their argument count and keyword arguments.** Too
+  many or too few arguments, an odd number of keyword arguments, and an unknown
+  keyword signal PROGRAM-ERROR; before, they were often ignored. When a keyword
+  is given twice, the first value is used (CLHS 3.4.1.4).
+- **`destructuring-bind`, `defmacro` and `restart-case` clause lambda lists
+  reject unknown keywords.**
+- **Arguments that were accepted silently now signal an error**, for example
+  `(compile nil 42)`, `make-array` with a bad `:fill-pointer` or
+  `:initial-contents`, `make-hash-table` with an invalid `:test`, `coerce` of a
+  character to a string, `:test` given to a `-if` function, and out-of-range
+  `:start` / `:end`.
+- **`define-condition` requires condition parents.** A parent such as
+  `standard-object`, a structure, or an undefined name is an error.
+- **`(the <array type> x)` is checked at safety 1 and above**; a mismatch
+  signals TYPE-ERROR.
+- **Floating-point exceptions follow one rule.** At `(safety 3)`, overflow,
+  division by zero and invalid operations signal; at lower safety, the default
+  included, the results are IEEE infinities and NaN. This now includes `exp`,
+  `expt` and `(log 0)`, which used to signal at every safety. Rational division
+  by zero always signals. See docs/deviations.md.
+- **A namestring without a version parses with version `:newest`**
+  (`(pathname-version #p"x.txt")` was NIL).
+- **`directory` matches the type**: `(directory "d*")` no longer returns
+  `d.txt`; write `"d*.*"`.
+- **Character case follows CLHS 13.1.4.3.** A character has case only when its
+  upper and lower forms map to each other; `alphanumericp` now leaves out
+  non-ASCII decimal digits.
+- **A float token whose exponent is too large is a READER-ERROR** instead of an
+  infinity.
+- **`compile-file` and `compile` report undefined functions and variables** as
+  style warnings at the end of the compilation unit.
+
+### Added
+
+- **Common Lisp libraries for C#.** The functions, classes and methods of a
+  `dotnet:library` form are compiled into a DLL together with the core
+  functions they reach. A C# project references the DLL and `DotCL.Runtime`;
+  no Lisp source or core is loaded. The DLL can be built by `dotnet build`
+  (`DotCL.Sdk`), `dotcl build-library` or `dotcl:build-library`, from files or
+  an ASDF system, and packed as a `.nupkg`. Bodies may use delegates, classes
+  may declare `:events`, and what a body may not do (call generic functions,
+  `eval`, ...) is an error naming the call at build time. See
+  docs/define-class.md and samples/PluginHostDemo.
+- **`dotcl-dap`**: conditional breakpoints, hit counts and logpoints; an
+  exception filter that stops on a signalled error with its restarts; line
+  breakpoints in `defmethod`. No VS Code extension for it is published yet.
+- **Source positions for compiler warnings**: `dotcl:compiler-condition-source`
+  and `dotcl:*compiler-context*` give the file, line and position of the
+  top-level form and the innermost subform.
+- **More cross references**: `dotcl:who-references`, `who-sets`, `who-binds`
+  and `who-macroexpands`; `who-calls` now sees calls inside `defmethod` bodies
+  and calls to standard operators such as `car` and `+`. Fasls are about 11%
+  larger and `compile-file` about 3% slower; `dotcl:*record-xref*` NIL turns
+  recording off.
+- `dotcl:function-lambda-list` answers for all operators of COMMON-LISP and the
+  exported operators of the dotcl packages.
+- `dotcl:*invoke-debugger-hook*`, as `sb-ext:*invoke-debugger-hook*`.
+- USE-VALUE and STORE-VALUE restarts for an unbound variable and an undefined
+  function.
+- A `handler-bind` handler for a .NET exception runs before the stack unwinds
+  and can invoke a restart established inside the call that threw.
+- A fasl records the host features `#+` / `#-` looked at; loading it where one
+  differs warns `dotcl:fasl-host-mismatch`.
+- docs/gc-tuning.md: GC settings for compute-heavy programs.
+
+### Faster
+
+Numbers are from one Mac unless marked Linux (one x86-64 machine).
+
+- The per-platform packages JIT Lisp code optimized on its first call: four of
+  six cl-bench cold runs 9-25% faster (Linux).
+- A self-recursive function declared `integer` runs on fixnums while its
+  arguments fit: cl-bench `fib` 0.218 to 0.098 s (Linux).
+- `return-from` out of a `lambda` given to `maphash` or `(map nil ...)` no
+  longer throws a .NET exception: 6109 to 194 ns per exit (Linux).
+- `dotnet:static` with typed or no arguments is resolved at compile time:
+  `Math.Max` 230 to 25 ns.
+- `make-instance` of a class with `:default-initargs` 283 to 43 ns.
+
+### Fixed
+
+- FORMAT (`~F`, `~E`, `~G`, `~$`, `~R`) and pretty printer (`pprint-tabular`,
+  `~T`, `*print-level*`) conformance cases.
+- Printer: `*print-readably*` signals PRINT-NOT-READABLE for unreadable
+  objects; radix prefixes are lower case (`#3r`).
+- Reader: `read-delimited-list` after a skipped `#+` / `#-`, and several
+  readtable differences.
+- Numbers: `log`, `expt` and the transcendental functions on rationals,
+  singles and branch cuts; bignum to double rounding.
+- Files: `open :if-exists :rename` keeps the old file; `close :abort` and an
+  abnormal exit from `with-open-file` remove a created file and restore a
+  superseded one.
+- CLOS: `call-next-method` with no next method calls `no-next-method`;
+  subclasses see `:default-initargs` changed by redefining a superclass.
+- `defstruct`: ten conformance cases (read-only slots, `:include` of a typed
+  structure, copiers, ...).
+- Packages: `use-package`, `export`, `import` and `unintern` report name
+  conflicts with restarts.
+- Integer code: a `the` of a wide integer range made fixnum products signal
+  TYPE-ERROR, and fixnum products or `ash` in an `if` branch failed on a bignum.
+- Unbounded recursion in a typed function signals STORAGE-CONDITION instead of
+  ending the process with a stack overflow.
+- `listen` and `read-char-no-hang` on standard input return NIL when no input
+  is waiting, instead of blocking.
+- SIGTERM and SIGHUP end the process through its exit hooks.
+- The runtime could corrupt the heap inside a host that had used up its
+  thread-local storage (seen in MSBuild tasks under frequent GC).
+- `macroexpand-all` looped on macros that expand to themselves.
+- `sxhash` of strings, symbols, characters and numbers is the same in every
+  image.
+
+### Known issues
+
+- Compiling `defclass` and `defmethod` forms is 15-22% slower than in v0.1.35
+  the first time in a process, from recording source positions for warnings.
+  Later compiles are about as fast as before.
+
 ## v0.1.35 -- 2026-10-23
 
 This release adds the server side of two editor integrations, a Debug

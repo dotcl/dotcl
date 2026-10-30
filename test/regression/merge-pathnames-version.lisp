@@ -34,20 +34,30 @@
   t)
 
 ;;; --- the third argument is honoured ---
+;;; A parsed namestring carries :NEWEST, so these use a pathname with none.
 
 (deftest merge-pathnames-version.explicit-default-version-wins
-  (eq (mpv-version "mpv-a.txt" *default-pathname-defaults* :wild) :wild)
+  (eq (mpv-version (make-pathname :name "mpv-a" :type "txt")
+                   *default-pathname-defaults* :wild)
+      :wild)
   t)
 
 (deftest merge-pathnames-version.explicit-default-version-can-be-a-number
-  (mpv-version "mpv-a.txt" *default-pathname-defaults* 3)
+  (mpv-version (make-pathname :name "mpv-a" :type "txt")
+               *default-pathname-defaults* 3)
   3)
 
 ;;; NIL asked for explicitly is not the same as no argument: it means leave the
 ;;; version alone rather than supply :NEWEST.
 (deftest merge-pathnames-version.explicit-nil-default-version
-  (mpv-version "mpv-a.txt" *default-pathname-defaults* nil)
+  (mpv-version (make-pathname :name "mpv-a" :type "txt")
+               *default-pathname-defaults* nil)
   nil)
+
+;;; A namestring's parsed :NEWEST is its own version, so the default is unused.
+(deftest merge-pathnames-version.parsed-version-survives-the-default
+  (mpv-version "mpv-a.txt" *default-pathname-defaults* :wild)
+  :newest)
 
 ;;; --- a version already present is not overridden ---
 ;;;

@@ -70,8 +70,17 @@ public class CatchThrowException : Exception
 /// </summary>
 public static class ControlFlowFilters
 {
+    /// <summary>What a filter of CATCH, BLOCK, TAGBODY, HANDLER-CASE or
+    /// RESTART-CASE matches on: EX, or for a raw .NET exception the non-local
+    /// exit its handlers took (the exception is signalled here if no filter
+    /// nearer the raise point did), else the error it unwinds as.</summary>
+    public static object Transfer(object ex) => Runtime.EffectiveException(ex, false);
+
+    /// <summary>Transfer, for the handler block of the filter that took EX.</summary>
+    public static object TakeTransfer(object ex) => Runtime.EffectiveException(ex, true);
+
     public static int CatchTagMatches(object ex, LispObject tag)
-        => ex is CatchThrowException c && ReferenceEquals(c.Tag, tag) ? 1 : 0;
+        => ex is CatchThrowException c && Runtime.IsTrueEq(c.Tag, tag) ? 1 : 0;
 
     /// <summary>Filter predicate for BLOCK: does this non-local RETURN-FROM target
     /// the block whose tag is TAG? Same reasoning as CatchTagMatches: a block that
@@ -200,9 +209,11 @@ public class GoException : Exception
 /// </summary>
 /// <summary>Per-thread state of CATCH / THROW: the catch tags and ThrowReturn's
 /// arm, in one thread-static object so the common path reads one TLS slot.</summary>
+internal struct TagSlot { internal LispObject Tag; }
+
 internal sealed class CatchState
 {
-    internal LispObject[] Tags = new LispObject[16];
+    internal TagSlot[] Tags = new TagSlot[16];
     internal int Count;
     internal LispFunction? ArmFn;
     internal int ArmIdx;
@@ -215,16 +226,42 @@ public static class CatchTagStack
     [ThreadStatic]
     private static CatchState? _state;
 
-    internal static CatchState State => _state ??= new CatchState();
+    internal static CatchState State
+    {
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        get => _state ?? NewState();
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static CatchState NewState() => _state = new CatchState();
 
     internal static CatchState? StateOrNull => _state;
+
+    /// <summary>Push TAG and return this thread's catch state, to be passed to
+    /// Leave (and ThrowReturn.CallNS) so they need not look it up again.</summary>
+    [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization
+    public static object Enter(LispObject tag)
+    {
+        var s = State;
+        int n = s.Count;
+        if (n == s.Tags.Length) Array.Resize(ref s.Tags, n * 2);
+        s.Tags[n].Tag = tag;
+        s.Count = n + 1;
+        return s;
+    }
+
+    public static void Leave(object state)
+    {
+        var s = System.Runtime.CompilerServices.Unsafe.As<CatchState>(state);
+        s.Tags[--s.Count].Tag = null!;
+    }
 
     public static void Push(LispObject tag) => PushIndex(tag);
 
     public static void Pop()
     {
         var s = _state!;
-        s.Tags[--s.Count] = null!;
+        s.Tags[--s.Count].Tag = null!;
     }
 
     public static int PushIndex(LispObject tag)
@@ -232,20 +269,20 @@ public static class CatchTagStack
         var s = State;
         int n = s.Count;
         if (n == s.Tags.Length) Array.Resize(ref s.Tags, n * 2);
-        s.Tags[n] = tag;
+        s.Tags[n].Tag = tag;
         s.Count = n + 1;
         return n;
     }
 
     /// <summary>Index of the innermost entry that the CATCH filter would accept
-    /// for TAG (reference identity), or -1.</summary>
+    /// for TAG (EQ), or -1.</summary>
     public static int InnermostIndex(LispObject tag)
     {
         var s = _state;
         if (s == null) return -1;
         var tags = s.Tags;
         for (int i = s.Count - 1; i >= 0; i--)
-            if (ReferenceEquals(tags[i], tag)) return i;
+            if (Runtime.IsTrueEq(tags[i].Tag, tag)) return i;
         return -1;
     }
 
@@ -255,11 +292,7 @@ public static class CatchTagStack
         if (s == null) return false;
         var tags = s.Tags;
         for (int i = s.Count - 1; i >= 0; i--)
-        {
-            if (ReferenceEquals(tags[i], tag)) return true;
-            // For non-reference types (numbers), use Equals
-            if (tags[i].Equals(tag)) return true;
-        }
+            if (Runtime.IsTrueEq(tags[i].Tag, tag)) return true;
         return false;
     }
 }
@@ -272,7 +305,7 @@ public static class CatchTagStack
 /// one leaves the function normally (cleanups run as finally blocks) and returns
 /// Sentinel, which only ever reaches the CallN that armed it.
 /// </summary>
-public static class ThrowReturn
+public static unsafe class ThrowReturn
 {
     private sealed class SentinelObject : LispObject
     {
@@ -301,14 +334,49 @@ public static class ThrowReturn
         if (s == null || s.AsyncDepth > 0 || claimed >= s.Count) return false;
         var tags = s.Tags;
         for (int i = s.Count - 1; i > claimed; i--)
-            if (ReferenceEquals(tags[i], tag)) return false;
-        return ReferenceEquals(tags[claimed], tag);
+            if (Runtime.IsTrueEq(tags[i].Tag, tag)) return false;
+        return Runtime.IsTrueEq(tags[claimed].Tag, tag);
     }
 
     /// <summary>The function's exit for such a THROW, after its cleanups ran.</summary>
     public static LispObject Return(LispObject value)
     {
         CatchTagStack.State.Pending = value;
+        return Sentinel;
+    }
+
+    // Claim, CanReturn and Return with the thread's catch state kept by the
+    // caller: ClaimS gives the state (null when nothing is claimed) and
+    // ClaimedIndex, read right after it, the claimed index.
+    [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization
+    public static object? ClaimS(LispFunction self)
+    {
+        var s = CatchTagStack.StateOrNull;
+        if (s == null) return null;
+        var fn = s.ArmFn;
+        if (fn == null) return null;
+        s.ArmFn = null;
+        return ReferenceEquals(fn, self) ? s : null;
+    }
+
+    public static int ClaimedIndex(object? state)
+        => state == null ? -1 : System.Runtime.CompilerServices.Unsafe.As<CatchState>(state).ArmIdx;
+
+    [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization
+    public static bool CanReturnS(LispObject tag, int claimed, object? state)
+    {
+        if (claimed < 0) return false;
+        var s = System.Runtime.CompilerServices.Unsafe.As<CatchState>(state)!;
+        if (s.AsyncDepth > 0 || claimed >= s.Count) return false;
+        var tags = s.Tags;
+        for (int i = s.Count - 1; i > claimed; i--)
+            if (Runtime.IsTrueEq(tags[i].Tag, tag)) return false;
+        return Runtime.IsTrueEq(tags[claimed].Tag, tag);
+    }
+
+    public static LispObject ReturnS(LispObject value, object? state)
+    {
+        System.Runtime.CompilerServices.Unsafe.As<CatchState>(state)!.Pending = value;
         return Sentinel;
     }
 
@@ -453,7 +521,14 @@ public static class ThrowReturn
         if (fn._func0 == null) return fn.Invoke0();
         var s = CatchTagStack.State;
         s.ArmIdx = idx; s.ArmFn = fn;
-        var r = fn.Invoke0();
+        LispObject r;
+        if (fn._entryKey == 1)
+        {
+            var saved = LispFunction.CurrentTop;
+            try { r = ((delegate*<LispFunction, LispObject>)fn._entry)(fn); GC.KeepAlive(fn); }
+            finally { LispFunction.RestoreTop(saved); }
+        }
+        else r = fn.Invoke0();
         s.ArmFn = null;
         return Take(s, r);
     }
@@ -463,7 +538,14 @@ public static class ThrowReturn
         if (fn._func1 == null) return fn.Invoke1(a);
         var s = CatchTagStack.State;
         s.ArmIdx = idx; s.ArmFn = fn;
-        var r = fn.Invoke1(a);
+        LispObject r;
+        if (fn._entryKey == 2)
+        {
+            var saved = LispFunction.CurrentTop;
+            try { r = ((delegate*<LispFunction, LispObject, LispObject>)fn._entry)(fn, a); GC.KeepAlive(fn); }
+            finally { LispFunction.RestoreTop(saved); }
+        }
+        else r = fn.Invoke1(a);
         s.ArmFn = null;
         return Take(s, r);
     }
@@ -473,7 +555,14 @@ public static class ThrowReturn
         if (fn._func2 == null) return fn.Invoke2(a, b);
         var s = CatchTagStack.State;
         s.ArmIdx = idx; s.ArmFn = fn;
-        var r = fn.Invoke2(a, b);
+        LispObject r;
+        if (fn._entryKey == 3)
+        {
+            var saved = LispFunction.CurrentTop;
+            try { r = ((delegate*<LispFunction, LispObject, LispObject, LispObject>)fn._entry)(fn, a, b); GC.KeepAlive(fn); }
+            finally { LispFunction.RestoreTop(saved); }
+        }
+        else r = fn.Invoke2(a, b);
         s.ArmFn = null;
         return Take(s, r);
     }
@@ -483,7 +572,106 @@ public static class ThrowReturn
         if (fn._func3 == null) return fn.Invoke3(a, b, c);
         var s = CatchTagStack.State;
         s.ArmIdx = idx; s.ArmFn = fn;
-        var r = fn.Invoke3(a, b, c);
+        LispObject r;
+        if (fn._entryKey == 4)
+        {
+            var saved = LispFunction.CurrentTop;
+            try { r = ((delegate*<LispFunction, LispObject, LispObject, LispObject, LispObject>)fn._entry)(fn, a, b, c); GC.KeepAlive(fn); }
+            finally { LispFunction.RestoreTop(saved); }
+        }
+        else r = fn.Invoke3(a, b, c);
+        s.ArmFn = null;
+        return Take(s, r);
+    }
+
+    // CallN for a CATCH entered with CatchTagStack.Enter: STATE is its result,
+    // and the catch is the innermost entry.
+    [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization
+    public static LispObject Call0S(LispFunction fn, object state)
+    {
+        if (fn._func0 == null) return fn.Invoke0();
+        var s = System.Runtime.CompilerServices.Unsafe.As<CatchState>(state);
+        s.ArmIdx = s.Count - 1; s.ArmFn = fn;
+        LispObject r;
+        if (fn._entryKey == 1)
+        {
+            var saved = LispFunction.CurrentTop;
+            try { r = ((delegate*<LispFunction, LispObject>)fn._entry)(fn); GC.KeepAlive(fn); }
+            finally { LispFunction.RestoreTop(saved); }
+        }
+        else r = fn.Invoke0();
+        s.ArmFn = null;
+        return Take(s, r);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization
+    public static LispObject Call1S(LispFunction fn, LispObject a, object state)
+    {
+        if (fn._func1 == null) return fn.Invoke1(a);
+        var s = System.Runtime.CompilerServices.Unsafe.As<CatchState>(state);
+        s.ArmIdx = s.Count - 1; s.ArmFn = fn;
+        LispObject r;
+        if (fn._entryKey == 2)
+        {
+            var saved = LispFunction.CurrentTop;
+            try { r = ((delegate*<LispFunction, LispObject, LispObject>)fn._entry)(fn, a); GC.KeepAlive(fn); }
+            finally { LispFunction.RestoreTop(saved); }
+        }
+        else r = fn.Invoke1(a);
+        s.ArmFn = null;
+        return Take(s, r);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization
+    public static LispObject Call2S(LispFunction fn, LispObject a, LispObject b, object state)
+    {
+        if (fn._func2 == null) return fn.Invoke2(a, b);
+        var s = System.Runtime.CompilerServices.Unsafe.As<CatchState>(state);
+        s.ArmIdx = s.Count - 1; s.ArmFn = fn;
+        LispObject r;
+        if (fn._entryKey == 3)
+        {
+            var saved = LispFunction.CurrentTop;
+            try { r = ((delegate*<LispFunction, LispObject, LispObject, LispObject>)fn._entry)(fn, a, b); GC.KeepAlive(fn); }
+            finally { LispFunction.RestoreTop(saved); }
+        }
+        else r = fn.Invoke2(a, b);
+        s.ArmFn = null;
+        return Take(s, r);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization
+    public static LispObject Call3S(LispFunction fn, LispObject a, LispObject b, LispObject c, object state)
+    {
+        if (fn._func3 == null) return fn.Invoke3(a, b, c);
+        var s = System.Runtime.CompilerServices.Unsafe.As<CatchState>(state);
+        s.ArmIdx = s.Count - 1; s.ArmFn = fn;
+        LispObject r;
+        if (fn._entryKey == 4)
+        {
+            var saved = LispFunction.CurrentTop;
+            try { r = ((delegate*<LispFunction, LispObject, LispObject, LispObject, LispObject>)fn._entry)(fn, a, b, c); GC.KeepAlive(fn); }
+            finally { LispFunction.RestoreTop(saved); }
+        }
+        else r = fn.Invoke3(a, b, c);
+        s.ArmFn = null;
+        return Take(s, r);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization
+    public static LispObject Call4S(LispFunction fn, LispObject a, LispObject b, LispObject c, LispObject d, object state)
+    {
+        if (fn._func4 == null) return fn.Invoke4(a, b, c, d);
+        var s = System.Runtime.CompilerServices.Unsafe.As<CatchState>(state);
+        s.ArmIdx = s.Count - 1; s.ArmFn = fn;
+        LispObject r;
+        if (fn._entryKey == 5)
+        {
+            var saved = LispFunction.CurrentTop;
+            try { r = ((delegate*<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject>)fn._entry)(fn, a, b, c, d); GC.KeepAlive(fn); }
+            finally { LispFunction.RestoreTop(saved); }
+        }
+        else r = fn.Invoke4(a, b, c, d);
         s.ArmFn = null;
         return Take(s, r);
     }
@@ -493,7 +681,14 @@ public static class ThrowReturn
         if (fn._func4 == null) return fn.Invoke4(a, b, c, d);
         var s = CatchTagStack.State;
         s.ArmIdx = idx; s.ArmFn = fn;
-        var r = fn.Invoke4(a, b, c, d);
+        LispObject r;
+        if (fn._entryKey == 5)
+        {
+            var saved = LispFunction.CurrentTop;
+            try { r = ((delegate*<LispFunction, LispObject, LispObject, LispObject, LispObject, LispObject>)fn._entry)(fn, a, b, c, d); GC.KeepAlive(fn); }
+            finally { LispFunction.RestoreTop(saved); }
+        }
+        else r = fn.Invoke4(a, b, c, d);
         s.ArmFn = null;
         return Take(s, r);
     }

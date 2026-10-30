@@ -95,7 +95,7 @@ public static class DynamicBindings
     }
 
     public static LispObject GetConstant(Symbol sym)
-        => sym.Value ?? throw new LispErrorException(new LispUnboundVariable(sym));
+        => sym.Value ?? Runtime.UnboundVariableError(sym, global: true);
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispObject Get(Symbol sym)
@@ -109,8 +109,7 @@ public static class DynamicBindings
     {
         var st = StackBinding(sym, out int pos);
         var v = st == null ? sym.Value : st.E[pos].Val;
-        if (v == null) throw new LispErrorException(new LispUnboundVariable(sym));
-        return v;
+        return v ?? Runtime.UnboundVariableError(sym);
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
@@ -164,7 +163,7 @@ public static class DynamicBindings
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static LispObject UnboundError(Symbol sym)
-        => throw new LispErrorException(new LispUnboundVariable(sym));
+        => Runtime.UnboundVariableError(sym);
 
     public static bool TryGet(Symbol sym, out LispObject value)
     {
@@ -216,6 +215,324 @@ public static class DynamicBindings
         slot.Prev = st.Tops[idx];
         st.Tops[idx] = top + 1;
         st.Top = top + 1;
+    }
+
+    /// <summary>Save the group depth and make room for COUNT entries once.</summary>
+    public static int BindGroupDepth(int count) => BindGroupDepthOn(count, Current);
+
+    public static int BindGroupDepthOn(int count, BindingStack st)
+    {
+        int need = st.Top + count;
+        if (need > st.E.Length)
+        {
+            int cap = st.E.Length;
+            while (cap < need) cap *= 2;
+            var bigger = new Entry[cap];
+            Array.Copy(st.E, bigger, st.Top);
+            st.E = bigger;
+        }
+        return st.Top;
+    }
+
+    public static void PushGroup2(Symbol s1, LispObject v1, Symbol s2, LispObject v2)
+        => PushGroup2On(s1, v1, s2, v2, Current);
+
+    public static void PushGroup2On(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                    BindingStack st)
+    {
+        int top = st.Top;
+        var tops = st.Tops;
+        var e = st.E;
+        int i1 = s1.BindIndex, i2 = s2.BindIndex;
+        if ((uint)(top + 2) <= (uint)e.Length
+            && (uint)(i1 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i2 - 1) < (uint)(tops.Length - 1)
+            && s1.EverDynamicallyBound && s2.EverDynamicallyBound
+            && v1 is not UnboundSentinel && v2 is not UnboundSentinel)
+        {
+            ref var a = ref e[top];
+            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            ref var b = ref e[top + 1];
+            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            st.Top = top + 2;
+            return;
+        }
+        PushOn(s1, v1, st); PushOn(s2, v2, st);
+    }
+
+    public static void PushGroup3(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                  Symbol s3, LispObject v3)
+        => PushGroup3On(s1, v1, s2, v2, s3, v3, Current);
+
+    public static void PushGroup3On(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                    Symbol s3, LispObject v3, BindingStack st)
+    {
+        int top = st.Top;
+        var tops = st.Tops;
+        var e = st.E;
+        int i1 = s1.BindIndex, i2 = s2.BindIndex, i3 = s3.BindIndex;
+        if ((uint)(top + 3) <= (uint)e.Length
+            && (uint)(i1 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i2 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i3 - 1) < (uint)(tops.Length - 1)
+            && s1.EverDynamicallyBound && s2.EverDynamicallyBound
+            && s3.EverDynamicallyBound
+            && v1 is not UnboundSentinel && v2 is not UnboundSentinel
+            && v3 is not UnboundSentinel)
+        {
+            ref var a = ref e[top];
+            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            ref var b = ref e[top + 1];
+            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            ref var c = ref e[top + 2];
+            c.Sym = s3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
+            st.Top = top + 3;
+            return;
+        }
+        PushOn(s1, v1, st); PushOn(s2, v2, st); PushOn(s3, v3, st);
+    }
+
+    public static void PushGroup4(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                  Symbol s3, LispObject v3, Symbol s4, LispObject v4)
+        => PushGroup4On(s1, v1, s2, v2, s3, v3, s4, v4, Current);
+
+    public static void PushGroup4On(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                    Symbol s3, LispObject v3, Symbol s4, LispObject v4,
+                                    BindingStack st)
+    {
+        int top = st.Top;
+        var tops = st.Tops;
+        var e = st.E;
+        int i1 = s1.BindIndex, i2 = s2.BindIndex, i3 = s3.BindIndex, i4 = s4.BindIndex;
+        if ((uint)(top + 4) <= (uint)e.Length
+            && (uint)(i1 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i2 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i3 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i4 - 1) < (uint)(tops.Length - 1)
+            && s1.EverDynamicallyBound && s2.EverDynamicallyBound
+            && s3.EverDynamicallyBound && s4.EverDynamicallyBound
+            && v1 is not UnboundSentinel && v2 is not UnboundSentinel
+            && v3 is not UnboundSentinel && v4 is not UnboundSentinel)
+        {
+            ref var a = ref e[top];
+            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            ref var b = ref e[top + 1];
+            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            ref var c = ref e[top + 2];
+            c.Sym = s3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
+            ref var d = ref e[top + 3];
+            d.Sym = s4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
+            st.Top = top + 4;
+            return;
+        }
+        PushOn(s1, v1, st); PushOn(s2, v2, st);
+        PushOn(s3, v3, st); PushOn(s4, v4, st);
+    }
+
+    public static void PushGroup5(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                  Symbol s3, LispObject v3, Symbol s4, LispObject v4,
+                                  Symbol s5, LispObject v5)
+        => PushGroup5On(s1, v1, s2, v2, s3, v3, s4, v4, s5, v5, Current);
+
+    public static void PushGroup5On(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                    Symbol s3, LispObject v3, Symbol s4, LispObject v4,
+                                    Symbol s5, LispObject v5, BindingStack st)
+    {
+        int top = st.Top;
+        var tops = st.Tops;
+        var e = st.E;
+        int i1 = s1.BindIndex, i2 = s2.BindIndex, i3 = s3.BindIndex, i4 = s4.BindIndex,
+            i5 = s5.BindIndex;
+        if ((uint)(top + 5) <= (uint)e.Length
+            && (uint)(i1 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i2 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i3 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i4 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i5 - 1) < (uint)(tops.Length - 1)
+            && s1.EverDynamicallyBound && s2.EverDynamicallyBound
+            && s3.EverDynamicallyBound && s4.EverDynamicallyBound
+            && s5.EverDynamicallyBound
+            && v1 is not UnboundSentinel && v2 is not UnboundSentinel
+            && v3 is not UnboundSentinel && v4 is not UnboundSentinel
+            && v5 is not UnboundSentinel)
+        {
+            ref var a = ref e[top];
+            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            ref var b = ref e[top + 1];
+            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            ref var c = ref e[top + 2];
+            c.Sym = s3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
+            ref var d = ref e[top + 3];
+            d.Sym = s4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
+            ref var f = ref e[top + 4];
+            f.Sym = s5; f.Val = v5; f.Prev = tops[i5]; tops[i5] = top + 5;
+            st.Top = top + 5;
+            return;
+        }
+        PushOn(s1, v1, st); PushOn(s2, v2, st); PushOn(s3, v3, st);
+        PushOn(s4, v4, st); PushOn(s5, v5, st);
+    }
+
+    public static void PushGroup6(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                  Symbol s3, LispObject v3, Symbol s4, LispObject v4,
+                                  Symbol s5, LispObject v5, Symbol s6, LispObject v6)
+        => PushGroup6On(s1, v1, s2, v2, s3, v3, s4, v4, s5, v5, s6, v6, Current);
+
+    public static void PushGroup6On(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                    Symbol s3, LispObject v3, Symbol s4, LispObject v4,
+                                    Symbol s5, LispObject v5, Symbol s6, LispObject v6,
+                                    BindingStack st)
+    {
+        int top = st.Top;
+        var tops = st.Tops;
+        var e = st.E;
+        int i1 = s1.BindIndex, i2 = s2.BindIndex, i3 = s3.BindIndex, i4 = s4.BindIndex,
+            i5 = s5.BindIndex, i6 = s6.BindIndex;
+        if ((uint)(top + 6) <= (uint)e.Length
+            && (uint)(i1 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i2 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i3 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i4 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i5 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i6 - 1) < (uint)(tops.Length - 1)
+            && s1.EverDynamicallyBound && s2.EverDynamicallyBound
+            && s3.EverDynamicallyBound && s4.EverDynamicallyBound
+            && s5.EverDynamicallyBound && s6.EverDynamicallyBound
+            && v1 is not UnboundSentinel && v2 is not UnboundSentinel
+            && v3 is not UnboundSentinel && v4 is not UnboundSentinel
+            && v5 is not UnboundSentinel && v6 is not UnboundSentinel)
+        {
+            ref var a = ref e[top];
+            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            ref var b = ref e[top + 1];
+            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            ref var c = ref e[top + 2];
+            c.Sym = s3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
+            ref var d = ref e[top + 3];
+            d.Sym = s4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
+            ref var f = ref e[top + 4];
+            f.Sym = s5; f.Val = v5; f.Prev = tops[i5]; tops[i5] = top + 5;
+            ref var g = ref e[top + 5];
+            g.Sym = s6; g.Val = v6; g.Prev = tops[i6]; tops[i6] = top + 6;
+            st.Top = top + 6;
+            return;
+        }
+        PushOn(s1, v1, st); PushOn(s2, v2, st); PushOn(s3, v3, st);
+        PushOn(s4, v4, st); PushOn(s5, v5, st); PushOn(s6, v6, st);
+    }
+
+    public static void PushGroup7(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                  Symbol s3, LispObject v3, Symbol s4, LispObject v4,
+                                  Symbol s5, LispObject v5, Symbol s6, LispObject v6,
+                                  Symbol s7, LispObject v7)
+        => PushGroup7On(s1, v1, s2, v2, s3, v3, s4, v4, s5, v5, s6, v6, s7, v7, Current);
+
+    public static void PushGroup7On(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                    Symbol s3, LispObject v3, Symbol s4, LispObject v4,
+                                    Symbol s5, LispObject v5, Symbol s6, LispObject v6,
+                                    Symbol s7, LispObject v7, BindingStack st)
+    {
+        int top = st.Top;
+        var tops = st.Tops;
+        var e = st.E;
+        int i1 = s1.BindIndex, i2 = s2.BindIndex, i3 = s3.BindIndex, i4 = s4.BindIndex,
+            i5 = s5.BindIndex, i6 = s6.BindIndex, i7 = s7.BindIndex;
+        if ((uint)(top + 7) <= (uint)e.Length
+            && (uint)(i1 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i2 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i3 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i4 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i5 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i6 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i7 - 1) < (uint)(tops.Length - 1)
+            && s1.EverDynamicallyBound && s2.EverDynamicallyBound
+            && s3.EverDynamicallyBound && s4.EverDynamicallyBound
+            && s5.EverDynamicallyBound && s6.EverDynamicallyBound
+            && s7.EverDynamicallyBound
+            && v1 is not UnboundSentinel && v2 is not UnboundSentinel
+            && v3 is not UnboundSentinel && v4 is not UnboundSentinel
+            && v5 is not UnboundSentinel && v6 is not UnboundSentinel
+            && v7 is not UnboundSentinel)
+        {
+            ref var a = ref e[top];
+            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            ref var b = ref e[top + 1];
+            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            ref var c = ref e[top + 2];
+            c.Sym = s3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
+            ref var d = ref e[top + 3];
+            d.Sym = s4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
+            ref var f = ref e[top + 4];
+            f.Sym = s5; f.Val = v5; f.Prev = tops[i5]; tops[i5] = top + 5;
+            ref var g = ref e[top + 5];
+            g.Sym = s6; g.Val = v6; g.Prev = tops[i6]; tops[i6] = top + 6;
+            ref var h = ref e[top + 6];
+            h.Sym = s7; h.Val = v7; h.Prev = tops[i7]; tops[i7] = top + 7;
+            st.Top = top + 7;
+            return;
+        }
+        PushOn(s1, v1, st); PushOn(s2, v2, st); PushOn(s3, v3, st);
+        PushOn(s4, v4, st); PushOn(s5, v5, st); PushOn(s6, v6, st);
+        PushOn(s7, v7, st);
+    }
+
+    public static void PushGroup8(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                  Symbol s3, LispObject v3, Symbol s4, LispObject v4,
+                                  Symbol s5, LispObject v5, Symbol s6, LispObject v6,
+                                  Symbol s7, LispObject v7, Symbol s8, LispObject v8)
+        => PushGroup8On(s1, v1, s2, v2, s3, v3, s4, v4, s5, v5, s6, v6, s7, v7, s8, v8, Current);
+
+    public static void PushGroup8On(Symbol s1, LispObject v1, Symbol s2, LispObject v2,
+                                    Symbol s3, LispObject v3, Symbol s4, LispObject v4,
+                                    Symbol s5, LispObject v5, Symbol s6, LispObject v6,
+                                    Symbol s7, LispObject v7, Symbol s8, LispObject v8,
+                                    BindingStack st)
+    {
+        int top = st.Top;
+        var tops = st.Tops;
+        var e = st.E;
+        int i1 = s1.BindIndex, i2 = s2.BindIndex, i3 = s3.BindIndex, i4 = s4.BindIndex,
+            i5 = s5.BindIndex, i6 = s6.BindIndex, i7 = s7.BindIndex, i8 = s8.BindIndex;
+        if ((uint)(top + 8) <= (uint)e.Length
+            && (uint)(i1 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i2 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i3 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i4 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i5 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i6 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i7 - 1) < (uint)(tops.Length - 1)
+            && (uint)(i8 - 1) < (uint)(tops.Length - 1)
+            && s1.EverDynamicallyBound && s2.EverDynamicallyBound
+            && s3.EverDynamicallyBound && s4.EverDynamicallyBound
+            && s5.EverDynamicallyBound && s6.EverDynamicallyBound
+            && s7.EverDynamicallyBound && s8.EverDynamicallyBound
+            && v1 is not UnboundSentinel && v2 is not UnboundSentinel
+            && v3 is not UnboundSentinel && v4 is not UnboundSentinel
+            && v5 is not UnboundSentinel && v6 is not UnboundSentinel
+            && v7 is not UnboundSentinel && v8 is not UnboundSentinel)
+        {
+            ref var a = ref e[top];
+            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            ref var b = ref e[top + 1];
+            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            ref var c = ref e[top + 2];
+            c.Sym = s3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
+            ref var d = ref e[top + 3];
+            d.Sym = s4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
+            ref var f = ref e[top + 4];
+            f.Sym = s5; f.Val = v5; f.Prev = tops[i5]; tops[i5] = top + 5;
+            ref var g = ref e[top + 5];
+            g.Sym = s6; g.Val = v6; g.Prev = tops[i6]; tops[i6] = top + 6;
+            ref var h = ref e[top + 6];
+            h.Sym = s7; h.Val = v7; h.Prev = tops[i7]; tops[i7] = top + 7;
+            ref var j = ref e[top + 7];
+            j.Sym = s8; j.Val = v8; j.Prev = tops[i8]; tops[i8] = top + 8;
+            st.Top = top + 8;
+            return;
+        }
+        PushOn(s1, v1, st); PushOn(s2, v2, st); PushOn(s3, v3, st);
+        PushOn(s4, v4, st); PushOn(s5, v5, st); PushOn(s6, v6, st);
+        PushOn(s7, v7, st); PushOn(s8, v8, st);
     }
 
     public static void Pop(Symbol sym)
@@ -312,10 +629,21 @@ public static class DynamicBindings
         return sym;
     }
 
+    private static List<LispObject> ProgvList(LispObject obj)
+    {
+        var result = new List<LispObject>();
+        var cur = obj;
+        while (cur is Cons c) { result.Add(c.Car); cur = c.Cdr; }
+        if (cur is not Nil)
+            throw new LispErrorException(new LispTypeError(
+                $"PROGV: not a proper list: {obj}", obj, Startup.Sym("LIST")));
+        return result;
+    }
+
     public static LispObject ProgvBind(LispObject symsObj, LispObject valsObj)
     {
-        var syms = Runtime.ToList(symsObj);
-        var vals = Runtime.ToList(valsObj);
+        var syms = ProgvList(symsObj);
+        var vals = ProgvList(valsObj);
         for (int i = 0; i < syms.Count; i++)
         {
             if (syms[i] is not Symbol sym)

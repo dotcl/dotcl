@@ -18,6 +18,9 @@
 (unless (find-package "QL")
   (require "quicklisp"))
 
+(load (merge-pathnames "../steady.lisp"
+                       (or *load-truename* *default-pathname-defaults*)))
+
 (defpackage #:coalton-bench-run
   (:use #:cl))
 
@@ -64,6 +67,8 @@
   (load (compile-file (merge-pathnames "kernels.lisp" *here*) :output-file fasl))
   (format t "~&COMPILE kernels ~D ms~%" (round (- (now-ms) t0))))
 
+(defvar *load-finished* (get-internal-real-time))
+
 ;;; The ray tracer at a reduced size: 160x90 pixels, 4 samples, depth 6.
 
 (defun raytrace-kernel ()
@@ -95,21 +100,32 @@
         (format nil "~,6E" (float v 1d0)))
       (format nil "~A" v)))
 
-(let ((runs (parse-integer (env "COALTON_BENCH_RUNS" "5"))))
+(let ((runs (parse-integer (env "COALTON_BENCH_RUNS" "5")))
+      (steady (ledger-steady:env "LEDGER_STEADY")))
   (dolist (k *selected*)
     (let ((fn (cdr k)) (result nil) (times '()))
-      (let ((t0 (now-ms)))
-        (setf result (funcall fn))
-        (format t "~&FIRST ~A ~,2F~%" (car k) (- (now-ms) t0)))
-      (dotimes (i runs)
-        (full-gc)
-        (let ((t0 (now-ms)))
-          (setf result (funcall fn))
-          (push (- (now-ms) t0) times)))
-      (setf times (nreverse times))
-      (format t "~&RESULT ~A ~,2F ~A~{ ~,2F~}~%"
-              (car k) (reduce #'min times) (checksum-string result) times)
-      (finish-output))))
+      (if steady
+          (multiple-value-bind (best count stable)
+              (ledger-steady:measure (lambda () (setf result (funcall fn)))
+                                     :prepare #'full-gc
+                                     :since *load-finished*)
+            (format t "~&STEADY ~A ~,2F ~D ~A ~A~%"
+                    (car k) (* 1000d0 best) count (if stable "stable" "unstable")
+                    (checksum-string result))
+            (finish-output))
+          (progn
+            (let ((t0 (now-ms)))
+              (setf result (funcall fn))
+              (format t "~&FIRST ~A ~,2F~%" (car k) (- (now-ms) t0)))
+            (dotimes (i runs)
+              (full-gc)
+              (let ((t0 (now-ms)))
+                (setf result (funcall fn))
+                (push (- (now-ms) t0) times)))
+            (setf times (nreverse times))
+            (format t "~&RESULT ~A ~,2F ~A~{ ~,2F~}~%"
+                    (car k) (reduce #'min times) (checksum-string result) times)
+            (finish-output))))))
 
 (let ((repeat (parse-integer (env "COALTON_BENCH_REPEAT" "0"))))
   (when (plusp repeat)

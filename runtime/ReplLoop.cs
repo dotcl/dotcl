@@ -280,7 +280,7 @@ public static class ReplLoop
             bool readError = false;
             try
             {
-                var reader = new Reader(new StringReader(buffer.ToString()));
+                var reader = new Reader(new StringReader(buffer.ToString())) { EndOfFileUnsignalled = true };
                 while (reader.TryRead(out var expr))
                     forms.Add(expr);
             }

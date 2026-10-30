@@ -575,7 +575,7 @@ public static class TypeParser
         bool? simple = headName.StartsWith("SIMPLE-", StringComparison.Ordinal) ? true : null;
         var dims = new Cons(c.Car, Nil.Instance);
         CType Vec(string et) => new ArrayType(NamedType.Get(et), dims, simple,
-            et == "NIL" ? Nil.Instance : Startup.Sym(et));
+            Startup.SymValue(et));
         return headName switch
         {
             "BASE-STRING" or "SIMPLE-BASE-STRING" => Vec("BASE-CHAR"),
@@ -673,6 +673,16 @@ public static class CTypeOps
             }
         }
 
+        // An empty intersection is a subtype of everything, including the shapes
+        // handled below that would otherwise only look at its conjuncts.
+        if (ct1 is IntersectionType inter0 && IsEmptyIntersection(inter0)) return (true, true);
+        // (CONS NIL X) and (CONS X NIL) hold no object: no car or cdr can
+        // satisfy an empty type.
+        if (ct1 is ConsType emptyCons
+            && (emptyCons.CarType is NamedType { Name: "NIL" }
+                || emptyCons.CdrType is NamedType { Name: "NIL" }))
+            return (true, true);
+
         // === Exact decompositions first ===
         // (OR a b) <: X iff a <: X and b <: X; X <: (AND a b) iff X <: a and X <: b.
         // Both are exact, so they go before the rules below that only find
@@ -716,9 +726,11 @@ public static class CTypeOps
             return SubtypepUnion1(union1, ct2);
         if (ct1 is IntersectionType inter1)
             return SubtypepIntersection1(inter1, ct2);
-        if (ct1 is NegationType)
+        if (ct1 is NegationType neg1)
         {
-            // (NOT A) <: B: hard in general. Only handle B=T (already done above).
+            // (NOT A) <: B: hard in general. A built-in type disjoint from both A
+            // and B is a witness that (NOT A) holds somewhere outside B.
+            if (HasDisjointWitness(neg1.Inner, ct2)) return (false, true);
             return (false, false);
         }
 
@@ -820,6 +832,9 @@ public static class CTypeOps
 
         if (ct1 is MemberType mem1)
             return SubtypepMember(mem1, ct2);
+
+        // Disjoint built-in shapes are a certain NO whatever their form.
+        if (AreDisjointCore(ct1, ct2)) return (false, true);
 
         // SATISFIES: cannot determine in general
         if (ct1 is SatisfiesType || ct2 is SatisfiesType)
@@ -979,10 +994,9 @@ public static class CTypeOps
             }
             if (allCert) return (true, true);
         }
-        // A non-empty built-in type disjoint from every member is not a subtype:
-        // INTEGER is not a subtype of (OR RATIO FLOAT).
-        if (ct1 is NamedType ne && ne.Name is not ("NIL" or "*") && Runtime.IsBuiltinTypeName(ne.Name)
-            && System.Array.TrueForAll(union2.Types, m => AreDisjoint(ct1, m)))
+        // A type disjoint from every member is not a subtype of their union:
+        // INTEGER is not of (OR RATIO FLOAT), nor an ARRAY of (OR CONS NULL).
+        if (System.Array.TrueForAll(union2.Types, m => AreDisjointCore(ct1, m)))
             return (false, true);
         return (false, false);
     }
@@ -1359,7 +1373,7 @@ public static class CTypeOps
         CType[] Named(params string[] names) => names.Select(n => (CType)NamedType.Get(n)).ToArray();
         CType[] Strings(bool simple) => new[] { "CHARACTER", "BASE-CHAR", "NIL" }
             .Select(e => (CType)new ArrayType(NamedType.Get(e), Runtime.List(Startup.Sym("*")),
-                simple ? true : null, e == "NIL" ? Nil.Instance : Startup.Sym(e)))
+                simple ? true : null, Startup.SymValue(e)))
             .ToArray();
         return new Dictionary<string, CType[]>
         {
@@ -1458,7 +1472,13 @@ public static class CTypeOps
         foreach (var member in union1.Types)
         {
             var (sub, cert) = Subtypep(member, ct2);
-            if (!sub) { allSub = false; if (!cert) allCert = false; }
+            if (!sub)
+            {
+                // One member certainly outside ct2 makes the union certainly not
+                // a subtype, whatever the other members answer.
+                if (cert) return (false, true);
+                allSub = false; allCert = false;
+            }
         }
         if (allSub) return (true, true);
         if (allCert) return (false, true);
@@ -1474,7 +1494,13 @@ public static class CTypeOps
         foreach (var member in inter2.Types)
         {
             var (sub, cert) = Subtypep(ct1, member);
-            if (!sub) { allSub = false; if (!cert) allCert = false; }
+            if (!sub)
+            {
+                // One conjunct certainly outside ct1 makes the intersection
+                // certainly not a supertype, whatever the other conjuncts say.
+                if (cert) return (false, true);
+                allSub = false; allCert = false;
+            }
         }
         if (allSub) return (true, true);
         if (allCert) return (false, true);
@@ -1794,16 +1820,14 @@ public static class CTypeOps
 
     // --- Array types ---
 
-    /// <summary>True when element types E1 and E2 upgrade to the same
-    /// specialized (not T) array element type.</summary>
-    private static bool SameSpecializedUpgrade(LispObject e1, LispObject e2)
+    /// <summary>The upgraded array element type name, null for a wildcard or
+    /// an element type that cannot be read.</summary>
+    private static string? UpgradedElementName(ArrayType a)
     {
-        try
-        {
-            var u1 = Runtime.ParseElementTypeName(e1);
-            return u1 != "T" && Runtime.SameElementTypeName(u1, Runtime.ParseElementTypeName(e2));
-        }
-        catch (LispErrorException) { return false; }
+        if (a.ElementSpec is null && a.ElementType is NamedType { Name: "*" }) return null;
+        var spec = a.ElementSpec ?? CTypeToSpecifier(a.ElementType);
+        try { return Runtime.ParseElementTypeName(spec); }
+        catch (LispErrorException) { return null; }
     }
 
     private static (bool, bool) SubtypepArray(ArrayType a1, ArrayType a2)
@@ -1812,31 +1836,24 @@ public static class CTypeOps
         if (a2.SimpleP == true && a1.SimpleP != true) return (false, true);
         if (a2.SimpleP == false && a1.SimpleP == true) return (false, true);
 
-        // Element type: must be equivalent (per upgraded-array-element-type)
+        // Dimensions first: a rank or length only the second type requires
+        // rules the subtype relation out ((ARRAY *) is not (VECTOR INTEGER)).
+        if (a2.Dimensions != null)
+        {
+            if (a1.Dimensions == null) return (false, true);
+            if (!DimensionsMatch(a1.Dimensions, a2.Dimensions))
+                return (false, true);
+        }
+
+        // CLHS 15.1.2.1: equal upgraded element types make equal arrays, T
+        // included, so (VECTOR T) and (VECTOR INTEGER) are the same type.
         if (a2.ElementType is not NamedType { Name: "*" })
         {
             if (a1.ElementType is NamedType { Name: "*" }) return (false, false);
-            // Element types must match (after upgrading)
-            var (sub1, _) = Subtypep(a1.ElementType, a2.ElementType);
-            var (sub2, _) = Subtypep(a2.ElementType, a1.ElementType);
-            // Two element types that are not the same type can still upgrade
-            // to the same specialized one: (integer 0 100) and (unsigned-byte 7)
-            // both make (unsigned-byte 7) arrays, so the array types are the
-            // same (CLHS 15.1.2.1). Only specialized element types are compared
-            // this way: T is also what an unknown type name upgrades to.
-            if ((!sub1 || !sub2) && a1.ElementSpec != null && a2.ElementSpec != null
-                && SameSpecializedUpgrade(a1.ElementSpec, a2.ElementSpec))
-                sub1 = sub2 = true;
-            if (!sub1 || !sub2) return (false, true);  // element types differ
-        }
-
-        // Dimensions
-        if (a2.Dimensions != null)
-        {
-            if (a1.Dimensions == null) return (false, false);
-            // Both have dimensions: compare
-            if (!DimensionsMatch(a1.Dimensions, a2.Dimensions))
-                return (false, true);
+            var u1 = UpgradedElementName(a1);
+            var u2 = UpgradedElementName(a2);
+            if (u1 is null || u2 is null) return (false, false);
+            if (!Runtime.SameElementTypeName(u1, u2)) return (false, true);
         }
 
         return (true, true);
@@ -1894,6 +1911,39 @@ public static class CTypeOps
         return false;
     }
 
+    /// <summary>True when the two dimension specs demand different ranks or a
+    /// different length on some axis. A wildcard dimension says nothing.</summary>
+    private static bool DimensionsDisjoint(LispObject? d1, LispObject? d2)
+    {
+        if (d1 == null || d2 == null) return false;
+        if (!DimensionShape(d1, out int r1, out var l1)) return false;
+        if (!DimensionShape(d2, out int r2, out var l2)) return false;
+        if (r1 != r2) return true;
+        for (int i = 0; i < l1.Length; i++)
+            if (l1[i] is long a && l2[i] is long b && a != b) return true;
+        return false;
+    }
+
+    private static bool DimensionShape(LispObject d, out int rank, out long?[] lengths)
+    {
+        if (d is Fixnum f)
+        {
+            rank = (int)f.Value;
+            lengths = new long?[rank];
+            return true;
+        }
+        var dims = new List<long?>();
+        var cur = d;
+        while (cur is Cons c)
+        {
+            dims.Add(c.Car is Fixnum n ? n.Value : null);
+            cur = c.Cdr;
+        }
+        rank = dims.Count;
+        lengths = dims.ToArray();
+        return cur is Nil;
+    }
+
     // --- Cons types ---
 
     private static (bool, bool) SubtypepCons(ConsType c1, ConsType c2)
@@ -1929,6 +1979,7 @@ public static class CTypeOps
         // Also check built-in hierarchy for structure-object etc.
         if (c1.Class.IsStructureClass && Runtime.CheckSubtypeByName("STRUCTURE-OBJECT", n2.Name))
             return (true, true);
+        if (AreDisjointCore(c1, n2)) return (false, true);
         return (false, false);  // conservative; named type might be a deftype alias
     }
 
@@ -1941,6 +1992,7 @@ public static class CTypeOps
                 if (ReferenceEquals(c, c2.Class) || c.Name.Name == c2.Class.Name.Name)
                     return (true, true);
         }
+        if (AreDisjointCore(n1, c2)) return (false, true);
         return (false, false);  // conservative
     }
 
@@ -2147,7 +2199,7 @@ public static class CTypeOps
                      : nt.Name == "NIL" ? Nil.Instance
                      : Startup.Sym(nt.Name);
             case ClassCType cls:
-                return cls.Class.Name;
+                return Runtime.CanonicalizeSymbol(cls.Class.Name);
             case MemberType mem:
             {
                 // Build (MEMBER obj1 obj2 ...) or (EQL obj) as a proper Lisp list
@@ -2196,7 +2248,7 @@ public static class CTypeOps
             default:
                 // Fallback: parse the string representation
                 try { return Runtime.ReadFromString(new LispObject[] { new LispString(ct.ToSpecifier()) }); }
-                catch { return Startup.Sym(ct.ToSpecifier()); }
+                catch { return Startup.SymValue(ct.ToSpecifier()); }
         }
     }
 
@@ -2210,37 +2262,130 @@ public static class CTypeOps
     /// </summary>
     public static bool AreDisjoint(CType a, CType b)
     {
-        // T is never disjoint with anything
-        if (a is NamedType { Name: "T" } || b is NamedType { Name: "T" }) return false;
-        // NIL is disjoint with everything (it's the empty type)
         if (a is NamedType { Name: "NIL" } || b is NamedType { Name: "NIL" }) return true;
+        if (ReferenceEquals(a, b)) return false;
+        // If either is a subtype of the other, not disjoint.
+        if (Subtypep(a, b).result) return false;
+        if (Subtypep(b, a).result) return false;
+        return AreDisjointCore(a, b);
+    }
+
+    /// <summary>Disjointness without calling SUBTYPEP, so the SUBTYPEP fallback
+    /// can use it. Conservative: returns false if unsure.</summary>
+    private static bool AreDisjointCore(CType a, CType b)
+    {
+        // NIL is disjoint with everything (it's the empty type), including itself.
+        if (a is NamedType { Name: "NIL" } || b is NamedType { Name: "NIL" }) return true;
+        if (ReferenceEquals(a, b) || StructurallyEqual(a, b)) return false;
+        // T is never disjoint with anything.
+        if (a is NamedType { Name: "T" } || b is NamedType { Name: "T" }) return false;
+
+        // A composite is disjoint as soon as it cannot hold a common element.
+        if (a is IntersectionType ia)
+            return System.Array.Exists(ia.Types, t => AreDisjointCore(t, b));
+        if (b is IntersectionType ib)
+            return System.Array.Exists(ib.Types, t => AreDisjointCore(a, t));
+        if (a is UnionType ua)
+            return System.Array.TrueForAll(ua.Types, t => AreDisjointCore(t, b));
+        if (b is UnionType ub)
+            return System.Array.TrueForAll(ub.Types, t => AreDisjointCore(a, t));
+
+        // A MEMBER or EQL type holds only the objects it names, so ask TYPEP
+        // about each one. A SATISFIES or unknown name cannot be asked safely.
+        if (a is MemberType memA) return MemberSetDisjoint(memA, b);
+        if (b is MemberType memB) return MemberSetDisjoint(memB, a);
+
+        // ATOM is exactly what is not a cons.
+        if (a is NamedType { Name: "ATOM" } && (b is ConsType || b is NamedType { Name: "CONS" }))
+            return true;
+        if (b is NamedType { Name: "ATOM" } && (a is ConsType || a is NamedType { Name: "CONS" }))
+            return true;
+
         if (ComplexMask(a) is int ma && ComplexMask(b) is int mb) return (ma & mb) == 0;
         if (a is ComplexType ca && b is ComplexType cb && (ca.Mask & cb.Mask) == 0) return true;
         if (a is ComplexType ca2 && ComplexMask(b) is int mb2 && (ca2.Mask & mb2) == 0) return true;
         if (b is ComplexType cb2 && ComplexMask(a) is int ma2 && (cb2.Mask & ma2) == 0) return true;
         if ((a is ComplexType || ComplexMask(a) != null) && (b is ComplexType || ComplexMask(b) != null))
             return false;
-        if (a is ComplexType) return AreDisjoint(NamedType.Get("COMPLEX"), b);
-        if (b is ComplexType) return AreDisjoint(a, NamedType.Get("COMPLEX"));
-
-        // If either is a subtype of the other, not disjoint
-        var (sub1, cert1) = Subtypep(a, b);
-        if (sub1) return false;
-        var (sub2, cert2) = Subtypep(b, a);
-        if (sub2) return false;
+        if (a is ComplexType) return AreDisjointCore(NamedType.Get("COMPLEX"), b);
+        if (b is ComplexType) return AreDisjointCore(a, NamedType.Get("COMPLEX"));
 
         // Two numeric classes neither of which contains the other: INTEGER and RATIO,
-        // (INTEGER 0 *) and FLOAT.
+        // (INTEGER 0 *) and FLOAT, REAL and COMPLEX.
         if (NumericNode(a) is string na && NumericNode(b) is string nb
             && !NumericAncestorOrSelf(na, nb) && !NumericAncestorOrSelf(nb, na))
             return true;
 
-        // Get disjoint groups for named/class types
+        // Distinct CLOS classes are disjoint unless one inherits from the other.
+        if (a is ClassCType ca3 && b is ClassCType cb3)
+        {
+            foreach (var c in ca3.Class.ClassPrecedenceList)
+                if (ReferenceEquals(c, cb3.Class)) return false;
+            foreach (var c in cb3.Class.ClassPrecedenceList)
+                if (ReferenceEquals(c, ca3.Class)) return false;
+            return true;
+        }
+
+        // An array has one simplicity, one upgraded element type and one set of
+        // dimensions; a different one of any of those cannot be the same array.
+        if (a is ArrayType aa && b is ArrayType bb)
+        {
+            if ((aa.SimpleP == true && bb.SimpleP == false)
+                || (aa.SimpleP == false && bb.SimpleP == true))
+                return true;
+            var ua2 = UpgradedElementName(aa);
+            var ub2 = UpgradedElementName(bb);
+            if (ua2 != null && ub2 != null && !Runtime.SameElementTypeName(ua2, ub2)) return true;
+            if (DimensionsDisjoint(aa.Dimensions, bb.Dimensions)) return true;
+        }
+
+        // A named type that partitions into parts is disjoint iff every part is.
+        if (a is NamedType pa && TypePartition(pa.Name) is CType[] partA)
+            return System.Array.TrueForAll(partA, p => AreDisjointCore(p, b));
+        if (b is NamedType pb && TypePartition(pb.Name) is CType[] partB)
+            return System.Array.TrueForAll(partB, p => AreDisjointCore(a, p));
+
+        // Get disjoint groups for named/class types.
         var groupA = GetDisjointGroup(a);
         var groupB = GetDisjointGroup(b);
         if (groupA != null && groupB != null && groupA != groupB)
             return true;
 
+        return false;
+    }
+
+    private static bool MemberSetDisjoint(MemberType mem, CType other)
+    {
+        if (ContainsSatisfies(other) || ContainsUnknownName(other)) return false;
+        var spec = CTypeToSpecifier(other);
+        foreach (var obj in mem.Members)
+        {
+            try
+            {
+                if (Runtime.Typep(obj, spec) != Nil.Instance) return false;
+            }
+            catch { return false; }
+        }
+        return true;
+    }
+
+    private static readonly string[] s_witnessTypeNames =
+    {
+        "NUMBER", "CHARACTER", "SYMBOL", "CONS", "ARRAY", "FUNCTION",
+        "HASH-TABLE", "PACKAGE", "PATHNAME", "RANDOM-STATE", "STREAM",
+        "CONDITION", "CLASS", "READTABLE",
+    };
+
+    /// <summary>True when some built-in kind lies outside INNER and outside CT2,
+    /// so (NOT INNER) certainly holds somewhere outside CT2.</summary>
+    private static bool HasDisjointWitness(CType inner, CType ct2)
+    {
+        foreach (var name in s_witnessTypeNames)
+        {
+            var witness = NamedType.Get(name);
+            if (AreDisjointCore(witness, inner) && AreDisjointCore(witness, ct2))
+                return true;
+        }
         return false;
     }
 
@@ -2280,12 +2425,24 @@ public static class CTypeOps
         ["PATHNAME"] = "PATHNAME", ["LOGICAL-PATHNAME"] = "PATHNAME",
         ["RANDOM-STATE"] = "RANDOM-STATE",
         ["RESTART"] = "RESTART",
+        ["CONDITION"] = "CONDITION",
+        ["CLASS"] = "CLASS",
     };
 
     private static string? GetDisjointGroup(CType ct)
     {
-        if (ct is NamedType nt && _disjointGroups.TryGetValue(nt.Name, out var group))
-            return group;
+        if (ct is NamedType nt)
+        {
+            if (_disjointGroups.TryGetValue(nt.Name, out var group)) return group;
+            // Named condition and other subclasses: their class precedence list
+            // names the built-in kind (CONDITION, STREAM, ...) they belong to.
+            if (Runtime.FindSystemClassByName(nt.Name) is LispClass namedCls)
+            {
+                foreach (var c in namedCls.ClassPrecedenceList)
+                    if (_disjointGroups.TryGetValue(c.Name.Name, out var cg)) return cg;
+            }
+            return null;
+        }
         if (ct is NumericType or ComplexType) return "NUMBER";
         if (ct is ArrayType) return "ARRAY";
         if (ct is ConsType) return "CONS";
@@ -2301,6 +2458,9 @@ public static class CTypeOps
             // (distinct structures are disjoint unless they share inheritance)
             if (cls.Class.IsStructureClass)
                 return "STRUCT:" + cls.Class.Name.Name;
+            // A standard class whose precedence list names no built-in kind is
+            // not a number, array, cons, function and so on.
+            return "STANDARD-OBJECT";
         }
         return null;
     }

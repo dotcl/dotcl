@@ -102,4 +102,59 @@ public static partial class DynamicClassBuilder
         if (returnType == typeof(void)) return null;
         return Runtime.LispToDotNet(result, returnType);
     }
+
+    /// <summary>
+    /// Called from the module initializer of a library whose function bodies
+    /// were compiled into it: make sure package NAME exists, using USES, before
+    /// the library's code interns its symbols there.
+    /// </summary>
+    public static void EnsureBakedPackage(string name, string[] uses)
+    {
+        if (Package.FindPackage(name) != null) return;
+        var pkg = new Package(name);
+        foreach (var u in uses)
+            if (Package.FindPackage(u) is Package used) pkg.UsePackage(used);
+    }
+
+    /// <summary>The function a compiled-in library body was defined under.</summary>
+    public static LispFunction ResolveBakedFunction(string pkgName, string name)
+    {
+        var pkg = Package.FindPackage(pkgName)
+            ?? throw new InvalidOperationException($"library package {pkgName} does not exist");
+        var (sym, status) = pkg.FindSymbol(name);
+        if (status == SymbolStatus.None)
+            throw new InvalidOperationException($"library function {pkgName}::{name} is not defined");
+        return CilAssembler.GetFunctionBySymbol(sym);
+    }
+
+    /// <summary>
+    /// Entry point of a public static method whose body was compiled into the
+    /// library: marshal the args, call FN, marshal the primary value back. An
+    /// ERROR the body does not handle leaves as a LispErrorException carrying
+    /// the condition, without entering the debugger.
+    /// </summary>
+    public static object? InvokeBaked(LispFunction fn, Type returnType, object?[] args)
+        => InvokeBakedCore(fn, returnType, null, false, args);
+
+    /// <summary>
+    /// <see cref="InvokeBaked"/> for an instance method or constructor: SELF is
+    /// the first argument of the function.
+    /// </summary>
+    public static object? InvokeBakedMethod(LispFunction fn, Type returnType, object? self, object?[] args)
+        => InvokeBakedCore(fn, returnType, self, true, args);
+
+    private static object? InvokeBakedCore(LispFunction fn, Type returnType, object? self,
+        bool hasSelf, object?[] args)
+    {
+        int off = hasSelf ? 1 : 0;
+        var lispArgs = new LispObject[args.Length + off];
+        if (hasSelf) lispArgs[0] = Runtime.DotNetToLisp(self);
+        for (int i = 0; i < args.Length; i++)
+            lispArgs[i + off] = Runtime.DotNetToLisp(args[i]);
+        var result = Runtime.InvokeLibraryCallback(fn, lispArgs);
+        if (returnType == typeof(void)) return null;
+        if (result is LispFunction lf && typeof(Delegate).IsAssignableFrom(returnType))
+            return Runtime.CreateLispDelegate(lf, returnType, propagate: true);
+        return Runtime.LispToDotNet(result, returnType);
+    }
 }

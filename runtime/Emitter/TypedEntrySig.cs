@@ -103,6 +103,15 @@ public static class TypedEntrySig
         return t;
     }
 
+    /// <summary>ParamTypes, but when SELFFREE the count of self-calls left before
+    /// a stack check in place of the function (LispFunction.TypedSelfDepth).</summary>
+    public static System.Type[] BodyParamTypes(string sig, bool selfFree)
+    {
+        var p = ParamTypes(sig);
+        if (selfFree) p[0] = typeof(int);
+        return p;
+    }
+
     public static System.Type ReturnType(string sig) => KindType(sig[sig.Length - 1]);
 
     /// <summary>Call the typed entry DEL of signature SIG with boxed ARGS, checking

@@ -50,6 +50,13 @@ what each one shows and what has to be installed to build it.
   Needs .NET SDK 10+ with the `android` workload (the emitting side loads the
   runtime pack's `Mono.Android.dll`) and a JDK to build the consumer app.
 
+- **[PluginHostDemo](PluginHostDemo/)**: a C# host that knows nothing about
+  dotcl loads plugin DLLs from a folder through `AssemblyLoadContext`; one
+  plugin is C#, the other is Common Lisp, a `DotCL.Sdk` project with a
+  `<LispLibrary>` item that `dotnet build` turns into a DLL implementing the
+  host's interface, with no `.lisp` and no core loaded at run time. Needs .NET
+  SDK 10+; runs on Windows, Linux and macOS.
+
 ## Shipping with no run-time code generation
 
 All three precompile Lisp at build time, so they need `compiler/cil-out.sil`
@@ -77,3 +84,25 @@ built once from the repository root with `make cross-compile`.
   Needs .NET SDK 10+ plus the Unity editor version recorded in
   `ProjectSettings/ProjectVersion.txt` with its WebGL module, and any static
   HTTP server to serve the result.
+
+## What is checked automatically
+
+`make test-samples` builds and runs the five headless samples (AspNetLispDemo,
+HotReloadDemo, McpServerDemo, PrecompiledLispDemo, PrecompiledLispDemoAot) and
+checks their output (about 72 s; `DOTCL_SAMPLES_AOT=0` skips the NativeAOT one,
+which needs clang on Linux and a current Xcode on macOS). AspNetLispDemo is built against a
+package packed from the current tree. PluginHostDemo has its own target,
+`make test-plugin-host-demo`.
+
+These four are not checked by a script, because they need something a
+headless build machine does not have:
+
+- **MonoGameLispDemo**: it draws a window, so it needs a display and a GPU
+  (and Windows, see above). Only the start of dotcl and the generation of the
+  `Game` subclass can be reached without one.
+- **MauiLispDemo**: it needs the MAUI workload and either Windows or an
+  Android device or emulator.
+- **AndroidServiceLispSpike**: it needs the `android` workload and a JDK to
+  build, and a device to run on, which the spike does not cover anyway.
+- **PrecompiledLispDemoWebGL**: it needs the Unity editor with the WebGL
+  module and a browser to look at the result.

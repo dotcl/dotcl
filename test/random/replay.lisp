@@ -32,11 +32,19 @@
 (in-package :cl-test)
 
 (defun rf-fixnum-width-dependent-p (form)
+  "FIXNUM in a declaration, a THE or an array element type (typed.lisp) only
+   describes values that fit in both implementations' fixnums, so it does not
+   count."
   (let ((names '("FIXNUM" "BIGNUM" "MOST-POSITIVE-FIXNUM" "MOST-NEGATIVE-FIXNUM")))
     (labels ((walk (x)
                (cond ((symbolp x) (member (symbol-name x) names :test #'string=))
-                     ((consp x) (or (walk (car x)) (walk (cdr x))))
-                     (t nil))))
+                     ((atom x) nil)
+                     ((eq (car x) 'declare) nil)
+                     ((and (eq (car x) 'the) (consp (cdr x))) (walk (cddr x)))
+                     ((and (eq (car x) :element-type) (consp (cdr x))
+                           (consp (second x)) (eq (car (second x)) 'quote))
+                      (walk (cddr x)))
+                     (t (or (walk (car x)) (walk (cdr x)))))))
       (walk form))))
 
 (defvar cl-user::*rf-case-timeout* 120)
@@ -53,6 +61,10 @@
        (finish-output ,out)))
   #-sbcl
   (progn out index `(progn ,@body)))
+
+;;; SBCL's COMPILE turns errors in the compiled code into runtime errors, so
+;;; an error escaping it is an SBCL compiler bug: the case is written as
+;;; (INDEX :SBCL-COMPILER-ERROR) and, like :TIMEOUT, not compared.
 
 (defvar cl-user::*rf-opaque* nil)
 
@@ -159,15 +171,22 @@
                                     (getf c :form))
                                 (getf c :vars)
                                 (getf c :var-types) (getf c :decls1)))
+                          (compile-error nil)
                           (fn (cl:handler-case
                                   (cl:handler-bind ((warning #'muffle-warning))
                                     (let ((*error-output* (make-broadcast-stream)))
                                       (if cl-user::*rf-fasl*
                                           (rf-compile-through-fasl src dir)
                                           (compile nil src))))
-                                (error () nil)))
+                                (error (e) (setf compile-error e) nil)))
                           (results
                             (if (null fn)
+                                #+sbcl
+                                (progn
+                                  (format t "~&replay: case ~D: SBCL's compiler signalled ~S~%"
+                                          (getf c :index) (type-of compile-error))
+                                  (list :sbcl-compiler-error))
+                                #-sbcl
                                 (list :compile-error)
                                 (loop for vals in (getf c :vals-list)
                                       collect (cl:handler-case

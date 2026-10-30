@@ -183,3 +183,36 @@ as one string."
 (deftest rred-repl-runtime-error-enters-debugger
   (and (search "Debugger entered on TYPE-ERROR" *rred-transcript*) t)
   t)
+
+;;; The runtime's restarts are offered by the debugger and continue the form.
+(defvar *rred-unbound-transcript*
+  (rred-repl '("(setf (dotnet:static \"DotCL.Debugger\" \"InteractiveRepl\") t)"
+               "(defvar *rred-rv*)"
+               "(makunbound '*rred-rv*)"
+               "*rred-rv*"
+               "1"
+               "42"
+               "(format t \"RRED-RV=~S~%\" *rred-rv*)")))
+
+(deftest rred-repl-unbound-store-value-restart
+  (list (and (search "Debugger entered on UNBOUND-VARIABLE" *rred-unbound-transcript*) t)
+        (and (search "[USE-VALUE] Use specified value." *rred-unbound-transcript*) t)
+        (and (search "[STORE-VALUE] Set specified value and use it." *rred-unbound-transcript*) t)
+        (and (search "RRED-RV=42" *rred-unbound-transcript*) t))
+  (t t t t))
+
+(defvar *rred-undefined-transcript*
+  (rred-repl '("(setf (dotnet:static \"DotCL.Debugger\" \"InteractiveRepl\") t)"
+               "(defun rred-missing-call () (rred-no-such-function 6))"
+               "(rred-missing-call)"
+               "1"
+               "(lambda (x) (format t \"RRED-FN=~S~%\" x) (* x 7))")))
+
+(deftest rred-repl-undefined-use-value-restart
+  (list (and (search "Debugger entered on UNDEFINED-FUNCTION" *rred-undefined-transcript*) t)
+        (and (search "[USE-VALUE] Call specified function." *rred-undefined-transcript*) t)
+        (and (search "[RETURN-VALUE] Return specified values." *rred-undefined-transcript*) t)
+        (and (search "[CONTINUE] Retry calling RRED-NO-SUCH-FUNCTION."
+                     *rred-undefined-transcript*) t)
+        (and (search "RRED-FN=6" *rred-undefined-transcript*) t))
+  (t t t t t))

@@ -823,6 +823,11 @@
   "The Int64[] slot holding ENTRY's hoisted raw slot array."
   (third entry))
 
+(defun struct-backing-inline-count (entry)
+  "The raw slot count when ENTRY's structure keeps its raw slots in fields
+   (the hoisted value is then the instance itself), else NIL."
+  (%struct-raw-inline-count (cdr (cddddr entry))))
+
 (defun struct-backing-type (entry)
   "The structure name ENTRY's binding was declared to hold. The fetch compares
    it against the instance's own, because a position is read out of the
@@ -898,6 +903,69 @@
                         (cons (length dims) info))))
                 ((eq head 'vector) (cons 1 info))
                 (t nil))))))
+
+;;; What is known about a local's array type when its rank is not: a
+;;; declaration (SIMPLE-ARRAY ELT) without dimensions, or one a copy or a
+;;; closure inherits. The rank is taken from the AREFs that use the variable,
+;;; and everything that relies on it declines at run time for an array of
+;;; another rank, which the per-element helper then reads or signals for.
+
+(defun %array-spec-of-type (type)
+  "TYPE as (SIMPLE-ARRAY ELT DIMS) when it is a SIMPLE-ARRAY specifier whose
+   element type has an unboxed storage, DIMS a list of rank 1 to 3 or * for an
+   unspecified rank; else NIL."
+  (setf type (%expand-array-type type))
+  (and (consp type)
+       (eq (car type) 'simple-array)
+       (consp (cdr type))
+       (let ((elt (cadr type))
+             (dims (if (cddr type) (caddr type) '*)))
+         (when (and (integerp dims) (<= 1 dims 3))
+           (setf dims (make-list dims :initial-element '*)))
+         (and (not (eq elt '*))
+              (or (eq dims '*)
+                  (and (consp dims) (<= 1 (length dims) 3)
+                       (every (lambda (d) (or (eq d '*) (and (integerp d) (<= 0 d #x7fffffff))))
+                              dims)))
+              (%simple-array-backing-kind (list 'simple-array elt '(*)))
+              (list 'simple-array elt dims)))))
+
+(defun %array-spec-with-rank (spec rank)
+  "SPEC with its unspecified rank made RANK."
+  (if (eq (third spec) '*)
+      (list 'simple-array (second spec) (make-list rank :initial-element '*))
+      spec))
+
+(defun array-spec-local (var)
+  "The (SIMPLE-ARRAY ELT DIMS) VAR's binding is known to hold, or NIL."
+  (and (symbolp var)
+       var
+       (boundp '*cstate*)
+       (let ((e (assoc (var-name var) (cstate-array-spec-locals) :test #'string=)))
+         (and e
+              (eq (lookup-local var) (second e))
+              (not (boxed-var-p var))
+              (cddr e)))))
+
+(defun %aref-rank-in (body names)
+  "The number of subscripts the AREFs on a variable named in NAMES take in
+   BODY, when there is one and they all take the same number, 1 to 3; else
+   NIL."
+  (let ((rank nil))
+    (labels ((walk (form)
+               (when (and (consp form) (not (eq (car form) 'quote)))
+                 (when (and (eq (car form) 'aref)
+                            (consp (cdr form))
+                            (symbolp (cadr form)) (cadr form)
+                            (member (var-name (cadr form)) names :test #'string=))
+                   (let ((n (loop for tail on (cddr form) while (consp tail) count t)))
+                     (cond ((null rank) (setf rank n))
+                           ((/= rank n) (return-from %aref-rank-in nil)))))
+                 (do ((r form (cdr r)))
+                     ((not (consp r)))
+                   (walk (car r))))))
+      (dolist (f body) (walk f)))
+    (and rank (<= 1 rank 3) rank)))
 
 (defun %make-array-static-rank (dims)
   "Statically-known rank of a make-array DIMS argument form, or NIL.
@@ -1074,8 +1142,12 @@
                (if entry
                    (and (eq (lookup-local v) (second entry))
                         (not (boxed-var-p v))
-                        (= (length idxs) (third entry))
-                        (cddr entry))
+                        (if (eq (third entry) :any)
+                            (and (eq (car expr) 'aref)
+                                 (<= 1 (length idxs) 3)
+                                 (cons (length idxs) (cdddr entry)))
+                            (and (= (length idxs) (third entry))
+                                 (cddr entry))))
                    (let ((info (constant-array-numeric-info v)))
                      (and info (= (length idxs) (car info)) info))))
              (let ((info (or (struct-accessor-array-info v)
@@ -1083,6 +1155,56 @@
                (and info
                     (= (length idxs) (car info))
                     info))))))
+
+(defun %the-checked-array-type-p (type)
+  "True when TYPE names an array type that THE checks above SAFETY 0."
+  (let ((ty (%typexpand-for-range type)))
+    (if (consp ty)
+        (member (car ty) '(simple-array array vector simple-vector))
+        (member ty '(simple-array array vector simple-vector)))))
+
+(defun %the-array-check-cacheable-p (type)
+  "True when an array of TYPE stays of TYPE for its whole life: a simple array,
+   or a type that fixes no dimension, which ADJUST-ARRAY cannot leave."
+  (let ((ty (%typexpand-for-range type)))
+    (or (atom ty)
+        (member (car ty) '(simple-array simple-vector))
+        (let ((dims (case (car ty) ((array) (third ty)) ((vector) (third ty)))))
+          (or (null (cddr ty)) (eq dims '*) (and (consp dims) (every (lambda (d) (eq d '*)) dims)))))))
+
+(defun %array-type-parts (type)
+  "(SIMPLE-P ET DIMS) for an array type, ET and DIMS * when unspecified; else NIL."
+  (let ((ty (%typexpand-for-range type)))
+    (flet ((parts (simple et dims)
+             (list simple et (if (integerp dims) (make-list dims :initial-element '*) dims))))
+      (cond ((eq ty 'simple-vector) (parts t t '(*)))
+            ((member ty '(simple-array array)) (parts (eq ty 'simple-array) '* '*))
+            ((eq ty 'vector) (parts nil '* '(*)))
+            ((atom ty) nil)
+            ((eq (car ty) 'simple-vector) (parts t t (list (if (cdr ty) (cadr ty) '*))))
+            ((eq (car ty) 'vector)
+             (parts nil (if (cdr ty) (cadr ty) '*) (list (if (cddr ty) (caddr ty) '*))))
+            ((member (car ty) '(simple-array array))
+             (parts (eq (car ty) 'simple-array) (if (cdr ty) (cadr ty) '*)
+                    (if (cddr ty) (caddr ty) '*)))))))
+
+(defun %array-type-within-p (have want)
+  "True when every array of type HAVE is of type WANT, judged on the forms alone."
+  (let ((h (%array-type-parts have)) (w (%array-type-parts want)))
+    (and h w
+         (or (not (first w)) (first h))
+         (or (eq (second w) '*) (equal (second h) (second w)))
+         (or (eq (third w) '*)
+             (and (listp (third h)) (= (length (third h)) (length (third w)))
+                  (every (lambda (hd wd) (or (eq wd '*) (eql hd wd))) (third h) (third w)))))))
+
+(defun %the-array-proven-p (form type)
+  "True when FORM is a local variable whose declared array type, checked where it
+   was bound and never assigned after, is within TYPE."
+  (and (symbolp form) form (boundp '*cstate*) *cstate*
+       (let* ((key (lookup-local form))
+              (have (and key (cdr (assoc key (cstate-proven-type-locals) :test #'equal)))))
+         (and have (%array-type-within-p have type)))))
 
 (defun the-array-numeric-info (expr)
   "For (THE TYPE FORM) with TYPE an integer array type, the info tail
@@ -1778,7 +1900,8 @@
                 (not (and pkg (string= (package-name pkg) "COMMON-LISP"))))
               (not (member (symbol-name op)
                            '("TRY-EVAL" "%SET-CHAR" "%SET-ELT" "%SET-SUBSEQ"
-                             "%PUTF" "INTERN" "DEFMACRO" "%DOTNET-CALL-DIRECT")
+                             "%PUTF" "INTERN" "DEFMACRO" "%DOTNET-CALL-DIRECT"
+                             "%DOTNET-STATIC-DIRECT")
                            :test #'string=))
               expander))))
 

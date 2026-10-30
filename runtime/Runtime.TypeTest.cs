@@ -120,7 +120,7 @@ public static partial class Runtime
             if (obj is Fixnum f) return f.Value >= _lo && f.Value <= _hi;
             if (obj is Bignum b)
                 return (_bigLo is not { } lo || b.Value >= lo) && (_bigHi is not { } hi || b.Value <= hi);
-            return IsPlainTypepObject(obj) || obj is LispStruct ? false : TypepGeneral(obj, _spec) is not Nil;
+            return IsPlainTypepObject(obj) || LispStruct.TryAs(obj, out _) ? false : TypepGeneral(obj, _spec) is not Nil;
         }
     }
 
@@ -142,7 +142,7 @@ public static partial class Runtime
         internal ClNameTypeTest(Symbol sym, System.Func<LispObject, bool> pred) { _sym = sym; _pred = pred; }
         internal override bool Test(LispObject obj)
         {
-            if (obj is LispStruct st) return ReferenceEquals(st.TypeName, _sym) || _pred(st);
+            if (LispStruct.TryAs(obj, out var st)) return ReferenceEquals(st.TypeName, _sym) || _pred(st);
             if (IsPlainTypepObject(obj)) return _pred(obj);
             return TypepGeneral(obj, _sym) is not Nil;
         }
@@ -188,7 +188,7 @@ public static partial class Runtime
         internal StructClassTypeTest(Symbol sym, LispClass cls) { _sym = sym; _cls = cls; }
         internal override bool Test(LispObject obj)
         {
-            if (obj is LispStruct st)
+            if (LispStruct.TryAs(obj, out var st))
             {
                 if (ReferenceEquals(st.TypeName, _sym)) return true;
                 for (var p = st.TypeName.StructParent; p != null; p = p.StructParent)
@@ -244,7 +244,7 @@ public static partial class Runtime
         private readonly TypeTest _expansion;
         internal DeftypeTypeTest(Symbol sym, TypeTest expansion) { _sym = sym; _expansion = expansion; }
         internal override bool Test(LispObject obj)
-            => IsPlainTypepObject(obj) || obj is LispStruct ? _expansion.Test(obj) : TypepGeneral(obj, _sym) is not Nil;
+            => IsPlainTypepObject(obj) || LispStruct.TryAs(obj, out _) ? _expansion.Test(obj) : TypepGeneral(obj, _sym) is not Nil;
     }
 
     /// <summary>(NAME arg...) for a DEFTYPE'd NAME outside COMMON-LISP. The

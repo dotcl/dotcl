@@ -38,7 +38,8 @@ public static class Cltl2
         Reg("VARIABLE-INFORMATION", -1, VariableInformation);
         Reg("FUNCTION-INFORMATION", -1, FunctionInformation);
         Reg("DECLARATION-INFORMATION", -1, DeclarationInformation);
-        Reg("AUGMENT-ENVIRONMENT", -1, AugmentEnvironment);
+        Reg("AUGMENT-ENVIRONMENT", -1, AugmentEnvironment)
+            .WithKeyArgs(1, 1, false, AugmentEnvironmentKeys);
         Reg("PARSE-MACRO", -1, ParseMacro);
         Reg("ENCLOSE", -1, Enclose);
         Reg("MACROEXPAND-ALL", -1, MacroexpandAll);
@@ -60,10 +61,12 @@ public static class Cltl2
         return fn.Invoke(new[] { args[0], args.Length > 1 ? args[1] : Nil.Instance });
     }
 
-    private static void Reg(string name, int arity, Func<LispObject[], LispObject> fn)
+    private static LispFunction Reg(string name, int arity, Func<LispObject[], LispObject> fn)
     {
         var (sym, _) = Cltl2Pkg.Intern(name);
-        sym.Function = new LispFunction(fn, "DOTCL-CLTL2:" + name, arity);
+        var f = new LispFunction(fn, "DOTCL-CLTL2:" + name, arity);
+        sym.Function = f;
+        return f;
     }
 
     /// <summary>(values nil nil nil): no information. env is always NIL on dotcl.</summary>
@@ -186,24 +189,21 @@ public static class Cltl2
     }
 
     // (augment-environment env &key variable symbol-macro function macro declare)
+    private static readonly string[] AugmentEnvironmentKeys =
+        { "VARIABLE", "SYMBOL-MACRO", "FUNCTION", "MACRO", "DECLARE" };
+
     public static LispObject AugmentEnvironment(LispObject[] args)
     {
-        if (args.Length < 1 || args.Length % 2 != 1)
-            throw new LispErrorException(new LispProgramError(
-                $"AUGMENT-ENVIRONMENT: wrong number of arguments: {args.Length}"));
         var hook = CompilerFunction("%CLTL2-AUGMENT-ENVIRONMENT");
         if (hook == null) return args[0];
-        var keys = new[] { "VARIABLE", "SYMBOL-MACRO", "FUNCTION", "MACRO", "DECLARE" };
+        var keys = AugmentEnvironmentKeys;
         var vals = new LispObject[] { Nil.Instance, Nil.Instance, Nil.Instance, Nil.Instance, Nil.Instance };
         var seen = new bool[keys.Length];
         for (int a = 1; a < args.Length; a += 2)
         {
             int idx = args[a] is Symbol ks && ks.HomePackage == Startup.KeywordPkg
                 ? Array.IndexOf(keys, ks.Name) : -1;
-            if (idx < 0)
-                throw new LispErrorException(new LispProgramError(
-                    $"AUGMENT-ENVIRONMENT: unknown keyword {args[a]}"));
-            if (!seen[idx]) { vals[idx] = args[a + 1]; seen[idx] = true; }
+            if (idx >= 0 && !seen[idx]) { vals[idx] = args[a + 1]; seen[idx] = true; }
         }
         return hook.Invoke(new[] { args[0], vals[0], vals[1], vals[2], vals[3], vals[4] });
     }

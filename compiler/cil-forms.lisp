@@ -172,6 +172,7 @@
 (defun compile-and-pop (form)
   "Compile FORM for effect. Uses void call variants when available to avoid allocation.
    Returns CIL instructions without (:pop) if a void variant was used."
+  (when (and *xref-caller* (not *at-toplevel*)) (xref-walk form))
   (let ((prefix (%form-prefix-code form)))
     (when prefix
       (return-from compile-and-pop
@@ -399,10 +400,19 @@
             "Runtime.CheckStoreU8" "Runtime.CheckStoreU16" "Runtime.CheckStoreI32"
             "Runtime.CheckStoreUnsigned" "Runtime.CheckStoreSigned"
             "Runtime.StructRefL" "Runtime.StructSetL" "Runtime.StructOf"
+            "Runtime.StructRefLK" "Runtime.StructSetLK"
+            "Runtime.RawInlineAt" "Runtime.RawInlineSet"
+            "Runtime.StructOfMasked"
             "Runtime.ReadU16LE" "Runtime.ReadU16BE" "Runtime.ReadU32LE"
             "Runtime.ReadU32BE" "Runtime.ReadU64LE" "Runtime.ReadU64BE"
             "Runtime.WriteU16LE" "Runtime.WriteU16BE" "Runtime.WriteU32LE"
-            "Runtime.WriteU32BE" "Runtime.WriteU64LE" "Runtime.WriteU64BE")
+            "Runtime.WriteU32BE" "Runtime.WriteU64LE" "Runtime.WriteU64BE"
+            "FloatLane.AddD" "FloatLane.SubtractD"
+            "FloatLane.MultiplyD" "FloatLane.DivideD"
+            "FloatLane.AddS" "FloatLane.SubtractS"
+            "FloatLane.MultiplyS" "FloatLane.DivideS"
+            "FloatLane.NarrowD" "FloatLane.SinhD"
+            "FloatLane.CoshD" "Runtime.ExpDouble" "FloatLane.NonFiniteD" "FloatLane.NonFiniteS" "FloatLane.SinD" "FloatLane.CosD" "FloatLane.TanD" "FloatLane.LogD")
           :test #'equal))
 
 (defun %mv-neutral-op-p (op)
@@ -739,6 +749,9 @@
   ;; return-froms below (self-call, CLOS reader/writer IC, struct accessor,
   ;; local flet/labels) are branches INSIDE this function, so recording at
   ;; entry catches them all.
+  (let ((alt (%renamed-callee name)))
+    (when alt
+      (return-from compile-named-call (compile-named-call alt args))))
   (xref-record-call name)
   (block compile-named-call
     ;; Self-TCO: if in tail position and calling current function, emit loop
@@ -782,7 +795,16 @@
                                     ;; A native self's parameters are all
                                     ;; declared FIXNUM.
                                     (every #'fixnum-wrap-typed-p args)))
+               (spec-slow nil)
                (da (cond
+                     ((and typed-self (%speculative-typed-self-p typed-self))
+                      (multiple-value-bind (temps eval slow boxed)
+                          (%speculative-self-call-parts args (second typed-self))
+                        (when slow
+                          (setq spec-slow
+                                `((:label ,slow)
+                                  ,@(%speculative-fallback-call (first typed-self) (length temps) boxed))))
+                        (cons temps eval)))
                      ;; Typed body: each argument as the raw value its
                      ;; parameter's slot holds, checked as the entry would.
                      (typed-self
@@ -857,7 +879,8 @@
                      ((and (not typed-self) (not use-native-tco)
                            (%tco-args-checked-p args))
                       `(:br ,(second (cstate-tco-checked))))
-                     (t `(:br ,(cstate-tco-loop-label))))))))
+                     (t `(:br ,(cstate-tco-loop-label))))
+              ,@spec-slow))))
       ;; Mutual-TCO: tail call to a labels sibling -> update shared params + br TCOLOOP
       (when (and (eq *in-tail-position* t)
                  (or (cstate-tco-in-try-catch) (not *in-try-block*))
@@ -892,13 +915,7 @@
           `(,@(compile-typed-self-call (cons name args))
             ,@(%box-typed-result (third (cstate-typed-self))))))
       ;; Non-tail self-call fast path: reuse LispFunction cached at body entry.
-      (when (and (cstate-self-fn-local)
-                 (not (local-function-entry name-str))
-                 (if (cstate-tco-self-symbol)
-                     (eq name (cstate-tco-self-symbol))
-                     (string= name-str (cstate-tco-self-name)))
-                 (self-call-shortcut-p name)
-                 (<= n-args 8))
+      (when (%self-shortcut-call-p name args)
         (let* ((skip-reset (single-value-form-p (cons name args)))
                (da (compile-direct-call-args args))
                (temps (car da))
@@ -915,7 +932,8 @@
                 ,@(if tr
                       ;; Pass this function's claimed CATCH on to the callee; a
                       ;; THROW it returned is returned on from here.
-                      (destructuring-bind (claim-key exit-label value-key used) tr
+                      (destructuring-bind (claim-key exit-label value-key used state-key) tr
+                        (declare (ignore state-key))
                         (setf (car used) t)
                         (let ((r (gen-local "TRFWD")) (cont (gen-label "TRCONT")))
                           `(,@mode
@@ -1102,14 +1120,16 @@
                 (if (<= n-args 8)
                     (let* ((mode-instrs (unless skip-reset (%call-site-mv-mode args name)))
                            (same-file (%same-file-call-p name n-args))
+                           (gf-ic (and (not same-file) (%gf-ic-call-p name n-args)))
                            (call-instrs
                              (cond
-                               (same-file
+                               ((or same-file
+                                    (and (not gf-ic) (%same-file-forward-call-p name n-args)))
                                 `(,@mode-instrs
                                   (:call-same-file ,(%package-physical-name (symbol-package name))
                                                    ,(mangle-name name) ,n-args
                                                    ,@(when mode-instrs '(:mode)))))
-                               ((%gf-ic-call-p name n-args)
+                               (gf-ic
                                 `(,@mode-instrs
                                   (:gf-ic1 ,(symbol-name name)
                                            ,(%package-physical-name (symbol-package name))
@@ -1149,6 +1169,77 @@
        (let ((info (gethash type *struct-info*)))
          (and info (null (getf info :type-option))))))
 
+(defun %struct-raw-inline-count (layout)
+  "The raw slot count of a *STRUCT-RAW-LAYOUTS* layout when its instances keep
+   them in fields (LispStructR), else NIL."
+  (let ((k (count-if (lambda (cell) (and cell (>= (car cell) 0))) layout)))
+    (and (<= 1 k 4) k)))
+
+(defun %struct-own-representation (name info)
+  "The representation of NAME's own instances: 0 for the array-backed
+   LispStruct, 1 to 4 for LispStruct1 .. LispStruct4, 5 for
+   LispStructR."
+  (let ((slots (getf info :slots))
+        (raw (gethash name *struct-raw-layouts*)))
+    (cond (raw (let ((k (%struct-raw-inline-count (cdr raw))))
+                 (if k 5 0)))
+          ((or (null slots) (> (length slots) 4)) 0)
+          (t (length slots)))))
+
+(defun %struct-includes-p (child ancestor)
+  (loop for p = (getf (gethash child *struct-info*) :parent)
+          then (getf (gethash p *struct-info*) :parent)
+        while p
+        thereis (eq p ancestor)))
+
+(defun %struct-type-representations (name)
+  "The representations a TYPEP of NAME can meet, or NIL for the general test."
+  (let ((versions (gethash name *struct-layout-versions*))
+        (info (gethash name *struct-info*)))
+    (when (and versions (eql (car versions) 0)
+               info (null (getf info :type-option)))
+      (let ((reps (list (%struct-own-representation name info)))
+            (usable t))
+        (maphash
+         (lambda (other other-info)
+           (when (%struct-includes-p other name)
+             (let ((other-versions (gethash other *struct-layout-versions*)))
+               (if (and other-versions (eql (car other-versions) 0)
+                        (null (getf other-info :type-option)))
+                   (pushnew (%struct-own-representation other other-info) reps)
+                   (setq usable nil)))))
+         *struct-info*)
+        (when usable (sort reps #'<))))))
+
+(defun %struct-representations-mask (reps)
+  (loop for rep in reps sum (ash 1 rep)))
+
+(defun %struct-array-reps-stable-p (name)
+  "True when NAME itself is array-backed at compile time."
+  (let ((info (gethash name *struct-info*))
+        (versions (gethash name *struct-layout-versions*)))
+    (and info versions (eql (car versions) 0)
+         (eql (%struct-own-representation name info) 0)
+         (let ((slots (getf info :slots)))
+           (or (gethash name *struct-raw-layouts*)
+               (> (length slots) 4))))))
+
+(defun %struct-typep-name-instrs (type)
+  (let ((reps (%struct-type-representations type)))
+    (cond ((null reps)
+           '((:call "LispStruct.TypeNameOf")))
+          ((and (equal reps '(0)) (%struct-array-reps-stable-p type))
+           '((:call "LispStruct.TypeNameOfStruct")))
+          ((equal reps '(5))
+           '((:call "LispStruct.TypeNameOfRawInline")))
+          (t
+           `((:ldc-i4 ,(%struct-representations-mask reps))
+             (:call "LispStruct.TypeNameOfKnown"))))))
+
+(defun %struct-known-mask (type)
+  (let ((reps (%struct-type-representations type)))
+    (and reps (%struct-representations-mask reps))))
+
 (defun compile-struct-typep (obj type)
   "Inline structure TYPEP; follows the instance's type name and :INCLUDE parents."
   (let ((not-struct (gen-label "STNOT"))
@@ -1158,18 +1249,17 @@
         (end-label (gen-label "STEND")))
     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
           (compile-expr obj))
-      (:isinst "LispStruct")
+      ,@(%struct-typep-name-instrs type)
       (:dup)
       (:brfalse ,not-struct)
-      (:call "LispStruct.get_TypeName")
-      (:castclass "LispObject")
+      (:castclass "Symbol")
       (:label ,loop-label)
       (:dup)
       ,@(compile-quoted type)
       (:ceq)
       (:brtrue ,found)
       (:call "Symbol.get_StructParent")
-      (:castclass "LispObject")
+      (:castclass "Symbol")
       (:dup)
       (:brtrue ,loop-label)
       (:pop)
@@ -1290,7 +1380,6 @@
         ;; COND of these, so a dispatch pays one call per clause it walks past
         ;; (measured ~25 ns each; %MINI-EVAL's 32-key dispatch pays ~0.77 us
         ;; before it reaches the function-call default).
-        ;; (eq x nil): EQ bridges the NIL object and the NIL symbol, as IsNilObj does.
         ((and (= nargs 2)
               (member op '(eq eql))
               (or (%nil-operand-p (first args)) (%nil-operand-p (second args))))
@@ -1373,6 +1462,31 @@
        (not (compiling-at-safety-0-p))
        (cadr type-form)))
 
+(defun %struct-owner-name (type-form)
+  "The structure name an accessor's expansion carries, whatever the safety."
+  (and (consp type-form) (eq (car type-form) 'quote)
+       (symbolp (cadr type-form)) (cadr type-form)
+       (not *cross-compiling*)
+       (cadr type-form)))
+
+(defun struct-slot-ref-owner (expr)
+  "For an EXPR STRUCT-SLOT-REF accepts, the structure whose accessor it is, or NIL."
+  (%struct-owner-name
+   (if (eq (car expr) '%struct-ref)
+       (fourth expr)
+       (let ((o (and (boundp '*struct-accessor-owners*)
+                     (gethash (car expr) *struct-accessor-owners*))))
+         (and o (list 'quote o))))))
+
+(defun %raw-struct-call (method owner)
+  "The call of the raw slot accessor METHOD on a structure of OWNER: its K
+   variant, with OWNER's representation mask, when an instance may keep its raw
+   slots in fields."
+  (let ((mask (and owner (%struct-known-mask owner))))
+    (if (and mask (logtest mask #x20))
+        `((:ldc-i4 ,mask) (:call ,(concatenate 'string method "K")))
+        `((:call ,method)))))
+
 (defun struct-slot-ref-type (expr)
   "For an EXPR STRUCT-SLOT-REF accepts, the structure name its object is
    checked against, or NIL."
@@ -1390,7 +1504,11 @@
         (compile-expr obj))
     (:ldc-i4 ,idx)
     ,@(if type
-          `(,@(compile-quoted type) (:call "Runtime.StructRefIT"))
+          (let ((mask (%struct-known-mask type)))
+            (if mask
+                `(,@(compile-quoted type) (:ldc-i4 ,mask)
+                  (:call "Runtime.StructRefITMasked"))
+                `(,@(compile-quoted type) (:call "Runtime.StructRefIT"))))
           '((:call "Runtime.StructRefI")))))
 
 (defun compile-struct-object (obj type)
@@ -1398,7 +1516,11 @@
   `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
         (compile-expr obj))
     ,@(when type
-        `(,@(compile-quoted type) (:call "Runtime.StructOf")))))
+        (let ((mask (%struct-known-mask type)))
+          (if mask
+              `(,@(compile-quoted type) (:ldc-i4 ,mask)
+                (:call "Runtime.StructOfMasked"))
+              `(,@(compile-quoted type) (:call "Runtime.StructOf")))))))
 
 (defun %strip-the (expr)
   "EXPR with any THE wrappers removed. A THE says what the value is, not how it
@@ -1430,17 +1552,24 @@
        (let ((tail (car (last code))))
          (and (consp tail)
               (eq (car tail) :call)
-              (member (cadr tail) '("Runtime.StructRefI" "Runtime.StructRefIT")
+              (member (cadr tail) '("Runtime.StructRefI" "Runtime.StructRefIT"
+                                    "Runtime.StructRefITMasked")
                       :test #'equal)))))
 
 (defun code-ends-unwrapped-p (code)
   "True when CODE ends in a Runtime.UnwrapMv, so its value is already a single
    value: a LET or PROGN whose last form was compiled in this same position."
-  (let ((tail (car (last code))))
+  (let ((tail (code-last-instr code)))
     (and (consp tail)
          (eq (car tail) :call)
          (equal (cadr tail) "Runtime.UnwrapMv")
          (null (cddr tail)))))
+
+(defun %struct-backing-load (entry)
+  (if (struct-backing-inline-count entry) '(:call "Runtime.RawInlineAt") '(:ldelem-i8)))
+
+(defun %struct-backing-store (entry)
+  (if (struct-backing-inline-count entry) '(:call "Runtime.RawInlineSet") '(:stelem-i8)))
 
 (defun %struct-backing-read (hit obj packed &optional type)
   "A raw slot read at a constant position against OBJ's hoisted raw array, with
@@ -1460,7 +1589,7 @@
       (return-from %struct-backing-read
         `((:ldloc ,back)
           (:ldc-i4 ,pos)
-          (:ldelem-i8)
+          ,(%struct-backing-load (car hit))
           ,@(case kind
               (1 '((:call "Runtime.RawBitsToDouble")))
               (2 '((:call "Runtime.RawBitsToSingle")))))))
@@ -1468,7 +1597,7 @@
       (:brfalse ,fall)
       (:ldloc ,back)
       (:ldc-i4 ,pos)
-      (:ldelem-i8)
+      ,(%struct-backing-load (car hit))
       ,@(case kind
           (1 '((:call "Runtime.RawBitsToDouble")))
           (2 '((:call "Runtime.RawBitsToSingle"))))
@@ -1476,10 +1605,11 @@
       (:label ,fall)
       ,@(compile-struct-object obj type)
       (:ldc-i4 ,packed)
-      (:call ,(case kind
-                (1 "Runtime.StructRefD")
-                (2 "Runtime.StructRefF")
-                (t "Runtime.StructRefL")))
+      ,@(%raw-struct-call (case kind
+                            (1 "Runtime.StructRefD")
+                            (2 "Runtime.StructRefF")
+                            (t "Runtime.StructRefL"))
+                          (struct-backing-type (car hit)))
       (:label ,done))))
 
 (defun %struct-backing-write (hit obj packed val-instrs &optional type)
@@ -1506,7 +1636,7 @@
           ,@(case kind
               (1 '((:call "Runtime.RawDoubleToBits")))
               (2 '((:call "Runtime.RawSingleToBits"))))
-          (:stelem-i8)
+          ,(%struct-backing-store (car hit))
           (:ldloc ,vtmp))))
     `((:declare-local ,vtmp ,(case kind (1 "Double") (2 "Single") (t "Int64")))
       ,@val-instrs
@@ -1519,21 +1649,22 @@
       ,@(case kind
           (1 '((:call "Runtime.RawDoubleToBits")))
           (2 '((:call "Runtime.RawSingleToBits"))))
-      (:stelem-i8)
+      ,(%struct-backing-store (car hit))
       (:br ,done)
       (:label ,fall)
       ,@(compile-struct-object obj type)
       (:ldc-i4 ,packed)
       (:ldloc ,vtmp)
-      (:call ,(case kind
-                (1 "Runtime.StructSetD")
-                (2 "Runtime.StructSetF")
-                (t "Runtime.StructSetL")))
+      ,@(%raw-struct-call (case kind
+                            (1 "Runtime.StructSetD")
+                            (2 "Runtime.StructSetF")
+                            (t "Runtime.StructSetL"))
+                          (struct-backing-type (car hit)))
       (:pop)
       (:label ,done)
       (:ldloc ,vtmp))))
 
-(defun compile-struct-slot-as-long (obj idx &optional type)
+(defun compile-struct-slot-as-long (obj idx &optional type owner)
   "Emit a structure slot read as a raw int64 (Runtime.StructRefL). Reached only
    from COMPILE-AS-LONG, i.e. where the context already reads the slot as a
    fixnum; a slot holding something else fails the same cast it fails today.
@@ -1545,7 +1676,7 @@
         (%struct-backing-read hit obj idx type)
         `(,@(compile-struct-object obj type)
           (:ldc-i4 ,idx)
-          (:call "Runtime.StructRefL")))))
+          ,@(%raw-struct-call "Runtime.StructRefL" (or owner type))))))
 
 (defun compile-progn-boolean-tail (forms label branch-on-true)
   "FORMS as statements except the last, which is compiled as a branch to LABEL.
@@ -1820,10 +1951,11 @@
 
 (defun %truth-test-instrs (expr)
   "EXPR's value and the test of it for not being NIL. A lexical variable never
-   holds a multiple-values return, so its test is the reference comparison."
+   holds a multiple-values return, and neither does a value that has been through
+   UnwrapMv, so their test is the reference comparison."
   (let ((code (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr expr))))
     `(,@code
-      ,(if (%plain-local-load-p expr code)
+      ,(if (or (%plain-local-load-p expr code) (code-ends-unwrapped-p code))
            '(:call "Runtime.IsNotNil")
            '(:call "Runtime.IsTruthy")))))
 
@@ -1852,6 +1984,43 @@
        (find-macro-expander (car expr))
        (or (not (local-function-entry (car expr)))
            (%lexical-macro-p (car expr)))))
+
+(defun %boolean-branchable-control-p (expr)
+  "True when EXPR is an IF, WHEN, UNLESS, COND or PROGN that a test position can
+   branch through, compiling each arm as a test instead of building the value."
+  (and (consp expr) (symbolp (car expr))
+       (case (car expr)
+         (if (and (consp (cdr expr)) (consp (cddr expr))
+                  (listp (cdddr expr)) (null (cddddr expr))))
+         ((when unless) (and (consp (cdr expr)) (listp (cddr expr))))
+         (cond (and (listp (cdr expr)) (every #'consp (cdr expr))))
+         (progn (listp (cdr expr)))
+         (t nil))
+       (not (local-function-entry (car expr)))))
+
+(defun %control-boolean-branch (expr label branch-on-true)
+  (flet ((if-branch (test then else)
+           (let ((else-label (gen-label "BIFELSE"))
+                 (done (gen-label "BIFEND")))
+             `(,@(compile-boolean-branch test else-label nil)
+               ,@(compile-boolean-branch then label branch-on-true)
+               (:br ,done)
+               (:label ,else-label)
+               ,@(compile-boolean-branch else label branch-on-true)
+               (:label ,done)))))
+    (ecase (car expr)
+      (if (if-branch (cadr expr) (caddr expr) (cadddr expr)))
+      (when (if-branch (cadr expr) `(progn ,@(cddr expr)) nil))
+      (unless (if-branch (cadr expr) nil `(progn ,@(cddr expr))))
+      (progn (compile-progn-boolean-tail (cdr expr) label branch-on-true))
+      (cond
+        (let ((clauses (cdr expr)))
+          (cond ((null clauses) (compile-boolean-branch nil label branch-on-true))
+                ((null (cdar clauses))
+                 (compile-boolean-branch `(or ,(caar clauses) (cond ,@(cdr clauses)))
+                                         label branch-on-true))
+                (t (if-branch (caar clauses) `(progn ,@(cdar clauses))
+                              `(cond ,@(cdr clauses))))))))))
 
 (defun compile-boolean-branch (expr label branch-on-true)
   "Compile expr as a boolean condition and emit a branch to label.
@@ -1926,6 +2095,26 @@
        (let ((inl (maybe-expand-inline (car expr) expr)))
          (let ((*at-toplevel* nil))
            (compile-boolean-branch inl label branch-on-true))))
+      ((and (consp expr) (symbolp (car expr))
+            (%same-file-inline-expansion (car expr) expr))
+       (let ((inl (%same-file-inline-expansion (car expr) expr))
+             (call (let ((*same-file-inline-declined* (cons expr *same-file-inline-declined*)))
+                     (%boolean-branch-default expr label branch-on-true))))
+         (if (not (%instrs-load-function-p call (car expr)))
+             call
+             (let ((else (gen-label "SFCALL"))
+                   (done (gen-label "SFDONE")))
+               (when *same-file-inline-cell* (incf (car *same-file-inline-cell*)))
+               `(,@(let ((*in-tail-position* nil)) (%same-file-guard-instrs (car expr)))
+                 (:brfalse ,else)
+                 ,@(let ((*at-toplevel* nil)) (compile-boolean-branch inl label branch-on-true))
+                 (:br ,done)
+                 (:label ,else)
+                 ,@call
+                 (:label ,done))))))
+      ;; IF and the forms that are IF underneath: each arm is itself a test.
+      ((%boolean-branchable-control-p expr)
+       (%control-boolean-branch expr label branch-on-true))
       ;; (and ...) in boolean context
       ((and (consp expr) (eq (car expr) 'and) (cdr expr))
        (if branch-on-true
@@ -1985,11 +2174,17 @@
                        (compile-expr (third args))))
                   (for-effect (quote ()))
                   (t (let ((*in-tail-position* nil)) (emit-nil))))))
+    (macrolet ((arms (prefix)
+                 `(let* ((prefix ,prefix) (then (then-arm)) (else (else-arm)))
+                    (%code-concat prefix then
+                                  (list (list :br end-label) (list :label else-label))
+                                  else
+                                  (list (list :label end-label))))))
     ;; Check for fused comparison+branch optimization
     (cond
       ;; Fused comparison: skip IsTruthy (still reset MV)
       ((setq fused-method (compile-if-fused-comparison-p cond-expr))
-       `(,@(let ((*in-tail-position* nil))
+       (arms `(,@(let ((*in-tail-position* nil))
              (ecase (first fused-method)
                (:binary (compile-binary-call (third fused-method) (second fused-method)))
                (:unary (compile-unary-call (third fused-method) (second fused-method)))
@@ -1999,35 +2194,20 @@
                (:double-cmp (compile-double-cmp (third fused-method) (second fused-method)))
                (:struct-typep (compile-struct-typep
                                (first (third fused-method)) (second fused-method)))))
-         (:brfalse ,else-label)
-         ,@(then-arm)
-         (:br ,end-label)
-         (:label ,else-label)
-         ,@(else-arm)
-         (:label ,end-label)))
+         (:brfalse ,else-label))))
       ;; (if (and ...) then else): chain brfalse to else for each condition
       ((and (consp cond-expr) (eq (car cond-expr) 'and) (cdr cond-expr))
-       `(,@(loop for sub in (cdr cond-expr)
-                 append (compile-boolean-branch sub else-label nil))
-         ,@(then-arm)
-         (:br ,end-label)
-         (:label ,else-label)
-         ,@(else-arm)
-         (:label ,end-label)))
+       (arms `(,@(loop for sub in (cdr cond-expr)
+                 append (compile-boolean-branch sub else-label nil)))))
       ;; (if (or ...) then else): chain brtrue to then for each, fall through to else
       ((and (consp cond-expr) (eq (car cond-expr) 'or) (cdr cond-expr))
        (let ((or-true (gen-label "ORTRUE")))
-         `(,@(loop for (sub . rest) on (cdr cond-expr)
+         (arms `(,@(loop for (sub . rest) on (cdr cond-expr)
                    if rest
                      append (compile-boolean-branch sub or-true t)
                    else
                      append (compile-boolean-branch sub else-label nil))
-           (:label ,or-true)
-           ,@(then-arm)
-           (:br ,end-label)
-           (:label ,else-label)
-           ,@(else-arm)
-           (:label ,end-label))))
+           (:label ,or-true)))))
       ;; A binding form or a transparent BLOCK as the test. COMPILE-BOOLEAN-BRANCH
       ;; knows how to push the test inward; without this clause the test's value
       ;; is built and handed to IsTruthy, which is what an inlined predicate
@@ -2040,14 +2220,11 @@
                      (not (%block-returns-to-p (cadr cond-expr) (cddr cond-expr))))
                 ;; ...or a call the INLINE proclamation turns into one of those.
                 (and (symbolp (car cond-expr))
-                     (maybe-expand-inline (car cond-expr) cond-expr))
-                (%boolean-branch-macro-p cond-expr)))
-       `(,@(compile-boolean-branch cond-expr else-label nil)
-         ,@(then-arm)
-         (:br ,end-label)
-         (:label ,else-label)
-         ,@(else-arm)
-         (:label ,end-label)))
+                     (or (maybe-expand-inline (car cond-expr) cond-expr)
+                         (%same-file-inline-expansion (car cond-expr) cond-expr)))
+                (%boolean-branch-macro-p cond-expr)
+                (%boolean-branchable-control-p cond-expr)))
+       (arms `(,@(compile-boolean-branch cond-expr else-label nil))))
       ;; Fused (not x) / (null x): negate the branch
       ((and (consp cond-expr)
             (symbolp (car cond-expr))
@@ -2056,15 +2233,10 @@
        (let ((inner-fused (compile-if-fused-comparison-p (cadr cond-expr))))
          (cond
           ((and (not inner-fused) (%boolean-branch-macro-p (cadr cond-expr)))
-           `(,@(compile-boolean-branch (cadr cond-expr) else-label t)
-             ,@(then-arm)
-             (:br ,end-label)
-             (:label ,else-label)
-             ,@(else-arm)
-             (:label ,end-label)))
+           (arms `(,@(compile-boolean-branch (cadr cond-expr) else-label t))))
           (inner-fused
              ;; Inner expression is fusable: use fused comparison with negated branch
-             `(,@(let ((*in-tail-position* nil))
+             (arms `(,@(let ((*in-tail-position* nil))
                    (ecase (first inner-fused)
                      (:binary (compile-binary-call (third inner-fused) (second inner-fused)))
                      (:unary (compile-unary-call (third inner-fused) (second inner-fused)))
@@ -2074,32 +2246,56 @@
                      (:double-cmp (compile-double-cmp (third inner-fused) (second inner-fused)))
                      (:struct-typep (compile-struct-typep
                                      (first (third inner-fused)) (second inner-fused)))))
-               (:brtrue ,else-label)  ;; Negate: branch to else when TRUE
-               ,@(then-arm)
-               (:br ,end-label)
-               (:label ,else-label)
-               ,@(else-arm)
-               (:label ,end-label)))
+               (:brtrue ,else-label))))  ;; Negate: branch to else when TRUE
           ;; Default: IsTruthy + negate
           (t
-             `(,@(%truth-test-instrs (cadr cond-expr))
+             (arms `(,@(%truth-test-instrs (cadr cond-expr))
                (:call "MultipleValues.Reset")
-               (:brtrue ,else-label)  ;; Negate: branch to else when TRUE (meaning (not x) is false)
-               ,@(then-arm)
-               (:br ,end-label)
-               (:label ,else-label)
-               ,@(else-arm)
-               (:label ,end-label))))))
+               (:brtrue ,else-label)))))))  ;; Negate: branch to else when TRUE (meaning (not x) is false)
       ;; Default: general condition
       (t
-       `(,@(%truth-test-instrs cond-expr)
-         (:call "MultipleValues.Reset")
-         (:brfalse ,else-label)
-         ,@(then-arm)
-         (:br ,end-label)
-         (:label ,else-label)
-         ,@(else-arm)
-         (:label ,end-label)))))))
+       (let ((test (%truth-test-instrs cond-expr)))
+         (if (%invoke-test-p test)
+             (let ((then (then-arm)) (else (else-arm)))
+               (flet ((reset-unless-loops (arm)
+                        (if (%loop-back-arm-p arm)
+                            arm
+                            (%code-concat (list '(:call "MultipleValues.Reset")) arm))))
+                 (%code-concat `(,@test (:brfalse ,else-label))
+                               (reset-unless-loops then)
+                               (list `(:br ,end-label) `(:label ,else-label))
+                               (reset-unless-loops else)
+                               (list `(:label ,end-label)))))
+             (arms `(,@test
+               (:call "MultipleValues.Reset")
+               (:brfalse ,else-label)))))))))))
+
+(defun %invoke-test-p (test)
+  "True when TEST, an IF test's instructions, ends in a LispFunction call and
+   its truth test. Such a call leaves the values channel as the argument calls
+   of a self tail call leave it before jumping back to the loop head."
+  (let ((tail (last test 3)))
+    (when (member (car (last tail)) '((:call "Runtime.IsTruthy") (:call "Runtime.IsNotNil"))
+                  :test #'equal)
+      (let ((call (if (equal (second tail) '(:call "Runtime.UnwrapMv"))
+                      (first tail)
+                      (second tail))))
+        (and (consp call)
+             (or (member (car call) '(:call-same-file :gf-ic1))
+                 (and (eq (car call) :callvirt)
+                      (or (find (second call) +invoke-names+ :test #'equal)
+                          (find (second call) +invoke-mode-names+ :test #'equal)))))))))
+
+(defun %loop-back-arm-p (arm)
+  "True when ARM, an IF arm's instructions, ends in the jump back to the head of
+   a self tail call loop: its value never leaves the IF."
+  (let ((last (code-last-instr arm)))
+    (and (consp last) (eq (car last) :br)
+         (symbolp (second last))
+         (let ((name (symbol-name (second last))))
+           (some (lambda (p) (and (> (length name) (length p))
+                                  (string= p name :end2 (length p))))
+                 '("TCOLOOP" "TCOCHK" "LABELSLOOP"))))))
 
 ;;; ============================================================
 ;;; progn
@@ -2317,7 +2513,7 @@
           (%list-longer-than-p forms *progn-chunk-threshold*)
           (%progn-chunk-safe-p forms))
      (compile-progn (%chunk-progn-forms forms)))
-    (t (append
+    (t (%code-concat
         ;; Non-last forms: never in tail position, and their values are
         ;; discarded so an MV-propagating context (e.g. block value position)
         ;; must not leak into them: subforms would skip UnwrapMv and leak

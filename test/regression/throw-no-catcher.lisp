@@ -100,3 +100,51 @@
           (handler-case (throw (list :tnc) :different-object)
             (control-error () :control-error))))
   (:same-object :control-error))
+
+;;; ---- tags compare by EQ on both sides ----
+;;
+;;; CLHS CATCH/THROW compare tags with EQ. Two distinct strings or floats with
+;;; the same contents used to match in the throw's no-catcher check and then
+;;; fail the catch filter, so the throw left as a raw .NET exception and killed
+;;; the process instead of signalling a catchable CONTROL-ERROR.
+
+(deftest throw-no-catcher.same-contents-string-tag-is-not-eq
+  (let ((a (copy-seq "tnc-tag"))
+        (b (copy-seq "tnc-tag")))
+    (list (eq a b)
+          (handler-case (catch a (throw b :thrown))
+            (control-error () :control-error))))
+  (nil :control-error))
+
+(deftest throw-no-catcher.same-contents-float-tag-is-not-eq
+  (let ((a (float 3/2 0.0d0))
+        (b (float 3/2 0.0d0)))
+    (list (eq a b)
+          (handler-case (catch a (throw b :thrown))
+            (control-error () :control-error))))
+  (nil :control-error))
+
+(deftest throw-no-catcher.same-string-object-tag-still-matches
+  (let ((tag (copy-seq "tnc-tag")))
+    (catch tag (throw tag :same-object)))
+  :same-object)
+
+(deftest throw-no-catcher.same-float-object-tag-still-matches
+  (let ((tag (float 3/2 0.0d0)))
+    (catch tag (throw tag :same-object)))
+  :same-object)
+
+;; EQ is true for a cached fixnum or for a character of the same name.
+(deftest throw-no-catcher.fixnum-and-character-tags-still-match
+  (list (catch 1 (throw 1 :fixnum))
+        (catch #\a (throw #\a :character)))
+  (:fixnum :character))
+
+(deftest throw-no-catcher.same-contents-string-tag-interpreted
+  (let ((dotcl:*evaluator-mode* :interpret))
+    (eval '(let ((a (copy-seq "tnc-tag"))
+                 (b (copy-seq "tnc-tag")))
+             (list (eq a b)
+                   (handler-case (catch a (throw b :thrown))
+                     (control-error () :control-error))))))
+  (nil :control-error))

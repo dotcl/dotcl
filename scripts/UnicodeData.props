@@ -1,0 +1,8 @@
+<Project>
+  <!-- Pinned Unicode data shared by the Makefile and runtime/DotCL.Runtime.csproj. -->
+  <PropertyGroup>
+    <UnicodeVersion>18.0.0</UnicodeVersion>
+    <UnicodeDataSha256>0736451de439ae7baf1425136617da495e09ee5afbe6e394374db7009ea08950</UnicodeDataSha256>
+    <UnicodeDataUrl>https://www.unicode.org/Public/$(UnicodeVersion)/ucd/UnicodeData.txt</UnicodeDataUrl>
+  </PropertyGroup>
+</Project>

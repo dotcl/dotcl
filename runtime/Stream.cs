@@ -94,6 +94,13 @@ public sealed class ByteTrackingReader : TextReader
     public System.IO.Stream BaseStream => _stream;
     public System.Text.Encoding CurrentEncoding { get; }
 
+    /// <summary>True when a byte can be read without waiting for the underlying stream.</summary>
+    public bool HasReadableData()
+    {
+        if (_pendingPos < _pendingLen || _carryLen > 0 || _bytePos < _byteLen) return true;
+        return _stream.CanSeek && _stream.Position < _stream.Length;
+    }
+
     public ByteTrackingReader(System.IO.Stream stream, System.Text.Encoding encoding,
                               bool skipPreamble)
     {
@@ -533,6 +540,12 @@ public class LispFileStream : LispStream
     public override string? StreamTypeName => "FILE-STREAM";
     /// <summary>Original Lisp pathname object used to open this stream (may be a logical pathname).</summary>
     public LispPathname? OriginalPathname { get; set; }
+    /// <summary>Output file to delete if this stream is closed abortively.</summary>
+    internal string? AbortDeletePath { get; set; }
+    /// <summary>Original file moved aside while this stream writes.</summary>
+    internal string? BackupPath { get; set; }
+    /// <summary>Keep BackupPath on normal close (:if-exists :rename).</summary>
+    internal bool KeepBackup { get; set; }
 
     // Input file stream
     public LispFileStream(ByteTrackingReader reader, string path)
@@ -572,6 +585,35 @@ public class LispFileStream : LispStream
     }
 
     public override string ToString() => $"#<FILE-STREAM \"{FilePath}\">";
+}
+
+internal sealed class BaseCharCheckingStringWriter : StringWriter
+{
+    private static void Check(char c) => Runtime.CheckBaseChar(c);
+
+    private static void Check(string? value)
+    {
+        if (value == null) return;
+        for (int i = 0; i < value.Length; i++) Check(value[i]);
+    }
+
+    public override void Write(char value) { Check(value); base.Write(value); }
+
+    public override void Write(string? value) { Check(value); base.Write(value); }
+
+    public override void Write(char[] buffer, int index, int count)
+    {
+        for (int i = index; i < index + count; i++) Check(buffer[i]);
+        base.Write(buffer, index, count);
+    }
+
+#if !NETSTANDARD2_0
+    public override void Write(ReadOnlySpan<char> buffer)
+    {
+        for (int i = 0; i < buffer.Length; i++) Check(buffer[i]);
+        base.Write(buffer);
+    }
+#endif
 }
 
 public class LispStringOutputStream : LispOutputStream
@@ -646,22 +688,34 @@ public class FillPointerStringWriter : TextWriter, IColumnWriter
         }
     }
 
+    private void Check(char c)
+    {
+        if (_vector.IsBaseCharVector) Runtime.CheckBaseChar(c);
+    }
+
     public override void Write(char value)
     {
+        Check(value);
         _vector.VectorPushExtend(LispChar.Make(value), 16);
     }
 
     public override void Write(char[] buffer, int index, int count)
     {
         for (int i = index; i < index + count; i++)
+        {
+            Check(buffer[i]);
             _vector.VectorPushExtend(LispChar.Make(buffer[i]), 16);
+        }
     }
 
     public override void Write(string? value)
     {
         if (value == null) return;
         for (int i = 0; i < value.Length; i++)
+        {
+            Check(value[i]);
             _vector.VectorPushExtend(LispChar.Make(value[i]), 16);
+        }
     }
 }
 
@@ -670,6 +724,8 @@ public class LispFillPointerStringOutputStream : LispOutputStream
 {
     public LispFillPointerStringOutputStream(LispVector vector) : base(new FillPointerStringWriter(vector))
     {
+        int n = vector.Length;
+        AtLineStart = n == 0 || (vector.ElementAt(n - 1) is LispChar c && c.Value == '\n');
     }
 
     public override string? StreamTypeName => "STRING-STREAM";
@@ -1172,7 +1228,9 @@ public sealed class BivalentStreamWriter : System.IO.TextWriter
 public sealed class WriteBufferedStream : System.IO.Stream
 {
     private readonly System.IO.Stream _s;
-    private readonly byte[] _buf = new byte[8192];
+    private const int BufferSize = 8192;
+    // Allocated by the first write: a stream that is only read never needs it.
+    private byte[]? _buf;
     private int _len;
     private readonly object _lock = new();
 
@@ -1196,7 +1254,7 @@ public sealed class WriteBufferedStream : System.IO.Stream
         if (_len == 0) return;
         int n = _len;
         _len = 0;
-        _s.Write(_buf, 0, n);
+        _s.Write(_buf!, 0, n);
     }
 
     private void FlushPending()
@@ -1221,11 +1279,12 @@ public sealed class WriteBufferedStream : System.IO.Stream
     {
         lock (_lock)
         {
-            if (count > _buf.Length - _len)
+            if (count > BufferSize - _len)
             {
                 FlushBuffer();
-                if (count > _buf.Length) { _s.Write(buffer, offset, count); return; }
+                if (count > BufferSize) { _s.Write(buffer, offset, count); return; }
             }
+            _buf ??= new byte[BufferSize];
             System.Buffer.BlockCopy(buffer, offset, _buf, _len, count);
             _len += count;
         }
@@ -1235,7 +1294,8 @@ public sealed class WriteBufferedStream : System.IO.Stream
     {
         lock (_lock)
         {
-            if (_len == _buf.Length) FlushBuffer();
+            if (_len == BufferSize) FlushBuffer();
+            _buf ??= new byte[BufferSize];
             _buf[_len++] = value;
         }
     }

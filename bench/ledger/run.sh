@@ -9,8 +9,9 @@
 # other jobs on the machine can take the lock between two measurements.
 #
 # Output (in $LEDGER_OUT, default $LEDGER_WORK/out):
-#   raw.tsv          one line per value: metric side round value unit note
-#   results.tsv      metric, dotcl, SBCL, ratio, unit, how (failed rows say "failed")
+#   raw.tsv          one line per value: metric mode side round value unit note runs
+#   results.tsv      metric, cold dotcl, cold SBCL, cold ratio, steady dotcl,
+#                    steady SBCL, steady ratio, runs, mark, unit, how, note
 #   results.md       the same as a Markdown table with the run header
 #   results-detail.tsv   per-test lines for the ironclad rows
 #
@@ -35,6 +36,15 @@
 #   DOTCL_QL_HOME    dotcl's Quicklisp home (default ~/.local/share/dotcl/quicklisp)
 #   ROS_QL_SOFTWARE  Roswell Quicklisp software directory
 #                    (default ~/.roswell/lisp/quicklisp/dists/quicklisp/software)
+#   LEDGER_COLD_MAX       cold ratio that gets a mark (default 10)
+#   LEDGER_STEADY_MAX     steady ratio that gets a mark (default 2)
+#   LEDGER_STEADY_STRONG  steady ratio that gets the strong mark (default 3)
+#   LEDGER_STEADY_TOLERANCE  consecutive-run spread considered stable (default 0.05)
+#   LEDGER_STEADY_WINDOW     consecutive stable runs required (default 3)
+#   LEDGER_STEADY_MIN_RUNS   runs before a stable window is accepted (default 10)
+#   LEDGER_STEADY_MIN_SECONDS  seconds before a stable window may start (default 3)
+#   LEDGER_STEADY_MAX_RUNS   runs after the minimum time before stopping (default 20)
+#   LEDGER_STEADY_MAX_SECONDS  cap on steady seconds per benchmark (default 120)
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -42,6 +52,15 @@ TREE=${LEDGER_TREE:-$(cd "$here/../.." && pwd)}
 WORK=${LEDGER_WORK:-$TREE/out/ledger}
 OUT=${LEDGER_OUT:-$WORK/out}
 ROUNDS=${LEDGER_ROUNDS:-3}
+COLD_MAX=${LEDGER_COLD_MAX:-10}
+STEADY_MAX=${LEDGER_STEADY_MAX:-2}
+STEADY_STRONG=${LEDGER_STEADY_STRONG:-3}
+STEADY_TOLERANCE=${LEDGER_STEADY_TOLERANCE:-0.05}
+STEADY_WINDOW=${LEDGER_STEADY_WINDOW:-3}
+STEADY_MIN_RUNS=${LEDGER_STEADY_MIN_RUNS:-10}
+STEADY_MIN_SECONDS=${LEDGER_STEADY_MIN_SECONDS:-3}
+STEADY_MAX_RUNS=${LEDGER_STEADY_MAX_RUNS:-20}
+STEADY_MAX_SECONDS=${LEDGER_STEADY_MAX_SECONDS:-120}
 ITEMS=${LEDGER_ITEMS:-$here/items.tsv}
 NOTES=${LEDGER_NOTES:-$here/notes.tsv}
 ONLY=${LEDGER_ONLY:-}
@@ -151,13 +170,13 @@ build_argv() {
   ARGV=()
   if [ "$side" = dotcl ]; then
     ARGV=("$RUNTIME" --core "$CORE")
-    for e in "${evals[@]}"; do ARGV+=(--eval "$e"); done
+    for e in ${evals[@]+"${evals[@]}"}; do ARGV+=(--eval "$e"); done
     ARGV+=("$file")
   else
     read -ra ARGV <<< "$SBCL_CMD"
     ARGV+=(--non-interactive)
     [ "$kind" = coalton ] || ARGV+=(--no-userinit)
-    for e in "${evals[@]}"; do ARGV+=(--eval "$e"); done
+    for e in ${evals[@]+"${evals[@]}"}; do ARGV+=(--eval "$e"); done
     ARGV+=(--load "$file")
     case $kind in clbench*) ARGV+=(--eval '(quit)');; esac
   fi
@@ -171,10 +190,18 @@ bench_names() {
   esac
 }
 
-# run_one KIND ARG SIDE TIMEOUT STDOUT STDERR : sets RC
+# run_one KIND ARG SIDE TIMEOUT STDOUT STDERR MODE : sets RC
 run_one() {
-  local kind=$1 arg=$2 side=$3 to=$4 so=$5 se=$6
-  local envs=(DOTCL_NO_JIT_PROFILE=1 DOTNET_gcServer=0) file evals=() dir=$WORK
+  local kind=$1 arg=$2 side=$3 to=$4 so=$5 se=$6 mode=${7:-cold}
+  local envs=(DOTCL_NO_JIT_PROFILE=1 DOTNET_gcServer=0
+              "LEDGER_STEADY_TOLERANCE=$STEADY_TOLERANCE"
+              "LEDGER_STEADY_WINDOW=$STEADY_WINDOW"
+              "LEDGER_STEADY_MIN_RUNS=$STEADY_MIN_RUNS"
+              "LEDGER_STEADY_MIN_SECONDS=$STEADY_MIN_SECONDS"
+              "LEDGER_STEADY_MAX_RUNS=$STEADY_MAX_RUNS"
+              "LEDGER_STEADY_MAX_SECONDS=$STEADY_MAX_SECONDS")
+  local file evals=() dir=$WORK
+  [ "$mode" = steady ] && envs+=(LEDGER_STEADY=1)
   case $kind in
     clbench)
       file=$TREE/bench/cl-bench-runner/run.lisp
@@ -204,8 +231,16 @@ run_one() {
       envs+=("LEDGER_FASL=$WORK/bic2-$side.fasl");;
     *) echo "unknown kind $kind" >&2; RC=99; return;;
   esac
-  build_argv "$side" "$kind" "$file" "${evals[@]}"
-  local cmd=(timeout -k 10 "$to" env "${envs[@]}" "${ARGV[@]}")
+  build_argv "$side" "$kind" "$file" ${evals[@]+"${evals[@]}"}
+  # GNU timeout is coreutils' gtimeout on macOS, and absent on a stock runner: without
+  # either, run unbounded rather than failing every item with exit 127.
+  local cmd
+  if command -v timeout >/dev/null 2>&1; then cmd=(timeout -k 10 "$to" env "${envs[@]}" "${ARGV[@]}")
+  elif command -v gtimeout >/dev/null 2>&1; then cmd=(gtimeout -k 10 "$to" env "${envs[@]}" "${ARGV[@]}")
+  else
+    echo "ledger: no timeout or gtimeout on PATH; running $kind without a time limit" >&2
+    cmd=(env "${envs[@]}" "${ARGV[@]}")
+  fi
   if [ -n "$LOCK" ]; then
     (cd "$dir" && flock "$LOCK" "${cmd[@]}") < /dev/null > "$so" 2> "$se"
   else
@@ -214,35 +249,70 @@ run_one() {
   RC=$?
 }
 
-# parse KIND ARG ID SO SE : prints "metric<TAB>value<TAB>unit<TAB>note" lines
+# parse KIND ARG ID SO SE MODE : prints "metric<TAB>value<TAB>unit<TAB>note<TAB>runs"
 parse() {
-  local kind=$1 arg=$2 id=$3 so=$4 se=$5
-  case $kind in
-    clbench|clbench-warm)
-      awk -v key="\"${arg##*,}\": " -v id="$id" '
-        { s = $0; sub(/^ +/, "", s)
-          if (index(s, key) != 1) next
-          v = substr(s, length(key) + 1)
-          gsub(/[\[\], ]+$/, "", v); gsub(/^\[/, "", v)
-          n = split(v, a, /, */)
-          for (i = 1; i <= n; i++) if (a[i] ~ /^[0-9.]+$/ && (best == "" || a[i] + 0 < best + 0)) best = a[i]
-        }
-        END { if (best != "") printf "%s\t%.1f\tms\t\n", id, best * 1000 }' "$se";;
-    clbench-suite)
-      awk '
-        { s = $0; sub(/^ +/, "", s)
-          if (s !~ /^"[^"]+": [0-9.]+,?$/ || s ~ /\/consed"/) next
-          split(s, a, "\": "); name = substr(a[1], 2); v = a[2]; sub(/,$/, "", v)
-          printf "cl-bench-suite/%s\t%.1f\tms\t\n", name, v * 1000 }' "$se";;
-    coalton)
-      awk -v k="$arg" -v id="$id" '$1 == "RESULT" && $2 == k { printf "%s\t%s\tms\t%s\n", id, $3, $4 }' "$so";;
-    parity)
-      awk -F'\t' -v id="$id" 'NF == 2 && $1 ~ /^[a-z][a-z-]*$/ && $2 ~ /^[0-9.]+$/ { printf "%s/%s\t%s\tms\t\n", id, $1, $2 }' "$so";;
-    ironclad-cold|ironclad-warm)
-      awk -v id="$id" '$1 == "TIME" && $5 == "ok" { printf "%s/%s/%s\t%.1f\tms\t\n", id, $2, $3, $4 * 1000 }' "$so";;
-    imago)
-      awk -v id="$id" '$1 == "BIC2" { printf "%s\t%s\tns\t%s\n", id, $2, $6 }' "$so";;
-  esac
+  local kind=$1 arg=$2 id=$3 so=$4 se=$5 mode=${6:-cold}
+  if [ "$mode" = steady ]; then
+    case $kind in
+      clbench|clbench-warm)
+        awk -v key="${arg##*,}" -v id="$id" '
+          $1 == "STEADY" && $2 == key {
+            printf "%s\t%.1f\tms\t%s\t%s\n", id, $3 * 1000,
+                   ($5 == "stable" ? "" : "steady: not stable"), $4 }' "$so";;
+      clbench-suite)
+        awk '
+          $1 == "STEADY" {
+            printf "cl-bench-suite/%s\t%.1f\tms\t%s\t%s\n", $2, $3 * 1000,
+                   ($5 == "stable" ? "" : "steady: not stable"), $4 }' "$so";;
+      coalton)
+        awk -v k="$arg" -v id="$id" '
+          $1 == "STEADY" && $2 == k {
+            printf "%s\t%s\tms\t%s%s\t%s\n", id, $3, $6,
+                   ($5 == "stable" ? "" : " steady: not stable"), $4 }' "$so";;
+      parity)
+        awk -v id="$id" '
+          $1 == "STEADY" && $2 ~ /^[a-z][a-z-]*$/ && $3 ~ /^[0-9.]+$/ {
+            printf "%s/%s\t%s\tms\t%s\t%s\n", id, $2, $3,
+                   ($5 == "stable" ? "" : "steady: not stable"), $4 }' "$so";;
+      ironclad-cold|ironclad-warm)
+        awk -v id="$id" '
+          $1 == "TIME" && $5 == "ok" {
+            printf "%s/%s/%s\t%.1f\tms\t%s\t%s\n", id, $2, $3, $4 * 1000,
+                   ($8 == "stable" ? "" : "steady: not stable"), $7 }' "$so";;
+      imago)
+        awk -v id="$id" '
+          $1 == "BIC2" {
+            printf "%s\t%s\tns\t%s\t%s\n", id, $2,
+                   ($8 == "stable" ? "" : "steady: not stable"), $7 }' "$so";;
+    esac
+  else
+    case $kind in
+      clbench|clbench-warm)
+        awk -v key="\"${arg##*,}\": " -v id="$id" '
+          { s = $0; sub(/^ +/, "", s)
+            if (index(s, key) != 1) next
+            v = substr(s, length(key) + 1)
+            gsub(/[\[\], ]+$/, "", v); gsub(/^\[/, "", v)
+            n = split(v, a, /, */)
+            for (i = 1; i <= n; i++) if (a[i] ~ /^[0-9.]+$/ && (best == "" || a[i] + 0 < best + 0)) best = a[i]
+          }
+          END { if (best != "") printf "%s\t%.1f\tms\t\n", id, best * 1000 }' "$se";;
+      clbench-suite)
+        awk '
+          { s = $0; sub(/^ +/, "", s)
+            if (s !~ /^"[^"]+": [0-9.]+,?$/ || s ~ /\/consed"/) next
+            split(s, a, "\": "); name = substr(a[1], 2); v = a[2]; sub(/,$/, "", v)
+            printf "cl-bench-suite/%s\t%.1f\tms\t\n", name, v * 1000 }' "$se";;
+      coalton)
+        awk -v k="$arg" -v id="$id" '$1 == "RESULT" && $2 == k { printf "%s\t%s\tms\t%s\n", id, $3, $4 }' "$so";;
+      parity)
+        awk -F'\t' -v id="$id" 'NF == 2 && $1 ~ /^[a-z][a-z-]*$/ && $2 ~ /^[0-9.]+$/ { printf "%s/%s\t%s\tms\t\n", id, $1, $2 }' "$so";;
+      ironclad-cold|ironclad-warm)
+        awk -v id="$id" '$1 == "TIME" && $5 == "ok" { printf "%s/%s/%s\t%.1f\tms\t\n", id, $2, $3, $4 * 1000 }' "$so";;
+      imago)
+        awk -v id="$id" '$1 == "BIC2" { printf "%s\t%s\tns\t%s\n", id, $2, $6 }' "$so";;
+    esac
+  fi
 }
 
 measure() {
@@ -279,13 +349,14 @@ measure() {
         [ "$failed" = 1 ] && continue
         so=$OUT/last-$side.out; se=$OUT/last-$side.err
         log "$id $side round $round"
-        run_one "$kind" "$arg" "$side" "$to" "$so" "$se"
-        parse "$kind" "$arg" "$id" "$so" "$se" > "$OUT/last.parsed"
+        run_one "$kind" "$arg" "$side" "$to" "$so" "$se" cold
+        parse "$kind" "$arg" "$id" "$so" "$se" cold > "$OUT/last.parsed"
         n=$(wc -l < "$OUT/last.parsed" | tr -d ' ')
-        awk -F'\t' -v s="$side" -v r="$round" '{ printf "%s\t%s\t%s\t%s\t%s\t%s\n", $1, s, r, $2, $3, $4 }' \
+        awk -F'\t' -v m=cold -v s="$side" -v r="$round" \
+          '{ printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", $1, m, s, r, $2, $3, $4, $5 }' \
           "$OUT/last.parsed" >> "$OUT/raw.tsv"
         if [ "$RC" != 0 ] || [ "$n" = 0 ]; then
-          printf '%s\t%s\t%s\t\t\tFAIL exit=%s values=%s\n' "$id" "$side" "$round" "$RC" "$n" >> "$OUT/raw.tsv"
+          printf '%s\t%s\t%s\t%s\t\t\tFAIL exit=%s values=%s\t\n' "$id" cold "$side" "$round" "$RC" "$n" >> "$OUT/raw.tsv"
           mkdir -p "$OUT/fail"
           cp "$so" "$OUT/fail/$(echo "$id" | tr '/+' '__')-$side.out" 2>/dev/null
           cp "$se" "$OUT/fail/$(echo "$id" | tr '/+' '__')-$side.err" 2>/dev/null
@@ -293,6 +364,23 @@ measure() {
           [ "$n" = 0 ] && eval "failed_$side=1"
         fi
       done
+    done
+    for side in dotcl sbcl; do
+      so=$OUT/steady-$side.out; se=$OUT/steady-$side.err
+      log "$id $side steady"
+      run_one "$kind" "$arg" "$side" "$to" "$so" "$se" steady
+      parse "$kind" "$arg" "$id" "$so" "$se" steady > "$OUT/last.parsed"
+      n=$(wc -l < "$OUT/last.parsed" | tr -d ' ')
+      awk -F'\t' -v m=steady -v s="$side" -v r=- \
+        '{ printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", $1, m, s, r, $2, $3, $4, $5 }' \
+        "$OUT/last.parsed" >> "$OUT/raw.tsv"
+      if [ "$RC" != 0 ] || [ "$n" = 0 ]; then
+        printf '%s\t%s\t%s\t%s\t\t\tFAIL exit=%s values=%s\t\n' "$id" steady "$side" - "$RC" "$n" >> "$OUT/raw.tsv"
+        mkdir -p "$OUT/fail"
+        cp "$so" "$OUT/fail/$(echo "$id" | tr '/+' '__')-$side-steady.out" 2>/dev/null
+        cp "$se" "$OUT/fail/$(echo "$id" | tr '/+' '__')-$side-steady.err" 2>/dev/null
+        log "$id $side steady: failed (exit $RC, $n values)"
+      fi
     done
   done < "$ITEMS"
   date +%s > "$OUT/end.epoch"
@@ -308,64 +396,123 @@ render() {
   [ -f "$prev" ] || { prev=$OUT/no-previous.tsv; : > "$prev"; }
  { printf -- '-\t-\t-\t-\n'; cat "$prev"; } > "$OUT/prev-in.tsv"
   : > "$OUT/regressions.tsv"; : > "$OUT/results-detail.tsv"
-  awk -F'\t' -v OFS='\t' -v regfile="$OUT/regressions.tsv" -v detailfile="$OUT/results-detail.tsv" -v thr="$REG_PCT" '
+  awk -F'\t' -v OFS='\t' -v regfile="$OUT/regressions.tsv" -v detailfile="$OUT/results-detail.tsv" \
+    -v thr="$REG_PCT" -v coldmax="$COLD_MAX" -v steadymax="$STEADY_MAX" -v strong="$STEADY_STRONG" '
     function how(m) {
-      if (m ~ /^cl-bench-warm\//) return "cl-bench, warm (1 warm-up + 3 runs in the process, min)"
-      if (m ~ /^cl-bench-suite\//) return "cl-bench, whole suite in one process (cold, JIT included, earlier benchmarks have run)"
-      if (m ~ /^cl-bench\//) return "cl-bench, cold (1 scalar run, JIT included)"
-      if (m ~ /^coalton\//) return "Coalton kernel, warm (1 warm-up in the process, min of 5)"
-      if (m ~ /^parity\//) return "csharp-parity kernel, warm (1 warm-up block, min of 5)"
-      if (m ~ /^ironclad-cold\//) return "ironclad rt suite, 1 rep per test (cache warm, JIT included); sum of tests"
-      if (m ~ /^ironclad-warm\//) return "ironclad rt suite, min of 4 reps per test; sum of tests"
-      if (m ~ /^imago\//) return "imago bicubic, warm (min of 5 in the process), ns per pixel"
+      if (m ~ /^cl-bench-warm\//) return "cl-bench: existing warm form in the cold column; steady repeats in-process until stable"
+      if (m ~ /^cl-bench-suite\//) return "cl-bench whole suite in one process; steady repeats each benchmark until stable"
+      if (m ~ /^cl-bench\//) return "cl-bench cold (1 scalar run, JIT included); steady repeats until stable"
+      if (m ~ /^coalton\//) return "Coalton kernel cold (1 warm-up + 5 runs, min); steady repeats until stable"
+      if (m ~ /^parity\//) return "csharp-parity kernel cold (1 warm-up + 5 runs, min); steady repeats until stable"
+      if (m ~ /^ironclad-cold\//) return "ironclad rt suite cold (1 rep per test); steady repeats each test until stable; sum of tests"
+      if (m ~ /^ironclad-warm\//) return "ironclad rt suite warm (min of 4 reps per test); steady repeats each test until stable; sum of tests"
+      if (m ~ /^imago\//) return "imago bicubic cold (min of 5, warm); steady repeats until stable; ns per pixel"
       return ""
+    }
+    function noteadd(a, b) {
+      if (a == "") return b
+      if (b == "") return a
+      return a "; " b
+    }
+    function runfield(m) {
+      d = sruns[m, "dotcl"]; s = sruns[m, "sbcl"]
+      if (d == "" && s == "") return "-"
+      if (d == s) return d
+      return d "/" s
     }
     FNR == 1 { fi++ }
     fi == 1 { hnote[$1] = $2; next }
-    fi == 2 { pratio[$1] = $4; next }
-    $6 ~ /^FAIL/ { fail[$1, $2] = 1; failnote[$1] = failnote[$1] " " $2 ":" $6; seen[$1] = 1; next }
-    $4 != "" {
-      k = $1 SUBSEP $2
-      if (!(k in best) || $4 + 0 < best[k] + 0) best[k] = $4 + 0
-      unit[$1] = $5
-      if ($6 != "") sumnote[$1, $2] = $6
-      seen[$1] = 1
+    fi == 2 { if ($4 ~ /^[0-9.]+$/) pratio[$1] = $4; next }
+    fi == 3 {
+      m = $1; mode = $2; side = $3; v = $5; u = $6; nt = $7; r = $8
+      if (nt ~ /^FAIL/) {
+        fail[m, side] = 1
+        failnote[m] = noteadd(failnote[m], side ":" nt)
+        seen[m] = 1
+        next
+      }
+      if (v == "") next
+      k = m SUBSEP side
+      if (mode == "cold") {
+        if (!(k in cbest) || v + 0 < cbest[k] + 0) cbest[k] = v + 0
+        unit[m] = u
+        if (nt != "") cnote[m, side] = nt
+      } else if (mode == "steady") {
+        if (!(k in sbest) || v + 0 < sbest[k] + 0) sbest[k] = v + 0
+        sruns[m, side] = r
+        sunit[m] = u
+        if (nt != "") snote[m, side] = nt
+      }
+      seen[m] = 1
     }
     END {
       for (m in seen) {
-        d = ((m SUBSEP "dotcl") in best) ? best[m, "dotcl"] : ""
-        s = ((m SUBSEP "sbcl") in best) ? best[m, "sbcl"] : ""
+        d = ((m SUBSEP "dotcl") in cbest) ? cbest[m, "dotcl"] : ""
+        s = ((m SUBSEP "sbcl") in cbest) ? cbest[m, "sbcl"] : ""
+        sd = ((m SUBSEP "dotcl") in sbest) ? sbest[m, "dotcl"] : ""
+        ss = ((m SUBSEP "sbcl") in sbest) ? sbest[m, "sbcl"] : ""
         if (m ~ /^ironclad-(cold|warm)\/[^\/]+\/./) {
           split(m, p, "/")
-          detail[m] = d OFS s
+          detail[m] = d OFS s OFS sd OFS ss
+          cat = p[1] "/" p[2]
+          ctotal[cat]++; ctotal[p[1] "/TOTAL"]++
           if (d != "" && s != "") {
-            cat = p[1] "/" p[2]
             cd[cat] += d; cs[cat] += s; cseen[cat] = 1
             td[p[1]] += d; ts[p[1]] += s; cseen[p[1] "/TOTAL"] = 1
           }
+          if (sd != "" && ss != "") {
+            scd[cat] += sd; scs[cat] += ss; sseen[cat] = 1
+            std[p[1]] += sd; sts[p[1]] += ss; sseen[p[1] "/TOTAL"] = 1
+            csteady[cat]++; csteady[p[1] "/TOTAL"]++
+          }
+          if (sruns[m, "dotcl"] != "" && sruns[m, "dotcl"] + 0 > rd[cat]) rd[cat] = sruns[m, "dotcl"] + 0
+          if (sruns[m, "sbcl"] != "" && sruns[m, "sbcl"] + 0 > rs[cat]) rs[cat] = sruns[m, "sbcl"] + 0
+          if (sruns[m, "dotcl"] != "" && sruns[m, "dotcl"] + 0 > rd[p[1] "/TOTAL"]) rd[p[1] "/TOTAL"] = sruns[m, "dotcl"] + 0
+          if (sruns[m, "sbcl"] != "" && sruns[m, "sbcl"] + 0 > rs[p[1] "/TOTAL"]) rs[p[1] "/TOTAL"] = sruns[m, "sbcl"] + 0
           continue
         }
         row[m] = 1
-        rd[m] = d; rs[m] = s
+        coldd[m] = d; colds[m] = s; steadyd[m] = sd; steadys[m] = ss
+        if (unit[m] == "") unit[m] = sunit[m]
       }
       for (c in cseen) {
-        if (c ~ /\/TOTAL$/) { split(c, q, "/"); rd[c] = td[q[1]]; rs[c] = ts[q[1]]; unit[c] = "ms" }
-        else { rd[c] = cd[c]; rs[c] = cs[c]; unit[c] = "ms" }
-        row[c] = 1
+        if (c ~ /\/TOTAL$/) { split(c, q, "/"); coldd[c] = td[q[1]]; colds[c] = ts[q[1]] }
+        else { coldd[c] = cd[c]; colds[c] = cs[c] }
+        unit[c] = "ms"; row[c] = 1
+      }
+      for (c in sseen) {
+        if (c ~ /\/TOTAL$/) { split(c, q, "/"); steadyd[c] = std[q[1]]; steadys[c] = sts[q[1]] }
+        else { steadyd[c] = scd[c]; steadys[c] = scs[c] }
+        unit[c] = "ms"; row[c] = 1
       }
       for (m in row) {
-        d = rd[m]; s = rs[m]
+        d = coldd[m]; s = colds[m]; sd = steadyd[m]; ss = steadys[m]
+        cr = (d != "" && s != "" && s + 0 > 0) ? sprintf("%.2f", d / s) : "-"
+        sr = (sd != "" && ss != "" && ss + 0 > 0) ? sprintf("%.2f", sd / ss) : "-"
+        mark = ""
+        if (sr != "-" && sr + 0 > strong) mark = "!!"
+        else if ((cr != "-" && cr + 0 > coldmax) || (sr != "-" && sr + 0 > steadymax)) mark = "!"
         note = ""
         split(m, g, "/"); hn = (m in hnote) ? hnote[m] : ((g[1] in hnote) ? hnote[g[1]] : "")
-        if (d != "" && s != "" && s + 0 > 0) ratio = sprintf("%.2f", d / s); else ratio = ""
-        if ((m SUBSEP "dotcl") in sumnote && (m SUBSEP "sbcl") in sumnote && sumnote[m, "dotcl"] != sumnote[m, "sbcl"]) note = "checksum differs"
-        if (hn != "") note = (note == "" ? hn : note "; " hn)
-        if (ratio != "" && (m in pratio) && pratio[m] ~ /^[0-9.]+$/ && ratio + 0 > pratio[m] * (1 + thr / 100)) {
-          printf "%s\t%s\t%s\t%+.0f%%\n", m, pratio[m], ratio, (ratio / pratio[m] - 1) * 100 > regfile
+        if ((m SUBSEP "dotcl") in cnote && (m SUBSEP "sbcl") in cnote && cnote[m, "dotcl"] != cnote[m, "sbcl"]) note = "checksum differs"
+        if (((m SUBSEP "dotcl") in snote && snote[m, "dotcl"] ~ /not stable/) || ((m SUBSEP "sbcl") in snote && snote[m, "sbcl"] ~ /not stable/)) note = noteadd(note, "steady: not stable")
+        if (m ~ /^ironclad-/ && (m in ctotal) && csteady[m] < ctotal[m]) note = noteadd(note, "steady incomplete")
+        if (hn != "") note = noteadd(note, hn)
+        if (cr != "-" && (m in pratio) && pratio[m] ~ /^[0-9.]+$/ && cr + 0 > pratio[m] * (1 + thr / 100)) {
+          printf "%s\t%s\t%s\t%+.0f%%\n", m, pratio[m], cr, (cr / pratio[m] - 1) * 100 > regfile
         }
         ds = (d == "") ? "failed" : sprintf("%.1f", d)
-        ss = (s == "") ? "failed" : sprintf("%.1f", s)
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", m, ds, ss, (ratio == "" ? "-" : ratio), (unit[m] == "" ? "ms" : unit[m]), how(m), note > "/dev/stdout"
+        ssx = (s == "") ? "failed" : sprintf("%.1f", s)
+        sds = (sd == "") ? "failed" : sprintf("%.1f", sd)
+        sss = (ss == "") ? "failed" : sprintf("%.1f", ss)
+        if (m ~ /^ironclad-/) {
+          if (rd[m] == "" && rs[m] == "") runs = "-"
+          else if (rd[m] == rs[m]) runs = rd[m]
+          else runs = rd[m] "/" rs[m]
+        } else runs = runfield(m)
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+          m, ds, ssx, cr, sds, sss, sr, runs, mark,
+          (unit[m] == "" ? "ms" : unit[m]), how(m), note > "/dev/stdout"
       }
       for (m in detail) print m, detail[m] > detailfile
     }' "$OUT/notes.tsv" "$OUT/prev-in.tsv" "$OUT/raw.tsv" | sort -t$'\t' -k4,4gr -k1,1 > "$OUT/results.body"
@@ -374,9 +521,10 @@ render() {
   rm -f "$OUT/results.body"
   sort -o "$OUT/results-detail.tsv" "$OUT/results-detail.tsv" 2>/dev/null
 
-  local start end elapsed
+  local start end elapsed tol
   start=$(cat "$OUT/start.epoch" 2>/dev/null || echo 0); end=$(cat "$OUT/end.epoch" 2>/dev/null || echo 0)
   elapsed=$(( end - start ))
+  tol=$(awk -v t="$STEADY_TOLERANCE" 'BEGIN { printf "%.0f", t * 100 }')
   {
     echo "# dotcl versus SBCL: current values"
     echo
@@ -384,9 +532,13 @@ render() {
     echo "- SBCL: $(cd "$WORK" && $SBCL_CMD --version 2>/dev/null </dev/null | head -1) (flags: ${SBCL_CMD#*--})"
     echo "- Coalton: $(git -C "$COALTON_DIR" rev-parse --short=8 HEAD 2>/dev/null); cl-bench: $(git -C "$WORK/cl-bench" rev-parse --short=8 HEAD 2>/dev/null)"
     echo "- machine: $(hostname), $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //')"
-    echo "- method: each row is its own process per side; dotcl and SBCL alternate $ROUNDS times; the fastest value of each side is shown"
+    echo "- host: $(nproc 2>/dev/null || sysctl -n hw.logicalcpu) logical CPUs, $(uname -sm), .NET $(dotnet --list-runtimes 2>/dev/null | awk '$1 == "Microsoft.NETCore.App" { v = $2 } END { print v }')"
+    echo "- cold: the row's existing fresh-process measurement; dotcl and SBCL alternate $ROUNDS times and the fastest value of each side is shown"
+    echo "- steady: repeated in one process until $STEADY_WINDOW consecutive runs are within ${tol}% of each other, after at least $STEADY_MIN_RUNS runs and $STEADY_MIN_SECONDS s (at most $STEADY_MAX_RUNS runs after those seconds or $STEADY_MAX_SECONDS s)"
+    echo "- mark: ! means cold is over ${COLD_MAX}x or steady is over ${STEADY_MAX}x; !! means steady is over ${STEADY_STRONG}x"
+    echo "- runs = steady runs to stability (dotcl/SBCL when they differ); ratio = dotcl / SBCL; times in ms (imago in ns per pixel)"
     echo "- date: $(date +%Y-%m-%d), wall time of the run $((elapsed / 60)) min (lock waits included)"
-    echo "- ratio = dotcl / SBCL; times in ms (imago in ns per pixel); \"failed\" = the process died or printed no value on that side in every round"
+    echo "- \"failed\" = the process died or printed no value on that side"
     echo
     if [ ! -s "$prev" ]; then echo "Regressions: no previous run to compare with ($PREV)."
     elif [ -s "$OUT/regressions.tsv" ]; then
@@ -398,11 +550,11 @@ render() {
     else echo "Regressions: none (nothing is ${REG_PCT}% or more above the previous run, $PREV)."
     fi
     echo
-    echo "| item | dotcl | SBCL | ratio | unit | how | note |"
-    echo "|---|---:|---:|---:|---|---|---|"
-    awk -F'\t' '{ printf "| %s | %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6, $7 }' "$OUT/results.tsv"
+    echo "| item | cold dotcl | cold SBCL | cold ratio | steady dotcl | steady SBCL | steady ratio | runs | mark | unit | how | note |"
+    echo "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|"
+    awk -F'\t' '{ printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12 }' "$OUT/results.tsv"
     echo
-    echo "Per-test lines of the ironclad rows are in results-detail.tsv (metric, dotcl ms, SBCL ms)."
+    echo "Per-test lines of the ironclad rows are in results-detail.tsv (metric, cold dotcl, cold SBCL, steady dotcl, steady SBCL)."
   } > "$OUT/results.md"
   if [ "${LEDGER_SAVE:-0}" = 1 ]; then mkdir -p "$(dirname "$PREV")"; cp "$OUT/results.tsv" "$PREV"; log "saved baseline $PREV"; fi
   log "wrote $OUT/results.md ($(wc -l < "$OUT/results.tsv" | tr -d ' ') rows)"

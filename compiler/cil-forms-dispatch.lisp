@@ -350,7 +350,8 @@
              (t nil))))
         ((and (symbolp expr) (boundp '*cstate*))
          (let ((key (lookup-local expr)))
-           (and key (cdr (assoc key (cstate-proven-type-locals) :test #'equal)))))
+           (let ((ty (and key (cdr (assoc key (cstate-proven-type-locals) :test #'equal)))))
+             (and (symbolp ty) ty))))
         ((and (consp expr) (symbolp (car expr)) (consp (cdr expr)) (null (cddr expr))
               (not *cross-compiling*)
               (not (local-function-entry (car expr))))
@@ -395,10 +396,12 @@
 (defun %proven-arg-type (var spec)
   "SPEC, when the entry check of parameter VAR declared SPEC leaves VAR known
    to be of it (a type symbol); else NIL."
-  (and (symbolp spec) spec (not (eq spec t))
-       (or (gethash spec *struct-info*)
-           (member spec '(fixnum integer character symbol cons list string function
-                          double-float single-float)))
+  (and spec (not (eq spec t))
+       (or (and (symbolp spec)
+                (or (gethash spec *struct-info*)
+                    (member spec '(fixnum integer character symbol cons list string function
+                                   double-float single-float))))
+           (%the-checked-array-type-p spec))
        (symbolp var) var
        spec))
 
@@ -429,7 +432,8 @@
 (defun %compile-make-struct-raw (expr plan)
   "Instructions for EXPR as %MAKE-STRUCT-RAW-PLAN planned it: each value into a
    temporary of its kind, in order, then the boxed ones into a LispObject[]
-   (none when every slot is raw), the raw bits into an Int64[] and
+   (none when every slot is raw), and the raw bits as the arguments of
+   Runtime.MakeStructRawInline (at most four) or in an Int64[] for
    Runtime.MakeStructRaw."
   (let* ((version (car plan)) (kinds (mapcar #'car (cdr plan)))
          (positions (mapcar #'cdr (cdr plan))) (n (length kinds))
@@ -458,12 +462,20 @@
               ,@(loop for k in kinds for tmp in temps for i from 0
                       when (eq k :boxed)
                         append `((:dup) (:ldc-i4 ,i) (:ldloc ,tmp) (:stelem-ref)))))
-      (:ldc-i4 ,nraw) (:newarr "Int64")
-      ,@(loop for k in kinds for tmp in temps for pos in positions
-              unless (eq k :boxed)
-                append `((:dup) (:ldc-i4 ,pos) (:ldloc ,tmp) (:stelem-i8)))
-      (:ldc-i4 ,version) (:ldc-i8 ,mask) (:ldc-i4 ,n)
-      (:call "Runtime.MakeStructRaw"))))
+      ,@(if (<= nraw 4)
+            `(,@(loop for p from 0 below 4
+                      collect (let ((tmp (loop for k in kinds for tmp in temps for pos in positions
+                                               when (and (not (eq k :boxed)) (eql pos p))
+                                                 return tmp)))
+                                (if tmp `(:ldloc ,tmp) '(:ldc-i8 0))))
+              (:ldc-i4 ,version) (:ldc-i8 ,mask) (:ldc-i4 ,n) (:ldc-i4 ,nraw)
+              (:call "Runtime.MakeStructRawInline"))
+            `((:ldc-i4 ,nraw) (:newarr "Int64")
+              ,@(loop for k in kinds for tmp in temps for pos in positions
+                      unless (eq k :boxed)
+                        append `((:dup) (:ldc-i4 ,pos) (:ldloc ,tmp) (:stelem-i8)))
+              (:ldc-i4 ,version) (:ldc-i8 ,mask) (:ldc-i4 ,n)
+              (:call "Runtime.MakeStructRaw"))))))
 
 ;;; The IL of a C# method, as DOTNET-CS:DISASSEMBLE-CS returns it, rewritten
 ;;; into instructions of this compiler for splicing into the function being
@@ -630,6 +642,51 @@
                `((declare (inline ,fn))))
            (%map-open ',op (,fn ,@(mapcar (lambda (c) `(car ,c)) curs)) ,@lists))))))
 
+(defun %map-nil-lambda-expansion (args)
+  "The loop (MAP NIL (LAMBDA (X) ...) SEQ) opens into, as %MAP-LAMBDA-EXPANSION
+   does for SOME: one sequence, result type NIL. Else NIL."
+  (let ((type (car args))
+        (lam (and (consp (cdr args)) (consp (cddr args)) (null (cdddr args))
+                  (%map-literal-lambda (cadr args)))))
+    (when (and lam
+               (or (null type) (equal type '(quote nil)))
+               (%map-lambda-accepts-p (cadr lam) 1)
+               (not (member 'map *notinline-functions*))
+               (not (%global-notinline-p 'map)))
+      (let ((fn (gensym "MAPFN"))
+            (cur (gensym "MAPC")))
+        `(flet ((,fn ,@(cdr lam)))
+           ,@(when (%map-body-exits-p (cddr lam))
+               `((declare (inline ,fn))))
+           (%map-open 'map-nil (,fn (car ,cur)) ,(caddr args)))))))
+
+(defun %maphash-lambda-expansion (args)
+  "The loop (MAPHASH (LAMBDA (K V) ...) TABLE) opens into when the lambda leaves
+   the walk with RETURN-FROM, RETURN or GO, else NIL. Inlined, such an exit is a
+   jump; from the function MAPHASH calls it is a .NET exception. The walk is the
+   snapshot MAPHASH takes (Runtime.HashWalkBegin), released by the cleanup."
+  (let ((lam (and (consp args) (consp (cdr args)) (null (cddr args))
+                  (%map-literal-lambda (car args)))))
+    (when (and lam
+               (%map-lambda-accepts-p (cadr lam) 2)
+               (not (member 'maphash *notinline-functions*))
+               (not (%global-notinline-p 'maphash))
+               (%map-body-exits-p (cddr lam)))
+      (let ((fn (gensym "MAPFN"))
+            (w (gensym "HWALK"))
+            (top (gensym "HTOP")))
+        `(flet ((,fn ,@(cdr lam)))
+           (declare (inline ,fn))
+           (let ((,w (%hash-walk-begin ,(cadr args))))
+             (unwind-protect
+                  (tagbody
+                     ,top
+                     (when (%hash-walk-next ,w)
+                       (,fn (%hash-walk-key ,w) (%hash-walk-value ,w))
+                       (go ,top)))
+               (%hash-walk-end ,w)))
+           nil)))))
+
 (defun %map-body-exits-p (body)
   "True when BODY is written with RETURN-FROM, RETURN or GO. Out of the FLET
    function such an exit is a non-local one; inlined into the loop it is a jump."
@@ -658,8 +715,9 @@
    list must be proper (checked when the walk is done), as the runtime MAPCAR;
    several stop at the first that runs out. MAPC returns the first list. MAPCAN
    follows NCONC's rules, as the library MAPCAN: a NIL piece adds nothing, a
-   non-list piece is allowed only last. SOME / EVERY / NOTANY / NOTEVERY take one
-   sequence: a list is walked with ENDP, anything else with LENGTH and AREF.
+   non-list piece is allowed only last. SOME / EVERY / NOTANY / NOTEVERY / MAP NIL
+   take one sequence: a list is walked with ENDP, anything else with LENGTH and
+   AREF.
    Every value is the primary value only."
   (destructuring-bind (qop call &rest lists) (cdr expr)
     (let* ((op (cadr qop))
@@ -754,7 +812,7 @@
                              (setq ,@(mapcan (lambda (c) (list c `(cdr ,c))) curs))))
                         (:br ,top)
                         (:label ,end))))
-                   ((some every notany notevery)
+                   ((some every notany notevery map-nil)
                     (let* ((c (car curs))
                            (ckey (cdr (assoc c vars)))
                            (s (gensym "MAPS"))
@@ -775,11 +833,13 @@
                                ;; The call on one element, and the branch out of
                                ;; the loop when it decides the answer.
                                (let ((call (list (car call) elt)))
-                                 (if (eq op 'some)
-                                     `(,@(%compile-statements `((setq ,r ,call)))
-                                       ,@(compile-boolean-branch r done t))
-                                     (compile-boolean-branch
-                                      call hit (eq op 'notany))))))
+                                 (case op
+                                   (some
+                                    `(,@(%compile-statements `((setq ,r ,call)))
+                                      ,@(compile-boolean-branch r done t)))
+                                   (map-nil (%compile-statements (list call)))
+                                   (t (compile-boolean-branch
+                                       call hit (eq op 'notany)))))))
                         (push `(:declare-local ,nkey "Int64") decls)
                         `((:ldloc ,ckey) (:stloc ,skey)
                           ,@(compile-boolean-branch `(listp ,s) vec nil)
@@ -802,7 +862,7 @@
                           ,@(step `(aref ,s ,i))
                           (:ldloc ,ikey) (:ldc-i8 1) (:add) (:stloc ,ikey)
                           (:br ,vtop)
-                          ,@(unless (eq op 'some)
+                          ,@(unless (member op '(some map-nil))
                               `((:label ,hit)
                                 ,@(if (eq op 'notevery) (emit-t) (emit-nil))
                                 (:stloc ,rkey)
@@ -946,6 +1006,193 @@
                (compile-binary-call (list (first args) (second args)) "Runtime.MemberEq"))
               ((cddr args) (compile-named-call 'member args))
               (t (compile-binary-call args "Runtime.Member" "MEMBER"))))))
+
+;;; POSITION / FIND on a literal simple string read a table built here.
+
+(defun %position-literal-string (form)
+  "The simple string FORM evaluates to at compile time, or NIL."
+  (let ((form (fold-constant-symbol form)))
+    (flet ((simple (s) (and (stringp s) (typep s 'simple-string) s)))
+      (cond
+        ((stringp form) (simple form))
+        ((and (consp form) (eq (car form) 'quote)
+              (consp (cdr form)) (null (cddr form)))
+         (simple (cadr form)))
+        ((and (consp form) (eq (car form) 'the)
+              (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+         (%position-literal-string (caddr form)))
+        ((and (symbolp form) form (not (eq form t)) (not (keywordp form))
+              (not (local-function-entry form))
+              (not (nth-value 1 (lookup-symbol-macro form)))
+              (constantp form) (boundp form))
+         (simple (symbol-value form)))
+        (t nil)))))
+
+(defun %position-const-value (form)
+  "FORM's constant value at compile time, or NIL and NIL."
+  (let ((form (fold-constant-symbol form)))
+    (cond
+      ((or (null form) (eq form t) (keywordp form)
+           (and (atom form) (not (symbolp form))))
+       (values form t))
+      ((and (consp form) (eq (car form) 'quote)
+            (consp (cdr form)) (null (cddr form)))
+       (values (cadr form) t))
+      ((and (symbolp form) form (not (eq form t)) (not (keywordp form))
+            (not (local-function-entry form))
+            (not (nth-value 1 (lookup-symbol-macro form)))
+            (constantp form) (boundp form))
+       (values (symbol-value form) t))
+      (t
+       (let ((v (%const-index-value form)))
+         (if (integerp v) (values v t) (values nil nil)))))))
+
+(defun %position-test-kind (form)
+  "1 for EQL, 2 for CHAR=, 3 for CHAR-EQUAL; NIL for any other test designator."
+  (let ((name (cond
+                ((and (consp form) (eq (car form) 'function)
+                      (consp (cdr form)) (null (cddr form)))
+                 (cadr form))
+                ((and (consp form) (eq (car form) 'quote)
+                      (consp (cdr form)) (null (cddr form)))
+                 (cadr form)))))
+    (when (and (symbolp name) name
+               (not (local-function-entry name))
+               (not (macrolet-shadowed-p name)))
+      (case name
+        (eql 1)
+        (char= 2)
+        (char-equal 3)))))
+
+(defun %parse-literal-position-args (args)
+  "ARGS as (ITEM SEQ STRING TEST START END FROM-END), or NIL."
+  (when (and (consp args) (consp (cdr args)))
+    (let ((item (first args))
+          (seq (second args))
+          (keys (cddr args))
+          (str (%position-literal-string (second args))))
+      (when (and str (evenp (length keys)))
+        (let ((test 0) (start 0) (end nil) (from-end nil) (ok t)
+              (have-test nil) (have-start nil) (have-end nil) (have-from-end nil))
+          (loop for tail on keys by #'cddr
+                for k = (first tail)
+                for v = (second tail)
+                do (let ((key (and (keywordp k) (symbol-name k))))
+                     (cond
+                       ((equal key "TEST")
+                        (when have-test (setq ok nil))
+                        (setq have-test t)
+                        (let ((kind (%position-test-kind v)))
+                          (if kind (setq test kind) (setq ok nil))))
+                       ((equal key "START")
+                        (when have-start (setq ok nil))
+                        (setq have-start t)
+                        (multiple-value-bind (val constp) (%position-const-value v)
+                          (if (and constp (integerp val))
+                              (setq start val)
+                              (setq ok nil))))
+                       ((equal key "END")
+                        (when have-end (setq ok nil))
+                        (setq have-end t)
+                        (multiple-value-bind (val constp) (%position-const-value v)
+                          (cond ((not constp) (setq ok nil))
+                                ((null val))
+                                ((integerp val) (setq end val))
+                                (t (setq ok nil)))))
+                       ((equal key "FROM-END")
+                        (when have-from-end (setq ok nil))
+                        (setq have-from-end t)
+                        (multiple-value-bind (val constp) (%position-const-value v)
+                          (if constp
+                              (setq from-end (not (null val)))
+                              (setq ok nil))))
+                       (t (setq ok nil)))))
+          (let* ((len (length str))
+                 (end* (or end len)))
+            (when (and ok
+                       (<= 0 start len)
+                       (<= start end* len)
+                       (< len #xD800))
+              (values item seq str test start end* from-end))))))))
+
+(defun %literal-string-table (str test start end from-end)
+  "A table: entry C is 1 + the index POSITION / FIND answer for C, or NUL."
+  (let* ((limit (if (= test 3)
+                    (max 256
+                         (1+ (or (loop for i from start below end
+                                       maximize (max (char-code (char str i))
+                                                     (char-code (char-upcase (char str i)))
+                                                     (char-code (char-downcase (char str i)))))
+                                 0)))
+                    (max 1
+                         (1+ (or (loop for i from start below end
+                                       maximize (char-code (char str i)))
+                                 0))))))
+    (when (<= limit 4096)
+      (let ((table (make-string limit :initial-element (code-char 0))))
+        (labels ((put (code value)
+                 (when (and (< code limit)
+                            (zerop (char-code (char table code))))
+                   (setf (char table code) value)))
+               (fill-one (i)
+                 (let ((value (code-char (1+ i))))
+                   (if (= test 3)
+                       (loop for code below limit
+                             when (char-equal (code-char code) (char str i))
+                               do (put code value))
+                       (put (char-code (char str i)) value)))))
+          (if from-end
+              (loop for i downfrom (1- end) to start do (fill-one i))
+              (loop for i from start below end do (fill-one i))))
+        table))))
+
+(defun %compile-literal-position-find (expr op)
+  "Instructions for EXPR when it is POSITION / FIND on a literal string, else NIL."
+  (unless *cross-compiling*
+    (multiple-value-bind (item seq str test start end from-end)
+        (%parse-literal-position-args (cdr expr))
+      (when str
+        (let ((table (%literal-string-table str test start end from-end)))
+          (when table
+            (let ((item-tmp (gen-local "POSITEM"))
+                  (seq-tmp (gen-local "POSSEQ")))
+              `((:declare-local ,item-tmp "LispObject")
+                ,@(compile-value-arg item) (:stloc ,item-tmp)
+                (:declare-local ,seq-tmp "LispObject")
+                ,@(compile-value-arg seq) (:stloc ,seq-tmp)
+                (:ldloc ,item-tmp)
+                (:ldloc ,seq-tmp)
+                ,@(compile-quoted table)
+                (:castclass "LispString")
+                (:ldc-i4 ,test)
+                (:ldc-i4 ,start)
+                (:ldc-i4 ,end)
+                (:ldc-i4 ,(if from-end 1 0))
+                (:call ,(if (eq op 'position)
+                            "Runtime.PositionLiteralString"
+                            "Runtime.FindLiteralString"))))))))))
+
+  (dolist (op '(position find))
+    (let ((op op))
+      (setf (gethash op h)
+            (lambda (expr)
+              (or (%compile-literal-position-find expr op)
+                  (let* ((args (cdr expr))
+                         (tf (and (= (length args) 4) (eq (third args) :test) (fourth args)))
+                         (test (and (consp tf) (eq (car tf) 'function) (consp (cdr tf)) (null (cddr tf))
+                                    (not (local-function-entry (cadr tf)))
+                                    (case (cadr tf)
+                                      (eql "Eql")
+                                      (equal "Equal")
+                                      (equalp "Equalp")
+                                      (char= "CharEq")
+                                      (char-equal "CharEqual")))))
+                    (if test
+                        (compile-binary-call (list (first args) (second args))
+                                             (concatenate 'string "Runtime."
+                                                          (if (eq op 'position) "Position" "Find")
+                                                          test))
+                        (compile-named-call op args))))))))
   (setf (gethash 'assoc h)
         (lambda (expr)
           (let ((n-args (length (cdr expr))) (args (cdr expr)))
@@ -1056,6 +1303,23 @@
           `(,@(compile-args-array (cdr expr))
             (:call "Runtime.LispErrorFormat"))))
 
+  ;; (%xref-scope 'name form): FORM's calls and variable uses are recorded for
+  ;; NAME, as a DEFUN body's are for the function. Evaluated, it is FORM.
+  (setf (gethash '%xref-scope h)
+        (lambda (expr)
+          (let ((key (second (second expr)))
+                (form (third expr)))
+            (if (or *cross-compiling* *xref-sink* (not *record-xref*))
+                (compile-expr form)
+                (let* ((*xref-caller* key)
+                       (*xref-top-level-conses* nil)
+                       (*xref-walked* nil)
+                       (*xref-edges* '())
+                       (*xref-uses* '())
+                       (instrs (compile-expr form))
+                       (note (xref-note-instrs)))
+                  (if note (append note instrs) instrs))))))
+
   ;; locally: preserves top-level-ness (uses *compile-was-toplevel*)
   (setf (gethash 'locally h)
         (lambda (expr)
@@ -1080,7 +1344,14 @@
                  (clauses (cddr expr))
                  (no-error-clause (find :no-error clauses :key #'car))
                  (error-clauses (remove :no-error clauses :key #'car)))
-            (if no-error-clause
+            (cond
+              ;; Nothing to handle: the form cannot signal.
+              ((and (null no-error-clause) (%no-signal-form-p body-form))
+               (dolist (c clauses)
+                 (when (and (consp c) (consp (cdr c)) (cadr c))
+                   (check-binding-name (car (cadr c)) "HANDLER-CASE")))
+               (compile-expr body-form))
+              (no-error-clause
                 (let* ((ne-lambda-list (cadr no-error-clause))
                        (ne-body (cddr no-error-clause))
                        (block-tag (gensym "HC-NO-ERROR"))
@@ -1095,8 +1366,8 @@
                   (compile-expr
                    `(block ,block-tag
                       (multiple-value-call (lambda ,ne-lambda-list ,@ne-body)
-                        (handler-case ,body-form ,@wrapped-clauses)))))
-                (compile-handler-case body-form clauses)))))
+                        (handler-case ,body-form ,@wrapped-clauses))))))
+              (t (compile-handler-case body-form clauses))))))
   (setf (gethash 'handler-bind h) (lambda (expr) (compile-handler-bind (cadr expr) (cddr expr))))
 
   ;; restart-case / restart-bind / invoke-restart / find-restart / compute-restarts
@@ -1148,14 +1419,25 @@
         (lambda (expr)
           (let ((name-tmp (gen-local "MKSNAME")) (slots-tmp (gen-local "MKSSLOTS"))
                 (raw-plan (%make-struct-raw-plan expr)))
-           (if raw-plan
-            (%compile-make-struct-raw expr raw-plan)
-            `((:declare-local ,name-tmp "LispObject")
-              (:declare-local ,slots-tmp "LispObject[]")
-              ,@(compile-value-arg (cadr expr)) (:stloc ,name-tmp)
-              ,@(compile-args-array (cddr expr)) (:stloc ,slots-tmp)
-              (:ldloc ,name-tmp) (:ldloc ,slots-tmp)
-              (:call "Runtime.MakeStruct"))))))
+           (cond
+            (raw-plan (%compile-make-struct-raw expr raw-plan))
+            ((<= 1 (length (cddr expr)) 4)
+             (let ((tmps (loop repeat (length (cddr expr)) collect (gen-local "MKSV"))))
+               `((:declare-local ,name-tmp "LispObject")
+                 ,@(compile-value-arg (cadr expr)) (:stloc ,name-tmp)
+                 ,@(loop for v in (cddr expr) for tmp in tmps
+                         append `((:declare-local ,tmp "LispObject")
+                                  ,@(compile-value-arg v) (:stloc ,tmp)))
+                 (:ldloc ,name-tmp)
+                 ,@(loop for tmp in tmps collect `(:ldloc ,tmp))
+                 (:call ,(format nil "Runtime.MakeStruct~D" (length tmps))))))
+            (t
+             `((:declare-local ,name-tmp "LispObject")
+               (:declare-local ,slots-tmp "LispObject[]")
+               ,@(compile-value-arg (cadr expr)) (:stloc ,name-tmp)
+               ,@(compile-args-array (cddr expr)) (:stloc ,slots-tmp)
+               (:ldloc ,name-tmp) (:ldloc ,slots-tmp)
+               (:call "Runtime.MakeStruct")))))))
   ;; (%check-slot-type VALUE TYPE STRUCT SLOT) -- the declared type of a
   ;; structure slot, checked where the value is stored. Compiles to just the
   ;; value under (safety 0): a violated declaration is undefined (CLHS 3.3.1),
@@ -1268,7 +1550,8 @@
   (setf (gethash '%struct-set h)
         (lambda (expr)
           (let ((obj (first (cdr expr))) (idx (second (cdr expr))) (val (third (cdr expr)))
-                (type (%struct-check-name (fifth expr))))
+                (type (%struct-check-name (fifth expr)))
+                (owner (%struct-owner-name (fifth expr))))
             (if (integerp idx)
                 (if (and (double-float-typed-p val) (not (fixnum-typed-p val)))
                     ;; A double-typed value into a slot whose storage is a raw
@@ -1287,7 +1570,7 @@
                             (:ldc-i4 ,idx)
                             ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                                 (compile-as-double val))
-                            (:call "Runtime.StructSetD")
+                            ,@(%raw-struct-call "Runtime.StructSetD" owner)
                             (:newobj "DoubleFloat"))))
                 (if (and (single-float-typed-p val) (not (fixnum-typed-p val)))
                     ;; A single-typed value: StructSetF stores its bits into a
@@ -1305,13 +1588,13 @@
                             (:ldc-i4 ,idx)
                             ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                                 (compile-as-single val))
-                            (:call "Runtime.StructSetF")
+                            ,@(%raw-struct-call "Runtime.StructSetF" owner)
                             (:newobj "SingleFloat"))))
                 (if (u64-native-local-p val)
                     `(,@(compile-struct-object obj type)
                       (:ldc-i4 ,idx)
                       (:ldloc ,(u64-native-local-p val))
-                      (:call "Runtime.StructSetU64")
+                      ,@(%raw-struct-call "Runtime.StructSetU64" owner)
                       (:call "Runtime.BoxU64"))
                 (if (fixnum-typed-p val)
                     ;; Fixnum value: store the raw long. The box the ordinary path
@@ -1330,7 +1613,7 @@
                             (:ldc-i4 ,idx)
                             ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                                 (compile-as-long val))
-                            (:call "Runtime.StructSetL")
+                            ,@(%raw-struct-call "Runtime.StructSetL" owner)
                             (:call "Fixnum.Make"))))
                 `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                       (compile-expr obj))
@@ -1338,7 +1621,11 @@
                   ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                       (compile-expr val))
                   ,@(if type
-                        `(,@(compile-quoted type) (:call "Runtime.StructSetIT"))
+                        (let ((mask (%struct-known-mask type)))
+                          (if mask
+                              `(,@(compile-quoted type) (:ldc-i4 ,mask)
+                                (:call "Runtime.StructSetITMasked"))
+                              `(,@(compile-quoted type) (:call "Runtime.StructSetIT"))))
                         '((:call "Runtime.StructSetI"))))))))
                 `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                       `(,@(compile-value-arg obj)
@@ -1673,7 +1960,7 @@
   (setf (gethash 'expt h)
         (lambda (expr)
           (if (= (length (cdr expr)) 2)
-              (compile-binary-call (cdr expr) "Runtime.Expt")
+              (compile-binary-call (cdr expr) (%overflow-entry "Runtime.Expt"))
               (compile-named-call 'expt (cdr expr)))))
   (setf (gethash 'ash h)
         (lambda (expr)
@@ -2082,7 +2369,7 @@
               ;; keep the order of elements the predicate calls equal.
               (compile-binary-call (cdr expr) "Runtime.StableSort"))))
   (setf (gethash 'reverse h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.Reverse" "REVERSE")))
-  (setf (gethash 'coerce h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.Coerce")))
+  (setf (gethash 'coerce h) (lambda (expr) (compile-binary-call (cdr expr) (%overflow-entry "Runtime.Coerce"))))
 
   ;; (APPLY f a b ... list). One or two fixed arguments ahead of the list go to a
   ;; runtime entry that takes them positionally. The general rewrite below conses a
@@ -2107,7 +2394,28 @@
             (if mode
                 (append (butlast code) mode (last code))
                 code)))))
-  (setf (gethash 'maphash h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.Maphash")))
+  (setf (gethash 'maphash h)
+        (lambda (expr)
+          (let ((opened (%maphash-lambda-expansion (cdr expr))))
+            (if opened
+                (compile-expr opened)
+                (compile-binary-call (cdr expr) "Runtime.Maphash")))))
+  (setf (gethash '%hash-walk-begin h)
+        (lambda (expr) (compile-unary-call (cdr expr) "Runtime.HashWalkBegin")))
+  (setf (gethash '%hash-walk-next h)
+        (lambda (expr) (compile-unary-call (cdr expr) "Runtime.HashWalkNext")))
+  (setf (gethash '%hash-walk-key h)
+        (lambda (expr) (compile-unary-call (cdr expr) "Runtime.HashWalkKey")))
+  (setf (gethash '%hash-walk-value h)
+        (lambda (expr) (compile-unary-call (cdr expr) "Runtime.HashWalkValue")))
+  (setf (gethash '%hash-walk-end h)
+        (lambda (expr) (compile-unary-call (cdr expr) "Runtime.HashWalkEnd")))
+  (setf (gethash 'map h)
+        (lambda (expr)
+          (let ((opened (%map-nil-lambda-expansion (cdr expr))))
+            (if opened
+                (compile-expr opened)
+                (compile-named-call (car expr) (cdr expr))))))
   ;; A literal LAMBDA opens into a loop (%MAP-LAMBDA-EXPANSION).
   (setf (gethash '%map-open h) #'compile-%map-open)
   (dolist (op '(mapc mapcan some every notany notevery))
@@ -2204,7 +2512,7 @@
               ;; (keeps SYNCHRONIZED handling in the registered LispFunction)
               (has-other-kw
                (compile-named-call 'make-hash-table (cdr expr)))
-              (test-expr
+              (test-only
                (let ((literal-name
                       (cond
                         ((and (consp test-expr) (eq (car test-expr) 'function)) (symbol-name (cadr test-expr)))
@@ -2423,8 +2731,10 @@
   (setf (gethash 'define-symbol-macro h)
         (lambda (expr)
           (let ((name (cadr expr)) (expansion (caddr expr)))
-            (setf (gethash name *global-symbol-macros*) expansion)
-            (incf *global-symbol-macros-epoch*)
+            ;; Only a top-level defining macro has a compile-time effect (CLHS 3.2.3.1.1).
+            (when *compile-was-toplevel*
+              (setf (gethash name *global-symbol-macros*) expansion)
+              (incf *global-symbol-macros-epoch*))
             (compile-expr `(%register-symbol-macro-rt ',name ',expansion)))))
   (dolist (sym '(defvar defparameter defconstant))
     (let ((sym sym))
@@ -2457,7 +2767,10 @@
             (cond
               ((and (fixnum-typed-p expr)
                     (checked-long-arith-p form)
-                    (not (fixnum-arith-unboxed-safe-p form)))
+                    (not (fixnum-arith-unboxed-safe-p form))
+                    ;; FLOOR/TRUNCATE also answer a remainder; the native lane has only the quotient.
+                    (or (not (member (car (fold-nary-arith form)) '(floor truncate)))
+                        (and (not *in-mv-context*) (not *in-tail-position*))))
                `(,@(if (compiling-at-safety-0-p)
                        (compile-as-long form)
                        (compile-checked-long-arith form))
@@ -2470,6 +2783,23 @@
               ;; declared double computation pays for a square root.
               ((and (double-float-typed-p expr) (double-sqrt-form-p form))
                `(,@(compile-as-double form) (:newobj "DoubleFloat")))
+              ((and (not (compiling-at-safety-0-p))
+                    (%the-checked-array-type-p (cadr expr))
+                    (not (%the-array-proven-p form (cadr expr))))
+               ;; LAST is the array that passed here last; the call takes it by
+               ;; reference so it stays in memory, not in a register a loop needs.
+               ;; The form keeps its values: the check reads the primary one.
+               (let ((v (gen-local "THEV")) (last (gen-local "THEOK")) (ok (gen-label "THEOK"))
+                     (code (let ((*in-mv-context* (or *in-mv-context* *in-tail-position*))
+                                 (*in-tail-position* nil)
+                                 (*mv-expect-args* (%mv-expect-for expr form)))
+                             (compile-expr form))))
+                 `((:declare-local ,v "LispObject") (:declare-local ,last "LispObject")
+                   ,@code (:stloc ,v)
+                   ,@(when (%the-array-check-cacheable-p (cadr expr))
+                       `((:ldloc ,v) (:ldloc ,last) (:beq ,ok)))
+                   (:ldloc ,v) ,@(%the-array-check-instrs (cadr expr) last)
+                   (:label ,ok) (:ldloc ,v))))
               (t (let ((*mv-expect-args* (%mv-expect-for expr form)))
                    (compile-expr form)))))))
   (setf (gethash 'load-time-value h)
@@ -2494,7 +2824,8 @@
               ;; reads the slot once and keeps it in a field of the loaded fasl.
               ((and mod-id *ltv-hoisted*)
                (push `(%set-ltv-slot-in ,mod-id ,ltv-id ,(cadr expr)) (car *ltv-hoisted*))
-               `((:load-const-cached ,(compile-expr `(%get-ltv-slot-in ,mod-id ,ltv-id)))))
+               `((:load-const-cached ,(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                                        (compile-expr `(%get-ltv-slot-in ,mod-id ,ltv-id))))))
               (mod-id
                 ;; Per-module namespaced LTV: prevents cross-run slot ID collisions
                 (compile-expr `(if (%has-ltv-slot-in ,mod-id ,ltv-id)

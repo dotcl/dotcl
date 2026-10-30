@@ -108,3 +108,23 @@
 (deftest-compiled-only apply-consing.spread-costs-only-the-result
   (< (bytes-per-op #'%ac-spread) 130)
   t)
+
+;;; APPLY without its argument list is a safe call with too few arguments
+;;; (CLHS 3.5.1.2), a PROGRAM-ERROR. The tree-walk interpreter's Lisp APPLY
+;;; used to take the missing list as NIL and answer (APPLY #'+)=0 and
+;;; (APPLY #'LIST)=NIL instead.
+(defun %ac-eval-apply (mode form)
+  (let ((dotcl:*evaluator-mode* mode))
+    (handler-case (eval form)
+      (program-error () :program-error)
+      (error (e) (list :other (type-of e))))))
+
+(deftest apply-consing.one-argument-compiled
+  (list (%ac-eval-apply :compile '(apply #'+))
+        (%ac-eval-apply :compile '(apply #'list)))
+  (:program-error :program-error))
+
+(deftest apply-consing.one-argument-interpreted
+  (list (%ac-eval-apply :interpret '(apply #'+))
+        (%ac-eval-apply :interpret '(apply #'list)))
+  (:program-error :program-error))

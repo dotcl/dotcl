@@ -18,7 +18,7 @@ dotcl exits when the file has been read, so a script does not need to say so.
 `dotcl:script-arguments` is the list of what came after the file name:
 
 ```console
-$ dotcl greet.lisp world twice
+$ dotcl greet.lisp world 2
 ```
 
 ```lisp

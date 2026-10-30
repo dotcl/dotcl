@@ -98,13 +98,13 @@ public static partial class SimdTable
         string n = SimdInfo.Name(k);
         string aref = n + "-AREF", rm = n + "-ROW-MAJOR-AREF";
 
-        Def(t, aref, -1, a =>
+        Def(t, aref, -1, "ARRAY &REST SUBSCRIPTS", a =>
         {
             if (a.Length < 2) throw ArgCount(aref, a.Length, "at least 2");
             var v = ArrayArg(k, a[0], aref);
             return LoadLanes(k, v, FirstLane(k, aref, v, a, 1, a.Length - 1), aref);
         });
-        Def(t, rm, 2, a =>
+        Def(t, rm, 2, "ARRAY INDEX", a =>
         {
             var v = ArrayArg(k, a[0], rm);
             long total = TotalSize(v);
@@ -115,7 +115,7 @@ public static partial class SimdTable
         });
 
         string setAref = "(SETF " + aref + ")", setRm = "(SETF " + rm + ")";
-        Def(t, setAref, -1, a =>
+        Def(t, setAref, -1, "NEW-VALUE ARRAY &REST SUBSCRIPTS", a =>
         {
             if (a.Length < 3) throw ArgCount(setAref, a.Length, "at least 3");
             var p = SimdInfo.Cast(k, a[0], setAref);
@@ -123,7 +123,7 @@ public static partial class SimdTable
             StoreLanes(k, v, FirstLane(k, setAref, v, a, 2, a.Length - 2), p);
             return p;
         });
-        Def(t, setRm, 3, a =>
+        Def(t, setRm, 3, "NEW-VALUE ARRAY INDEX", a =>
         {
             var p = SimdInfo.Cast(k, a[0], setRm);
             var v = ArrayArg(k, a[1], setRm);

@@ -548,7 +548,8 @@
    null test alone. In the slow copy a structure access keeps its per-access
    test, because the copy is taken when ANY buffer was missing, not
    necessarily that one."
-  (let* ((entries (remove-if (lambda (e) (or (backing-entry-dims e)
+  (let* ((entries (remove-if (lambda (e) (or (and (backing-entry-dims e)
+                                                  (not (eq (sixth e) :maybe)))
                                              (%backing-never-declines-p e)
                                              (eq (tenth e) :never-null)))
                              entries))
@@ -572,11 +573,12 @@
                         ,@(loop for e in struct-entries
                                 append `((:ldloc ,(struct-backing-slot e))
                                          (:brfalse ,slow)
-                                         (:ldloc ,(struct-backing-slot e))
-                                         (:ldlen)
-                                         (:conv-i4)
-                                         (:ldc-i4 ,(%struct-backing-length e))
-                                         (:blt ,slow)))))
+                                         ,@(unless (struct-backing-inline-count e)
+                                             `((:ldloc ,(struct-backing-slot e))
+                                               (:ldlen)
+                                               (:conv-i4)
+                                               (:ldc-i4 ,(%struct-backing-length e))
+                                               (:blt ,slow)))))))
                (fast (let ((*backing-arm* (if arrays :fast *backing-arm*))
                            (*array-backing-tested*
                              (if arrays
@@ -619,7 +621,11 @@
         for kind = (fourth e)
         for dims = (backing-entry-dims e)
         unless (%raw-array-entry-p e)
-        append `((:declare-local ,(third e) ,(%backing-slot-type kind))
+        append `(,@(when (nth 11 e)
+                     `((:ldloc ,(second e))
+                       (:load-const ,(nth 11 e))
+                       (:call "Runtime.CheckArgType")))
+                 (:declare-local ,(third e) ,(%backing-slot-type kind))
                  ,@(cond
                      ((second e) `((:ldloc ,(second e))))
                      ((nth 10 e)
@@ -631,6 +637,14 @@
                      (t (let ((*in-tail-position* nil) (*in-mv-context* nil))
                           (compile-expr (ninth e)))))
                  ,@(cond
+                     ((eq (sixth e) :maybe)
+                      `((:ldc-i4 ,(max 1 (length dims)))
+                        (:ldc-i4 ,(or (fifth e) 0))
+                        (:call ,(ecase kind
+                                  (1 "Runtime.BackingIfU8") (2 "Runtime.BackingIfU16")
+                                  (3 "Runtime.BackingIfI32") (4 "Runtime.BackingIfI64")
+                                  (:u64 "Runtime.BackingIfU64")
+                                  (:f64 "Runtime.BackingIfF64") (:f32 "Runtime.BackingIfF32")))))
                      (dims
                       `((:ldc-i4 ,(length dims))
                         ,@(loop for k below 3
@@ -1001,13 +1015,12 @@
     ;; (values x) where only the primary value is taken, nothing reads what is published.
     ((and (null (cdr args)) (null *in-mv-context*) (null *in-tail-position*))
      (compile-for-single-value (car args)))
-    ;; (values x) is "the primary value of x, published as the only value", which
-    ;; is exactly what MULTIPLEVALUES.PRIMARY does -- and it publishes through a
-    ;; per-thread cached array, so nothing is allocated. Going through the general
-    ;; entry built a LispObject[1] the callee then threw away, 32 bytes a call.
+    ;; (values x) is "the primary value of x as the only value": the channel's
+    ;; "nobody published" state, which every reader takes as one value, the
+    ;; returned one.
     ((null (cdr args))
      `(,@(let ((*in-mv-context* t)) (compile-expr (car args)))
-       (:call "MultipleValues.Primary")))
+       (:call "MultipleValues.PrimaryAlone")))
     ;; In a tail position with a value mode (the tail of a body whose caller
     ;; passed one, or the form of a capture in this body): the values in the
     ;; form the mode names, without an MvReturn (MultipleValues.ValuesNMode).

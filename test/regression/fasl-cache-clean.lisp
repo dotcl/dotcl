@@ -52,13 +52,19 @@
 
 (defun %fcc-run (root args)
   "Run the CLI with XDG_CACHE_HOME pointed at ROOT. Returns (exit stdout stderr)."
-  (let ((saved (dotcl:getenv "XDG_CACHE_HOME")))
+  (let ((saved (dotcl:getenv "XDG_CACHE_HOME"))
+        (saved-no-jit (dotcl:getenv "DOTCL_NO_JIT_PROFILE")))
     (unwind-protect
          ;; Forward slashes on both platforms: .NET accepts them on Windows, and
          ;; converting would break the POSIX path.
          (progn (dotcl:setenv "XDG_CACHE_HOME" root)
+                ;; The child must record a profile, whatever the caller's environment.
+                (dotcl:unsetenv "DOTCL_NO_JIT_PROFILE")
                 (dotcl:run-process *fcc-exe* args))
-      (dotcl:setenv "XDG_CACHE_HOME" (or saved "")))))
+      (dotcl:setenv "XDG_CACHE_HOME" (or saved ""))
+      (if saved-no-jit
+          (dotcl:setenv "DOTCL_NO_JIT_PROFILE" saved-no-jit)
+          (dotcl:unsetenv "DOTCL_NO_JIT_PROFILE")))))
 
 (defun %fcc-survivors (cl-dir)
   "What is left under CL-DIR that clean must never touch: the other

@@ -35,7 +35,11 @@
     ;; The loop a mapping function with a literal lambda opens into. Only the
     ;; compiler's own MAPCAR / SOME / ... handlers make it, and compile it at
     ;; once; no macro expands into it.
-    "%MAP-OPEN")
+    "%MAP-OPEN"
+    ;; The steps of a MAPHASH opened the same way, made and compiled by the
+    ;; compiler's MAPHASH handler only.
+    "%HASH-WALK-BEGIN" "%HASH-WALK-NEXT" "%HASH-WALK-KEY" "%HASH-WALK-VALUE"
+    "%HASH-WALK-END")
   "Intrinsics that must NOT have a function binding, with the reason each.")
 
 (defun %ifb-handler-table ()

@@ -31,5 +31,9 @@
 
   "magicl": "Does not load: `magicl/ext-blas` expands `with-array-pointers`, which signals an error on an implementation it has no branch for, and the expansion error makes the compile of `blas-cffi` fail. With a dotcl branch there the system loads and the tests get as far as on SBCL, which stops in the LAPACK examples on `zuncsd_`, a routine the measuring machine's LAPACK does not export.",
 
-  "coalton": "The released Coalton (2026-01-01) implements its hashing only for SBCL, Allegro and CCL and stops with `#.(error ...)` elsewhere, so it does not load. Coalton's upstream main supports dotcl, and the with forks column is measured from it: it loads in 51 seconds and its suite passes (698 checks), but building the test system takes 201 seconds and running the suite 481 (SBCL 2.6.8 on the same machine: 20, 70 and 53 seconds, with 757 checks including the thread tests dotcl does not run)."
+  "coalton": "The released Coalton (2026-01-01) implements its hashing only for SBCL, Allegro and CCL and stops with `#.(error ...)` elsewhere, so it does not load. Coalton's upstream main supports dotcl, and the with forks column is measured from it: it loads in 51 seconds and its suite passes (698 checks), but building the test system takes 201 seconds and running the suite 481 (SBCL 2.6.8 on the same machine: 20, 70 and 53 seconds, with 757 checks including the thread tests dotcl does not run).",
+
+  "with-user-abort": "Does not load: the parent of `user-abort` is chosen by `#+sbcl`, `#+ccl`, ... conditionals with no dotcl branch, so the parent list is `(nil)` and `define-condition` rejects it, as SBCL does without its branch. Earlier dotcl accepted it and defined a `user-abort` that was not a condition.",
+
+  "sqlite": "Flaky: the suite is sensitive to a lock conflict (`SQLITE_BUSY`) between threads inserting at the same time, so it varies between runs. Three measurements gave pass 2, fail 1."
 }

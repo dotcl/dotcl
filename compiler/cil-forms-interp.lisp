@@ -609,9 +609,33 @@
   nil)
 
 (defparameter +arg-check-calls+
-  '((list . "Runtime.CheckArgList") (cons . "Runtime.CheckArgCons")
-    (symbol . "Runtime.CheckArgSymbol") (function . "Runtime.CheckArgFunction")
+  '((symbol . "Runtime.CheckArgSymbol") (function . "Runtime.CheckArgFunction")
     (character . "Runtime.CheckArgCharacter") (integer . "Runtime.CheckArgInteger")))
+
+(defun %arg-check-fail-instrs (var spec)
+  "The failure branch of an open-coded argument check: report SPEC for VAR."
+  `(,@(compile-expr var) ,@(compile-quoted-cached spec)
+    (:call "Runtime.ArgTypeError") (:throw)))
+
+(defun %arg-check-list-instrs (var spec)
+  "NIL or a CONS pass; anything else reaches the TYPE-ERROR branch."
+  (let ((ok (gen-label "ACLOK")))
+    `(,@(compile-expr var) (:isinst "Cons") (:brtrue ,ok)
+      ,@(compile-expr var) ,@(emit-nil) (:beq ,ok)
+      ,@(%arg-check-fail-instrs var spec)
+      (:label ,ok))))
+
+(defun %arg-check-cons-instrs (var spec)
+  (let ((ok (gen-label "ACCOK")))
+    `(,@(compile-expr var) (:isinst "Cons") (:brtrue ,ok)
+      ,@(%arg-check-fail-instrs var spec)
+      (:label ,ok))))
+
+(defun %arg-check-null-instrs (var spec)
+  (let ((ok (gen-label "ACNOK")))
+    `(,@(compile-expr var) ,@(emit-nil) (:beq ,ok)
+      ,@(%arg-check-fail-instrs var spec)
+      (:label ,ok))))
 
 (defun %arg-checked-at-entry-p (var range)
   "True when VAR is a parameter of the typed entry being compiled whose entry
@@ -662,6 +686,9 @@
                ,@(compile-quoted-cached spec) (:call "Runtime.CheckArgSingleRange"))
              `(,@(compile-expr var) (:ldc-r8 ,lo) (:ldc-r8 ,hi)
                ,@(compile-quoted-cached spec) (:call "Runtime.CheckArgDoubleRange")))))
+      ((eq ty 'list) (%arg-check-list-instrs var ty))
+      ((eq ty 'cons) (%arg-check-cons-instrs var ty))
+      ((eq ty 'null) (%arg-check-null-instrs var spec))
       ((and (consp ty) (eq (car ty) 'or) (= (length ty) 3) (member 'null (cdr ty)))
        (let ((ok (gen-label "ACOK"))
              (other (if (eq (second ty) 'null) (third ty) (second ty))))
@@ -686,7 +713,12 @@
          (:ldstr ,(%simple-vector-et-hint ty t)) (:ldc-i4 ,(car (third ty)))
          (:call "Runtime.CheckArgSimpleVectorN")))
       ((and (symbolp ty) (not (eq (symbol-package ty) (find-package "COMMON-LISP"))))
-       `(,@(compile-expr var) ,@(compile-quoted-cached spec) (:call "Runtime.CheckArgStructSym")))
+       (let ((mask (%struct-known-mask ty)))
+         (if mask
+             `(,@(compile-expr var) ,@(compile-quoted-cached spec) (:ldc-i4 ,mask)
+               (:call "Runtime.CheckArgStructSymKnown"))
+             `(,@(compile-expr var) ,@(compile-quoted-cached spec)
+               (:call "Runtime.CheckArgStructSym")))))
       (t `(,@(compile-expr var) ,@(compile-quoted-cached spec) (:call "Runtime.CheckArgType"))))))
 
 (defun %member-symbol-literals (ty)
@@ -730,6 +762,17 @@
             ((symbolp u) (symbol-name u))
             ((and (consp u) (member (car u) '(unsigned-byte signed-byte)) (integerp (second u)))
              (format nil "~a-~d" (symbol-name (car u)) (second u)))))))
+
+(defun %the-array-check-instrs (spec last)
+  "Instructions that check the array on the stack against SPEC, consuming it,
+   and store it in the local LAST."
+  (let* ((parts (%array-type-parts spec))
+         (rank (and parts (first parts) (listp (third parts))
+                    (every (lambda (d) (eq d '*)) (third parts)) (length (third parts))))
+         (et (and rank (not (eq (second parts) '*))
+                  (%simple-vector-et-hint `(simple-array ,(second parts) (*))))))
+    `(,@(compile-quoted-cached spec) (:ldstr ,(or et "")) (:ldc-i4 ,(or rank 0))
+      (:ldloca ,last) (:call "Runtime.CheckTheArray"))))
 
 (defun %check-simple-decl (value spec)
   "The function behind the %CHECK-SIMPLE-DECL intrinsic, for an evaluator that
@@ -1133,6 +1176,14 @@
                    bind))
             ,@(nreverse tag-forms))))))
 
+(defun %mini-defining-form-p (form)
+  "True for the CL defining macros this evaluator handles as special forms."
+  (and (consp form) (symbolp (car form))
+       (member (symbol-name (car form))
+               '("DEFUN" "DEFMACRO" "DEFVAR" "DEFPARAMETER" "DEFCONSTANT")
+               :test #'string=)
+       t))
+
 (defun %mini-eval-handler-bind (form env)
   "Interpret (handler-bind ((type handler-form)...) body...), or the
    (%mini-handler-case-bind ...) form %MINI-EXPAND-HANDLER-CASE builds.
@@ -1195,12 +1246,12 @@
              (if found
                  (%mini-eval sm env)
                  ;; Not lexically bound: a global symbol macro
-                 ;; (define-symbol-macro) expands via macroexpand-1; otherwise
-                 ;; treat as a dynamic/global variable reference.
-                 (multiple-value-bind (exp expandedp) (macroexpand-1 form)
-                   (if expandedp
-                       (%mini-eval exp env)
-                       (symbol-value form))))))))
+                 ;; (define-symbol-macro) expands; otherwise treat as a
+                 ;; dynamic/global variable reference.
+                 (let ((exp (%macroexpand-1-or-self form)))
+                   (if (eq exp form)
+                       (symbol-value form)
+                       (%mini-eval exp env))))))))
     ((consp form)
      ;; A lexical FLET/LABELS binding shadows a GLOBAL MACRO of the same name
      ;; (CLHS 3.1.2.1.2.4). MACROEXPAND-1 cannot see ENV, so expanding first
@@ -1302,23 +1353,25 @@
      ;; the expansion: the SETF family's expanders take no environment, and look
      ;; a place's operator up there ((setf (m x) v) with M a local macro).
      (let ((expanded
-            (if (or *symbol-macros* lex-macros)
-                (let* ((*sm-interp-env* env)
-                       (menv (%mini-macroexpand-env lex-macros env))
-                       (*interp-expansion-macros* lex-macros)
-                       (*interp-expansion-env* menv))
-                  (%macroexpand-1-or-self form menv))
-                ;; No MACROLET or SYMBOL-MACROLET in scope: the expansion is made
-                ;; once per form and kept (%MINI-MACROEXPAND-1-CACHED). Only
-                ;; when a global symbol macro exists and the kept one cannot
-                ;; serve this scope is it made here, with ENV, as before.
-                (let ((kept (%mini-macroexpand-1-cached form)))
-                  (if (eq kept *%mini-expansion-miss*)
-                      (%mini-store-expansion
-                       form
-                       (let ((*sm-interp-env* env))
-                         (%macroexpand-1-or-self form (%mini-macroexpand-env nil env))))
-                      kept)))))
+            (if (%mini-defining-form-p form)
+                form
+                (if (or *symbol-macros* lex-macros)
+                    (let* ((*sm-interp-env* env)
+                           (menv (%mini-macroexpand-env lex-macros env))
+                           (*interp-expansion-macros* lex-macros)
+                           (*interp-expansion-env* menv))
+                      (%macroexpand-1-or-self form menv))
+                    ;; No MACROLET or SYMBOL-MACROLET in scope: the expansion is made
+                    ;; once per form and kept (%MINI-MACROEXPAND-1-CACHED). Only
+                    ;; when a global symbol macro exists and the kept one cannot
+                    ;; serve this scope is it made here, with ENV, as before.
+                    (let ((kept (%mini-macroexpand-1-cached form)))
+                      (if (eq kept *%mini-expansion-miss*)
+                          (%mini-store-expansion
+                           form
+                           (let ((*sm-interp-env* env))
+                             (%macroexpand-1-or-self form (%mini-macroexpand-env nil env))))
+                          kept))))))
        (if (not (eq expanded form))
            (%mini-eval expanded env tailp gop)
            ;; Dispatch on special form operators
@@ -1414,7 +1467,8 @@
                                   (t (multiple-value-bind (sm found) (lookup-symbol-macro var)
                                        (if found
                                            (values sm t)
-                                           (macroexpand-1 var)))))
+                                           (let ((exp (%macroexpand-1-or-self var)))
+                                             (values exp (not (eq exp var))))))))
                           (if smp
                               ;; Hand the whole assignment back to the evaluator as
                               ;; a SETF of the expansion, so the value form is
@@ -1551,9 +1605,12 @@
                 ;; input with a different answer -- a negative, whose root is a
                 ;; COMPLEX -- signals there above SAFETY 0.
                 ;;
+                ;; An array type is checked as the compiler checks it.
+                ;;
                 ;; THE returns all the values of its form (CLHS): the check
                 ;; reads the primary value and the rest pass through.
-                (if (member (cadr form) '(fixnum double-float))
+                (if (or (member (cadr form) '(fixnum double-float))
+                        (%the-checked-array-type-p (cadr form)))
                     (multiple-value-call
                         (lambda (&optional v &rest more)
                           (when (and (not (typep v (cadr form)))
@@ -1807,12 +1864,14 @@
                   (when (stringp doc) (setf (documentation name 'variable) doc))
                   name))
                (defparameter
+                (%check-defvar-syntax form)
                 (let ((name (cadr form)) (doc (cadddr form)))
                   (proclaim (list 'special name))
                   (set name (%mini-eval (caddr form) env))
                   (when (stringp doc) (setf (documentation name 'variable) doc))
                   name))
                (defconstant
+                (%check-defvar-syntax form)
                 ;; SET-SYMBOL-CONSTANT is what makes CONSTANTP answer T; without it
                 ;; a constant defined through EVAL was an ordinary special. That
                 ;; matters beyond introspection: SYMBOL-MACROLET's program-error
@@ -1976,6 +2035,12 @@
                              (%mini-eval (nth 4 form) env)
                              (caddr form)
                              (%mini-eval-args (nthcdr 5 form) env)))
+                    nil)
+                (if (and (symbolp op) (string= (symbol-name op) "%DOTNET-STATIC-DIRECT"))
+                    (return-from %mini-eval
+                      (apply (symbol-function (find-symbol "STATIC" "DOTNET"))
+                             (cadr form) (caddr form)
+                             (%mini-eval-args (nthcdr 4 form) env)))
                     nil)
                 ;; A keyword structure constructor called at (safety 0). The
                 ;; compiler builds such a call at the call site

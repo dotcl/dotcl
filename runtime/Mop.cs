@@ -65,6 +65,8 @@ public static class Mop
             "ENSURE-CLASS", "ENSURE-CLASS-USING-CLASS",
             "ENSURE-GENERIC-FUNCTION-USING-CLASS",
             "FIND-METHOD-COMBINATION", "FUNCALLABLE-STANDARD-INSTANCE-ACCESS",
+            "METHOD-COMBINATION-NAME", "METHOD-COMBINATION-OPTIONS",
+            "METHOD-COMBINATION-TYPE-NAME",
             "GENERIC-FUNCTION-ARGUMENT-PRECEDENCE-ORDER",
             "GENERIC-FUNCTION-DECLARATIONS",
             "MAKE-METHOD-LAMBDA", "MAP-DEPENDENTS",
@@ -211,8 +213,20 @@ public static class Mop
         RegisterMop("GENERIC-FUNCTION-METHOD-COMBINATION", 1, args =>
         {
             if (args[0] is not GenericFunction gf) return Nil.Instance;
-            return gf.MethodCombination is { } sym ? (LispObject)sym : Startup.Sym("STANDARD");
+            var typeName = gf.MethodCombination ?? Startup.Sym("STANDARD");
+            var options = gf.MethodCombinationArgs is { Length: > 0 } given
+                ? Runtime.List(given) : (LispObject)Nil.Instance;
+            return new MethodCombinationObject(typeName, options);
         });
+
+        RegisterMop("METHOD-COMBINATION-NAME", 1, args =>
+            args[0] is MethodCombinationObject mc ? Runtime.CanonicalizeSymbol(mc.TypeName) : Nil.Instance);
+
+        RegisterMop("METHOD-COMBINATION-TYPE-NAME", 1, args =>
+            args[0] is MethodCombinationObject mtc ? Runtime.CanonicalizeSymbol(mtc.TypeName) : Nil.Instance);
+
+        RegisterMop("METHOD-COMBINATION-OPTIONS", 1, args =>
+            args[0] is MethodCombinationObject moc ? moc.Options : Nil.Instance);
 
         RegisterMop("GENERIC-FUNCTION-DECLARATIONS", 1, args =>
             args[0] is GenericFunction gfd ? gfd.Declarations : Nil.Instance);
@@ -517,10 +531,17 @@ public static class Mop
             args =>
         {
             var comb = args[1];
-            // Standard combination is named STANDARD or passed as NIL.
-            if (comb is Symbol cs && cs.Name != "STANDARD" && cs.Name != "NIL")
+            // Standard combination is named STANDARD, passed as NIL, or handed over
+            // as the metaobject GENERIC-FUNCTION-METHOD-COMBINATION returns.
+            var combName = comb switch
+            {
+                MethodCombinationObject mc => mc.TypeName.Name,
+                Symbol cs => cs.Name,
+                _ => "NIL"
+            };
+            if (combName != "STANDARD" && combName != "NIL")
                 throw new LispErrorException(new LispError(
-                    $"COMPUTE-EFFECTIVE-METHOD: only the STANDARD method combination is supported, got {cs.Name}"));
+                    $"COMPUTE-EFFECTIVE-METHOD: only the STANDARD method combination is supported, got {combName}"));
             return Runtime.ComputeEffectiveMethodStandard(args[2]);
         });
 
@@ -538,7 +559,7 @@ public static class Mop
             var rest = new LispObject[args.Length - 1];      // name + initargs
             Array.Copy(args, 1, rest, 0, args.Length - 1);
             return ec.Invoke(rest);
-        });
+        }).WithKeyArgs(2, 2, true, "METACLASS", "DIRECT-SUPERCLASSES", "DIRECT-SLOTS", "DIRECT-DEFAULT-INITARGS");
 
         // ENSURE-GENERIC-FUNCTION-USING-CLASS (gf name &rest initargs): functional core
         // of DEFGENERIC. ENSURE-GENERIC-FUNCTION already reinitializes an existing GF
@@ -553,7 +574,7 @@ public static class Mop
             var rest = new LispObject[args.Length - 1];      // name + initargs
             Array.Copy(args, 1, rest, 0, args.Length - 1);
             return egf.Invoke(rest);
-        });
+        }).WithKeyArgs(2, 2, true, "LAMBDA-LIST", "ARGUMENT-PRECEDENCE-ORDER", "DOCUMENTATION", "GENERIC-FUNCTION-CLASS");
 
         // -- Protocol GFs (extensible via defmethod) ----------------------
         // VALIDATE-SUPERCLASS: default = standard-class/standard-class -> T, else NIL
@@ -632,7 +653,9 @@ public static class Mop
                         cls, Startup.Keyword("NAME"), name,
                         Startup.Keyword("ALLOCATION"), eslot.AllocationKeyword,
                         Startup.Keyword("DOCUMENTATION"), eslot.Documentation });
-                    if (effClass is LispClass ec && !ReferenceEquals(ec, stdEffective))
+                    var ec = effClass as LispClass
+                        ?? (effClass is Symbol effName ? Runtime.FindClassOrNil(effName) as LispClass : null);
+                    if (ec != null && !ReferenceEquals(ec, stdEffective))
                     {
                         eslot.MetaClass = ec;
                         Runtime.InitializeSlotdExtraSlots(eslot, ec, null);
@@ -678,7 +701,7 @@ public static class Mop
         // Method combination options are not supported: dotcl keeps them on the
         // generic function, not in the form, so an options list here cannot be
         // honoured and is rejected rather than silently dropped.
-        RegisterMop("COMPUTE-EFFECTIVE-METHOD-FUNCTION", -1, args =>
+        RegisterMop("COMPUTE-EFFECTIVE-METHOD-FUNCTION", 2, 3, args =>
         {
             var form = args.Length > 1 ? args[1] : Nil.Instance;
             var options = args.Length > 2 ? args[2] : Nil.Instance;
@@ -813,8 +836,7 @@ public static class Mop
             };
         }
 
-        RegisterMop("ENSURE-FINALIZED", -1, args =>                        // (ensure-finalized class &optional errorp)
-            args.Length >= 1 ? args[0] : Nil.Instance);
+        RegisterMop("ENSURE-FINALIZED", 1, 2, args => args[0]);
 
         RegisterMop("CLASSP", 1, args =>
             args[0] is LispClass ? T.Instance : Nil.Instance);
@@ -836,7 +858,7 @@ public static class Mop
         RegisterMop("EXTRACT-SPECIALIZER-NAMES", 1, args =>
             ExtractSpecializerNames(args[0]));
 
-        RegisterMop("REQUIRED-ARGS", -1, args =>
+        RegisterMop("REQUIRED-ARGS", 1, 2, args =>
         {
             // (required-args lambda-list &optional reduce) -> list of required parameter names.
             var ll = args[0];
@@ -1033,10 +1055,16 @@ public static class Mop
         return (instance, index);
     }
 
-    private static void RegisterMop(string name, int arity, Func<LispObject[], LispObject> fn)
+    // ARITY >= 0 is the exact argument count; -1 leaves checking to FN.
+    private static LispFunction RegisterMop(string name, int arity, Func<LispObject[], LispObject> fn)
+        => arity >= 0 ? RegisterMop(name, arity, arity, fn) : RegisterMop(name, -1, -1, fn);
+
+    // MIN..MAX arguments (MAX -1: no upper bound); MIN -1 leaves checking to FN.
+    private static LispFunction RegisterMop(string name, int min, int max, Func<LispObject[], LispObject> fn)
     {
         var fullName = $"DOTCL-MOP:{name}";
-        var lispFn = new LispFunction(fn, fullName, arity);
+        var lispFn = new LispFunction(fn, fullName, min);
+        if (min >= 0) lispFn.WithArgCount(min, max);
         var (sym, _) = MopPkg.Intern(name);
         MopPkg.Export(sym);
         sym.Function = lispFn;
@@ -1046,6 +1074,7 @@ public static class Mop
         // (with the colon in the name) and clobber things via the cross-package
         // bridge. Symbol-based dispatch (compile-named-call -> GetFunctionBySymbol)
         // only needs sym.Function to be set, which is enough.
+        return lispFn;
     }
 
     internal static LispObject BuildLambdaListPlaceholder(
@@ -1095,14 +1124,13 @@ public static class Mop
     private static LispObject ExtractSpecializerNames(LispObject ll)
     {
         var result = new List<LispObject>();
-        var tSym = Startup.Sym("T");
         for (var cur = ll; cur is Cons c; cur = c.Cdr)
         {
             if (c.Car is Symbol s && s.Name.StartsWith("&")) break;
             if (c.Car is Cons spec && spec.Cdr is Cons rest)
                 result.Add(rest.Car);
             else
-                result.Add(tSym);
+                result.Add(T.Instance);
         }
         return Runtime.List(result.ToArray());
     }

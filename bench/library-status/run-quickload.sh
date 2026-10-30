@@ -39,8 +39,11 @@
 set -eu
 
 root="${1:-.}"
-# Note filters (scrub_note), shared with the other stage.
+# Note filters (scrub_note) and the native-library classifier, shared with the
+# other stages.
 . "$(dirname "$0")/scrub.sh"
+. "$(dirname "$0")/native.sh"
+. "$(dirname "$0")/net.sh"
 . "$(dirname "$0")/dists.sh"
 per="${LIBRARY_STATUS_TIMEOUT:-300}"
 retry="${LIBRARY_STATUS_RETRY:-900}"
@@ -174,12 +177,21 @@ DRVEOF
     code=$?
     set -e
   fi
+  # A failed fetch says nothing about the library: try once more after a pause.
+  if [ "$code" -ne 0 ] && [ "$code" -ne 124 ] && net_failure "$log"; then
+    sleep "${LIBRARY_STATUS_NET_PAUSE:-30}"
+    set +e
+    "$timeout" "$per" "$work/lisp" "$work/drv.lisp" > "$log" 2>&1 < /dev/null
+    code=$?
+    set -e
+  fi
   t1=$(now_seconds)
   elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')
 
   release=$(sed -n 's/^LIBSTATUS-RELEASE //p' "$log" | tail -1)
   dist=$(sed -n 's/^LIBSTATUS-DIST //p' "$log" | tail -1)
   note=""
+  native=""
 
   # The debugger banner is checked as well as the exit code: a nested debugger
   # that returns on end-of-input leaves the run looking successful.
@@ -214,13 +226,17 @@ DRVEOF
     [ -n "$note" ] || note=$(grep -a -E '(Unbound variable|Undefined function|Undeclared local|not found|Unhandled exception|[A-Za-z.]+(Error|Exception|Condition)[: ])' "$log" \
              | grep -a -v '^[[:space:]]*at ' | head -1)
     [ -n "$note" ] || note=$(grep -a -v '^[[:space:]]*$' "$log" | tail -1)
+    native=$(native_missing "$log")
+    if net_failure "$log"; then note="$NET_NOTE_PREFIX$note"; fi
   fi
 
   release_json=null
   [ -n "$release" ] && [ "$release" != "?" ] && release_json="\"$(jstr "$release")\""
+  native_json=null
+  [ -n "$native" ] && native_json="\"$(jstr "$native")\""
 
-  printf '  {"system": "%s", "release": %s, "status": "%s", "issue": null, "checked": "%s", "note": "%s", "dists": "%s", "runtime": "%s", "seconds": %s}\n' \
-    "$sys" "$release_json" "$status" "$checked" "$(jstr "${note:-}")" "$dists_desc" "$runtime_desc" "$elapsed" >> "$work/entries"
+  printf '  {"system": "%s", "release": %s, "status": "%s", "issue": null, "checked": "%s", "note": "%s", "native": %s, "dists": "%s", "runtime": "%s", "seconds": %s}\n' \
+    "$sys" "$release_json" "$status" "$checked" "$(jstr "${note:-}")" "$native_json" "$dists_desc" "$runtime_desc" "$elapsed" >> "$work/entries"
   write_json
   ran=$((ran + 1))
 
@@ -234,4 +250,5 @@ echo "run-quickload: $ran systems in $((finished - started))s ($skipped already 
 for s in load-only patched fail; do
   printf '  %-10s %s\n' "$s" "$(grep -c "\"status\": \"$s\"" "$work/entries" || true)"
 done
+printf '  %-10s %s\n' native "$(grep -c '"native": "' "$work/entries" || true)"
 echo "  logs       $logdir"

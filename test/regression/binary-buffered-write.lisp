@@ -60,3 +60,25 @@
            (stream-error () :broken-pipe))
       (ignore-errors (close s))))
   :ok)
+
+;;; The output buffer is made by the first write: a stream only read from (a
+;;; request body in a MemoryStream) does not pay for it.
+(defun %bbin-stream-bytes (ms)
+  (let ((b0 (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread")))
+    (dotnet:to-stream ms :binary t)
+    (- (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread") b0)))
+
+(deftest-compiled-only binary-buffered-write.buffer-only-when-written
+  (let ((ms (dotnet:new "System.IO.MemoryStream")))
+    (%bbin-stream-bytes ms)
+    (< (%bbin-stream-bytes ms) 4096))
+  t)
+
+(deftest binary-buffered-write.lazy-buffer-writes
+  (let* ((ms (dotnet:new "System.IO.MemoryStream"))
+         (s (dotnet:to-stream ms :binary t)))
+    (write-byte 7 s)
+    (write-sequence (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(8 9)) s)
+    (finish-output s)
+    (dotnet:invoke ms "Length"))
+  3)

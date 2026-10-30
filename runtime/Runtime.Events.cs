@@ -34,7 +34,7 @@ internal static class DotNetEvents
 
         var del = MakeDelegate(ev.EventHandlerType!, handler);
         ev.GetAddMethod()!.Invoke(target, new[] { del });
-        return Nil.Instance;
+        return handler;
     }
 
     // (dotnet:remove-event obj "Click" handler)

@@ -5,10 +5,11 @@
 ;;;;
 ;;;;   [{"system": "alexandria",
 ;;;;     "release": "alexandria-20241012-git",
-;;;;     "status": "ok",              ; ok | load-only | patched | fail
+;;;;     "status": "ok",              ; ok | load-only | patched | native | fail
 ;;;;     "issue": 53,                 ; public dotcl/dotcl issue, or null
 ;;;;     "checked": "2026-09-14",
-;;;;     "note": "..."},              ; optional, may be "" or absent
+;;;;     "note": "...",               ; optional, may be "" or absent
+;;;;     "native": "libyaml.dylib"},  ; optional missing native library/header
 ;;;;    ...]
 ;;;;
 ;;;; "note" is a machine field: a check run rewrites it from whatever that run
@@ -277,6 +278,7 @@ for a file written before it was recorded."
   '(("ok" . "loads, and the library's own test suite ran here and passed")
     ("load-only" . "loads; its test suite was not run here, or did not pass (the tests column says which)")
     ("patched" . "loads from the patched release in the dotcl dist overlay")
+    ("native" . "fails to load, or to run its tests, because a native library or header is missing; the row names it, and says when SBCL failed the same way")
     ("fail" . "does not load")
     ("not checked" . "not measured in this run"))
   "The status values a row may carry, in the order they are explained.")
@@ -398,6 +400,168 @@ measure: one that is ok with the dists alone, or whose tree reaches no fork."
 (defvar *sbcl-tests* (make-hash-table :test #'equal)
   "The same suites run on SBCL.")
 
+(defun %split-spaces (string)
+  (let ((words '()) (start nil))
+    (dotimes (i (length string))
+      (if (char= (char string i) #\Space)
+          (when start (push (subseq string start i) words) (setf start nil))
+          (unless start (setf start i))))
+    (when start (push (subseq string start) words))
+    (nreverse words)))
+
+;;; --- missing native libraries ---------------------------------------------
+
+(defun %substring-after (marker string)
+  (let ((at (search marker string :test #'char-equal)))
+    (and at (subseq string (+ at (length marker))))))
+
+(defun %ends-with (suffix string)
+  (let ((start (- (length string) (length suffix))))
+    (and (>= start 0) (string-equal suffix string :start2 start))))
+
+(defun %until-char (char string)
+  (let ((end (position char string)))
+    (if end (subseq string 0 end) string)))
+
+(defun %header-after (text)
+  (let ((tail (%substring-after "fatal error:" text)))
+    (when tail
+      (let ((name (string-trim " " (%until-char #\: tail))))
+        (and (plusp (length name)) name)))))
+
+(defun %file-token (text)
+  "The first C library or header file named in TEXT, without its directory."
+  (loop for word in (%split-spaces text)
+        for token = (string-trim "()[]{}<>\"',;:" word)
+        for base = (subseq token (1+ (or (position #\/ token :from-end t) -1)))
+        when (or (some (lambda (suffix) (%ends-with suffix base))
+                       '(".h" ".hpp" ".so" ".dylib" ".dll"))
+                 (and (search ".so." base) t))
+          return base))
+
+(defun %alternatives (text)
+  "The library named after \"Unable to load any of the alternatives:\"."
+  (let* ((start (position #\( text))
+         (end (and start (position #\) text :from-end t :start (1+ start)))))
+    (when (and start end)
+      (let ((inside (string-trim " " (subseq text (1+ start) end))))
+        (or (let ((tail (%substring-after "(:framework " inside)))
+              (and tail (string-trim " " (%until-char #\) tail))))
+            (let ((tail (%substring-after "(:default " inside)))
+              (and tail (string-trim " " (%until-char #\) tail))))
+            (%file-token inside)
+            (first (%split-spaces inside))
+            inside)))))
+
+(defun %paren-content (text)
+  (let* ((start (position #\( text))
+         (end (and start (position #\) text :start (1+ start)))))
+    (and end (string-trim " " (subseq text (1+ start) end)))))
+
+(defun %native-note-name (note)
+  "The native library or header NOTE says is missing, or NIL."
+  (let* ((text note)
+         (lower (string-downcase note))
+         (alternatives (%substring-after
+                        "unable to load any of the alternatives:" text))
+         (foreign (%substring-after "unable to load foreign library" text))
+         (failed (%substring-after "failed to load " text))
+         (file (%file-token text)))
+    (cond ((search "sb-mpfr failed to load" lower) "libmpfr")
+          ((search "cuda sdk not found" lower) "libcuda")
+          ((%header-after text))
+          (alternatives (or (%alternatives alternatives) "shared library"))
+          (foreign (or (%paren-content foreign) "shared library"))
+          ((and failed
+                (let ((word (first (%split-spaces (string-trim " " failed)))))
+                  (and word (>= (length word) 3)
+                       (string-equal "lib" word :end2 3)
+                       (string-trim ".,;:" word)))))
+          ((and file
+                (or (search "fatal error:" lower)
+                    (search "no such file or directory" lower)))
+           file)
+          ((and (search "subprocess" lower)
+                (search "with command" lower)
+                (search "(cc " lower))
+           "C compiler")
+          ((search "fatal error:" lower) "C compiler")
+          ((or (search "unable to load shared library" lower)
+               (search "error opening shared object" lower)
+               (search "cannot open shared object" lower)
+               (search "library not loaded" lower)
+               (search "dlopen(" lower))
+           "shared library")
+          (t nil))))
+
+(defun %native-note-p (note)
+  (not (null (%native-note-name note))))
+
+(defun %native-entry (entry)
+  "(values FOUND NAME) when ENTRY records a failure to find a native library."
+  (when entry
+    (let* ((field (%field entry "native"))
+           (note (or (%field entry "note") ""))
+           (status (or (%field entry "status") (%field entry "verdict") "")))
+      (cond ((and (stringp field) (plusp (length field)))
+             (values t field))
+            ((eq field t) (values t "native library"))
+            ((or (string= status "native") (%native-note-p note))
+             (values t (or (%native-note-name note) "native library")))
+            (t (values nil nil))))))
+
+(defun %row-native (row tests)
+  "(values FOUND NAME SOURCE) for the native failure the row shows.
+SOURCE is :load when loading failed, :test when a test suite that did not
+pass names the missing library."
+  (multiple-value-bind (found name) (%native-entry row)
+    (if found
+        (values t name :load)
+        (let ((test (gethash (%field row "system") tests)))
+          (when (and test (%loads-p row)
+                     (not (equal (%field test "verdict") "pass")))
+            (multiple-value-bind (test-found test-name) (%native-entry test)
+              (if test-found
+                  (values t test-name :test)
+                  (values nil nil nil))))))))
+
+(defun %sbcl-native (row source)
+  "(values FOUND NAME) when SBCL failed the same way as SOURCE."
+  (let ((entry (if (eq source :test)
+                   (gethash (%field row "system") *sbcl-tests*)
+                   (gethash (%field row "system") *sbcl-results*))))
+    (if (and entry
+             (not (and (eq source :test)
+                       (equal (%field entry "verdict") "pass"))))
+        (%native-entry entry)
+        (values nil nil))))
+
+(defun %native-text (name)
+  (cond ((or (null name) (string= name "native library"))
+         "a native library is missing")
+        ((string= name "C compiler")
+         "the C compiler failed (a header or C library is missing)")
+        ((string= name "shared library")
+         "a shared library is missing")
+        (t (format nil "~A is missing" name))))
+
+(defun %native-cell-name (name)
+  (cond ((or (null name) (string= name "native library")) "library not named")
+        (t name)))
+
+(defun %status-cell (row tests status)
+  (if (string= status "native")
+      (multiple-value-bind (found name source) (%row-native row tests)
+        (declare (ignore found))
+        (multiple-value-bind (sbcl-found sbcl-name) (%sbcl-native row source)
+          (declare (ignore sbcl-name))
+          (format nil "`native` (~A~@[; SBCL too~])"
+                  (if (eq source :test)
+                      (format nil "tests: ~A" (%native-text name))
+                      (%native-cell-name name))
+                  (and sbcl-found t))))
+      (format nil "`~A`" status)))
+
 (defun %seconds (entry)
   "The \"seconds\" of ENTRY as a real, or NIL."
   (let ((v (and entry (%field entry "seconds"))))
@@ -439,13 +603,16 @@ measure: one that is ok with the dists alone, or whose tree reaches no fork."
             (round dl) (round sl) nl (round dt) (round st) nt)))
 
 (defun %status-for (row tests)
-  "The status to show. Only a row that loads and whose suite passed becomes
-ok; the stored status is shown unchanged otherwise."
+  "The status to show. A missing native library or header is its own status;
+only a row that loads and whose suite passed becomes ok; the stored status is
+shown unchanged otherwise."
   (let ((status (or (%field row "status") "not checked"))
         (test (gethash (%field row "system") tests)))
-    (if (and (%loads-p row) test (equal (%field test "verdict") "pass"))
-        "ok"
-        status)))
+    (multiple-value-bind (native) (%row-native row tests)
+      (cond (native "native")
+            ((and (%loads-p row) test (equal (%field test "verdict") "pass"))
+             "ok")
+            (t status)))))
 
 (defun %tests-cell (row tests)
   "What the test stage saw, in a few words, and when, or \"\" when it has not run.
@@ -462,21 +629,24 @@ redone independently."
                (framework (or (%field test "framework") "-"))
                (passed (or (%field test "passed") 0))
                (failed (or (%field test "failed") 0))
-               (checked (%field test "checked"))
-               (text (cond ((string= verdict "pass")
-                            (format nil "~A: ~D passed" framework passed))
-                           ((string= verdict "fail")
-                            (format nil "~A: ~D of ~D failed" framework failed (+ passed failed)))
-                           ((string= verdict "no-result") "ran; no recognised result")
-                           ((string= verdict "no-tests") "defines no tests")
-                           ((string= verdict "error")
-                            (if (string= framework "-")
-                                "error"
-                                (format nil "~A: error after ~D passed" framework passed)))
-                           ((string= verdict "timeout") "timeout")
-                           ((string= verdict "load-fail") "test system did not load")
-                           (t verdict))))
-          (if checked (format nil "~A (~A)" text checked) text)))))
+               (checked (%field test "checked")))
+          (multiple-value-bind (native name) (%native-entry test)
+            (let ((text (if (and native (not (string= verdict "pass")))
+                            (format nil "native: ~A" (%native-text name))
+                            (cond ((string= verdict "pass")
+                                   (format nil "~A: ~D passed" framework passed))
+                                  ((string= verdict "fail")
+                                   (format nil "~A: ~D of ~D failed" framework failed (+ passed failed)))
+                                  ((string= verdict "no-result") "ran; no recognised result")
+                                  ((string= verdict "no-tests") "defines no tests")
+                                  ((string= verdict "error")
+                                   (if (string= framework "-")
+                                       "error"
+                                       (format nil "~A: error after ~D passed" framework passed)))
+                                  ((string= verdict "timeout") "timeout")
+                                  ((string= verdict "load-fail") "test system did not load")
+                                  (t verdict)))))
+              (if checked (format nil "~A (~A)" text checked) text)))))))
 
 (defun %row-for (system by-system)
   "The result object for SYSTEM, or a placeholder saying it was not measured."
@@ -488,10 +658,11 @@ redone independently."
   (format out "~%| system | status | tests | with forks | seconds, dotcl / SBCL | issue | checked | why | note |~%")
   (format out "| --- | --- | --- | --- | --- | --- | --- | --- | --- |~%")
   (dolist (row rows)
-    (let ((system (or (%field row "system") "?")))
-      (format out "| ~A | `~A` | ~A | ~A | ~A | ~A | ~A | ~A | ~A |~%"
+    (let* ((system (or (%field row "system") "?"))
+           (status (%status-for row tests)))
+      (format out "| ~A | ~A | ~A | ~A | ~A | ~A | ~A | ~A | ~A |~%"
               (%escape-cell system)
-              (%status-for row tests)
+              (%escape-cell (%status-cell row tests status))
               (%escape-cell (%tests-cell row tests))
               (%escape-cell (%forks-cell row))
               (%seconds-cell row tests)
@@ -505,6 +676,7 @@ redone independently."
 (defparameter *tests-legend*
   '(("<framework>: N passed" . "the suite ran and every check passed (the row is ok)")
     ("<framework>: K of N failed" . "the suite ran and K checks failed")
+    ("native: ..." . "the suite did not run, or did not pass, because a native library or header the log named is missing")
     ("<framework>: error after N passed" . "the suite started, then signalled or exited abnormally")
     ("ran; no recognised result" . "the test operation finished but printed no summary a recogniser knows; not a pass")
     ("error" . "the test operation signalled before any recognised summary")
@@ -573,15 +745,6 @@ measurement says so."
           (t (format nil "mixed: ~{~A~^; ~}"
                      (mapcar (lambda (c) (format nil "~A (~D rows)" (car c) (cdr c)))
                              counts))))))
-
-(defun %split-spaces (string)
-  (let ((words '()) (start nil))
-    (dotimes (i (length string))
-      (if (char= (char string i) #\Space)
-          (when start (push (subseq string start i) words) (setf start nil))
-          (unless start (setf start i))))
-    (when start (push (subseq string start) words))
-    (nreverse words)))
 
 (defun %write-markdown (path rows dist dotcl-version extra annotations tests
                         &optional hand-picked-rows measured-dists cut-off
@@ -714,7 +877,8 @@ measurement says so."
                   (count-if (lambda (pair) (%annotation annotations (car pair)))
                             annotations))
           (format t "status:~{ ~A ~D~}~%"
-                  (loop for status in '("ok" "load-only" "patched" "fail" "not checked")
+                  (loop for status in '("ok" "load-only" "patched" "native" "fail"
+                                        "not checked")
                         collect status
                         collect (count status all :key (lambda (row) (%status-for row tests))
                                                   :test #'equal)))

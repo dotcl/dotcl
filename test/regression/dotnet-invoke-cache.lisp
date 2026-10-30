@@ -49,3 +49,25 @@
 (deftest invoke-cache-optional-all-supplied
   (dotnet:invoke (dotnet:new "DotCL.TestSupport.OptionalArgs") "Greet" "Bob" 2)
   "hi Bob;hi Bob;")
+
+;; A property or indexer named without get_ is cached as its getter, and a name
+;; that is no member at all still reaches the same error.
+(deftest invoke-cache-property-getter
+  (let ((sb (dotnet:new "System.Text.StringBuilder"))
+        (l (dotnet:new "System.Collections.Generic.List`1[System.String]")))
+    (dotnet:invoke sb "Append" "abc")
+    (dotnet:invoke l "Add" "a") (dotnet:invoke l "Add" "b")
+    (list (dotnet:invoke sb "Length") (dotnet:invoke sb "Length")
+          (dotnet:invoke l "Item" 1) (dotnet:invoke l "Item" 0)
+          (dotnet:invoke (funcall #'dotnet:static "System.Text.Encoding" "UTF8") "WebName")
+          (handler-case (dotnet:invoke sb "NoSuchMember") (error () :error))))
+  (3 3 "b" "a" "utf-8" :error))
+
+(deftest-compiled-only invoke-cache-property-getter-no-invokemember
+  (progn
+    (funcall #'dotnet:static "System.Text.Encoding" "UTF8")
+    (let ((b0 (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread")))
+      (dotimes (i 1000) (funcall #'dotnet:static "System.Text.Encoding" "UTF8"))
+      ;; InvokeMember allocates about 1400 bytes a call here.
+      (< (- (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread") b0) 700000)))
+  t)

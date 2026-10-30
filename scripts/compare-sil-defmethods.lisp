@@ -1,0 +1,81 @@
+;;; Compare named DEFMETHOD bodies from two .sil files, ignoring gensym numbering.
+;;; DOTCL_COMPARE_A, DOTCL_COMPARE_B: the files; DOTCL_COMPARE_FUNCS: names.
+
+(defun sil-env (name)
+  #+dotcl (dotcl:getenv name)
+  #-dotcl (uiop:getenv name))
+
+(defun sil-quit (code)
+  #+dotcl (dotcl:quit code)
+  #-dotcl (uiop:quit code))
+
+(defun sil-read (path)
+  (with-open-file (in path) (read in)))
+
+(defun sil-funcs (string)
+  (let ((out '()) (start 0))
+    (loop for i from 0 to (length string)
+          do (when (or (= i (length string))
+                       (char= (char string i) #\Space))
+               (when (> i start) (push (subseq string start i) out))
+               (setf start (1+ i))))
+    (nreverse out)))
+
+(defun sil-method (x names)
+  (and (consp x)
+       (member (car x) '(:defmethod :defmethod-direct))
+       (member (second x) names :test #'string=)
+       x))
+
+(defun sil-canon (x map counter package)
+  (cond
+    ((consp x)
+     (cons (sil-canon (car x) map counter package)
+           (sil-canon (cdr x) map counter package)))
+    ((and (symbolp x) (null (symbol-package x)))
+     (or (gethash x map)
+         (setf (gethash x map)
+               (intern (format nil "G~D" (incf (car counter))) package))))
+    ((stringp x) x)
+    ((vectorp x)
+     (let ((v (make-array (length x))))
+       (dotimes (i (length x) v)
+         (setf (aref v i) (sil-canon (aref x i) map counter package)))))
+    (t x)))
+
+(defun sil-same (a b)
+  (cond
+    ((and (stringp a) (stringp b)) (string= a b))
+    ((and (vectorp a) (vectorp b))
+     (and (= (length a) (length b))
+          (dotimes (i (length a) t)
+            (unless (sil-same (aref a i) (aref b i))
+              (return nil)))))
+    ((and (consp a) (consp b))
+     (and (sil-same (car a) (car b))
+          (sil-same (cdr a) (cdr b))))
+    (t (eql a b))))
+
+(defun sil-canonical (form)
+  (let ((package (or (find-package "DOTCL-SIL-CANON")
+                     (make-package "DOTCL-SIL-CANON" :use '()))))
+    (sil-canon form (make-hash-table :test #'eq) (list 0) package)))
+
+(let* ((a (sil-read (sil-env "DOTCL_COMPARE_A")))
+       (b (sil-read (sil-env "DOTCL_COMPARE_B")))
+       (names (sil-funcs (sil-env "DOTCL_COMPARE_FUNCS")))
+       (bad nil))
+  (dolist (name names)
+    (let ((fa (find-if (lambda (x) (sil-method x (list name))) a))
+          (fb (find-if (lambda (x) (sil-method x (list name))) b)))
+      (cond
+        ((or (null fa) (null fb))
+         (format t "~&sil compare: ~a missing~%" name)
+         (setf bad t))
+        ((sil-same (sil-canonical fa) (sil-canonical fb))
+         (format t "~&sil compare: ~a OK~%" name))
+        (t
+         (format t "~&sil compare: ~a DIFFERS~%" name)
+         (setf bad t)))))
+  (format t "~&sil compare: ~d function~:p checked~%" (length names))
+  (sil-quit (if bad 1 0)))

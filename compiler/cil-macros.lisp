@@ -51,7 +51,12 @@
         (mode :required)
         (nreq 0)
         (max nil)
-        (tail-checked (not strict)))
+        (tail-checked (not strict))
+        (key-tail nil)
+        (key-keywords nil)
+        (key-shape-cell nil)
+        (key-check-cell nil)
+        (allow-other-keys-p nil))
     ;; Handle &whole
     (when (and (consp pattern) (eq (car pattern) '&whole))
       (let ((whole-var (cadr pattern)))
@@ -87,13 +92,18 @@
         ((eq elem '&optional) (setq mode :optional))
         ((or (eq elem '&rest) (eq elem '&body)) (setq mode :rest))
         ((eq elem '&key)
-         (setq mode :key)
+         (setq mode :key
+               key-tail rest-var)
          ;; Check the shape of what &KEY is about to consume once, here, before
          ;; any key is looked up: the per-key MEMBER below cannot tell a missing
-         ;; key from a list whose pairs are out of step.
+         ;; key from a list whose pairs are out of step. Filled in below.
          (when strict
-           (push (list (gensym "KEYCHK") `(%check-key-list ,rest-var)) bindings)))
-        ((eq elem '&allow-other-keys) nil)
+           (setq key-shape-cell (list (gensym "KEYCHK") nil))
+           (push key-shape-cell bindings)
+           ;; Report an unknown key before any default form runs; filled in below.
+           (setq key-check-cell (list (gensym "KEYUNK") nil))
+           (push key-check-cell bindings)))
+        ((eq elem '&allow-other-keys) (setq allow-other-keys-p t))
         ((eq elem '&aux) (check-tail) (setq mode :aux))
         (t
          (case mode
@@ -155,7 +165,8 @@
                    (default (cadr key-spec))
                    (supplied-p (caddr key-spec))
                    (found-var (gensym "KV")))
-              (push (list found-var `(%db-key-tail ,keyword ,rest-var)) bindings)
+              (push keyword key-keywords)
+              (push (list found-var `(%db-key-tail ',keyword ,rest-var)) bindings)
               (if (consp inner-var)
                   ;; Nested destructuring in key position: ((:A (B C)) default)
                   (let ((sub-var (gensym "KSUB")))
@@ -173,6 +184,14 @@
             (let* ((var (if (consp elem) (car elem) elem))
                    (init (if (consp elem) (cadr elem) nil)))
               (push (list var init) bindings)))))))
+    (when key-shape-cell
+      (setf (cadr key-shape-cell)
+            `(%check-key-list ,key-tail
+                              (or ,allow-other-keys-p
+                                  (%db-allow-other-keys ,key-tail)))))
+    (when key-check-cell
+      (setf (cadr key-check-cell)
+            `(%check-key-arguments ,key-tail ',(nreverse key-keywords) ,allow-other-keys-p)))
     (check-tail))
     (nreverse bindings)))
 
@@ -378,6 +397,21 @@ quietly took every typed slot back off the raw path."
                                        when (eq (car tl) key) return tl)))
                        (if tail (cadr tail) (eval (cadr s)))))
                    slots keys))))
+
+(defun %structure-instance-plan (name)
+  "Keyword initarg names and compiled default thunks for structure NAME."
+  (let* ((info (or (gethash name *struct-info*)
+                   (error "MAKE-INSTANCE: ~S has no structure definition" name)))
+         (slots (getf info :slots))
+         (keys (make-array (length slots)))
+         (defaults (make-array (length slots))))
+    (loop for s in slots
+          for i from 0
+          do (setf (aref keys i) (intern (symbol-name (car s)) "KEYWORD"))
+             (let ((form (cadr s)))
+               (setf (aref defaults i)
+                     (and form (eval `(lambda () ,form))))))
+    (list keys defaults)))
 
 ;;; --- Cross-compile (make-host-2) SBCL classoid registration -------------
 ;;; When dotcl is used as the cross-compile host to build SBCL, SBCL's own
@@ -638,7 +672,7 @@ quietly took every typed slot back off the raw path."
 (defun %setf-key (sym)
   (let ((pkg (and (symbolp sym) (symbol-package sym))))
     (if pkg
-        (let ((pname (package-name pkg)))
+        (let ((pname (%package-physical-name pkg)))
           (if (or (string= pname "COMMON-LISP") (string= pname "CL"))
               (symbol-name sym)
               (concatenate 'string pname ":" (symbol-name sym))))
@@ -862,22 +896,20 @@ quietly took every typed slot back off the raw path."
               ;; Normal CL:MACRO-FUNCTION setf
               `(let ((v ,value) (n ,(second place))
                      ,@(when env-form `((,(gensym "ENV") ,env-form))))
-                 (if v
-                     (let ((mkey (macro-key-for-symbol n)))
-                       ;; skip if CL macro already registered
-                       (if (and (let ((pkg (symbol-package n)))
-                                  (and pkg (string= (package-name pkg) "COMMON-LISP")))
-                                (gethash mkey *macros*))
-                           v  ;; CL macro already registered; don't overwrite
-                           (progn
-                             (%register-macro-function-rt n v)
-                             (setf (gethash mkey *macros*)
-                                   (let ((fn v)) (lambda (form) (funcall fn form nil))))
-                             v)))
-                     (progn
-                       (%unregister-macro-function-rt n)
-                       (remhash (macro-key-for-symbol n) *macros*)
-                       v)))))))
+                 (unless (functionp v)
+                   (error 'type-error :datum v :expected-type 'function))
+                 (let ((mkey (macro-key-for-symbol n)))
+                   ;; skip if CL macro already registered, except while cross-compiling
+                   (if (and (not *cross-compiling*)
+                            (let ((pkg (symbol-package n)))
+                              (and pkg (string= (package-name pkg) "COMMON-LISP")))
+                            (gethash mkey *macros*))
+                       v  ;; CL macro already registered; don't overwrite
+                       (progn
+                         (%register-macro-function-rt n v)
+                         (setf (gethash mkey *macros*)
+                               (let ((fn v)) (lambda (form) (funcall fn form nil))))
+                         v))))))))
 
 (setf (gethash "FDEFINITION" *setf-expanders*)
       (lambda (place value)
@@ -1153,13 +1185,13 @@ quietly took every typed slot back off the raw path."
                    ;; Check for symbol-macro: (setf y ...) where y is a symbol-macro
                    (let ((sm-exp (lookup-symbol-macro place)))
                      (if sm-exp
-                         ;; If symbol-macro expands to a non-place (e.g. constant 0 from XC stubs),
-                         ;; treat as no-op: evaluate value for side effects and return it.
-                         ;; Example: (define-symbol-macro *gc-epoch* 0) in SBCL's cross-misc.lisp
                          (if (or (symbolp sm-exp) (consp sm-exp))
                              `(setf ,sm-exp ,value)
-                             (let ((tmp (gensym "SETF-NOP")))
-                               `(let ((,tmp ,value)) ,tmp)))
+                             ;; Signalled when run, not when expanded: a SETF that
+                             ;; is compiled but never run must still compile.
+                             `(error 'program-error
+                                     :format-control "SETF: the symbol macro ~S expands to ~S, which is not a place"
+                                     :format-arguments '(,place ,sm-exp)))
                          `(setq ,place ,value))))
                   ((and (consp place) (eq (car place) 'car))
                    ;; CLHS 5.1.1.1: the place subform is evaluated (into a temp)
@@ -1708,6 +1740,12 @@ quietly took every typed slot back off the raw path."
                                 (values nil nil (list s) `(setf ,place ,s) place))))))))))))
     (t (error "get-setf-expansion: unknown place: ~s" place))))
 
+;;; Get-setf-expansion of a CCASE / CTYPECASE keyplace, or a read-once literal.
+(defun %get-keyplace-expansion (keyform)
+  (if (or (symbolp keyform) (consp keyform))
+      (%get-setf-expansion keyform)
+      (values nil nil nil nil keyform)))
+
 ;;; --- %dmm-helper: runtime helper for define-modify-macro generated macros ---
 ;;; Expands (name place extra-args) to a proper read-modify-write form.
 ;;; fn is the function symbol (e.g. '+), extra-args is a list of additional arg forms.
@@ -1789,6 +1827,16 @@ quietly took every typed slot back off the raw path."
                    ,setter
                    ,result-var)))))))
 
+;;; The store variables of each place, bound to its old values once, left to right.
+(defun %save-place-values (expansions save-lists body)
+  (if (null expansions)
+      body
+      `(multiple-value-bind ,(car save-lists) ,(fifth (car expansions))
+         ,(%save-place-values (cdr expansions) (cdr save-lists) body))))
+
+(defun %place-store-vars (exp)
+  (mapcar (lambda (s) (declare (ignore s)) (gensym "OLD")) (third exp)))
+
 ;;; --- rotatef ---
 ;;; (rotatef p1 p2 ... pN): cyclically rotates values through N places.
 ;;; p1 gets old p2, p2 gets old p3, ..., pN gets old p1. Returns nil.
@@ -1801,27 +1849,23 @@ quietly took every typed slot back off the raw path."
                       (mapcar (lambda (p)
                                 (multiple-value-list (%get-setf-expansion p)))
                               places))
-                     (save-vars
-                      (mapcar (lambda (p) (declare (ignore p)) (gensym "OLD"))
-                              places))
                      (all-bindings
                       (apply #'append
                              (mapcar (lambda (exp)
                                        (mapcar #'list (first exp) (second exp)))
                                      expansions)))
-                     (save-bindings
-                      (mapcar (lambda (sv exp) (list sv (fifth exp)))
-                              save-vars expansions))
-                     ;; rotate: place[i] <- old-val[i+1 mod N]
-                     (rotated-saves (append (cdr save-vars) (list (car save-vars))))
-                     (assignments
-                      (mapcar (lambda (exp rotated)
-                                `(let ((,(car (third exp)) ,rotated))
-                                   ,(fourth exp)))
-                              expansions rotated-saves)))
-                `(let* (,@all-bindings ,@save-bindings)
-                   ,@assignments
-                   nil))))))
+                     (save-lists (mapcar #'%place-store-vars expansions))
+                     ;; rotate: place[i] <- old values of place[i+1 mod N]
+                     (rotated (append (cdr save-lists) (list (car save-lists)))))
+                `(let* (,@all-bindings)
+                   ,(%save-place-values
+                     expansions save-lists
+                     `(progn
+                        ,@(mapcar (lambda (exp saves)
+                                    `(multiple-value-bind ,(third exp) (values ,@saves)
+                                       ,(fourth exp)))
+                                  expansions rotated)
+                        nil))))))))
 
 ;;; --- shiftf ---
 ;;; (shiftf p1 p2 ... pN newval)
@@ -1831,35 +1875,32 @@ quietly took every typed slot back off the raw path."
       (lambda (form)
         (let* ((args (cdr form))
                (places (butlast args))
-               (newval (car (last args)))
-               (expansions
-                (mapcar (lambda (p)
-                          (multiple-value-list (%get-setf-expansion p)))
-                        places))
-               (all-bindings
-                (apply #'append
-                       (mapcar (lambda (exp)
-                                 (mapcar #'list (first exp) (second exp)))
-                               expansions)))
-               (save-vars
-                (mapcar (lambda (p) (declare (ignore p)) (gensym "OLD"))
-                        places))
-               (save-bindings
-                (mapcar (lambda (sv exp) (list sv (fifth exp)))
-                        save-vars expansions))
-               ;; Each place gets old value of next; last gets newval
-               (shifted-values (append (cdr save-vars) (list newval)))
-               (assignments
-                (mapcar (lambda (exp sv)
-                          (let ((stores (third exp))
-                                (setter (fourth exp)))
-                            (if (cdr stores)
-                                `(multiple-value-bind ,stores ,sv ,setter)
-                                `(let ((,(car stores) ,sv)) ,setter))))
-                        expansions shifted-values)))
-          `(let* (,@all-bindings ,@save-bindings)
-             ,@assignments
-             ,(car save-vars)))))
+               (newval (car (last args))))
+          (if (null places)
+              nil
+              (let* ((expansions
+                      (mapcar (lambda (p)
+                                (multiple-value-list (%get-setf-expansion p)))
+                              places))
+                     (all-bindings
+                      (apply #'append
+                             (mapcar (lambda (exp)
+                                       (mapcar #'list (first exp) (second exp)))
+                                     expansions)))
+                     (save-lists (mapcar #'%place-store-vars expansions))
+                     (new-saves (%place-store-vars (car (last expansions))))
+                     ;; Each place gets the old values of the next; last gets newval.
+                     (shifted (append (cdr save-lists) (list new-saves))))
+                `(let* (,@all-bindings)
+                   ,(%save-place-values
+                     expansions save-lists
+                     `(multiple-value-bind ,new-saves ,newval
+                        (progn
+                          ,@(mapcar (lambda (exp saves)
+                                      `(multiple-value-bind ,(third exp) (values ,@saves)
+                                         ,(fourth exp)))
+                                    expansions shifted)
+                          ,(car (car save-lists)))))))))))
 
 ;;; The temporary that holds INCF's / DECF's delta (kept so the delta is
 ;;; evaluated after the place's subforms and before the place is read) was an
@@ -2123,6 +2164,13 @@ quietly took every typed slot back off the raw path."
       (lambda (form) (fourth form)))
 
 ;;; --- do ---
+(defun %check-result-forms-for-declare (forms name)
+  "Signal a PROGRAM-ERROR when FORMS holds a DECLARE, which is not a form."
+  (when (some (lambda (f) (and (consp f) (eq (car f) 'declare))) forms)
+    (error 'program-error
+           :format-control "~A: a DECLARE cannot be a result form: ~S"
+           :format-arguments (list name forms))))
+
 (defun %form-size-within-p (x budget)
   "True when X has at most BUDGET conses (QUOTE not entered)."
   (let ((n budget))
@@ -2186,6 +2234,7 @@ quietly took every typed slot back off the raw path."
                (ind-var nil)
                (comp-vars nil)
                (comp-decls nil))
+          (%check-result-forms-for-declare result-forms 'do)
           (loop for v in vars for s in steps for hs in has-step
                 when (and hs (not ind-var))
                   do (multiple-value-bind (decl next)
@@ -2277,6 +2326,7 @@ quietly took every typed slot back off the raw path."
                (body (cdddr form))
                (end-test (car end-clause))
                (result-forms (cdr end-clause)))
+          (%check-result-forms-for-declare result-forms 'do*)
           (let ((loop-tag (gensym "DO*-LOOP")))
             (multiple-value-bind (decls real-body) (extract-declarations body)
               `(block nil
@@ -2305,6 +2355,7 @@ quietly took every typed slot back off the raw path."
                (list-var (gensym "LIST"))
                (elt-var (gensym "ELT"))
                (loop-tag (gensym "DOLIST-LOOP")))
+          (%check-result-forms-for-declare (list result-form) 'dolist)
           ;; VAR is bound afresh for each element, as SBCL, CCL and ECL do
           ;; (CLHS leaves it to the implementation). A closure made in the body
           ;; keeps the element it was made for; with one binding assigned on
@@ -2383,6 +2434,7 @@ quietly took every typed slot back off the raw path."
                ;; lets (* I 16) stay native where FIXNUM alone cannot.
                (fx-decl `((declare (fixnum ,limit-var ,var)
                                    (%induction ,var 1 ,limit-var nil)))))
+          (%check-result-forms-for-declare (list result-form) 'dotimes)
           (multiple-value-bind (decls real-body) (extract-declarations body)
             `(block nil
                (let ((,limit-var ,(if fx-count count-form `(%dotimes-limit ,count-form)))
@@ -2833,23 +2885,27 @@ quietly took every typed slot back off the raw path."
         (let ((key-var (gensym "CTC"))
               (keyform (cadr form))
               (clauses (cddr form)))
-          (let ((all-types (mapcar #'car clauses)))
-            `(let ((,key-var ,keyform))
-               (loop
-                 (cond
-                   ,@(mapcar
-                      (lambda (clause)
-                        (let ((type (car clause))
-                              (body (cdr clause)))
-                          `((typep ,key-var ',type) (return (progn ,@body)))))
-                      clauses)
-                   (t (restart-case
-                        (error 'type-error :datum ,key-var
-                               :expected-type '(or ,@all-types))
-                        (store-value (new-val)
-                          :report "Supply a new value"
-                          (setf ,key-var new-val)
-                          (setf ,keyform ,key-var)))))))))))
+          (multiple-value-bind (temps vals stores setter getter)
+              (%get-keyplace-expansion keyform)
+            (let ((all-types (mapcar #'car clauses)))
+              `(let* (,@(mapcar #'list temps vals)
+                      (,key-var ,getter))
+                 (loop
+                   (cond
+                     ,@(mapcar
+                        (lambda (clause)
+                          (let ((type (car clause))
+                                (body (cdr clause)))
+                            `((typep ,key-var ',type) (return (progn ,@body)))))
+                        clauses)
+                     (t (restart-case
+                          (error 'type-error :datum ,key-var
+                                 :expected-type '(or ,@all-types))
+                          (store-value (new-val)
+                            :report "Supply a new value"
+                            (setf ,key-var new-val)
+                            (multiple-value-bind ,stores ,key-var
+                              ,setter))))))))))))
 
 ;;; cerror is a function, not a macro (registered in Startup.cs)
 
@@ -2973,6 +3029,24 @@ quietly took every typed slot back off the raw path."
     (list (nreverse required) (nreverse optional) rest-var
           (nreverse key-params) allow-other-keys (nreverse aux))))
 
+;; The values are computed first, in order, as (LIST ...) computes them; then the
+;; vector is made and filled.
+(defvar *struct-padding-form* (gensym "STRUCT-PADDING")
+  "Marks a representation position skipped by :INITIAL-OFFSET in a constructor.")
+
+(defun %typed-vector-struct-form (elem-type elems)
+  "The new vector of a (:TYPE (VECTOR ELEM-TYPE)) structure constructor holding ELEMS."
+  (let* ((positions (loop for elem in elems for i from 0
+                          unless (eq elem *struct-padding-form*) collect i))
+         (forms (loop for elem in elems
+                      unless (eq elem *struct-padding-form*) collect elem))
+         (temps (loop repeat (length forms) collect (gensym "E")))
+         (v (gensym "V")))
+    `(let* (,@(mapcar #'list temps forms)
+            (,v (make-array ,(length elems) :element-type ',elem-type)))
+       ,@(loop for tmp in temps for i in positions collect `(setf (aref ,v ,i) ,tmp))
+       ,v)))
+
 ;; Generate a BOA constructor defun.
 ;; boa-lambda-list is the raw lambda list from (:constructor name (params...))
 ;; slots is list of (slot-name default-value)
@@ -3051,11 +3125,23 @@ quietly took every typed slot back off the raw path."
            (cond
              ((null type-option)
               ;; Standard struct. Each initial value is checked against the
-              ;; slot's declared type, the same check a later store gets.
-              (%with-slot-checks
-               (mapcar (lambda (s v) (%slot-check-stmt v s struct-name))
-                       slots slot-values)
-               `(%make-struct (quote ,struct-name) ,@slot-values)))
+              ;; slot's declared type, the same check a later store gets. An
+              ;; initform (a slot the lambda list does not name) is evaluated
+              ;; once, into a variable the check and the store both read.
+              (let* ((binds '())
+                     (vals (mapcar (lambda (s v)
+                                     (if (and (getf (cddr s) :type)
+                                              (not (symbolp v)) (not (constantp v)))
+                                         (let ((g (gensym (symbol-name (car s)))))
+                                           (push (list g v) binds)
+                                           g)
+                                         v))
+                                   slots slot-values))
+                     (form (%with-slot-checks
+                            (mapcar (lambda (s v) (%slot-check-stmt v s struct-name))
+                                    slots vals)
+                            `(%make-struct (quote ,struct-name) ,@vals))))
+                (if binds `(let* ,(nreverse binds) ,form) form)))
              ((eq type-option 'list)
               ;; List-based typed struct
               `(list ,@(make-list ioffset :initial-element nil)
@@ -3063,15 +3149,15 @@ quietly took every typed slot back off the raw path."
                      ,@slot-values))
              (t
               ;; Vector-based typed struct
-              (let ((all-elems `(,@(make-list ioffset :initial-element nil)
-                                ,@(when named-p (list `',struct-name))
-                                ,@slot-values))
-                    (elem-type (when (and (consp type-option) (consp (cdr type-option)))
-                                 (cadr type-option))))
+              (let* ((elem-type (when (and (consp type-option) (consp (cdr type-option)))
+                                  (cadr type-option)))
+                     (all-elems `(,@(make-list ioffset
+                                               :initial-element
+                                               (if elem-type *struct-padding-form* nil))
+                                 ,@(when named-p (list `',struct-name))
+                                 ,@slot-values)))
                 (if elem-type
-                    `(make-array ,(length all-elems)
-                                :element-type ',elem-type
-                                :initial-contents (list ,@all-elems))
+                    (%typed-vector-struct-form elem-type all-elems)
                     `(vector ,@all-elems)))))))
     `(defun ,ctor-name ,defun-lambda-list
        ,body)))
@@ -3146,14 +3232,35 @@ quietly took every typed slot back off the raw path."
                ;; Parent slots from :include, with overrides applied
                (include-slots
                  (when include-info
+                   (let ((parent-type (getf include-info :type-option)))
+                     (when (and type-option (null parent-type))
+                       (error "DEFSTRUCT ~S: the structure has a :TYPE option but :INCLUDE ~S does not."
+                              name include-name))
+                     (when (and (null type-option) parent-type)
+                       (error "DEFSTRUCT ~S: :INCLUDE ~S has a :TYPE option; the including structure must have one too."
+                              name include-name)))
                    (let ((parent-slots (mapcar #'copy-list (getf include-info :slots))))
                      ;; Apply overrides from (:include parent (slot1 new-default) ...)
                      (dolist (override include-overrides)
                        (let* ((oname (if (consp override) (car override) override))
-                              (odefault (if (consp override) (cadr override) nil))
                               (entry (assoc oname parent-slots)))
                          (when entry
-                           (setf (cadr entry) odefault))))
+                           (setf (cadr entry) (if (consp override) (cadr override) nil))
+                           (when (consp override)
+                             (let ((options (cddr override))
+                                   (read-only-supplied (member :read-only (cddr override)))
+                                   (type-supplied (member :type (cddr override))))
+                               (when (and (getf (cddr entry) :read-only)
+                                          read-only-supplied
+                                          (null (getf options :read-only)))
+                                 (error "DEFSTRUCT ~S: slot ~S is read-only in the included structure and cannot be made writable."
+                                        name oname))
+                               (when read-only-supplied
+                                 (setf (getf (cddr entry) :read-only)
+                                       (getf options :read-only)))
+                               (when type-supplied
+                                 (setf (getf (cddr entry) :type)
+                                       (getf options :type))))))))
                      parent-slots)))
                ;; For typed structs with :include, retrieve parent's layout info
                (parent-type-option (when include-info
@@ -3273,6 +3380,10 @@ quietly took every typed slot back off the raw path."
                            (t
                             (push (list :boa (cadr c) (caddr c)) specs))))
                        (nreverse specs))))
+               (standard-keyword-ctor
+                 (loop for spec in constructor-specs
+                       when (and spec (eq (car spec) :keyword))
+                         return (cadr spec)))
                ;; copier: not present or :bare -> default, (:copier nil) -> no copier,
                ;;         (:copier name) -> custom name
                (copy-name (cond
@@ -3343,6 +3454,11 @@ quietly took every typed slot back off the raw path."
           ;; Error: :predicate with :type (without :named) is invalid per CLHS
           (when (and type-option pred-raw pred-name (not named-p))
             (error "~A is an invalid DEFSTRUCT option for a typed structure." :predicate))
+          ;; CLHS DEFSTRUCT: only one of :PRINT-OBJECT and :PRINT-FUNCTION.
+          (when (and print-fn-raw (not (eq print-fn-raw :bare))
+                     print-obj-raw (not (eq print-obj-raw :bare)))
+            (error "DEFSTRUCT ~S: :PRINT-OBJECT and :PRINT-FUNCTION cannot both be supplied."
+                   name))
           ;; Error: :named with :type (vector element-type) where element-type
           ;; cannot hold a symbol (e.g., single-float, double-float, bit, (unsigned-byte n))
           (when (and named-p (consp type-option) (eq (car type-option) 'vector))
@@ -3526,20 +3642,21 @@ quietly took every typed slot back off the raw path."
                                      ctor-forms)))
                             (t
                              ;; Vector-typed constructor: use ctor-layout for correct layout
-                             (let ((body-elems (mapcar (lambda (elem)
-                                                         (cond ((null elem) nil)
-                                                               ((and (consp elem) (eq (car elem) :name))
-                                                                `',(cadr elem))
-                                                               ((and (consp elem) (eq (car elem) :slot))
-                                                                (let ((pos (position (cadr elem) all-slots :key #'car)))
-                                                                  (if pos (nth pos slot-vars) (cadr elem))))
-                                                               (t nil)))
-                                                       ctor-layout)))
+                             (let* ((elem-type (and (consp type-option) (consp (cdr type-option))
+                                                    (cadr type-option)))
+                                    (padding (if elem-type *struct-padding-form* nil))
+                                    (body-elems (mapcar (lambda (elem)
+                                                          (cond ((null elem) padding)
+                                                                ((and (consp elem) (eq (car elem) :name))
+                                                                 `',(cadr elem))
+                                                                ((and (consp elem) (eq (car elem) :slot))
+                                                                 (let ((pos (position (cadr elem) all-slots :key #'car)))
+                                                                   (if pos (nth pos slot-vars) (cadr elem))))
+                                                                (t nil)))
+                                                        ctor-layout)))
                                (push `(defun ,(cadr spec) (&key ,@key-params)
-                                        ,(if (and (consp type-option) (consp (cdr type-option)))
-                                             `(make-array ,(length body-elems)
-                                                          :element-type ',(cadr type-option)
-                                                          :initial-contents (list ,@body-elems))
+                                        ,(if elem-type
+                                             (%typed-vector-struct-form elem-type body-elems)
                                              `(vector ,@body-elems)))
                                      ctor-forms))))))
                        ((eq (car spec) :boa)
@@ -3635,7 +3752,10 @@ quietly took every typed slot back off the raw path."
              ,@(when copy-name
                  (cond
                    ((null type-option)
-                    `((defun ,copy-name (obj) (%copy-struct obj))))
+                    `((defun ,copy-name (obj)
+                        (unless (%struct-typep obj ',name)
+                          (error 'type-error :datum obj :expected-type ',name))
+                        (%copy-struct obj))))
                    ((eq type-option 'list)
                     `((defun ,copy-name (obj) (copy-list obj))))
                    (t
@@ -3644,14 +3764,25 @@ quietly took every typed slot back off the raw path."
              ,@(when (and (null type-option)
                           print-fn-raw (not (eq print-fn-raw :bare)))
                  `((defmethod print-object ((obj ,name) stream)
-                     (funcall (function ,(cadr print-fn-raw)) obj stream *print-level*))))
+                     (funcall (function ,(cadr print-fn-raw)) obj stream
+                              (%print-object-depth)))))
              ,@(when (and (null type-option)
                           print-obj-raw (not (eq print-obj-raw :bare)))
                  `((defmethod print-object ((obj ,name) stream)
                      (funcall (function ,(cadr print-obj-raw)) obj stream))))
              ;; Documentation (CLHS 8.1)
              ,@(when struct-doc
-                 (list `(funcall #'(setf documentation) ,struct-doc ',name 'structure)))
+                 (append
+                  (list `(funcall #'(setf documentation) ,struct-doc ',name 'structure))
+                  (unless type-option
+                    (list `(funcall #'(setf documentation) ,struct-doc ',name 'type)
+                          `(funcall #'(setf documentation) ,struct-doc
+                                    (find-class ',name) 'type)
+                          `(funcall #'(setf documentation) ,struct-doc
+                                    (find-class ',name) t)))))
+             ,@(unless type-option
+                 `((eval-when (:compile-toplevel :load-toplevel :execute)
+                     (%register-struct-reader ',name ',standard-keyword-ctor))))
              ;; Return type name
              ',name))))
 
@@ -4121,8 +4252,19 @@ quietly took every typed slot back off the raw path."
                      (setf report-option (cadr opt)))
                     ((consp opt)
                      (push opt defclass-options)))))
-          (let ((forms (list `(defclass ,name ,parents ,slots
-                                ,@(nreverse defclass-options)))))
+          (let* ((validation-form
+                   `(dolist (parent ',parents)
+                      (let ((class (find-class parent nil)))
+                        (unless class
+                          (error 'program-error
+                                 :format-control "DEFINE-CONDITION ~S: parent ~S is not defined"
+                                 :format-arguments (list ',name parent)))
+                        (unless (subtypep parent 'condition)
+                          (error 'type-error
+                                 :datum parent
+                                 :expected-type 'condition)))))
+                 (forms (list `(defclass ,name ,parents ,slots
+                                 ,@(nreverse defclass-options)))))
             (when report-option
               (let ((report-body
                       (cond ((stringp report-option)
@@ -4137,7 +4279,7 @@ quietly took every typed slot back off the raw path."
                              (call-next-method)
                              ,report-body))
                       forms)))
-            `(progn ,@(nreverse forms) ',name)))))
+            `(progn ,validation-form ,@(nreverse forms) ',name)))))
 
 ;;; --- define-modify-macro ---
 (setf (gethash 'define-modify-macro *macros*)
@@ -4871,6 +5013,14 @@ quietly took every typed slot back off the raw path."
                                               (setf req nil))
                                             (if (and req (consp sp)) (car sp) sp))
                                           specialized-params))))
+               (unless *cross-compiling*
+                 (setf method-lambda
+                       `(%xref-scope
+                         '(defmethod ,name ,@qualifiers
+                           ,(loop for sp in specialized-params
+                                  until (member sp lambda-list-keywords)
+                                  collect (if (consp sp) (cadr sp) t)))
+                         ,method-lambda)))
                (if (and (not *cross-compiling*) (listp spec-names))
                 ;; Every specializer is a class name: the method is data plus
                 ;; one call (%DEFMETHOD-RUN). Spelled out, the steps below cost
@@ -5377,7 +5527,7 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                       (,rest-var ,entries-var))
                  (flet ((,name ()
                           (if (null ,rest-var)
-                              (values nil nil nil nil)
+                              nil
                               (let ((entry (car ,rest-var)))
                                 (setq ,rest-var (cdr ,rest-var))
                                 (values t (car entry) (cadr entry) (caddr entry))))))
@@ -5398,8 +5548,14 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
         ;; Generates a runtime registration call so COMPILER-MACRO-FUNCTION can retrieve it.
         (let* ((name (cadr form))
                (lambda-list (caddr form))
-               (body (cdddr form))
+               (raw-body (cdddr form))
+               (has-docstring (and (consp raw-body)
+                                   (stringp (car raw-body))
+                                   (cdr raw-body)))
+               (docstring (when has-docstring (car raw-body)))
+               (body (if has-docstring (cdr raw-body) raw-body))
                (whole-sym (gensym "WHOLE"))
+               (env-sym (gensym "ENV"))
                ;; Extract &whole var if present
                (whole-var (when (and (consp lambda-list) (eq (car lambda-list) '&whole))
                             (cadr lambda-list)))
@@ -5418,13 +5574,14 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                (forms (nth-value 1 (extract-declarations body)))
                ;; &environment binding
                (wrapped-body (if env-var
-                                 `((let ((,env-var nil)) (declare (ignorable ,env-var)) ,@forms))
+                                 `((let ((,env-var (or ,env-sym (%reify-macro-environment))))
+                                     (declare (ignorable ,env-var))
+                                     ,@forms))
                                  forms))
                ;; Implicit block named after the function (CLHS: same as defmacro)
                ;; Use (symbolp name) to get the block name; (setf foo) names use car
                (block-name (if (consp name) (cadr name) name))
                (block-wrapped-body `(,@decls (block ,block-name ,@wrapped-body)))
-               (env-sym (gensym "ENV"))
                ;; A (FUNCALL #'NAME . args) form is destructured on ARGS, not on
                ;; (#'NAME . args); &WHOLE still gets the whole form (CLHS 3.2.2.1.3).
                (args-form `(if (and (eq (car ,whole-sym) 'funcall)
@@ -5436,17 +5593,22 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                (expander-form
                  (if whole-var
                      `(lambda (,whole-sym ,env-sym)
-                        (declare (ignore ,env-sym))
+                        ,@(unless env-var `((declare (ignore ,env-sym))))
                         (let ((,whole-var ,whole-sym))
                           (declare (ignorable ,whole-var))
                           (destructuring-bind ,clean-ll ,args-form
                             ,@block-wrapped-body)))
                      `(lambda (,whole-sym ,env-sym)
-                        (declare (ignore ,env-sym))
+                        ,@(unless env-var `((declare (ignore ,env-sym))))
                         (destructuring-bind ,clean-ll ,args-form
                           ,@block-wrapped-body)))))
           `(progn
+             ,@(when *cross-compiling*
+                 `((eval-when (:compile-toplevel)
+                     (%register-compiler-macro-rt ',name ,expander-form))))
              (%register-compiler-macro-rt ',name ,expander-form)
+             ,@(when docstring
+                 `((funcall #'(setf documentation) ,docstring ',name 'compiler-macro)))
              ',name))))
 
 ;;; --- define-method-combination ---
@@ -5644,7 +5806,8 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                                     ,@(when gf-var `((,gf-var ,gf-obj-var))))
                                 (declare (ignorable ,@arguments-vars ,@(when gf-var (list gf-var))))
                                 ,@body))))
-                        (%em-arguments-info ',arguments-lambda-list))
+                        (%em-arguments-info ',arguments-lambda-list)
+                        ',name)
                        ,@(when doc
                            `((funcall #'(setf documentation) ,doc ',name 'method-combination)))
                        ',name))))
@@ -5664,7 +5827,7 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                 ;; Default operator is the name itself
                 (unless operator (setf operator name))
                 `(progn
-                   (%register-method-combination ,(string name) ,(string operator) ,identity-with-one-arg ',operator)
+                   (%register-method-combination ,(string name) ,(string operator) ,identity-with-one-arg ',operator ',name)
                    ,@(when doc
                        `((funcall #'(setf documentation) ,doc ',name 'method-combination)))
                    ',name))))))
@@ -5714,11 +5877,15 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                (options (cddr spec))
                (body (cddr form)))
           (multiple-value-bind (decls real-body) (extract-declarations body)
-            `(let ((,var (open ,path ,@options)))
-               ,@decls
-               (unwind-protect
-                 (progn ,@real-body)
-                 (when ,var (close ,var))))))))
+            (let ((aborted (gensym "ABORT")))
+              `(let ((,var (open ,path ,@options))
+                     (,aborted t))
+                 ,@decls
+                 (unwind-protect
+                   (multiple-value-prog1
+                       (progn ,@real-body)
+                     (setq ,aborted nil))
+                   (when ,var (close ,var :abort ,aborted)))))))))
 
 ;;; --- with-output-to-string ---
 
@@ -5898,17 +6065,22 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
         (let ((keyvar (gensym "KEY"))
               (keyform (cadr form))
               (clauses (cddr form)))
-          (let ((all-keys (%case-all-keys clauses)))
-            `(let ((,keyvar ,keyform))
-               (loop
-                 (cond
-                   ,@(remove nil (mapcar (lambda (c) (%case-to-cond keyvar c t)) clauses))
-                   (t (restart-case
-                        (error 'type-error :datum ,keyvar
-                               :expected-type '(member ,@all-keys))
-                        (store-value (new-val)
-                          :report "Supply a new value"
-                          (setf ,keyvar new-val)))))))))))
+          (multiple-value-bind (temps vals stores setter getter)
+              (%get-keyplace-expansion keyform)
+            (let ((all-keys (%case-all-keys clauses)))
+              `(let* (,@(mapcar #'list temps vals)
+                      (,keyvar ,getter))
+                 (loop
+                   (cond
+                     ,@(remove nil (mapcar (lambda (c) (%case-to-cond keyvar c t)) clauses))
+                     (t (restart-case
+                          (error 'type-error :datum ,keyvar
+                                 :expected-type '(member ,@all-keys))
+                          (store-value (new-val)
+                            :report "Supply a new value"
+                            (setf ,keyvar new-val)
+                            (multiple-value-bind ,stores ,keyvar
+                              ,setter))))))))))))
 
 ;;; --- prog1 / prog2 (ensure they exist) ---
 
@@ -6297,8 +6469,9 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                                           (t actual-stream))))
                (declare (ignorable ,actual-stream))
                (let ((,list-var ,list-form)
-                     (,count-var 0))
-                 (declare (ignorable ,count-var))
+                     (,count-var 0)
+                     (.first-pop. t))
+                 (declare (ignorable ,count-var .first-pop.))
                  ,@(when (or prefix per-line-prefix)
                      `((let ((.pfx. ,(or prefix per-line-prefix)))
                          (unless (stringp .pfx.)
@@ -6310,7 +6483,7 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                  ;; *print-circle* support: scan list and check for circle labels
                  (let ((.circle-started. (%pprint-circle-scan ,list-var)))
                    (unwind-protect
-                     (let ((.circle-label. (%pprint-circle-check ,list-var)))
+                     (let ((.circle-label. (%pprint-circle-check-root ,list-var)))
                        (cond
                          ;; Back-reference (#n#): print label and skip entire block
                          ((and (stringp .circle-label.)
@@ -6334,10 +6507,9 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                                       ;; (%pprint-start/end-block) is gated on pretty.
                                       ,@(when (or prefix per-line-prefix)
                                           `((write-string ,(or prefix per-line-prefix) ,actual-stream)))
-                                      (when *print-pretty*
-                                        (%pprint-start-block ,actual-stream
-                                          ,(if (or prefix per-line-prefix) `(length ,(or prefix per-line-prefix)) 0)
-                                          ,@(when per-line-prefix (list per-line-prefix))))
+                                      (%pprint-start-block ,actual-stream
+                                        ,(if (or prefix per-line-prefix) `(length ,(or prefix per-line-prefix)) 0)
+                                        ,@(when per-line-prefix (list per-line-prefix)))
                                       (unwind-protect
                                         (block nil
                                           (macrolet ((pprint-exit-if-list-exhausted ()
@@ -6359,13 +6531,14 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                                                              (list 'setf ',count-var (list '+ ',count-var 1))
                                                              ;; Circle check: back-ref (#n#) or forward-ref (#n=) -> print ". #n#" or ". #n=CONTENT"
                                                              (list 'let (list (list '.cdr-circle. (list '%pprint-circle-check ',list-var)))
-                                                               (list 'when (list 'and (list 'stringp '.cdr-circle.)
+                                                               (list 'when (list 'and (list 'not '.first-pop.)
+                                                                                      (list 'stringp '.cdr-circle.)
                                                                                       (list '> (list 'length '.cdr-circle.) 0))
                                                                      (list 'write-string ". " ',actual-stream)
                                                                      (list 'write-string '.cdr-circle. ',actual-stream)
                                                                      ;; forward-ref: also write the cons content after the "#n=" prefix
                                                                      (list 'when (list 'char= (list 'char '.cdr-circle. (list '1- (list 'length '.cdr-circle.))) '#\=)
-                                                                           (list 'write-string (list '%pprint-format-content ',list-var) ',actual-stream))
+                                                                           (list '%pprint-write-content ',actual-stream ',list-var))
                                                                      (list 'setf ',list-var nil)
                                                                      '(return)))
                                                              (list 'cond
@@ -6376,10 +6549,12 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                                                                          (list 'setf ',list-var nil)
                                                                          '(return))
                                                                    (list t (list 'prog1 (list 'car ',list-var)
-                                                                                 (list 'setf ',list-var (list 'cdr ',list-var))))))))
+                                                                                 (list 'setf ',list-var (list 'cdr ',list-var))
+                                                                                 (list 'setf '.first-pop. nil)))))))
                                             ,@body))
-                                        (when *print-pretty*
-                                          (%pprint-end-block)))
+                                        ,@(when suffix
+                                            `((%pprint-set-block-suffix ,suffix)))
+                                        (%pprint-end-block))
                                       ,@(when suffix
                                           `((write-string ,suffix ,actual-stream))))))))))
                      (when .circle-started. (%pprint-circle-end))))
@@ -6424,8 +6599,9 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                  (when ,type-printed-var (write-char #\Space ,stream-var))
                  ,@body
                  (when ,identity-flag
-                   ;; Always write a space before identity (gives "#< addr>" when no type/body)
-                   (write-char #\Space ,stream-var)
+                   ;; With no body forms the type's space is the only one before identity.
+                   (unless (and ,(null body) ,type-printed-var)
+                     (write-char #\Space ,stream-var))
                    (format ,stream-var "~D" (%object-id ,obj-var))))
                (write-char #\> ,stream-var)
                nil)))))

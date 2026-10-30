@@ -280,7 +280,7 @@ public static class Startup
 
     /// <summary>Assembly-metadata key holding the compiler generation. Written by the
     /// fasl writer (Emitter/FaslAssembler.cs) and read by the fasl loader
-    /// (Runtime.Misc.cs). It lives here, not on the writer, because an emit-free
+    /// (Runtime.Reader.cs). It lives here, not on the writer, because an emit-free
     /// build has no writer but still loads fasls: and must still be able to warn
     /// that one was compiled by a different core.</summary>
     internal const string CoreGenerationKey = "dotcl-core-generation";
@@ -765,6 +765,12 @@ public static class Startup
         starHostFeatures.IsSpecial = true;
         starHostFeatures.Value = featuresList;
 
+        // dotcl:*invoke-debugger-hook*: SBCL's extension, also observed by BREAK.
+        var (starInvokeDebuggerHook, _) = DotclPkg.Intern("*INVOKE-DEBUGGER-HOOK*");
+        DotclPkg.Export(starInvokeDebuggerHook);
+        starInvokeDebuggerHook.IsSpecial = true;
+        starInvokeDebuggerHook.Value = Nil.Instance;
+
         foreach (var name in new[] { "*INTERRUPTS-ENABLED*", "*ALLOW-WITH-INTERRUPTS*" })
         {
             var (iv, _) = DotclPkg.Intern(name);
@@ -972,7 +978,7 @@ public static class Startup
         DotclPkg.Export(SymInPkg("R2R-STATS", "DOTCL"));
         Emitter.CilAssembler.RegisterFunction("R2R-STATS", new LispFunction(args =>
             new Cons(Fixnum.Make(Runtime.R2rFaslsLoaded),
-                     Fixnum.Make(Runtime.FaslsLoaded)), "R2R-STATS"));
+                     Fixnum.Make(Runtime.FaslsLoaded)), "R2R-STATS").WithArgCount(0, 0));
         SymInPkg("R2R-STATS", "DOTCL").Function =
             Emitter.CilAssembler.GetFunction("R2R-STATS");
 
@@ -995,7 +1001,7 @@ public static class Startup
 
         DotclPkg.Export(SymInPkg("PACKAGE-RID", "DOTCL"));
         Emitter.CilAssembler.RegisterFunction("PACKAGE-RID", new LispFunction(args =>
-            Runtime.PackageRid() is string r ? new LispString(r) : Nil.Instance, "PACKAGE-RID"));
+            Runtime.PackageRid() is string r ? new LispString(r) : Nil.Instance, "PACKAGE-RID").WithArgCount(0, 0));
         SymInPkg("PACKAGE-RID", "DOTCL").Function = Emitter.CilAssembler.GetFunction("PACKAGE-RID");
         Emitter.CilAssembler.RegisterFunction("%PACKAGE-RID-FOR", new LispFunction(args =>
             args.Length == 3
@@ -1380,6 +1386,10 @@ public static class Startup
     /// later fbound-foreign registrations. Function-call sites use SymFn
     /// (via :load-sym-fn) for the bridging behavior.
     /// </summary>
+    /// <summary>Sym for a symbol handed to Lisp as a value: T and NIL come back
+    /// as T.Instance / Nil.Instance, not their package-table entries.</summary>
+    internal static LispObject SymValue(string name) => Runtime.CanonicalizeSymbol(Sym(name));
+
     public static Symbol Sym(string name)
     {
         if (_symCache.TryGetValue(name, out var cached)) return cached;
@@ -1537,9 +1547,9 @@ public static class Startup
         // Bridge found no fbound symbol. If the home package has the symbol
         // (even unbound: e.g. reader-interned but never defun'd), return it so
         // an undefined-function condition carries the symbol the user actually
-        // named (cell-error-name returns CL-TEST::MY-UNDEFINED-FUNCTION, not a
-        // DOTCL-INTERNAL placeholder). Falls back to DOTCL-INTERNAL only if the
-        // home package doesn't have the symbol at all.
+        // named (cell-error-name returns CL-TEST::MY-UNDEFINED-FUNCTION).
+        // Falls back to the runtime's own package only if the home package
+        // doesn't have the symbol at all.
         if (packageName is not null && Package.FindPackage(packageName) is { } homePkg2)
         {
             var (homeSym2, homeStatus2) = homePkg2.FindSymbol(name);
@@ -1890,7 +1900,7 @@ public static class Startup
                 GC.Collect(2, Compat.AggressiveGCMode, true, true);
                 Runtime.RunFinalizers();
                 return Nil.Instance;
-            }, "DOTCL:GC", -1);
+            }, "DOTCL:GC", -1).WithArgCount(0, 0);
             var gcSym = SymInPkg("GC", "DOTCL");
             gcSym.Function = gcFn;
             DotclPkg.Export(gcSym);
@@ -1909,7 +1919,7 @@ public static class Startup
                     throw new LispErrorException(new LispProgramError("CANCEL-FINALIZATION: requires 1 argument"));
                 return Runtime.CancelFinalization(a[0]);
             }, "DOTCL:CANCEL-FINALIZATION");
-            var runFn = new LispFunction(_ => Fixnum.Make(Runtime.RunFinalizers()), "DOTCL:RUN-FINALIZERS", -1);
+            var runFn = new LispFunction(_ => Fixnum.Make(Runtime.RunFinalizers()), "DOTCL:RUN-FINALIZERS", -1).WithArgCount(0, 0);
             foreach (var (nm, fn) in new[] { ("FINALIZE", finFn), ("CANCEL-FINALIZATION", cancelFn), ("RUN-FINALIZERS", runFn) })
             {
                 var (sym, _) = DotclPkg.Intern(nm);
@@ -1994,21 +2004,21 @@ public static class Startup
         {
             // Name omitted on purpose: a named fn would push its own frame onto
             // the call stack and appear in its own backtrace output.
-            var btFn = new LispFunction(Runtime.Backtrace);
+            var btFn = new LispFunction(Runtime.Backtrace).WithArgCount(0, 0);
             RegisterDotcl("BACKTRACE", btFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:BACKTRACE", btFn);
-            var btaFn = new LispFunction(Runtime.BacktraceWithArgs);
+            var btaFn = new LispFunction(Runtime.BacktraceWithArgs).WithArgCount(0, 0);
             RegisterDotcl("BACKTRACE-WITH-ARGS", btaFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:BACKTRACE-WITH-ARGS", btaFn);
             // Nameless for the same reason as BACKTRACE: a frame of its own would
             // shift every index the caller asks about by one.
-            var flFn = new LispFunction(Runtime.FrameLocals);
+            var flFn = new LispFunction(Runtime.FrameLocals).WithArgCount(0, 1);
             RegisterDotcl("FRAME-LOCALS", flFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:FRAME-LOCALS", flFn);
-            var fsFn = new LispFunction(Runtime.FrameSpecials);
+            var fsFn = new LispFunction(Runtime.FrameSpecials).WithArgCount(0, 1);
             RegisterDotcl("FRAME-SPECIALS", fsFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:FRAME-SPECIALS", fsFn);
-            var pflFn = new LispFunction(Runtime.PrintFrameLocals);
+            var pflFn = new LispFunction(Runtime.PrintFrameLocals).WithArgCount(0, 2);
             RegisterDotcl("PRINT-FRAME-LOCALS", pflFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:PRINT-FRAME-LOCALS", pflFn);
             // Frame-locals mode flag. The compiled compiler reads it through a
@@ -2024,23 +2034,34 @@ public static class Startup
             var efpSym = Startup.Sym("*EMIT-FORM-PREFIX*");
             DotclPkg.Import(efpSym);
             DotclPkg.Export(efpSym);
-            var pbtFn = new LispFunction(Runtime.PrintBacktrace);
+            var bosHookSym = Startup.Sym("*BREAK-ON-SIGNALS-HOOK*");
+            DotclPkg.Import(bosHookSym);
+            DotclPkg.Export(bosHookSym);
+            if (bosHookSym.Value == null) bosHookSym.Value = Nil.Instance;
+            var pbtFn = new LispFunction(Runtime.PrintBacktrace).WithArgCount(0, 1);
             RegisterDotcl("PRINT-BACKTRACE", pbtFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:PRINT-BACKTRACE", pbtFn);
-            var fslFn = new LispFunction(Runtime.FunctionSourceLocation, "DOTCL:FUNCTION-SOURCE-LOCATION", -1);
+            var fslFn = new LispFunction(Runtime.FunctionSourceLocation, "DOTCL:FUNCTION-SOURCE-LOCATION", -1).WithArgCount(1, 1);
             RegisterDotcl("FUNCTION-SOURCE-LOCATION", fslFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:FUNCTION-SOURCE-LOCATION", fslFn);
-            var dssFn = new LispFunction(Runtime.DefinitionSources, "DOTCL:DEFINITION-SOURCES", -1);
+            var dssFn = new LispFunction(Runtime.DefinitionSources, "DOTCL:DEFINITION-SOURCES", -1).WithArgCount(1, 1);
             RegisterDotcl("DEFINITION-SOURCES", dssFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:DEFINITION-SOURCES", dssFn);
-            var dsFn = new LispFunction(Runtime.DefinitionSource, "DOTCL:DEFINITION-SOURCE", -1);
+            var dsFn = new LispFunction(Runtime.DefinitionSource, "DOTCL:DEFINITION-SOURCE", -1).WithArgCount(1, 1);
             RegisterDotcl("DEFINITION-SOURCE", dsFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:DEFINITION-SOURCE", dsFn);
             RegisterDotclInternal("%NOTE-DEFINITION",
                 new LispFunction(Runtime.NoteDefinition, "DOTCL::%NOTE-DEFINITION", -1));
-            var rdsFn = new LispFunction(Runtime.RecordDefinitionSourcesForm, "DOTCL:RECORD-DEFINITION-SOURCES", -1);
+            var rdsFn = new LispFunction(Runtime.RecordDefinitionSourcesForm, "DOTCL:RECORD-DEFINITION-SOURCES", -1).WithArgCount(3, 3);
             RegisterDotcl("RECORD-DEFINITION-SOURCES", rdsFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:RECORD-DEFINITION-SOURCES", rdsFn);
+            var ccsFn = new LispFunction(Runtime.CompilerConditionSource, "DOTCL:COMPILER-CONDITION-SOURCE", -1).WithArgCount(0, 1);
+            RegisterDotcl("COMPILER-CONDITION-SOURCE", ccsFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:COMPILER-CONDITION-SOURCE", ccsFn);
+            var cctxSym = DotclPkg.Intern("*COMPILER-CONTEXT*").Item1;
+            DotclPkg.Export(cctxSym);
+            cctxSym.IsSpecial = true;
+            if (cctxSym.Value == null) cctxSym.Value = Nil.Instance;
             // The text the debugger's :source and :frame print about a frame's
             // source, for the tests (the debugger itself needs a terminal).
             RegisterDotclInternal("%DEBUGGER-SOURCE-LINES",
@@ -2077,13 +2098,14 @@ public static class Startup
         // PPRINT-*, COPY-PPRINT-DISPATCH, SET-PPRINT-DISPATCH, PPRINT-EXIT-IF-LIST-EXHAUSTED, PPRINT-POP: moved to Runtime.Printer.cs
 
         // SHARED-INITIALIZE, INITIALIZE-INSTANCE, REINITIALIZE-INSTANCE, DESCRIBE-OBJECT,
-        // CHANGE-CLASS, MAKE-LOAD-FORM, FUNCTION-KEYWORDS, UPDATE-INSTANCE-FOR-REDEFINED-CLASS: moved to Runtime.CLOS.cs
+        // CHANGE-CLASS, MAKE-LOAD-FORM, FUNCTION-KEYWORDS, UPDATE-INSTANCE-FOR-REDEFINED-CLASS: moved to Runtime.CLOS.Builtins.cs
 
         RegisterDotclFunctions();
         Runtime.RegisterMiscBuiltins();
         Runtime.RegisterCoreBuiltins();
         Runtime.RegisterPackageBuiltins();
         Runtime.RegisterArithmeticBuiltins();
+        Runtime.RegisterOverflowCheckedFunctions();
         Runtime.RegisterIOBuiltins();
         Runtime.RegisterCLOSBuiltins();
         // DOTCL-MOP package (AMOP introspection on top of dotcl CLOS).
@@ -2205,7 +2227,7 @@ public static class Startup
         // add-to-init-file, which merges against the home dir) target the real
         // location on every platform.
         RegisterDotcl("USER-INIT-FILE",
-            new LispFunction(args => LispPathname.FromString(UserInitFilePath())));
+            new LispFunction(args => LispPathname.FromString(UserInitFilePath())).WithArgCount(0, 0));
 
         // Pinned vectors: a specialized vector whose storage the GC does not move,
         // so foreign code can use its address (the static-vectors backend).
@@ -2218,12 +2240,12 @@ public static class Startup
         RegisterDotcl("FUNCTION-SIL", new LispFunction(args => {
             if (args[0] is LispFunction f && f.Sil != null) return f.Sil;
             return Nil.Instance;
-        }));
+        }).WithArgCount(1, 1));
 
         // dotcl:getcwd: current working directory as a pathname (uiop:getcwd delegate)
         RegisterDotcl("GETCWD", new LispFunction(args => {
             return LispPathname.FromString(Directory.GetCurrentDirectory() + "/");
-        }));
+        }).WithArgCount(0, 0));
 
         // dotcl:chdir: set the process current directory, POSIX chdir(2) semantics
         // (backs uiop:chdir / uiop:with-current-directory). Returns the new cwd.
@@ -2243,7 +2265,7 @@ public static class Startup
                     $"CHDIR: cannot change directory to {dir}: {e.Message}"));
             }
             return LispPathname.FromString(Directory.GetCurrentDirectory() + "/");
-        }));
+        }).WithArgCount(1, 1));
 
         // dotcl:charpos: the column an output stream is at, the number of
         // characters written since the last newline, or NIL when it is not known
@@ -2278,7 +2300,7 @@ public static class Startup
                     throw new LispErrorException(new LispProgramError(
                         "SYMBOL-GLOBAL-VALUE: requires exactly 1 argument"));
                 var sym = Runtime.GetSymbol(args[0], "SYMBOL-GLOBAL-VALUE");
-                return sym.Value ?? throw new LispErrorException(new LispUnboundVariable(sym));
+                return sym.Value ?? Runtime.UnboundVariableError(sym, global: true);
             }, "SYMBOL-GLOBAL-VALUE", 1));
             var (sgv, _) = DotclPkg.Intern("SYMBOL-GLOBAL-VALUE");
             sgv.SetfFunction = new LispFunction(args => {
@@ -2298,7 +2320,7 @@ public static class Startup
             var name = Runtime.StringValueOrNull(args[0]) ?? args[0].ToString();
             var val = System.Environment.GetEnvironmentVariable(name);
             return val != null ? (LispObject)new LispString(val) : Nil.Instance;
-        }));
+        }).WithArgCount(1, 1));
 
         // dotcl:getpid: the process id (like sb-posix:getpid on SBCL).
         RegisterDotcl("GETPID", new LispFunction(_ => Fixnum.Make(
@@ -2307,11 +2329,13 @@ public static class Startup
 #else
             System.Environment.ProcessId
 #endif
-            ), "GETPID", 0));
+            ), "GETPID", 0).WithArgCount(0, 0));
 
         // dotcl:string-to-octets, dotcl:octets-to-string: as in sb-ext.
-        RegisterDotcl("STRING-TO-OCTETS", new LispFunction(Runtime.StringToOctets, "STRING-TO-OCTETS"));
-        RegisterDotcl("OCTETS-TO-STRING", new LispFunction(Runtime.OctetsToString, "OCTETS-TO-STRING"));
+        RegisterDotcl("STRING-TO-OCTETS", new LispFunction(Runtime.StringToOctets, "STRING-TO-OCTETS")
+            .WithKeyArgs(1, 1, false, "EXTERNAL-FORMAT", "START", "END", "NULL-TERMINATE"));
+        RegisterDotcl("OCTETS-TO-STRING", new LispFunction(Runtime.OctetsToString, "OCTETS-TO-STRING")
+            .WithKeyArgs(1, 1, false, "EXTERNAL-FORMAT", "START", "END"));
 
         // dotcl:setenv: set an environment variable (backs (setf uiop:getenv)).
         // Returns the value set.
@@ -2322,7 +2346,7 @@ public static class Startup
             var value = Runtime.StringValueOrNull(args[1]) ?? args[1].ToString();
             System.Environment.SetEnvironmentVariable(name, value);
             return args[1];
-        }));
+        }).WithArgCount(2, 2));
 
         // dotcl:unsetenv: remove an environment variable (backs uiop:unsetenv).
         // Passing null to SetEnvironmentVariable deletes the entry. Returns NIL.
@@ -2332,7 +2356,7 @@ public static class Startup
             var name = Runtime.StringValueOrNull(args[0]) ?? args[0].ToString();
             System.Environment.SetEnvironmentVariable(name, null);
             return Nil.Instance;
-        }));
+        }).WithArgCount(1, 1));
 
         // dotcl:posix-environ: the environment as "NAME=VALUE" strings, as
         // sb-ext:posix-environ; the form launch-process's :environment takes.
@@ -2345,7 +2369,7 @@ public static class Startup
             for (int i = entries.Count - 1; i >= 0; i--)
                 result = new Cons(new LispString(entries[i]), result);
             return result;
-        }, "POSIX-ENVIRON", 0));
+        }, "POSIX-ENVIRON", 0).WithArgCount(0, 0));
 
         // dotcl:combine-fasls: back uiop:combine-fasls (monolithic FASL bundle).
         // The inputs are not concatenated: a dotcl FASL is a .NET PE assembly, so
@@ -2389,6 +2413,27 @@ public static class Startup
         debugStacktraceSym.IsSpecial = true;
         debugStacktraceSym.Value = Nil.Instance;
 
+        // dotcl:*warn-host-dependent-fasl*: when NIL, LOAD does not warn about a fasl
+        // whose #+ / #- chose by a host feature that differs on this host.
+        var warnHostSym = SymInPkg("*WARN-HOST-DEPENDENT-FASL*", "DOTCL");
+        DotclPkg.Export(warnHostSym);
+        warnHostSym.IsSpecial = true;
+        warnHostSym.Value = T.Instance;
+
+        // dotcl:*host-feature-ignore*: host features (keywords) COMPILE-FILE leaves out of
+        // the record it writes into the fasl.
+        var hostIgnoreSym = SymInPkg("*HOST-FEATURE-IGNORE*", "DOTCL");
+        DotclPkg.Export(hostIgnoreSym);
+        hostIgnoreSym.IsSpecial = true;
+        hostIgnoreSym.Value = Nil.Instance;
+
+        RegisterDotcl("FASL-HOST-FEATURES", new LispFunction(args => {
+            if (args.Length != 1)
+                throw new LispErrorException(new LispProgramError(
+                    "FASL-HOST-FEATURES: requires a fasl pathname"));
+            return Runtime.FaslHostFeatures(Runtime.StringValueOrNull(args[0]) ?? args[0].ToString()!);
+        }, "FASL-HOST-FEATURES", 1));
+
         // dotcl:*foreign-callback-handler*: handler invoked when a Lisp error
         // escapes a C#->Lisp callback (delegate / event / %define-class override).
         // A function of one argument (the condition); its result becomes the
@@ -2417,7 +2462,7 @@ public static class Startup
         RegisterDotcl("%CTYPE-STATS", new LispFunction(args => {
             if (args.Length > 0) Runtime.SetCTypeStats(args[0] is not Nil);
             return new LispString(Runtime.CTypeStats());
-        }));
+        }).WithArgCount(0, 1));
 
         // dotcl:%handler-cluster-depth: (values handler-depth restart-depth). Exposes the
         // live HANDLER-BIND/HANDLER-CASE and RESTART-BIND/RESTART-CASE cluster-stack depths
@@ -2426,7 +2471,7 @@ public static class Startup
             return MultipleValues.Values(
                 Fixnum.Make(HandlerClusterStack.Depth),
                 Fixnum.Make(RestartClusterStack.Depth));
-        }));
+        }).WithArgCount(0, 0));
 
         // dotcl:%throw-raw-clr-exception: throw a .NET exception that never went
         // through SIGNAL, on purpose. The interpreter has to catch and convert
@@ -2447,9 +2492,9 @@ public static class Startup
         DotclPkg.Export(disabledSym);
         disabledSym.IsSpecial = true;
         disabledSym.Value = Nil.Instance;
-        RegisterDotcl("LOCK-PACKAGE", new LispFunction(args => Runtime.LockPackage(args[0])));
-        RegisterDotcl("UNLOCK-PACKAGE", new LispFunction(args => Runtime.UnlockPackage(args[0])));
-        RegisterDotcl("PACKAGE-LOCKED-P", new LispFunction(args => Runtime.PackageLockedP(args[0])));
+        RegisterDotcl("LOCK-PACKAGE", new LispFunction(args => Runtime.LockPackage(args[0])).WithArgCount(1, 1));
+        RegisterDotcl("UNLOCK-PACKAGE", new LispFunction(args => Runtime.UnlockPackage(args[0])).WithArgCount(1, 1));
+        RegisterDotcl("PACKAGE-LOCKED-P", new LispFunction(args => Runtime.PackageLockedP(args[0])).WithArgCount(1, 1));
 
         // The DOTIMES loop test. The compiler has an intrinsic for it that keeps
         // the counter in a raw Int64 slot, but an intrinsic is only reachable
@@ -2497,15 +2542,15 @@ public static class Startup
                              "%ADD-LOCAL-NICKNAME", -1));
         RegisterDotcl("ADD-PACKAGE-LOCAL-NICKNAME",
             new LispFunction(args => Runtime.AddPackageLocalNickname(
-                args[0], args[1], args.Length > 2 ? args[2] : DynamicBindings.Get(Sym("*PACKAGE*")))));
+                args[0], args[1], args.Length > 2 ? args[2] : DynamicBindings.Get(Sym("*PACKAGE*")))).WithArgCount(2, 3));
         RegisterDotcl("REMOVE-PACKAGE-LOCAL-NICKNAME",
             new LispFunction(args => Runtime.RemovePackageLocalNickname(
-                args[0], args.Length > 1 ? args[1] : DynamicBindings.Get(Sym("*PACKAGE*")))));
+                args[0], args.Length > 1 ? args[1] : DynamicBindings.Get(Sym("*PACKAGE*")))).WithArgCount(1, 2));
         RegisterDotcl("PACKAGE-LOCAL-NICKNAMES",
             new LispFunction(args => Runtime.PackageLocalNicknames(
-                args.Length > 0 ? args[0] : DynamicBindings.Get(Sym("*PACKAGE*")))));
+                args.Length > 0 ? args[0] : DynamicBindings.Get(Sym("*PACKAGE*")))).WithArgCount(0, 1));
         RegisterDotcl("PACKAGE-LOCALLY-NICKNAMED-BY-LIST",
-            new LispFunction(args => Runtime.PackageLocallyNicknamedByList(args[0])));
+            new LispFunction(args => Runtime.PackageLocallyNicknamedByList(args[0])).WithArgCount(1, 1));
         // Package units. Not exported until the entry point is settled.
         RegisterDotclInternal("LIST-EVERY-PACKAGE", new LispFunction(args => {
             Runtime.CheckArityExact("LIST-EVERY-PACKAGE", args, 0);
@@ -2563,7 +2608,7 @@ public static class Startup
             return new Cons(letSym, new Cons(bindings, body));
         }, "WITHOUT-PACKAGE-LOCKS"));
 
-        RegisterDotcl("DOTCL-HOMEDIR-PATHNAME", new LispFunction(Runtime.ContribParent));
+        RegisterDotcl("DOTCL-HOMEDIR-PATHNAME", new LispFunction(Runtime.ContribParent).WithArgCount(0, 0));
 
         // dotcl:*exit-hooks*: functions of no arguments called, in order, when
         // the process exits: through dotcl:quit or when the program ends, as
@@ -2579,7 +2624,7 @@ public static class Startup
             int code = args.Length > 0 && args[0] is Fixnum n ? (int)n.Value : 0;
             System.Environment.Exit(code);
             return Nil.Instance; // unreachable
-        }));
+        }).WithArgCount(0, 1));
 
         // dotcl:script-arguments: what a script was given, and nothing else.
         //
@@ -2594,7 +2639,7 @@ public static class Startup
                 for (int i = sa.Count - 1; i >= 0; i--)
                     result = new Cons(new LispString(sa[i]), result);
             return result;
-        }, "SCRIPT-ARGUMENTS", 0));
+        }, "SCRIPT-ARGUMENTS", 0).WithArgCount(0, 0));
 
         // dotcl:command-line-arguments: argv as uiop:raw-command-line-arguments
         // expects it on dotcl.
@@ -2627,12 +2672,14 @@ public static class Startup
             for (int i = argv.Length - 1; i >= 0; i--)
                 result = new Cons(new LispString(argv[i]), result);
             return result;
-        }));
+        }).WithArgCount(0, 0));
 
         // dotcl:save-application: SBCL-style save-lisp-and-die for dotcl.
         // MVP: :executable nil only.
         RegisterDotcl("SAVE-APPLICATION", new LispFunction(
             Runtime.SaveApplication, "SAVE-APPLICATION"));
+        RegisterDotcl("BUILD-LIBRARY", new LispFunction(
+            Runtime.BuildLibraryLisp, "BUILD-LIBRARY"));
 
         // (dotnet-cs lives entirely in contrib/dotnet-cs/;
         // no runtime registration here. IlDisasm.cs stays in runtime as a
@@ -2643,6 +2690,20 @@ public static class Startup
         // locals/labels may span the whole body (e.g. the cross-compiled
         // cil-out.sil). Emits it into ModuleInit via FaslAssembler.AddMonolithicForm.
         // Emit-only: FaslAssembler is excluded from the netstandard2.0 build.
+#if DOTCL_EMIT && NET9_0_OR_GREATER
+        // (dotcl:library-runtime-surface dll-path &optional grouped) => sorted list of the
+        // DotCL.Runtime members the DLL names ("T type", "M type::name(args)->ret",
+        // "F type::name:type"); GROUPED prefixes each with its group (LibrarySurface.Group).
+        RegisterDotcl("LIBRARY-RUNTIME-SURFACE", new LispFunction(args => {
+            var path = Runtime.StringValueOrNull(args[0]) ?? args[0].ToString();
+            LispObject result = Nil.Instance;
+            var entries = LibrarySurface.Entries(System.IO.File.ReadAllBytes(path));
+            bool grouped = args.Length > 1 && args[1] != Nil.Instance;
+            for (int i = entries.Count - 1; i >= 0; i--)
+                result = new Cons(new LispString(grouped ? LibrarySurface.Group(entries[i]) + " " + entries[i] : entries[i]), result);
+            return result;
+        }, "LIBRARY-RUNTIME-SURFACE", -1).WithArgCount(1, 2));
+#endif
 #if DOTCL_EMIT
         // (dotcl:sil-to-fasl input-path output-path &optional module-name)
         // module-name pins a stable .NET assembly name (no per-run guid suffix) for
@@ -2697,7 +2758,7 @@ public static class Startup
 
         // dotcl:main-thread-p: T on the thread the process started on.
         RegisterDotcl("MAIN-THREAD-P",
-            new LispFunction(MainThread.MainThreadP, "MAIN-THREAD-P", 0));
+            new LispFunction(MainThread.MainThreadP, "MAIN-THREAD-P", 0).WithArgCount(0, 0));
 
         // dotcl:gc-stats: (gen0-count gen1-count gen2-count total-memory total-allocated-bytes)
         // Used by TIME to compute before/after deltas.
@@ -2715,7 +2776,7 @@ public static class Startup
                     "COLLECT-INVOKE-STATS: takes exactly 1 argument (T or NIL)"));
             var old = LispFunction.CollectInvokeStats;
             LispFunction.CollectInvokeStats = args[0] is not Nil;
-            return old ? Sym("T") : (LispObject)Nil.Instance;
+            return old ? T.Instance : (LispObject)Nil.Instance;
         }, "COLLECT-INVOKE-STATS", 1));
 
         // dotcl:invoke-slow-stats: alist (((name . argc) . count) ...) sorted by
@@ -2767,7 +2828,7 @@ public static class Startup
             w.WriteLine($"| {"TOTAL",-21} | {total,11:N0} |    |");
             w.Flush();
             return Nil.Instance;
-        }, "ALLOC-REPORT", 0));
+        }, "ALLOC-REPORT", 0).WithArgCount(0, 0));
 
         // dotcl:alloc-stacks: print the sampled allocation stacks collected for
         // the type named by DOTCL_ALLOC_STACK, most frequent first. Optional
@@ -2797,13 +2858,13 @@ public static class Startup
             }
             w.Flush();
             return Nil.Instance;
-        }, "ALLOC-STACKS", -1));
+        }, "ALLOC-STACKS", -1).WithArgCount(0, 1));
 
         // dotcl:alloc-reset: zero all per-type counters.
         RegisterDotcl("ALLOC-RESET", new LispFunction(args => {
             Diagnostics.AllocCounter.Reset();
             return Nil.Instance;
-        }, "ALLOC-RESET", 0));
+        }, "ALLOC-RESET", 0).WithArgCount(0, 0));
 
         // dotcl:phase-report: where COMPILE-FILE's time went, slowest first.
         RegisterDotcl("PHASE-REPORT", new LispFunction(args => {
@@ -2827,12 +2888,12 @@ public static class Startup
             w.WriteLine($"| {"TOTAL",-9} | {total,10:F3} |    |            |");
             w.Flush();
             return Nil.Instance;
-        }, "PHASE-REPORT", 0));
+        }, "PHASE-REPORT", 0).WithArgCount(0, 0));
 
         RegisterDotcl("PHASE-RESET", new LispFunction(args => {
             Diagnostics.PhaseTimer.Reset();
             return Nil.Instance;
-        }, "PHASE-RESET", 0));
+        }, "PHASE-RESET", 0).WithArgCount(0, 0));
 
         // dotcl:%phase-time: charge a thunk's elapsed time to a named phase.
         // Lets the Lisp compiler mark its own phase boundaries; a no-op beyond
@@ -2949,7 +3010,7 @@ public static class Startup
             } catch (System.Exception ex) {
                 return Runtime.List(new Fixnum(1), new LispString(ex.Message), new LispString(""));
             }
-        });
+        }).WithArgCount(1, 2);
         RegisterDotcl("RUN-PROCESS", runProcess);
         RegisterDotcl("%RUN-PROCESS", runProcess); // backward-compat alias
 
@@ -2993,8 +3054,8 @@ public static class Startup
             // so the same keyword can appear twice: the first (normalized) must win.
             // Accept upstream's :error/:if-error-exists names and their
             // :error-output/:if-error-output-exists aliases. :element-type
-            // (unsigned-byte 8) makes the :stream targets byte streams; :wait,
-            // :allow-other-keys, :search are tolerated and ignored.
+            // (unsigned-byte 8) makes the :stream targets byte streams. Other
+            // keywords (UIOP's :wait) need :allow-other-keys, which UIOP passes.
             bool haveIn = false, haveOut = false, haveErr = false, haveDir = false,
                  haveIfIn = false, haveIfOut = false, haveIfErr = false, haveEnv = false,
                  haveEf = false, haveEt = false;
@@ -3033,37 +3094,39 @@ public static class Startup
                 && etArg.Car is Fixnum etBits && etBits.Value == 8;
             return LispProcess.Launch(program, argStrings, dir, input, output, error,
                                       ifInputDne, ifOutputExists, ifErrorExists, env, encoding, binary);
-        }));
+        }).WithKeyArgs(1, 2, false, "DIRECTORY", "ENVIRONMENT", "INPUT", "OUTPUT", "ERROR",
+            "IF-INPUT-DOES-NOT-EXIST", "IF-OUTPUT-EXISTS", "IF-ERROR-EXISTS", "EXTERNAL-FORMAT",
+            "ELEMENT-TYPE", "ERROR-OUTPUT", "IF-ERROR-OUTPUT-EXISTS"));
         RegisterDotcl("PROCESS-INPUT", new LispFunction(args =>
             args[0] is LispProcess p ? p.InputStream
-            : throw new LispErrorException(new LispTypeError("PROCESS-INPUT: not a process", args[0]))));
+            : throw new LispErrorException(new LispTypeError("PROCESS-INPUT: not a process", args[0]))).WithArgCount(1, 1));
         RegisterDotcl("PROCESS-OUTPUT", new LispFunction(args =>
             args[0] is LispProcess p ? p.OutputStream
-            : throw new LispErrorException(new LispTypeError("PROCESS-OUTPUT: not a process", args[0]))));
+            : throw new LispErrorException(new LispTypeError("PROCESS-OUTPUT: not a process", args[0]))).WithArgCount(1, 1));
         RegisterDotcl("PROCESS-ERROR", new LispFunction(args =>
             args[0] is LispProcess p ? p.ErrorStream
-            : throw new LispErrorException(new LispTypeError("PROCESS-ERROR: not a process", args[0]))));
+            : throw new LispErrorException(new LispTypeError("PROCESS-ERROR: not a process", args[0]))).WithArgCount(1, 1));
         RegisterDotcl("PROCESS-PID", new LispFunction(args =>
             args[0] is LispProcess p ? (LispObject)new Fixnum(p.Process.Id)
-            : throw new LispErrorException(new LispTypeError("PROCESS-PID: not a process", args[0]))));
+            : throw new LispErrorException(new LispTypeError("PROCESS-PID: not a process", args[0]))).WithArgCount(1, 1));
         // process-wait: block until exit (and until redirection helpers finish
         // copying, so file output is fully written), return exit code (fixnum).
         RegisterDotcl("PROCESS-WAIT", new LispFunction(args => {
             if (args[0] is not LispProcess p)
                 throw new LispErrorException(new LispTypeError("PROCESS-WAIT: not a process", args[0]));
             return new Fixnum(p.Wait());
-        }));
+        }).WithArgCount(1, 1));
         // process-alive-p: T while running, NIL once exited.
         RegisterDotcl("PROCESS-ALIVE-P", new LispFunction(args =>
             args[0] is LispProcess p
                 ? (p.Process.HasExited ? (LispObject)Nil.Instance : T.Instance)
-                : throw new LispErrorException(new LispTypeError("PROCESS-ALIVE-P: not a process", args[0]))));
+                : throw new LispErrorException(new LispTypeError("PROCESS-ALIVE-P: not a process", args[0]))).WithArgCount(1, 1));
         // process-exit-code: fixnum if exited, NIL if still running.
         RegisterDotcl("PROCESS-EXIT-CODE", new LispFunction(args => {
             if (args[0] is not LispProcess p)
                 throw new LispErrorException(new LispTypeError("PROCESS-EXIT-CODE: not a process", args[0]));
             return p.Process.HasExited ? (LispObject)new Fixnum(p.Process.ExitCode) : Nil.Instance;
-        }));
+        }).WithArgCount(1, 1));
         // process-kill: terminate the process (and its tree); returns NIL.
         RegisterDotcl("PROCESS-KILL", new LispFunction(args => {
             if (args[0] is not LispProcess p)
@@ -3075,7 +3138,7 @@ public static class Startup
             }
             catch { }
             return Nil.Instance;
-        }));
+        }).WithArgCount(1, 1));
 
         // precompiled-only toggle: when set, runtime code generation
         // (eval/compile, define-class, FFI) throws. Mirrors DotclHost.PrecompiledOnly.
@@ -3083,19 +3146,19 @@ public static class Startup
             if (args.Length > 0)
                 Emitter.CilAssembler.PrecompiledOnly = args[0] is not Nil;
             return Emitter.CilAssembler.PrecompiledOnly ? (LispObject)T.Instance : Nil.Instance;
-        }));
+        }).WithArgCount(0, 1));
 
         // Threading primitives: public dotcl: API backed by Runtime.Thread.cs.
         // bordeaux-threads impl-dotcl.lisp delegates to these.
         RegisterDotcl("DELETE-DIRECTORY",
-            new LispFunction(Runtime.DeleteDirectoryFn, "DELETE-DIRECTORY", -1),
+            new LispFunction(Runtime.DeleteDirectoryFn, "DELETE-DIRECTORY", -1).WithKeyArgs(1, 1, false, "RECURSIVE"),
             "Delete the directory PATHSPEC names (in file or directory form). Unless RECURSIVE is true the directory must be empty. Signals FILE-ERROR when there is no directory there, when it is not empty, or when it cannot be deleted. Returns the directory's pathname in directory form.");
         RegisterDotcl("MAKE-THREAD",
-            new LispFunction(Runtime.MakeThread, "MAKE-THREAD", -1));
+            new LispFunction(Runtime.MakeThread, "MAKE-THREAD", -1).WithKeyArgs(1, 1, false, "NAME"));
         RegisterDotcl("CURRENT-THREAD",
-            new LispFunction(Runtime.CurrentThread, "CURRENT-THREAD", 0));
+            new LispFunction(Runtime.CurrentThread, "CURRENT-THREAD", 0).WithArgCount(0, 0));
         RegisterDotcl("THREADP",
-            new LispFunction(Runtime.Threadp, "THREADP", 1));
+            new LispFunction(Runtime.Threadp, "THREADP", 1).WithArgCount(1, 1));
         RegisterDotcl("THREAD-NAME",
             new LispFunction(Runtime.ThreadName, "THREAD-NAME", 1));
         RegisterDotcl("THREAD-ALIVE-P",
@@ -3105,13 +3168,13 @@ public static class Startup
         RegisterDotcl("THREAD-JOIN",
             new LispFunction(Runtime.ThreadJoin, "THREAD-JOIN", 1));
         RegisterDotcl("THREAD-YIELD",
-            new LispFunction(Runtime.ThreadYield, "THREAD-YIELD", 0));
+            new LispFunction(Runtime.ThreadYield, "THREAD-YIELD", 0).WithArgCount(0, 0));
         RegisterDotcl("DESTROY-THREAD",
             new LispFunction(Runtime.DestroyThread, "DESTROY-THREAD", 1));
         RegisterDotcl("INTERRUPT-THREAD",
             new LispFunction(Runtime.InterruptThread, "INTERRUPT-THREAD", 2));
         RegisterDotcl("KNOWN-TYPE-NAME-P",
-            new LispFunction(Runtime.KnownTypeNameP, "KNOWN-TYPE-NAME-P", 1));
+            new LispFunction(Runtime.KnownTypeNameP, "KNOWN-TYPE-NAME-P", 1).WithArgCount(1, 1));
         // DEFTYPE expansion, the MACROEXPAND-1 / MACROEXPAND of type specifiers:
         // (values expansion expandedp). Portability layers such as
         // introspect-environment look for these in the implementation's
@@ -3127,7 +3190,7 @@ public static class Startup
         RegisterDotcl("DECLARATION-NAME-P",
             new LispFunction(args =>
                 args[0] is Symbol s && s.IsDeclarationName ? (LispObject)T.Instance : Nil.Instance,
-                "DECLARATION-NAME-P", 1));
+                "DECLARATION-NAME-P", 1).WithArgCount(1, 1));
         RegisterDotcl("WATCH-FDEFINITION",
             new LispFunction(FunctionWatch.Watch, "WATCH-FDEFINITION", 2),
             "(dotcl:watch-fdefinition symbol function): call FUNCTION with SYMBOL and its new global function definition (NIL when removed) after each change to it; FUNCTION NIL stops watching.");
@@ -3147,20 +3210,20 @@ public static class Startup
                 (args[0] is Symbol s ? s.IsNotinlineProclaimed
                  : Runtime.SetfNameTarget(args[0]) is Symbol t && t.IsSetfNotinlineProclaimed)
                     ? (LispObject)T.Instance : Nil.Instance,
-                "GLOBAL-NOTINLINE-P", 1));
+                "GLOBAL-NOTINLINE-P", 1).WithArgCount(1, 1));
         RegisterDotcl("GLOBAL-INLINE-P",
             new LispFunction(args =>
                 (args[0] is Symbol s ? s.IsInlineProclaimed
                  : Runtime.SetfNameTarget(args[0]) is Symbol t && t.IsSetfInlineProclaimed)
                     ? (LispObject)T.Instance : Nil.Instance,
-                "GLOBAL-INLINE-P", 1));
+                "GLOBAL-INLINE-P", 1).WithArgCount(1, 1));
         RegisterDotcl("FUNCTION-LAMBDA-LIST",
             new LispFunction(args => Runtime.FunctionLambdaList(args[0]),
-                             "FUNCTION-LAMBDA-LIST", 1));
+                             "FUNCTION-LAMBDA-LIST", 1).WithArgCount(1, 1));
         RegisterDotcl("ALL-THREADS",
-            new LispFunction(Runtime.AllThreads, "ALL-THREADS", 0));
+            new LispFunction(Runtime.AllThreads, "ALL-THREADS", 0).WithArgCount(0, 0));
         RegisterDotcl("MAKE-LOCK",
-            new LispFunction(Runtime.MakeLock, "MAKE-LOCK", -1));
+            new LispFunction(Runtime.MakeLock, "MAKE-LOCK", -1).WithArgCount(0, 1));
         var acquireLockFn = new LispFunction(Runtime.AcquireLock, "ACQUIRE-LOCK", -1);
         acquireLockFn.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.AcquireLock1);
         RegisterDotcl("ACQUIRE-LOCK", acquireLockFn);
@@ -3169,32 +3232,32 @@ public static class Startup
         RegisterDotcl("RELEASE-LOCK", releaseLockFn);
         RegisterDotcl("LOCKP",
             new LispFunction(args => args.Length > 0 && args[0] is LispLock
-                ? (LispObject)T.Instance : Nil.Instance, "LOCKP", 1));
+                ? (LispObject)T.Instance : Nil.Instance, "LOCKP", 1).WithArgCount(1, 1));
         RegisterDotcl("MAKE-RECURSIVE-LOCK",
-            new LispFunction(Runtime.MakeRecursiveLock, "MAKE-RECURSIVE-LOCK", -1));
+            new LispFunction(Runtime.MakeRecursiveLock, "MAKE-RECURSIVE-LOCK", -1).WithArgCount(0, 1));
         RegisterDotcl("RECURSIVE-LOCK-P",
             new LispFunction(args => args.Length > 0 && args[0] is LispLock lk && lk.Recursive
-                ? (LispObject)T.Instance : Nil.Instance, "RECURSIVE-LOCK-P", 1));
+                ? (LispObject)T.Instance : Nil.Instance, "RECURSIVE-LOCK-P", 1).WithArgCount(1, 1));
         RegisterDotcl("CONDITION-VARIABLE-P",
             new LispFunction(args => args.Length > 0 && args[0] is LispConditionVariable
-                ? (LispObject)T.Instance : Nil.Instance, "CONDITION-VARIABLE-P", 1));
+                ? (LispObject)T.Instance : Nil.Instance, "CONDITION-VARIABLE-P", 1).WithArgCount(1, 1));
         RegisterDotcl("MAKE-CONDITION-VARIABLE",
-            new LispFunction(Runtime.MakeConditionVariable, "MAKE-CONDITION-VARIABLE", -1));
+            new LispFunction(Runtime.MakeConditionVariable, "MAKE-CONDITION-VARIABLE", -1).WithKeyArgs(0, 0, false, "NAME"));
         RegisterDotcl("CONDITION-WAIT",
-            new LispFunction(Runtime.ConditionWait, "CONDITION-WAIT", -1));
+            new LispFunction(Runtime.ConditionWait, "CONDITION-WAIT", -1).WithKeyArgs(2, 2, false, "TIMEOUT"));
         RegisterDotcl("CONDITION-NOTIFY",
             new LispFunction(Runtime.ConditionNotify, "CONDITION-NOTIFY", 1));
         RegisterDotcl("CONDITION-BROADCAST",
             new LispFunction(Runtime.ConditionBroadcast, "CONDITION-BROADCAST", 1));
         RegisterDotcl("MAKE-SEMAPHORE",
-            new LispFunction(Runtime.MakeSemaphore, "MAKE-SEMAPHORE", -1));
+            new LispFunction(Runtime.MakeSemaphore, "MAKE-SEMAPHORE", -1).WithKeyArgs(0, 0, false, "NAME", "COUNT"));
         RegisterDotcl("SEMAPHORE-P",
             new LispFunction(args => args.Length > 0 && args[0] is LispSemaphore
-                ? (LispObject)T.Instance : Nil.Instance, "SEMAPHORE-P", 1));
+                ? (LispObject)T.Instance : Nil.Instance, "SEMAPHORE-P", 1).WithArgCount(1, 1));
         RegisterDotcl("SIGNAL-SEMAPHORE",
             new LispFunction(Runtime.SignalSemaphore, "SIGNAL-SEMAPHORE", -1));
         RegisterDotcl("WAIT-ON-SEMAPHORE",
-            new LispFunction(Runtime.WaitOnSemaphore, "WAIT-ON-SEMAPHORE", -1));
+            new LispFunction(Runtime.WaitOnSemaphore, "WAIT-ON-SEMAPHORE", -1).WithKeyArgs(1, 1, false, "TIMEOUT"));
 
         // Opt into concurrent eval (drop the process-wide _evalLock). Default is
         // serialized/safe; hosts that call compiled functions from many threads
@@ -3203,30 +3266,30 @@ public static class Startup
             new LispFunction(args => {
                 Runtime.SerializeEval = args.Length == 0 || args[0] is Nil;
                 return args.Length > 0 && args[0] is not Nil ? (LispObject)T.Instance : Nil.Instance;
-            }, "SET-PARALLEL-EVAL", -1));
+            }, "SET-PARALLEL-EVAL", -1).WithArgCount(0, 1));
         RegisterDotcl("PARALLEL-EVAL-P",
             new LispFunction(_ => Runtime.SerializeEval ? Nil.Instance : (LispObject)T.Instance,
-                "PARALLEL-EVAL-P", 0));
+                "PARALLEL-EVAL-P", 0).WithArgCount(0, 0));
 
         // Atomic single-cell primitives (Interlocked-backed). Concurrency layer
         // alongside MAKE-LOCK; bordeaux-threads' atomic-integer backs its counter
         // with one of these for lock-free compare-and-swap / incf / decf.
         RegisterDotcl("MAKE-ATOMIC-LONG",
-            new LispFunction(Runtime.MakeAtomicLong, "MAKE-ATOMIC-LONG", -1));
+            new LispFunction(Runtime.MakeAtomicLong, "MAKE-ATOMIC-LONG", -1).WithArgCount(0, 1));
         RegisterDotcl("ATOMIC-LONG-P",
             new LispFunction(args => args.Length > 0 && args[0] is LispAtomicLong
-                ? (LispObject)T.Instance : Nil.Instance, "ATOMIC-LONG-P", 1));
+                ? (LispObject)T.Instance : Nil.Instance, "ATOMIC-LONG-P", 1).WithArgCount(1, 1));
         RegisterDotcl("ATOMIC-LONG-VALUE",
-            new LispFunction(Runtime.AtomicLongValue, "ATOMIC-LONG-VALUE", 1));
+            new LispFunction(Runtime.AtomicLongValue, "ATOMIC-LONG-VALUE", 1).WithArgCount(1, 1));
         RegisterDotcl("SET-ATOMIC-LONG-VALUE",
-            new LispFunction(Runtime.SetAtomicLongValue, "SET-ATOMIC-LONG-VALUE", 2));
+            new LispFunction(Runtime.SetAtomicLongValue, "SET-ATOMIC-LONG-VALUE", 2).WithArgCount(2, 2));
         RegisterDotcl("ATOMIC-LONG-CAS",
-            new LispFunction(Runtime.AtomicLongCas, "ATOMIC-LONG-CAS", 3));
-        var atomicIncfFn = new LispFunction(Runtime.AtomicLongIncf, "ATOMIC-LONG-INCF", -1);
+            new LispFunction(Runtime.AtomicLongCas, "ATOMIC-LONG-CAS", 3).WithArgCount(3, 3));
+        var atomicIncfFn = new LispFunction(Runtime.AtomicLongIncf, "ATOMIC-LONG-INCF", -1).WithArgCount(1, 2);
         atomicIncfFn.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.AtomicLongIncf1);
         atomicIncfFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.AtomicLongIncf2);
         RegisterDotcl("ATOMIC-LONG-INCF", atomicIncfFn);
-        var atomicDecfFn = new LispFunction(Runtime.AtomicLongDecf, "ATOMIC-LONG-DECF", -1);
+        var atomicDecfFn = new LispFunction(Runtime.AtomicLongDecf, "ATOMIC-LONG-DECF", -1).WithArgCount(1, 2);
         atomicDecfFn.SetDirectDelegate((Func<LispObject, LispObject>)Runtime.AtomicLongDecf1);
         atomicDecfFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)Runtime.AtomicLongDecf2);
         RegisterDotcl("ATOMIC-LONG-DECF", atomicDecfFn);
@@ -3423,7 +3486,7 @@ public static class Startup
 
         // DOTNET package functions
         RegisterDotNet(DotNetPkg, "LOAD-ASSEMBLY", new LispFunction(Runtime.DotNetLoadAssembly, "DOTNET:LOAD-ASSEMBLY", -1),
-            "(dotnet:load-assembly name-or-path) => assembly\nLoad a .NET assembly by simple name, file path, or partial name so its types\nbecome resolvable (cf. dotnet:resolve-type) and callable.");
+            "(dotnet:load-assembly name-or-path) => full-name\nLoad a .NET assembly by simple name, file path, or partial name so its types\nbecome resolvable (cf. dotnet:resolve-type) and callable. Returns the loaded\nassembly's full name as a string.");
         RegisterDotNet(DotNetPkg, "MAKE-DELEGATE", new LispFunction(Runtime.DotNetMakeDelegate, "DOTNET:MAKE-DELEGATE", 2),
             "(dotnet:make-delegate delegate-type fn) => delegate\nWrap a Lisp function FN as a .NET delegate of DELEGATE-TYPE (a type name string).\nEach delegate call marshals the .NET args to Lisp, calls FN, and marshals the\nresult back to the delegate's return type.");
         RegisterDotNet(DotNetPkg, "CALL-OUT", new LispFunction(Runtime.DotNetCallOut, "DOTNET:CALL-OUT", -1),
@@ -3438,7 +3501,7 @@ public static class Startup
             "(dotnet:await awaitable) => value\nBlock until a .NET Task / Task<T> / ValueTask / ValueTask<T> completes and return\nits result marshalled to Lisp (NIL for a void/non-generic awaitable). A faulted\nawaitable rethrows its inner exception so handler-case sees the real condition.\nHolds the calling thread, so run it on a worker thread (bordeaux-threads) when the\ncaller must stay responsive. Non-blocking (async ...) is tracked separately.");
         RegisterDotNet(DotNetPkg, "RESOLVE-TYPE", new LispFunction(Runtime.DotNetResolveType, "DOTNET:RESOLVE-TYPE", 1),
             "(dotnet:resolve-type type-name) => type\nResolve a .NET System.Type from a name string, searching loaded assemblies\n(loading by namespace prefix, probing the app base directory, and COM ProgIDs on\nWindows). Results are memoized until an assembly loads. Errors if not found.");
-        RegisterDotNet(DotNetPkg, "CLEAR-TYPE-CACHE", new LispFunction(Runtime.DotNetClearTypeCache, "DOTNET:CLEAR-TYPE-CACHE", 0),
+        RegisterDotNet(DotNetPkg, "CLEAR-TYPE-CACHE", new LispFunction(Runtime.DotNetClearTypeCache, "DOTNET:CLEAR-TYPE-CACHE", 0).WithArgCount(0, 0),
             "(dotnet:clear-type-cache) => t\nDrop all memoized resolve-type entries so the next resolution re-searches the\ncurrent set of loaded assemblies. Rarely needed; a new assembly load\ninvalidates the cache automatically.");
         RegisterDotNet(DotNetPkg, "CLASS-FOR-TYPE", new LispFunction(Runtime.DotNetClassForType, "DOTNET:CLASS-FOR-TYPE", 1),
             "(dotnet:class-for-type type) => class\nReturn the CLOS class dotcl uses for a .NET type, registering it lazily on first\ncall. TYPE is a System.Type (from dotnet:resolve-type / dotnet:make-generic-type) or\na type-name string/symbol. Use the returned class object directly as a defmethod\nspecializer (via read-time #.), so you never hand-spell a class symbol; handy for\nclosed generics whose auto-derived name is a long assembly-qualified string. e.g.\n(defmethod area ((s #.(dotnet:class-for-type \"MyLib.Shape\"))) ...).");
@@ -3472,11 +3535,11 @@ public static class Startup
             "(dotnet:new type-name &rest args) => instance\nConstruct a new instance of the named .NET type, selecting the constructor by\nargument count and types. ARGS are marshalled from Lisp values.");
         RegisterDotNet(DotNetPkg, "NULL", new LispFunction(Runtime.DotNetNull, "DOTNET:NULL", 0),
             "(dotnet:null) => marker\nReturn a marker that marshals to an explicit .NET null, for a reference or\nNullable<T> parameter. Distinct from Lisp NIL, which marshals to false for a\nbool / Nullable<bool> target.");
-        RegisterDotNet(DotNetPkg, "EXCEPTION-TYPE", new LispFunction(args => Runtime.DotNetExceptionType(args[0]), "DOTNET:EXCEPTION-TYPE", 1),
+        RegisterDotNet(DotNetPkg, "EXCEPTION-TYPE", new LispFunction(args => Runtime.DotNetExceptionType(args[0]), "DOTNET:EXCEPTION-TYPE", 1).WithArgCount(1, 1),
             "(dotnet:exception-type condition) => type-or-nil\nFor a condition wrapping a raw .NET exception (e.g. caught in handler-case),\nreturn the original CLR exception System.Type; NIL for an ordinary Lisp condition.");
-        RegisterDotNet(DotNetPkg, "EXCEPTION-OBJECT", new LispFunction(args => Runtime.DotNetExceptionObject(args[0]), "DOTNET:EXCEPTION-OBJECT", 1),
+        RegisterDotNet(DotNetPkg, "EXCEPTION-OBJECT", new LispFunction(args => Runtime.DotNetExceptionObject(args[0]), "DOTNET:EXCEPTION-OBJECT", 1).WithArgCount(1, 1),
             "(dotnet:exception-object condition) => exception-or-nil\nFor a condition wrapping a raw .NET exception, return the exception instance\nitself as a .NET object; e.g. to read SocketException.SocketErrorCode or walk\nthe InnerException chain. NIL for an ordinary Lisp condition.");
-        RegisterDotNet(DotNetPkg, "EXCEPTION-TYPEP", new LispFunction(args => Runtime.DotNetExceptionTypep(args[0], args[1]), "DOTNET:EXCEPTION-TYPEP", 2),
+        RegisterDotNet(DotNetPkg, "EXCEPTION-TYPEP", new LispFunction(args => Runtime.DotNetExceptionTypep(args[0], args[1]), "DOTNET:EXCEPTION-TYPEP", 2).WithArgCount(2, 2),
             "(dotnet:exception-typep condition type) => boolean\nT if CONDITION wraps a raw .NET exception whose CLR type is TYPE or a subtype\n(Type.IsAssignableFrom). TYPE is a type-name string/symbol or System.Type. This is\nthe matcher dotnet:handler-bind uses.");
         RegisterDotNet(DotNetPkg, "MAKE-GENERIC-TYPE", new LispFunction(Runtime.DotNetMakeGenericType, "DOTNET:MAKE-GENERIC-TYPE", 2),
             "(dotnet:make-generic-type open-type type-args-list) => type\nConstruct a closed generic System.Type from an open generic type definition and a\nlist of type-argument names. OPEN-TYPE may carry the CLR backtick-arity suffix\n(\"...Dictionary`2\") or omit it (arity inferred from the list). The result is\nusable with dotnet:new and other type args. e.g.\n(dotnet:make-generic-type \"System.Collections.Generic.Dictionary\" '(\"System.String\" \"System.Int32\")).");
@@ -3492,6 +3555,7 @@ public static class Startup
             "(dotnet:new-array element-type &rest elements) => array\nCreate a typed .NET array (element-type[]) filled with the marshalled ELEMENTS.\nELEMENT-TYPE is a type-name string/symbol or a resolved System.Type. Build from\na Lisp list with (apply #'dotnet:new-array element-type list). A Lisp list or\nvector is also auto-marshalled to an array-typed parameter or property.");
         RegisterDotNet(DotNetPkg, "%DEFINE-CLASS", new LispFunction(Runtime.DotNetDefineClass, "DOTNET:%DEFINE-CLASS", -1));
         RegisterDotNet(DotNetPkg, "%SAVE-LIBRARY", new LispFunction(Runtime.DotNetSaveLibrary, "DOTNET:%SAVE-LIBRARY", -1));
+        RegisterDotNet(DotNetPkg, "%PACK-LIBRARY", new LispFunction(Runtime.DotNetPackLibrary, "DOTNET:%PACK-LIBRARY", -1));
         RegisterDotNet(DotNetPkg, "%REGISTER-CLASS-HANDLERS", new LispFunction(Runtime.DotNetRegisterClassHandlers, "DOTNET:%REGISTER-CLASS-HANDLERS", -1));
         RegisterDotNet(DotNetPkg, "BOX", new LispFunction(Runtime.DotNetBox, "DOTNET:BOX", -1),
             "(dotnet:box value type-name) => boxed-value\nMarshal a Lisp VALUE to the named .NET type and keep it boxed at that static\ntype, so the right overload is chosen when it is passed to a subsequent call.");
@@ -3500,18 +3564,19 @@ public static class Startup
             return Runtime.DotNetHintType(args[0]);
         }, "DOTNET:HINT-TYPE", 1),
             "(dotnet:hint-type obj) => type-or-nil\nFor a dotnet:box value, return its hint type (the user-supplied static type used\nto choose overloads) as a System.Type; NIL if OBJ carries no hint. See\ndotnet:object-type for the actual runtime type.");
-        RegisterDotNet(DotNetPkg, "TYPE-NAMES", new LispFunction(Runtime.DotNetTypeNames, "DOTNET:TYPE-NAMES", -1),
+        RegisterDotNet(DotNetPkg, "TYPE-NAMES", new LispFunction(Runtime.DotNetTypeNames, "DOTNET:TYPE-NAMES", -1).WithKeyArgs(1, 1, false, "LIMIT"),
             "(dotnet:type-names prefix &key limit) => list of plists\nThe type names starting with PREFIX, as (:name :kind). KIND is :class for a type and\n:namespace for a name that only leads to more names, so \"System.Te\" answers with the\nnamespace \"System.Text.\" as well as the types directly under it. LIMIT caps the\nresult (default 200). Indexed once per change to the loaded assemblies, so a package\npulled in with nuget:require shows up without restarting.");
         RegisterDotNet(DotNetPkg, "DOCUMENTATION", new LispFunction(Runtime.DotNetDocumentation, "DOTNET:DOCUMENTATION", -1),
             "(dotnet:documentation type-or-object &optional member-name) => plist-or-nil\nThe prose .NET ships for a type, or for one of its members: (:summary :parameters\n:returns :exceptions), where :parameters and :exceptions are alists. Read from the XML\nfile beside the assembly, or from the reference pack for the shared framework (which\nships none). NIL when nothing documents it. A property accessor is answered under the\nproperty (get_Length as Length), and an inherited member under the type that declares\nit. e.g. (dotnet:documentation \"System.Text.StringBuilder\" \"AppendLine\").");
-        RegisterDotNet(DotNetPkg, "MEMBERS", new LispFunction(Runtime.DotNetMembers, "DOTNET:MEMBERS", -1),
+        RegisterDotNet(DotNetPkg, "MEMBERS", new LispFunction(Runtime.DotNetMembers, "DOTNET:MEMBERS", -1)
+            .WithKeyArgs(1, 1, false, "KIND", "PREFIX", "STATIC", "INHERITED", "EXTENSIONS", "DOCUMENTATION"),
             "(dotnet:members type-or-object &key kind prefix static inherited extensions documentation) => list of plists\nList what can be called on a type, or on the runtime type of an object: each entry is a plist\n(:name :kind :static :signature :declaring-type). KIND keeps one of :method :property :field\n:event :constructor; PREFIX keeps names starting with a string (case-insensitive); STATIC is\n:both (default), :static or :instance; INHERITED defaults to T; EXTENSIONS defaults to T and\nadds the extension methods that apply to the type. DOCUMENTATION adds :documentation, the\nsentence .NET ships for the member, to the entries that have one. Property accessors are listed under the\nnames dotnet:invoke takes (get_Item, set_Width).");
         RegisterDotNet(DotNetPkg, "OBJECT-TYPE", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError($"DOTNET:OBJECT-TYPE: requires 1 argument, got {args.Length}"));
             return Runtime.DotNetObjectType(args[0]);
         }, "DOTNET:OBJECT-TYPE", 1),
             "(dotnet:object-type obj) => type-or-nil\nReturn the actual runtime type of a .NET object as a System.Type; NIL if OBJ is\nnot a .NET object. For a dotnet:box value this may differ from dotnet:hint-type.");
-        RegisterDotNet(DotNetPkg, "TO-STREAM", new LispFunction(Runtime.DotNetToStream, "DOTNET:TO-STREAM", -1),
+        RegisterDotNet(DotNetPkg, "TO-STREAM", new LispFunction(Runtime.DotNetToStream, "DOTNET:TO-STREAM", -1).WithKeyArgs(1, 1, false, "BINARY", "BIVALENT"),
             "(dotnet:to-stream net-stream &key binary bivalent) => stream\nWrap a .NET System.IO.Stream as a Lisp stream: characters (UTF-8, no BOM),\nbytes with :BINARY, or both on one stream with :BIVALENT. CLOSE on the Lisp\nstream closes the .NET stream (for a socket, the connection).");
 #if DOTCL_EMIT
         // %FFI-CALL / FFI use DynamicMethod + calli (Runtime.FFI.cs): emit-only.
@@ -3524,28 +3589,28 @@ public static class Startup
         RegisterDotNet(DotNetPkg, "MAKE-FFI-CALLBACK", new LispFunction(Runtime.MakeFfiCallback, "DOTNET:MAKE-FFI-CALLBACK", -1),
             "(dotnet:make-ffi-callback fn arg-types ret-type) => pointer\nExpose the Lisp function FN as a native function pointer callable from C. ARG-TYPES\nis a list of type keywords, RET-TYPE a keyword or NIL for void.");
 #endif
-        RegisterDotNet(DotNetPkg, "%FFI-CALL-PTR", new LispFunction(Runtime.FfiCallPtr, "DOTNET:%FFI-CALL-PTR", -1));
-        RegisterDotNet(DotNetPkg, "ALLOC-MEM", new LispFunction(Runtime.AllocMem, "DOTNET:ALLOC-MEM", -1),
+        RegisterDotNet(DotNetPkg, "%FFI-CALL-PTR", new LispFunction(Runtime.FfiCallPtr, "DOTNET:%FFI-CALL-PTR", -1).WithArgCount(3, -1));
+        RegisterDotNet(DotNetPkg, "ALLOC-MEM", new LispFunction(Runtime.AllocMem, "DOTNET:ALLOC-MEM", -1).WithArgCount(1, 1),
             "(dotnet:alloc-mem size) => pointer\nAllocate SIZE bytes of unmanaged memory and return a pointer. Free it with\ndotnet:free-mem.");
-        RegisterDotNet(DotNetPkg, "FREE-MEM", new LispFunction(Runtime.FreeMem, "DOTNET:FREE-MEM", -1),
+        RegisterDotNet(DotNetPkg, "FREE-MEM", new LispFunction(Runtime.FreeMem, "DOTNET:FREE-MEM", -1).WithArgCount(1, 1),
             "(dotnet:free-mem pointer) => nil\nFree unmanaged memory previously allocated with dotnet:alloc-mem.");
-        RegisterDotNet(DotNetPkg, "MEM-READ", new LispFunction(Runtime.MemRead, "DOTNET:MEM-READ", -1),
+        RegisterDotNet(DotNetPkg, "MEM-READ", new LispFunction(Runtime.MemRead, "DOTNET:MEM-READ", -1).WithArgCount(2, 3),
             "(dotnet:mem-read type pointer &optional offset) => value\nRead a value of TYPE (e.g. :int, :double, :pointer, \"int\") from unmanaged memory\nat POINTER plus optional OFFSET bytes. TYPE comes first, as it does in\ndotnet:mem-write.");
-        RegisterDotNet(DotNetPkg, "MEM-WRITE", new LispFunction(Runtime.MemWrite, "DOTNET:MEM-WRITE", -1),
+        RegisterDotNet(DotNetPkg, "MEM-WRITE", new LispFunction(Runtime.MemWrite, "DOTNET:MEM-WRITE", -1).WithArgCount(3, 4),
             "(dotnet:mem-write value type pointer &optional offset) => value\nWrite VALUE as TYPE into unmanaged memory at POINTER plus optional OFFSET bytes.");
-        RegisterDotNet(DotNetPkg, "TYPE-SIZE", new LispFunction(Runtime.TypeSize, "DOTNET:TYPE-SIZE", -1),
+        RegisterDotNet(DotNetPkg, "TYPE-SIZE", new LispFunction(Runtime.TypeSize, "DOTNET:TYPE-SIZE", -1).WithArgCount(1, 1),
             "(dotnet:type-size type) => bytes\nReturn the marshalled size in bytes of TYPE (cf. C sizeof).");
-        RegisterDotNet(DotNetPkg, "TYPE-ALIGN", new LispFunction(Runtime.TypeAlign, "DOTNET:TYPE-ALIGN", -1),
+        RegisterDotNet(DotNetPkg, "TYPE-ALIGN", new LispFunction(Runtime.TypeAlign, "DOTNET:TYPE-ALIGN", -1).WithArgCount(1, 1),
             "(dotnet:type-align type) => bytes\nReturn the alignment requirement in bytes of TYPE (cf. C alignof).");
-        RegisterDotNet(DotNetPkg, "LOAD-LIBRARY", new LispFunction(Runtime.LoadLibrary, "DOTNET:LOAD-LIBRARY", -1),
+        RegisterDotNet(DotNetPkg, "LOAD-LIBRARY", new LispFunction(Runtime.LoadLibrary, "DOTNET:LOAD-LIBRARY", -1).WithArgCount(1, 1),
             "(dotnet:load-library name) => handle\nLoad a native shared library (.dll/.so/.dylib) by name or path and return its\nhandle for use with dotnet:find-symbol / dotnet:free-library.");
-        RegisterDotNet(DotNetPkg, "FREE-LIBRARY", new LispFunction(Runtime.FreeLibrary, "DOTNET:FREE-LIBRARY", -1),
+        RegisterDotNet(DotNetPkg, "FREE-LIBRARY", new LispFunction(Runtime.FreeLibrary, "DOTNET:FREE-LIBRARY", -1).WithArgCount(1, 1),
             "(dotnet:free-library handle) => nil\nUnload a native library previously loaded with dotnet:load-library.");
-        RegisterDotNet(DotNetPkg, "FIND-SYMBOL", new LispFunction(Runtime.FindSymbolInLib, "DOTNET:FIND-SYMBOL", -1),
-            "(dotnet:find-symbol handle name) => pointer\nLook up exported symbol NAME in the native library HANDLE, returning its address.");
-        RegisterDotNet(DotNetPkg, "FIND-SYMBOL-ANY", new LispFunction(Runtime.FindSymbolAny, "DOTNET:FIND-SYMBOL-ANY", -1),
+        RegisterDotNet(DotNetPkg, "FIND-SYMBOL", new LispFunction(Runtime.FindSymbolInLib, "DOTNET:FIND-SYMBOL", -1).WithArgCount(2, 2),
+            "(dotnet:find-symbol name handle) => pointer\nLook up exported symbol NAME in the native library HANDLE, returning its address.");
+        RegisterDotNet(DotNetPkg, "FIND-SYMBOL-ANY", new LispFunction(Runtime.FindSymbolAny, "DOTNET:FIND-SYMBOL-ANY", -1).WithArgCount(1, 1),
             "(dotnet:find-symbol-any name) => pointer\nLook up exported symbol NAME across already-loaded native libraries.");
-        RegisterDotNet(DotNetPkg, "LIBRARY-PATH", new LispFunction(Runtime.LibraryPath, "DOTNET:LIBRARY-PATH", -1),
+        RegisterDotNet(DotNetPkg, "LIBRARY-PATH", new LispFunction(Runtime.LibraryPath, "DOTNET:LIBRARY-PATH", -1).WithArgCount(1, 1),
             "(dotnet:library-path handle) => path\nReturn the file path of the native library identified by HANDLE.");
         // Accessor the stdlib uses to install the above docstrings into the Lisp
         // *documentation-table* once DOCUMENTATION is defined (#25).

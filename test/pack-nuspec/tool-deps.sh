@@ -14,6 +14,9 @@
 # (runtime.csproj) and the library (DotCL.Runtime.csproj) sharing
 # runtime/obj/project.assets.json; see runtime/Directory.Build.props.
 #
+# Also checks that a package carrying dotcl.core carries cil-stdlib.lisp and
+# cil-stdlib.generation beside it.
+#
 # Exits 1 if any tool package lists a dependency, and also if DIR holds no
 # tool package at all, so a pack that produced nothing cannot pass this check.
 set -u
@@ -42,6 +45,17 @@ for nupkg in "$dir"/$pattern; do
     echo "tool-deps: FAIL: $(basename "$nupkg") lists dependencies:"
     echo "$nuspec" | sed -n '/<dependencies>/,/<\/dependencies>/p'
     bad=$((bad + 1))
+  fi
+  # A package that carries the core must carry the source of its Lisp
+  # functions beside it: dotnet:library builds compile the ones a body uses.
+  files=$(unzip -Z1 "$nupkg")
+  if echo "$files" | grep -q '/dotcl\.core$'; then
+    for need in cil-stdlib.lisp cil-stdlib.generation; do
+      echo "$files" | grep -q "/$need\$" || {
+        echo "tool-deps: FAIL: $(basename "$nupkg") carries dotcl.core but not $need"
+        bad=$((bad + 1))
+      }
+    done
   fi
 done
 

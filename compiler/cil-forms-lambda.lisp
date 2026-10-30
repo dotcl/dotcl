@@ -71,6 +71,7 @@
                                           character boolean))
                      (declared-integer-range ret)))))
      t)
+    ((%self-call-single-value-p expr) t)
     (t nil)))
 
 (defun %induction-overflow-step (var key val-expr up)
@@ -106,6 +107,29 @@
           ,@(%frame-set-instrs key var :long)
           (:call "Fixnum.Make"))))))
 
+(defun %setq-sink-into-body (var form)
+  "(SETQ VAR FORM) as FORM with the assignment around its last form, when FORM
+   is a LET, LET*, PROGN or LOCALLY that neither binds VAR nor mentions it in a
+   declaration. NIL otherwise."
+  (labels ((mentions-p (x)
+             (cond ((eq x var) t)
+                   ((consp x) (or (mentions-p (car x)) (mentions-p (cdr x)))))))
+    (when (and (consp form) (consp (cdr form)))
+      (case (car form)
+        ((let let* locally)
+         (let ((bindings (if (eq (car form) 'locally) nil (cadr form)))
+               (body (if (eq (car form) 'locally) (cdr form) (cddr form))))
+           (when (and (listp bindings)
+                      (notany (lambda (b) (eq (if (consp b) (car b) b) var)) bindings))
+             (let ((decls (loop while (and (consp body) (consp (car body))
+                                           (eq (caar body) 'declare))
+                                collect (pop body))))
+               (when (and body (not (mentions-p decls)))
+                 `(,(car form) ,@(if (eq (car form) 'locally) nil (list bindings))
+                   ,@decls ,@(butlast body) (setq ,var ,(car (last body)))))))))
+        (progn
+         `(progn ,@(butlast (cdr form)) (setq ,var ,(car (last form)))))))))
+
 (defun compile-setq (var val-expr)
   "Compile (setq var value). Returns the assigned value on stack (single value)."
   ;; If var is a symbol-macro, delegate to SETF of the expansion (branch on found-p,
@@ -119,6 +143,13 @@
   (when (and (boundp '*cstate*)
              (or (native-slot-p var (cstate-long-locals)) (u64-native-local-p var)))
     (let ((sunk (%mv-setq-sink-inline (list var) val-expr)))
+      (when sunk
+        (return-from compile-setq (compile-expr sunk)))))
+  ;; A LET / LET* / PROGN / LOCALLY value assigned to an Int64 slot: the
+  ;; assignment moves to the last form, which is then compiled in the scope of
+  ;; the bindings (an inline call there stays raw instead of being boxed).
+  (when (and (boundp '*cstate*) (native-slot-p var (cstate-long-locals)))
+    (let ((sunk (%setq-sink-into-body var val-expr)))
       (when sunk
         (return-from compile-setq (compile-expr sunk)))))
   ;; Int64-slot local (long-rep let binding or native body param): store the
@@ -219,6 +250,7 @@
           ;; one. The check is at run time because the symbol may not be a
           ;; constant yet when this form is compiled.
           (let ((tmp (gen-local "SETQSPL")))
+            (xref-record-use :sets var)
             `((:declare-local ,tmp "LispObject")
               ,@val-instrs
               (:stloc ,tmp)
@@ -580,7 +612,8 @@
 (defun %captured-value-types (free-vars boxed-fvs)
   "(FV . TYPE) for each captured free variable of FREE-VARS that is captured by
    value (not in BOXED-FVS) and whose value is known to be an integer in a range
-   ((:RANGE LO . HI)), a fixnum, a single-float or a double-float."
+   ((:RANGE LO . HI)), a fixnum, a single-float, a double-float or an array of
+   a known type ((:ARRAY . SPEC), see CSTATE-ARRAY-SPEC-LOCALS)."
   (loop for fv in free-vars
         for ty = (and (symbolp fv) fv
                       (not (member fv boxed-fvs :test #'eq))
@@ -590,7 +623,8 @@
                         (cond (r (cons :range r))
                               ((fixnum-exact-p fv) '(:fixnum))
                               ((single-float-typed-p fv) '(:single))
-                              ((double-float-typed-p fv) '(:double)))))
+                              ((double-float-typed-p fv) '(:double))
+                              ((array-spec-local fv) (cons :array (array-spec-local fv))))))
         when ty collect (cons fv ty)))
 
 (defun capture-compile-env (boxed-fvs lispbox-fvs &optional free-vars)
@@ -681,6 +715,8 @@
            (loop for (fv . ty) in fv-types
                  when (eq (car ty) kind) collect (var-name fv))))
   (let* ((names (mapcar #'var-name params))
+         (specs (append (extract-array-spec-locals body)
+                        (%captured-array-specs fv-types env-locals params)))
          (*fixnum-locals* (append (extract-fixnum-locals body)
                                   (drop-shadowed-type-locals
                                    names (append (captured :fixnum) *fixnum-locals*))))
@@ -707,12 +743,55 @@
                              (cstate-small-int-locals))
                      +cs-numeric-array-locals+
                      (append (extract-numeric-array-locals body)
+                             (%spec-numeric-entries specs '())
                              (cstate-numeric-array-locals))
+                     +cs-array-spec-locals+
+                     (append specs (cstate-array-spec-locals))
                      +cs-float-range-locals+
                      (append (rekey-by-param (extract-float-range-locals body)
                                              params param-locals)
-                             (cstate-float-range-locals)))))
-    (funcall thunk))))
+                             (cstate-float-range-locals))))
+         (backing (%captured-array-backing specs body)))
+    (if backing
+        (let ((*cstate* (cstate-with *cstate* +cs-array-backing-locals+
+                                     (append backing (cstate-array-backing-locals)))))
+          (append (array-backing-prologue backing)
+                  (unswitch-array-backing backing body thunk)))
+        (funcall thunk)))))
+
+(defun %captured-array-specs (fv-types env-locals params)
+  "CSTATE-ARRAY-SPEC-LOCALS entries, keyed by their slots in the closure, for
+   the captured values FV-TYPES knows the array type of, unless a parameter
+   of the same name covers them."
+  (loop for (fv . ty) in fv-types
+        for key = (cdr (assoc fv env-locals :test #'eq))
+        when (and key (eq (car ty) :array)
+                  (not (member (var-name fv) params :key #'var-name :test #'string=)))
+          collect (list* (var-name fv) key (cdr ty))))
+
+(defun %captured-array-backing (specs body)
+  "Element buffers to fetch on entry to a closure body for the captured arrays
+   SPECS describes that BODY reads or writes with AREF inside a loop. The rank
+   of a type that does not give one is that of the AREFs. The fetch declines
+   for any other array, and every access keeps the per-element helper."
+  (loop for (name key . spec) in specs
+        for names = (cons name (%let-aliases-of body name))
+        for rank = (if (eq (third spec) '*)
+                       (%aref-rank-in body names)
+                       (length (third spec)))
+        for full = (and rank (%array-spec-with-rank spec rank))
+        for kind = (and full
+                        (some (lambda (n)
+                                (%var-iterated-access-p
+                                 body n nil (function %tree-finds-aref-p)))
+                              names)
+                        (%simple-array-backing-kind full))
+        when kind
+          collect (list name key (gen-local "ABACK") kind
+                        (%simple-array-store-narrow full) :maybe
+                        (mapcar (lambda (d) (if (integerp d) d (gen-local "ADIM")))
+                                (%simple-array-backing-dims full))
+                        (second full))))
 
 (defun closure-mv-mode-key (direct-p special-param-syms)
   "The value-mode local for a closure body, or NIL: only a :direct closure is
@@ -959,12 +1038,10 @@
                    (%union-eq (fn-body-special-params body all-params)
                           (remove-if-not #'global-special-p all-params)))
                  (special-push-instrs
-                   (loop for p in special-param-syms
-                         for pkey = (cdr (assoc p param-locals))
-                         append `(,@(compile-sym-lookup p)
-                                  (:castclass "Symbol")
-                                  (:ldloc ,pkey)
-                                  (:call "DynamicBindings.Push"))))
+                   (%special-push-instrs
+                    (loop for p in special-param-syms
+                          for pkey = (cdr (assoc p param-locals))
+                          collect (cons p `((:ldloc ,pkey))))))
                  ;; Also find free vars (non-params) declared special in body.
                  ;; These must be removed from *locals* so body references use
                  ;; DynamicBindings.Get instead of the closure-captured lexical value.
@@ -1262,6 +1339,9 @@
                  `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
                  `((:ldloc ,key))))
            (progn
+             (let ((alt (%renamed-callee thing)))
+               (when alt
+                 (return-from compile-function-special (compile-function-special alt))))
              ;; xref: #'(setf f) is an indirect-call reference, same edge as a call
              (xref-record-call thing)
              `(,@(compile-sym-lookup (cadr thing))
@@ -1293,6 +1373,9 @@
            ;; is authoritative (no cross-package fallback): unqualified #'sym resolves
            ;; via Startup.Sym's bare-name bridge at symbol-resolution time.
            (progn
+             (let ((alt (%renamed-callee thing)))
+               (when alt
+                 (return-from compile-function-special (compile-function-special alt))))
              ;; xref: #'f is an indirect-call reference (funcall/mapcar target),
              ;; recorded as the same caller->callee edge as a direct call.
              (xref-record-call thing)

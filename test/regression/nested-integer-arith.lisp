@@ -189,3 +189,33 @@
         (%nia-let-special)
         (%nia-let-star 5))
   ((3 (:a :b)) 13 6 3 -7 2 16))
+
+;; A second read of the variable that only a macro's expansion shows: the name
+;; built from data (SBCL's backquote holds ,X in a structure), or a symbol macro.
+(defmacro %nia-named (name) (intern name (symbol-package '%nia-named)))
+
+(defun %nia-let-hidden-read (c)
+  (let ((%nia-x (car c)))
+    (+ %nia-x (%nia-named "%NIA-X"))))
+
+(defun %nia-let-hidden-values (c)
+  (let ((%nia-x (car c)))
+    (values %nia-x (%nia-named "%NIA-X"))))
+
+(defun %nia-let-hidden-outer (c)
+  (let ((%nia-x 100))
+    (list %nia-x
+          (let ((%nia-x (car c)))
+            (+ %nia-x (%nia-named "%NIA-X"))))))
+
+(defun %nia-let-symbol-macro (c)
+  (symbol-macrolet ((%nia-y %nia-x))
+    (let ((%nia-x (car c)))
+      (+ %nia-x %nia-y))))
+
+(deftest nested-integer-arith.let-hidden-read
+  (list (%nia-let-hidden-read '(4))
+        (multiple-value-list (%nia-let-hidden-values '(4)))
+        (%nia-let-hidden-outer '(4))
+        (%nia-let-symbol-macro '(4)))
+  (8 (4 4) (100 8) 8))

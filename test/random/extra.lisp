@@ -577,8 +577,12 @@
         (1 `(+ (length (load-time-value (list (rf-lit-struct ,n ,m) (rf-lit-obj ,m ,n)))) ,x))))))
 
 (defun make-random-integer-form (size)
+  ;; One value: a shape's second value (the float remainder of FLOOR, the
+  ;; present-p of GETHASH) would reach a MULTIPLE-VALUE-CALL of #'+ when the
+  ;; shape ends the body of a local function.
   (if (and (>= size 4) (< (random 1.0) cl-user::*rf-extra-rate*))
-      (rcase
+      (list 'values
+       (rcase
         (3 (rf-float-form size))
         (2 (rf-string-form size))
         (2 (rf-array-form size))
@@ -606,5 +610,5 @@
         (2 (rf-array3-form size))
         (2 (rf-stream-form size))
         (2 (rf-printvar-form size))
-        (4 (rf-literal-form size)))
+        (4 (rf-literal-form size))))
       (funcall *rf-original-make-random-integer-form* size)))

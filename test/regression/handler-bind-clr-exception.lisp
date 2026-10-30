@@ -80,25 +80,23 @@ bound to the condition) is returned by a non-local exit."
     :not-signalled)
   nil t)
 
-;;; A restart established between the HANDLER-BIND and the raise point is gone
-;;; by the time the transfer can be taken: a CONTROL-ERROR, not an exception
-;;; that nothing receives.
-(deftest-emitting-only handler-bind-clr-exception.restart-inside
+;;; A restart, or a CATCH, established between the HANDLER-BIND and the raise
+;;; point is reached too: the condition is signalled before those frames unwind.
+(deftest handler-bind-clr-exception.restart-inside
   (handler-case
       (handler-bind ((error (lambda (e) (declare (ignore e)) (invoke-restart '%hbc-skip))))
         (with-simple-restart (%hbc-skip "skip")
           (%hbc-middle #'%hbc-raise)))
     (control-error () :control-error))
-  :control-error)
+  nil t)
 
-;;; A THROW to a CATCH between the HANDLER-BIND and the raise point: the same.
-(deftest-emitting-only handler-bind-clr-exception.catch-inside
+(deftest handler-bind-clr-exception.catch-inside
   (handler-case
       (handler-bind ((error (lambda (e) (declare (ignore e)) (throw '%hbc-in :x))))
         (catch '%hbc-in
           (%hbc-middle #'%hbc-raise)))
     (control-error () :control-error))
-  :control-error)
+  :x)
 
 ;;; The failed cast is a TYPE-ERROR naming FIXNUM (the datum is not known).
 (deftest-emitting-only handler-bind-clr-exception.cast-expected-type

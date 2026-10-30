@@ -43,3 +43,31 @@
   (let ((r (%fiw-nested 5)))
     (list (first r) (aref (first (second r)) 0) (third r)))
   (5d0 5d0 5d0))
+
+;;; Nested immediately-applied lambdas still reach the local INLINE function.
+
+(defun %fiw-immediate ()
+  (flet ((alloc (a b)
+           (ldb (byte 64 0) (logior #xF000000000000000 (ash a 32) b))))
+    (declare (inline alloc))
+    (list ((lambda () ((lambda () (alloc 1 2)))))
+          ((lambda () ((lambda () ((lambda () (alloc 1 2)))))))
+          (let ((a 1) (b 2))
+            ((lambda () ((lambda () (alloc a b)))))))))
+
+(deftest flet-inline-wide-result.nested-immediate
+  (%fiw-immediate)
+  (17293822573397671938 17293822573397671938 17293822573397671938))
+
+(defun %fiw-immediate-mv ()
+  (flet ((alloc (a b)
+           (values (ldb (byte 64 0) (logior #xF000000000000000 (ash a 32) b))
+                   (ldb (byte 64 0) (logior #xE000000000000000 (ash b 32) a)))))
+    (declare (inline alloc))
+    (list (multiple-value-list ((lambda () ((lambda () (alloc 1 2))))))
+          (multiple-value-list ((lambda () ((lambda () ((lambda () (alloc 3 4)))))))))))
+
+(deftest flet-inline-wide-result.nested-immediate-multiple-values
+  (%fiw-immediate-mv)
+  ((17293822573397671938 16140901073085792257)
+   (17293822581987606532 16140901081675726851)))

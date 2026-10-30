@@ -17,7 +17,25 @@
 (defvar *cli-sp-core*
   (regression-child-core))
 
-(defun %cli-sp-run (args) (dotcl:run-process *cli-sp-exe* args))
+;;; The children see a cache home of their own: `clean --dry-run` sizes every
+;;; dotcl-* directory under it, and on a machine with a large compile cache that
+;;; walk, not the code path under test, was most of this file's time.
+(defvar *cli-sp-cache*
+  (let ((dir (concatenate 'string (regression-temp-dir) "/cli-sp-cache/")))
+    (ensure-directories-exist dir)
+    dir))
+
+(defun %cli-sp-call (thunk)
+  (let ((saved (dotcl:getenv "XDG_CACHE_HOME")))
+    (unwind-protect
+         (progn (dotcl:setenv "XDG_CACHE_HOME" *cli-sp-cache*)
+                (funcall thunk))
+      (if saved
+          (dotcl:setenv "XDG_CACHE_HOME" saved)
+          (dotcl:unsetenv "XDG_CACHE_HOME")))))
+
+(defun %cli-sp-run (args)
+  (%cli-sp-call (lambda () (dotcl:run-process *cli-sp-exe* args))))
 
 (defun %cli-sp-cleaned-p (result)
   "True when the child actually ran the clean subcommand (dry run)."
@@ -69,7 +87,8 @@
 ;;; its banner and ends normally.
 (defun %cli-sp-repl-banner (args)
   "First line the child writes to stdout, and its exit code."
-  (let* ((p (dotcl:launch-process *cli-sp-exe* args :input nil :error nil))
+  (let* ((p (%cli-sp-call
+             (lambda () (dotcl:launch-process *cli-sp-exe* args :input nil :error nil))))
          (line (read-line (dotcl:process-output p) nil "")))
     (loop while (read-line (dotcl:process-output p) nil nil))
     (list (and (search "dotcl REPL." line) t) (dotcl:process-wait p))))

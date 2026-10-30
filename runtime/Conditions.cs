@@ -59,6 +59,9 @@ public class LispCondition : LispObject
     /// the InnerException chain (an IOException around a socket timeout), etc.
     /// Null for ordinary Lisp conditions.</summary>
     public System.Exception? ClrException { get; set; }
+    /// <summary>Source position copied from the compiler context when the condition
+    /// was signalled, so a handler can ask after the compilation has moved on.</summary>
+    public LispObject? CompilerSource { get; set; }
     public LispCondition(string message) => _message = message;
     public LispCondition(System.Func<string> messageThunk) => _messageThunk = messageThunk;
     public override string ToString() => $"#<{ConditionTypeName}: {Message}>";
@@ -109,7 +112,7 @@ public class LispStorageCondition : LispCondition
 public class LispCellError : LispError
 {
     public LispObject Name { get; set; }
-    public LispCellError(string message, LispObject name) : base(message) { Name = name; }
+    public LispCellError(string message, LispObject name) : base(message) { Name = Runtime.CanonicalValue(name); }
 }
 
 public class LispUndefinedFunction : LispCellError
@@ -266,7 +269,7 @@ public class LispRestart : LispObject
             return sw.ToString();
         }
         if (Description != null) return Description;
-        if (NameSymbol != null) return Runtime.FormatObject(NameSymbol, true);
+        if (NameSymbol != null) return Runtime.FormatObject(Runtime.CanonicalizeSymbol(NameSymbol), true);
         if (Name != "NIL") return Name;
         return ToString();
     }
@@ -395,6 +398,7 @@ public static class HandlerClusterStack
     /// for the caller to throw: each frame the throw crosses costs.</summary>
     internal static HandlerCaseInvocationException? SignalForExit(LispCondition condition)
     {
+        Runtime.CaptureCompilerSource(condition);
         var clusters = _clusters;
         if (clusters == null) return null;
         for (int i = clusters.Count - 1; i >= 0; i--)
@@ -565,6 +569,16 @@ public static class RestartClusterStack
         return false;
     }
 
+    /// <summary>Whether RESTART is still established, ignoring its test function.</summary>
+    internal static bool IsActive(LispRestart restart)
+    {
+        if (_clusters == null) return false;
+        foreach (var cluster in _clusters)
+            foreach (var r in cluster)
+                if (ReferenceEquals(r, restart)) return true;
+        return false;
+    }
+
     /// <summary>CLHS 9.1.4.2: a restart is visible for CONDITION (NIL included)
     /// only if its test function returns true, and, for a non-NIL condition, it
     /// is associated with that condition or with none.</summary>
@@ -673,15 +687,18 @@ public static class ConditionSystem
     }
 
     private static Symbol? s_debuggerHookSym;
+    private static Symbol? s_invokeDebuggerHookSym;
 
     /// <summary>Whether an unhandled runtime-signalled error goes on to
-    /// INVOKE-DEBUGGER as ERROR does: in the REPL, or when *DEBUGGER-HOOK* is
-    /// neither NIL nor a reporting hook.</summary>
+    /// INVOKE-DEBUGGER as ERROR does: in the REPL, or when
+    /// *INVOKE-DEBUGGER-HOOK* or *DEBUGGER-HOOK* is set to a hook.</summary>
     internal static bool UnhandledErrorsInvokeDebugger
     {
         get
         {
             if (t_unhandledErrorsEnterDebugger) return true;
+            var invSym = s_invokeDebuggerHookSym ??= Startup.SymInPkg("*INVOKE-DEBUGGER-HOOK*", "DOTCL");
+            if (DynamicBindings.TryGet(invSym, out var invHook) && invHook is not Nil) return true;
             var sym = s_debuggerHookSym ??= Startup.Sym("*DEBUGGER-HOOK*");
             return DynamicBindings.TryGet(sym, out var hook)
                 && hook is not Nil
@@ -690,9 +707,10 @@ public static class ConditionSystem
     }
 
     /// <summary>
-    /// Hand an unhandled error to INVOKE-DEBUGGER, which runs *DEBUGGER-HOOK*
-    /// and then the debugger. Returns only when there is no INVOKE-DEBUGGER to
-    /// call or it returned; the caller then unwinds.
+    /// Hand an unhandled error to INVOKE-DEBUGGER, which runs
+    /// dotcl:*INVOKE-DEBUGGER-HOOK*, then *DEBUGGER-HOOK*, then the debugger.
+    /// Returns only when there is no INVOKE-DEBUGGER to call or it returned;
+    /// the caller then unwinds.
     /// </summary>
     internal static void InvokeDebugger(LispCondition condition)
     {
@@ -819,6 +837,69 @@ public static class ConditionSystem
         PollCallSlow();
     }
 
+    /// <summary>The test of PollInterrupt alone, for a loop back-edge whose slow
+    /// path saves the loop's raw float locals around the call: on x64 Unix no
+    /// XMM register survives a call, and a float live across the slow call was
+    /// stored and reloaded on every iteration.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static bool PollPending() => PollGate != 0;
+
+    /// <summary>True where no float register survives a call (x64 other than
+    /// Windows), the only place saving the floats pays: elsewhere the JIT keeps
+    /// them in callee-saved registers, and the saved path only adds moves. A
+    /// static readonly field, so tiered code folds the test away.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static bool PollSavesFloats() => s_pollSavesFloats;
+    private static readonly bool s_pollSavesFloats =
+        System.Runtime.InteropServices.RuntimeInformation.ProcessArchitecture
+            == System.Runtime.InteropServices.Architecture.X64
+        && !System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Windows);
+
+    /// <summary>The slow path of PollInterrupt, after PollPending.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public static void PollInterruptSaved()
+    {
+        if (_countPolls) PollCount++;
+        PollCallSlow();
+    }
+
+    // Not inlined, so the JIT cannot see that the buffer holds the value it
+    // already has and keep the local live across the slow call. The first
+    // values go in with the buffer's creation: a value saved after a call on
+    // this path has to survive that call, and the JIT then stores it to the
+    // frame on every iteration.
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public static double[] PollSave1(int n, double a)
+    { var b = new double[n]; b[0] = a; return b; }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public static double[] PollSave2(int n, double a, double b)
+    { var r = new double[n]; r[0] = a; r[1] = b; return r; }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public static double[] PollSave3(int n, double a, double b, double c)
+    { var r = new double[n]; r[0] = a; r[1] = b; r[2] = c; return r; }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public static double[] PollSave4(int n, double a, double b, double c, double d)
+    { var r = new double[n]; r[0] = a; r[1] = b; r[2] = c; r[3] = d; return r; }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public static void PollSaveD(double[] buffer, int i, double v) => buffer[i] = v;
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    public static double PollLoadD(double[] buffer, int i) => buffer[i];
+
     /// <summary>The work of a poll without counting it: the call entry of a
     /// body that links its own frame polls here.</summary>
     internal static void PollCallSlow()
@@ -861,6 +942,12 @@ public static class ConditionSystem
             {
                 if (Runtime.IsTruthy(Runtime.Typep(condition, bosVal)))
                 {
+                    if (DynamicBindings.TryGet(Startup.Sym("*BREAK-ON-SIGNALS-HOOK*"), out var hookVal)
+                        && hookVal is not Nil)
+                    {
+                        Runtime.Funcall(hookVal, new LispObject[] { condition });
+                        return;
+                    }
                     var breakSym = Startup.Sym("BREAK");
                     if (breakSym.Function is LispFunction breakFn)
                         breakFn.Invoke(new LispString(ConditionText.Report(condition)));

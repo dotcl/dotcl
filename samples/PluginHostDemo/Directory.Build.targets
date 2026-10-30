@@ -1,0 +1,20 @@
+<Project>
+  <!--
+    Only inside a dotcl checkout, and only for the DotCL.Sdk project (LispPlugin):
+    build against this tree instead of the DotCL.Runtime package, which may not
+    be released yet with what the tree has. Copied out of the checkout, this file
+    does nothing and can be deleted.
+  -->
+  <PropertyGroup Condition="'$(UsingDotCLSdk)' == 'true' and Exists('$(MSBuildThisFileDirectory)../../runtime/DotCL.Runtime.csproj')">
+    <_DotclTree>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../'))</_DotclTree>
+    <DisableImplicitDotCLRuntimeReference>true</DisableImplicitDotCLRuntimeReference>
+    <DotclBuildTool>$(_DotclTree)runtime/build-tasks/bin/$(Configuration)/net10.0/DotCL.Build.Tasks.dll</DotclBuildTool>
+    <DotclBaseCore>$(_DotclTree)compiler/dotcl.core</DotclBaseCore>
+    <DotclContribDir>$(_DotclTree)contrib</DotclContribDir>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(_DotclTree)' != ''">
+    <ProjectReference Include="$(_DotclTree)runtime/DotCL.Runtime.csproj" />
+    <ProjectReference Include="$(_DotclTree)runtime/build-tasks/DotCL.Build.Tasks.csproj"
+                      ReferenceOutputAssembly="false" Private="false" />
+  </ItemGroup>
+</Project>

@@ -87,6 +87,36 @@ public static partial class DynamicClassBuilder
                              // cannot see a method whose parameters are nameless.
                              IReadOnlyList<string>? ParamNames = null);
 
+    // Invoke signature of the delegates of the library being built: reflection
+    // cannot read a member of a type that is still being emitted.
+    [ThreadStatic] private static Dictionary<string, (MethodInfo Invoke, Type ReturnType, Type[] Params, Type Type)>? _libraryDelegatesTls;
+    private static Dictionary<string, (MethodInfo Invoke, Type ReturnType, Type[] Params, Type Type)> _libraryDelegates
+        => _libraryDelegatesTls ??= new();
+
+    private static (MethodInfo Invoke, Type ReturnType, Type[] Params, Type Type) DelegateSignature(Type delegateType)
+    {
+        if (delegateType.FullName != null && _libraryDelegates.TryGetValue(delegateType.FullName, out var d))
+            return d;
+        var mi = delegateType.GetMethod("Invoke")
+            ?? throw new ArgumentException(
+                $"delegate {delegateType.FullName} has no Invoke method", nameof(delegateType));
+        return (mi, mi.ReturnType, mi.GetParameters().Select(p => p.ParameterType).ToArray(), delegateType);
+    }
+
+    private static bool IsDelegateType(Type t)
+        => (t.FullName != null && _libraryDelegates.ContainsKey(t.FullName))
+           || typeof(Delegate).IsAssignableFrom(t);
+
+    /// <summary>A class of the library being built, named in a member signature
+    /// before the class exists. PopulateType replaces it with the real type.</summary>
+    internal sealed class LibraryTypeRef : TypeDelegator
+    {
+        public string LibraryName { get; }
+        public LibraryTypeRef(string name) : base(typeof(object)) { LibraryName = name; }
+        public override string Name => LibraryName.Substring(LibraryName.LastIndexOf('.') + 1);
+        public override string? FullName => LibraryName;
+    }
+
     // multi-ctor support: one spec per constructor overload.
     public record CtorSpec(
         LispObject? Body,
@@ -228,6 +258,33 @@ public static partial class DynamicClassBuilder
                 | TypeAttributes.AnsiClass | TypeAttributes.BeforeFieldInit,
             baseType);
 
+        Type Bind(Type t)
+        {
+            if (t is not LibraryTypeRef r) return t;
+            if (r.LibraryName == fullName) return tb;
+            if (_libraryDelegates.TryGetValue(r.LibraryName, out var dg)) return dg.Type;
+            return mb.GetType(r.LibraryName)
+                ?? throw new ArgumentException(
+                    $"{fullName}: {r.LibraryName} must be defined before the class that uses it");
+        }
+        if (fields != null)
+            fields = fields.Select(f => (f.Name, Bind(f.Type))).ToList();
+        if (properties != null)
+            properties = properties.Select(p => (p.Name, Bind(p.Type), p.Notify)).ToList();
+        if (methods != null)
+            methods = methods.Select(m => m with
+            {
+                ReturnType = Bind(m.ReturnType),
+                ParamTypes = m.ParamTypes.Select(Bind).ToList()
+            }).ToList();
+        if (events != null)
+            events = events.Select(e => (e.Name, Bind(e.DelegateType))).ToList();
+        if (ctorSpecs != null)
+            ctorSpecs = ctorSpecs.Select(c => c with
+            {
+                ParamTypes = c.ParamTypes?.Select(Bind).ToList()
+            }).ToList();
+
         // Declared interfaces. Each is a reference type that must be
         // an interface; duplicates are rejected to catch user typos early.
         if (interfaces != null)
@@ -282,7 +339,7 @@ public static partial class DynamicClassBuilder
                     throw new ArgumentException("event name must be non-empty", nameof(events));
                 if (!seenEvents.Add(name))
                     throw new ArgumentException($"duplicate event name: {name}", nameof(events));
-                if (delegateType == null || !typeof(Delegate).IsAssignableFrom(delegateType))
+                if (delegateType == null || !IsDelegateType(delegateType))
                     throw new ArgumentException(
                         $"event type must derive from System.Delegate: {delegateType?.FullName ?? "<null>"}",
                         nameof(events));
@@ -319,7 +376,7 @@ public static partial class DynamicClassBuilder
                             nameof(properties));
                     raiserInfo = found;
                 }
-                EmitAutoProperty(tb, name, type, raiserInfo);
+                EmitAutoProperty(tb, name, type, raiserInfo, interfaces);
             }
         }
 
@@ -368,8 +425,13 @@ public static partial class DynamicClassBuilder
                 if (spec.Body != null)
                 {
                     var ctorKey = MethodDispatchKey(CtorKey, spec.ParamTypes ?? Array.Empty<Type>());
-                    ctorIl.Emit(OpCodes.Ldstr, fullName);
-                    ctorIl.Emit(OpCodes.Ldstr, ctorKey);
+                    if (spec.Body is Symbol bakedCtor)
+                        EmitLoadBakedFunction(ctorIl, tb, bakedCtor, ctorKey, fullName + " constructor");
+                    else
+                    {
+                        ctorIl.Emit(OpCodes.Ldstr, fullName);
+                        ctorIl.Emit(OpCodes.Ldstr, ctorKey);
+                    }
                     ctorIl.Emit(OpCodes.Ldtoken, typeof(void));
                     ctorIl.Emit(OpCodes.Call, GetTypeFromHandleMI);
                     ctorIl.Emit(OpCodes.Ldarg_0);
@@ -384,9 +446,10 @@ public static partial class DynamicClassBuilder
                             ctorIl.Emit(OpCodes.Box, specCtorTypes[i]);
                         ctorIl.Emit(OpCodes.Stelem_Ref);
                     }
-                    ctorIl.Emit(OpCodes.Call, DispatchMI);
+                    ctorIl.Emit(OpCodes.Call, spec.Body is Symbol
+                        ? typeof(DynamicClassBuilder).GetMethod(nameof(InvokeBakedMethod))! : DispatchMI);
                     ctorIl.Emit(OpCodes.Pop);
-                    pendingCtorHandlers.Add((ctorKey, spec.Body));
+                    if (spec.Body is not Symbol) pendingCtorHandlers.Add((ctorKey, spec.Body));
                 }
                 ctorIl.Emit(OpCodes.Ret);
             }
@@ -493,9 +556,29 @@ public static partial class DynamicClassBuilder
         var simple = SanitizeAssemblyName(assemblyName);
         var an = new AssemblyName(simple);
         if (version != null) an.Version = version;
+        _libraryDelegates.Clear();
         var pab = new PersistedAssemblyBuilder(an, typeof(object).Assembly);
         var mb = pab.DefineDynamicModule(simple);
         return new LibraryBuilder(pab, mb, savePath, corlibProfile, simple);
+    }
+
+    /// <summary>
+    /// Like <see cref="BeginLibrary"/>, but the library is also a fasl: Lisp
+    /// forms added to <paramref name="fasl"/> are compiled into it, and a static
+    /// method whose body is a symbol calls the function those forms define
+    /// under it. A module initializer boots the runtime and runs the forms, so
+    /// a consumer needs DotCL.Runtime but no Lisp source and no core.
+    /// </summary>
+    internal static LibraryBuilder BeginBakedLibrary(string savePath, string assemblyName,
+        Version? version, out FaslAssembler fasl)
+    {
+        CilAssembler.EnsureEmitAllowed("dotcl:library");
+        if (string.IsNullOrEmpty(savePath))
+            throw new ArgumentException("savePath must be non-empty", nameof(savePath));
+        var simple = SanitizeAssemblyName(assemblyName);
+        _libraryDelegates.Clear();
+        fasl = new FaslAssembler(simple, version);
+        return new LibraryBuilder(null, fasl.ModuleBuilder, savePath, "netstandard", simple, fasl);
     }
 
     /// <summary>
@@ -508,7 +591,9 @@ public static partial class DynamicClassBuilder
     /// </summary>
     public sealed class LibraryBuilder
     {
-        private readonly PersistedAssemblyBuilder _pab;
+        private readonly PersistedAssemblyBuilder? _pab;
+        private readonly FaslAssembler? _host;
+        private readonly List<(string Name, string[] Uses)> _bakedPackages = new();
         private readonly ModuleBuilder _mb;
         private readonly string _savePath;
         private readonly string _corlibProfile;
@@ -517,10 +602,12 @@ public static partial class DynamicClassBuilder
         private readonly List<(string Id, string Summary)> _docs = new();
         private bool _saved;
 
-        internal LibraryBuilder(PersistedAssemblyBuilder pab, ModuleBuilder mb,
-            string savePath, string corlibProfile, string assemblyName)
+        internal LibraryBuilder(PersistedAssemblyBuilder? pab, ModuleBuilder mb,
+            string savePath, string corlibProfile, string assemblyName,
+            FaslAssembler? host = null)
         {
             _pab = pab;
+            _host = host;
             _mb = mb;
             _savePath = savePath;
             _corlibProfile = corlibProfile;
@@ -534,6 +621,10 @@ public static partial class DynamicClassBuilder
         /// so a C# consumer's IntelliSense shows the summary.
         /// </summary>
         public void AddDoc(string id, string summary) => _docs.Add((id, summary));
+
+        /// <summary>A package the compiled-in forms intern into, created by the
+        /// module initializer when the consuming process lacks it.</summary>
+        internal void AddBakedPackage(string name, string[] uses) => _bakedPackages.Add((name, uses));
 
         /// <summary>
         /// Add one public class to the library. Parameters mirror
@@ -632,7 +723,9 @@ public static partial class DynamicClassBuilder
                 | MethodAttributes.NewSlot | MethodAttributes.Virtual,
                 returnType, paramTypes.ToArray());
             invoke.SetImplementationFlags(MethodImplAttributes.Runtime | MethodImplAttributes.Managed);
-            return tb.CreateType();
+            var created = tb.CreateType();
+            _libraryDelegates[fullName] = (invoke, returnType, paramTypes.ToArray(), created);
+            return created;
         }
 
         /// <summary>
@@ -692,12 +785,20 @@ public static partial class DynamicClassBuilder
         {
             if (_saved) throw new InvalidOperationException("library already saved");
             _saved = true;
+            _libraryDelegates.Clear();
             var dir = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(_savePath));
             if (!string.IsNullOrEmpty(dir)) System.IO.Directory.CreateDirectory(dir);
+            if (_host != null)
+            {
+                EmitModuleInitializer();
+                _host.Save(_savePath, _corlibProfile);
+                WriteXmlDoc();
+                return;
+            }
             byte[] image;
             using (var ms = new System.IO.MemoryStream())
             {
-                _pab.Save(ms);
+                _pab!.Save(ms);
                 image = ms.ToArray();
             }
             // PersistedAssemblyBuilder references System.Private.CoreLib (the
@@ -709,6 +810,46 @@ public static partial class DynamicClassBuilder
             FaslCorlibRetarget.RetargetCorlib(image, _corlibProfile);
             System.IO.File.WriteAllBytes(_savePath, image);
             WriteXmlDoc();
+        }
+
+        // <Module>..cctor: the CLR runs it before anything in the library is
+        // touched, which is what makes `Lib.Fib(30)` work with no setup call.
+        private void EmitModuleInitializer()
+        {
+            var cctor = _mb.DefineGlobalMethod(".cctor",
+                MethodAttributes.Private | MethodAttributes.Static
+                | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName,
+                typeof(void), Type.EmptyTypes);
+            var il = cctor.GetILGenerator();
+            il.Emit(OpCodes.Call, typeof(DotclHost).GetMethod(nameof(DotclHost.Initialize))!);
+            il.Emit(OpCodes.Call, typeof(System.Reflection.Assembly).GetMethod(
+                nameof(System.Reflection.Assembly.GetExecutingAssembly))!);
+            il.Emit(OpCodes.Call, typeof(LibrarySurface).GetMethod(nameof(LibrarySurface.Check))!);
+            _host!.AddAssemblyMetadata(LibrarySurface.KeyRuntimeVersion,
+                typeof(LibrarySurface).Assembly
+                    .GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()
+                    ?.InformationalVersion ?? typeof(LibrarySurface).Assembly.GetName().Version!.ToString());
+            _host.AddAssemblyMetadata(LibrarySurface.KeyRuntimeSource, Startup.RuntimeSource() ?? "");
+            _host.AddAssemblyMetadata(LibrarySurface.KeySurface, LibrarySurface.SurfacePlaceholder);
+            _host.ImageHook = LibrarySurface.StampImage;
+            foreach (var (name, uses) in _bakedPackages)
+            {
+                il.Emit(OpCodes.Ldstr, name);
+                il.Emit(OpCodes.Ldc_I4, uses.Length);
+                il.Emit(OpCodes.Newarr, typeof(string));
+                for (int i = 0; i < uses.Length; i++)
+                {
+                    il.Emit(OpCodes.Dup);
+                    il.Emit(OpCodes.Ldc_I4, i);
+                    il.Emit(OpCodes.Ldstr, uses[i]);
+                    il.Emit(OpCodes.Stelem_Ref);
+                }
+                il.Emit(OpCodes.Call, typeof(DynamicClassBuilder).GetMethod(nameof(EnsureBakedPackage))!);
+            }
+            il.Emit(OpCodes.Call, _host!.ModuleInitMethod);
+            il.Emit(OpCodes.Pop);
+            il.Emit(OpCodes.Ret);
+            _mb.CreateGlobalFunctions();
         }
 
         // Write the sidecar <name>.xml doc file next to the .dll (the standard
@@ -758,15 +899,25 @@ public static partial class DynamicClassBuilder
     /// for `public T Name { get; set; }`.
     /// </summary>
     private static void EmitAutoProperty(TypeBuilder tb, string name, Type propType,
-        (MethodBuilder Raiser, Type[] ParamTypes)? notifyRaiser = null)
+        (MethodBuilder Raiser, Type[] ParamTypes)? notifyRaiser = null,
+        IReadOnlyList<Type>? interfaces = null)
     {
+        var ifaceGet = interfaces != null
+            ? FindMatchingInterfaceMethods(interfaces, "get_" + name, Type.EmptyTypes, propType)
+            : new List<MethodInfo>();
+        var ifaceSet = interfaces != null
+            ? FindMatchingInterfaceMethods(interfaces, "set_" + name, new[] { propType }, typeof(void))
+            : new List<MethodInfo>();
+        const MethodAttributes IfaceSlot = MethodAttributes.Virtual | MethodAttributes.NewSlot
+                                         | MethodAttributes.Final;
         var backing = tb.DefineField("<" + name + ">k__BackingField",
             propType, FieldAttributes.Private);
 
         var getter = tb.DefineMethod("get_" + name,
             MethodAttributes.Public | MethodAttributes.SpecialName
-                | MethodAttributes.HideBySig,
+                | MethodAttributes.HideBySig | (ifaceGet.Count > 0 ? IfaceSlot : 0),
             propType, Type.EmptyTypes);
+        foreach (var target in ifaceGet) tb.DefineMethodOverride(getter, target);
         var gil = getter.GetILGenerator();
         gil.Emit(OpCodes.Ldarg_0);
         gil.Emit(OpCodes.Ldfld, backing);
@@ -774,8 +925,9 @@ public static partial class DynamicClassBuilder
 
         var setter = tb.DefineMethod("set_" + name,
             MethodAttributes.Public | MethodAttributes.SpecialName
-                | MethodAttributes.HideBySig,
+                | MethodAttributes.HideBySig | (ifaceSet.Count > 0 ? IfaceSlot : 0),
             typeof(void), new[] { propType });
+        foreach (var target in ifaceSet) tb.DefineMethodOverride(setter, target);
         var sil = setter.GetILGenerator();
         sil.Emit(OpCodes.Ldarg_0);
         sil.Emit(OpCodes.Ldarg_1);
@@ -866,6 +1018,21 @@ public static partial class DynamicClassBuilder
 
         var il = method.GetILGenerator();
 
+        if (m.LispBody is Symbol bakedFn)
+        {
+            EmitLoadBakedFunction(il, tb, bakedFn, dispatchKey, m.Name);
+            il.Emit(OpCodes.Ldtoken, m.ReturnType);
+            il.Emit(OpCodes.Call, GetTypeFromHandleMI);
+            il.Emit(OpCodes.Ldarg_0);
+            var icells = EmitArgMarshal(il, paramArr, 1);
+            il.Emit(OpCodes.Call, typeof(DynamicClassBuilder).GetMethod(nameof(InvokeBakedMethod))!);
+            EmitDispatchTail(il, m.ReturnType, paramArr, 1, icells);
+            if (baseMethod != null) tb.DefineMethodOverride(method, baseMethod);
+            if (ifaceTargets != null)
+                foreach (var target in ifaceTargets) tb.DefineMethodOverride(method, target);
+            return;
+        }
+
         // DispatchLispMethod(typeName, dispatchKey, returnType, self, object[] args)
         il.Emit(OpCodes.Ldstr, fullName);
         il.Emit(OpCodes.Ldstr, dispatchKey);
@@ -931,6 +1098,17 @@ public static partial class DynamicClassBuilder
 
         var il = method.GetILGenerator();
 
+        if (m.LispBody is Symbol baked)
+        {
+            EmitLoadBakedFunction(il, tb, baked, dispatchKey, m.Name);
+            il.Emit(OpCodes.Ldtoken, m.ReturnType);
+            il.Emit(OpCodes.Call, GetTypeFromHandleMI);
+            var bcells = EmitArgMarshal(il, paramArr, 0);
+            il.Emit(OpCodes.Call, typeof(DynamicClassBuilder).GetMethod(nameof(InvokeBaked))!);
+            EmitDispatchTail(il, m.ReturnType, paramArr, 0, bcells);
+            return;
+        }
+
         // DispatchLispStatic(typeName, dispatchKey, returnType, object[] args)
         il.Emit(OpCodes.Ldstr, fullName);
         il.Emit(OpCodes.Ldstr, dispatchKey);
@@ -941,6 +1119,29 @@ public static partial class DynamicClassBuilder
         il.Emit(OpCodes.Call, DispatchStaticMI);
 
         EmitDispatchTail(il, m.ReturnType, paramArr, 0, cells);
+    }
+
+    /// <summary>
+    /// Push the LispFunction a library body was compiled under BAKED, resolved
+    /// once into a static field of TB.
+    /// </summary>
+    private static void EmitLoadBakedFunction(ILGenerator il, TypeBuilder tb, Symbol baked,
+        string key, string what)
+    {
+        var fnField = tb.DefineField("<fn>" + key, typeof(LispFunction),
+            FieldAttributes.Private | FieldAttributes.Static);
+        var have = il.DefineLabel();
+        il.Emit(OpCodes.Ldsfld, fnField);
+        il.Emit(OpCodes.Dup);
+        il.Emit(OpCodes.Brtrue, have);
+        il.Emit(OpCodes.Pop);
+        il.Emit(OpCodes.Ldstr, baked.HomePackage?.Name
+            ?? throw new ArgumentException($"{what}: an uninterned symbol cannot name a library function"));
+        il.Emit(OpCodes.Ldstr, baked.Name);
+        il.Emit(OpCodes.Call, typeof(DynamicClassBuilder).GetMethod(nameof(ResolveBakedFunction))!);
+        il.Emit(OpCodes.Dup);
+        il.Emit(OpCodes.Stsfld, fnField);
+        il.MarkLabel(have);
     }
 
     /// <summary>
@@ -1043,22 +1244,18 @@ public static partial class DynamicClassBuilder
     private static (MethodBuilder, Type[]) EmitEventRaiser(TypeBuilder tb, FieldBuilder field,
         string eventName, Type delegateType)
     {
-        var invokeMi = delegateType.GetMethod("Invoke")
-            ?? throw new ArgumentException(
-                $"delegate {delegateType.FullName} has no Invoke method",
-                nameof(delegateType));
-        if (invokeMi.ReturnType != typeof(void))
+        var (invokeMi, invokeReturn, invokeParams, _) = DelegateSignature(delegateType);
+        if (invokeReturn != typeof(void))
             throw new ArgumentException(
                 $"event delegate {delegateType.FullName} must return void for auto-raiser",
                 nameof(delegateType));
 
-        var invokeParams = invokeMi.GetParameters();
         bool senderPattern = invokeParams.Length >= 1
-            && invokeParams[0].ParameterType == typeof(object);
+            && invokeParams[0] == typeof(object);
 
         Type[] raiserParams = senderPattern
-            ? invokeParams.Skip(1).Select(p => p.ParameterType).ToArray()
-            : invokeParams.Select(p => p.ParameterType).ToArray();
+            ? invokeParams.Skip(1).ToArray()
+            : invokeParams;
 
         var mb = tb.DefineMethod("On" + eventName,
             MethodAttributes.Public | MethodAttributes.Virtual

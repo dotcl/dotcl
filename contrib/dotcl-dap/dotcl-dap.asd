@@ -3,5 +3,5 @@
 (defsystem "dotcl-dap"
   :description "A Debug Adapter Protocol server inside a running dotcl."
   :version "0.1"
-  :depends-on ("dotcl-thread" "dotcl-socket" "dotcl-jsonrpc")
+  :depends-on ("dotcl-thread" "dotcl-socket" "dotcl-bsd-sockets" "dotcl-jsonrpc")
   :class require-system)

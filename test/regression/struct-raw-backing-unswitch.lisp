@@ -244,16 +244,18 @@
 ;; One test before the loop (the null test and the length test), and the fast
 ;; copy's accesses are bare element loads and stores. The calls that remain are
 ;; the slow copy's, one per access.
+;; The structure keeps its raw slots in fields, so the test before the loop is
+;; the null test only.
 (deftest-emitting-only struct-raw-backing-unswitch.tested-once
   (let ((r (%sru-sil #'%sru-rmw)))
-    (list (%sru-count "Runtime.StructRawBacking" r)
+    (list (%sru-count "Runtime.StructRawInline" r)
           (%sru-count "LDLEN" r)
-          (%sru-count "LDELEM-I8" r)
-          (%sru-count "STELEM-I8" r)
+          (%sru-count "Runtime.RawInlineAt" r)
+          (%sru-count "Runtime.RawInlineSet" r)
           (%sru-count "Runtime.StructRefL" r)
           (%sru-count "Runtime.StructSetL" r)))
   ;; Fast copy: 2 loads, 1 store. Slow copy: the same behind a test each, plus
   ;; the calls.
-  (1 1 4 2 2 1))
+  (1 0 4 2 2 1))
 
 (setf dotcl:*save-sil* nil)

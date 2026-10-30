@@ -78,9 +78,7 @@
   (equal (%csc-all *csc-callers* #'%csc-define-in-memory) (%csc-all-expected))
   t)
 
-;; Not under the interpreter: there UNTRACE leaves the original function
-;; findable by name, and a later FMAKUNBOUND does not reach it.
-(deftest-emitting-only call-symbol-callee.trace
+(deftest call-symbol-callee.trace
   (equal (%csc-trace-all *csc-callers* #'%csc-define-in-memory) (%csc-trace-all-expected))
   t)
 

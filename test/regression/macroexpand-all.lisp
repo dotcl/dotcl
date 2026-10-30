@@ -113,3 +113,25 @@
   (mea '(macrolet ((m (&environment e x) (macroexpand x e)))
           (macrolet ((q () 7)) (m (q)))))
   7)
+
+;;; A macro whose expansion is its own form must be walked as an ordinary call.
+(defmacro mea-identity (&whole form &rest args) (declare (ignore args)) form)
+
+(deftest mea-fixed-point-macro-walks-subforms
+  (equal (mea '(mea-identity (mea-twice 1)))
+         '(mea-identity (progn 1 1)))
+  t)
+
+;;; Standard-macro bridges with no real expander must not loop.
+(deftest mea-fixed-point-standard-macros-terminate
+  (equal (list (mea '(step 1))
+               (mea '(formatter "x"))
+               (mea '(define-symbol-macro mea-fixed-point-sym 1)))
+         '((step 1) (formatter "x") (define-symbol-macro mea-fixed-point-sym 1)))
+  t)
+
+;;; MULTIPLE-VALUE-LIST has a real expansion; series drives MACROEXPAND-1 itself.
+(deftest mea-multiple-value-list-expands
+  (equal (mea '(multiple-value-list (mea-twice 1)))
+         '(multiple-value-call #'list (progn 1 1)))
+  t)

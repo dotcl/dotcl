@@ -1,0 +1,36 @@
+--- a/swank-loader.lisp
++++ b/swank-loader.lisp
+@@ -53,11 +53,12 @@
+   #+clasp '(metering (swank clasp) (swank gray))
+   #+mkcl '((swank mkcl) (swank gray))
+   #+mezzano '((swank mezzano) (swank gray))
++  #+dotcl '((swank dotcl) (swank gray))
+   )
+ 
+ (defparameter *implementation-features*
+   '(:allegro :lispworks :sbcl :clozure :cmu :clisp :ccl :corman :cormanlisp
+-    :armedbear :gcl :ecl :scl :mkcl :clasp :mezzano))
++    :armedbear :gcl :ecl :scl :mkcl :clasp :mezzano :dotcl))
+ 
+ (defparameter *os-features*
+   '(:macosx :linux :windows :mswindows :win32 :solaris :darwin :sunos :hpux
+@@ -110,7 +111,8 @@
+   #+ecl (ecl-version-string)
+   #+clasp (clasp-version-string)
+   #+mezzano (let ((s (lisp-implementation-version)))
+-              (subseq s 0 (position #\space s))))
++              (subseq s 0 (position #\space s)))
++  #+dotcl (lisp-implementation-version))
+ 
+ (defun unique-dir-name ()
+   "Return a name that can be used as a directory name that is
+--- a/swank.asd
++++ b/swank.asd
+@@ -53,6 +53,7 @@
+                              (:file "clasp" :if-feature :clasp)
+                              (:file "mkcl" :if-feature :mkcl)
+                              (:file "mezzano" :if-feature :mezzano)
++                             (:file "dotcl" :if-feature :dotcl)
+                              (:file "gray")
+                              (:file "match")
+                              (:file "rpc")))

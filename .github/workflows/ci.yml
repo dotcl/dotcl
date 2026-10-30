@@ -124,8 +124,18 @@ jobs:
       # configuration is: a run reads the same registry on every machine.
       CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") :ignore-inherited-configuration)'
     steps:
-      # A full disk fails a run somewhere unrelated, much later. Checked first
-      # on our own runners, which keep their disk between runs.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Prune old NuGet packages
+        if: runner.environment != 'github-hosted'
+        run: python3 ci/prune-nuget.py
+
+      # A full disk fails a run somewhere unrelated, much later. Checked right
+      # after the old runtime packs are pruned, on our own runners only (they
+      # keep their disk between runs).
       - name: Free disk space
         if: runner.environment != 'github-hosted'
         run: |
@@ -137,11 +147,6 @@ jobs:
             du -sh "$HOME"/.nuget/packages/* 2>/dev/null | sort -rh | head -20
             exit 1
           fi
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
 
       - name: Runner info
         run: |
@@ -356,6 +361,16 @@ jobs:
         if: env.RUN_FULL == 'true'
         run: make test-host-api
 
+      # The regression files that touch threads, frames, multiple values,
+      # structures, CLOS and conditions, run with a tiny gen0 budget (GC very
+      # often) both from the CLI and from a C# host that has used up .NET's small
+      # TLS block first. A frame-chain head kept at the address of a TLS field
+      # that the GC could move went unnoticed for weeks: the CLI always got the
+      # fixed TLS block, a host (MSBuild, an ASP.NET app) did not. ~1.5 min.
+      - name: Regression under GC stress (CLI and C# host)
+        if: env.RUN_FULL == 'true'
+        run: make test-gc-stress
+
       # Booting from a core held in memory -- the only way in for a host with no
       # filesystem, and the only way in at all for the emit-free runtime. ~25s.
       - name: In-memory core boot
@@ -375,6 +390,12 @@ jobs:
       - name: save-class-library (C# consumes emitted metadata)
         if: env.RUN_FULL == 'true'
         run: make test-save-class-lib
+
+      # A C# host (knows nothing of dotcl) loads a C# plugin and a Common Lisp plugin
+      # baked into a DLL, from a folder, through AssemblyLoadContext. ~15s.
+      - name: plugin host sample (C# host, Lisp plugin)
+        if: env.RUN_FULL == 'true'
+        run: make test-plugin-host-demo
 
       # DOTCL_EMIT_PDB: the .lisp must appear in the PDB with sequence points and
       # named locals, which is what makes the VS / VS Code debugger show Lisp
@@ -463,6 +484,15 @@ jobs:
       DOTCL_CI: "1"
       CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") :ignore-inherited-configuration)'
     steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Prune old NuGet packages
+        if: runner.environment != 'github-hosted'
+        run: python3 ci/prune-nuget.py
+
       # As in the test job.
       - name: Free disk space
         if: runner.environment != 'github-hosted'
@@ -475,11 +505,6 @@ jobs:
             du -sh "$HOME"/.nuget/packages/* 2>/dev/null | sort -rh | head -20
             exit 1
           fi
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
 
       - name: Runner info
         run: |
@@ -646,13 +671,15 @@ jobs:
         run: make update-ansi-state
 
       # Random differential test (test/random/): 1000 fresh random integer
-      # forms, each checked inside dotcl (optimized against notinline) and
+      # forms with the typed shapes (declarations, specialized arrays, local
+      # functions; test/random/typed.lisp), each checked inside dotcl (optimized
+      # against notinline) and
       # replayed on SBCL (Roswell, installed above) with the results diffed.
       # The forms differ on every run, so a red here is a new finding rather
       # than a regression of a known case: the uploaded cases.lsp and
       # self-discrepancies.lsp reproduce it. Full run only.
       - name: Random differential test
-        run: make test-random-forms RANDOM_N=1000
+        run: make test-random-forms RANDOM_N=1000 RANDOM_TYPED=1
 
       - name: Upload random differential test outputs
         if: failure()
@@ -851,6 +878,15 @@ jobs:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 40
     steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Prune old NuGet packages
+        if: runner.environment != 'github-hosted'
+        run: python3 ci/prune-nuget.py
+
       # As in the test job.
       - name: Free disk space
         if: runner.environment != 'github-hosted'
@@ -863,11 +899,6 @@ jobs:
             du -sh "$HOME"/.nuget/packages/* 2>/dev/null | sort -rh | head -20
             exit 1
           fi
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4

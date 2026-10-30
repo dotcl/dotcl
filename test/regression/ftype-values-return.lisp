@@ -68,7 +68,7 @@
 (deftest-emitting-only ftype-values-return.double-is-r8
   (let ((r (%fvr-sil #'%fvr-dsum)))
     (list (%fvr-count "Runtime.Add)" r) (%fvr-count "UNBOX-DOUBLE" r)))
-  (0 2))
+  (0 0))
 
 (deftest-emitting-only ftype-values-return.two-values-stays-generic
   (plusp (%fvr-count "Runtime.Increment" (%fvr-sil #'%fvr-two-use)))

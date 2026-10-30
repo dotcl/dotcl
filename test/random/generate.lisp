@@ -16,6 +16,10 @@
 ;;;;   cl-user::*rf-prune*  how many discrepancies to shrink (default 20)
 ;;;;   cl-user::*rf-extra*  true: also generate the shapes of extra.lisp
 ;;;;                        (floats, strings, arrays, multiple values, exits)
+;;;;   cl-user::*rf-typed*  true: also generate the shapes of typed.lisp
+;;;;                        (declared types, specialized arrays, local functions)
+;;;;   cl-user::*rf-seed*   seed of the generator, an (unsigned-byte 32); NIL
+;;;;                        (default) picks one. Written to self-summary.txt.
 ;;;;   cl-user::*rf-case-timeout*  seconds one case may take (default 300);
 ;;;;                        dotcl only, see RF-START-WATCHDOG
 ;;;;
@@ -31,15 +35,26 @@
 (defvar *rf-prune* 20)
 (defvar *rf-case-timeout* 300)
 (defvar *rf-extra* nil)
+(defvar *rf-typed* nil)
+(defvar *rf-seed* nil)
 
 (load "test/random/load.lisp")
 (when *rf-extra* (load "test/random/extra.lisp"))
+(when *rf-typed* (load "test/random/typed.lisp"))
 
 (in-package :cl-test)
 
+(defvar *rf-safe*)
+
+(defun rf-safety (decls) (or (second (assoc 'safety decls)) 1))
+
 (defun rf-make-case (size nvars)
-  "Same generation steps as TEST-RANDOM-INTEGER-FORM, but returns the case."
-  (let* ((vars (subseq '(a b c d e f g h i j k l m n o p q r s u v w x y z)
+  "Same generation steps as TEST-RANDOM-INTEGER-FORM, but returns the case.
+   The OPTIMIZE settings are drawn first: typed.lisp generates forms that
+   signal an error only when both say safety 1 or more."
+  (let* ((decls1 (make-random-optimize-settings))
+         (decls2 (make-random-optimize-settings))
+         (vars (subseq '(a b c d e f g h i j k l m n o p q r s u v w x y z)
                        0 nvars))
          (var-ranges (mapcar #'make-random-integer-range vars))
          (var-types (mapcar (lambda (range) `(integer ,(car range) ,(cadr range)))
@@ -49,7 +64,8 @@
                                    collect (make-var-desc :name v :type tp)))
                      (*random-int-form-blocks* nil)
                      (*random-int-form-catch-tags* nil)
-                     (*go-tags* nil))
+                     (*go-tags* nil)
+                     (*rf-safe* (and (> (rf-safety decls1) 0) (> (rf-safety decls2) 0))))
                  (with-random-integer-form-params
                    (make-random-integer-form (1+ (random size))))))
          (vals-list
@@ -59,9 +75,24 @@
                                                          (car range)))
                                  var-ranges))))
     (list :vars vars :var-types var-types :vals-list vals-list
-          :decls1 (make-random-optimize-settings)
-          :decls2 (make-random-optimize-settings)
+          :decls1 decls1
+          :decls2 decls2
           :form form)))
+
+(defun rf-seed-random-state (seed)
+  "A random state determined by SEED: MT19937 seeded by init_genrand, in the
+   627-word layout dotcl and SBCL print (#S(RANDOM-STATE :STATE ...))."
+  #+sbcl (sb-ext:seed-random-state seed)
+  #-sbcl
+  (let ((words (list 0 #x9908B0DF 624))
+        (s (ldb (byte 32 0) seed)))
+    (loop for i from 0 below 624
+          do (when (> i 0)
+               (setf s (ldb (byte 32 0) (+ (* 1812433253 (logxor s (ash s -30))) i))))
+             (push s words)
+          finally (setf words (nreverse words)))
+    (let ((*read-eval* nil))
+      (read-from-string (format nil "#S(RANDOM-STATE :STATE ~S)" words)))))
 
 (defun rf-write (obj stream)
   (let ((*package* (find-package :cl-test))
@@ -110,6 +141,9 @@
                (merge-pathnames cl-user::*rf-out* (truename "."))))
          (discrepancies '())
          (start (get-internal-real-time)))
+    (unless cl-user::*rf-seed*
+      (setf cl-user::*rf-seed* (random (expt 2 32) (make-random-state t))))
+    (setf *random-state* (rf-seed-random-state cl-user::*rf-seed*))
     (rf-start-watchdog out)
     (with-open-file (cases (merge-pathnames "cases.lsp" out)
                            :direction :output :if-exists :supersede)
@@ -138,9 +172,13 @@
                       (subseq discrepancies 0
                               (min cl-user::*rf-prune*
                                    (length discrepancies))))))))
-      (with-open-file (s (merge-pathnames "self-discrepancies.lsp" out)
-                         :direction :output :if-exists :supersede)
-        (dolist (d (or pruned discrepancies)) (rf-write d s))))
+      (let ((minimal (or pruned discrepancies)))
+        (with-open-file (s (merge-pathnames "self-discrepancies.lsp" out)
+                           :direction :output :if-exists :supersede)
+          (dolist (d minimal) (rf-write d s)))
+        (dolist (d minimal)
+          (format t "~&random-forms: seed ~D index ~D form ~S~%"
+                  cl-user::*rf-seed* (getf d :index) (getf d :form)))))
     (let ((kinds (make-hash-table :test 'equal)))
       (dolist (d discrepancies) (incf (gethash (rf-kind-key d) kinds 0)))
       (with-open-file (s (merge-pathnames "self-summary.txt" out)
@@ -150,6 +188,8 @@
                   cl-user::*rf-n* (length discrepancies)
                   (/ (- (get-internal-real-time) start)
                      internal-time-units-per-second))
+          (format stream "  seed ~D~@[, extra~]~@[, typed~]~%"
+                  cl-user::*rf-seed* cl-user::*rf-extra* cl-user::*rf-typed*)
           (maphash (lambda (k n) (format stream "  ~5D ~S~%" n k)) kinds))))
     discrepancies))
 

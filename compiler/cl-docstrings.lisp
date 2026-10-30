@@ -259,7 +259,7 @@
    ("ENCODE-UNIVERSAL-TIME" "Return the universal time, an integer count of seconds since 1900, corresponding to the given SECOND, MINUTE, HOUR, DATE, MONTH, YEAR, and optional time ZONE.")
    ("ENDP" "Return true if OBJECT is the empty list, signaling an error if OBJECT is not a list; the standard list-termination test.")
    ("ENOUGH-NAMESTRING" "Return the shortest namestring for PATHNAME that, when merged with DEFAULTS (default *DEFAULT-PATHNAME-DEFAULTS*), still yields PATHNAME.")
-   ("ENSURE-DIRECTORIES-EXIST" "Create any directory components of PATHSPEC that do not yet exist. Returns the pathname and a second value indicating whether a directory was created.")
+   ("ENSURE-DIRECTORIES-EXIST" "Create any directory components of PATHSPEC that do not yet exist. Returns PATHSPEC and a second value indicating whether a directory was created.")
    ("ENSURE-GENERIC-FUNCTION" "Return a generic function named FUNCTION-NAME, creating it or updating an existing one according to keyword options such as :LAMBDA-LIST and :METHOD-CLASS.")
    ("EQ" "Return true if X and Y are the identical object, the most stringent and fastest equality test.")
    ("EQL" "Return true if X and Y are EQ, or are numbers of the same type with the same value, or are the same character.")

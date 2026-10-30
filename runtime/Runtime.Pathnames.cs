@@ -6,10 +6,34 @@ public static partial class Runtime
 
     public static LispObject MakePathname(LispObject[] args)
     {
+        if (args.Length % 2 != 0)
+            throw new LispErrorException(new LispProgramError("MAKE-PATHNAME: odd number of keyword arguments"));
+
+        bool allowOtherKeys = false;
+        bool caseCommon = false;
+        for (int j = 0; j < args.Length; j += 2)
+        {
+            if (args[j] is Symbol s && s.Name == "ALLOW-OTHER-KEYS" && IsTruthy(args[j + 1]))
+                allowOtherKeys = true;
+            else if (args[j] is Symbol c && c.Name == "CASE"
+                     && args[j + 1] is Symbol cs && cs.Name == "COMMON")
+                caseCommon = true;
+        }
+        if (!allowOtherKeys)
+        {
+            for (int j = 0; j < args.Length; j += 2)
+            {
+                if (args[j] is not Symbol key || !IsMakePathnameKeyword(key.Name))
+                    throw new LispErrorException(new LispProgramError(
+                        $"MAKE-PATHNAME: unknown keyword argument {args[j]}"));
+            }
+        }
+
         LispObject? host = null, device = null, name = null, type = null, version = null;
         LispObject? directory = null;
         LispPathname? defaults = null;
-        bool hostSet = false, deviceSet = false, nameSet = false, typeSet = false, directorySet = false, versionSet = false;
+        bool hostSet = false, deviceSet = false, nameSet = false, typeSet = false,
+             directorySet = false, versionSet = false, defaultsSet = false;
 
         // Helper: convert a value to the appropriate LispObject for a pathname component.
         // :WILD keyword -> stored as-is; string -> LispString; NIL -> null; otherwise stored as-is.
@@ -20,12 +44,18 @@ public static partial class Runtime
             return val;
         }
 
-        static LispObject DirectoryComponents(LispObject dir)
+        LispObject? Component(LispObject val)
+        {
+            var c = ToComponent(val);
+            return caseCommon ? DiddlePathnameCase(c) : c;
+        }
+
+        LispObject DirectoryComponents(LispObject dir)
         {
             if (dir is not Cons) return dir;
             var items = new List<LispObject>();
             for (var c = dir; c is Cons cell; c = cell.Cdr)
-                items.Add(ToComponent(cell.Car) ?? Nil.Instance);
+                items.Add(Component(cell.Car) ?? Nil.Instance);
             return Runtime.List(items.ToArray());
         }
 
@@ -34,21 +64,23 @@ public static partial class Runtime
             string key = args[j] switch { Symbol s => s.Name, _ => args[j].ToString() };
             switch (key)
             {
-                case "HOST": host = ToComponent(args[j + 1]); hostSet = true; break;
-                case "DEVICE": device = ToComponent(args[j + 1]); deviceSet = true; break;
+                case "HOST":
+                    if (!hostSet) { host = ToComponent(args[j + 1]); hostSet = true; }
+                    break;
+                case "DEVICE":
+                    if (!deviceSet) { device = Component(args[j + 1]); deviceSet = true; }
+                    break;
                 case "NAME":
-                    nameSet = true;
-                    name = ToComponent(args[j + 1]);
+                    if (!nameSet) { name = Component(args[j + 1]); nameSet = true; }
                     break;
                 case "TYPE":
-                    typeSet = true;
-                    type = ToComponent(args[j + 1]);
+                    if (!typeSet) { type = Component(args[j + 1]); typeSet = true; }
                     break;
                 case "VERSION":
-                    versionSet = true;
-                    version = ToComponent(args[j + 1]);
+                    if (!versionSet) { version = Component(args[j + 1]); versionSet = true; }
                     break;
                 case "DIRECTORY":
+                    if (directorySet) break;
                     directorySet = true;
                     var dirVal = args[j + 1];
                     if (dirVal is Nil) directory = null;
@@ -57,10 +89,12 @@ public static partial class Runtime
                     // CLHS 19.2.2.4.3: a string is (:ABSOLUTE string).
                     else if (dirVal is LispString
                              || (dirVal is LispVector dirVec && dirVec.IsCharVector && dirVec.Rank == 1))
-                        directory = Runtime.List(Startup.Keyword("ABSOLUTE"), ToComponent(dirVal)!);
+                        directory = Runtime.List(Startup.Keyword("ABSOLUTE"), Component(dirVal)!);
                     else directory = DirectoryComponents(dirVal);
                     break;
                 case "DEFAULTS":
+                    if (defaultsSet) break;
+                    defaultsSet = true;
                     var dval = args[j + 1];
                     if (dval is LispPathname dp) defaults = dp;
                     else if (dval is LispString dstr) defaults = FromNamestring(dstr.Value);
@@ -96,9 +130,53 @@ public static partial class Runtime
             isLogical = true;
 
         if (isLogical)
-            return new LispLogicalPathname(host, device, directory, name, type, version);
+            return new LispLogicalPathname(
+                UppercaseLogicalComponent(host), UppercaseLogicalComponent(device),
+                UppercaseLogicalComponent(directory), UppercaseLogicalComponent(name),
+                UppercaseLogicalComponent(type), UppercaseLogicalComponent(version));
 
         return new LispPathname(host, device, directory, name, type, version);
+    }
+
+    private static bool IsMakePathnameKeyword(string name)
+        => name is "HOST" or "DEVICE" or "NAME" or "TYPE" or "VERSION"
+            or "DIRECTORY" or "DEFAULTS" or "CASE" or "ALLOW-OTHER-KEYS";
+
+    private static LispObject? DiddlePathnameCase(LispObject? component)
+    {
+        if (component is LispString s)
+        {
+            bool upper = false, lower = false;
+            foreach (var c in s.Value)
+            {
+                if (char.IsUpper(c)) upper = true;
+                else if (char.IsLower(c)) lower = true;
+            }
+            if (upper && !lower) return new LispString(s.Value.ToLowerInvariant());
+            if (lower && !upper) return new LispString(s.Value.ToUpperInvariant());
+            return component;
+        }
+        if (component is Cons cons)
+        {
+            var items = new List<LispObject>();
+            for (LispObject cur = cons; cur is Cons cell; cur = cell.Cdr)
+                items.Add(DiddlePathnameCase(cell.Car) ?? Nil.Instance);
+            return Runtime.List(items.ToArray());
+        }
+        return component;
+    }
+
+    private static LispObject? UppercaseLogicalComponent(LispObject? component)
+    {
+        if (component is LispString s) return new LispString(s.Value.ToUpperInvariant());
+        if (component is Cons cons)
+        {
+            var items = new List<LispObject>();
+            for (LispObject cur = cons; cur is Cons cell; cur = cell.Cdr)
+                items.Add(UppercaseLogicalComponent(cell.Car) ?? Nil.Instance);
+            return Runtime.List(items.ToArray());
+        }
+        return component;
     }
 
     /// <summary>
@@ -117,24 +195,14 @@ public static partial class Runtime
     {
         LispPathname p, w;
         if (path is LispPathname lp) p = lp;
-        else if (path is LispString ps)
-            p = IsLogicalPathnameString(ps.Value) ? LispLogicalPathname.FromLogicalString(ps.Value) : LispPathname.FromString(ps.Value);
-        else if (path is LispVector pv && pv.IsCharVector)
-        {
-            var pvs = pv.ToCharString();
-            p = IsLogicalPathnameString(pvs) ? LispLogicalPathname.FromLogicalString(pvs) : LispPathname.FromString(pvs);
-        }
+        else if (path is LispString ps) p = FromNamestring(ps.Value);
+        else if (path is LispVector pv && pv.IsCharVector) p = FromNamestring(pv.ToCharString());
         else if (path is LispFileStream pfs) p = LispPathname.FromString(pfs.FilePath);
         else throw new LispErrorException(new LispTypeError("PATHNAME-MATCH-P: not a pathname designator", path));
 
         if (wildcard is LispPathname wp) w = wp;
-        else if (wildcard is LispString ws)
-            w = IsLogicalPathnameString(ws.Value) ? LispLogicalPathname.FromLogicalString(ws.Value) : LispPathname.FromString(ws.Value);
-        else if (wildcard is LispVector wv && wv.IsCharVector)
-        {
-            var wvs = wv.ToCharString();
-            w = IsLogicalPathnameString(wvs) ? LispLogicalPathname.FromLogicalString(wvs) : LispPathname.FromString(wvs);
-        }
+        else if (wildcard is LispString ws) w = FromNamestring(ws.Value);
+        else if (wildcard is LispVector wv && wv.IsCharVector) w = FromNamestring(wv.ToCharString());
         else if (wildcard is LispFileStream wfs) w = LispPathname.FromString(wfs.FilePath);
         else throw new LispErrorException(new LispTypeError("PATHNAME-MATCH-P: not a pathname designator", wildcard));
 
@@ -249,18 +317,19 @@ public static partial class Runtime
         LispPathname s, f, t;
         static LispPathname ToPn(LispObject obj, string who) => obj switch {
             LispPathname p => p,
-            LispString s => IsLogicalPathnameString(s.Value)
-                ? LispLogicalPathname.FromLogicalString(s.Value)
-                : LispPathname.FromString(s.Value),
-            LispVector v when v.IsCharVector => IsLogicalPathnameString(v.ToCharString())
-                ? LispLogicalPathname.FromLogicalString(v.ToCharString())
-                : LispPathname.FromString(v.ToCharString()),
+            LispString s => FromNamestring(s.Value),
+            LispVector v when v.IsCharVector => FromNamestring(v.ToCharString()),
             LispFileStream fs => LispPathname.FromString(fs.FilePath),
             _ => throw new LispErrorException(new LispTypeError($"{who}: not a pathname designator", obj))
         };
         s = ToPn(source, "TRANSLATE-PATHNAME");
         f = ToPn(fromWild, "TRANSLATE-PATHNAME");
         t = ToPn(toWild, "TRANSLATE-PATHNAME");
+
+        if (PathnameMatchP(s, f) is not T)
+            throw new LispErrorException(new LispError(
+                $"TRANSLATE-PATHNAME: source {s} does not match from-wildcard {f}")
+                { ConditionTypeName = "SIMPLE-ERROR" });
 
         // Translate directory: replace the from-wild prefix with to-wild prefix,
         // keeping the subdirectories that matched :wild-inferiors
@@ -270,6 +339,15 @@ public static partial class Runtime
         var newType = TranslateComponent(s.TypeComponent, f.TypeComponent, t.TypeComponent);
 
         var newVersion = TranslateComponent(s.Version, f.Version, t.Version);
+
+        if (t is LispLogicalPathname)
+            return new LispLogicalPathname(
+                UppercaseLogicalComponent(t.Host ?? s.Host),
+                UppercaseLogicalComponent(t.Device ?? s.Device),
+                UppercaseLogicalComponent(newDir),
+                UppercaseLogicalComponent(newName),
+                UppercaseLogicalComponent(newType),
+                UppercaseLogicalComponent(newVersion));
 
         // When source is a logical pathname, lowercase string components in physical result
         bool srcIsLogical = s is LispLogicalPathname;
@@ -283,7 +361,7 @@ public static partial class Runtime
         }
 
         return new LispPathname(
-            t.Host is LispString th && th.Value.Length > 0 ? t.Host : s.Host is LispLogicalPathname ? null : s.Host,
+            t.Host ?? (s is LispLogicalPathname ? null : s.Host),
             t.Device ?? s.Device,
             newDir, newName, newType,
             newVersion);
@@ -377,7 +455,7 @@ public static partial class Runtime
         var input = args[0];
         LispPathname p = input switch {
             LispPathname lp => lp,
-            LispString s => LispPathname.FromString(s.Value),
+            LispString s => FromNamestring(s.Value),
             LispFileStream fs => fs.OriginalPathname ?? LispPathname.FromString(fs.FilePath),
             _ => throw new LispErrorException(new LispTypeError("COMPILE-FILE-PATHNAME: not a pathname designator", input))
         };
@@ -406,9 +484,18 @@ public static partial class Runtime
     /// one. A single character before the colon is always a drive letter, never a host.
     /// </summary>
     internal static LispPathname FromNamestring(string str)
-        => IsLogicalPathnameString(str)
+    {
+        var p = IsLogicalPathnameString(str)
             ? LispLogicalPathname.FromLogicalString(str)
             : LispPathname.FromString(str);
+        // A named physical namestring has no version field, so its version is :NEWEST.
+        if (p is not LispLogicalPathname && p.Version == null
+            && p.NameComponent != null && p.NameComponent is not Nil)
+            return new LispPathname(p.Host, p.Device, p.DirectoryComponent,
+                                    p.NameComponent, p.TypeComponent,
+                                    Startup.Keyword("NEWEST"));
+        return p;
+    }
 
     /// <summary>Coerce a pathname designator to a pathname. CLHS specifies the pathname
     /// accessors and MERGE-PATHNAMES in terms of PATHNAME, so a string designator has to
@@ -500,6 +587,26 @@ public static partial class Runtime
         return merged;
     }
 
+    private static LispObject ParseNamestringJunk(LispObject value, int offset, bool junkAllowed, string substr)
+    {
+        if (junkAllowed)
+            return MultipleValues.Values2(value, Fixnum.Make(offset));
+        throw new LispErrorException(new LispError($"PARSE-NAMESTRING: cannot parse \"{substr}\""));
+    }
+
+    private static int LogicalNamestringBadOffset(string s)
+    {
+        for (int i = 0; i < s.Length; i++)
+        {
+            char ch = s[i];
+            bool wordChar = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+                            || (ch >= '0' && ch <= '9') || ch == '-';
+            if (!wordChar && ch != '*' && ch != ';' && ch != ':' && ch != '.')
+                return i;
+        }
+        return -1;
+    }
+
     internal static void RegisterPathnameBuiltins()
     {
         // USER-HOMEDIR-PATHNAME
@@ -519,77 +626,33 @@ public static partial class Runtime
 
         // LOGICAL-PATHNAME, LOGICAL-PATHNAME-TRANSLATIONS, TRANSLATE-LOGICAL-PATHNAME
         Emitter.CilAssembler.RegisterFunction("LOGICAL-PATHNAME",
-            new LispFunction(args => Runtime.LogicalPathname(args[0])));
+            new LispFunction(args => Runtime.LogicalPathname(args[0])).WithArgCount(1, 1));
         Emitter.CilAssembler.RegisterFunction("LOGICAL-PATHNAME-TRANSLATIONS",
-            new LispFunction(args => Runtime.LogicalPathnameTranslations(args[0])));
+            new LispFunction(args => Runtime.LogicalPathnameTranslations(args[0])).WithArgCount(1, 1));
         Emitter.CilAssembler.RegisterFunction("TRANSLATE-LOGICAL-PATHNAME",
-            new LispFunction(args => { Runtime.CheckArityMin("TRANSLATE-LOGICAL-PATHNAME", args, 1); return Runtime.TranslateLogicalPathname(args[0]); }));
+            new LispFunction(args => Runtime.TranslateLogicalPathname(args[0])).WithKeyArgs(1, 1, false));
 
         // MAKE-PATHNAME as callable function (also compiled inline by cil-compiler)
         Emitter.CilAssembler.RegisterFunction("MAKE-PATHNAME", new LispFunction(Runtime.MakePathname));
 
-        // Pathname accessor functions: accept optional :case keyword (ignored)
-        Emitter.CilAssembler.RegisterFunction("PATHNAME-HOST", new LispFunction(args => {
-            if (args.Length < 1) throw new LispErrorException(new LispProgramError("PATHNAME-HOST: expected at least 1 argument"));
-            if (args.Length > 1 && (args.Length - 1) % 2 != 0)
-                throw new LispErrorException(new LispProgramError("PATHNAME-HOST: odd number of keyword arguments"));
-            if (args.Length > 1) {
-                bool allowOtherKeys = false;
-                for (int i = 1; i < args.Length - 1; i += 2) {
-                    if (args[i] is Symbol s && s.Name == "ALLOW-OTHER-KEYS" && args[i+1] is not Nil)
-                        allowOtherKeys = true;
-                }
-                if (!allowOtherKeys) {
-                    for (int i = 1; i < args.Length - 1; i += 2) {
-                        if (!(args[i] is Symbol s && (s.Name == "CASE" || s.Name == "ALLOW-OTHER-KEYS")))
-                            throw new LispErrorException(new LispProgramError("PATHNAME-HOST: unknown keyword argument"));
-                    }
-                }
-            }
-            return Runtime.PathnameHost(args[0]);
-        }, "PATHNAME-HOST", -1));
-
-        Emitter.CilAssembler.RegisterFunction("PATHNAME-DEVICE", new LispFunction(args => {
-            if (args.Length < 1) throw new LispErrorException(new LispProgramError("PATHNAME-DEVICE: expected at least 1 argument"));
-            if (args.Length > 1 && (args.Length - 1) % 2 != 0)
-                throw new LispErrorException(new LispProgramError("PATHNAME-DEVICE: odd number of keyword arguments"));
-            if (args.Length > 1) {
-                bool allowOtherKeys = false;
-                for (int i = 1; i < args.Length - 1; i += 2) {
-                    if (args[i] is Symbol s && s.Name == "ALLOW-OTHER-KEYS" && args[i+1] is not Nil)
-                        allowOtherKeys = true;
-                }
-                if (!allowOtherKeys) {
-                    for (int i = 1; i < args.Length - 1; i += 2) {
-                        if (!(args[i] is Symbol s && (s.Name == "CASE" || s.Name == "ALLOW-OTHER-KEYS")))
-                            throw new LispErrorException(new LispProgramError("PATHNAME-DEVICE: unknown keyword argument"));
-                    }
-                }
-            }
-            return Runtime.PathnameDevice(args[0]);
-        }, "PATHNAME-DEVICE", -1));
-
-        Emitter.CilAssembler.RegisterFunction("PATHNAME-NAME", new LispFunction(args => {
-            if (args.Length < 1) throw new LispErrorException(new LispProgramError("PATHNAME-NAME: expected at least 1 argument"));
-            return Runtime.PathnameName(args[0]);
-        }, "PATHNAME-NAME", -1));
-
-        Emitter.CilAssembler.RegisterFunction("PATHNAME-TYPE", new LispFunction(args => {
-            if (args.Length < 1) throw new LispErrorException(new LispProgramError("PATHNAME-TYPE: expected at least 1 argument"));
-            return Runtime.PathnameType(args[0]);
-        }, "PATHNAME-TYPE", -1));
+        // Pathname accessor functions: accept the :case keyword (ignored)
+        Emitter.CilAssembler.RegisterFunction("PATHNAME-HOST",
+            new LispFunction(args => Runtime.PathnameHost(args[0]), "PATHNAME-HOST", -1).WithKeyArgs(1, 1, false, "CASE"));
+        Emitter.CilAssembler.RegisterFunction("PATHNAME-DEVICE",
+            new LispFunction(args => Runtime.PathnameDevice(args[0]), "PATHNAME-DEVICE", -1).WithKeyArgs(1, 1, false, "CASE"));
+        Emitter.CilAssembler.RegisterFunction("PATHNAME-NAME",
+            new LispFunction(args => Runtime.PathnameName(args[0]), "PATHNAME-NAME", -1).WithKeyArgs(1, 1, false, "CASE"));
+        Emitter.CilAssembler.RegisterFunction("PATHNAME-TYPE",
+            new LispFunction(args => Runtime.PathnameType(args[0]), "PATHNAME-TYPE", -1).WithKeyArgs(1, 1, false, "CASE"));
 
         Emitter.CilAssembler.RegisterFunction("PATHNAME-VERSION", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("PATHNAME-VERSION: expected exactly 1 argument"));
             return Runtime.PathnameVersion(args[0]);
         }, "PATHNAME-VERSION", -1));
 
-        var pathnameDirFn = new LispFunction(args => {
-            if (args.Length < 1) throw new LispErrorException(new LispProgramError("PATHNAME-DIRECTORY: expected at least 1 argument"));
-            return Runtime.PathnameDirectory(args[0]);
-        }, "PATHNAME-DIRECTORY", -1);
-        // 1-arg direct delegate: same code path as the wrapper with one argument
-        // (the :case keyword was already ignored by the wrapper).
+        var pathnameDirFn = new LispFunction(args => Runtime.PathnameDirectory(args[0]), "PATHNAME-DIRECTORY", -1)
+            .WithKeyArgs(1, 1, false, "CASE");
+        // 1-arg direct delegate: same code path as the wrapper with one argument.
         pathnameDirFn.SetDirectDelegate((Func<LispObject, LispObject>)(a => Runtime.PathnameDirectory(a)));
         Emitter.CilAssembler.RegisterFunction("PATHNAME-DIRECTORY", pathnameDirFn);
 
@@ -618,7 +681,9 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("DIRECTORY-NAMESTRING", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError($"DIRECTORY-NAMESTRING: expected 1 argument, got {args.Length}"));
             var p = Startup.ToPathname(args[0], "DIRECTORY-NAMESTRING");
-            var dirP = new LispPathname(null, null, p.DirectoryComponent, null, null, null);
+            var dirP = p is LispLogicalPathname
+                ? (LispPathname)new LispLogicalPathname(null, null, p.DirectoryComponent, null, null, null)
+                : new LispPathname(null, null, p.DirectoryComponent, null, null, null);
             return new LispString(dirP.ToNamestring());
         }));
 
@@ -644,8 +709,14 @@ public static partial class Runtime
 
             bool sameDir = Startup.LispObjectEqual(p.DirectoryComponent, defaults.DirectoryComponent);
             if (sameDir) {
-                var fileP = new LispPathname(null, null, null, p.NameComponent, p.TypeComponent, p.Version);
-                return new LispString(fileP.ToNamestring());
+                // A relative directory is prepended again when merged, so it has to stay.
+                bool relative = p.DirectoryComponent is Cons sameCons
+                    && sameCons.Car is Symbol sameRoot && sameRoot.Name == "RELATIVE";
+                if (!relative)
+                {
+                    var fileP = new LispPathname(null, null, null, p.NameComponent, p.TypeComponent, p.Version);
+                    return new LispString(fileP.ToNamestring());
+                }
             }
 
             if (p.DirectoryComponent is Cons pDir && defaults.DirectoryComponent is Cons dDir) {
@@ -684,7 +755,7 @@ public static partial class Runtime
             // a caller-supplied default could never be applied on top of it: the
             // "still nil after merge" test was already false by the time it ran.
             return Runtime.MergePathnames(path, defaults, defaultVersion);
-        }));
+        }).WithArgCount(1, 3));
 
         // WILD-PATHNAME-P: check if pathname has wildcard components
         Emitter.CilAssembler.RegisterFunction("WILD-PATHNAME-P", new LispFunction(args => {
@@ -736,75 +807,109 @@ public static partial class Runtime
         // PARSE-NAMESTRING
         Emitter.CilAssembler.RegisterFunction("PARSE-NAMESTRING",
             new LispFunction(args => {
-                Runtime.CheckArityMin("PARSE-NAMESTRING", args, 1);
                 var thing = args[0];
 
+                int start = 0;
+                int? end = null;
+                bool junkAllowed = false;
+                bool startSeen = false, endSeen = false, junkSeen = false;
+                for (int i = 3; i < args.Length - 1; i += 2)
+                {
+                    if (args[i] is Symbol kw)
+                    {
+                        if (!startSeen && kw.Name == "START" && args[i + 1] is Fixnum sf)
+                        { start = (int)sf.Value; startSeen = true; }
+                        else if (!endSeen && kw.Name == "END" && args[i + 1] is Fixnum ef)
+                        { end = (int)ef.Value; endSeen = true; }
+                        else if (!endSeen && kw.Name == "END" && args[i + 1] is Nil)
+                        { end = null; endSeen = true; }
+                        else if (!junkSeen && kw.Name == "JUNK-ALLOWED")
+                        { junkAllowed = Runtime.IsTruthy(args[i + 1]); junkSeen = true; }
+                    }
+                }
+
                 if (thing is LispPathname pn)
-                    return MultipleValues.Values2(pn, Fixnum.Make(0));
+                    return MultipleValues.Values2(pn, Fixnum.Make(start));
 
                 if (thing is LispFileStream fs2)
-                    return MultipleValues.Values2(LispPathname.FromString(fs2.FilePath), Fixnum.Make(0));
+                    return MultipleValues.Values2(LispPathname.FromString(fs2.FilePath), Nil.Instance);
 
                 string str;
                 if (thing is LispString ls) str = ls.Value;
                 else if (thing is LispVector vec && vec.IsCharVector) str = vec.ToCharString();
                 else throw new LispErrorException(new LispTypeError("PARSE-NAMESTRING: not a string or pathname", thing));
 
-                int kwCount = args.Length - 3;
-                if (kwCount > 0) {
-                    if (kwCount % 2 != 0)
-                        throw new LispErrorException(new LispProgramError("PARSE-NAMESTRING: odd number of keyword arguments"));
-                    for (int i = 3; i < args.Length; i += 2)
-                    {
-                        if (!(args[i] is Symbol kw2 && (kw2.Name == "START" || kw2.Name == "END" || kw2.Name == "JUNK-ALLOWED")))
-                            throw new LispErrorException(new LispProgramError("PARSE-NAMESTRING: invalid keyword argument"));
-                    }
-                }
-                int start = 0;
-                int end = str.Length;
-                bool junkAllowed = false;
-                for (int i = 3; i < args.Length - 1; i += 2)
+                int strEnd = end ?? str.Length;
+
+                string? logicalHost = null;
+                bool explicitLogicalHost = false;
+                var hostArg = args.Length > 1 ? args[1] : Nil.Instance;
+                if (hostArg is LispString hs
+                    && Runtime._logicalPathnameTranslations.ContainsKey(hs.Value.ToUpperInvariant()))
+                    { logicalHost = hs.Value.ToUpperInvariant(); explicitLogicalHost = true; }
+                else if (hostArg is Symbol hsym && hsym.Name != null
+                         && Runtime._logicalPathnameTranslations.ContainsKey(hsym.Name.ToUpperInvariant()))
+                    { logicalHost = hsym.Name.ToUpperInvariant(); explicitLogicalHost = true; }
+                if (logicalHost == null && args.Length > 2)
                 {
-                    if (args[i] is Symbol kw)
+                    LispPathname? defaultsPn = args[2] switch
                     {
-                        if (kw.Name == "START" && args[i + 1] is Fixnum sf) start = (int)sf.Value;
-                        else if (kw.Name == "END" && args[i + 1] is Fixnum ef) end = (int)ef.Value;
-                        else if (kw.Name == "END" && args[i + 1] is Nil) end = str.Length;
-                        else if (kw.Name == "JUNK-ALLOWED") junkAllowed = Runtime.IsTruthy(args[i + 1]);
-                    }
+                        LispPathname dp => dp,
+                        LispString ds when Runtime.IsLogicalPathnameString(ds.Value)
+                            => LispLogicalPathname.FromLogicalString(ds.Value),
+                        LispVector dv when dv.IsCharVector
+                            && Runtime.IsLogicalPathnameString(dv.ToCharString())
+                            => LispLogicalPathname.FromLogicalString(dv.ToCharString()),
+                        _ => null
+                    };
+                    if (defaultsPn is LispLogicalPathname dlp && dlp.Host is LispString dh)
+                        logicalHost = dh.Value;
                 }
 
-                var substr = str.Substring(start, end - start);
-                if (substr.Length == 0)
-                {
-                    return MultipleValues.Values2(LispPathname.FromString(""), Fixnum.Make(end));
-                }
-
+                var substr = str.Substring(start, strEnd - start);
+                int position = substr.Length;
+                bool knownLogicalHost = Runtime.IsLogicalPathnameString(substr);
+                int badOffset = LogicalNamestringBadOffset(substr);
+                bool logicalOk = badOffset < 0;
                 try
                 {
                     LispPathname result;
-                    if (Runtime.IsLogicalPathnameString(substr))
+                    if (explicitLogicalHost)
+                    {
+                        if (!logicalOk) return ParseNamestringJunk(Nil.Instance, badOffset, junkAllowed, substr);
+                        result = substr.Contains(':')
+                            ? LispLogicalPathname.FromLogicalString(substr)
+                            : LispLogicalPathname.FromLogicalString(logicalHost + ":" + substr);
+                    }
+                    else if (knownLogicalHost && logicalOk)
                         result = LispLogicalPathname.FromLogicalString(substr);
-                    else
+                    else if (logicalHost != null)
+                    {
+                        if (!logicalOk) return ParseNamestringJunk(Nil.Instance, badOffset, junkAllowed, substr);
+                        result = substr.Contains(':')
+                            ? LispLogicalPathname.FromLogicalString(substr)
+                            : LispLogicalPathname.FromLogicalString(logicalHost + ":" + substr);
+                    }
+                    else if (knownLogicalHost)
                         result = LispPathname.FromString(substr);
-                    return MultipleValues.Values2(result, Fixnum.Make(end));
+                    else
+                        result = Runtime.FromNamestring(substr);
+                    return MultipleValues.Values2(result, Fixnum.Make(position));
                 }
                 catch
                 {
-                    if (junkAllowed)
-                        return MultipleValues.Values2(Nil.Instance, Fixnum.Make(start));
-                    throw new LispErrorException(new LispError($"PARSE-NAMESTRING: cannot parse \"{substr}\""));
+                    return ParseNamestringJunk(Nil.Instance, position, junkAllowed, substr);
                 }
-            }));
+            }).WithKeyArgs(1, 3, false, "START", "END", "JUNK-ALLOWED"));
 
         // PATHNAME-MATCH-P / TRANSLATE-PATHNAME
         Startup.RegisterBinary("PATHNAME-MATCH-P", Runtime.PathnameMatchP);
         Emitter.CilAssembler.RegisterFunction("TRANSLATE-PATHNAME",
-            new LispFunction(args => Runtime.TranslatePathname(args[0], args[1], args[2])));
+            new LispFunction(args => Runtime.TranslatePathname(args[0], args[1], args[2])).WithKeyArgs(3, 3, false));
 
         // COMPILE-FILE-PATHNAME
         Emitter.CilAssembler.RegisterFunction("COMPILE-FILE-PATHNAME",
-            new LispFunction(args => Runtime.CompileFilePathname(args)));
+            new LispFunction(args => Runtime.CompileFilePathname(args)).WithKeyArgs(1, 1, true, "OUTPUT-FILE"));
 
         // %SET-LOGICAL-PATHNAME-TRANSLATIONS
         Emitter.CilAssembler.RegisterFunction("%SET-LOGICAL-PATHNAME-TRANSLATIONS", new LispFunction(args => {

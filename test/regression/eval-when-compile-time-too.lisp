@@ -79,3 +79,59 @@
        "    (defun ewctt4-seen () (ewctt4-use))))"))
     (funcall (intern "EWCTT4-SEEN")))
   (:set))
+
+;;; A nested EVAL-WHEN is not top level: only :EXECUTE matters, both when the
+;;; outer EVAL-WHEN is EVALUATEd ({:COMPILE-TOPLEVEL} without
+;;; :LOAD-TOPLEVEL) and when its body is PROCESSed (with :LOAD-TOPLEVEL). CLHS
+;;; 3.2.3.1 Figure 3-7 and EVAL-WHEN examples 4 and 5: A, B and D do nothing,
+;;; C and E run once at compile time, and none of them reaches the fasl.
+(defvar *ewn-sits* nil)
+
+(deftest-compiled-only eval-when-nested.compile-only-outer-evaluates
+  (let ((src "ewn-tmp.lisp")
+        (fasl "ewn-tmp.fasl"))
+    (unwind-protect
+         (progn
+           (with-open-file (s src :direction :output :if-exists :supersede)
+             (write-line "(eval-when (:compile-toplevel)" s)
+             (write-line "  (eval-when (:compile-toplevel) (push :a *ewn-sits*)))" s)
+             (write-line "(eval-when (:compile-toplevel)" s)
+             (write-line "  (eval-when (:load-toplevel) (push :b *ewn-sits*)))" s)
+             (write-line "(eval-when (:compile-toplevel)" s)
+             (write-line "  (eval-when (:execute) (push :c *ewn-sits*)))" s)
+             (write-line "(eval-when (:compile-toplevel)" s)
+             (write-line "  (eval-when (:compile-toplevel :load-toplevel) (push :d *ewn-sits*)))" s)
+             (write-line "(eval-when (:compile-toplevel)" s)
+             (write-line "  (eval-when (:compile-toplevel :load-toplevel :execute) (push :e *ewn-sits*)))" s)
+             (write-line "(push :loaded *ewn-sits*)" s))
+           (setq *ewn-sits* nil)
+           (compile-file src :output-file fasl)
+           (let ((at-compile (nreverse *ewn-sits*)))
+             (setq *ewn-sits* nil)
+             (load fasl)
+             (list at-compile (nreverse *ewn-sits*))))
+      (ignore-errors (delete-file src))
+      (ignore-errors (delete-file fasl))
+      (setq *ewn-sits* nil)))
+  ((:c :e) (:loaded)))
+
+;; The Process action still treats the body forms as top level: the nested
+;; {:COMPILE-TOPLEVEL} is EVALUATEd at compile time and not put in the fasl.
+(deftest-compiled-only eval-when-nested.compile-only-inside-compile-and-load
+  (let ((src "ewn2-tmp.lisp")
+        (fasl "ewn2-tmp.fasl"))
+    (unwind-protect
+         (progn
+           (with-open-file (s src :direction :output :if-exists :supersede)
+             (write-line "(eval-when (:compile-toplevel :load-toplevel)" s)
+             (write-line "  (eval-when (:compile-toplevel) (push :inner-ct *ewn-sits*)))" s))
+           (setq *ewn-sits* nil)
+           (compile-file src :output-file fasl)
+           (let ((at-compile (nreverse *ewn-sits*)))
+             (setq *ewn-sits* nil)
+             (load fasl)
+             (list at-compile (nreverse *ewn-sits*))))
+      (ignore-errors (delete-file src))
+      (ignore-errors (delete-file fasl))
+      (setq *ewn-sits* nil)))
+  ((:inner-ct) nil))

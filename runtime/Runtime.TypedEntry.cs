@@ -129,6 +129,11 @@ public static partial class Runtime
         if (!ok) throw TypedEntryTypeError(v, spec);
     }
 
+    /// <summary>The TYPE-ERROR of an argument check that failed an open-coded test.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static LispErrorException ArgTypeError(LispObject v, LispObject spec) =>
+        TypedEntryTypeError(v, spec);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void CheckArgList(LispObject v)
     {
@@ -174,8 +179,20 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void CheckArgStructSym(LispObject v, LispObject sym)
     {
-        if (!(v is LispStruct s && (ReferenceEquals(s.TypeName, sym) || IsStructSubclass(s.TypeName, sym))))
+        if (!(LispStruct.TryAs(v, out var s) && (ReferenceEquals(s.TypeName, sym) || IsStructSubclass(s.TypeName, sym))))
             CheckArgType(v, sym);
+    }
+
+    /// <summary>CheckArgStructSym for a type whose representations are in MASK.
+    /// The direct parent is compared inline: an ADT argument is usually a
+    /// constructor's struct whose parent is the declared type.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void CheckArgStructSymKnown(LispObject v, LispObject sym, int mask)
+    {
+        if (!(LispStruct.IsKnown(v, mask, out var s)
+              && (ReferenceEquals(s.TypeName, sym) || ReferenceEquals(s.TypeName.StructParent, sym)
+                  || IsStructSubclass(s.TypeName, sym))))
+            CheckArgStructSym(v, sym);
     }
 
     static bool IsStructSubclass(Symbol name, LispObject sym)
@@ -204,5 +221,17 @@ public static partial class Runtime
         if (!(v is LispVector lv && lv._dimensions == null && lv.IsSimple
               && lv.Length == length && lv.ElementTypeName == et))
             CheckArgType(v, spec);
+    }
+
+    /// <summary>(THE <array type> V) above SAFETY 0. ET and RANK describe
+    /// (SIMPLE-ARRAY et (* ...)), or ET is "". LAST receives V once it passed.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static void CheckTheArray(LispObject v, LispObject spec, string et, int rank, ref LispObject? last)
+    {
+        var p = v is MvReturn mv ? mv.PrimaryValue : v;
+        if (!(et.Length != 0 && p is LispVector lv && lv.IsSimple && lv.ElementTypeName == et
+              && (rank == 1 ? lv._dimensions == null : lv._dimensions?.Length == rank)))
+            CheckArgType(p, spec);
+        if (ReferenceEquals(p, v)) last = v;
     }
 }

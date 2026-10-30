@@ -11,6 +11,10 @@ public static partial class Runtime
            : throw new LispErrorException(new LispTypeError(
                $"{who}: not a character", arg, Startup.Sym("CHARACTER")));
 
+    private static LispReadtable ReadtableArg(LispObject arg)
+        => arg is Nil ? Startup.StandardReadtable
+         : arg as LispReadtable ?? (LispReadtable)DynamicBindings.Get(Startup.Sym("*READTABLE*"));
+
     // --- Setf support ---
 
     public static LispObject Rplaca(LispObject cons, LispObject val)
@@ -82,6 +86,8 @@ public static partial class Runtime
                 prev = c;
                 current = next;
             }
+            if (current is not Nil)
+                throw new LispErrorException(new LispTypeError("NREVERSE: not a proper list", current, Startup.Sym("LIST")));
             return prev;
         }
         throw new LispErrorException(new LispTypeError("NREVERSE: not a sequence", list));
@@ -201,13 +207,11 @@ public static partial class Runtime
     }
 
     /// <summary>True when EQL with ITEM (already a primary value) is identity:
-    /// ITEM is neither a number nor a character, and not one of the two objects
-    /// (T, NIL) that have a second representation. MEMBER's compiler-side
+    /// ITEM is neither a number nor a character. MEMBER's compiler-side
     /// callers look symbols up in constant lists, and going through the full
     /// EQL for every element was a few percent of a COMPILE-FILE.</summary>
     internal static bool EqlIsIdentity(LispObject item) =>
-        item is not (Number or LispChar or T or Nil)
-        && !ReferenceEquals(item, Startup.T_SYM) && !ReferenceEquals(item, Startup.NIL_SYM);
+        item is not (Number or LispChar);
 
     public static LispObject Member(LispObject item, LispObject list)
     {
@@ -245,13 +249,11 @@ public static partial class Runtime
     {
         if (alist is not Nil && alist is not Cons)
             throw new LispErrorException(new LispTypeError("ASSOC: not a list", alist, Startup.Sym("LIST")));
-        // A symbol (other than the T and NIL symbols, which are EQL to the T and
-        // NIL objects) is EQL to exactly itself, so the test is an identity
+        // A symbol is EQL to exactly itself, so the test is an identity
         // check. The tree-walk evaluator's environment is an alist keyed by
         // symbols, and it looks names up in it several times per form.
         key = Primary(key);
-        bool symKey = key is Symbol
-            && !ReferenceEquals(key, Startup.T_SYM) && !ReferenceEquals(key, Startup.NIL_SYM);
+        bool symKey = key is Symbol;
         var current = alist;
         while (current is Cons c)
         {
@@ -304,6 +306,7 @@ public static partial class Runtime
     public static LispObject Cddr(LispObject obj) => Cdr(Cdr(obj));
     public static LispObject Caar(LispObject obj) => Car(Car(obj));
     public static LispObject Cdar(LispObject obj) => Cdr(Car(obj));
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispObject Caddr(LispObject obj) => Car(Cdr(Cdr(obj)));
 
     // --- Plist operations ---
@@ -706,7 +709,7 @@ public static partial class Runtime
         if (SetfNameTarget(name) is Symbol setfTarget)
         {
             if (setfTarget.SetfFunction is LispFunction setfFn) return setfFn;
-            throw new LispErrorException(new LispUndefinedFunction(name));
+            return UndefinedFunctionError(name);
         }
         // Any other cons is not a valid function name: signal type-error (CLHS).
         if (name is Cons)
@@ -720,7 +723,7 @@ public static partial class Runtime
         if (IsSpecialOperator(sym))
             return new LispFunction(_ => throw new LispErrorException(
                 new LispError($"Cannot call special operator {sym.Name} as a function")), sym.Name);
-        throw new LispErrorException(new LispUndefinedFunction(sym));
+        return UndefinedFunctionError(sym);
     }
 
     /// <summary>SYMBOL-FUNCTION: like FDEFINITION but only accepts symbols.</summary>
@@ -736,7 +739,7 @@ public static partial class Runtime
         if (IsSpecialOperator(sym))
             return new LispFunction(_ => throw new LispErrorException(
                 new LispError($"Cannot call special operator {sym.Name} as a function")), sym.Name);
-        throw new LispErrorException(new LispUndefinedFunction(sym));
+        return UndefinedFunctionError(sym);
     }
 
     public static LispObject SpecialOperatorP(LispObject name)
@@ -1022,7 +1025,9 @@ public static partial class Runtime
         if (typeSpec is T) return "T";
         if (typeSpec is Symbol ets)
         {
-            var known = ets.Name switch
+            // Only the COMMON-LISP symbols name these types: another package's
+            // SINGLE-FLOAT (SBCL's SB-XC:SINGLE-FLOAT, say) is a different type.
+            var known = ets.HomePackage != Startup.CL ? null : ets.Name switch
             {
                 "T" => "T",
                 "NIL" => "NIL",
@@ -1056,7 +1061,7 @@ public static partial class Runtime
         }
         if (typeSpec is Cons etCons && etCons.Car is Symbol etHead)
         {
-            string hname = etHead.Name;
+            string hname = etHead.HomePackage == Startup.CL ? etHead.Name : "";
             if ((hname == "UNSIGNED-BYTE" || hname == "SIGNED-BYTE") && etCons.Cdr is Cons nbC && nbC.Car is Fixnum nbF)
                 return $"{hname}-{nbF.Value}";
             if (hname == "UNSIGNED-BYTE" || hname == "SIGNED-BYTE") return hname;
@@ -1164,8 +1169,10 @@ public static partial class Runtime
             if (Emitter.CilAssembler.FindFunctionAcrossPackages(sym)
                 is LispFunction otherFn)
                 return otherFn;
-            throw new LispErrorException(new LispUndefinedFunction(sym));
+            return UndefinedFunctionError(sym);
         }
+        if (designator is LispDotNetObject { Value: Delegate del })
+            return DelegateAsFunction(del);
         throw new LispErrorException(new LispTypeError("FUNCALL: not a function designator", designator));
     }
 
@@ -1338,8 +1345,11 @@ public static partial class Runtime
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispObject UnwrapMv(LispObject obj)
     {
-        if (obj is MvReturn mv) return UnwrapMvSlow(mv);
-        return obj;
+        // Not "is MvReturn": the JIT lays that out with the usual, non-null
+        // case as the branch taken out of line.
+        if (obj is not null && obj.GetType() == typeof(MvReturn))
+            return UnwrapMvSlow(System.Runtime.CompilerServices.Unsafe.As<MvReturn>(obj));
+        return obj!;
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
@@ -1605,6 +1615,9 @@ public static partial class Runtime
             ex is LispErrorException || ex is HandlerCaseInvocationException ||
             ex is System.Threading.ThreadInterruptedException)
             throw ex;
+        var signalled = AlreadySignalled(ex);
+        if (signalled != null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(signalled).Throw();
         // Well-known CLR exceptions (e.g. DivideByZeroException) map to their ANSI
         // condition type so handler-bind can catch division-by-zero / arithmetic-error.
         var mapped = MapWellKnownClrException(ex);
@@ -1620,34 +1633,104 @@ public static partial class Runtime
         throw new LispErrorException(condition);
     }
 
-    /// <summary>What a HANDLER-BIND filter found for one raw .NET exception: the
-    /// condition it signalled, and the non-local exit a handler (or the debugger)
-    /// took, if any.</summary>
-    private sealed class HandlerBindOutcome
+    /// <summary>What signalling one raw .NET exception found: the condition it
+    /// became, and the non-local exit a handler (or the debugger) took, if any.</summary>
+    internal sealed class HandlerBindOutcome
     {
         public LispCondition Condition = null!;
         public Exception? Transfer;
+        public bool DebuggerConsidered;
+        private LispErrorException? _unwind;
+        /// <summary>What the exception stands for while it unwinds: the transfer,
+        /// or the condition as an error that is not signalled again.</summary>
+        public Exception Effective
+            => Transfer ?? (_unwind ??= LispErrorException.WithoutSignal(Condition));
     }
 
     private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Exception, HandlerBindOutcome>
         _handlerBindOutcomes = new();
 
     /// <summary>
-    /// Exception filter for HANDLER-BIND. A raw .NET exception (an
-    /// InvalidCastException from compiled code, say) is signalled here, during
-    /// the first pass of exception dispatch, while the frames that raised it are
-    /// still on the stack: its handlers run where the error happened, in its
-    /// dynamic environment, and can take a backtrace of it. Catching it first and
-    /// signalling from the catch block ran the handlers only after those frames
-    /// were gone.
-    ///
-    /// A filter cannot let an exception escape (the runtime swallows it and
-    /// treats the filter as declining), so a handler's non-local exit is recorded
-    /// and taken by HandlerBindRethrow from this HANDLER-BIND's catch block. A
-    /// transfer to a point between here and the raise point (a CATCH or a restart
-    /// established below this HANDLER-BIND) cannot be taken that way; those frames
-    /// are unwound by then, as they already were when this signalled from the
-    /// catch block.
+    /// Signal a raw .NET exception as a condition, once. The first exception
+    /// filter on its way out does this (HANDLER-BIND, HANDLER-CASE, RESTART-CASE,
+    /// CATCH, BLOCK, TAGBODY), during the first pass of exception dispatch, so
+    /// the handlers run with the raising frames and everything they established
+    /// (restarts, catch tags, special bindings) still in place, as CLHS 9.1.4
+    /// requires. A filter cannot let an exception escape, so the non-local exit
+    /// a handler takes is recorded, and the frame it targets takes the raw
+    /// exception in its own filter and continues that exit.
+    /// </summary>
+    internal static HandlerBindOutcome SignalRawException(Exception ex)
+    {
+        if (_handlerBindOutcomes.TryGetValue(ex, out var outcome)) return outcome;
+        outcome = new HandlerBindOutcome { Condition = ClrExceptionCondition(ex) };
+        _handlerBindOutcomes.Add(ex, outcome);
+        var saved = t_rawSignalled;
+        t_rawSignalled = outcome.Condition;
+        try
+        {
+            outcome.Transfer = HandlerClusterStack.SignalForExit(outcome.Condition);
+        }
+        catch (Exception transfer)
+        {
+            outcome.Transfer = Detached(transfer);
+        }
+        finally
+        {
+            t_rawSignalled = saved;
+        }
+        return outcome;
+    }
+
+    [ThreadStatic] private static LispCondition? t_rawSignalled;
+
+    /// <summary>True while CONDITION is being signalled for a raw .NET exception
+    /// that is still on its way out (SignalRawException).</summary>
+    internal static bool IsRawExceptionCondition(LispObject condition)
+        => condition != null && ReferenceEquals(condition, t_rawSignalled);
+
+    /// <summary>
+    /// For a boundary that converts a raw .NET exception into a Lisp error after
+    /// catching it: when a filter already signalled EX, the exception to throw
+    /// instead of signalling it a second time (the handler's transfer, or the
+    /// same condition unsignalled, after the debugger step ERROR would take),
+    /// else null.
+    /// </summary>
+    internal static Exception? AlreadySignalled(Exception ex)
+    {
+        if (!_handlerBindOutcomes.TryGetValue(ex, out var outcome)) return null;
+        _handlerBindOutcomes.Remove(ex);
+        if (outcome.Transfer == null && !outcome.DebuggerConsidered)
+        {
+            outcome.DebuggerConsidered = true;
+            if (ConditionSystem.UnhandledErrorsInvokeDebugger)
+                ConditionSystem.InvokeDebugger(outcome.Condition);
+        }
+        return outcome.Effective;
+    }
+
+    /// <summary>A recorded transfer is taken only after the frames in between
+    /// have unwound, and their cleanup forms may THROW again: the per-thread
+    /// cached CatchThrowException must not be the one recorded.</summary>
+    private static Exception Detached(Exception transfer)
+        => transfer is CatchThrowException c ? new CatchThrowException(c.Tag, c.Value) : transfer;
+
+    /// <summary>The exception a raw .NET exception stands for (see
+    /// SignalRawException), or EX itself when it is not a raw .NET exception.</summary>
+    internal static object EffectiveException(object ex, bool take)
+    {
+        if (ex is not Exception e || !NeedsRewrap(e)) return ex;
+        var effective = SignalRawException(e).Effective;
+        if (take) _handlerBindOutcomes.Remove(e);
+        return effective;
+    }
+
+    /// <summary>
+    /// Exception filter for HANDLER-BIND. A raw .NET exception is signalled
+    /// (SignalRawException) unless a filter nearer the raise point already did.
+    /// If no handler took it, this is where ERROR would enter the debugger, with
+    /// the raising frames still there to look at. The catch block then continues
+    /// the recorded transfer (HandlerBindRethrow).
     ///
     /// Lisp conditions and non-local exits are not taken (0): they were
     /// signalled where they were raised, or are on their way elsewhere.
@@ -1655,20 +1738,21 @@ public static partial class Runtime
     public static int HandlerBindFilter(object exObj)
     {
         if (exObj is not Exception ex || !NeedsRewrap(ex)) return 0;
-        if (_handlerBindOutcomes.TryGetValue(ex, out _)) return 1;
-        var outcome = new HandlerBindOutcome { Condition = ClrExceptionCondition(ex) };
-        _handlerBindOutcomes.Add(ex, outcome);
-        try
+        var outcome = SignalRawException(ex);
+        if (outcome.Transfer == null && !outcome.DebuggerConsidered)
         {
-            HandlerClusterStack.Signal(outcome.Condition);
-            // No handler took it: this is where ERROR would enter the debugger,
-            // with the raising frames still there to look at.
+            outcome.DebuggerConsidered = true;
             if (ConditionSystem.UnhandledErrorsInvokeDebugger)
-                ConditionSystem.InvokeDebugger(outcome.Condition);
-        }
-        catch (Exception transfer)
-        {
-            outcome.Transfer = transfer;
+            {
+                try
+                {
+                    ConditionSystem.InvokeDebugger(outcome.Condition);
+                }
+                catch (Exception transfer)
+                {
+                    outcome.Transfer = Detached(transfer);
+                }
+            }
         }
         return 1;
     }
@@ -1821,9 +1905,9 @@ public static partial class Runtime
         {
             return thunk.Invoke();
         }
-        catch (Exception e) when (NeedsRewrap(e))
+        catch (Exception e) when (HandlerBindFilter(e) != 0)
         {
-            RewrapNonLispException(e); // always throws
+            HandlerBindRethrow(e); // always throws
             throw; // unreachable
         }
         catch (LispErrorException lee) when ((clause = UnsignalledClause(lee, cluster)) >= 0)
@@ -1924,8 +2008,10 @@ public static partial class Runtime
         // CallWithHandlerCluster: an invoke-restart aimed at an OUTER restart-case
         // must not enter this frame at all, or nested restart-cases stack one
         // restarted dispatch each on the way out.
-        catch (RestartInvocationException rie) when (IndexOfTag(tags, rie.Tag) >= 0)
+        catch (Exception e) when (EffectiveException(e, false) is RestartInvocationException rie0
+                                  && IndexOfTag(tags, rie0.Tag) >= 0)
         {
+            var rie = (RestartInvocationException)EffectiveException(e, true);
             int idx = IndexOfTag(tags, rie.Tag);
             RestartClusterStack.PopCluster();
             popped = true;
@@ -2207,12 +2293,9 @@ public static partial class Runtime
 
         // COPY-STRUCTURE, MAKE-SYMBOL
         Startup.RegisterUnary("COPY-STRUCTURE", obj => {
-            if (obj is not LispStruct s)
+            if (!LispStruct.TryAs(obj, out var s))
                 throw new LispErrorException(new LispTypeError("COPY-STRUCTURE: not a structure", obj));
-            var src = s.SlotsSnapshot();
-            var dst = new LispObject[src.Length];
-            Array.Copy(src, dst, src.Length);
-            return new LispStruct(s, dst);
+            return LispStruct.Copy(s);
         });
         Startup.RegisterUnary("MAKE-SYMBOL", obj =>
             obj is LispString ls ? new Symbol(ls.Value)
@@ -2451,16 +2534,16 @@ public static partial class Runtime
                 : Startup.StandardReadtable;
             toRt.CopySyntax(toChar, fromChar, fromRt);
             return T.Instance;
-        }));
+        }).WithArgCount(2, 4));
         Emitter.CilAssembler.RegisterFunction("GET-MACRO-CHARACTER", new LispFunction(args => {
             if (args.Length == 0) throw new LispErrorException(new LispProgramError("GET-MACRO-CHARACTER: too few arguments: 0 (expected at least 1)"));
             if (args.Length > 2) throw new LispErrorException(new LispProgramError($"GET-MACRO-CHARACTER: too many arguments: {args.Length} (expected at most 2)"));
             char ch = ((LispChar)args[0]).Value;
-            var rt = args.Length >= 2 && args[1] is LispReadtable rt1 ? rt1
+            var rt = args.Length >= 2 ? ReadtableArg(args[1])
                 : (LispReadtable)DynamicBindings.Get(Startup.Sym("*READTABLE*"));
             var fn = rt.GetMacroFunction(ch);
-            if (fn == null) return Nil.Instance;
             bool nonTerm = rt.IsNonTerminating(ch);
+            if (fn == null) return MultipleValues.Values2(Nil.Instance, nonTerm ? T.Instance : Nil.Instance);
             var lispFn = rt.GetLispMacroFunction(ch);
             if (lispFn == null)
             {
@@ -2541,7 +2624,7 @@ public static partial class Runtime
                 return (result is Nil && MultipleValues.Count == 0) ? null : result;
             }, nonTerm, lispFn);
             return T.Instance;
-        }));
+        }).WithArgCount(2, 4));
         Emitter.CilAssembler.RegisterFunction("MAKE-DISPATCH-MACRO-CHARACTER", new LispFunction(args => {
             if (args.Length == 0) throw new LispErrorException(new LispProgramError("MAKE-DISPATCH-MACRO-CHARACTER: too few arguments: 0 (expected at least 1)"));
             if (args.Length > 3) throw new LispErrorException(new LispProgramError($"MAKE-DISPATCH-MACRO-CHARACTER: too many arguments: {args.Length} (expected at most 3)"));
@@ -2577,12 +2660,12 @@ public static partial class Runtime
                 return (result is Nil && MultipleValues.Count == 0) ? null : result;
             }, lispFn);
             return T.Instance;
-        }));
+        }).WithArgCount(3, 4));
         Emitter.CilAssembler.RegisterFunction("GET-DISPATCH-MACRO-CHARACTER", new LispFunction(args => {
             if (args.Length < 2) throw new System.Exception("GET-DISPATCH-MACRO-CHARACTER: requires 2 arguments");
             char dispChar = ((LispChar)args[0]).Value;
             char subChar = ((LispChar)args[1]).Value;
-            var rt = args.Length >= 3 && args[2] is LispReadtable rt1 ? rt1
+            var rt = args.Length >= 3 ? ReadtableArg(args[2])
                 : (LispReadtable)DynamicBindings.Get(Startup.Sym("*READTABLE*"));
             if (rt.GetDispatchTable(dispChar) == null)
                 throw new LispErrorException(new LispError($"{dispChar} is not a dispatching macro character in the current readtable"));
@@ -2637,7 +2720,7 @@ public static partial class Runtime
                 }));
             }
             return Nil.Instance;
-        }));
+        }).WithArgCount(2, 3));
     }
 
 

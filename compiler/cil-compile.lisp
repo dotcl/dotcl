@@ -159,6 +159,12 @@
   #+dotcl (dotcl:quit code)
   #-dotcl (uiop:quit code))
 
+;; A dotcl host loads the tree's own COMPILE-DEFMACRO before compiling the tree.
+#+dotcl
+(let ((bootstrap (portable-getenv "DOTCL_BOOTSTRAP")))
+  (when (and bootstrap (> (length bootstrap) 0))
+    (load bootstrap)))
+
 (let* ((inputs-env (portable-getenv "DOTCL_INPUTS"))
        (output-env (portable-getenv "DOTCL_OUTPUT")))
   (unless (and inputs-env output-env

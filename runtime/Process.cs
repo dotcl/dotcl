@@ -341,13 +341,15 @@ public sealed class LispProcess : LispObject
         bool inDirect = unixDirect && IsFdTarget(input);
         bool outDirect = unixDirect && IsFdTarget(output);
         bool errDirect = unixDirect && (mergeErr ? outDirect : IsFdTarget(error));
+        // Unix: duplicate stdout's fd for stderr before exec, so one reader keeps write order.
+        bool osMerged = mergeErr && unixDirect && !outInherit && !outDirect;
 
         // As SBCL does, the child gets a process group of its own unless it shares
         // the caller's standard input.
         bool ownGroup = unixDirect && !IsInherit(input);
         string fileName = program;
         System.Collections.Generic.IList<string> argList = arguments;
-        bool viaShell = inDirect || outDirect || errDirect;
+        bool viaShell = inDirect || outDirect || errDirect || osMerged;
         if (viaShell)
         {
             fileName = "/bin/sh";
@@ -359,7 +361,8 @@ public sealed class LispProcess : LispObject
         psi.CreateNoWindow = true;
         psi.RedirectStandardInput = !IsInherit(input) && !inDirect;
         psi.RedirectStandardOutput = !outInherit && !outDirect;
-        psi.RedirectStandardError = !errDirect && (mergeErr ? !outInherit : !IsInherit(error));
+        psi.RedirectStandardError = !errDirect && !osMerged
+            && (mergeErr ? !outInherit : !IsInherit(error));
         if (!string.IsNullOrEmpty(directory)) psi.WorkingDirectory = directory;
         // The child's pipes use ENCODING when one was given (:external-format), else
         // the .NET default. The setters are only legal on a redirected stream.
@@ -433,7 +436,7 @@ public sealed class LispProcess : LispObject
             if (!outInherit && !outDirect)
                 outStream = WireMergedOutput(output, ifOutputExists, encoding, proc, helpers,
                                              () => proc.StandardOutput, () => proc.StandardError,
-                                             binary, failure);
+                                             binary, failure, osMerged);
         }
         else
         {
@@ -521,9 +524,7 @@ public sealed class LispProcess : LispObject
             redirs.Append(" </dev/null");
         Out("", output, ifOutputExists);
         if (mergeErr)
-        {
-            if (IsFdTarget(output)) redirs.Append(" 2>&1");
-        }
+            redirs.Append(" 2>&1");
         else
             Out("2", error, ifErrorOutputExists);
 
@@ -650,13 +651,34 @@ public sealed class LispProcess : LispObject
     /// <summary>Wire stdout AND stderr into a single destination (uiop's
     /// :error-output :output). :stream yields one merged live stream; a file gets both
     /// pipes appended under a lock; nil drains both to null. Caller guarantees the
-    /// destination (stdout spec) is redirected (not inherited).</summary>
+    /// destination (stdout spec) is redirected (not inherited). With OSMERGED both fds
+    /// are already one pipe; on Windows their order is not defined.</summary>
     private static LispObject WireMergedOutput(
         LispObject spec, LispObject ifExists, System.Text.Encoding? encoding, ChildProcess proc,
         System.Collections.Generic.List<System.Threading.Thread> helpers,
         System.Func<System.IO.TextReader> stdoutSrc, System.Func<System.IO.TextReader> stderrSrc,
-        bool binary, CopyFailure failure)
+        bool binary, CopyFailure failure, bool osMerged)
     {
+        if (osMerged)
+        {
+            if (Runtime.IsStreamArg(spec))
+            {
+                helpers.Add(CopyToLispStream("dotcl-copy-stdout", spec, binary, failure,
+                    stdoutSrc, () => proc.StandardOutput.BaseStream, null));
+                return Nil.Instance;
+            }
+            if (IsKw(spec, "STREAM"))
+                return binary ? new LispBinaryStream(proc.StandardOutput.BaseStream)
+                              : new LispInputStream(new ProcessStreamReader(proc, stdoutSrc()));
+            if (FilePath(spec) is string osPath)
+            {
+                var w = OpenRedirectFile(osPath, IsKw(ifExists, "APPEND"), encoding);
+                helpers.Add(Spawn("dotcl-drain-stdout", () => { using (w) Copy(stdoutSrc(), w); }));
+                return Nil.Instance;
+            }
+            helpers.Add(Spawn("dotcl-drain-stdout", () => Copy(stdoutSrc(), System.IO.TextWriter.Null)));
+            return Nil.Instance;
+        }
         if (Runtime.IsStreamArg(spec))
         {
             // Both pipes into one Lisp stream, a chunk at a time under one lock.

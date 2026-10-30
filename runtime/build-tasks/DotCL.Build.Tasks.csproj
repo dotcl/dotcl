@@ -18,6 +18,13 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <!-- This is build tooling, not a shipped library or its own package. -->
     <IsPackable>false</IsPackable>
+    <!-- Also an executable: the SDK's LispLibrary build runs it as
+         `dotnet DotCL.Build.Tasks.dll ... build-library ...` (BuildLibraryMain.cs).
+         No apphost and no deps.json: the package ships the .dll and its
+         runtimeconfig, and DotCL.Runtime is resolved from the path it is given. -->
+    <OutputType>Exe</OutputType>
+    <UseAppHost>false</UseAppHost>
+    <GenerateDependencyFile>false</GenerateDependencyFile>
     <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
     <!-- Don't drag the (huge, RID-bound) DotCL.Runtime.dll into this project's
          own output; the packed task resolves it from the package's lib/ via the

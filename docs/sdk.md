@@ -97,6 +97,67 @@ It runs once per build, after the FASL and the manifest exist, and only when
 `DotclProjectAsd` is set. It is intentionally empty -- it exists to be
 scheduled around.
 
+## Lisp libraries
+
+A project with `LispLibrary` items builds a .NET library whose assembly is the
+DLL a `dotnet:library` form writes, instead of a C# assembly:
+
+```xml
+<Project Sdk="DotCL.Sdk">
+  <ItemGroup>
+    <LispLibrary Include="plugin.lisp" />
+    <ProjectReference Include="../PluginHost.Abstractions/PluginHost.Abstractions.csproj" />
+  </ItemGroup>
+</Project>
+```
+
+An ASDF system takes the place of the files with a `LispSystem` item (one per
+project). The system names its `dotnet:library` file as a `(:dotnet-library ...)`
+component; see [Building the library from an ASDF
+system](define-class.md#building-the-library-from-an-asdf-system):
+
+```xml
+<Project Sdk="DotCL.Sdk">
+  <ItemGroup>
+    <LispSystem Include="word-stats.asd" />
+    <DotclAsdSearchPath Include="../text-util/" />
+    <ProjectReference Include="../PluginHost.Abstractions/PluginHost.Abstractions.csproj" />
+  </ItemGroup>
+</Project>
+```
+
+`DotclAsdSearchPath` items are the directories the systems it depends on are found
+in. The `.lisp` and `.asd` files under the system's directory and under those
+directories are the build's inputs, and ASDF's compiled files go under `obj/`.
+
+The files are loaded in order, after every non-framework reference of the project
+is loaded, so they can name its types without `dotnet:load-assembly`. Exactly one
+`dotnet:library` form has to be evaluated; its `:path` is ignored and its name has
+to be the project's `AssemblyName`. The build runs in a process of its own (a
+library build loads assemblies and defines types, which a build node that stays
+alive could not take back), and is skipped when no file, reference or the core
+changed. The files listed are the inputs: a file they `load` themselves is not
+tracked.
+
+For such a project the SDK changes these defaults: `OutputType=Library`, no
+default C# compile items (C# sources are not compiled; the assembly is the Lisp
+one), no reference assembly and no PDB, and `CopyLocalLockFileAssemblies=true` so
+`DotCL.Runtime.dll` lands beside the DLL. The packaged `dotcl.core` and contrib
+tree are left out of its output. Whether a project is one is read off its file
+(an element `<LispLibrary` or `<LispSystem`); a project that gets its items from
+an import sets `DotclLispLibrary=true`.
+
+| Property | Default | Meaning |
+|----------|---------|---------|
+| `DotclLispLibrary` | `true` when the project file has a `<LispLibrary` or `<LispSystem` element | Build the assembly from the `LispLibrary` or `LispSystem` items. |
+| `DotclBuildTool` | `tasks/DotCL.Build.Tasks.dll` in the `DotCL.Runtime` package | The program that runs the build. |
+| `DotclBaseCore` | `dotcl.core` in the package | The core the build boots. |
+| `DotclContribDir` | `contrib` in the package | Where `dotnet-class` and `dotnet-library` are found. |
+
+The build runs on the `DotCL.Runtime` the project references, which is also the
+one the DLL is built against. Inside a dotcl checkout, `samples/PluginHostDemo`
+points the three properties at the tree's own build (its `Directory.Build.targets`).
+
 ## Trimmed publish
 
 A FASL is loaded at run time and reaches .NET only through reflection, so the

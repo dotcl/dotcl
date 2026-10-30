@@ -51,9 +51,23 @@ Compiled functions, macros, generic functions and interpreted closures answer,
 and so do functions loaded from a FASL, including the standard functions in the
 core image. Given a symbol, a macro binding wins over a function binding: what a
 macro takes is its own lambda list, not the `(form env)` pair its expander
-takes. The rough edge is the built-ins written in C#: most answer `nil`, and a
-few answer a placeholder with generated names, which tells you the arity and
-nothing more.
+takes. Every function, macro and special operator of the `COMMON-LISP` package
+answers the lambda list of its entry in the standard, whether it is written in
+C# or in Lisp; names that are not symbols of `COMMON-LISP` come back
+uninterned:
+
+```lisp
+(dotcl:function-lambda-list 'mapcar)  ; => (FUNCTION LIST &REST #:MORE-LISTS), T
+(dotcl:function-lambda-list 'let)     ; => (#:BINDINGS &BODY #:BODY), T
+```
+
+The operators of the `dotcl`, `dotnet`, `dotcl-mop` and `dotcl-cltl2` packages
+answer in the same way, with the parameter names of their documentation, and
+so do the functions of the contrib modules:
+
+```lisp
+(dotcl:function-lambda-list 'dotnet:invoke)  ; => (#:OBJECT #:MEMBER-NAME &REST #:ARGS), T
+```
 
 ## Common Lisp libraries
 

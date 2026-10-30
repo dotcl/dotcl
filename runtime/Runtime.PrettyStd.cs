@@ -91,6 +91,22 @@ public static partial class Runtime
         return Nil.Instance;
     }, "PPRINT-STANDARD-ENTRY", 2);
 
+    // PPRINT-DISPATCH's default function: print the object as PRINT-OBJECT
+    // would, without consulting the pprint dispatch table.
+    private static LispFunction? _defaultPprintFunction;
+    internal static LispFunction DefaultPprintFunction => _defaultPprintFunction ??= new LispFunction(args =>
+    {
+        if (args.Length != 2)
+            throw new LispErrorException(new LispProgramError("default pprint function: requires 2 arguments"));
+        var w = GetOutputWriter(args[0]);
+        var text = FormatObjectNoDispatch(args[1]);
+        w.Write(text);
+        PprintTrackWrite(text);
+        w.Flush();
+        NoteWritten(args[0], text);
+        return Nil.Instance;
+    }, "PPRINT-DEFAULT-ENTRY", 2);
+
     private static LispPprintDispatchTable? CurrentPprintDispatchTable()
     {
         var sym = Startup.Sym("*PRINT-PPRINT-DISPATCH*");
@@ -358,7 +374,21 @@ public static partial class Runtime
                 PprintVector((LispVector)obj);
                 return;
             }
-            AddText(FormatObject(obj, _escape), PpAtom);
+            AddText(FormatAtom(obj, _escape), PpAtom);
+        }
+
+        /// <summary>The text of an element. The element's text reaches the
+        /// enclosing logical block's stream only after these ops are laid out,
+        /// so a PRINT-OBJECT method (or condition report) runs with that
+        /// block set aside: it must not write to (or flush staged text into) the
+        /// block's stream ahead of the text queued before it.</summary>
+        private static string FormatAtom(LispObject obj, bool escape)
+        {
+            if (!_pprintActive || !(obj is LispInstance || obj is LispCondition || LispStruct.TryAs(obj, out _)))
+                return FormatObject(obj, escape);
+            var suspended = PprintSuspend();
+            try { return FormatObject(obj, escape); }
+            finally { PprintResume(suspended); }
         }
 
         /// <summary>The #n= / #n# label and the *PRINT-LEVEL* cut of a compound
@@ -937,6 +967,41 @@ public static partial class Runtime
                 cur = c.Cdr;
             }
             return cur is Nil ? null : n;
+        }
+
+        /// <summary>Queue this object's flat text and layout tokens into the
+        /// enclosing logical block's XP buffer.</summary>
+        public void EmitFlat(System.IO.StringWriter sw)
+        {
+            var tokens = _pprintDeferredNewlines;
+            var sb = sw.GetStringBuilder();
+            void Tok(string kind, int suffixLen = 0)
+                => tokens?.Add((sb.Length, kind, _pprintBlockColumn, 0, _pprintPerLinePrefix, suffixLen));
+            foreach (var op in _ops)
+            {
+                switch (op.Op)
+                {
+                    case PpText:
+                    case PpAtom:
+                        sb.Append(op.Str);
+                        break;
+                    case PpNewline:
+                        if (op.Kind == NlLiteral) sb.Append('\n');
+                        else if (op.Kind == NlLinear || op.Kind == NlMandatory) Tok("STD:LINEAR");
+                        else if (op.Kind == NlFill) Tok("STD:FILL");
+                        else Tok("STD:MISER");
+                        break;
+                    case PpIndent:
+                        Tok("STDINDENT:" + (op.Kind == IndBlock ? "BLOCK" : "CURRENT") + ":" + op.Amount);
+                        break;
+                    case PpBlockStart:
+                        Tok("BLOCK_START", op.Str!.Length);
+                        break;
+                    case PpBlockEnd:
+                        Tok("BLOCK_END");
+                        break;
+                }
+            }
         }
 
         // ---- layout ----

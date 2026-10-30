@@ -37,3 +37,38 @@
     (list (cl-user::%sfc-caller 1) (funcall 'cl-user::%sfc-leaf 1)
           (cl-user::%sfc-ni-caller 2) (cl-user::%sfc-d3-caller 3)))
   ((:new 1) (:new 1) (:new-ni 2) (:new-d3 3)))
+
+;;; A call to a function DEFUNed later in the same file goes the same way, through
+;;; a stub the later DEFUN fills.
+
+(deftest-compiled-only same-file.forward-calls
+  (list (cl-user::%sfc-fw-caller 1) (cl-user::%sfc-fw-mv 2)
+        (cl-user::%sfc-fw-uses-stub 3) (cl-user::%sfc-fw-ev 2000)
+        (remove-if-not (lambda (n) (search "%SFC-FW-" n)) (cl-user::%sfc-fw-bt-caller 1)))
+  ((:fw-leaf 1) (2 (1 2 3) 1) (:fw-real 3) :even
+   ("%SFC-FW-BT-LEAF" "%SFC-FW-BT-CALLER")))
+
+(deftest-compiled-only same-file.forward-not-defined
+  (list (handler-case (cl-user::%sfc-fw-undefined 1)
+          (undefined-function (c) (cell-error-name c)))
+        (handler-case (cl-user::%sfc-fw-arity 1)
+          (program-error () :arity))
+        (progn (eval '(defun cl-user::%sfc-fw-never (x) (list :never x)))
+               (cl-user::%sfc-fw-undefined 2))
+        (cl-user::%sfc-fw-car-caller '(1))
+        (handler-case (cl-user::%sfc-fw-car-caller 5)
+          (type-error (c) (type-error-datum c))))
+  (cl-user::%sfc-fw-never :arity (:never 2) (1) 5))
+
+(deftest-compiled-only same-file.forward-redefinition
+  (let ((r '()))
+    (trace cl-user::%sfc-fw-traced)
+    (let ((*trace-output* (make-broadcast-stream)))
+      (push (cl-user::%sfc-fw-traced-caller 1) r))
+    (untrace cl-user::%sfc-fw-traced)
+    (eval '(defun cl-user::%sfc-fw-leaf (x) (list :new x)))
+    (eval '(defun cl-user::%sfc-fw-ni-leaf (x) (list :new-ni x)))
+    (setf (fdefinition 'cl-user::%sfc-fw-traced) (lambda (x) (list :setf x)))
+    (list* (cl-user::%sfc-fw-caller 2) (cl-user::%sfc-fw-ni-caller 3)
+           (cl-user::%sfc-fw-traced-caller 4) r))
+  ((:new 2) (:new-ni 3) (:setf 4) (:fw-traced 1)))

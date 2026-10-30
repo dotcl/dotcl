@@ -6,9 +6,9 @@
 ;;; arguments were put in an array, and the element type was parsed again on
 ;;; every call. ironclad makes a 16-word (unsigned-byte 32) scratch array this
 ;;; way on every Salsa20 block. The element type name is now resolved when the
-;;; form is compiled, and only for specs whose meaning cannot change at run
-;;; time ((unsigned-byte N), (signed-byte N), FIXNUM, BIT, the float and the
-;;; character types). Every other shape is the generic call, as before.
+;;; form is compiled, for (unsigned-byte N), (signed-byte N), FIXNUM, BIT, the
+;;; float and the character types, and for a DEFTYPE known then whose expansion
+;;; is one of those (CLHS 3.2.2.3). Every other shape is the generic call.
 
 (setf dotcl:*save-sil* t)
 
@@ -30,7 +30,8 @@
 (defun %maot-list-dims () (make-array '(4) :element-type '(unsigned-byte 32)))
 (defun %maot-2d () (make-array '(2 3) :element-type '(unsigned-byte 32)))
 (defun %maot-dim (d) (make-array d :element-type '(unsigned-byte 32)))
-;; Not resolved here: a DEFTYPE name, a keyword more, a non-constant spec.
+;; A DEFTYPE name is resolved to its expansion; a keyword more and a
+;; non-constant spec are not resolved here.
 (deftype %maot-octet () '(unsigned-byte 8))
 (defun %maot-deftype () (make-array 2 :element-type '%maot-octet))
 (defun %maot-adj () (make-array 2 :element-type '(unsigned-byte 32) :adjustable t))
@@ -43,7 +44,7 @@
                       #'%maot-list-dims #'%maot-dim))
         (mapcar (lambda (f) (%maot-count "MakeArrayOfType" f))
                 (list #'%maot-deftype #'%maot-adj #'%maot-var)))
-  ((1 1 1 1 1 1 1 1 1 1 1 1) (0 0 0)))
+  ((1 1 1 1 1 1 1 1 1 1 1 1) (1 0 0)))
 
 (defun %maot-describe (a)
   (list (array-element-type a) (array-dimensions a) (adjustable-array-p a)

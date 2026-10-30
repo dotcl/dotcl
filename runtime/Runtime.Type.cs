@@ -145,7 +145,7 @@ public static partial class Runtime
     // --- Typep ---
 
     public static bool IsTrueTypep(LispObject obj, LispObject typeSpec) =>
-        (obj is LispStruct st && ReferenceEquals(st.TypeName, typeSpec))
+        (LispStruct.TryAs(obj, out var st) && ReferenceEquals(st.TypeName, typeSpec))
         || Typep(obj, typeSpec) is not Nil;
 
     /// <summary>Whether a generic function object is one because its class says so.
@@ -161,7 +161,7 @@ public static partial class Runtime
 
     public static LispObject Typep(LispObject obj, LispObject typeSpec)
     {
-        if (obj is LispStruct st && ReferenceEquals(st.TypeName, typeSpec)) return T.Instance;
+        if (LispStruct.TryAs(obj, out var st) && ReferenceEquals(st.TypeName, typeSpec)) return T.Instance;
         if (typeSpec is Symbol sym && SymbolTypeTest(sym) is { } test)
             return test.Test(obj) ? T.Instance : Nil.Instance;
         return TypepGeneral(obj, typeSpec);
@@ -179,7 +179,7 @@ public static partial class Runtime
             // name lookup and up to three class registry lookups. A same-named
             // symbol from another package, or a structure whose class is missing,
             // still takes the general path below.
-            if (obj is LispStruct fst && typeSpec is Symbol fts)
+            if (LispStruct.TryAs(obj, out var fst) && typeSpec is Symbol fts)
             {
                 if (ReferenceEquals(fst.TypeName, fts)) return T.Instance;
                 if (FindClassOrNil(fts) is LispClass ftc && ftc.IsStructureClass
@@ -198,7 +198,7 @@ public static partial class Runtime
             // clause types by bare name, which lands them there, and they rely on the
             // name match.
             if (typeSpec is Symbol unkSym
-                && (obj is LispStruct ls0 ? !ReferenceEquals(ls0.TypeName, unkSym)
+                && (LispStruct.TryAs(obj, out var ls0) ? !ReferenceEquals(ls0.TypeName, unkSym)
                     : obj is LispInstance || obj is LispInstanceCondition)
                 && IsUnknownTypeSymbol(unkSym))
                 throw UnknownTypeSpecifier(unkSym);
@@ -221,7 +221,7 @@ public static partial class Runtime
                 return Nil.Instance;
             }
             // Fast path: struct type check: avoid full switch when positive match
-            if (typeSpec is Symbol typeSym && obj is LispStruct st)
+            if (typeSpec is Symbol typeSym && LispStruct.TryAs(obj, out var st))
             {
                 // The name match is for callers that name a structure by a bare
                 // symbol interned elsewhere. A COMMON-LISP symbol names the
@@ -888,7 +888,7 @@ public static partial class Runtime
             || (obj is LispInstanceCondition ufc && ClassMatchesCPL(ufc.Instance.Class, "UNDEFINED-FUNCTION")),
         "UNBOUND-VARIABLE" => obj is LispUnboundVariable
             || (obj is LispInstanceCondition uvc && ClassMatchesCPL(uvc.Instance.Class, "UNBOUND-VARIABLE")),
-        "STRUCTURE-OBJECT" => obj is LispStruct,
+        "STRUCTURE-OBJECT" => LispStruct.TryAs(obj, out _),
         "STRUCTURE-CLASS" => obj is LispClass lsc && lsc.IsStructureClass,
         "STANDARD-OBJECT" => (obj is LispInstance li2 && !li2.Class.IsBuiltIn) || obj is LispClass || obj is LispMethod || obj is LispCondition || obj is LispStream || obj is GenericFunction,
         // A forward-referenced placeholder is not a standard class yet; it becomes one
@@ -901,7 +901,7 @@ public static partial class Runtime
         "METHOD" => obj is LispMethod,
         "STANDARD-METHOD" => obj is LispMethod,
         // Fallback: check for struct type name, CLOS class hierarchy, or condition type hierarchy
-        _ => (obj is LispStruct s && StructTypeMatches(s, typeName))
+        _ => (LispStruct.TryAs(obj, out var s) && StructTypeMatches(s, typeName))
           || (obj is LispInstance inst && ClassMatchesCPL(inst.Class, typeName))
           || (obj is LispInstanceCondition lic && ClassMatchesCPL(lic.Instance.Class, typeName))
           || (obj is LispCondition cond && ConditionTypeMatches(cond.ConditionTypeName, typeName))
@@ -911,7 +911,7 @@ public static partial class Runtime
 
     /// <summary>Check if obj is a LispStruct that satisfies FLOAT type (for cross-compilation target-float structs).</summary>
     private static bool IsStructFloat(LispObject obj)
-        => obj is LispStruct s && (s.TypeName.Name is "SINGLE-FLOAT" or "DOUBLE-FLOAT"
+        => LispStruct.TryAs(obj, out var s) && (s.TypeName.Name is "SINGLE-FLOAT" or "DOUBLE-FLOAT"
             or "SHORT-FLOAT" or "LONG-FLOAT" or "FLOAT"
             || StructTypeMatches(s, "FLOAT"));
 

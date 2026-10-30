@@ -473,7 +473,7 @@ public static partial class Runtime
             : throw new LispErrorException(new LispTypeError("CHAR/=: not characters", a));
 
     // Case-insensitive character comparisons
-    public static char CharFoldCase(LispChar c) => char.ToUpperInvariant(c.Value);
+    public static char CharFoldCase(LispChar c) => CharCase.Fold(c.Value);
     public static LispObject CharEqualCI(LispObject a, LispObject b) =>
         a is LispChar ca && b is LispChar cb
             ? (CharFoldCase(ca) == CharFoldCase(cb) ? T.Instance : Nil.Instance)
@@ -501,16 +501,16 @@ public static partial class Runtime
 
     // Character predicates
     public static LispObject UpperCaseP(LispObject obj) =>
-        obj is LispChar c ? (char.IsUpper(c.Value) ? T.Instance : Nil.Instance)
+        obj is LispChar c ? (CharCase.IsUpper(c.Value) ? T.Instance : Nil.Instance)
             : throw new LispErrorException(new LispTypeError("UPPER-CASE-P: not a character", obj));
     public static LispObject LowerCaseP(LispObject obj) =>
-        obj is LispChar c ? (char.IsLower(c.Value) ? T.Instance : Nil.Instance)
+        obj is LispChar c ? (CharCase.IsLower(c.Value) ? T.Instance : Nil.Instance)
             : throw new LispErrorException(new LispTypeError("LOWER-CASE-P: not a character", obj));
     public static LispObject AlphaCharP(LispObject obj) =>
         obj is LispChar c ? (char.IsLetter(c.Value) ? T.Instance : Nil.Instance)
             : throw new LispErrorException(new LispTypeError("ALPHA-CHAR-P: not a character", obj));
     public static LispObject Alphanumericp(LispObject obj) =>
-        obj is LispChar c ? (char.IsLetterOrDigit(c.Value) ? T.Instance : Nil.Instance)
+        obj is LispChar c ? (char.IsLetter(c.Value) || (c.Value >= '0' && c.Value <= '9') ? T.Instance : Nil.Instance)
             : throw new LispErrorException(new LispTypeError("ALPHANUMERICP: not a character", obj));
     public static LispObject GraphicCharP(LispObject obj) =>
         obj is LispChar c ? (IsGraphicChar(c.Value) ? T.Instance : Nil.Instance)
@@ -522,13 +522,13 @@ public static partial class Runtime
         && char.GetUnicodeCategory(ch) != System.Globalization.UnicodeCategory.PrivateUse
         && char.GetUnicodeCategory(ch) != System.Globalization.UnicodeCategory.OtherNotAssigned;
     public static LispObject BothCaseP(LispObject obj) =>
-        obj is LispChar c ? ((char.IsUpper(c.Value) || char.IsLower(c.Value)) ? T.Instance : Nil.Instance)
+        obj is LispChar c ? (CharCase.HasCase(c.Value) ? T.Instance : Nil.Instance)
             : throw new LispErrorException(new LispTypeError("BOTH-CASE-P: not a character", obj));
     public static LispObject CharUpcase(LispObject obj) =>
-        obj is LispChar c ? LispChar.Make(char.IsLower(c.Value) ? char.ToUpperInvariant(c.Value) : c.Value)
+        obj is LispChar c ? LispChar.Make(CharCase.Upcase(c.Value))
             : throw new LispErrorException(new LispTypeError("CHAR-UPCASE: not a character", obj));
     public static LispObject CharDowncase(LispObject obj) =>
-        obj is LispChar c ? LispChar.Make(char.IsUpper(c.Value) ? char.ToLowerInvariant(c.Value) : c.Value)
+        obj is LispChar c ? LispChar.Make(CharCase.Downcase(c.Value))
             : throw new LispErrorException(new LispTypeError("CHAR-DOWNCASE: not a character", obj));
 
     // Hash table iteration
@@ -540,6 +540,29 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("MAPHASH: not a hash table", table, Startup.Sym("HASH-TABLE")));
         ht.ForEachLisp(func);
         return MultipleValues.Alone(Nil.Instance);
+    }
+
+    // MAPHASH opened into a loop by the compiler (a literal lambda that leaves
+    // the walk with RETURN-FROM or GO): begin, step, read, and end in the
+    // cleanup of an UNWIND-PROTECT. The entries are the snapshot MAPHASH walks.
+    public static LispObject HashWalkBegin(LispObject table)
+    {
+        if (table is not LispHashTable ht)
+            throw new LispErrorException(new LispTypeError("MAPHASH: not a hash table", table, Startup.Sym("HASH-TABLE")));
+        return new HashTableWalk(ht);
+    }
+
+    public static LispObject HashWalkNext(LispObject walk)
+        => ((HashTableWalk)walk).MoveNext() ? T.Instance : Nil.Instance;
+
+    public static LispObject HashWalkKey(LispObject walk) => ((HashTableWalk)walk).Key;
+
+    public static LispObject HashWalkValue(LispObject walk) => ((HashTableWalk)walk).Value;
+
+    public static LispObject HashWalkEnd(LispObject walk)
+    {
+        ((HashTableWalk)walk).End();
+        return Nil.Instance;
     }
 
     // CL spec: type-of returns the most specific type.
@@ -561,7 +584,7 @@ public static partial class Runtime
         return v;
     }
 
-    static char CheckBaseChar(char c)
+    internal static char CheckBaseChar(char c)
     {
         if (c >= BaseCharCodeLimit)
             throw new LispErrorException(new LispTypeError(
@@ -606,7 +629,15 @@ public static partial class Runtime
         }
     }
 
-    public static LispObject TypeOf(LispObject obj) => obj switch
+    public static LispObject TypeOf(LispObject obj)
+    {
+#if DEBUG
+        AssertNotTableTNil(obj);
+#endif
+        return CanonicalValue(TypeOfCore(obj));
+    }
+
+    private static LispObject TypeOfCore(LispObject obj) => obj switch
     {
         Nil => Startup.Sym("NULL"),
         T => Startup.Sym("BOOLEAN"),
@@ -625,6 +656,7 @@ public static partial class Runtime
         LispChar => Startup.Sym("EXTENDED-CHAR"),
         MethodCombinationObject => Startup.Sym("METHOD-COMBINATION"),
         EqlSpecializer => Startup.Sym("EQL-SPECIALIZER"),
+        LispRestart => Startup.Sym("RESTART"),
         GenericFunction gf when gf.StoredClass != null => gf.StoredClass.Name,
         GenericFunction => Startup.Sym("STANDARD-GENERIC-FUNCTION"),
         LispFunction => Startup.Sym("COMPILED-FUNCTION"),
@@ -638,7 +670,7 @@ public static partial class Runtime
         LispVector v when v.IsCharVector && v.ElementTypeName == "NIL" => VectorTypeOf(v),
         LispVector v when !v.IsCharVector && !v.IsBitVector && v.IsSimple && v.ElementTypeName == "T" && v.Rank == 1 => Runtime.List(Startup.Sym("SIMPLE-VECTOR"), Fixnum.Make(v.Dimensions[0])),
         LispVector v when v.Rank == 1 && v.IsSimple => VectorTypeOf(v), // (SIMPLE-ARRAY et (n))
-        LispVector v when v.Rank == 1 && !v.IsCharVector && !v.IsBitVector && v.ElementTypeName == "T" => Runtime.List(Startup.Sym("VECTOR"), Startup.Sym("T"), Fixnum.Make(v.Dimensions[0])),
+        LispVector v when v.Rank == 1 && !v.IsCharVector && !v.IsBitVector && v.ElementTypeName == "T" => Runtime.List(Startup.Sym("VECTOR"), T.Instance, Fixnum.Make(v.Dimensions[0])),
         LispVector v when v.Rank == 1 => Startup.Sym("VECTOR"),
         LispVector v => VectorTypeOf(v),
         LispReadtable => Startup.Sym("READTABLE"),
@@ -667,15 +699,15 @@ public static partial class Runtime
         // the way the LispInstance branch above does.
         LispClass cls => Runtime.ClassOf(cls) is LispClass meta
             ? (!meta.NameCleared && meta.Name is Symbol metaName ? metaName : (LispObject)meta)
-            : Startup.Sym("T"),
+            : T.Instance,
         // A slot-definition metaobject: its class is STANDARD-DIRECT- or
         // STANDARD-EFFECTIVE-SLOT-DEFINITION, or whatever DIRECT-/EFFECTIVE-
         // SLOT-DEFINITION-CLASS returned. Same shape as the class branch above.
         SlotDefinition => Runtime.ClassOf(obj) is LispClass sdc
             ? (!sdc.NameCleared && sdc.Name is Symbol sdcName ? sdcName : (LispObject)sdc)
-            : Startup.Sym("T"),
+            : T.Instance,
         LispDotNetObject dn => Runtime.EnsureDotNetTypeClass(dn.Type).Name,
-        _ => Startup.Sym("T")
+        _ => T.Instance
     };
 
     // Convert a stored ElementTypeName string to a proper Lisp element-type specifier
@@ -690,7 +722,7 @@ public static partial class Runtime
         // Same answer ARRAY-ELEMENT-TYPE gives for a complex element type.
         if (elemTypeName == "COMPLEX" || elemTypeName.StartsWith("COMPLEX-", StringComparison.Ordinal))
             return Runtime.ElementTypeNameToType(elemTypeName);
-        return Startup.Sym(elemTypeName);
+        return Startup.SymValue(elemTypeName);
     }
 
     // Returns compound type specifier (SIMPLE-ARRAY elem dims) for multi-dim/0-dim arrays
@@ -762,14 +794,13 @@ public static partial class Runtime
     {
         if (obj is Cons) return false;
         if (ReferenceEquals(obj, Nil.Instance)) return true;
-        return IsTrueEndpSlow(obj);
+        // Only a throw, so that past a false answer OBJ is known to be a cons
+        // and the CAR / CDR that follow need no type test of their own.
+        throw EndpTypeError(obj);
     }
 
-    private static bool IsTrueEndpSlow(LispObject obj)
-    {
-        if (obj is MvReturn mv) return IsTrueEndp(mv.PrimaryValue);
-        throw TypedEntryTypeError(obj, Startup.Sym("LIST"));
-    }
+    private static LispErrorException EndpTypeError(LispObject obj)
+        => TypedEntryTypeError(obj, Startup.Sym("LIST"));
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispObject Endp(LispObject obj) => IsTrueEndp(obj) ? T.Instance : Nil.Instance;
@@ -822,6 +853,21 @@ public static partial class Runtime
         }
     }
 
+    /// <summary>Signal the PROGRAM-ERROR for a call with NARGS arguments to a
+    /// function that takes MIN to MAX (MAX &lt; 0: no upper bound).</summary>
+    public static void ThrowArgCount(string name, int nargs, int min, int max)
+    {
+        string expected = max < 0 ? $"at least {min}" : min == max ? $"{min}" : $"{min}-{max}";
+        string what = nargs < min ? "too few" : "too many";
+        throw new LispErrorException(new LispProgramError($"{name}: {what} arguments: {nargs} (expected {expected})"));
+    }
+
+    public static void CheckArgCount(string name, LispObject[] args, int min, int max)
+    {
+        if (args.Length < min || (max >= 0 && args.Length > max))
+            ThrowArgCount(name, args.Length, min, max);
+    }
+
     public static void CheckArityMin(string name, LispObject[] args, int min)
     {
         if (args.Length < min)
@@ -832,6 +878,13 @@ public static partial class Runtime
     {
         if (args.Length > max)
             throw new LispErrorException(new LispProgramError($"{name}: too many arguments: {args.Length} (expected at most {max})"));
+    }
+
+    public static void CheckKeywordArgs(string name, LispObject[] args, int keyStart, string[] validKeys, bool allowOtherKeys)
+    {
+        if (!allowOtherKeys) { CheckNoUnknownKeys2(name, args, keyStart, validKeys, null); return; }
+        if (args.Length > keyStart && (args.Length - keyStart) % 2 != 0)
+            throw new LispErrorException(new LispProgramError($"{name}: odd number of keyword arguments"));
     }
 
     public static void CheckNoUnknownKeys(string name, LispObject[] args, int keyStart, string[] validKeys)
@@ -1020,7 +1073,7 @@ public static partial class Runtime
         var sym = GetSymbol(obj, "SYMBOL-VALUE");
         if (DynamicBindings.TryGet(sym, out var val))
             return val;
-        throw new LispErrorException(new LispUnboundVariable(sym));
+        return Runtime.UnboundVariableError(sym);
     }
 
     public static LispObject Getenv(LispObject name)
@@ -1129,6 +1182,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError($"{fname}: odd number of keyword arguments"));
         bool? allowOtherKeys = null;
         bool hasUnknown = false;
+        bool startSeen = false, endSeen = false;
         for (int i = 1; i < args.Length; i += 2)
         {
             if (args[i] is not Symbol kwSym)
@@ -1138,10 +1192,18 @@ public static partial class Runtime
             switch (kwName)
             {
                 case "START":
-                    start = val is Fixnum fs ? (int)fs.Value : val is Nil ? 0 : throw new LispErrorException(new LispProgramError($"{fname}: :start must be an integer"));
+                    if (!startSeen)
+                    {
+                        start = val is Fixnum fs ? (int)fs.Value : val is Nil ? 0 : throw new LispErrorException(new LispProgramError($"{fname}: :start must be an integer"));
+                        startSeen = true;
+                    }
                     break;
                 case "END":
-                    end = val is Fixnum fe ? (int)fe.Value : val is Nil ? strLen : throw new LispErrorException(new LispProgramError($"{fname}: :end must be an integer or nil"));
+                    if (!endSeen)
+                    {
+                        end = val is Fixnum fe ? (int)fe.Value : val is Nil ? strLen : throw new LispErrorException(new LispProgramError($"{fname}: :end must be an integer or nil"));
+                        endSeen = true;
+                    }
                     break;
                 case "ALLOW-OTHER-KEYS":
                     if (allowOtherKeys == null) allowOtherKeys = IsTruthy(val);
@@ -1153,6 +1215,7 @@ public static partial class Runtime
         }
         if (hasUnknown && allowOtherKeys != true)
             throw new LispErrorException(new LispProgramError($"{fname}: unknown keyword argument"));
+        CheckBoundingIndices(start, end, strLen, fname);
         return (str, start, end);
     }
 
@@ -1160,7 +1223,11 @@ public static partial class Runtime
     {
         var (str, start, end) = ParseStringCaseArgs(args, "STRING-UPCASE");
         var chars = str.ToCharArray();
-        for (int i = start; i < end; i++) chars[i] = char.ToUpperInvariant(chars[i]);
+        for (int i = start; i < end; i++)
+        {
+            char c = chars[i];
+            chars[i] = c >= 'a' && c <= 'z' ? (char)(c - 32) : c < 128 ? c : CharCase.Upcase(c);
+        }
         return new LispString(chars);
     }
 
@@ -1168,7 +1235,11 @@ public static partial class Runtime
     {
         var (str, start, end) = ParseStringCaseArgs(args, "STRING-DOWNCASE");
         var chars = str.ToCharArray();
-        for (int i = start; i < end; i++) chars[i] = char.ToLowerInvariant(chars[i]);
+        for (int i = start; i < end; i++)
+        {
+            char c = chars[i];
+            chars[i] = c >= 'A' && c <= 'Z' ? (char)(c + 32) : c < 128 ? c : CharCase.Downcase(c);
+        }
         return new LispString(chars);
     }
 
@@ -1182,7 +1253,7 @@ public static partial class Runtime
             char c = chars[i];
             if (char.IsLetter(c))
             {
-                chars[i] = wordBoundary ? char.ToUpperInvariant(c) : char.ToLowerInvariant(c);
+                chars[i] = wordBoundary ? CharCase.Upcase(c) : CharCase.Downcase(c);
                 wordBoundary = false;
             }
             else if (char.IsDigit(c)) wordBoundary = false;
@@ -1258,19 +1329,22 @@ public static partial class Runtime
     public static LispObject StringTrim(LispObject charBag, LispObject obj)
     {
         var chars = GetTrimChars(charBag);
-        return new LispString(ToStringDesignator(obj, "STRING-TRIM").Trim(chars));
+        var str = ToStringDesignator(obj, "STRING-TRIM");
+        return new LispString(chars.Length == 0 ? str : str.Trim(chars));
     }
 
     public static LispObject StringLeftTrim(LispObject charBag, LispObject obj)
     {
         var chars = GetTrimChars(charBag);
-        return new LispString(ToStringDesignator(obj, "STRING-LEFT-TRIM").TrimStart(chars));
+        var str = ToStringDesignator(obj, "STRING-LEFT-TRIM");
+        return new LispString(chars.Length == 0 ? str : str.TrimStart(chars));
     }
 
     public static LispObject StringRightTrim(LispObject charBag, LispObject obj)
     {
         var chars = GetTrimChars(charBag);
-        return new LispString(ToStringDesignator(obj, "STRING-RIGHT-TRIM").TrimEnd(chars));
+        var str = ToStringDesignator(obj, "STRING-RIGHT-TRIM");
+        return new LispString(chars.Length == 0 ? str : str.TrimEnd(chars));
     }
 
     private static char[] GetTrimChars(LispObject charBag)
@@ -1534,13 +1608,13 @@ public static partial class Runtime
         return true;
     }
 
-    private static int ReplaceSeqLength(LispObject seq) => seq switch
+    private static int ReplaceSeqLength(LispObject seq, string fnName = "REPLACE") => seq switch
     {
         Nil => 0,
-        Cons => ListLength(seq),
+        Cons => CheckedListLength(seq, fnName),
         LispString s => s.Length,
         LispVector v => v.Length,
-        _ => throw new LispErrorException(new LispTypeError("REPLACE: not a sequence", seq))
+        _ => throw new LispErrorException(new LispTypeError($"{fnName}: not a sequence", seq))
     };
 
     private static LispObject ReplaceSeqGet(LispObject seq, int i)
@@ -1556,7 +1630,13 @@ public static partial class Runtime
 
     private static void ReplaceSeqSet(LispObject seq, int i, LispObject value)
     {
-        if (seq is LispString s && value is LispChar ch) { s[i] = ch.Value; return; }
+        if (seq is LispString s)
+        {
+            if (value is not LispChar ch)
+                throw new LispErrorException(new LispTypeError("REPLACE: cannot store a non-character in a string", value, Startup.Sym("CHARACTER")));
+            s[i] = ch.Value;
+            return;
+        }
         if (seq is LispVector v) { v.SetElement(i, value); return; }
         // list
         LispObject cur = seq;
@@ -1672,6 +1752,12 @@ public static partial class Runtime
         bool junkAllowed = false;
         if ((args.Length - 1) % 2 != 0)
             throw new LispErrorException(new LispProgramError("PARSE-INTEGER: odd number of keyword arguments"));
+        static int BoundingIndex(LispObject o, string key)
+        {
+            if (o is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue) return (int)f.Value;
+            throw new LispErrorException(new LispTypeError(
+                $"PARSE-INTEGER: :{key} is not a valid bounding index", o, Startup.Sym("INTEGER")));
+        }
         // CL spec: leftmost keyword occurrence wins
         bool seenStart = false, seenEnd = false, seenRadix = false, seenJunk = false;
         bool allowOtherKeys = false; bool seenAllowOtherKeys = false;
@@ -1682,18 +1768,23 @@ public static partial class Runtime
             switch (key)
             {
                 case "START":
-                    if (!seenStart) { start = args[j + 1] is Fixnum sf ? (int)sf.Value : 0; seenStart = true; }
+                    if (!seenStart) { start = BoundingIndex(args[j + 1], "start"); seenStart = true; }
                     break;
                 case "END":
                     if (!seenEnd) {
-                        if (args[j + 1] is Nil) end = origLen;
-                        else if (args[j + 1] is Fixnum ef) end = (int)ef.Value;
-                        else end = origLen;
+                        end = args[j + 1] is Nil ? origLen : BoundingIndex(args[j + 1], "end");
                         seenEnd = true;
                     }
                     break;
                 case "RADIX":
-                    if (!seenRadix) { radix = args[j + 1] is Fixnum rf ? (int)rf.Value : 10; seenRadix = true; }
+                    if (!seenRadix) {
+                        if (args[j + 1] is not Fixnum rf || rf.Value < 2 || rf.Value > 36)
+                            throw new LispErrorException(new LispTypeError(
+                                "PARSE-INTEGER: :radix must be an integer between 2 and 36",
+                                args[j + 1], Startup.Sym("INTEGER")));
+                        radix = (int)rf.Value;
+                        seenRadix = true;
+                    }
                     break;
                 case "JUNK-ALLOWED":
                     if (!seenJunk) { junkAllowed = args[j + 1] is not Nil; seenJunk = true; }
@@ -1708,6 +1799,7 @@ public static partial class Runtime
         }
         if (unknownKey != null && !allowOtherKeys)
             throw new LispErrorException(new LispProgramError($"PARSE-INTEGER: unrecognized keyword :{unknownKey}"));
+        CheckBoundingIndices(start, end, origLen, "PARSE-INTEGER");
         // Skip leading whitespace
         int i = start;
         while (i < end && char.IsWhiteSpace(str[i])) i++;
@@ -1753,25 +1845,24 @@ public static partial class Runtime
 
     public static LispObject MakeHashTable(LispObject test)
     {
-        string testName = test switch
-        {
-            Symbol sym => sym.Name,
-            LispFunction fn => HashTestFunctionName(fn),
-            _ => "EQL"
-        };
-        return new LispHashTable(testName);
+        return new LispHashTable(HashTestName(test));
     }
 
     public static LispObject MakeHashTableSync(LispObject test, bool synchronized)
     {
-        string testName = test switch
-        {
-            Symbol sym => sym.Name,
-            LispFunction fn => HashTestFunctionName(fn),
-            _ => "EQL"
-        };
-        return new LispHashTable(testName, synchronized);
+        return new LispHashTable(HashTestName(test), synchronized);
     }
+
+    private static string HashTestName(LispObject test) => test switch
+    {
+        Symbol sym => sym.Name,
+        LispFunction fn => HashTestFunctionName(fn),
+        _ => throw new LispErrorException(new LispTypeError(
+                 "MAKE-HASH-TABLE: :test must be a designator for EQ, EQL, EQUAL or EQUALP",
+                 test,
+                 Runtime.List(Startup.Sym("MEMBER"), Startup.Sym("EQ"), Startup.Sym("EQL"),
+                              Startup.Sym("EQUAL"), Startup.Sym("EQUALP"))))
+    };
 
     /// <summary>The :TEST name of a function object given to MAKE-HASH-TABLE. An
     /// anonymous function used to become EQL without a word, so a table meant to
@@ -1808,6 +1899,48 @@ public static partial class Runtime
 
     private static LispObject ProperFunctionName(LispFunction fn)
         => Runtime.FunctionNameObject(fn) is Symbol sym ? sym : fn;
+
+    private static void CheckHashSize(LispObject value)
+    {
+        if (value is Fixnum f ? f.Value >= 0 : value is Bignum b && b.Value.Sign >= 0)
+            return;
+        throw new LispErrorException(new LispTypeError(
+            "MAKE-HASH-TABLE: :size must be a non-negative integer", value,
+            Runtime.List(Startup.Sym("INTEGER"), Fixnum.Make(0), Startup.Sym("*"))));
+    }
+
+    private static void CheckHashRehashSize(LispObject value)
+    {
+        switch (value)
+        {
+            case Fixnum f when f.Value >= 1: return;
+            case Bignum b when b.Value >= 1: return;
+            case SingleFloat sf when sf.Value > 1.0f: return;
+            case DoubleFloat df when df.Value > 1.0: return;
+        }
+        throw new LispErrorException(new LispTypeError(
+            "MAKE-HASH-TABLE: :rehash-size must be an integer at least 1 or a float greater than 1.0",
+            value,
+            Runtime.List(Startup.Sym("OR"),
+                         Runtime.List(Startup.Sym("INTEGER"), Fixnum.Make(1), Startup.Sym("*")),
+                         Runtime.List(Startup.Sym("FLOAT"),
+                                      Runtime.List(new SingleFloat(1.0f)), Startup.Sym("*")))));
+    }
+
+    private static void CheckHashRehashThreshold(LispObject value)
+    {
+        switch (value)
+        {
+            case Fixnum f when f.Value >= 0 && f.Value <= 1: return;
+            case Bignum b when b.Value >= 0 && b.Value <= 1: return;
+            case Ratio r when r.Numerator.Sign >= 0 && r.Numerator <= r.Denominator: return;
+            case SingleFloat sf when sf.Value >= 0 && sf.Value <= 1: return;
+            case DoubleFloat df when df.Value >= 0 && df.Value <= 1: return;
+        }
+        throw new LispErrorException(new LispTypeError(
+            "MAKE-HASH-TABLE: :rehash-threshold must be a real between 0 and 1", value,
+            Runtime.List(Startup.Sym("REAL"), Fixnum.Make(0), Fixnum.Make(1))));
+    }
 
     public static LispObject MakeHashTable0()
     {
@@ -1896,25 +2029,33 @@ public static partial class Runtime
         {
             Nil => 0,
             T => 1,
-            Fixnum f => f.Value.GetHashCode(),
+            Fixnum f => SxhashLong(f.Value),
             // Every number hashes by its value: EQUAL compares numbers with EQL,
             // and a constant hash put every bignum key of a table built on SXHASH
-            // (Coalton's hash maps) in one bucket.
-            Bignum b => b.Value.GetHashCode(),
-            SingleFloat sf => sf.Value.GetHashCode(),
-            DoubleFloat df => df.Value.GetHashCode(),
-            Ratio r => unchecked(r.Numerator.GetHashCode() * 31 + r.Denominator.GetHashCode()),
+            // (Coalton's hash maps) in one bucket. Content hashes are fixed
+            // here, not the runtime's seeded ones, so every image agrees.
+            Bignum b => Compat.ByteHash(b.Value.ToByteArray()),
+            SingleFloat sf => Compat.SingleToInt32Bits(sf.Value),
+            DoubleFloat df => SxhashLong(BitConverter.DoubleToInt64Bits(df.Value)),
+            Ratio r => unchecked(SxhashInteger(r.Numerator) * 31 + SxhashInteger(r.Denominator)),
             LispComplex cx => unchecked(SxhashCompute(cx.Real, depth - 1) * 31 + SxhashCompute(cx.Imaginary, depth - 1)),
-            LispChar ch => ch.Value.GetHashCode(),
-            Symbol s => s.Name.GetHashCode(StringComparison.Ordinal),
-            LispString ls => ls.Value.GetHashCode(StringComparison.Ordinal),
-            LispVector lv when lv.IsCharVector => lv.ToCharString().GetHashCode(StringComparison.Ordinal),
+            LispChar ch => ch.Value,
+            Symbol s => Compat.StringHash(s.Name),
+            LispString ls => Compat.StringHash(ls.Chars),
+            LispVector lv when lv.IsCharVector => Compat.StringHash(lv.ToCharString()),
             LispVector lv when lv.IsBitVector => SxhashBitVector(lv),
             Cons c => unchecked(SxhashCompute(c.Car, depth - 1) * 31 + SxhashCompute(c.Cdr, depth - 1)),
-            LispPathname p => p.ToString().GetHashCode(StringComparison.OrdinalIgnoreCase),
+            LispPathname p => Compat.StringHash(p.ToString().ToUpperInvariant()),
             _ => 0,
         };
     }
+
+    private static int SxhashLong(long v) => unchecked((int)v ^ (int)(v >> 32));
+
+    private static int SxhashInteger(System.Numerics.BigInteger v)
+        => v >= long.MinValue && v <= long.MaxValue
+            ? SxhashLong((long)v)
+            : Compat.ByteHash(v.ToByteArray());
 
     private static int SxhashBitVector(LispVector lv)
     {
@@ -1962,42 +2103,84 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("MAKE-HASH-TABLE",
             new LispFunction(args => {
                 if (args.Length == 0) return Runtime.MakeHashTable0();
+                if (args.Length % 2 != 0)
+                    throw new LispErrorException(new LispProgramError(
+                        "MAKE-HASH-TABLE: odd number of keyword arguments"));
                 LispObject? testArg = null;
                 LispObject? hashArg = null;
                 bool synchronized = false;
                 string? weakness = null;
                 int size = 0;
-                for (int i = 0; i < args.Length - 1; i += 2)
+                Symbol? unknownKey = null;
+                bool allowOtherKeys = false, allowOtherKeysSeen = false;
+                bool sizeSeen = false, testSeen = false, hashSeen = false, syncSeen = false,
+                     rehashSizeSeen = false, rehashThresholdSeen = false, weaknessSeen = false;
+                for (int i = 0; i < args.Length; i += 2)
                 {
-                    if (args[i] is Symbol kw)
+                    if (args[i] is not Symbol kw)
+                        throw new LispErrorException(new LispProgramError(
+                            $"MAKE-HASH-TABLE: expected a keyword, got {args[i]}"));
+                    switch (kw.Name)
                     {
-                        if (kw.Name == "SIZE") { if (args[i + 1] is Fixnum sz && sz.Value > 0) size = (int)Math.Min(sz.Value, int.MaxValue); }
-                        else if (kw.Name == "TEST") testArg = args[i + 1];
-                        else if (kw.Name == "HASH-FUNCTION") hashArg = args[i + 1];
-                        else if (kw.Name == "SYNCHRONIZED") synchronized = args[i + 1] is not Nil;
-                        else if (kw.Name == "WEAKNESS")
-                        {
+                        case "SIZE":
+                            if (!sizeSeen)
+                            {
+                                Runtime.CheckHashSize(args[i + 1]);
+                                size = args[i + 1] is Fixnum sz
+                                    ? (int)Math.Min(sz.Value, int.MaxValue)
+                                    : int.MaxValue;
+                                sizeSeen = true;
+                            }
+                            break;
+                        case "TEST":
+                            if (!testSeen) { testArg = args[i + 1]; testSeen = true; }
+                            break;
+                        case "HASH-FUNCTION":
+                            if (!hashSeen) { hashArg = args[i + 1]; hashSeen = true; }
+                            break;
+                        case "SYNCHRONIZED":
+                            if (!syncSeen) { synchronized = args[i + 1] is not Nil; syncSeen = true; }
+                            break;
+                        case "REHASH-SIZE":
+                            if (!rehashSizeSeen)
+                            { Runtime.CheckHashRehashSize(args[i + 1]); rehashSizeSeen = true; }
+                            break;
+                        case "REHASH-THRESHOLD":
+                            if (!rehashThresholdSeen)
+                            { Runtime.CheckHashRehashThreshold(args[i + 1]); rehashThresholdSeen = true; }
+                            break;
+                        case "WEAKNESS":
                             // Accept :value (SBCL extension); other modes
                             // throw at LispHashTable construction.
-                            if (args[i + 1] is Symbol ws) weakness = ws.Name;
-                            else if (args[i + 1] is Nil) weakness = null;
-                        }
+                            if (!weaknessSeen)
+                            {
+                                if (args[i + 1] is Symbol ws) weakness = ws.Name;
+                                else if (args[i + 1] is Nil) weakness = null;
+                                weaknessSeen = true;
+                            }
+                            break;
+                        case "ALLOW-OTHER-KEYS":
+                            if (!allowOtherKeysSeen)
+                            {
+                                allowOtherKeysSeen = true;
+                                allowOtherKeys = args[i + 1] is not Nil;
+                            }
+                            break;
+                        default:
+                            unknownKey ??= kw;
+                            break;
                     }
                 }
+                if (unknownKey != null && !allowOtherKeys)
+                    throw new LispErrorException(new LispProgramError(
+                        $"MAKE-HASH-TABLE: unrecognized keyword :{unknownKey.Name}"));
                 if (hashArg != null && hashArg is not Nil)
                 {
                     var hf = Runtime.MakeHashTableWithHashFunction(testArg, hashArg, synchronized, weakness);
                     if (hf is LispHashTable hft) hft.EnsureCapacity(size);
                     return hf;
                 }
-                string testName = testArg switch
-                {
-                    Symbol s => s.Name.ToUpperInvariant(),
-                    LispString ls => ls.Value.ToUpperInvariant(),
-                    LispFunction fn => Runtime.HashTestFunctionName(fn).ToUpperInvariant(),
-                    null => "EQL",
-                    _ => "EQL"
-                };
+                string testName = testArg == null ? "EQL" : Runtime.HashTestName(testArg);
                 var made = new LispHashTable(testName, synchronized, weakness);
                 made.EnsureCapacity(size);
                 return made;
@@ -2197,7 +2380,7 @@ public static partial class Runtime
             int rowMajorIdx = 0;
             for (int i = 0; i < dims.Length; i++)
             {
-                int sub = (int)((Fixnum)args[i + 1]).Value;
+                int sub = Runtime.IntArg("ARRAY-ROW-MAJOR-INDEX", "subscript", args[i + 1]);
                 rowMajorIdx = rowMajorIdx * dims[i] + sub;
             }
             return Fixnum.Make(rowMajorIdx);
@@ -2285,7 +2468,9 @@ public static partial class Runtime
             else if (arr is LispString sArr) dims = new[] { sArr.Length };
             else throw new LispErrorException(new LispTypeError("ARRAY-IN-BOUNDS-P: not an array", arr));
             int nSubs = args.Length - 1;
-            if (nSubs != dims.Length) return Nil.Instance; // wrong number of subscripts
+            if (nSubs != dims.Length)
+                throw new LispErrorException(new LispProgramError(
+                    $"ARRAY-IN-BOUNDS-P: wrong number of subscripts: {nSubs} for an array of rank {dims.Length}"));
             for (int i = 0; i < dims.Length; i++)
             {
                 // Bignum index is always out of bounds
@@ -2457,41 +2642,7 @@ public static partial class Runtime
                 int start = (int)((Fixnum)args[1]).Value;
                 int end = args[2] is Fixnum fe ? (int)fe.Value : -1;
                 var source = args[3];
-                if (target is LispString ts)
-                {
-                    int srcLen = source is LispString srcStr ? srcStr.Length
-                        : source is LispVector srcVec ? srcVec.Length : 0;
-                    int len = end >= 0 ? end - start : ts.Length - start;
-                    for (int i = 0; i < len && i < srcLen; i++)
-                    {
-                        char c = source is LispString ss2 ? ss2[i]
-                            : source is LispVector sv2 && sv2.GetElement(i) is LispChar lc2 ? lc2.Value : '\0';
-                        ts[start + i] = c;
-                    }
-                }
-                else if (target is LispVector tv)
-                {
-                    int srcLen = source is LispString srcStr2 ? srcStr2.Length
-                        : source is LispVector srcVec2 ? srcVec2.Length : 0;
-                    int len = end >= 0 ? end - start : tv.Length - start;
-                    for (int i = 0; i < len && i < srcLen; i++)
-                    {
-                        LispObject elem = source is LispString ss3 ? LispChar.Make(ss3[i])
-                            : source is LispVector sv3 ? sv3.GetElement(i) : Nil.Instance;
-                        tv.SetElement(start + i, elem);
-                    }
-                }
-                else if (target is Cons || target is Nil)
-                {
-                    // List target: walk and set elements
-                    int targetLen = ListLength(target);
-                    int e = end >= 0 ? end : targetLen;
-                    int srcLen = source is Cons || source is Nil ? ListLength(source)
-                        : source is LispVector sv4 ? sv4.Length
-                        : source is LispString ss4 ? ss4.Length : 0;
-                    for (int i = start, j = 0; i < e && j < srcLen; i++, j++)
-                        Runtime.SetElt(target, Fixnum.Make(i), Runtime.Elt(source, Fixnum.Make(j)));
-                }
+                ReplaceCore(target, source, start, end, 0, -1);
                 return source;
             }));
 

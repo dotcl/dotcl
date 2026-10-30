@@ -667,7 +667,7 @@ single-entry `LastDispatch` cache, MethodCombination)、`SlotDefinition`
 **主要なファイル**: `runtime/Clos.cs` (404 行、class / instance /
 method の C# 実装)、`runtime/Mop.cs` (322 行、closer-mop 互換シンボル
 と introspection API: `class-slots` / `generic-function-methods` 等)、
-`runtime/Runtime.CLOS.cs` (3566 行、`make-instance` / dispatch /
+`runtime/Runtime.CLOS*.cs` (`make-instance` / dispatch /
 `defclass` 展開)。
 
 **実装上の論点**: CPL は C3 linearization。slot マージは initargs
@@ -782,7 +782,7 @@ top-level の `abort` リスタートを張るので、子スレッド内のエ�
 の順で解決する。配布物の ASDF は `runtime/contrib/asdf/asdf.fasl` を
 同梱しているので、ユーザは `(require "asdf")` するだけで使える。
 
-**主要なファイル**: `runtime/Runtime.Misc.cs` 内の
+**主要なファイル**: `runtime/Runtime.Modules.cs` 内の
 `ModuleProvideContrib`、配布バンドル `runtime/contrib/asdf/asdf.fasl`、
 ASDF 本体は別 fork (`github.com/dotcl/asdf`) の `dotcl-0.1.11` ブランチ
 (互換世代 pin ブランチ) を `make setup-asdf` で取り込む。

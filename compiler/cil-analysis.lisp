@@ -243,7 +243,7 @@
                     ((and (symbolp head) (member head '(let let*)) (listp (cadr e)))
                      (let* ((bindings (cadr e))
                             (lbody (cddr e))
-                            (inner-bound (copy-list bnd))
+                            (inner-bound bnd)
                             (is-star (eq head 'let*)))
                        (dolist (b bindings)
                          (let ((init (if (consp b) (cadr b) nil))
@@ -526,7 +526,8 @@
                          (let ((expander (find-macro-expander head)))
                            (multiple-value-bind (exp hits)
                                (%walker-macroexpand e expander bnd)
-                             (setf expanded exp)
+                             ;; An expansion EQUAL to its input is a fixed point.
+                             (setf expanded (and exp (not (equal exp e)) exp))
                              ;; A place that is a global symbol macro may be a
                              ;; LET-bound variable here: walk the name as a
                              ;; reference so a binding outside this form is still
@@ -1170,7 +1171,8 @@
 ;;; new op that carries local KEYs, whether as a direct operand or embedded in a
 ;;; nested operand list, is taught to every pass by editing only this section.
 ;;; Authoritative op set (CilAssembler.Emit.cs): :declare-local, :ldloc, :stloc,
-;;; :dotnet-call-direct-locals (RECV + ARG list). Background: a missed
+;;; :ldloca, :dotnet-call-direct-locals (RECV + ARG list),
+;;; :dotnet-static-direct-locals (ARG list). Background: a missed
 ;;; nested-operand local once let slot-sharing orphan a merged local into an
 ;;; "Undeclared local" at assembly time, because each pass scanned for top-level
 ;;; :ldloc/:stloc independently and none knew the new op carried locals.
@@ -1192,7 +1194,9 @@
     `(let ((,i ,instr))
        (when (consp ,i)
          (case (car ,i)
-           (:ldloc (let ((,var (cadr ,i))) ,@body))
+           ;; An address taken may be read through, and written: it counts
+           ;; as a read.
+           ((:ldloc :ldloca) (let ((,var (cadr ,i))) ,@body))
            ;; The debug frame stores (:frame-set NAME KEY) and its box /
            ;; native-rep variants all read KEY.
            ((:frame-set :frame-set-box :frame-set-long :frame-set-double :frame-set-single)
@@ -1202,6 +1206,9 @@
            (:dotnet-call-direct-locals
             (let ((,var (nth 3 ,i))) ,@body)
             (dolist (,k (nth 4 ,i)) (let ((,var ,k)) ,@body)))
+           ;; (:dotnet-static-direct-locals TYPE MEMBER (ARG...) (PARAM...))
+           (:dotnet-static-direct-locals
+            (dolist (,k (nth 3 ,i)) (let ((,var ,k)) ,@body)))
            (t nil))))))
 
 (defmacro do-instr-local-writes ((var instr) &body body)
@@ -1242,7 +1249,7 @@
 
 (defun rewrite-instr-locals (instr rename)
   "Return INSTR with every local KEY mapped through RENAME (a hash-table; a key
-   absent from RENAME is left unchanged). Covers :declare-local/:ldloc/:stloc,
+   absent from RENAME is left unchanged). Covers :declare-local/:ldloc/:stloc/:ldloca,
    the debug (:frame-set[-box] NAME KEY) stores, and the RECV + ARG locals of
    :dotnet-call-direct-locals. Other instrs are returned unchanged."
   ;; RN is a macrolet, not an flet: this runs once per instruction of every
@@ -1263,6 +1270,8 @@
                     (if (eq n (cadr instr)) instr `(:ldloc ,n))))
           (:stloc (let ((n (rn (cadr instr))))
                     (if (eq n (cadr instr)) instr `(:stloc ,n))))
+          (:ldloca (let ((n (rn (cadr instr))))
+                     (if (eq n (cadr instr)) instr `(:ldloca ,n))))
           ((:frame-set :frame-set-box :frame-set-long :frame-set-double :frame-set-single)
            (let ((n (rn (caddr instr))))
              (if (eq n (caddr instr)) instr
@@ -1273,13 +1282,355 @@
              ,(rn (nth 3 instr))
              ,(loop for k in (nth 4 instr) collect (rn k))
              ,(nth 5 instr)))
+          (:dotnet-static-direct-locals
+           `(:dotnet-static-direct-locals
+             ,(nth 1 instr) ,(nth 2 instr)
+             ,(loop for k in (nth 3 instr) collect (rn k))
+             ,(nth 4 instr)))
           (t instr)))))
 
 ;;; ============================================================
 ;;; Copy propagation: eliminate single-reference let locals
 ;;; ============================================================
 
-(defun eliminate-single-ref-locals (instrs)
+(defconstant +instr-memo-min-length+ 256
+  "Instruction lists shorter than this are not recorded by %CODE-CONCAT or
+   ELIMINATE-SINGLE-REF-LOCALS: walking or copying one costs less than keeping
+   the entry, and almost every list is short.")
+
+(defvar *instr-summaries* nil
+  "NIL, or a cons whose car is NIL or a %MAKE-INSTR-MEMO from an instruction
+   list that ELIMINATE-SINGLE-REF-LOCALS returned to its %ESRL summary. Bound per
+   top-level compile. An enclosing LET's list ends in its body's list, so the
+   pass, and CODE-LAST-INSTR, stop walking where a summarized list begins.")
+
+(defconstant +instr-memo-size+ 4)
+
+(defun %make-instr-memo ()
+  "A small table of the instruction lists recorded last, searched by EQ. Few
+   lists are long enough to be recorded, and the one asked for was almost
+   always recorded just before, so a bounded table keeps the nest linear
+   without hashing every list or keeping all of them."
+  (let ((v (make-array (1+ +instr-memo-size+) :initial-element nil)))
+    (setf (svref v +instr-memo-size+) 0)
+    v))
+
+(defun %memo-get (memo key)
+  (dotimes (i +instr-memo-size+ nil)
+    (let ((e (svref memo i)))
+      (when (and e (eq (car e) key)) (return (cdr e))))))
+
+(defun %memo-rem (memo key)
+  (dotimes (i +instr-memo-size+ nil)
+    (let ((e (svref memo i)))
+      (when (and e (eq (car e) key)) (setf (svref memo i) nil) (return)))))
+
+(defun %memo-put (memo key val)
+  (%memo-rem memo key)
+  (let ((i (svref memo +instr-memo-size+)))
+    (setf (svref memo i) (cons key val)
+          (svref memo +instr-memo-size+) (mod (1+ i) +instr-memo-size+))
+    val))
+
+(defun %instr-summaries ()
+  (and *instr-summaries*
+       (or (car *instr-summaries*)
+           (setf (car *instr-summaries*) (%make-instr-memo)))))
+
+;;; A summary is (LAST ENTRY EXIT CANDS TABLE): the last cons of the list; its
+;;; first instruction that is a list and not a :DECLARE-LOCAL (NIL if none);
+;;; :PASS when there is no such instruction, else the key of a final
+;;; (:STLOC KEY) or NIL; the keys of the (:STLOC KEY) (:LDLOC KEY) pairs in it;
+;;; and NIL or an EQUAL table of key -> #(WRITES READS DECLARES TYPE) over the
+;;; whole list.
+
+(defvar *instr-walk-steps* nil
+  "NIL, or a cons whose car counts the conses CODE-LAST-INSTR and
+   ELIMINATE-SINGLE-REF-LOCALS walk and %CODE-CONCAT copies (for tests of how
+   the work grows).")
+
+(defvar *owned-code* nil
+  "NIL, or a cons whose car is NIL or a %MAKE-INSTR-MEMO from an instruction
+   list %CODE-CONCAT returned to (LAST-CONS OWNED-P). OWNED-P: every cons of the
+   list was made for its caller alone, so the next %CODE-CONCAT that takes it
+   as a part links it in place instead of copying it. Bound per top-level
+   compile.")
+
+(defun %owned-code ()
+  (and *owned-code*
+       (or (car *owned-code*)
+           (setf (car *owned-code*) (%make-instr-memo)))))
+
+(defun %forget-instr-memos ()
+  "Drop the recorded instruction lists once a function's body is complete: the
+   passes over the whole body copy it, and a recorded list would outlive them."
+  (when *instr-summaries* (setf (car *instr-summaries*) nil))
+  (when *owned-code* (setf (car *owned-code*) nil)))
+
+(defun %code-concat (&rest parts)
+  "(APPEND PARTS...) for instruction lists, sharing a long last part as APPEND
+   does. A part %CODE-CONCAT returned with all its conses fresh is linked in
+   place rather than copied. Only a result of +INSTR-MEMO-MIN-LENGTH+ or more
+   is recorded."
+  (when (block short
+          (let ((n 0))
+            (declare (fixnum n))
+            (dolist (part parts t)
+              (loop while (consp part)
+                    do (when (>= (incf n) +instr-memo-min-length+)
+                         (return-from short nil))
+                       (setf part (cdr part))))))
+    (return-from %code-concat (apply #'append parts)))
+  (let ((table (%owned-code))
+        (head nil) (tail nil) (owned t))
+    (macrolet ((link (list last)
+                 `(let ((l ,list))
+                    (if tail (setf (cdr tail) l) (setf head l))
+                    (setf tail ,last))))
+      (loop for (part . more) on parts
+            when (consp part)
+              do (let ((e (and table (%memo-get table part))))
+                   (cond ((and e (second e))
+                          (%memo-rem table part)
+                          (link part (%code-last-cons-from (first e))))
+                         ((and (notany #'consp more)
+                               (or e (nthcdr +instr-memo-min-length+ part)))
+                          (setf owned nil)
+                          (link part (if e
+                                         (%code-last-cons-from (first e))
+                                         (%code-last-cons part))))
+                         (t
+                          (let ((copy (copy-list part)))
+                            (link copy (last copy)))
+                          (when *instr-walk-steps*
+                            (incf (car *instr-walk-steps*) (length part))))))))
+    (when (and table (nthcdr (1- +instr-memo-min-length+) head))
+      (%memo-put table head (list tail owned)))
+    head))
+
+(defun %code-append-instr (code instr)
+  "(APPEND CODE (LIST INSTR)), as %CODE-CONCAT would make it."
+  (if (nthcdr (- +instr-memo-min-length+ 2) code)
+      (%code-concat code (list instr))
+      (append code (list instr))))
+
+(defun %code-last-cons-from (cons)
+  "The last cons of the list CONS is in."
+  (loop while (consp (cdr cons)) do (setf cons (cdr cons)))
+  cons)
+
+(defun %code-last-cons (code)
+  "(LAST CODE), starting from what a summary or %CODE-CONCAT recorded."
+  (let* ((memo (and *instr-summaries* (car *instr-summaries*)))
+         (owned (and *owned-code* (car *owned-code*)))
+         (s (and memo (%memo-get memo code)))
+         (l (cond ((and (consp s) (not (eq (car s) :depth))) (first s))
+                  ((and owned (car (%memo-get owned code))))
+                  (t code))))
+    (if (and *instr-walk-steps* (nthcdr (1- +instr-memo-min-length+) code))
+        (let ((n 0))
+          (loop while (consp (cdr l)) do (setf l (cdr l)) (incf n))
+          (incf (car *instr-walk-steps*) n)
+          l)
+        (last l))))
+
+(defun code-last-instr (code)
+  "(CAR (LAST CODE)), from what a summary or %CODE-CONCAT recorded."
+  (let ((l (%code-last-cons code)))
+    (and (consp l) (car l))))
+
+(defun %esrl-count (table list end)
+  "Add the local references of LIST's instructions, up to the cons END, to TABLE."
+  (flet ((entry (k)
+           (or (gethash k table)
+               (setf (gethash k table) (vector 0 0 0 nil)))))
+    (loop for x on list
+          until (eq x end)
+          do (when *instr-walk-steps* (incf (car *instr-walk-steps*)))
+             (let ((instr (car x)))
+               (when (consp instr)
+                 (when (eq (car instr) :declare-local)
+                   (let ((e (entry (cadr instr))))
+                     (incf (svref e 2))
+                     (setf (svref e 3) (caddr instr))))
+                 (do-instr-local-writes (k instr) (incf (svref (entry k) 0)))
+                 (do-instr-local-reads (k instr) (incf (svref (entry k) 1))))))
+    table))
+
+(defun %esrl-count-before (table list end)
+  "Add the references of LIST's instructions up to END to TABLE, the counts of
+   what follows them: a declared type already in TABLE stays, being later."
+  (maphash (lambda (k e)
+             (let ((b (gethash k table)))
+               (if b
+                   (progn (incf (svref b 0) (svref e 0))
+                          (incf (svref b 1) (svref e 1))
+                          (when (zerop (svref b 2)) (setf (svref b 3) (svref e 3)))
+                          (incf (svref b 2) (svref e 2)))
+                   (setf (gethash k table) e))))
+           (%esrl-count (make-hash-table :test #'equal) list end))
+  table)
+
+(defun %esrl-scan (list end prev)
+  "Scan LIST up to the cons END for pairs, starting with PREV pending.
+   Values: entry, final prev (:PASS when no pairing instruction), cands
+   (reversed), last cons before END."
+  (let ((entry nil) (state :pass) (cands '()) (last nil) (n 0))
+    (loop for x on list
+          until (eq x end)
+          do (setf last x)
+             (incf n)
+             (let ((instr (car x)))
+               (when (and (consp instr) (not (eq (car instr) :declare-local)))
+                 (unless entry (setf entry instr))
+                 (let ((p (if (eq state :pass) prev state)))
+                   (case (car instr)
+                     (:stloc (setf state (cadr instr)))
+                     (:ldloc
+                      (when (and p (equal p (cadr instr)))
+                        (push p cands))
+                      (setf state nil))
+                     (t (setf state nil)))))))
+    (when *instr-walk-steps* (incf (car *instr-walk-steps*) n))
+    (values entry state cands last)))
+
+(defun eliminate-single-ref-locals (instrs &optional body)
+  "See %ESRL-PLAIN, which this computes the same result as. Inside a top-level
+   compile the walk stops at the first cons that is a list this pass returned
+   before, and continues from that list's summary, so a chain of nested LETs is
+   not rescanned once per level."
+  (let ((memo (%instr-summaries)))
+    (if (or (null memo) (null (nthcdr (1- +instr-memo-min-length+) instrs)))
+        (%esrl-plain instrs)
+        (%esrl-incremental instrs memo body))))
+
+(defconstant +esrl-plain-depth+ 8)
+
+(defun %esrl-incremental (instrs memo body)
+  ;; A summarized list can only be a tail of INSTRS: the tail at BODY, or a
+  ;; few conses into it (a LET body may start with a MultipleValues.Reset).
+  (let* ((r (and body
+                 (loop for x on instrs
+                       when (eq x body)
+                         return (loop for y on x
+                                      repeat 3
+                                      when (%memo-get memo y) return y))))
+         (rs (and r (%memo-get memo r))))
+    ;; A nest only a few levels deep costs less rescanned than summarized: the
+    ;; plain pass until the chain of LETs ending here is +ESRL-PLAIN-DEPTH+ deep.
+    ;; Such a result records only its depth, and is summarized if a deeper LET
+    ;; continues from it.
+    (when (or (null rs)
+              (and (eq (car rs) :depth) (< (cdr rs) +esrl-plain-depth+)))
+      (let ((out (%esrl-plain instrs)))
+        (when (consp out)
+          (%memo-put memo out (cons :depth (if rs (1+ (cdr rs)) 1))))
+        (return-from %esrl-incremental out)))
+    (when (eq (car rs) :depth)
+      (setf rs (multiple-value-bind (o-entry o-state o-cands o-last) (%esrl-scan r nil nil)
+                 (list o-last o-entry o-state (remove-duplicates o-cands :test #'equal) nil))))
+    (multiple-value-bind (entry state cands last) (%esrl-scan instrs r nil)
+      (when rs
+        (destructuring-bind (r-last r-entry r-exit r-cands r-table) rs
+          (declare (ignore r-table))
+          (when (and (not (eq state :pass)) state
+                     (consp r-entry) (eq (car r-entry) :ldloc)
+                     (equal state (cadr r-entry)))
+            (push state cands))
+          (setf cands (append r-cands cands))
+          (unless entry (setf entry r-entry))
+          (unless (eq r-exit :pass) (setf state r-exit))
+          (setf last r-last)))
+      (when (null cands)
+        (let ((table (and rs (fifth rs))))
+          (when table
+            (%memo-rem memo r)
+            (%esrl-count-before table instrs r))
+          (%memo-put memo instrs (list last entry state '() table)))
+        (return-from %esrl-incremental instrs))
+      ;; The counts over the whole list: R's table, made now if R has none,
+      ;; plus the instructions before R.
+      (let* ((table (or (and rs (fifth rs))
+                        (%esrl-count (make-hash-table :test #'equal) (or r instrs) nil)))
+             (r-only (and r (loop for k in cands
+                                  for e = (gethash k table)
+                                  collect (cons k (if e (copy-seq e) (vector 0 0 0 nil)))))))
+        (when r (%memo-rem memo r) (%esrl-count-before table instrs r))
+        (let ((removable (loop for k in cands
+                               for e = (gethash k table)
+                               when (and e (= (svref e 0) 1) (= (svref e 1) 1)
+                                         (string= (or (svref e 3) "") "LispObject"))
+                                 collect k)))
+          (setf removable (remove-duplicates removable :test #'equal))
+          (when (null removable)
+            (%memo-put memo instrs (list last entry state (remove-duplicates cands :test #'equal) table))
+            (return-from %esrl-incremental instrs))
+          (flet ((drop-p (instr)
+                   (and (consp instr)
+                        (member (car instr) '(:declare-local :stloc :ldloc))
+                        (member (cadr instr) removable :test #'equal))))
+            ;; Inside R, a removed key may only be read by R's first pairing
+            ;; instruction; otherwise copy the whole list as %ESRL-PLAIN does.
+            (let* ((r-entry (and rs (second rs)))
+                   (entry-key (and (consp r-entry) (eq (car r-entry) :ldloc)
+                                   (member (cadr r-entry) removable :test #'equal)
+                                   (cadr r-entry)))
+                   (fast (and r
+                              (loop for k in removable
+                                    for e = (cdr (assoc k r-only :test #'equal))
+                                    always (or (null e)
+                                               (and (= (svref e 0) 0) (= (svref e 1) 0)
+                                                    (= (svref e 2) 0))
+                                               (and (equal k entry-key)
+                                                    (= (svref e 0) 0) (= (svref e 1) 1)
+                                                    (= (svref e 2) 0)))))))
+              (if (not fast)
+                  (let ((out (remove-if #'drop-p instrs)))
+                    (when (consp out)
+                      (dolist (k removable) (remhash k table))
+                      (multiple-value-bind (o-entry o-state o-cands o-last) (%esrl-scan out nil nil)
+                        (%memo-put memo out
+                                   (list o-last o-entry o-state
+                                         (remove-duplicates o-cands :test #'equal) table))))
+                    out)
+                  (let* ((head '())
+                         (tail r))
+                    (loop for x on instrs until (eq x r)
+                          unless (drop-p (car x)) do (push (car x) head))
+                    (when entry-key
+                      (loop until (eq (car tail) r-entry)
+                            do (push (car tail) head) (setf tail (cdr tail)))
+                      (setf tail (cdr tail)))
+                    (dolist (k removable) (remhash k table))
+                    (let ((out (nreconc head tail)))
+                      (when (consp out)
+                        (multiple-value-bind (t-entry t-state t-cands t-last)
+                            (if (eq tail r)
+                                (values (second rs) (third rs) nil (first rs))
+                                (let ((e (loop for i in tail
+                                               when (and (consp i) (not (eq (car i) :declare-local)))
+                                                 return i)))
+                                  (values e (if e (third rs) :pass) nil
+                                          (and (consp tail) (first rs)))))
+                          (declare (ignore t-cands))
+                          (multiple-value-bind (h-entry h-state h-cands h-last)
+                              (%esrl-scan out tail nil)
+                            (let ((c (append (remove-if (lambda (k) (member k removable :test #'equal))
+                                                        (fourth rs))
+                                             h-cands)))
+                              (when (and (not (eq h-state :pass)) h-state
+                                         (consp t-entry) (eq (car t-entry) :ldloc)
+                                         (equal h-state (cadr t-entry)))
+                                (push h-state c))
+                              (%memo-put memo out
+                                    (list (or t-last h-last)
+                                          (or h-entry t-entry)
+                                          (if (eq t-state :pass) h-state t-state)
+                                          (remove-duplicates c :test #'equal)
+                                          table))))))
+                      out))))))))))
+
+(defun %esrl-plain (instrs)
   "Peephole: remove :declare-local / :stloc / :ldloc for single-reference locals.
    A local KEY is eligible when:
      - exactly 1 (:stloc KEY) and 1 (:ldloc KEY) appear in INSTRS
@@ -1309,7 +1660,7 @@
              (setf prev nil))
             (t (setf prev nil))))))
     (when (null cands)
-      (return-from eliminate-single-ref-locals instrs))
+      (return-from %esrl-plain instrs))
     ;; Each candidate: (KEY STLOC-COUNT LDLOC-COUNT DECLARED-TYPE). Counted via
     ;; the central enumerator so locals embedded in nested operands (e.g.
     ;; :dotnet-call-direct-locals) raise the read count and correctly disqualify
@@ -1611,6 +1962,15 @@
                (setf changed t)
                (push i1 out)
                (setf cur (cddr cur)))
+              ;; P15: a checked fixnum add of a constant that is not negative
+              ;; needs one compare for its overflow test instead of the
+              ;; sign arithmetic for an operand of either sign.
+              ((and (consp i1) (eq (car i1) :ldc-i8) (integerp (cadr i1)) (>= (cadr i1) 0)
+                    (consp i2) (equal i2 '(:call "Runtime.AddFixnumChecked")))
+               (setf changed t)
+               (push i1 out)
+               (push (list :call "Runtime.AddFixnumCheckedNonNeg") out)
+               (setf cur (cddr cur)))
               ;; P14: an int64 masked to its low 8 / 16 / 32 bits by zero
               ;; extension: 2 bytes of IL where ldc.i8 and AND take 10.
               ((and (consp i1) (eq (car i1) :ldc-i8)
@@ -1744,6 +2104,217 @@
              (setf prev i))
     (nreverse out)))
 
+(defconstant +poll-save-max-locals+ 16)
+
+(defun %poll-loop-region (v i labels)
+  "The loop a back-edge poll at index I of V closes, as (START . END) indexes:
+   a poll followed by a branch back to an earlier label, or a poll right after
+   a label that a later branch jumps back to. NIL for any other shape."
+  (let ((next (and (< (1+ i) (length v)) (svref v (1+ i))))
+        (prev (and (> i 0) (svref v (1- i)))))
+    (cond ((and (consp next) (eq (car next) :br))
+           (let ((start (gethash (cadr next) labels)))
+             (and start (< start i) (cons start i))))
+          ((and (consp prev) (eq (car prev) :label))
+           (let ((end nil))
+             (loop for k from (1+ i) below (length v)
+                   for x = (svref v k)
+                   when (and (consp x) (member (car x) '(:br :brtrue :brfalse :beq :bne :blt :bgt :ble :bge
+                                                     :bne-un :bge-un :bgt-un :ble-un :blt-un))
+                             (eq (cadr x) (cadr prev)))
+                     do (setf end k))
+             (and end (cons (1- i) end)))))))
+
+(defun %poll-upward-float-reads (v start end types)
+  "The raw float locals of TYPES read in V between START and END before the
+   region writes them (in instruction order): the values the loop carries
+   round its back-edge."
+  (let ((written '()) (read '()))
+    (loop for k from start to end
+          for x = (svref v k)
+          when (and (consp x) (member (car x) '(:ldloc :stloc)) (gethash (cadr x) types))
+            do (if (eq (car x) :stloc)
+                   (pushnew (cadr x) written)
+                   (unless (or (member (cadr x) written) (member (cadr x) read))
+                     (push (cadr x) read))))
+    (let ((r (nreverse read)))
+      (if (> (length r) +poll-save-max-locals+)
+          (subseq r 0 +poll-save-max-locals+)
+          r))))
+
+(defun %poll-instr-p (x)
+  (and (consp x) (eq (car x) :call) (equal (cadr x) "ConditionSystem.PollInterrupt")))
+
+(defun %poll-saving-instrs (locals types)
+  (let* ((first (subseq locals 0 (min 4 (length locals))))
+         (rest (nthcdr (length first) locals))
+         (buf (gen-local "PSAVE"))
+         (save (gen-label "PSAVE"))
+         (skip (gen-label "PSKIP")))
+    `((:call "ConditionSystem.PollPending")
+      (:brfalse ,skip)
+      (:call "ConditionSystem.PollSavesFloats")
+      (:brtrue ,save)
+      (:call "ConditionSystem.PollInterruptSaved")
+      (:br ,skip)
+      (:label ,save)
+      (:declare-local ,buf "Double[]")
+      (:ldc-i4 ,(length locals))
+      ,@(loop for x in first
+              append `((:ldloc ,x)
+                       ,@(when (equal (gethash x types) "Single") '((:conv-r8)))))
+      (:call ,(format nil "ConditionSystem.PollSave~D" (length first)))
+      (:stloc ,buf)
+      ,@(loop for x in rest for k from (length first)
+              append `((:ldloc ,buf) (:ldc-i4 ,k) (:ldloc ,x)
+                       ,@(when (equal (gethash x types) "Single") '((:conv-r8)))
+                       (:call "ConditionSystem.PollSaveD")))
+      (:call "ConditionSystem.PollInterruptSaved")
+      ,@(loop for x in locals for k from 0
+              append `((:ldloc ,buf) (:ldc-i4 ,k) (:call "ConditionSystem.PollLoadD")
+                       ,@(when (equal (gethash x types) "Single") '((:conv-r4)))
+                       (:stloc ,x)))
+      (:label ,skip))))
+
+(defun %poll-save-raw-floats (instrs)
+  "A loop's back-edge poll whose loop carries raw DOUBLE-FLOAT or SINGLE-FLOAT
+   locals saves them to a heap buffer around its slow call and reads them
+   back. On x64 Unix no XMM register survives a call, and a float local live
+   across the slow call was stored and reloaded on every iteration, on the
+   path of the loop's own dependency chain. Saved this way, no float local
+   is live across the call. Only the body's own instructions: a nested
+   closure body is another method."
+  (if (not (find-if #'%poll-instr-p instrs))
+      instrs
+      (let ((types (make-hash-table :test #'eq))
+            (labels (make-hash-table :test #'eq)))
+        (dolist (x instrs)
+          (when (consp x)
+            (case (car x)
+              (:declare-local
+               (when (member (caddr x) '("Double" "Single") :test #'equal)
+                 (setf (gethash (cadr x) types) (caddr x)))))))
+        (if (zerop (hash-table-count types))
+            instrs
+            (let* ((v (coerce instrs 'simple-vector))
+                   (n (length v)))
+              (dotimes (k n)
+                (let ((x (svref v k)))
+                  (when (and (consp x) (eq (car x) :label))
+                    (setf (gethash (cadr x) labels) k))))
+              (loop for k from 0 below n
+                    for x = (svref v k)
+                    append (let* ((region (and (%poll-instr-p x) (%poll-loop-region v k labels)))
+                                  (locals (and region
+                                               (%poll-upward-float-reads
+                                                v (car region) (cdr region) types))))
+                             (if locals
+                                 (%poll-saving-instrs locals types)
+                                 (list x)))))))))
+
+(defun %fold-constant-fixnum-locals (instrs)
+  "A LispObject local stored once, from a boxed integer constant or from such a
+   local, and read only to be unboxed or copied into such a local, is replaced
+   by the constant at each unboxing read. Coalton's arithmetic binds each
+   operand with a LET, so (+ i 1) on a raw counter boxed the 1 into a temporary
+   and unboxed it on every iteration."
+  (unless (loop for (a b c) on instrs
+                thereis (and (consp a) (eq (car a) :ldc-i8)
+                             (equal b '(:call "Fixnum.Make"))
+                             (consp c) (eq (car c) :stloc)))
+    (return-from %fold-constant-fixnum-locals instrs))
+  (let ((stores (make-hash-table :test #'eq))
+        (src (make-hash-table :test #'eq))
+        (reads (make-hash-table :test #'eq))
+        (bad (make-hash-table :test #'eq))
+        (others '()))
+    (loop for (y z a b) on (list* nil nil instrs)
+          when (consp a)
+            do (case (car a)
+                 (:stloc
+                  (let ((l (cadr a)))
+                    (incf (gethash l stores 0))
+                    (setf (gethash l src)
+                          (cond ((and (consp z) (equal z '(:call "Fixnum.Make"))
+                                      (consp y) (eq (car y) :ldc-i8))
+                                 (list :const (cadr y)))
+                                ((and (consp z) (eq (car z) :ldloc))
+                                 (list :copy (cadr z)))
+                                (t (list :other))))))
+                 (:ldloc
+                  (cond ((and (consp b) (eq (car b) :unbox-fixnum)))
+                        ((and (consp b) (eq (car b) :stloc))
+                         (push (cadr b) (gethash (cadr a) reads)))
+                        (t (setf (gethash (cadr a) bad) t))))
+                 ((:declare-local))
+                 (t (push a others))))
+    ;; Only a local stored once from a constant or a copy can be folded, so the
+    ;; other instructions are searched for those locals alone.
+    (let ((cands (make-hash-table :test #'eq))
+          (names (make-hash-table :test #'equal))
+          (seen (make-hash-table :test #'eq)))
+      (maphash (lambda (l n)
+                 (when (and (eql n 1) (not (gethash l bad))
+                            (member (car (gethash l src)) '(:const :copy)))
+                   (setf (gethash l cands) t)
+                   (push l (gethash (symbol-name l) names))))
+               stores)
+      (when (zerop (hash-table-count cands))
+        (return-from %fold-constant-fixnum-locals instrs))
+      (labels ((walk (x)
+                 (cond ((consp x)
+                        (unless (gethash x seen)
+                          (setf (gethash x seen) t)
+                          (walk (car x)) (walk (cdr x))))
+                       ((and x (symbolp x) (not (keywordp x)))
+                        (when (gethash x cands) (setf (gethash x bad) t)))
+                       ((stringp x)
+                        (dolist (l (gethash x names)) (setf (gethash l bad) t))))))
+        (dolist (a others) (walk (cdr a)))))
+    (let ((value (make-hash-table :test #'eq))
+          (changed t))
+      (maphash (lambda (l n)
+                 (when (and (eql n 1) (not (gethash l bad))
+                            (member (car (gethash l src)) '(:const :copy)))
+                   (setf (gethash l value) :unknown)))
+               stores)
+      (loop while changed
+            do (setf changed nil)
+               (maphash (lambda (l v)
+                          (let* ((s (gethash l src))
+                                 (nv (if (eq (car s) :const)
+                                         (cadr s)
+                                         (multiple-value-bind (xv found) (gethash (cadr s) value)
+                                           (if (and found (not (eq xv :unknown))) xv v)))))
+                            (cond ((or (and (eq (car s) :copy)
+                                            (not (nth-value 1 (gethash (cadr s) value))))
+                                       (some (lambda (to) (not (nth-value 1 (gethash to value))))
+                                             (gethash l reads)))
+                                   (remhash l value) (setf changed t))
+                                  ((not (eql nv v))
+                                   (setf (gethash l value) nv changed t)))))
+                        value))
+      (maphash (lambda (l v) (when (eq v :unknown) (remhash l value))) value)
+      (if (zerop (hash-table-count value))
+          instrs
+          (let ((out '()))
+            (loop while instrs
+                  do (let ((a (pop instrs)))
+                       (cond ((and (consp a) (eq (car a) :ldc-i8)
+                                   (equal (first instrs) '(:call "Fixnum.Make"))
+                                   (consp (second instrs)) (eq (car (second instrs)) :stloc)
+                                   (gethash (cadr (second instrs)) value))
+                              (pop instrs) (pop instrs))
+                             ((and (consp a) (eq (car a) :ldloc)
+                                   (consp (first instrs)) (eq (car (first instrs)) :stloc)
+                                   (gethash (cadr (first instrs)) value))
+                              (pop instrs))
+                             ((and (consp a) (eq (car a) :ldloc) (gethash (cadr a) value))
+                              (pop instrs)
+                              (push (list :ldc-i8 (gethash (cadr a) value)) out))
+                             (t (push a out)))))
+            (nreverse out))))))
+
 (defun merge-disjoint-locals (instrs)
   "Linear-scan slot-share locals, then peephole-optimize. Thin wrapper so all
    callers get the peephole pass; the slot-merge logic lives in
@@ -1755,20 +2326,42 @@
   ;; its own physical slot (a coalesced slot would host several source vars over
   ;; its lifetime, which a method-wide PDB LocalVariable name can't represent).
   ;; The classic "debug builds don't reuse slots" tradeoff. Peephole still runs.
-  (%thread-binding-stack
-   (peephole-optimize
-    (%hoist-loop-mv-resets
-     (if *emit-source-lines*
-         (elide-unused-rest-list instrs)
-         (%merge-disjoint-locals (elide-unused-rest-list instrs)))))))
+  (%forget-instr-memos)
+  (%poll-save-raw-floats
+   (%thread-binding-stack
+    (peephole-optimize
+     (%fold-constant-fixnum-locals
+     (%hoist-loop-mv-resets
+      (if *emit-source-lines*
+          (elide-unused-rest-list instrs)
+          (%merge-disjoint-locals (elide-unused-rest-list instrs)))))))))
+
+(defconstant +max-special-group+ 8
+  "Most special bindings one grouped runtime push takes.")
+
+(defconstant +min-special-group+ 3
+  "Fewest special bindings worth a grouped runtime push.")
+
+(defparameter +group-push-arities+
+  (loop for n from 2 to +max-special-group+
+        collect (cons (format nil "DynamicBindings.PushGroup~D" n) n)))
+
+(defun %group-push-arity (i)
+  (and (consp i) (eq (car i) :call)
+       (cdr (assoc (cadr i) +group-push-arities+ :test #'equal))))
 
 (defparameter +binding-stack-calls+
-  '(("DynamicBindings.Get" . "DynamicBindings.GetOn")
-    ("DynamicBindings.SetChecked" . "DynamicBindings.SetCheckedOn")
-    ("DynamicBindings.Push" . "DynamicBindings.PushOn")
-    ("DynamicBindings.Pop" . "DynamicBindings.PopOn")
-    ("DynamicBindings.BindDepth" . "DynamicBindings.BindDepthOn")
-    ("DynamicBindings.UnbindTo" . "DynamicBindings.UnbindToOn"))
+  (append
+   '(("DynamicBindings.Get" . "DynamicBindings.GetOn")
+     ("DynamicBindings.SetChecked" . "DynamicBindings.SetCheckedOn")
+     ("DynamicBindings.Push" . "DynamicBindings.PushOn")
+     ("DynamicBindings.Pop" . "DynamicBindings.PopOn")
+     ("DynamicBindings.BindDepth" . "DynamicBindings.BindDepthOn")
+     ("DynamicBindings.BindGroupDepth" . "DynamicBindings.BindGroupDepthOn")
+     ("DynamicBindings.UnbindTo" . "DynamicBindings.UnbindToOn"))
+   (loop for n from 2 to +max-special-group+
+         collect (cons (format nil "DynamicBindings.PushGroup~D" n)
+                       (format nil "DynamicBindings.PushGroup~DOn" n))))
   "Binding stack operations, each paired with the entry that takes the thread's
    stack as its last argument.")
 
@@ -1781,15 +2374,26 @@
 
 (defun %note-bound-specials (instrs)
   "Record the variables bound by the body: each bind is the symbol load, a
-   castclass, the value from a local and the push."
-  (let (p1 p2 p3)
-    (dolist (i instrs)
-      (when (and (consp i) (eq (car i) :call) (equal (cadr i) "DynamicBindings.Push")
-                 (consp p1) (eq (car p1) :ldloc)
-                 (equal p2 '(:castclass "Symbol"))
-                 (%sym-load-p p3))
-        (setf (gethash p3 *bound-special-loads*) t))
-      (setq p3 p2 p2 p1 p1 i))))
+   castclass, the value from a local and a push."
+  (let ((v (coerce instrs 'vector)))
+    (dotimes (idx (length v))
+      (let ((i (aref v idx)))
+        (cond
+          ((and (consp i) (eq (car i) :call)
+                (equal (cadr i) "DynamicBindings.Push") (>= idx 3)
+                (consp (aref v (1- idx))) (eq (car (aref v (1- idx))) :ldloc)
+                (equal (aref v (- idx 2)) '(:castclass "Symbol"))
+                (%sym-load-p (aref v (- idx 3))))
+           (setf (gethash (aref v (- idx 3)) *bound-special-loads*) t))
+          ((%group-push-arity i)
+           (dotimes (k (%group-push-arity i))
+             (let ((j (- idx (* 3 (1+ k)))))
+               (when (and (>= j 0)
+                          (%sym-load-p (aref v j))
+                          (equal (aref v (1+ j)) '(:castclass "Symbol"))
+                          (consp (aref v (+ j 2)))
+                          (eq (car (aref v (+ j 2))) :ldloc))
+                 (setf (gethash (aref v j) *bound-special-loads*) t))))))))))
 
 (defun %lazy-bound-special-access (instrs)
   "Read or SETQ of a variable some compiled body binds: through the stack in a
@@ -1840,7 +2444,8 @@
    nested in it is another method."
   (if (find-if (lambda (i)
                  (and (consp i) (eq (car i) :call)
-                      (equal (cadr i) "DynamicBindings.Push")))
+                      (or (equal (cadr i) "DynamicBindings.Push")
+                          (%group-push-arity i))))
                instrs)
       (let* ((st (gen-local "DSTACK"))
              (body (loop for i in instrs
@@ -1885,7 +2490,13 @@
     "Fixnum.Make" "Runtime.AddFixnumChecked" "Runtime.IsTrueEq" "Runtime.IsTrueEql"
     "Runtime.IsTrueConsp" "Runtime.IsTrueAtom" "Runtime.IsTrueListp"
     "Runtime.IsTrueSymbolp" "Runtime.Endp" "Runtime.IsTrueEndp" "Runtime.IsNotNil"
-    "Runtime.IsNilObj" "Runtime.IsConsObject" "Runtime.IsAtomObject" "Runtime.IsListObject"))
+    "Runtime.IsNilObj" "Runtime.IsConsObject" "Runtime.IsAtomObject" "Runtime.IsListObject"
+    "FloatLane.AddD" "FloatLane.SubtractD"
+    "FloatLane.MultiplyD" "FloatLane.DivideD"
+    "FloatLane.AddS" "FloatLane.SubtractS"
+    "FloatLane.MultiplyS" "FloatLane.DivideS"
+    "FloatLane.NarrowD" "FloatLane.SinhD"
+    "FloatLane.CoshD" "Runtime.ExpDouble" "FloatLane.NonFiniteD" "FloatLane.NonFiniteS" "FloatLane.SinD" "FloatLane.CosD" "FloatLane.TanD" "FloatLane.LogD"))
 
 (defun %mv-quiet-instr-p (x)
   (and (consp x)
@@ -2065,9 +2676,16 @@
         (setf (gethash key last-pos) pos))
       (incf pos))
     ;; Collect eligible candidates: LispObject type with at least one use
-    (let ((candidates nil))
+    ;; A local whose address is taken keeps its own slot: the callee may write
+    ;; it at any time, and its first reference may read the null it starts with.
+    (let ((candidates nil)
+          (addressed (let ((h nil))
+                       (dolist (instr instrs h)
+                         (when (and (consp instr) (eq (car instr) :ldloca))
+                           (push (cadr instr) h))))))
       (maphash (lambda (key type)
                  (when (and (string= type "LispObject")
+                            (not (member key addressed :test #'equal))
                             (gethash key first-pos)
                             (gethash key last-pos))
                    (push (list (gethash key first-pos)
@@ -2129,6 +2747,26 @@
 
 (defvar *uv-level* 0)
 
+(defvar *uv-current-form* nil
+  "The nearest enclosing cons form of the symbol being walked.")
+
+(defvar *uv-local-functions* nil
+  "Function names bound by enclosing FLET / LABELS forms.")
+
+(defun %uv-note-function (name form)
+  "Record NAME, called in FORM, when it is not a local operator, macro or
+   function. The end of the compilation unit decides whether it stayed undefined."
+  (when (and *compiler-note-undefined*
+             (symbolp name) name (symbol-package name)
+             (not (keywordp name))
+             (not (special-operator-name-p name))
+             (not (%lexical-function-p name))
+             (not (member name *uv-local-functions* :test #'eq))
+             (not (gethash name *compile-form-handlers*))
+             (not (find-macro-expander name))
+             (not (fboundp name)))
+    (funcall *compiler-note-undefined* :function name form)))
+
 (defun %uv-decls (body doc-p)
   "(values SPECIALS IGNORES IGNORABLES REST) for the declarations heading BODY."
   (let ((specials '()) (ignores '()) (ignorables '()))
@@ -2184,13 +2822,22 @@
 (defun %uv-note (sym env slot)
   "SYM is read (SLOT 0) or assigned (SLOT 1) where ENV is visible."
   (let ((e (assoc sym env :test #'eq)))
-    (when e
-      (case (cadr e)
-        ;; An assignment from a closure counts as a use, as in SBCL.
-        (:var (setf (svref (cddr e) (if (> *uv-depth* (svref (cddr e) 3)) 0 slot)) t))
-        (:sm (when (< *uv-sm-depth* 20)
-               (let ((*uv-sm-depth* (1+ *uv-sm-depth*)))
-                 (%uv-walk (cddr e) env))))))))
+    (cond
+      (e
+       (case (cadr e)
+         ;; An assignment from a closure counts as a use, as in SBCL.
+         (:var (setf (svref (cddr e) (if (> *uv-depth* (svref (cddr e) 3)) 0 slot)) t))
+         (:sm (when (< *uv-sm-depth* 20)
+                (let ((*uv-sm-depth* (1+ *uv-sm-depth*)))
+                  (%uv-walk (cddr e) env))))))
+      ((and *compiler-note-undefined*
+            (symbolp sym) sym (symbol-package sym)
+            (not (keywordp sym))
+            (not (constantp sym))
+            (not (global-special-p sym))
+            (not (boundp sym)))
+       (funcall *compiler-note-undefined* :variable sym
+                (or *uv-current-form* sym))))))
 
 (defun %uv-walk-list (forms env)
   (loop while (consp forms)
@@ -2282,7 +2929,10 @@
   (let* ((defs (if (listp (cadr form)) (cadr form) '()))
          (shadows (%flet-macro-shadows defs))
          (*macroexpand-scope* *macroexpand-scope*)
-         (*lexical-operators* *lexical-operators*))
+         (*lexical-operators* *lexical-operators*)
+         (*uv-local-functions*
+           (append (remove-if-not #'symbolp (mapcar #'car defs))
+                   *uv-local-functions*)))
     (flet ((enter ()
              (when shadows
                (setf *macroexpand-scope* (cons defs *macroexpand-scope*)
@@ -2339,14 +2989,17 @@
         (%uv-lambda (cadr clause) body env clause nil)))))
 
 (defun %uv-walk (form env)
-  (cond
-    ((symbolp form) (when form (%uv-note form env 0)))
-    ((atom form) nil)
-    ((or (> *uv-level* 2000) (not (%stack-space-available-p)))
-     (throw '%uv-give-up nil))
-    (t
-     (let ((head (car form))
-           (*uv-level* (1+ *uv-level*)))
+  (when (and *compiler-source-note* (consp form))
+    (funcall *compiler-source-note* form))
+  (let ((*uv-current-form* (if (consp form) form *uv-current-form*)))
+    (cond
+      ((symbolp form) (when form (%uv-note form env 0)))
+      ((atom form) nil)
+      ((or (> *uv-level* 2000) (not (%stack-space-available-p)))
+       (throw '%uv-give-up nil))
+      (t
+       (let ((head (car form))
+             (*uv-level* (1+ *uv-level*)))
        (cond
          ((not (listp (cdr form))) nil)
          ((consp head)
@@ -2400,9 +3053,20 @@
          (t
           (let ((expander (find-macro-expander head)))
             (let ((expanded (and expander (%walker-macroexpand form expander :none))))
-              (if (and expanded (not (eq expanded form)))
+              (if (and expanded (not (equal expanded form)))
                   (%uv-walk expanded env)
-                  (%uv-walk-list (cdr form) env))))))))))
+                  (progn
+                    (%uv-note-function head form)
+                    (%uv-walk-list (cdr form) env))))))))))))
+
+(defun %compiler-warn-undefined (kind name)
+  "Signal the warning for NAME, first used in the form whose source position is
+   the current compiler context."
+  (if (eq kind :variable)
+      (warn 'style-warning :format-control "undefined variable: ~S"
+            :format-arguments (list name))
+      (warn 'style-warning :format-control "undefined function: ~S"
+            :format-arguments (list name))))
 
 (defun note-unused-variables (form)
   "Signal the unused-variable style warnings for FORM, a top-level form that
@@ -2462,12 +3126,55 @@
         (*macrolet-expanders* (list nil))
         (*fold-call-memo* (list nil))
         (*bmr-cache* (make-hash-table :test #'eq))
+        (*instr-summaries* (list nil))
+        (*owned-code* (list nil))
         (*ffv-free-cache* (list nil))
         (*uv-warned* nil)
-        (*ltv-hoisted* (and *compile-file-mode* *current-module-id* (list '()))))
-    (let ((body (compile-expr expr)))
-      `(,@(peephole-optimize (append (%compile-hoisted-ltvs) body))
+        (*ltv-hoisted* (and *compile-file-mode* *current-module-id* (list '())))
+        (*xref-caller* (%xref-top-level-caller expr))
+        (*xref-top-level-conses* nil)
+        (*xref-walked* nil)
+        (*xref-edges* '())
+        (*xref-uses* '()))
+    (when (and (consp *xref-caller*) (eq (car *xref-caller*) :top-level-form))
+      (setq *xref-top-level-conses* (%form-cons-set (fourth *xref-caller*))
+            *xref-caller* (list :top-level-form (second *xref-caller*) (third *xref-caller*))))
+    (let* ((body (compile-expr expr))
+           (ltvs (%compile-hoisted-ltvs))
+           ;; Code compiled to run now registers now: a registration in the
+           ;; code would be the only code of a COMPILEd lambda's thunk.
+           (note (and *xref-caller*
+                      (if *compile-file-mode*
+                          (xref-note-instrs)
+                          (progn (xref-register-now) nil)))))
+      `(,@(peephole-optimize (append note ltvs body))
         (:ret)))))
+
+(defun %xref-top-level-caller (expr)
+  "The xref name for the top level form EXPR, from *XREF-TOP-LEVEL-NAME*, which
+   is cleared so that a compile nested in this one does not take it too."
+  (let ((spec *xref-top-level-name*))
+    (when spec
+      (setq *xref-top-level-name* nil)
+      (when (and *record-xref* (not *xref-sink*) (not *cross-compiling*) (consp spec))
+        (case (car spec)
+          (:top-level-form spec)
+          (:compile (or (second spec)
+                        (and (consp expr) (eq (car expr) 'lambda)
+                             (let ((file (or *load-truename* *compile-file-truename*)))
+                               (if file
+                                   `(lambda ,(second expr) :in ,(namestring file))
+                                   `(lambda ,(second expr))))))))))))
+
+(defun %form-cons-set (form)
+  (let ((set (make-hash-table :test #'eq)))
+    (labels ((walk (x)
+               (loop while (and (consp x) (not (gethash x set)))
+                     do (setf (gethash x set) t)
+                        (walk (car x))
+                        (setq x (cdr x)))))
+      (walk form))
+    set))
 
 (defun %compile-hoisted-ltvs ()
   "The instructions that run the LOAD-TIME-VALUE forms collected in
@@ -2512,11 +3219,16 @@
         (*macrolet-expanders* (list nil))
         (*fold-call-memo* (list nil))
         (*bmr-cache* (make-hash-table :test #'eq))
+        (*instr-summaries* (list nil))
+        (*owned-code* (list nil))
         (*ffv-free-cache* (list nil))
         (*uv-warned* nil)
         ;; Code EVAL (or COMPILE) runs now, also when a macro calls it while
         ;; COMPILE-FILE compiles a top level form: its LOAD-TIME-VALUE forms
         ;; belong to it, not to the fasl being written.
         (*ltv-hoisted* nil)
-        (*ltv-eval-now* t))
+        (*ltv-eval-now* t)
+        (*xref-caller* nil)
+        (*xref-top-level-conses* nil)
+        (*xref-walked* nil))
     (%close-toplevel-segments (compile-expr expr))))

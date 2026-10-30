@@ -129,7 +129,7 @@
 ;; declared type is a bounded integer and leaves the rest alone.
 (deftest-emitting-only fixnum-leaf-range-struct-slot.subscript-is-raw
   (let ((s (%flr-sil #'%flr-peek)))
-    (list (%flr-count "Runtime.StructRefL)" s)     ; the integer subscript
+    (list (%flr-count "Runtime.StructRefLK)" s)    ; the integer subscript
           (%flr-count "Runtime.StructRefI)" s)     ; the array slot, unchanged
           (%flr-count "UNBOX-FIXNUM" s)))
   (1 1 0))
@@ -149,7 +149,7 @@
 (deftest-emitting-only fixnum-leaf-range-struct-slot.decrement-of-bounded-slot-is-native
   (let ((s (%flr-sil #'%flr-dec-small)))
     (list (%flr-count "Runtime.Decrement)" s)
-          (%flr-count "Runtime.StructRefL)" s)))
+          (%flr-count "Runtime.StructRefLK)" s)))
   (0 1))
 
 ;; 1- of a FIXNUM slot does not, and is expected not to: the range algebra

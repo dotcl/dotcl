@@ -50,7 +50,7 @@ takes the steps in call order instead; a step is a member name, or
 ```lisp
 (dotnet:-> uri "Host" ("Substring" 0 7) "ToUpper")     ; => "EXAMPLE"
 (setf (dotnet:-> sb "Capacity") 128)                   ; the chain is a place
-(setf (dotnet:-> lst ("Item" 0)) 99)                   ; indexed property
+(setf (dotnet:-> list ("Item" 0)) 99)                  ; indexed property
 ```
 
 `dotnet:doto` applies several members to one object and returns that object:
@@ -63,6 +63,41 @@ takes the steps in call order instead; a step is a member name, or
 Member names are strings because the Lisp reader upcases bare symbols while .NET
 member names are case-sensitive. A symbol is accepted and contributes its name
 verbatim, so `|Host|` works and `host` correctly does not.
+
+## Typed calls
+
+A call whose receiver and arguments carry their .NET type is resolved when it is
+compiled and becomes a direct call: no member lookup, no argument array, no
+reflection at run time. The type is given with `(the (dotnet "T") x)`, or is
+known from `dotnet:new`, `dotnet:box`, or an earlier typed call in a chain:
+
+```lisp
+(dotnet:invoke (the (dotnet "System.Text.StringBuilder") sb) "Append"
+               (the (dotnet "System.String") "hi"))           ; sb.Append("hi")
+(dotnet:invoke (the (dotnet "System.Text.StringBuilder") sb) "Length") ; => 2
+```
+
+`dotnet:static` with a literal type and member name does the same when every
+argument is typed. With no arguments (a property, a field, or a method that
+takes none) there is nothing to declare, so it is always resolved this way:
+
+```lisp
+(dotnet:static "System.Math" "Max" (the (dotnet "System.Int32") a)
+                                   (the (dotnet "System.Int32") b))  ; Math.Max(int, int)
+(dotnet:static "System.DateTime" "Now")                         ; DateTime.Now
+(dotnet:invoke (dotnet:static "System.Text.Encoding" "UTF8") "GetByteCount"
+               (the (dotnet "System.String") "abc"))            ; => 3
+```
+
+The declared types choose the overload, as in C#. A receiver or argument that is a
+Lisp value (a string, number or character) is converted to the declared type the
+same way as in the ordinary call, so `(the (dotnet "System.String") s)` accepts a
+Lisp string. A call that does not resolve
+(an argument without a type, a name the type does not have, a type defined at
+run time) is made the ordinary way and gives the same result, only slower.
+One difference remains: an exception the .NET method throws reaches the handler
+as an `error` carrying the .NET type (`dotnet:exception-typep` sees it), but its
+message does not start with the `DOTNET:STATIC Type.Member` context.
 
 ## Indexers
 
@@ -173,8 +208,9 @@ span is a view of that storage, not a copy, so a method that writes into a span
 writes into the vector:
 
 ```lisp
-(let ((buf (make-array 16 :element-type '(unsigned-byte 8))))
-  (dotnet:invoke stream "Read" buf))            ; Stream.Read(Span<byte>) fills BUF
+(let* ((buf (make-array 16 :element-type '(unsigned-byte 8)))
+       (stream (dotnet:new "System.IO.FileStream" path "Open" "Read")))
+  (dotnet:invoke stream "Read" buf))            ; FileStream.Read(Span<byte>) fills BUF
 
 (dotnet:invoke (dotnet:static "System.Text.Encoding" "UTF8") "GetBytes" "abc" buf)
 (multiple-value-list (dotnet:call-out "System.Int32" "TryParse" octets))  ; ReadOnlySpan<byte>
@@ -312,11 +348,15 @@ runtime:
 
 ```lisp
 (dotnet:members "System.Net.Sockets.TcpClient" :prefix "Connect")
-;; => ((:name "Connect" :kind :method :static nil
-;;      :signature "(String, Int32) => Void"
-;;      :declaring-type "System.Net.Sockets.TcpClient")
-;;     (:name "ConnectAsync" ... :signature "(IPAddress, Int32) => Task")
-;;     ...)
+;; => one entry per Connect and ConnectAsync overload; reflection order is
+;;    unspecified, so this listing is representative:
+;;    (:name "Connect" :kind :method :static nil
+;;     :signature "(IPAddress, Int32) => Void"
+;;     :declaring-type "System.Net.Sockets.TcpClient")
+;;    (:name "Connect" :kind :method :static nil
+;;     :signature "(IPAddress[], Int32) => Void"
+;;     :declaring-type "System.Net.Sockets.TcpClient")
+;;    ...
 ```
 
 The first argument is a type name, a resolved `System.Type`, or any .NET object
@@ -343,9 +383,11 @@ names:
 ```
 
 And an optional trailing parameter is marked with `?`, because omitting one is
-what makes a call fail to resolve:
+what makes a call fail to resolve. A type that lives in an assembly not loaded
+yet needs that assembly first:
 
 ```lisp
+(dotnet:load-assembly "Microsoft.AspNetCore.Http.Abstractions")
 (dotnet:members "Microsoft.AspNetCore.Http.HttpResponse" :prefix "Write")
 ;; => WriteAsync (String, CancellationToken?) => Task
 ;;    WriteAsync (String, Encoding, CancellationToken?) => Task
@@ -358,10 +400,13 @@ LINQ over a string.
 ## Loading assemblies
 
 ```lisp
-(dotnet:load-assembly "System.Text.Json")     ; => T
+(dotnet:load-assembly "System.Text.Json")
+;; => "System.Text.Json, Version=10.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51"
 ```
 
-Types from a loaded assembly resolve by name afterwards. For NuGet packages, see
+The return value is the loaded assembly's full name string, which identifies the
+version that was resolved. Types from a loaded assembly resolve by name
+afterwards. For NuGet packages, see
 [Using libraries](libraries.md).
 
 ## Conditions in a .NET host

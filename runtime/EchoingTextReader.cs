@@ -29,6 +29,8 @@ internal sealed class EchoingTextReader : TextReader
         _echo = echo;
     }
 
+    internal TextReader Inner => _inner;
+
     public override int Peek() => _inner.Peek();
 
     public override int Read()

@@ -342,17 +342,30 @@
   "Largest local function body, in conses, substituted without an INLINE
    declaration (%SMALL-LOCAL-FN-P).")
 
+(defun %small-local-fn-decl-p (form)
+  "True when FORM is a DECLARE whose specifiers only declare types or IGNORE /
+   IGNORABLE: the substituted LET checks those types as the out-of-line entry does."
+  (and (consp form) (eq (car form) 'declare)
+       (every (lambda (spec)
+                (and (consp spec) (symbolp (car spec)) (car spec)
+                     (not (member (car spec)
+                                  '(special inline notinline ftype dynamic-extent
+                                    declaration optimize)))))
+              (cdr form))))
+
 (defun %small-local-fn-p (fdef)
   "True when FDEF, an FLET definition, is substituted at its calls without being
    declared INLINE: a required-only lambda list and a body of at most
-   *SMALL-LOCAL-INLINE-BODY-SIZE* conses that declares nothing."
+   *SMALL-LOCAL-INLINE-BODY-SIZE* conses that declares nothing but types."
   (let ((params (cadr fdef))
         (fn-body (cddr fdef)))
     (and (listp params)
          (every (lambda (p) (and p (symbolp p) (not (member p lambda-list-keywords))))
                 params)
          (consp fn-body)
-         (notany (lambda (f) (and (consp f) (eq (car f) 'declare))) fn-body)
+         (every (lambda (f) (or (not (and (consp f) (eq (car f) 'declare)))
+                                (%small-local-fn-decl-p f)))
+                fn-body)
          (not (stringp (car fn-body)))
          (<= (%form-size fn-body (1+ *small-local-inline-body-size*))
              *small-local-inline-body-size*))))
@@ -418,6 +431,18 @@
         ((and (consp name) (eq (car name) 'setf) (symbolp (cadr name))) (cadr name))
         (t nil)))
 
+(defun %local-fn-block-body (name fn-body)
+  "FN-BODY of the local function NAME, with its forms inside the implicit block
+   when something returns from it. The leading declarations (and a docstring)
+   stay outside: they are about the parameters, and a BLOCK takes none."
+  (let ((bname (local-fn-block-name name)))
+    (if (and bname (some (lambda (f) (form-has-return-from-p bname f)) fn-body))
+        (let ((doc (and (stringp (car fn-body)) (cdr fn-body) (list (car fn-body)))))
+          (multiple-value-bind (decls rest)
+              (%split-leading-declares (if doc (cdr fn-body) fn-body))
+            `(,@doc ,@decls (block ,bname ,@rest))))
+        fn-body)))
+
 (defun compile-flet (fn-defs body)
   "Compile (flet ((name (params) body...) ...) body...).
    Tries the capture-lifting path first (see %LIFT-CAPTURES); a call site that
@@ -468,11 +493,7 @@
         ;; ((setf sym) names: block sym).
         (flet ((compile-the-lambda ()
                  (let ((*lift-block-tags* (if plan (cstate-block-tags) nil)))
-                   (let ((bname (local-fn-block-name name)))
-                     (if (and bname
-                              (some (lambda (f) (form-has-return-from-p bname f)) fn-body))
-                         (compile-lambda params `((block ,bname ,@fn-body)))
-                         (compile-lambda params fn-body))))))
+                   (compile-lambda params (%local-fn-block-body name fn-body)))))
           ;; A definition that may be inlined away is compiled LATER, and only if
           ;; the body turns out to still reach the binding. Not merely dropped
           ;; after the fact: compiling a closure that contains a RETURN-FROM out
@@ -904,12 +925,8 @@
   (let ((own (mapcar (lambda (e) (%labelfn-local-sym (mangle-name (first e))))
                      fn-compile-list)))
     (every (lambda (e)
-             (let* ((name (first e)) (params (second e)) (fn-body (third e))
-                    (bname (local-fn-block-name name))
-                    (body (if (and bname
-                                   (some (lambda (f) (form-has-return-from-p bname f)) fn-body))
-                              `((block ,bname ,@fn-body))
-                              fn-body)))
+             (let* ((name (first e)) (params (second e))
+                    (body (%local-fn-block-body name (third e))))
                (every (lambda (v) (member v own :test #'eq))
                       (remove-if #'global-special-p
                                  (find-free-vars-with-defaults params body)))))
@@ -997,11 +1014,7 @@
                      (let ((*cstate* (cstate-with *cstate*
                                        +cs-tco-local-fn-key+ key
                                        +cs-tco-self-symbol+ (if (symbolp name) name nil))))
-                       (let ((bname (local-fn-block-name name)))
-                         (if (and bname
-                                  (some (lambda (f) (form-has-return-from-p bname f)) fn-body))
-                             (compile-lambda params `((block ,bname ,@fn-body)) name-str)
-                             (compile-lambda params fn-body name-str))))))
+                       (compile-lambda params (%local-fn-block-body name fn-body) name-str))))
                  ;; Speculative direct+TCO: try compiling this labels fn
                  ;; through the direct path so a single self-tail-recursion is
                  ;; TCO'd instead of overflowing. Accept only when the generated
@@ -1083,11 +1096,8 @@
                                                   +cs-tco-local-fn-key+ key
                                                   +cs-tco-self-symbol+
                                                   (if (symbolp name) name nil))))
-                                  (let ((bname (local-fn-block-name name)))
-                                    (if (and bname
-                                             (some (lambda (f) (form-has-return-from-p bname f)) fn-body))
-                                        (compile-lambda params `((block ,bname ,@fn-body)) name-str)
-                                        (compile-lambda params fn-body name-str))))))
+                                  (compile-lambda params (%local-fn-block-body name fn-body)
+                                                  name-str))))
             (setf store-instrs
                   (append store-instrs
                           `((:ldloc ,key) (:ldc-i4 0)
@@ -1193,12 +1203,7 @@
                                           ;; ... not of the enclosing body: its tail
                                           ;; VALUES is no answer to that body's caller.
                                           (*mv-mode-local* nil))
-                                      (let ((bname (local-fn-block-name (car fdef))))
-                                        (if (and bname
-                                                 (some (lambda (f) (form-has-return-from-p bname f))
-                                                       fn-body))
-                                            (compile-progn `((block ,bname ,@fn-body)))
-                                            (compile-progn fn-body))))))
+                                      (compile-progn (%local-fn-block-body (car fdef) fn-body)))))
                              (cons lbl fn-instrs))))
                    ;; Emit order: fn[N-1] first (fall-through from dispatch), then fn[0]..fn[N-2]
                    (sections-in-emit-order

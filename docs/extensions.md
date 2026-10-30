@@ -40,6 +40,8 @@ rather than for code you ship.
   of one system in the same image. A lock file names the `.asd`
   of each system and puts the conflicting version in a package unit:
   `(dotcl-lock:use-lock "dotcl-systems.lock")`, then `asdf:load-system`.
+  Without a lock, `(dotcl-lock:add-unit "swank@git" "/src/slime/swank.asd")`
+  puts one `.asd` in a unit and `dotcl-lock:call-in-unit` runs code there.
   `resolve.lisp` beside it writes the lock from directories holding several
   versions of a system, choosing versions as Cargo does (also runs on SBCL).
 - `asdf-version-range` (experimental): a `:version` dependency may name a
@@ -99,6 +101,10 @@ What other implementations provide and portable libraries build on.
 - `dotnet-class`: `dotnet:define-class` emits a named .NET type from Lisp, for
   .NET code that wants a subclass or an interface implementation.
   [Defining .NET classes](define-class.md)
+- `dotnet-library`: builds an ASDF system into a .NET library DLL:
+  `(asdf:make ...)` through `:build-operation "dotnet-library-op"`, with the
+  `dotnet:library` form in a `(:dotnet-library "file")` component.
+  [Building the library from an ASDF system](define-class.md#building-the-library-from-an-asdf-system)
 - `dotnet-ffi`: `dotnet:define-ffi` declares a native function and makes a Lisp
   function that calls it (P/Invoke).
 - `dotnet-nuget`: resolves NuGet packages and their dependencies, with versions
@@ -131,8 +137,9 @@ resolve their NuGet package on first use.
   (`dotcl-dap:start-server`). A function breakpoint, or a condition that would
   enter the debugger, stops only the thread it happens on; the REPL and other
   threads keep running. Function breakpoints, stack, variables, evaluate,
-  continue, and resuming through a restart. Line breakpoints and stepping are
-  not there yet.
+  continue, stepping, line breakpoints in `defun` and `defmethod`, and resuming
+  through a restart. The `error` exception filter also stops where an error is
+  signaled, even when a handler would take it.
 
 ### Lower layers
 
@@ -178,7 +185,7 @@ Types:
 - `dotnet:class-for-type`: the CLOS class dotcl uses for a .NET type. [Dispatching on .NET types](dotnet-package.md#dispatching-on-net-types)
 - `dotnet:clear-type-cache`: forget memoized type lookups.
 - `dotnet:define-class` (from `dotnet-class`): emit a real .NET class from Lisp. [Defining .NET classes](define-class.md)
-- `dotnet:library`, `dotnet:register-class-handlers` (from `dotnet-class`): write several classes into a `.dll` for C# to reference, and attach their Lisp bodies when the `.dll` is used. [Producing a .dll](define-class.md#producing-a-dll-for-c-to-reference)
+- `dotnet:library`, `dotnet:pack-library`, `dotnet:register-class-handlers` (from `dotnet-class`): write several classes into a `.dll` (or a NuGet package) for C# to reference, and attach their Lisp bodies when the `.dll` is used. [Producing a .dll](define-class.md#producing-a-dll-for-c-to-reference)
 - `dotnet:*type-aliases*` (from `dotnet-class`): short names for types in `define-class` signatures. [Defining .NET classes](define-class.md#the-shape-of-a-definition)
 
 Arrays, streams, delegates, events, tasks:
@@ -223,7 +230,7 @@ Scripts and the process:
 - `dotcl:script-arguments`: the arguments a script was given. [Writing scripts](scripting.md#arguments)
 - `dotcl:command-line-arguments`: the command line, in the shape UIOP expects. [Writing scripts](scripting.md#arguments)
 - `dotcl:quit`: exit the process with a code. [Writing scripts](scripting.md#exit-code)
-- `dotcl:*exit-hooks*`: functions of no arguments called, in order, when the process exits through `dotcl:quit` or at the end of the program, as `sb-ext:*exit-hooks*`. An error in one is printed and the rest still run.
+- `dotcl:*exit-hooks*`: functions of no arguments called, in order, when the process exits through `dotcl:quit`, at the end of the program, or on SIGTERM / SIGHUP (Unix; status 143 / 129, no unwinding), as `sb-ext:*exit-hooks*`. An error in one is printed and the rest still run.
 - `dotcl:getenv`, `dotcl:setenv`, `dotcl:unsetenv`: environment variables.
 - `dotcl:posix-environ`: the whole environment as a list of `"NAME=VALUE"` strings, as `sb-ext:posix-environ`; the form `dotcl:launch-process` takes for `:environment`.
 - `dotcl:getpid`: the process id, as `sb-posix:getpid`.
@@ -283,7 +290,16 @@ Introspection and debugging:
 - `dotcl:definition-sources`: every recorded definition of a name (function, macro, compiler macro, generic function and each method, variable, class, type, method combination, ...; a package's `defpackage` given its name), each with its kind, file and line.
 - `dotcl:definition-source`: the file and line where a function, macro function, generic function, method, class or package object was defined.
 - `dotcl:record-definition-sources`: attribute the definitions in a form to a file and line, for a tool that compiles one form at a time.
+- `dotcl:compiler-condition-source`, `dotcl:*compiler-context*`: where a condition signalled during compilation came from. Inside a handler for a warning or error from `compile-file` or `compile` (or a warning during `load` of source), `(dotcl:compiler-condition-source)` and `dotcl:*compiler-context*` describe the current top-level form and the subform being compiled, as a plist: `:file`, `:line` and `:position` (the top-level form's 1-based line and 0-based character offset), `:subform-line` and `:subform-position` (the innermost source form the compiler knows, when it does), `:form` and `:top-level-form`. `(dotcl:compiler-condition-source condition)` returns the position saved when that condition was signalled, so it can be read after the handler has returned. The undefined-function and undefined-variable warnings that `compile-file` reports at the end of a compilation unit carry the position of the first use. NIL outside compilation.
 - `dotcl:who-calls`, `dotcl:who-is-called-by`: cross references between functions.
+  `dotcl:who-references`, `dotcl:who-sets`, `dotcl:who-binds`: the definitions that read, assign
+  or bind a global variable; `dotcl:who-macroexpands`: the ones that expand a global macro.
+  A DEFMETHOD body is named `(defmethod name qualifier... (specializer...))`, a macro's expander
+  `(macro-function name)`, a top level form of a file `(:top-level-form file line)` and
+  `(compile nil ...)` `(lambda lambda-list :in file)`. Standard functions and macros
+  (`print`, `car`, `when`, ...) are recorded too. Recorded when code is compiled;
+  `dotcl:*record-xref*` NIL turns the recording off, `dotcl:*record-xref-standard*` NIL only
+  that of the standard functions and macros the compiler lowers itself.
 - `dotcl:typexpand-1`, `dotcl:typexpand`: expand a `deftype`.
 - `dotcl:symbol-global-value`: the global value of a symbol, ignoring dynamic bindings; a place.
 - `dotcl:charpos`: the column an output stream is at.
@@ -291,14 +307,17 @@ Introspection and debugging:
 - `dotcl:backtrace`, `dotcl:backtrace-with-args`, `dotcl:print-backtrace`: the Lisp call stack.
 - `dotcl:frame-locals`, `dotcl:print-frame-locals`, `dotcl:frame-specials`: a frame's lexical variables (when compiled with `dotcl:*emit-frame-locals*` true) and the dynamic bindings in effect. [The REPL](repl.md#when-a-form-signals)
 - `dotcl:*debug-stacktrace*`: print the .NET stack trace with an unhandled error.
+- `dotcl:*invoke-debugger-hook*`: a function of two arguments, the condition and the hook, called by `invoke-debugger` before `*debugger-hook*`, with itself bound to NIL during the call, as `sb-ext:*invoke-debugger-hook*`; `break` is seen too. If it returns normally the debugger still runs.
 - `dotcl:*foreign-callback-handler*`, `dotcl:*foreign-callback-propagate*`: what happens to a Lisp error inside a callback from .NET. [Delegates and callbacks](dotnet-package.md#delegates-and-callbacks)
 - `dotcl:jit-disassemble`: the native code of a function; needs the `dotcl-jitdisasm` module.
 
 Compiling and shipping:
 
 - `dotcl:save-application`: bundle sources into a FASL or an executable. [Packaging an app](dotcl-pack.md)
+- `dotcl:build-library`: write the .NET library a `dotnet:library` form defines, from files or from an ASDF system (`:system`), after loading the assemblies it references, compiling in the functions of those sources its bodies reach; what `dotcl build-library` and the SDK's `LispLibrary` / `LispSystem` items run. [Building the library](define-class.md#building-the-library-from-a-project-or-the-command-line)
 - `dotcl:combine-fasls`: one FASL that loads several; what `uiop:combine-fasls` calls.
 - `dotcl:fasl-version-mismatch`, `dotcl:fasl-version-mismatch-pathname`, `dotcl:fasl-version-mismatch-built-by`, `dotcl:load-as-is`: the error LOAD signals for a FASL another dotcl compiled; the restart `dotcl:load-as-is` (or `continue`) loads it anyway, except when it needs a newer `DotCL.Runtime`. ASDF's `load-op` compiles such a file again instead.
+- `dotcl:fasl-host-mismatch`, `dotcl:fasl-host-mismatch-pathname`, `dotcl:fasl-host-mismatch-features`, `dotcl:*warn-host-dependent-fasl*`, `dotcl:*host-feature-ignore*`, `dotcl:fasl-host-features`: `compile-file` records the host-dependent features (`:x86-64`, `:windows`, `:64-bit`, ...) that `#+` / `#-` examined, with their truth, in the FASL. LOAD warns `dotcl:fasl-host-mismatch` when one is true or false differently on this host (the FASL still loads); bind `*warn-host-dependent-fasl*` to NIL to silence it, or list features in `*host-feature-ignore*` while compiling to leave them out of the record. `fasl-host-features` reads the record (an alist of keyword and truth) from a FASL without loading it.
 - `dotcl:*compile-r2r*`, `dotcl:*load-r2r*`, `dotcl:write-r2r-sibling`, `dotcl:r2r-stats`: ahead-of-time compiled siblings of FASLs. [ReadyToRun](readytorun.md)
 - `dotcl:package-rid`: the portable RID (`linux-x64`, `osx-arm64`, `linux-musl-x64`, ...) that compiled packages are made and looked up for. [Libraries](libraries.md)
 - `dotcl:precompiled-only`: refuse to generate code at run time, so only precompiled code runs. [Embedding dotcl](embedding.md#without-run-time-code-generation)

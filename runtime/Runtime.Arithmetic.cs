@@ -6,17 +6,22 @@ public static partial class Runtime
 {
     // --- Arithmetic (backward compat + number tower) ---
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject Add(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb)
         {
-            long va = fa.Value, vb = fb.Value;
-            long result = va + vb;
-            // Overflow check: sign of result must be consistent
-            if (((va ^ vb) < 0) || ((va ^ result) >= 0))
-                return Fixnum.Make(result);
-            return Bignum.MakeInteger(new System.Numerics.BigInteger(va) + vb);
+            long va = fa.Value, vb = fb.Value, r = unchecked(va + vb);
+            if (((va ^ r) & (vb ^ r)) >= 0) return Fixnum.Make(r);
         }
+        return AddNonFixnum(a, b);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject AddNonFixnum(LispObject a, LispObject b)
+    {
+        if (a is Fixnum fa && b is Fixnum fb)
+            return Bignum.MakeInteger(new System.Numerics.BigInteger(fa.Value) + fb.Value);
         if (a is DoubleFloat da && b is DoubleFloat db)
             return new DoubleFloat(da.Value + db.Value);
         if (a is SingleFloat sfa && b is SingleFloat sfb)
@@ -34,17 +39,22 @@ public static partial class Runtime
         return Arithmetic.Add(AsNumber(a), AsNumber(b));
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject Subtract(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb)
         {
-            long va = fa.Value, vb = fb.Value;
-            long result = va - vb;
-            // Overflow check: sign of result must be consistent
-            if (((va ^ vb) >= 0) || ((va ^ result) >= 0))
-                return Fixnum.Make(result);
-            return Bignum.MakeInteger(new System.Numerics.BigInteger(va) - vb);
+            long va = fa.Value, vb = fb.Value, r = unchecked(va - vb);
+            if (((va ^ vb) & (va ^ r)) >= 0) return Fixnum.Make(r);
         }
+        return SubtractNonFixnum(a, b);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject SubtractNonFixnum(LispObject a, LispObject b)
+    {
+        if (a is Fixnum fa && b is Fixnum fb)
+            return Bignum.MakeInteger(new System.Numerics.BigInteger(fa.Value) - fb.Value);
         if (a is DoubleFloat da && b is DoubleFloat db)
             return new DoubleFloat(da.Value - db.Value);
         if (a is SingleFloat sfa && b is SingleFloat sfb)
@@ -67,27 +77,35 @@ public static partial class Runtime
     public static LispObject Negate(LispObject a) => Arithmetic.Negate(AsNumber(a));
 
     /// <summary>Fast path for (1+ x): avoids creating Fixnum(1) and second type check.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject Increment(LispObject a)
     {
+        if (a is Fixnum fa && fa.Value < long.MaxValue) return Fixnum.Make(fa.Value + 1);
+        return IncrementNonFixnum(a);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject IncrementNonFixnum(LispObject a)
+    {
         if (a is Fixnum fa)
-        {
-            long v = fa.Value;
-            if (v < long.MaxValue) return Fixnum.Make(v + 1);
-            return Bignum.MakeInteger(new System.Numerics.BigInteger(v) + 1);
-        }
+            return Bignum.MakeInteger(new System.Numerics.BigInteger(fa.Value) + 1);
         if (a is Ratio r) return Ratio.MakeReduced(r.Numerator + r.Denominator, r.Denominator);
         return Arithmetic.Add(AsNumber(a), Fixnum.Make(1));
     }
 
     /// <summary>Fast path for (1- x): avoids creating Fixnum(1) and second type check.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject Decrement(LispObject a)
     {
+        if (a is Fixnum fa && fa.Value > long.MinValue) return Fixnum.Make(fa.Value - 1);
+        return DecrementNonFixnum(a);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject DecrementNonFixnum(LispObject a)
+    {
         if (a is Fixnum fa)
-        {
-            long v = fa.Value;
-            if (v > long.MinValue) return Fixnum.Make(v - 1);
-            return Bignum.MakeInteger(new System.Numerics.BigInteger(v) - 1);
-        }
+            return Bignum.MakeInteger(new System.Numerics.BigInteger(fa.Value) - 1);
         if (a is Ratio r) return Ratio.MakeReduced(r.Numerator - r.Denominator, r.Denominator);
         return Arithmetic.Subtract(AsNumber(a), Fixnum.Make(1));
     }
@@ -237,15 +255,7 @@ public static partial class Runtime
     /// DIVISION-BY-ZERO as the generic LOG does, since that is not a
     /// violation of the declaration.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static double LogDouble(double x)
-    {
-        if (x == 0.0) throw LogOfZero();
-        return System.Math.Log(x);
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    static LispErrorException LogOfZero()
-        => new LispErrorException(new LispError("LOG: division by zero") { ConditionTypeName = "DIVISION-BY-ZERO" });
+    public static double LogDouble(double x) => System.Math.Log(x);
 
     /// <summary>
     /// EXP of a raw double, for the compiler's double lane. Signals
@@ -256,7 +266,7 @@ public static partial class Runtime
     {
         double r = System.Math.Exp(x);
         if (double.IsInfinity(r) && !double.IsInfinity(x))
-            throw new LispErrorException(new LispError("EXP: floating-point overflow") { ConditionTypeName = "FLOATING-POINT-OVERFLOW" });
+            throw FloatingPointOverflow("EXP", new DoubleFloat(x));
         return r;
     }
 
@@ -265,6 +275,17 @@ public static partial class Runtime
     {
         long r = unchecked(a + b);
         if (((a ^ r) & (b ^ r)) < 0)
+            throw DeclaredFixnumOverflow((System.Numerics.BigInteger)a + b);
+        return r;
+    }
+
+    /// <summary>AddFixnumChecked for a B known not to be negative: the sum
+    /// overflowed exactly when it came out below A.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long AddFixnumCheckedNonNeg(long a, long b)
+    {
+        long r = unchecked(a + b);
+        if (r < a)
             throw DeclaredFixnumOverflow((System.Numerics.BigInteger)a + b);
         return r;
     }
@@ -320,7 +341,19 @@ public static partial class Runtime
         return Fixnum.Make(r);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LispObject Multiply(LispObject a, LispObject b)
+    {
+        if (a is Fixnum fa && b is Fixnum fb)
+        {
+            long hi = Compat.BigMul(fa.Value, fb.Value, out long result);
+            if (hi == (result >> 63)) return Fixnum.Make(result);
+        }
+        return MultiplyNonFixnum(a, b);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject MultiplyNonFixnum(LispObject a, LispObject b)
     {
         if (a is Fixnum fa && b is Fixnum fb)
         {
@@ -396,6 +429,138 @@ public static partial class Runtime
         if (b is Ratio rb && a is Fixnum { Value: 1 }) return Arithmetic.RatioReciprocal(rb);
         try { return Arithmetic.Divide(AsNumber(a), AsNumber(b)); }
         catch (DivideByZeroException) { throw DivisionByZero("/", a, b); }
+    }
+
+    /// <summary>
+    /// The FLOATING-POINT-OVERFLOW of an operation on finite operands whose
+    /// result is infinite, with the operation and operands as DivisionByZero
+    /// carries them.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static LispErrorException FloatingPointOverflow(string operation, params LispObject[] operands)
+    {
+        var op = Startup.Sym(operation);
+        LispObject args = Nil.Instance;
+        for (int i = operands.Length - 1; i >= 0; i--) args = new Cons(operands[i], args);
+        var message = "arithmetic error FLOATING-POINT-OVERFLOW signalled\nOperation was "
+            + FormatTop(new Cons(op, args), true) + ".";
+        return new LispErrorException(new LispError(message)
+        { ConditionTypeName = "FLOATING-POINT-OVERFLOW", OperationRef = op, OperandsRef = args });
+    }
+
+    // The entries compiled code calls at (safety 3): the plain entry, then a NaN
+    // or an infinity from operands that are not signals (FloatFault).
+
+    public static LispObject AddChecked(LispObject a, LispObject b) => CheckFault(Add(a, b), "+", a, b);
+    public static LispObject SubtractChecked(LispObject a, LispObject b) => CheckFault(Subtract(a, b), "-", a, b);
+    public static LispObject MultiplyChecked(LispObject a, LispObject b) => CheckFault(Multiply(a, b), "*", a, b);
+    public static LispObject DivideChecked(LispObject a, LispObject b) => CheckFault(Divide(a, b), "/", a, b);
+    public static LispObject CoerceChecked(LispObject x, LispObject type) => CheckFault(Coerce(x, type), "COERCE", x, type);
+
+    public static LispObject ExptChecked(LispObject a, LispObject b)
+    {
+        var r = Expt(a, b);
+        if (HasNaN(r) ? !HasNaN(a) && !HasNaN(b) : HasInfinity(r) && !HasInfinity(a) && !HasInfinity(b))
+            throw FloatFault("EXPT", a, b, HasNaN(r), a is Number na && IsZeroNumber(na));
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static LispObject CheckFault(LispObject r, string op, LispObject a, LispObject b)
+    {
+        if (r is DoubleFloat d) { if (System.Math.Abs(d.Value) <= double.MaxValue) return r; }
+        else if (r is SingleFloat f) { if (System.Math.Abs(f.Value) <= float.MaxValue) return r; }
+        else if (r is not LispComplex) return r;
+        return CheckFaultSlow(r, op, a, b);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static LispObject CheckFaultSlow(LispObject r, string op, LispObject a, LispObject b)
+    {
+        if (HasNaN(r) ? !HasNaN(a) && !HasNaN(b) : HasInfinity(r) && !HasInfinity(a) && !HasInfinity(b))
+            throw FloatFault(op, a, b, HasNaN(r), op == "/" && IsZeroDivisor(b));
+        return r;
+    }
+
+    /// <summary>The condition of a float operation OP on finite / non-NaN
+    /// operands whose value is a NaN (NAN) or an infinity: FLOATING-POINT-
+    /// INVALID-OPERATION, DIVISION-BY-ZERO when BYZERO, else FLOATING-POINT-OVERFLOW.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static LispErrorException FloatFault(string op, LispObject a, LispObject b, bool nan, bool byZero)
+        => nan ? FloatInvalid(op, a, b)
+           : byZero ? DivisionByZero(op, a, b)
+           : FloatingPointOverflow(op, a, b);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static LispErrorException FloatInvalid(string operation, params LispObject[] operands)
+    {
+        var op = Startup.Sym(operation);
+        LispObject args = Nil.Instance;
+        for (int i = operands.Length - 1; i >= 0; i--) args = new Cons(operands[i], args);
+        var message = "arithmetic error FLOATING-POINT-INVALID-OPERATION signalled\nOperation was "
+            + FormatTop(new Cons(op, args), true) + ".";
+        return new LispErrorException(new LispError(message)
+        { ConditionTypeName = "FLOATING-POINT-INVALID-OPERATION", OperationRef = op, OperandsRef = args });
+    }
+
+    internal static bool HasNaN(LispObject x) => x switch
+    {
+        DoubleFloat d => double.IsNaN(d.Value),
+        SingleFloat s => float.IsNaN(s.Value),
+        DoubleComplex dc => double.IsNaN(dc.RealValue) || double.IsNaN(dc.ImagValue),
+        LispComplex c => HasNaN(c.Real) || HasNaN(c.Imaginary),
+        _ => false
+    };
+
+    internal static bool HasInfinity(LispObject x) => x switch
+    {
+        DoubleFloat d => double.IsInfinity(d.Value),
+        SingleFloat s => float.IsInfinity(s.Value),
+        DoubleComplex dc => double.IsInfinity(dc.RealValue) || double.IsInfinity(dc.ImagValue),
+        LispComplex c => HasInfinity(c.Real) || HasInfinity(c.Imaginary),
+        _ => false
+    };
+
+    static bool IsZeroDivisor(LispObject x) => x switch
+    {
+        Fixnum f => f.Value == 0,
+        DoubleFloat d => d.Value == 0.0,
+        SingleFloat s => s.Value == 0f,
+        LispComplex c => IsZeroDivisor(c.Real) && IsZeroDivisor(c.Imaginary),
+        _ => false
+    };
+
+    /// <summary>The (safety 3) entry of the function NAME: its value, signalling
+    /// when that is a NaN or an infinity and no argument is. An infinity is
+    /// DIVISION-BY-ZERO when POLE (LOG of zero), else FLOATING-POINT-OVERFLOW.</summary>
+    static LispFunction CheckedFunction(string name, bool pole)
+    {
+        var plain = Startup.Sym(name);
+        return new LispFunction(args =>
+        {
+            var r = ((LispFunction)plain.Function!).Invoke(args);
+            if (HasNaN(r))
+            {
+                foreach (var a in args) if (HasNaN(a)) return r;
+                throw FloatInvalid(name, args);
+            }
+            if (HasInfinity(r))
+            {
+                foreach (var a in args) if (HasInfinity(a)) return r;
+                bool byZero = pole || (name == "EXPT" && args[0] is Number b && IsZeroNumber(b));
+                throw byZero ? DivisionByZero(name, args) : FloatingPointOverflow(name, args);
+            }
+            return r;
+        }, "%" + name + "-CHECKED", -1);
+    }
+
+    internal static void RegisterOverflowCheckedFunctions()
+    {
+        foreach (var name in new[] { "SCALE-FLOAT", "FLOAT", "EXP", "SINH", "COSH", "SIN", "COS", "TAN", "LOG", "EXPT" })
+        {
+            var (sym, _) = Startup.DotclPkg.Intern("%" + name + "-CHECKED");
+            sym.Function = CheckedFunction(name, name == "LOG");
+        }
     }
 
     /// <summary>
@@ -655,7 +820,12 @@ public static partial class Runtime
         return z ? T.Instance : Nil.Instance;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool IsTrueZerop(LispObject a)
+        => a is Fixnum f ? f.Value == 0 : IsTrueZeropNonFixnum(a);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static bool IsTrueZeropNonFixnum(LispObject a)
     {
         a = Primary(a);
         if (a is Fixnum fa) return fa.Value == 0;
@@ -686,31 +856,12 @@ public static partial class Runtime
 
     // --- Bool-returning equality (fused in compile-if) ---
 
-    public static bool IsTrueEq(LispObject a, LispObject b)
-    {
-        a = Primary(a); b = Primary(b);
-        if (ReferenceEquals(a, b)) return true;
-        // T is a singleton, so this is identity rather than a type test.
-        if ((ReferenceEquals(a, T.Instance) && ReferenceEquals(b, Startup.T_SYM)) ||
-            (ReferenceEquals(b, T.Instance) && ReferenceEquals(a, Startup.T_SYM)))
-            return true;
-        if ((a is Nil && ReferenceEquals(b, Startup.NIL_SYM)) ||
-            (b is Nil && ReferenceEquals(a, Startup.NIL_SYM)))
-            return true;
-        return false;
-    }
+    public static bool IsTrueEq(LispObject a, LispObject b) => IsEqRef(a, b);
 
     public static bool IsTrueEql(LispObject a, LispObject b)
     {
         a = Primary(a); b = Primary(b);
         if (ReferenceEquals(a, b)) return true;
-        // T is a singleton, so this is identity rather than a type test.
-        if ((ReferenceEquals(a, T.Instance) && ReferenceEquals(b, Startup.T_SYM)) ||
-            (ReferenceEquals(b, T.Instance) && ReferenceEquals(a, Startup.T_SYM)))
-            return true;
-        if ((a is Nil && ReferenceEquals(b, Startup.NIL_SYM)) ||
-            (b is Nil && ReferenceEquals(a, Startup.NIL_SYM)))
-            return true;
         if (a is Fixnum fa && b is Fixnum fb) return fa.Value == fb.Value;
         // eql compares floats by bit representation (CLHS): finer than =, (eql 0.0 -0.0)=NIL,
         // bit-identical NaNs are eql=T. Value compare (==) would give NaN!=NaN, 0.0==-0.0; a mismatch.
@@ -865,15 +1016,22 @@ public static partial class Runtime
     }
     private static LispObject RandomImpl(LispObject limit, LispRandomState rs)
     {
+        if (limit is DoubleFloat d && d.Value > 0)
+            return new DoubleFloat(rs.NextDouble(d.Value));
         if (limit is Fixnum f && f.Value > 0)
             return Fixnum.Make(rs.NextBelowFixnum(f.Value));
         if (limit is SingleFloat sf && sf.Value > 0)
             return new SingleFloat(rs.NextSingle(sf.Value));
-        if (limit is DoubleFloat d && d.Value > 0)
-            return new DoubleFloat(rs.NextDouble(d.Value));
         if (limit is Bignum bg && bg.Value > 0)
             return Bignum.MakeInteger(rs.NextBelow(bg.Value));
         throw new LispErrorException(new LispTypeError("RANDOM: limit must be a positive number", limit));
+    }
+    private static double RandomDoubleImpl(double limit, LispRandomState rs)
+    {
+        if (limit > 0)
+            return rs.NextDouble(limit);
+        throw new LispErrorException(new LispTypeError("RANDOM: limit must be a positive number",
+                                                       new DoubleFloat(limit)));
     }
     public static LispObject Random(LispObject limit)
         => RandomImpl(limit, GetCurrentRandomState());
@@ -881,6 +1039,13 @@ public static partial class Runtime
     {
         var rs = state is LispRandomState r ? r : GetCurrentRandomState();
         return RandomImpl(limit, rs);
+    }
+    public static double RandomDoubleRaw(double limit)
+        => RandomDoubleImpl(limit, GetCurrentRandomState());
+    public static double RandomDoubleRaw2(double limit, LispObject state)
+    {
+        var rs = state is LispRandomState r ? r : GetCurrentRandomState();
+        return RandomDoubleImpl(limit, rs);
     }
     static bool TryMulLong(long a, long b, out long r)
     {
@@ -957,7 +1122,36 @@ public static partial class Runtime
         if (!powerIsFloat && !powerIsExact && !powerIsComplex)
             throw new LispErrorException(new LispTypeError("EXPT: not a number", power));
 
-        // 0. base == 0 with positive realpart(power): (expt 0 y) = (* 0 y) for type contagion
+        // 1. power == 0: return appropriate 1 (before complex handling)
+        bool powerIsZero = (power is Fixnum fz && fz.Value == 0)
+            || (power is Bignum bz && bz.Value.IsZero)
+            || (power is SingleFloat sfz && sfz.Value == 0.0f)
+            || (power is DoubleFloat dfz && dfz.Value == 0.0)
+            || (power is Ratio rz && rz.Numerator.IsZero);
+        if (powerIsZero)
+        {
+            if (baseIsComplex)
+            {
+                var lc = (LispComplex)baseObj;
+                bool baseHasFloat = lc.Real is SingleFloat || lc.Real is DoubleFloat
+                    || lc.Imaginary is SingleFloat || lc.Imaginary is DoubleFloat;
+                // CLHS 12.2.3: a non-integer zero power keeps the complex type.
+                bool powerHasFloat = !(power is Fixnum || power is Bignum || power is Ratio);
+                if (!baseHasFloat && !powerHasFloat)
+                    return Fixnum.Make(1);
+                if (NumberHasDoublePart(AsNumber(baseObj)) || NumberHasDoublePart(AsNumber(power)))
+                    return new DoubleComplex(1.0, 0.0);
+                return new BoxedComplex(new SingleFloat(1.0f), new SingleFloat(0.0f));
+            }
+            // CL spec: (expt float 0) => (float 1 float)
+            if (baseIsDouble || powerIsDouble)
+                return new DoubleFloat(1.0);
+            if (baseIsSingle || powerIsSingle)
+                return new SingleFloat(1.0f);
+            return Fixnum.Make(1);
+        }
+
+        // base == 0 with positive realpart(power): (expt 0 y) = (* 0 y) for type contagion
         {
             bool baseZero = (baseObj is Fixnum fzb && fzb.Value == 0)
                 || (baseObj is Bignum bzb && bzb.Value.IsZero)
@@ -973,35 +1167,11 @@ public static partial class Runtime
                     : Arithmetic.ToDouble(AsNumber(power));
                 if (powerReal > 0)
                     return Arithmetic.Multiply(AsNumber(baseObj), AsNumber(power));
+                if (power is LispComplex)
+                    throw new LispErrorException(new LispError("EXPT: division by zero (0 raised to a non-positive complex power)") { ConditionTypeName = "DIVISION-BY-ZERO" });
+                if (powerReal < 0 && baseIsExact && powerIsExact)
+                    throw DivisionByZero("EXPT", baseObj, power);
             }
-        }
-
-        // 1. power == 0: return appropriate 1 (before complex handling)
-        bool powerIsZero = (power is Fixnum fz && fz.Value == 0)
-            || (power is Bignum bz && bz.Value.IsZero)
-            || (power is SingleFloat sfz && sfz.Value == 0.0f)
-            || (power is DoubleFloat dfz && dfz.Value == 0.0)
-            || (power is Ratio rz && rz.Numerator.IsZero);
-        if (powerIsZero)
-        {
-            if (baseIsComplex)
-            {
-                var lc = (LispComplex)baseObj;
-                // (complex single-float) => #c(1.0s0 0.0s0)
-                if (lc.Real is SingleFloat)
-                    return new BoxedComplex(new SingleFloat(1.0f), new SingleFloat(0.0f));
-                // (complex double-float) => #c(1.0d0 0.0d0)
-                if (lc.Real is DoubleFloat)
-                    return new DoubleComplex(1.0, 0.0);
-                // (complex integer) or (complex rational) => 1
-                return Fixnum.Make(1);
-            }
-            // CL spec: (expt float 0) => (float 1 float)
-            if (baseIsDouble || powerIsDouble)
-                return new DoubleFloat(1.0);
-            if (baseIsSingle || powerIsSingle)
-                return new SingleFloat(1.0f);
-            return Fixnum.Make(1);
         }
 
         // 2. Handle complex base with integer power: exact arithmetic
@@ -1039,7 +1209,9 @@ public static partial class Runtime
             var pc = power is LispComplex lc2
                 ? Arithmetic.ToSystemComplex(lc2)
                 : new System.Numerics.Complex(Arithmetic.ToDouble(AsNumber(power)), 0);
-            return Arithmetic.FromSystemComplex(System.Numerics.Complex.Pow(bc, pc));
+            var z = System.Numerics.Complex.Pow(bc, pc);
+            bool single = !(NumberHasDoublePart(AsNumber(baseObj)) || NumberHasDoublePart(AsNumber(power)));
+            return FloatComplexResult(z, single, keepComplex: false);
         }
 
         // 3. Both exact integers and power > 0: use BigInteger.Pow
@@ -1119,28 +1291,8 @@ public static partial class Runtime
         }
         double result_d = Math.Pow(bd, pd);
 
-        // Check for single-float overflow/underflow: result_d is finite in double but
-        // overflows or underflows when cast to single-float
-        if (resultIsSingle && !double.IsInfinity(result_d) && !double.IsNaN(result_d))
-        {
-            float resultF = (float)result_d;
-            if (float.IsInfinity(resultF))
-            {
-                var cond = new LispError($"EXPT: floating-point overflow computing ({baseObj}) ^ ({power})")
-                    { ConditionTypeName = "FLOATING-POINT-OVERFLOW" };
-                throw new LispErrorException(cond);
-            }
-            // Underflow flushes to 0.0f (IEEE default; SBCL/CCL/ECL mask the underflow
-            // trap, and dotcl's own * already flushes), so let it fall through to 0.0f.
-        }
-
-        // Check for overflow (infinity)
-        if (double.IsInfinity(result_d) && !double.IsInfinity(bd) && !double.IsInfinity(pd))
-        {
-            var cond = new LispError($"EXPT: floating-point overflow computing ({baseObj}) ^ ({power})")
-                { ConditionTypeName = "FLOATING-POINT-OVERFLOW" };
-            throw new LispErrorException(cond);
-        }
+        // An overflow, or a zero base with a negative power, gives the IEEE
+        // infinity; ExptChecked, which (safety 3) code calls, signals.
 
         // Underflow (result is 0 but inputs are nonzero) flushes to 0.0 rather than
         // signaling: the IEEE underflow trap is masked by default, as in SBCL/CCL/ECL,
@@ -2119,6 +2271,68 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static double MaxDouble(double a, double b) => a.CompareTo(b) >= 0 ? a : b;
 
+    // CLHS 12.1.4.4: any double-float argument or complex part makes the result double.
+    static bool NumberHasDoublePart(Number n) =>
+        n is DoubleFloat
+        || (n is LispComplex c
+            && (c.Real is DoubleFloat || c.Imaginary is DoubleFloat));
+
+    static bool IsZeroReal(Number n) => n switch
+    {
+        Fixnum f => f.Value == 0,
+        Bignum b => b.Value.IsZero,
+        Ratio r => r.Numerator.IsZero,
+        SingleFloat s => s.Value == 0.0f,
+        DoubleFloat d => d.Value == 0.0,
+        _ => false
+    };
+
+    static bool IsZeroNumber(Number n) =>
+        IsZeroReal(n)
+        || (n is LispComplex c && IsZeroReal(c.Real) && IsZeroReal(c.Imaginary));
+
+    // Float complex result; keepComplex preserves a zero imaginary part.
+    static LispObject FloatComplexResult(System.Numerics.Complex c, bool single, bool keepComplex)
+    {
+        if (single)
+        {
+            if (!keepComplex && c.Imaginary == 0.0)
+                return new SingleFloat((float)c.Real);
+            return new BoxedComplex(new SingleFloat((float)c.Real),
+                                    new SingleFloat((float)c.Imaginary));
+        }
+        if (!keepComplex && c.Imaginary == 0.0)
+            return new DoubleFloat(c.Real);
+        return new DoubleComplex(c.Real, c.Imaginary);
+    }
+
+    static System.Numerics.Complex LogComplex(Number n, out bool complex)
+    {
+        if (n is LispComplex lc)
+        {
+            complex = true;
+            return System.Numerics.Complex.Log(Arithmetic.ToSystemComplex(lc));
+        }
+        double d = Arithmetic.ToDouble(n);
+        if (d < 0)
+        {
+            complex = true;
+            return new System.Numerics.Complex(System.Math.Log(-d), System.Math.PI);
+        }
+        complex = false;
+        return new System.Numerics.Complex(System.Math.Log(d), 0.0);
+    }
+
+    // CLHS 12.2.5: the negative-axis side follows the sign of a zero imaginary part.
+    static System.Numerics.Complex ClSqrt(System.Numerics.Complex z)
+    {
+        if (z.Imaginary != 0.0)
+            return System.Numerics.Complex.Sqrt(z);
+        if (z.Real < 0.0)
+            return new System.Numerics.Complex(0.0, Compat.CopySign(System.Math.Sqrt(-z.Real), z.Imaginary));
+        return new System.Numerics.Complex(z.Real == 0.0 ? 0.0 : System.Math.Sqrt(z.Real), z.Imaginary);
+    }
+
     internal static void RegisterArithmeticBuiltins()
     {
         // FLOAT function
@@ -2132,7 +2346,7 @@ public static partial class Runtime
                 // Not a float: convert to single-float by default
                 return num switch {
                     Fixnum f => (LispObject)new SingleFloat((float)f.Value),
-                    Bignum b => (LispObject)new SingleFloat((float)(double)b.Value),
+                    Bignum b => (LispObject)new SingleFloat((float)Arithmetic.ToDouble(b)),
                     Ratio r => (LispObject)new SingleFloat((float)Arithmetic.RatioToDouble(r)),
                     LispDecimal d => (LispObject)new SingleFloat((float)d.Value),
                     _ => throw new LispErrorException(new LispTypeError("FLOAT: not a number", num, Startup.Sym("REAL")))
@@ -2143,8 +2357,8 @@ public static partial class Runtime
             return num switch {
                 Fixnum f => wantDouble ? (LispObject)new DoubleFloat((double)f.Value)
                                        : new SingleFloat((float)f.Value),
-                Bignum b => wantDouble ? (LispObject)new DoubleFloat((double)b.Value)
-                                       : new SingleFloat((float)(double)b.Value),
+                Bignum b => wantDouble ? (LispObject)new DoubleFloat(Arithmetic.ToDouble(b))
+                                       : new SingleFloat((float)Arithmetic.ToDouble(b)),
                 Ratio r => wantDouble ? (LispObject)new DoubleFloat(Arithmetic.RatioToDouble(r))
                                       : new SingleFloat((float)Arithmetic.RatioToDouble(r)),
                 SingleFloat sf => wantDouble ? (LispObject)new DoubleFloat((double)sf.Value) : sf,
@@ -2195,7 +2409,11 @@ public static partial class Runtime
         // SQRT
         Startup.RegisterUnary("SQRT", obj => {
             var n = Runtime.AsNumber(obj);
-            if (n is LispComplex lc) return Arithmetic.FromSystemComplex(System.Numerics.Complex.Sqrt(Arithmetic.ToSystemComplex(lc)), n);
+            if (n is LispComplex lc)
+            {
+                var z = ClSqrt(Arithmetic.ToSystemComplex(lc));
+                return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
+            }
             double d = Arithmetic.ToDouble(n);
             if (d < 0) {
                 var im = System.Math.Sqrt(-d);
@@ -2210,90 +2428,115 @@ public static partial class Runtime
             if (args.Length == 0 || args.Length > 2)
                 throw new LispErrorException(new LispProgramError($"LOG: wrong number of arguments: {args.Length}"));
             var n = Runtime.AsNumber(args[0]);
-            if (n is LispComplex lc) {
-                var z = System.Numerics.Complex.Log(Arithmetic.ToSystemComplex(lc));
-                if (args.Length > 1) {
-                    var n2 = Runtime.AsNumber(args[1]);
-                    System.Numerics.Complex b2;
-                    if (n2 is LispComplex lc2) b2 = Arithmetic.ToSystemComplex(lc2);
-                    else b2 = new System.Numerics.Complex(Arithmetic.ToDouble(n2), 0);
-                    z = z / System.Numerics.Complex.Log(b2);
+            if (args.Length == 1)
+            {
+                bool single = !NumberHasDoublePart(n);
+                if (n is LispComplex lc)
+                {
+                    var z = System.Numerics.Complex.Log(Arithmetic.ToSystemComplex(lc));
+                    return FloatComplexResult(z, single, keepComplex: true);
                 }
-                return Arithmetic.FromSystemComplex(z, n);
-            }
-            double d = Arithmetic.ToDouble(n);
-            if (d == 0.0)
-                throw new LispErrorException(new LispError("LOG: division by zero") { ConditionTypeName = "DIVISION-BY-ZERO" });
-            if (args.Length > 1) {
-                var n2 = Runtime.AsNumber(args[1]);
-                if (d < 0 && !double.IsNegativeInfinity(d)) {
-                    var z = System.Numerics.Complex.Log(new System.Numerics.Complex(d, 0));
-                    System.Numerics.Complex b2;
-                    if (n2 is LispComplex lc2b) b2 = Arithmetic.ToSystemComplex(lc2b);
-                    else b2 = new System.Numerics.Complex(Arithmetic.ToDouble(n2), 0);
-                    return Arithmetic.FromSystemComplex(z / System.Numerics.Complex.Log(b2), n);
+                double d = Arithmetic.ToDouble(n);
+                if (d < 0)
+                {
+                    var z = new System.Numerics.Complex(System.Math.Log(-d), System.Math.PI);
+                    return FloatComplexResult(z, single, keepComplex: true);
                 }
-                double b = Arithmetic.ToDouble(n2);
-                return Startup.MakeFloat(System.Math.Log(d, b), args[0]);
+                return Startup.MakeFloat(System.Math.Log(d), args[0]);
             }
-            if (d < 0 && !double.IsNegativeInfinity(d)) {
-                var z = new System.Numerics.Complex(d, 0);
-                return Arithmetic.FromSystemComplex(System.Numerics.Complex.Log(z), n);
+            var baseNumber = Runtime.AsNumber(args[1]);
+            bool useSingle = !(NumberHasDoublePart(n) || NumberHasDoublePart(baseNumber));
+            // CLHS 12.2.3: a base of zero returns zero, even for (log 0 0).
+            if (IsZeroNumber(baseNumber))
+                return useSingle ? (LispObject)new SingleFloat(0.0f) : new DoubleFloat(0.0);
+            bool nComplex;
+            var lnN = LogComplex(n, out nComplex);
+            bool baseComplex;
+            var lnBase = LogComplex(baseNumber, out baseComplex);
+            if (!nComplex && !baseComplex)
+            {
+                double d = Arithmetic.ToDouble(n);
+                double b = Arithmetic.ToDouble(baseNumber);
+                return useSingle ? (LispObject)new SingleFloat((float)System.Math.Log(d, b))
+                                 : new DoubleFloat(System.Math.Log(d, b));
             }
-            return Startup.MakeFloat(System.Math.Log(d), args[0]);
+            return FloatComplexResult(lnN / lnBase, useSingle, keepComplex: true);
         }, "LOG", -1));
 
         // EXP
         Startup.RegisterUnary("EXP", obj => {
             var n = Runtime.AsNumber(obj);
-            if (n is LispComplex lc) return Arithmetic.FromSystemComplex(System.Numerics.Complex.Exp(Arithmetic.ToSystemComplex(lc)), n);
-            double d = Arithmetic.ToDouble(n);
-            double result = System.Math.Exp(d);
-            if (double.IsInfinity(result) && !double.IsInfinity(d))
-                throw new LispErrorException(new LispError("EXP: floating-point overflow") { ConditionTypeName = "FLOATING-POINT-OVERFLOW" });
-            // Underflow flushes to 0.0 (masked trap, as SBCL/CCL/ECL); only overflow signals.
-            // Single-float overflow: double result is fine but float cast overflows.
-            if (n is SingleFloat && !double.IsInfinity(result) && !double.IsNaN(result)) {
-                float sf = (float)result;
-                if (float.IsInfinity(sf))
-                    throw new LispErrorException(new LispError("EXP: floating-point overflow") { ConditionTypeName = "FLOATING-POINT-OVERFLOW" });
+            if (n is LispComplex lc)
+            {
+                var z = System.Numerics.Complex.Exp(Arithmetic.ToSystemComplex(lc));
+                return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
             }
-            return Startup.MakeFloat(result, obj);
+            // Underflow flushes to 0.0 (masked trap, as SBCL/CCL/ECL). Overflow
+            // signals through %EXP-CHECKED, which (safety 3) code calls.
+            return Startup.MakeFloat(System.Math.Exp(Arithmetic.ToDouble(n)), obj);
         });
 
         // Trig functions: SIN, COS, TAN, ASIN, ACOS
         Startup.RegisterUnary("SIN", obj => {
             var n = Runtime.AsNumber(obj);
-            if (n is LispComplex lc) return Arithmetic.FromSystemComplex(System.Numerics.Complex.Sin(Arithmetic.ToSystemComplex(lc)), n);
+            if (n is LispComplex lc)
+            {
+                var z = System.Numerics.Complex.Sin(Arithmetic.ToSystemComplex(lc));
+                return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
+            }
             return Startup.MakeFloat(System.Math.Sin(Arithmetic.ToDouble(n)), obj);
         });
         Startup.RegisterUnary("COS", obj => {
             var n = Runtime.AsNumber(obj);
-            if (n is LispComplex lc) return Arithmetic.FromSystemComplex(System.Numerics.Complex.Cos(Arithmetic.ToSystemComplex(lc)), n);
+            if (n is LispComplex lc)
+            {
+                var z = System.Numerics.Complex.Cos(Arithmetic.ToSystemComplex(lc));
+                return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
+            }
             return Startup.MakeFloat(System.Math.Cos(Arithmetic.ToDouble(n)), obj);
         });
         Startup.RegisterUnary("TAN", obj => {
             var n = Runtime.AsNumber(obj);
-            if (n is LispComplex lc) return Arithmetic.FromSystemComplex(System.Numerics.Complex.Tan(Arithmetic.ToSystemComplex(lc)), n);
+            if (n is LispComplex lc)
+            {
+                var z = System.Numerics.Complex.Tan(Arithmetic.ToSystemComplex(lc));
+                return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
+            }
             return Startup.MakeFloat(System.Math.Tan(Arithmetic.ToDouble(n)), obj);
         });
         Startup.RegisterUnary("ASIN", obj => {
             var n = Runtime.AsNumber(obj);
-            if (n is LispComplex lc) return Arithmetic.FromSystemComplex(System.Numerics.Complex.Asin(Arithmetic.ToSystemComplex(lc)), n);
+            if (n is LispComplex lc)
+            {
+                var z = Arithmetic.AsinComplex(Arithmetic.ToSystemComplex(lc));
+                return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
+            }
             double x = Arithmetic.ToDouble(n);
-            // |x|>1 is outside asin's real domain. Promote via the CLHS formula
-            // asin(z) = -i log(iz + sqrt(1-z)sqrt(1+z)) rather than Math.Asin (NaN) or
-            // .NET Complex.Asin (different branch on the real cut than CL/SBCL).
+            // |x|>1: the CLHS principal value; the complex formula cancels at large |x|.
             if (System.Math.Abs(x) > 1.0)
-                return Arithmetic.FromSystemComplex(Arithmetic.AsinComplex(new System.Numerics.Complex(x, 0)), n);
+            {
+                double a = Compat.Acosh(System.Math.Abs(x));
+                var z = x > 0 ? new System.Numerics.Complex(System.Math.PI / 2, -a)
+                              : new System.Numerics.Complex(-System.Math.PI / 2, a);
+                return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
+            }
             return Startup.MakeFloat(System.Math.Asin(x), obj);
         });
         Startup.RegisterUnary("ACOS", obj => {
             var n = Runtime.AsNumber(obj);
-            if (n is LispComplex lc) return Arithmetic.FromSystemComplex(System.Numerics.Complex.Acos(Arithmetic.ToSystemComplex(lc)), n);
+            if (n is LispComplex lc)
+            {
+                var z = Arithmetic.AcosComplex(Arithmetic.ToSystemComplex(lc));
+                return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
+            }
             double x = Arithmetic.ToDouble(n);
             if (System.Math.Abs(x) > 1.0)
-                return Arithmetic.FromSystemComplex(Arithmetic.AcosComplex(new System.Numerics.Complex(x, 0)), n);
+            {
+                double a = Compat.Acosh(System.Math.Abs(x));
+                var z = x > 0 ? new System.Numerics.Complex(0.0, a)
+                              : new System.Numerics.Complex(System.Math.PI, -a);
+                return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
+            }
             return Startup.MakeFloat(System.Math.Acos(x), obj);
         });
 
@@ -2304,7 +2547,10 @@ public static partial class Runtime
             var n = Runtime.AsNumber(args[0]);
             if (n is LispComplex lc) {
                 if (args.Length > 1) throw new LispErrorException(new LispProgramError("ATAN: complex argument not allowed with two arguments"));
-                return Arithmetic.FromSystemComplex(System.Numerics.Complex.Atan(Arithmetic.ToSystemComplex(lc)), n);
+                {
+                    var z = System.Numerics.Complex.Atan(Arithmetic.ToSystemComplex(lc));
+                    return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
+                }
             }
             double y = Arithmetic.ToDouble(n);
             if (args.Length > 1) {
@@ -2319,24 +2565,41 @@ public static partial class Runtime
         // Hyperbolic: SINH, COSH, TANH
         Startup.RegisterUnary("SINH", obj => {
             var n = Runtime.AsNumber(obj);
-            if (n is LispComplex lc) return Arithmetic.FromSystemComplex(System.Numerics.Complex.Sinh(Arithmetic.ToSystemComplex(lc)), n);
+            if (n is LispComplex lc)
+            {
+                var z = System.Numerics.Complex.Sinh(Arithmetic.ToSystemComplex(lc));
+                return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
+            }
             return Startup.MakeFloat(System.Math.Sinh(Arithmetic.ToDouble(n)), obj);
         });
         Startup.RegisterUnary("COSH", obj => {
             var n = Runtime.AsNumber(obj);
-            if (n is LispComplex lc) return Arithmetic.FromSystemComplex(System.Numerics.Complex.Cosh(Arithmetic.ToSystemComplex(lc)), n);
+            if (n is LispComplex lc)
+            {
+                var z = System.Numerics.Complex.Cosh(Arithmetic.ToSystemComplex(lc));
+                return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
+            }
             return Startup.MakeFloat(System.Math.Cosh(Arithmetic.ToDouble(n)), obj);
         });
         Startup.RegisterUnary("TANH", obj => {
             var n = Runtime.AsNumber(obj);
-            if (n is LispComplex lc) return Arithmetic.FromSystemComplex(System.Numerics.Complex.Tanh(Arithmetic.ToSystemComplex(lc)), n);
+            if (n is LispComplex lc)
+            {
+                var z = System.Numerics.Complex.Tanh(Arithmetic.ToSystemComplex(lc));
+                return FloatComplexResult(z, !NumberHasDoublePart(n), keepComplex: true);
+            }
             return Startup.MakeFloat(System.Math.Tanh(Arithmetic.ToDouble(n)), obj);
         });
 
         // ASINH, ACOSH, ATANH
         Startup.RegisterUnary("ASINH", obj => {
             var n = Runtime.AsNumber(obj);
-            if (n is LispComplex lc) { var z = Arithmetic.ToSystemComplex(lc); return Arithmetic.FromSystemComplex(System.Numerics.Complex.Log(z + System.Numerics.Complex.Sqrt(z * z + 1)), n); }
+            if (n is LispComplex lc)
+            {
+                var z = Arithmetic.ToSystemComplex(lc);
+                var r = System.Numerics.Complex.Log(z + System.Numerics.Complex.Sqrt(z * z + 1));
+                return FloatComplexResult(r, !NumberHasDoublePart(n), keepComplex: true);
+            }
             return Startup.MakeFloat(Compat.Asinh(Arithmetic.ToDouble(n)), obj);
         });
         Startup.RegisterUnary("ACOSH", obj => {
@@ -2344,20 +2607,30 @@ public static partial class Runtime
             // CLHS: acosh(z) = log(z + sqrt(z-1)*sqrt(z+1)). The factored sqrt picks the
             // right branch where sqrt(z*z-1) does not (e.g. acosh(-2) real part > 0,
             // acosh(0.5) real part exactly 0).
-            if (n is LispComplex lc) { var z = Arithmetic.ToSystemComplex(lc); return Arithmetic.FromSystemComplex(Arithmetic.AcoshComplex(z), n); }
+            if (n is LispComplex lc)
+            {
+                var z = Arithmetic.ToSystemComplex(lc);
+                return FloatComplexResult(Arithmetic.AcoshComplex(z), !NumberHasDoublePart(n), keepComplex: true);
+            }
             double d = Arithmetic.ToDouble(n);
             if (d < 1.0)
-                return Arithmetic.FromSystemComplex(Arithmetic.AcoshComplex(new System.Numerics.Complex(d, 0)), n);
+                return FloatComplexResult(Arithmetic.AcoshComplex(new System.Numerics.Complex(d, 0)),
+                                          !NumberHasDoublePart(n), keepComplex: true);
             return Startup.MakeFloat(Compat.Acosh(d), obj);
         });
         Startup.RegisterUnary("ATANH", obj => {
             var n = Runtime.AsNumber(obj);
             // CLHS: atanh(z) = (log(1+z) - log(1-z))/2. Separated logs keep the branch
             // correct on the real cut |x|>1 where (1+z)/(1-z) flips the sign of zero.
-            if (n is LispComplex lc) { var z = Arithmetic.ToSystemComplex(lc); return Arithmetic.FromSystemComplex(Arithmetic.AtanhComplex(z), n); }
+            if (n is LispComplex lc)
+            {
+                var z = Arithmetic.ToSystemComplex(lc);
+                return FloatComplexResult(Arithmetic.AtanhComplex(z), !NumberHasDoublePart(n), keepComplex: true);
+            }
             double d = Arithmetic.ToDouble(n);
             if (System.Math.Abs(d) > 1.0)
-                return Arithmetic.FromSystemComplex(Arithmetic.AtanhComplex(new System.Numerics.Complex(d, 0)), n);
+                return FloatComplexResult(Arithmetic.AtanhComplex(new System.Numerics.Complex(d, 0)),
+                                          !NumberHasDoublePart(n), keepComplex: true);
             return Startup.MakeFloat(Compat.Atanh(d), obj);
         });
 
@@ -2675,7 +2948,7 @@ public static partial class Runtime
                     exponent = exponent - 1023 - 52;
                 }
                 return MultipleValues.Values(new Fixnum(mantissa), new Fixnum(exponent), new Fixnum(sign));
-            }, "INTEGER-DECODE-FLOAT", 1));
+            }, "INTEGER-DECODE-FLOAT", 1).WithArgCount(1, 1));
 
         // DECODE-FLOAT: (decode-float f) => (values significand exponent sign)
         Emitter.CilAssembler.RegisterFunction("DECODE-FLOAT",
@@ -2707,7 +2980,7 @@ public static partial class Runtime
                     : BitLength(bits & 0xFFFFFFFFFFFFFL) - 1074;
                 double significand = Compat.ScaleB(d, -exponent);
                 return MultipleValues.Values(MakeF(significand), new Fixnum(exponent), MakeF(signVal));
-            }, "DECODE-FLOAT", 1));
+            }, "DECODE-FLOAT", 1).WithArgCount(1, 1));
 
         // SCALE-FLOAT: FLOAT * 2^SCALE with a single rounding. Multiplying by a
         // separately built 2^SCALE loses the answer whenever that power of two is
@@ -2735,24 +3008,24 @@ public static partial class Runtime
                         throw new LispErrorException(new LispTypeError(
                             "SCALE-FLOAT: argument is not a float", args[0], Startup.Sym("FLOAT")));
                 }
-            }, "SCALE-FLOAT", 2));
+            }, "SCALE-FLOAT", 2).WithArgCount(2, 2));
 
         // FLOAT-RADIX: always 2 for IEEE floats
         Emitter.CilAssembler.RegisterFunction("FLOAT-RADIX",
-            new LispFunction(args => new Fixnum(2), "FLOAT-RADIX", 1));
+            new LispFunction(args => new Fixnum(2), "FLOAT-RADIX", 1).WithArgCount(1, 1));
 
         // FLOAT-DIGITS: how many digits the argument's FORMAT holds -- 24 for a
         // single, 53 for a double. It answered 53 for every argument, so a single
         // float claimed a double's mantissa and a non-float got an answer at all.
         Emitter.CilAssembler.RegisterFunction("FLOAT-DIGITS",
             new LispFunction(args => new Fixnum(FloatFormatDigits("FLOAT-DIGITS", args[0])),
-                             "FLOAT-DIGITS", 1));
+                             "FLOAT-DIGITS", 1).WithArgCount(1, 1));
 
         // FLOAT-PRECISION: how many digits this VALUE actually carries. That is
         // the format's digit count for a normal float, fewer for a denormal (whose
         // leading zeros are not significant), and zero for a zero.
         Emitter.CilAssembler.RegisterFunction("FLOAT-PRECISION",
-            new LispFunction(args => new Fixnum(FloatValuePrecision(args[0])), "FLOAT-PRECISION", 1));
+            new LispFunction(args => new Fixnum(FloatValuePrecision(args[0])), "FLOAT-PRECISION", 1).WithArgCount(1, 1));
 
         // FLOAT-SIGN: (float-sign f1 &optional f2) => the sign of f1 on the
         // magnitude of f2 (1 by default), IN F2'S FORMAT. Returning a double
@@ -2783,4 +3056,170 @@ public static partial class Runtime
     }
 
 
+}
+
+/// <summary>
+/// Raw float arithmetic for compiled code at (safety 3). An infinite
+/// result of finite operands signals FLOATING-POINT-OVERFLOW; an infinite
+/// operand propagates and a quotient by zero stays the IEEE infinity. The cold
+/// path only throws, so nothing has to stay live across it.
+/// </summary>
+public static class FloatLane
+{
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double AddD(double a, double b)
+    {
+        double r = a + b;
+        if (!(System.Math.Abs(r) <= double.MaxValue)
+            && (double.IsNaN(r) ? !double.IsNaN(a) && !double.IsNaN(b) : !double.IsInfinity(a) && !double.IsInfinity(b)))
+            throw Fault('+', a, b, r);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float AddS(float a, float b)
+    {
+        float r = a + b;
+        if (!(System.Math.Abs(r) <= float.MaxValue)
+            && (float.IsNaN(r) ? !float.IsNaN(a) && !float.IsNaN(b) : !float.IsInfinity(a) && !float.IsInfinity(b)))
+            throw Fault('+', a, b, r);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double SubtractD(double a, double b)
+    {
+        double r = a - b;
+        if (!(System.Math.Abs(r) <= double.MaxValue)
+            && (double.IsNaN(r) ? !double.IsNaN(a) && !double.IsNaN(b) : !double.IsInfinity(a) && !double.IsInfinity(b)))
+            throw Fault('-', a, b, r);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float SubtractS(float a, float b)
+    {
+        float r = a - b;
+        if (!(System.Math.Abs(r) <= float.MaxValue)
+            && (float.IsNaN(r) ? !float.IsNaN(a) && !float.IsNaN(b) : !float.IsInfinity(a) && !float.IsInfinity(b)))
+            throw Fault('-', a, b, r);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double MultiplyD(double a, double b)
+    {
+        double r = a * b;
+        if (!(System.Math.Abs(r) <= double.MaxValue)
+            && (double.IsNaN(r) ? !double.IsNaN(a) && !double.IsNaN(b) : !double.IsInfinity(a) && !double.IsInfinity(b)))
+            throw Fault('*', a, b, r);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float MultiplyS(float a, float b)
+    {
+        float r = a * b;
+        if (!(System.Math.Abs(r) <= float.MaxValue)
+            && (float.IsNaN(r) ? !float.IsNaN(a) && !float.IsNaN(b) : !float.IsInfinity(a) && !float.IsInfinity(b)))
+            throw Fault('*', a, b, r);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double DivideD(double a, double b)
+    {
+        double r = a / b;
+        if (!(System.Math.Abs(r) <= double.MaxValue)
+            && (double.IsNaN(r) ? !double.IsNaN(a) && !double.IsNaN(b) : !double.IsInfinity(a) && !double.IsInfinity(b)))
+            throw Fault('/', a, b, r);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float DivideS(float a, float b)
+    {
+        float r = a / b;
+        if (!(System.Math.Abs(r) <= float.MaxValue)
+            && (float.IsNaN(r) ? !float.IsNaN(a) && !float.IsNaN(b) : !float.IsInfinity(a) && !float.IsInfinity(b)))
+            throw Fault('/', a, b, r);
+        return r;
+    }
+
+    /// <summary>True for an infinity or a NaN.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool NonFiniteD(double r) => !(System.Math.Abs(r) <= double.MaxValue);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool NonFiniteS(float r) => !(System.Math.Abs(r) <= float.MaxValue);
+
+    /// <summary>A double narrowed to a single-float, as FLOAT does.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float NarrowD(double d)
+    {
+        float f = (float)d;
+        if (float.IsInfinity(f) && !double.IsInfinity(d))
+            throw Runtime.FloatingPointOverflow("FLOAT", new DoubleFloat(d), new SingleFloat(1f));
+        return f;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double SinhD(double x)
+    {
+        double r = System.Math.Sinh(x);
+        if (System.Math.Abs(r) > double.MaxValue && !double.IsInfinity(x)) throw Runtime.FloatingPointOverflow("SINH", new DoubleFloat(x));
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double CoshD(double x)
+    {
+        double r = System.Math.Cosh(x);
+        if (System.Math.Abs(r) > double.MaxValue && !double.IsInfinity(x)) throw Runtime.FloatingPointOverflow("COSH", new DoubleFloat(x));
+        return r;
+    }
+
+    /// <summary>The condition of OP on A and B giving R, a NaN or an infinity
+    /// from operands that are not: FLOATING-POINT-INVALID-OPERATION for a NaN,
+    /// DIVISION-BY-ZERO for a quotient by zero, else FLOATING-POINT-OVERFLOW.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static LispErrorException Fault(char op, double a, double b, double r)
+        => Runtime.FloatFault(op.ToString(), new DoubleFloat(a), new DoubleFloat(b), double.IsNaN(r), op == '/' && b == 0.0);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    internal static LispErrorException Fault(char op, float a, float b, float r)
+        => Runtime.FloatFault(op.ToString(), new SingleFloat(a), new SingleFloat(b), float.IsNaN(r), op == '/' && b == 0f);
+
+    /// <summary>LOG of a double declared to have a DOUBLE-FLOAT logarithm, at
+    /// (safety 3): zero signals DIVISION-BY-ZERO.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double LogD(double x)
+    {
+        if (x == 0.0) throw Runtime.DivisionByZero("LOG", new DoubleFloat(x));
+        return Runtime.LogDoubleChecked(x);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double SinD(double x)
+    {
+        double r = System.Math.Sin(x);
+        if (double.IsNaN(r) && !double.IsNaN(x)) throw Runtime.FloatInvalid("SIN", new DoubleFloat(x));
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double CosD(double x)
+    {
+        double r = System.Math.Cos(x);
+        if (double.IsNaN(r) && !double.IsNaN(x)) throw Runtime.FloatInvalid("COS", new DoubleFloat(x));
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double TanD(double x)
+    {
+        double r = System.Math.Tan(x);
+        if (double.IsNaN(r) && !double.IsNaN(x)) throw Runtime.FloatInvalid("TAN", new DoubleFloat(x));
+        return r;
+    }
 }

@@ -305,6 +305,8 @@ public class LispClass : LispObject
     public bool IsForwardReferenced { get; set; }
     /// <summary>Slot names for #S reader macro support.</summary>
     public Symbol[]? StructSlotNames { get; set; }
+    /// <summary>Standard keyword constructor #S calls, or null when there is none.</summary>
+    public Symbol? StructKeywordConstructor { get; set; }
     /// <summary>Direct default initargs defined by this class (before inheritance merge).</summary>
     /// <summary>The canonicalized default initargs AMOP asks for: the name, the
     /// initform as source, and the function that evaluates it. The form is what
@@ -367,6 +369,8 @@ public class LispClass : LispObject
     /// <summary>Make-instance plan for the custom-method-free path; null until the first
     /// such make-instance, stale once the method epoch moves.</summary>
     internal CtorPlan? Ctor;
+    /// <summary>MAKE-INSTANCE plan for a structure class, built on first use.</summary>
+    internal StructCtorPlan? StructCtor;
     /// <summary>Cached result of HasCustomInitMethods check. Null = not yet computed.</summary>
     internal bool? CachedHasCustomInitMethods;
     /// <summary>Cached result of IsConditionClass check. Null = not yet computed.</summary>
@@ -602,8 +606,7 @@ public class LispClass : LispObject
 
             // Fast path: no default initargs, no shared initargs, no :class allocation slots
             // and no cross-package name collision (the fast paths match by name).
-            HasSimpleInitialization = DefaultInitargs.Length == 0
-                && !hasSharedInitarg
+            HasSimpleInitialization = !hasSharedInitarg
                 && !HasSymbolCollision
                 && !Array.Exists(EffectiveSlots, s => s.IsClassAllocation);
             SimpleInitChecked = false;
@@ -973,6 +976,8 @@ internal sealed class CtorPlan
     /// <summary>The :AFTER methods of INITIALIZE-INSTANCE to run, least specific first.</summary>
     public readonly LispMethod[] Afters;
     public volatile (Symbol Key, int Slot)[] Keys = Array.Empty<(Symbol, int)>();
+    public readonly (Symbol Key, int Slot, LispFunction Thunk)[] Defaults;
+    public readonly object SourceDefaults;
 
     public CtorPlan(LispClass cls, int epoch, LispMethod[] afters)
     {
@@ -991,6 +996,15 @@ internal sealed class CtorPlan
         InitformSlots = slots.ToArray();
         Initforms = thunks.ToArray();
         InitformValues = values.ToArray();
+        SourceDefaults = cls.DefaultInitargs;
+        var map = cls.InitargToSlotIndex;
+        var defs = new (Symbol, int, LispFunction)[cls.DefaultInitargs.Length];
+        for (int i = 0; i < defs.Length; i++)
+        {
+            var d = cls.DefaultInitargs[i];
+            defs[i] = (d.Key, map != null && map.TryGetValue(d.Key.Name, out int idx) ? idx : -1, d.Thunk);
+        }
+        Defaults = defs;
     }
 
     public void AddKey(Symbol key, int slot)
@@ -1005,8 +1019,9 @@ internal sealed class CtorPlan
 
     /// <summary>The new instance, or null when an initarg has not been seen yet.</summary>
     [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization (not in netstandard2.0)
-    public LispInstance? TryMake(LispObject[] initargs)
+    public LispInstance? TryMake(LispObject[] initargs, out LispObject[] effective)
     {
+        effective = initargs;
         var keys = Keys;
         for (int i = 0; i < initargs.Length; i += 2)
         {
@@ -1026,6 +1041,8 @@ internal sealed class CtorPlan
                     break;
                 }
         }
+        var defs = Defaults;
+        if (defs.Length != 0) ApplyDefaults(slotv, initargs, ref effective);
         var forms = Initforms;
         for (int j = 0; j < forms.Length; j++)
         {
@@ -1033,6 +1050,38 @@ internal sealed class CtorPlan
             if (slotv[s] == null) Store(slotv, s, InitformValues[j] ?? LispFunction.Call0(forms[j]));
         }
         return inst;
+    }
+
+    // Defaulted initargs follow the caller's, so a supplied key wins; each default
+    // form runs once per instance.
+    private void ApplyDefaults(LispObject?[] slotv, LispObject[] initargs, ref LispObject[] effective)
+    {
+        var defs = Defaults;
+        LispObject[]? extra = null;
+        int n = 0;
+        for (int j = 0; j < defs.Length; j++)
+        {
+            var key = defs[j].Key;
+            bool supplied = false;
+            for (int i = 0; i < initargs.Length; i += 2)
+                if (initargs[i] is Symbol s && (ReferenceEquals(s, key) || s.Name == key.Name)) { supplied = true; break; }
+            if (supplied) continue;
+            var v = Runtime.UnwrapMv(defs[j].Thunk.Invoke(Array.Empty<LispObject>()));
+            int slot = defs[j].Slot;
+            if (slot >= 0 && slotv[slot] == null) Store(slotv, slot, v);
+            if (Afters.Length != 0)
+            {
+                extra ??= new LispObject[defs.Length * 2];
+                extra[n++] = key; extra[n++] = v;
+            }
+        }
+        if (n != 0)
+        {
+            var eff = new LispObject[initargs.Length + n];
+            Array.Copy(initargs, eff, initargs.Length);
+            Array.Copy(extra!, 0, eff, initargs.Length, n);
+            effective = eff;
+        }
     }
 
     // Slots is exactly LispObject?[], so the covariance check of a plain store is dead weight.
@@ -1046,6 +1095,26 @@ internal sealed class CtorPlan
 #else
         a[i] = v;
 #endif
+    }
+}
+
+internal sealed class StructCtorPlan
+{
+    public readonly Symbol[] Keys;
+    public readonly Dictionary<Symbol, int> KeyToSlot;
+    public readonly LispFunction?[] Defaults;
+    /// <summary>Epoch the method cache below was built under.</summary>
+    public int Epoch = -1;
+    public bool MethodsSimple;
+    public LispMethod[] SharedAfters = Array.Empty<LispMethod>();
+    public LispMethod[] InitAfters = Array.Empty<LispMethod>();
+
+    public StructCtorPlan(Symbol[] keys, Dictionary<Symbol, int> keyToSlot,
+                          LispFunction?[] defaults)
+    {
+        Keys = keys;
+        KeyToSlot = keyToSlot;
+        Defaults = defaults;
     }
 }
 
@@ -1454,7 +1523,7 @@ public sealed class GFCallCache
             Gf = gf; Slot = slot; C0 = slot.C0; Epoch = epoch; Name = name; ClassEpoch = classEpoch;
             if (arg is Fixnum) Kind = KindFixnum;
             else if (arg is LispInstance) Kind = KindInstance;
-            else if (arg is LispStruct st) { Kind = KindStruct; StructName = st.TypeName; }
+            else if (LispStruct.TryAs(arg, out var st)) { Kind = KindStruct; StructName = st.TypeName; }
         }
     }
 }
@@ -1673,27 +1742,40 @@ public class GenericFunction : LispFunction
         internal readonly LooseSlot[]? EqlHits;
         internal readonly bool NoDefault;
 
+        // The fixnum keys by value, and their slots, for a fixnum argument.
+        private readonly long[]? _fixKeys;
+        private readonly LooseSlot[]? _fixHits;
+
         internal LooseSlot(LispClass? c0, LispFunction fn, bool noDefault, LispObject[] keys, LooseSlot[] hits)
             : this(c0, null, fn)
         {
             NoDefault = noDefault; EqlKeys = keys; EqlHits = hits;
+            var fk = new List<long>(); var fh = new List<LooseSlot>();
+            for (int i = 0; i < keys.Length; i++)
+                if (keys[i] is Fixnum f) { fk.Add(f.Value); fh.Add(hits[i]); }
+            _fixKeys = fk.ToArray(); _fixHits = fh.ToArray();
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        internal LooseSlot? PickEql(LispObject a)
+        {
+            if (a is Fixnum fa)
+            {
+                var keys = _fixKeys!;
+                long v = fa.Value;
+                for (int i = 0; i < keys.Length; i++)
+                    if (keys[i] == v) return _fixHits![i];
+                return NoDefault ? null : this;
+            }
+            return PickEqlRef(a);
         }
 
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-        internal LooseSlot? PickEql(LispObject a)
+        private LooseSlot? PickEqlRef(LispObject a)
         {
             var keys = EqlKeys!;
-            if (a is Fixnum fa)
-            {
-                long v = fa.Value;
-                for (int i = 0; i < keys.Length; i++)
-                    if (keys[i] is Fixnum fk && fk.Value == v) return EqlHits![i];
-            }
-            else
-            {
-                for (int i = 0; i < keys.Length; i++)
-                    if (ReferenceEquals(keys[i], a)) return EqlHits![i];
-            }
+            for (int i = 0; i < keys.Length; i++)
+                if (ReferenceEquals(keys[i], a)) return EqlHits![i];
             return NoDefault ? null : this;
         }
 

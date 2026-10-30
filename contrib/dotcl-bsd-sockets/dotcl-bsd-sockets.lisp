@@ -26,7 +26,8 @@
 ;;; subclasses for name resolution), classified by the SocketError code, which
 ;;; is the same on every OS. SOCKET-ERROR-FROM-EXCEPTION does that translation
 ;;; for a .NET exception raised elsewhere, such as by a read on a socket stream
-;;; whose receive timeout expired.
+;;; whose receive timeout expired. A read or write on a socket stream that does
+;;; expire signals SOCKET-TIMEOUT, a STREAM-ERROR.
 
 (defpackage :dotcl-bsd-sockets
   (:use :cl)
@@ -60,7 +61,7 @@
    #:connection-refused-error #:host-down-error #:host-unreachable-error
    #:name-service-error #:name-service-error-host #:name-service-error-code
    #:host-not-found-error #:try-again-error #:no-recovery-error
-   #:socket-error-from-exception))
+   #:socket-timeout #:socket-error-from-exception))
 
 (in-package :dotcl-bsd-sockets)
 
@@ -103,6 +104,14 @@
 (define-condition host-not-found-error (name-service-error) ())
 (define-condition try-again-error (name-service-error) ())
 (define-condition no-recovery-error (name-service-error) ())
+
+(define-condition socket-timeout (stream-error)
+  ()
+  (:documentation "A read or write on a socket stream waited longer than the
+socket's receive or send timeout. A STREAM-ERROR, so handlers for that still
+catch it; its stream is STREAM-ERROR-STREAM.")
+  (:report (lambda (c s)
+             (format s "Socket timeout on ~a." (stream-error-stream c)))))
 
 ;;; Keyed on SocketException.SocketErrorCode, whose values are the Winsock
 ;;; numbers on every OS (ErrorCode / NativeErrorCode are the OS errno and

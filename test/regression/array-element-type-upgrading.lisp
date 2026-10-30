@@ -142,3 +142,15 @@
         (array-element-type (make-array 3 :element-type '(unsigned-byte 8)))
         (array-element-type (make-array 3 :element-type 'character)))
   (double-float (unsigned-byte 8) character))
+
+;; Another package's symbol named like a standard type is not that type, and
+;; with no DEFTYPE of its own it has no specialization: SBCL's cross-build
+;; makes (make-array 11 :element-type 'sb-xc:single-float :initial-element 0).
+(defpackage :aet-other (:use) (:export #:single-float #:unsigned-byte #:character))
+
+(deftest array-element-type-upgrading.other-package-names
+  (list (array-element-type (make-array 3 :element-type 'aet-other:single-float :initial-element 0))
+        (array-element-type (make-array 3 :element-type '(aet-other:unsigned-byte 8)))
+        (upgraded-array-element-type 'aet-other:character)
+        (array-element-type (make-array 3 :element-type 'single-float)))
+  (t t t single-float))

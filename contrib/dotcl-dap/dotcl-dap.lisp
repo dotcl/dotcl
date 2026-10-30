@@ -11,27 +11,74 @@
 
 (require "dotcl-thread")
 (require "dotcl-socket")
+(require "dotcl-bsd-sockets")
 (require "dotcl-jsonrpc")
 
 (defpackage :dotcl-dap
   (:use :cl :dotcl-jsonrpc)
   (:export #:start-server #:stop-server #:server-port #:*server*
-           #:stopped-threads))
+           #:stopped-threads #:*log-stream*))
 
 (in-package :dotcl-dap)
 
 ;;; The server and its one session.
 
-(defstruct server socket thread port (session nil))
+(defstruct server socket thread port (session nil) (owner nil))
 
 (defstruct session
   stream
   (lock (dotcl-thread:make-lock "dap-session"))
   (seq 0)
   (open t)
+  (client nil)
+  (known nil)
+  (watcher nil)
   (package (find-package "CL-USER")))
 
 (defvar *server* nil)
+
+(defvar *log-stream* t
+  "Where the server reports connections and stops, one line each. T means the
+*STANDARD-OUTPUT* of the caller of START-SERVER; NIL keeps it silent.")
+
+(defvar *start-output* nil)
+
+(defvar *log-lock* (dotcl-thread:make-lock "dap-log"))
+
+(defun %log (control &rest args)
+  (let ((stream (cond ((eq *log-stream* t) *start-output*)
+                      (t *log-stream*))))
+    (when stream
+      (ignore-errors
+       (dotcl-thread:with-lock-held (*log-lock*)
+         (format stream "dotcl-dap: ~?~%" control args)
+         (finish-output stream))))))
+
+(defun %address-text (address)
+  (or (ignore-errors
+       (if (and (vectorp address) (every #'integerp address))
+           (if (= (length address) 4)
+               (format nil "~{~D~^.~}" (coerce address 'list))
+               (format nil "~(~{~2,'0X~}~)" (coerce address 'list)))
+           (princ-to-string address)))
+      "unknown address"))
+
+(defun %stop-function-name (stop)
+  (let* ((f (first (stop-frames stop)))
+         (name (and f (frame-name f))))
+    (if (stringp name)
+        (let ((start (if (and (plusp (length name)) (char= (char name 0) #\()) 1 0)))
+          (subseq name start (or (position-if (lambda (c) (member c '(#\Space #\)))) name :start start)
+                                 (length name))))
+        (princ-to-string name))))
+
+(defun %log-stop (stop)
+  (%log "thread ~S stopped at ~A (~A)"
+        (or (ignore-errors (dotcl:thread-name (stop-thread stop))) "thread")
+        (%stop-function-name stop)
+        (if (stop-condition stop)
+            (format nil "exception: ~A" (%condition-text (stop-condition stop)))
+            (stop-reason stop))))
 
 ;; Everything below is guarded by *state-lock*.
 (defvar *state-lock* (dotcl-thread:make-lock "dap-state"))
@@ -44,6 +91,8 @@
 (defvar *exception-filters* '() "The exception breakpoint filters the client enabled.")
 (defvar *previous-debugger-hook* nil)
 (defvar *hook-installed* nil)
+(defvar *signal-hook-installed* nil)
+(defvar *previous-break-on-signals* nil)
 (defvar *var-refs* (make-hash-table) "variablesReference -> list of (name . value)")
 
 (defun %new-id ()
@@ -53,6 +102,55 @@
   (dotcl-thread:with-lock-held (*state-lock*)
     (or (gethash thread *thread-ids*)
         (setf (gethash thread *thread-ids*) (incf *next-thread-id*)))))
+
+(defvar *internal-threads* '() "Threads of this package, kept out of THREADS.")
+
+(defun %thread-name (thread)
+  (let ((name (ignore-errors (dotcl:thread-name thread))))
+    (if (and (stringp name) (plusp (length name))) name "thread")))
+
+(defun %visible-threads ()
+  "The live Lisp threads a client should see: the thread that started the
+server (the REPL) first, then every other Lisp thread, the server's own
+included, and the stopped ones. VS Code draws no row for the only thread of
+a session while it runs, so the server's thread keeps the REPL in view."
+  (let* ((owner (and *server* (server-owner *server*)))
+         (owner (and owner (ignore-errors (dotcl:thread-alive-p owner)) owner))
+         (threads (remove-duplicates
+                   (append (ignore-errors (dotcl:all-threads))
+                           (stopped-threads))))
+         (others (sort (set-difference (remove owner threads) *internal-threads*)
+                       #'< :key #'thread-id)))
+    (if owner (cons owner others) others)))
+
+(defun %thread-json (thread)
+  (list :obj "id" (thread-id thread) "name" (%thread-name thread)))
+
+(defvar *announce-lock* (dotcl-thread:make-lock "dap-announce"))
+
+(defun %announce-threads (session)
+  "Send thread started / exited events for the change since the last call."
+  (dotcl-thread:with-lock-held (*announce-lock*)
+    (let* ((now (%visible-threads))
+           (before (session-known session)))
+      (setf (session-known session) now)
+      (dolist (th now)
+        (unless (member th before)
+          (%event session "thread" (list :obj "reason" "started" "threadId" (thread-id th)))))
+      (dolist (th before)
+        (unless (member th now)
+          (%event session "thread" (list :obj "reason" "exited" "threadId" (thread-id th))))))))
+
+(defun %watch-threads (session)
+  (let ((watcher (dotcl-thread:make-thread
+                  (lambda ()
+                    (loop while (session-open session)
+                          do (sleep 0.25)
+                             (when (session-open session)
+                               (ignore-errors (%announce-threads session)))))
+                  :name "dap-thread-watch")))
+    (dotcl-thread:with-lock-held (*state-lock*) (push watcher *internal-threads*))
+    (setf (session-watcher session) watcher)))
 
 (defun %send (session message)
   (dotcl-thread:with-lock-held ((session-lock session))
@@ -82,12 +180,12 @@
 ;;; breakpoint is set calls itself through the wrapper too, and a watch on
 ;;; the name wraps each new definition.
 
-(defstruct bp id name symbol original wrapper saved-inlinep)
+(defstruct bp id name symbol original wrapper saved-inlinep spec)
 
 (defstruct frame id name args locals file line)
 
 (defstruct stop
-  thread thread-id reason bp condition restarts frames
+  thread thread-id reason bp condition restarts frames signaled
   (lock (dotcl-thread:make-lock "dap-stop"))
   (cv (dotcl-thread:make-condition-variable))
   (queue '()))
@@ -146,6 +244,114 @@ whose name is in that list."
 
 (defvar *in-stop* nil)
 
+;;; A breakpoint's condition, hit count and log message are judged on the
+;;; hitting thread, with the variables of the frame it would stop in.
+
+(defstruct hit-spec condition hit-test log-message (hits 0))
+
+(defun %blank-to-nil (string)
+  (and (stringp string)
+       (string/= "" (string-trim '(#\Space #\Tab #\Newline) string))
+       string))
+
+(defun %parse-hit-condition (text)
+  "(op . n) for TEXT such as 5, =5, >= 5 or %3 (a bare number means =); NIL
+when TEXT cannot be read."
+  (let* ((s (string-trim '(#\Space #\Tab) text))
+         (op (find-if (lambda (o) (and (<= (length o) (length s)) (string= o s :end2 (length o))))
+                      '(">=" "<=" "==" ">" "<" "=" "%")))
+         (n (ignore-errors (parse-integer s :start (length op)))))
+    (when (and n (>= n 0) (not (and (equal op "%") (zerop n))))
+      (cons (cond ((null op) "=") ((string= op "==") "=") (t op)) n))))
+
+(defun %hit-matches-p (test n)
+  (let ((m (cdr test)))
+    (cond ((string= (car test) "=") (= n m))
+          ((string= (car test) ">") (> n m))
+          ((string= (car test) ">=") (>= n m))
+          ((string= (car test) "<") (< n m))
+          ((string= (car test) "<=") (<= n m))
+          (t (zerop (mod n m))))))
+
+(defun %make-hit-spec (source)
+  "The spec of the DAP breakpoint SOURCE, or NIL when it has none; as a second
+value, why it cannot be used."
+  (let ((condition (%blank-to-nil (jget source "condition")))
+        (hit (%blank-to-nil (jget source "hitCondition")))
+        (log (%blank-to-nil (jget source "logMessage"))))
+    (cond ((and hit (null (%parse-hit-condition hit)))
+           (values nil (format nil "hit count ~S is not a number, =N, >N, >=N, <N, <=N or %N" hit)))
+          ((or condition hit log)
+           (make-hit-spec :condition condition
+                         :hit-test (and hit (%parse-hit-condition hit))
+                         :log-message log)))))
+
+(defun %interpolate (text frame package)
+  "TEXT with each {form} replaced by the value of the form in FRAME; {{ and }}
+stand for braces."
+  (with-output-to-string (out)
+    (let ((i 0) (n (length text)))
+      (loop while (< i n)
+            do (let ((c (char text i)))
+                 (cond ((and (char= c #\{) (< (1+ i) n) (char= (char text (1+ i)) #\{))
+                        (write-char #\{ out) (incf i 2))
+                       ((and (char= c #\}) (< (1+ i) n) (char= (char text (1+ i)) #\}))
+                        (write-char #\} out) (incf i 2))
+                       ((char= c #\{)
+                        (let ((end (loop with depth = 0
+                                         for j from (1+ i) below n
+                                         do (case (char text j)
+                                              (#\{ (incf depth))
+                                              (#\} (if (zerop depth) (return j) (decf depth)))))))
+                          (if (null end)
+                              (progn (write-string text out :start i) (setf i n))
+                              (let ((form (subseq text (1+ i) end)))
+                                (write-string
+                                 (handler-case
+                                     (let ((*print-length* 20) (*print-level* 4))
+                                       (format nil "~{~A~^ ~}"
+                                               (multiple-value-list
+                                                (%eval-in-frame form frame package))))
+                                   (error (e) (format nil "<error: ~A>" (%condition-text e))))
+                                 out)
+                                (setf i (1+ end))))))
+                       (t (write-char c out) (incf i))))))))
+
+(defun %bp-output (session frame text)
+  (let ((file (and frame (frame-file frame))))
+    (%event session "output"
+            (list* :obj "category" "console" "output" (format nil "~A~%" text)
+                   (when file
+                     (list "source" (list :obj "name" (file-namestring file)
+                                          "path" (namestring file))
+                           "line" (frame-line frame)))))))
+
+(defun %bp-stops-p (session spec frame)
+  "Whether a hit stops in FRAME: SPEC's condition holds there and its hit
+count matches, and it is not a logpoint (whose message is output instead)."
+  (let ((package (session-package session))
+        (*in-stop* t))
+    (when (null spec) (return-from %bp-stops-p t))
+    (let ((condition (hit-spec-condition spec)))
+      (when condition
+        (handler-case
+            (unless (%eval-in-frame condition frame package)
+              (return-from %bp-stops-p nil))
+          (error (e)
+            (%bp-output session frame
+                        (format nil "breakpoint condition ~A failed: ~A"
+                                condition (%condition-text e)))
+            (return-from %bp-stops-p t)))))
+    (let ((n (dotcl-thread:with-lock-held (*state-lock*) (incf (hit-spec-hits spec)))))
+      (when (and (hit-spec-hit-test spec)
+                 (not (%hit-matches-p (hit-spec-hit-test spec) n)))
+        (return-from %bp-stops-p nil)))
+    (let ((message (hit-spec-log-message spec)))
+      (when message
+        (%bp-output session frame (%interpolate message frame package))
+        (return-from %bp-stops-p nil)))
+    t))
+
 (defun %bp-hit (bp args)
   (let ((session (%live-session)))
     (when (and session (not *in-stop*)
@@ -162,7 +368,8 @@ whose name is in that list."
                               :frames (cons top (%capture-frames)))))
         (let ((loc (ignore-errors (dotcl:function-source-location (bp-symbol bp)))))
           (setf (frame-file top) (getf loc :file) (frame-line top) (getf loc :line)))
-        (%stop-here session stop)))))
+        (when (%bp-stops-p session (bp-spec bp) top)
+          (%stop-here session stop))))))
 
 ;;; Conditions: with the "uncaught" filter on, the global *DEBUGGER-HOOK*
 ;;; stops the thread a condition would enter the debugger on. The thread is
@@ -173,6 +380,18 @@ whose name is in that list."
 (defun %condition-text (condition)
   (or (ignore-errors (princ-to-string condition))
       (prin1-to-string (type-of condition))))
+
+(defun %signal-hook (condition)
+  (let ((session (%live-session)))
+    (when (and session (not *in-stop*)
+               (member "error" *exception-filters* :test #'string=)
+               (not (eq (dotcl:current-thread) (server-thread *server*))))
+      (let* ((thread (dotcl:current-thread))
+             (stop (make-stop :thread thread :thread-id (thread-id thread)
+                              :reason "exception" :condition condition :signaled t
+                              :restarts (compute-restarts condition)
+                              :frames (%capture-frames '("ERROR" "SIGNAL" "%SIGNAL-HOOK")))))
+        (%stop-here session stop)))))
 
 (defun %debugger-hook (condition hook)
   (declare (ignore hook))
@@ -201,13 +420,26 @@ whose name is in that list."
           ((and (null filters) *hook-installed*)
            (when (eq (dotcl:symbol-global-value '*debugger-hook*) #'%debugger-hook)
              (setf (dotcl:symbol-global-value '*debugger-hook*) *previous-debugger-hook*))
-           (setf *previous-debugger-hook* nil *hook-installed* nil)))))
+           (setf *previous-debugger-hook* nil *hook-installed* nil)))
+    (cond ((and (member "error" filters :test #'string=) (not *signal-hook-installed*))
+           (setf *previous-break-on-signals* (dotcl:symbol-global-value '*break-on-signals*)
+                 (dotcl:symbol-global-value 'dotcl:*break-on-signals-hook*) #'%signal-hook
+                 (dotcl:symbol-global-value '*break-on-signals*) 'error
+                 *signal-hook-installed* t))
+          ((and (not (member "error" filters :test #'string=)) *signal-hook-installed*)
+           (setf (dotcl:symbol-global-value 'dotcl:*break-on-signals-hook*) nil
+                 (dotcl:symbol-global-value '*break-on-signals*) *previous-break-on-signals*
+                 *previous-break-on-signals* nil
+                 *signal-hook-installed* nil)))))
 
 (defun %stop-here (session stop)
   (dotcl-thread:with-lock-held (*state-lock*)
     (push stop *stops*)
     (dolist (f (stop-frames stop))
       (setf (gethash (frame-id f) *frames*) (cons stop f))))
+  (%log-stop stop)
+  ;; VS Code does not focus a stopped thread it has not been told about.
+  (ignore-errors (%announce-threads session))
   (%event session "stopped"
           (list* :obj "reason" (stop-reason stop)
                  "threadId" (stop-thread-id stop)
@@ -305,19 +537,22 @@ done, else a message for the client."
     (let ((sym (ignore-errors (read-from-string name))))
       (and (symbolp sym) sym))))
 
-(defun set-function-breakpoints (names package)
-  "Replace the installed function breakpoints with ones on NAMES. Returns a
-list of (verified-p id message), one per name."
+(defun set-function-breakpoints (sources package)
+  "Replace the installed function breakpoints with SOURCES, DAP
+FunctionBreakpoint objects. Returns a list of (verified-p id message), one per
+breakpoint."
   (mapc #'%uninstall (dotcl-thread:with-lock-held (*state-lock*)
                        (shiftf *breakpoints* '())))
-  (loop for name in names
-        collect (let ((sym (%read-name name package)))
-                  (if (and sym (fboundp sym) (not (macro-function sym))
+  (loop for source in sources
+        for name = (jget source "name")
+        collect (multiple-value-bind (spec why) (%make-hit-spec source)
+                 (let ((sym (%read-name name package)))
+                  (if (and (not why) sym (fboundp sym) (not (macro-function sym))
                            (not (special-operator-p sym))
                            (not (typep (fdefinition sym) 'generic-function))
                            (not (find sym *breakpoints* :key #'bp-symbol)))
                       (let ((bp (make-bp :id (%new-id) :name name :symbol sym
-                                         :original (fdefinition sym))))
+                                         :original (fdefinition sym) :spec spec)))
                         (dotcl-thread:with-lock-held (*state-lock*)
                           (push bp *breakpoints*))
                         (%install bp)
@@ -325,15 +560,17 @@ list of (verified-p id message), one per name."
                               (and (member sym (ignore-errors (dotcl:who-calls sym)))
                                    (%recompile-self-calls bp))))
                       (list nil (%new-id)
-                            (if (and sym (fboundp sym)
-                                     (typep (fdefinition sym) 'generic-function))
-                                (format nil "~A is a generic function" name)
-                                (format nil "no function named ~A" name)))))))
+                            (cond (why why)
+                                  ((and sym (fboundp sym)
+                                        (typep (fdefinition sym) 'generic-function))
+                                   (format nil "~A is a generic function" name))
+                                  (t (format nil "no function named ~A" name)))))))))
 
 (defun %clear-breakpoints ()
   (mapc #'%uninstall (dotcl-thread:with-lock-held (*state-lock*)
                        (shiftf *breakpoints* '())))
   (%clear-line-breakpoints)
+  (%unwrap-file-functions)
   (%set-exception-filters '()))
 
 (defun stopped-threads ()
@@ -345,11 +582,14 @@ list of (verified-p id message), one per name."
 ;;; with the position of every list it contains, and compiled again with
 ;;; DOTCL:*EMIT-FORM-PREFIX* putting a call in front of the outermost form the
 ;;; compiler meets on that line. Clearing them puts the definition that was
-;;; there back.
+;;; there back. A DEFMETHOD is compiled the same way and its method replaces
+;;; the one the file defined; the other methods of the generic function stay.
+;;; LOAD and COMPILE-FILE are wrapped while line breakpoints exist, so that a
+;;; definition replaced by loading the file again is instrumented again.
 
-(defstruct line-bp id path line verified message)
+(defstruct line-bp id path line verified message spec)
 
-(defstruct instrumented symbol original definition)
+(defstruct instrumented kind symbol original definition generic bps)
 
 (defvar *line-bps* (make-hash-table :test 'equal)
   "path -> (line-bps . instrumented definitions)")
@@ -427,12 +667,27 @@ in it and each list's enclosing list. IN-PACKAGE forms are followed."
         (setf (bp-original bp) definition)
         (setf (fdefinition symbol) definition))))
 
+(defun %instrumented-method (i)
+  (let ((new (instrumented-definition i)))
+    (find-method (instrumented-generic i) (method-qualifiers new)
+                 (method-specializers new) nil)))
+
+(defun %instrumented-stale-p (i)
+  "True when the definition I put in was replaced since."
+  (let ((sym (instrumented-symbol i)))
+    (if (eq (instrumented-kind i) :method)
+        (not (eq (%instrumented-method i) (instrumented-definition i)))
+        (not (and (fboundp sym)
+                  (eq (%current-definition sym) (instrumented-definition i)))))))
+
 (defun %restore-instrumented (instrumented)
   (dolist (i instrumented)
-    (let ((sym (instrumented-symbol i)))
-      (when (and (fboundp sym)
-                 (eq (%current-definition sym) (instrumented-definition i)))
-        (%set-current-definition sym (instrumented-original i))))))
+    (unless (%instrumented-stale-p i)
+      (if (eq (instrumented-kind i) :method)
+          (let ((generic (instrumented-generic i)))
+            (remove-method generic (instrumented-definition i))
+            (add-method generic (instrumented-original i)))
+          (%set-current-definition (instrumented-symbol i) (instrumented-original i))))))
 
 (defun %clear-line-breakpoints ()
   (let ((entries (dotcl-thread:with-lock-held (*state-lock*)
@@ -451,7 +706,6 @@ in it and each list's enclosing list. IN-PACKAGE forms are followed."
         (lbp (%find-line-bp id)))
     (when (and session lbp (not *in-stop*)
                (not (eq (dotcl:current-thread) (server-thread *server*))))
-      (%set-step (dotcl:current-thread) nil)
       (let* ((thread (dotcl:current-thread))
              (frames (%capture-frames))
              (stop (make-stop :thread thread :thread-id (thread-id thread)
@@ -459,28 +713,46 @@ in it and each list's enclosing list. IN-PACKAGE forms are followed."
         (when frames
           (setf (frame-file (first frames)) (line-bp-path lbp)
                 (frame-line (first frames)) (line-bp-line lbp)))
-        (%stop-here session stop)))))
+        (when (%bp-stops-p session (line-bp-spec lbp) (first frames))
+          (%set-step thread nil)
+          (%stop-here session stop))))))
+
+(defun %method-name-p (name)
+  (or (and name (symbolp name))
+      (and (consp name) (eq (first name) 'setf) (symbolp (second name)))))
 
 (defun %instrument (toplevel bps path)
-  "Compile TOPLEVEL's DEFUN again with a stop in front of the outermost form
-starting on each of BPS' lines. Marks the BPS verified when their line got
-one, and returns an INSTRUMENTED, or NIL when nothing was compiled."
+  "Compile TOPLEVEL's DEFUN or DEFMETHOD again with a stop in front of the
+outermost form starting on each of BPS' lines. Marks the BPS verified when
+their line got one, and returns an INSTRUMENTED, or NIL when nothing was
+compiled."
   (let* ((form (toplevel-form toplevel))
          (sym (second form))
          (lines (toplevel-lines toplevel))
          (parents (toplevel-parents toplevel))
          (asked (make-hash-table :test 'eq))
-         (hit-lines '()))
+         (hit-lines '())
+         (methodp (member (first form) '(defmethod cl:defmethod)))
+         (generic nil)
+         (methods-before nil))
     (flet ((give-up (message)
              (dolist (b bps) (setf (line-bp-message b) message))
              (return-from %instrument nil)))
-      (unless (and (member (first form) '(defun cl:defun)) (symbolp sym))
-        (give-up "only lines inside a DEFUN can have a breakpoint"))
+      (unless (and (or (member (first form) '(defun cl:defun)) methodp)
+                   (if methodp (%method-name-p sym) (symbolp sym)))
+        (give-up "only lines inside a DEFUN or DEFMETHOD can have a breakpoint"))
       (unless (find :dotcl-emit *features*)
         (give-up "this build does not compile code, so it cannot place line breakpoints"))
       (unless (fboundp sym)
         (give-up (format nil "~S is not defined; load the file first" sym)))
-      (let ((original (%current-definition sym)))
+      (when methodp
+        (setf generic (fdefinition sym))
+        (unless (typep generic 'generic-function)
+          (give-up (format nil "~S is not a generic function" sym)))
+        (setf methods-before (copy-list (generic-function-methods generic))))
+      (let ((original (unless methodp (%current-definition sym)))
+            (new-method nil)
+            (old-method nil))
         (flet ((prefix (f)
                  (let ((line (gethash f lines)))
                    (when (and line (not (eq f form))
@@ -501,41 +773,134 @@ one, and returns an INSTRUMENTED, or NIL when nothing was compiled."
                 (funcall (compile nil `(lambda () ,form))))
             (error (e)
               (give-up (format nil "compiling the definition again failed: ~A" e)))))
+        (when methodp
+          (let ((after (generic-function-methods generic)))
+            (setf new-method (find-if-not (lambda (m) (member m methods-before)) after)
+                  old-method (find-if-not (lambda (m) (member m after)) methods-before))
+            (unless new-method
+              (give-up "compiling the method again defined nothing"))
+            (unless old-method
+              (remove-method generic new-method)
+              (give-up "the method is not defined; load the file first"))))
         (dolist (b bps)
           (if (member (line-bp-line b) hit-lines)
               (setf (line-bp-verified b) t)
               (setf (line-bp-message b) "no form starts on this line")))
-        (make-instrumented :symbol sym :original original
-                           :definition (%current-definition sym))))))
+        (if methodp
+            (make-instrumented :kind :method :symbol sym :generic generic :bps bps
+                               :original old-method :definition new-method)
+            (make-instrumented :kind :function :symbol sym :bps bps :original original
+                               :definition (%current-definition sym)))))))
 
-(defun set-line-breakpoints (path lines)
-  "Replace the line breakpoints in the file at PATH with ones on LINES.
-Returns the LINE-BP structures, one per line."
-  (let ((old (dotcl-thread:with-lock-held (*state-lock*)
-               (prog1 (gethash path *line-bps*) (remhash path *line-bps*)))))
-    (%restore-instrumented (cdr old)))
-  (let ((bps (loop for line in lines
-                   collect (make-line-bp :id (%new-id) :path path :line line)))
-        (instrumented '()))
-    (when bps
-      (let ((toplevels (handler-case (%read-toplevel-forms path)
-                         (error (e)
-                           (dolist (b bps)
-                             (setf (line-bp-message b) (format nil "reading the file failed: ~A" e)))
-                           nil))))
-        (dolist (tl toplevels)
-          (let ((mine (remove-if-not (lambda (b) (<= (toplevel-start tl) (line-bp-line b)
-                                                     (toplevel-end tl)))
-                                     bps)))
-            (when mine
-              (let ((i (%instrument tl mine path)))
-                (when i (push i instrumented))))))
-        (dolist (b bps)
-          (unless (or (line-bp-verified b) (line-bp-message b))
-            (setf (line-bp-message b) "the line is outside every top-level form")))))
-    (dotcl-thread:with-lock-held (*state-lock*)
-      (setf (gethash path *line-bps*) (cons bps instrumented)))
-    bps))
+(defun %place-line-breakpoints (path bps)
+  "Instrument the definitions in the file at PATH that BPS fall in. Returns
+the INSTRUMENTED list; each of BPS gets a verdict."
+  (let ((instrumented '())
+        (toplevels (handler-case (%read-toplevel-forms path)
+                     (error (e)
+                       (dolist (b bps)
+                         (setf (line-bp-message b) (format nil "reading the file failed: ~A" e)))
+                       nil))))
+    (dolist (tl toplevels)
+      (let ((mine (remove-if-not (lambda (b) (<= (toplevel-start tl) (line-bp-line b)
+                                                 (toplevel-end tl)))
+                                 bps)))
+        (when mine
+          (let ((i (%instrument tl mine path)))
+            (when i (push i instrumented))))))
+    (dolist (b bps)
+      (unless (or (line-bp-verified b) (line-bp-message b))
+        (setf (line-bp-message b) "the line is outside every top-level form")))
+    instrumented))
+
+(defvar *line-lock* (dotcl-thread:make-lock "dap-line-breakpoints"))
+
+(defun set-line-breakpoints (path sources)
+  "Replace the line breakpoints in the file at PATH with SOURCES, DAP
+SourceBreakpoint objects. Returns the LINE-BP structures, one per source."
+  (dotcl-thread:with-lock-held (*line-lock*)
+    (let ((old (dotcl-thread:with-lock-held (*state-lock*)
+                 (prog1 (gethash path *line-bps*) (remhash path *line-bps*)))))
+      (%restore-instrumented (cdr old)))
+    (let* ((all (loop for source in sources
+                      collect (multiple-value-bind (spec why) (%make-hit-spec source)
+                                (make-line-bp :id (%new-id) :path path :line (jget source "line")
+                                              :spec spec :message why))))
+           (bps (remove-if #'line-bp-message all))
+           (instrumented (when bps
+                           (when (find :dotcl-emit *features*) (%wrap-file-functions))
+                           (%place-line-breakpoints path bps))))
+      (dotcl-thread:with-lock-held (*state-lock*)
+        (setf (gethash path *line-bps*) (cons bps instrumented)))
+      all)))
+
+;;; Loading a file again replaces its definitions, and with them the
+;;; instrumented ones. LOAD and COMPILE-FILE are wrapped while line
+;;; breakpoints exist; afterwards each file with a stale one, or with a
+;;; breakpoint waiting for its definition, is placed again and the client is
+;;; told how the breakpoints came out.
+
+(defvar *file-wrappers* '() "(name original . wrapper) of the functions wrapped.")
+(defvar *replacing* nil "True while breakpoints are being placed again.")
+
+(defun %wrap-file-functions ()
+  (dolist (name '(load compile-file))
+    (unless (assoc name *file-wrappers*)
+      (let* ((original (fdefinition name))
+             (wrapper (lambda (&rest args)
+                        (unwind-protect (apply original args)
+                          (ignore-errors (%replace-line-breakpoints))))))
+        (dotcl:without-package-locks (setf (fdefinition name) wrapper))
+        (push (list* name original wrapper) *file-wrappers*)))))
+
+(defun %unwrap-file-functions ()
+  (loop for entry = (pop *file-wrappers*) while entry
+        do (destructuring-bind (name original . wrapper) entry
+             (dotcl:without-package-locks
+               (when (eq (fdefinition name) wrapper)
+                 (setf (fdefinition name) original))))))
+
+(defun %waiting-p (bp)
+  (and (not (line-bp-verified bp))
+       (line-bp-message bp)
+       (search "load the file first" (line-bp-message bp))))
+
+(defun %breakpoint-event (session bp)
+  (%event session "breakpoint"
+          (list :obj "reason" "changed"
+                "breakpoint" (list :obj "id" (line-bp-id bp)
+                                   "verified" (if (line-bp-verified bp) t :false)
+                                   "line" (line-bp-line bp)
+                                   "message" (line-bp-message bp)))))
+
+(defun %replace-line-breakpoints ()
+  (let ((session (%live-session)))
+    (when (and session (not *replacing*) (find :dotcl-emit *features*)
+               (plusp (hash-table-count *line-bps*)))
+      (let ((*replacing* t))
+        (dotcl-thread:with-lock-held (*line-lock*)
+          (dolist (path (dotcl-thread:with-lock-held (*state-lock*)
+                          (loop for k being the hash-keys of *line-bps* collect k)))
+            (let ((entry (dotcl-thread:with-lock-held (*state-lock*)
+                           (gethash path *line-bps*))))
+              (when entry
+                (destructuring-bind (bps . instrumented) entry
+                  (when (or (some #'%instrumented-stale-p instrumented)
+                            (some #'%waiting-p bps))
+                    (let ((before (mapcar (lambda (b) (cons (line-bp-verified b)
+                                                            (line-bp-message b)))
+                                          bps)))
+                      (%restore-instrumented instrumented)
+                      (dolist (b bps)
+                        (setf (line-bp-verified b) nil (line-bp-message b) nil))
+                      (let ((new (%place-line-breakpoints path bps)))
+                        (dotcl-thread:with-lock-held (*state-lock*)
+                          (setf (gethash path *line-bps*) (cons bps new))))
+                      (loop for b in bps
+                            for (verified . message) in before
+                            unless (and (eq verified (line-bp-verified b))
+                                        (equal message (line-bp-message b)))
+                              do (%breakpoint-event session b)))))))))))))
 
 ;;; Stepping: every line of a DEFUN compiled for a line breakpoint also gets a
 ;;; step point, which stops only a thread that is stepping. next stops at the
@@ -694,6 +1059,9 @@ when there is exactly one."
       (cond
         ((string= command "initialize")
          (ok "supportsFunctionBreakpoints" t
+             "supportsConditionalBreakpoints" t
+             "supportsHitConditionalBreakpoints" t
+             "supportsLogPoints" t
              "supportsConfigurationDoneRequest" t
              "supportsSingleThreadExecutionRequests" t
              "supportsExceptionInfoRequest" t
@@ -701,11 +1069,17 @@ when there is exactly one."
              (vector (list :obj "filter" "uncaught"
                            "label" "Unhandled conditions"
                            "description" "Stop where a condition would enter the debugger; resume through one of its restarts."
-                           "default" t)))
+                           "default" t)
+                     (list :obj "filter" "error"
+                           "label" "Signaled errors"
+                           "description" "Stop where an error is signaled, even when a handler would take it; resume through one of its restarts, or continue to let the handlers run."
+                           "default" :false)))
+         (setf (session-client session)
+               (or (jget args "clientName") (jget args "clientID")))
          (%event session "initialized"))
         ((string= command "setExceptionBreakpoints")
          (%set-exception-filters
-          (remove-if-not (lambda (f) (equal f "uncaught"))
+          (remove-if-not (lambda (f) (member f '("uncaught" "error") :test #'equal))
                          (coerce (jget args "filters" #()) 'list)))
          (ok))
         ((string= command "exceptionInfo")
@@ -714,7 +1088,7 @@ when there is exactly one."
            (if c
                (ok "exceptionId" (prin1-to-string (type-of c))
                    "description" (%condition-text c)
-                   "breakMode" "unhandled"
+                   "breakMode" (if (stop-signaled stop) "always" "unhandled")
                    "details" (list :obj "typeName" (prin1-to-string (type-of c))
                                    "message" (%condition-text c)))
                (fail "the thread is not stopped on a condition"))))
@@ -732,7 +1106,16 @@ when there is exactly one."
                                               (coerce (jget args "arguments" #()) 'list)))
                          "the thread is not stopped")))
            (if why (fail why) (ok))))
-        ((member command '("attach" "launch" "configurationDone") :test #'string=)
+        ((string= command "attach")
+         (ok)
+         (setf (session-known session) (%visible-threads))
+         (%watch-threads session)
+         (let ((version (lisp-implementation-version)) (pid (dotcl:getpid)))
+           (%log "attached (~A)" (or (session-client session) "DAP client"))
+           (%event session "output"
+                   (list :obj "category" "console"
+                         "output" (format nil "Attached to dotcl ~A (pid ~D)~%" version pid)))))
+        ((member command '("launch" "configurationDone") :test #'string=)
          (ok))
         ((string= command "setBreakpoints")
          (let ((path (jget (jget args "source" '(:obj)) "path")))
@@ -745,24 +1128,19 @@ when there is exactly one."
                                         "line" (line-bp-line b)
                                         "message" (line-bp-message b)))
                         (set-line-breakpoints
-                         path (map 'list (lambda (b) (jget b "line"))
-                                   (jget args "breakpoints" #()))))))))
+                         path (coerce (jget args "breakpoints" #()) 'list)))))))
         ((string= command "setFunctionBreakpoints")
-         (let ((names (map 'list (lambda (b) (jget b "name")) (jget args "breakpoints" #()))))
+         (let ((sources (coerce (jget args "breakpoints" #()) 'list)))
            (ok "breakpoints"
                (map 'vector (lambda (r)
                               (destructuring-bind (verified id message) r
                                 (list :obj "id" id "verified" (if verified t :false)
                                       "message" message)))
-                    (set-function-breakpoints names (session-package session))))))
+                    (set-function-breakpoints sources (session-package session))))))
         ((string= command "threads")
-         (ok "threads"
-             (map 'vector (lambda (th)
-                            (list :obj "id" (thread-id th)
-                                  "name" (or (ignore-errors (dotcl:thread-name th))
-                                             "thread")))
-                  (remove-duplicates
-                   (append (dotcl:all-threads) (stopped-threads))))))
+         (let ((threads (%visible-threads)))
+           (setf (session-known session) threads)
+           (ok "threads" (map 'vector #'%thread-json threads))))
         ((string= command "stackTrace")
          (let ((stop (%find-stop (jget args "threadId"))))
            (if stop
@@ -779,7 +1157,10 @@ when there is exactly one."
                                                          "path" (frame-file f))))))
                           frames)
                      "totalFrames" (length frames)))
-               (fail "the thread is not stopped"))))
+               (if (find (jget args "threadId") (%visible-threads)
+                         :key #'thread-id)
+                   (ok "stackFrames" #() "totalFrames" 0)
+                   (fail "no such thread")))))
         ((string= command "scopes")
          (let ((entry (%frame (jget args "frameId"))))
            (if entry
@@ -894,7 +1275,13 @@ when there is exactly one."
                                                   :message (princ-to-string e)))))))
     (setf (session-open session) nil)
     (%clear-breakpoints)
-    (ignore-errors (close (session-stream session)))))
+    (ignore-errors (close (session-stream session)))
+    (let ((watcher (session-watcher session)))
+      (when watcher
+        (ignore-errors (dotcl-thread:thread-join watcher))
+        (dotcl-thread:with-lock-held (*state-lock*)
+          (setf *internal-threads* (remove watcher *internal-threads*)))))
+    (%log "client disconnected")))
 
 (defun start-server (&key (host "127.0.0.1") (port 0))
   "Listen for a DAP client on HOST:PORT (0 picks a free port) and serve one
@@ -903,14 +1290,23 @@ tells the port."
   (when *server* (stop-server))
   (let* ((socket (dotcl-socket:make-server-socket host port))
          (server (make-server :socket socket :port (dotcl-socket:local-port socket))))
+    (setf *start-output* *standard-output*)
+    (setf (server-owner server) (dotcl:current-thread))
     (setf (server-thread server)
           (dotcl-thread:make-thread
            (lambda ()
              (loop
-               (let ((stream (handler-case (dotcl-socket:socket-accept socket :binary t)
-                               (error () (return)))))
+               (multiple-value-bind (stream address port)
+                   (handler-case
+                       (multiple-value-bind (s address port)
+                           (dotcl-bsd-sockets:socket-accept socket)
+                         (values (dotcl-bsd-sockets:socket-make-stream
+                                  s :element-type '(unsigned-byte 8))
+                                 address port))
+                     (error () (return)))
                  (let ((session (make-session :stream stream)))
                    (setf (server-session server) session)
+                   (%log "client connected from ~A:~D" (%address-text address) port)
                    (%serve session)))))
            :name "dap-server"))
     (setf *server* server)))

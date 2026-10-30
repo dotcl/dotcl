@@ -55,6 +55,16 @@
                   keys)))
     (dotcl:process-wait p)))
 
+(defun lpls-lines (text)
+  (let ((lines nil) (start 0))
+    (loop for nl = (position #\Newline text :start start)
+          while nl
+          do (push (subseq text start nl) lines)
+             (setf start (1+ nl)))
+    (when (< start (length text))
+      (push (subseq text start) lines))
+    (nreverse lines)))
+
 (deftest launch-process-lisp-streams.output-to-string-stream
   (let ((code nil))
     (list (with-output-to-string (s)
@@ -79,11 +89,21 @@ y
 z")
 
 (deftest launch-process-lisp-streams.error-to-output
-  ;; :error :output sends the error output to the same Lisp stream.
-  (let ((text (with-output-to-string (s)
-                (lpls-run *lpls-both* :input nil :output s :error :output))))
-    (sort (list (subseq text 0 3) (subseq text 4 7)) #'string<))
+  ;; Both lines arrive complete even at a chunk boundary.
+  (sort (lpls-lines
+         (with-output-to-string (s)
+           (lpls-run *lpls-both* :input nil :output s :error :output)))
+        #'string<)
   ("err" "out"))
+
+#-(or windows win32)
+(deftest launch-process-lisp-streams.error-to-output-order
+  ;; Merged on one descriptor, so the bytes keep the child's write order.
+  (with-output-to-string (s)
+    (lpls-run *lpls-both* :input nil :output s :error :output))
+  "out
+err
+")
 
 (defvar *lpls-target*)
 

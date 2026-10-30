@@ -172,5 +172,5 @@ public static class MainThread
 
     // (dotcl:main-thread-p) -> T on the thread the process started on
     public static LispObject MainThreadP(LispObject[] args) =>
-        IsMainThread ? Startup.Sym("T") : (LispObject)Nil.Instance;
+        IsMainThread ? T.Instance : (LispObject)Nil.Instance;
 }

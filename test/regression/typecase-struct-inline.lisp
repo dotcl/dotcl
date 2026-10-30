@@ -1,5 +1,6 @@
 ;;; TYPECASE and TYPEP of a compile-time structure name are compiled as an
-;;; ISINST plus the type-name/:INCLUDE chain, not as a runtime TYPEP call.
+;;; inline structure test plus the type-name/:INCLUDE chain, not as a runtime
+;;; TYPEP call.
 
 (setf dotcl:*save-sil* t)
 
@@ -42,7 +43,7 @@
   (let ((sil (%flat-text (dotcl:function-sil fn))))
     (list (not (search "Runtime.IsTrueTypep" sil))
           (not (search "Runtime.Typep" sil))
-          (and (search "ISINST" sil) t)
+          (and (search "LispStruct.TypeNameOf" sil) t)
           (and (search "get_StructParent" sil) t))))
 
 (deftest-emitting-only typecase-struct-inline.sil

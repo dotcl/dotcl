@@ -12,12 +12,13 @@
 
 (deftest hash-table-size.odd-sizes
   (list (hash-table-count (make-hash-table :size 0))
-        (hash-table-count (make-hash-table :size 1.5))
+        (handler-case (progn (make-hash-table :size 1.5) :no-error)
+          (type-error () :type-error))
         (hash-table-count (make-hash-table :size (expt 2 40)))
         (let ((h (make-hash-table :test 'equal :size 1000000)))
           (setf (gethash "a" h) 1)
           (gethash "a" h)))
-  (0 0 0 1))
+  (0 :type-error 0 1))
 
 (deftest hash-table-size.with-hash-function
   (let ((h (make-hash-table :test 'equal :size 50 :hash-function #'sxhash)))

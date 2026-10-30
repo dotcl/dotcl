@@ -2,7 +2,8 @@
 
 From an empty machine to a Common Lisp executable you can hand to someone
 else. Every command below was run as written; the output quoted under each
-one is the real output, on Windows on ARM64 with dotcl 0.1.28.
+one is the real output from a released dotcl (0.1.28). A build from source
+reports version 0.0.0 instead.
 
 Along the way: install dotcl, create a project from a template, run it, add a
 library to it, and publish a standalone `.exe`.

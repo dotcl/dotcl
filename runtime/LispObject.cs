@@ -34,8 +34,14 @@ public sealed class OnceCell
 
 public sealed class Cons : LispObject
 {
+#if DEBUG
+    private LispObject _car = null!, _cdr = null!;
+    public LispObject Car { get => _car; set { Runtime.AssertNotTableTNil(value); _car = value; } }
+    public LispObject Cdr { get => _cdr; set { Runtime.AssertNotTableTNil(value); _cdr = value; } }
+#else
     public LispObject Car { get; set; }
     public LispObject Cdr { get; set; }
+#endif
 
     public Cons(LispObject car, LispObject cdr)
     {

@@ -72,3 +72,62 @@
                       (b (%ceut-normalize-calls 200 read-p)))
                   (<= b (+ 10 (* 3 a)))))
   (t t))
+
+;;; Nor does compiling each level look through the bindings of all the levels
+;;; around it, or through the whole body below it, or copy the levels around
+;;; it: the instructions walked and the bytes allocated grow with the depth.
+(defun %ceut-deep-form (n)
+  (let ((form '(%ceut-two)))
+    (dotimes (i n) (setq form `(let ((,(gensym) ,i)) ,form)))
+    `(lambda () (list ,form))))
+
+(defun %ceut-if-chain (n)
+  (let ((form '(%ceut-id 1)))
+    (dotimes (i n) (setq form `(if (%ceut-id ,i) ,form (%ceut-id 2))))
+    `(lambda () (list ,form))))
+
+(defun %ceut-progn-chain (n)
+  (let ((form '(%ceut-id 1)))
+    (dotimes (i n) (setq form `(progn (%ceut-id ,i) ,form)))
+    `(lambda () (list ,form))))
+
+(defun %ceut-work (form)
+  "(CALLS STEPS BYTES) of compiling FORM: calls of compiler functions that walk
+   a body, conses the instruction passes walk or copy, and bytes allocated."
+  (let* ((names '("SAME-VAR-PACKAGE-P" "%INLINE-INT-PARAM-USE-P" "STRIP-VALUE-WRAPPERS"
+                  "FIND-MACRO-EXPANDER" "%SYMBOL-MACRO-NAME-P"))
+         (syms (mapcar (lambda (n) (find-symbol n "DOTCL.CIL-COMPILER")) names))
+         (origs (mapcar #'symbol-function syms))
+         (steps (find-symbol "*INSTR-WALK-STEPS*" "DOTCL-INTERNAL"))
+         (cell (list 0))
+         (calls 0)
+         (bytes 0))
+    (loop for s in syms for f in origs
+          do (let ((f f))
+               (setf (symbol-function s)
+                     (lambda (&rest args) (incf calls) (apply f args)))))
+    (setf (symbol-value steps) cell)
+    (unwind-protect
+         (let ((a0 (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread")))
+           (compile nil form)
+           (setf bytes (- (dotnet:static "System.GC" "GetAllocatedBytesForCurrentThread") a0)))
+      (setf (symbol-value steps) nil)
+      (loop for s in syms for f in origs do (setf (symbol-function s) f)))
+    (list calls (car cell) bytes)))
+
+;;; Doubling the depth at most doubles the calls and the instructions walked
+;;; (plus a little), and the bytes stay within 2.5 times (they were 2.7 to 3
+;;; times when each level copied the bindings or the code around it).
+(deftest-emitting-only compile-expr-unwrapped-tail.deep-linear-walks
+  (progn
+    (compile nil (%ceut-deep-form 20))
+    (loop for make in (list #'%ceut-deep-form
+                            (lambda (n) (%ceut-chain n t))
+                            #'%ceut-if-chain
+                            #'%ceut-progn-chain)
+          collect (destructuring-bind (c1 s1 b1) (%ceut-work (funcall make 100))
+                    (destructuring-bind (c2 s2 b2) (%ceut-work (funcall make 200))
+                      (list (<= c2 (+ 10 (* 2.2 c1)))
+                            (<= s2 (+ 100 (* 2.2 s1)))
+                            (<= b2 (* 2.5 b1)))))))
+  ((t t t) (t t t) (t t t) (t t t)))

@@ -84,6 +84,14 @@
     <RuntimeHostConfigurationOption Include="System.Runtime.TieredCompilation.CallCountingDelayMs" Value="5" />
   </ItemGroup>
 
+  <!-- Methods first called outside ReadyToRun code are compiled optimized on the
+       first call instead of as tier-0 code. Only for a per-RID build, whose core and
+       runtime are ReadyToRun (no startup cost); the any-RID IL package and the
+       development tree keep quick JIT, where this would slow startup 2.5x. -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' != '' and '$(RuntimeIdentifier)' != 'any'">
+    <TieredCompilationQuickJit>false</TieredCompilationQuickJit>
+  </PropertyGroup>
+
   <!-- Only the CLI sources; all runtime sources live in DotCL.Runtime.csproj -->
   <ItemGroup>
     <Compile Remove="**/*.cs" />
@@ -132,6 +140,16 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </Content>
+    <!-- The Lisp source of the core's own functions, beside the core: a
+         dotnet:library build compiles the ones its body uses from it. -->
+    <None Include="cil-stdlib.lisp;cil-stdlib.generation" Condition="Exists('cil-stdlib.lisp')">
+      <Pack>true</Pack>
+      <PackagePath>tools/net10.0/any/</PackagePath>
+    </None>
+    <Content Include="cil-stdlib.lisp;cil-stdlib.generation" Condition="Exists('cil-stdlib.lisp')" Pack="false">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+    </Content>
     <None Include="contrib/**" Exclude="$(ContribR2RExclude)" Condition="Exists('contrib')">
       <Pack>true</Pack>
       <PackagePath>tools/net10.0/any/contrib/</PackagePath>
@@ -173,6 +191,8 @@
              Condition="!Exists('dotcl.core') and Exists('$(OutputPath)dotcl.core')" />
     <Delete Files="$(OutputPath)dotcl.core"
             Condition="!Exists('dotcl.core') and Exists('$(OutputPath)dotcl.core')" />
+    <Delete Files="$(OutputPath)cil-stdlib.lisp;$(OutputPath)cil-stdlib.generation"
+            Condition="!Exists('cil-stdlib.lisp')" />
   </Target>
 
   <!-- save-application :executable t hook -->

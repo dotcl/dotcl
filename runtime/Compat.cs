@@ -139,6 +139,13 @@ internal static class Compat
         => Math.Log2(x);
 #endif
 
+    public static double CopySign(double value, double sign)
+    {
+        long valueBits = BitConverter.DoubleToInt64Bits(value);
+        long signBit = BitConverter.DoubleToInt64Bits(sign) & unchecked((long)0x8000000000000000);
+        return BitConverter.Int64BitsToDouble((valueBits & 0x7FFFFFFFFFFFFFFF) | signBit);
+    }
+
     public static double Acosh(double x)
 #if NETSTANDARD2_0
         => Math.Log(x + Math.Sqrt(x * x - 1.0));
@@ -251,14 +258,34 @@ internal static class Compat
         => BitConverter.Int32BitsToSingle(value);
 #endif
 
-    /// <summary>The hash String.GetHashCode gives the same characters, without
-    /// making a string of them.</summary>
+    // FNV-1a: fixed constants, so the hash does not change between processes.
+    private const uint FnvOffset = 2166136261u;
+    private const uint FnvPrime = 16777619u;
+
+    /// <summary>FNV-1a over CHARS, stable across processes (String.GetHashCode
+    /// is seeded per process).</summary>
     public static int StringHash(ReadOnlySpan<char> chars)
-#if NETSTANDARD2_0
-        => new string(chars.ToArray()).GetHashCode();
-#else
-        => string.GetHashCode(chars);
-#endif
+    {
+        uint h = FnvOffset;
+        foreach (char c in chars)
+        {
+            h ^= c;
+            h *= FnvPrime;
+        }
+        return unchecked((int)h);
+    }
+
+    /// <summary>FNV-1a over BYTES, stable across processes.</summary>
+    public static int ByteHash(ReadOnlySpan<byte> bytes)
+    {
+        uint h = FnvOffset;
+        foreach (byte b in bytes)
+        {
+            h ^= b;
+            h *= FnvPrime;
+        }
+        return unchecked((int)h);
+    }
 
     public static bool IsNegative(double value)
         => BitConverter.DoubleToInt64Bits(value) < 0;

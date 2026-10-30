@@ -156,6 +156,11 @@ public class Reader
     /// <summary>Lisp stream reference for stream-error-stream in error conditions.</summary>
     public LispObject? LispStreamRef { get; set; }
 
+    /// <summary>For a caller that reads to find out whether the input is complete
+    /// (the REPL): running out of input mid-form is an answer to it, not an
+    /// error, so END-OF-FILE is thrown without being signalled.</summary>
+    internal bool EndOfFileUnsignalled { get; set; }
+
     /// <summary>The underlying TextReader, exposed for user-defined macro character functions.</summary>
     public TextReader Input => _input;
 
@@ -183,6 +188,55 @@ public class Reader
         }
     }
 
+    internal sealed class ShareScope : IDisposable
+    {
+        private readonly Reader _reader;
+        private readonly Dictionary<int, LispObject>? _labels;
+        private readonly Dictionary<int, SharePlaceholder>? _placeholders;
+        private readonly LispStream? _stream;
+        private readonly Dictionary<int, LispObject>? _streamLabels;
+        private readonly Dictionary<int, SharePlaceholder>? _streamPlaceholders;
+
+        internal ShareScope(Reader reader, Dictionary<int, LispObject>? labels,
+                            Dictionary<int, SharePlaceholder>? placeholders, LispStream? stream,
+                            Dictionary<int, LispObject>? streamLabels,
+                            Dictionary<int, SharePlaceholder>? streamPlaceholders)
+        {
+            _reader = reader;
+            _labels = labels;
+            _placeholders = placeholders;
+            _stream = stream;
+            _streamLabels = streamLabels;
+            _streamPlaceholders = streamPlaceholders;
+        }
+
+        public void Dispose()
+        {
+            _reader._shareLabels = _labels;
+            _reader._sharePlaceholders = _placeholders;
+            if (_stream != null)
+            {
+                _stream.ShareLabels = _streamLabels;
+                _stream.SharePlaceholders = _streamPlaceholders;
+            }
+        }
+    }
+
+    internal ShareScope PushShareScope()
+    {
+        var stream = LispStreamRef as LispStream;
+        var scope = new ShareScope(this, _shareLabels, _sharePlaceholders, stream,
+                                   stream?.ShareLabels, stream?.SharePlaceholders);
+        _shareLabels = new Dictionary<int, LispObject>();
+        _sharePlaceholders = new Dictionary<int, SharePlaceholder>();
+        if (stream != null)
+        {
+            stream.ShareLabels = _shareLabels;
+            stream.SharePlaceholders = _sharePlaceholders;
+        }
+        return scope;
+    }
+
     private LispErrorException MakeReaderError(string message)
     {
         var err = new LispError(message);
@@ -196,7 +250,7 @@ public class Reader
         var err = new LispError(message);
         err.ConditionTypeName = "END-OF-FILE";
         if (LispStreamRef != null) err.StreamErrorStreamRef = LispStreamRef;
-        return new LispErrorException(err);
+        return EndOfFileUnsignalled ? LispErrorException.WithoutSignal(err) : new LispErrorException(err);
     }
 
     internal int Peek()
@@ -210,7 +264,7 @@ public class Reader
     public void ConsumeOneWhitespace()
     {
         int ch = Peek();
-        if (ch != -1 && char.IsWhiteSpace((char)ch))
+        if (ch != -1 && GetCurrentReadtable().GetSyntaxType((char)ch) == SyntaxType.Whitespace)
             ReadChar();
     }
 
@@ -416,6 +470,8 @@ public class Reader
 
     public void ExitRecursiveRead() => _topLevelReadDepth--;
 
+    internal bool InRead => _topLevelReadDepth > 0;
+
     public bool TryRead(out LispObject result)
     {
         // Sync *read-suppress* dynamic variable
@@ -447,6 +503,30 @@ public class Reader
         {
             _readSuppress = savedSuppress;
             _topLevelReadDepth--;
+        }
+    }
+
+    /// <summary>Read one object; false when a reader macro produced no value.</summary>
+    internal bool TryReadStep(out LispObject result)
+    {
+        var suppressSym = Startup.Sym("*READ-SUPPRESS*");
+        bool dynSuppress = DynamicBindings.Get(suppressSym) is not Nil;
+        var savedSuppress = _readSuppress;
+        if (dynSuppress) _readSuppress = true;
+        try
+        {
+            var obj = ReadStep1();
+            if (obj == null)
+            {
+                result = Nil.Instance;
+                return false;
+            }
+            result = _readSuppress ? Nil.Instance : obj;
+            return true;
+        }
+        finally
+        {
+            _readSuppress = savedSuppress;
         }
     }
 
@@ -792,8 +872,9 @@ public class Reader
     internal LispObject ReadList(char _triggerChar)
     {
         // Line of the opening paren: used to source-map the resulting form for
-        // debug info (only when line tracking is active; see Runtime.SourceLineTable).
-        int startLine = _line;
+        // debug info and nested definition locations (see Runtime.SourceLineTable).
+        int startLine = Runtime.SourceLineTable != null && LineSource != null ? CurrentFormLine() : _line;
+        int startPosition = Position - 1;
         // Column of the opening paren (already consumed, so it sits at Position-1).
         int startCol = Position - _lineStartPos;
         var items = new List<LispObject>();
@@ -857,8 +938,13 @@ public class Reader
 
         // Source-map the outer cons to the form's span, opening paren through the
         // char past the closing paren (no-op unless a debug build has tracking on).
-        if (Runtime.SourceLineTable != null && result is Cons)
+        // Only the reader of a file has LineSource: READ elsewhere must not add
+        // forms to the table of a LOAD or COMPILE-FILE running on this thread.
+        if (Runtime.SourceLineTable != null && LineSource != null && result is Cons)
+        {
             Runtime.StampSourceLine(result, startLine, startCol < 1 ? 1 : startCol, _line, CurCol);
+            Runtime.StampSourcePosition(result, startPosition, Position);
+        }
 
         return result;
     }
@@ -1215,16 +1301,14 @@ public class Reader
         if (typeSymbol == Startup.Sym("RANDOM-STATE"))
             return ReadRandomStateLiteral(firstCons.Cdr);
 
-        // Look up the class to get slot names
+        // #S is a call to the standard constructor, as CLHS 2.4.8.13 says.
         var cls = Runtime.FindClassOrNil(typeSymbol) as LispClass;
         if (cls == null || !cls.IsStructureClass || cls.StructSlotNames == null)
             throw MakeReaderError($"#S: {typeSymbol.Name} is not a known structure type");
+        var ctor = cls.StructKeywordConstructor;
+        if (ctor == null)
+            throw MakeReaderError($"#S: {typeSymbol.Name} does not have a standard constructor");
 
-        var slotNames = cls.StructSlotNames;
-        var slots = new LispObject[slotNames.Length];
-        Compat.Fill(slots, Nil.Instance);
-
-        // Parse slot-value pairs from the rest of the list
         var rest = firstCons.Cdr;
         var pairs = new List<(string key, LispObject value)>();
 
@@ -1249,26 +1333,13 @@ public class Reader
             rest = valueCons.Cdr;
         }
 
-        // Assign values to slots (first occurrence wins per CLHS)
-        var assigned = new bool[slotNames.Length];
-        foreach (var (key, value) in pairs)
+        var args = new LispObject[pairs.Count * 2];
+        for (int i = 0; i < pairs.Count; i++)
         {
-            if (key == "ALLOW-OTHER-KEYS") continue;
-
-            int idx = -1;
-            for (int i = 0; i < slotNames.Length; i++)
-            {
-                if (slotNames[i].Name == key) { idx = i; break; }
-            }
-
-            if (idx >= 0 && !assigned[idx])
-            {
-                slots[idx] = value;
-                assigned[idx] = true;
-            }
+            args[2 * i] = Startup.Keyword(pairs[i].key);
+            args[2 * i + 1] = pairs[i].value;
         }
-
-        return new LispStruct(typeSymbol, slots);
+        return MultipleValues.Primary(Runtime.Funcall(ctor, args));
     }
 
     /// <summary>#S(RANDOM-STATE :STATE words), the form SBCL and dotcl print: the
@@ -1367,6 +1438,11 @@ public class Reader
             SharePlaceholders[label] = ph;
         }
         var obj = Read();
+        if (obj == ph)
+        {
+            SharePlaceholders.Remove(label);
+            throw MakeReaderError($"Must label something more than just #{label}#");
+        }
         ShareLabels[label] = obj;
         ph.Value = obj;
         SharePlaceholders.Remove(label);
@@ -1402,7 +1478,7 @@ public class Reader
                     PatchPlaceholders(vec[i], ph, replacement, visited);
             }
         }
-        else if (root is LispStruct st)
+        else if (LispStruct.TryAs(root, out var st))
         {
             for (int i = 0; i < st.SlotCount; i++)
             {
@@ -1471,7 +1547,7 @@ public class Reader
             int ch = Peek();
             if (ch == '0') { ReadChar(); bits.Add(Fixnum.Make(0)); }
             else if (ch == '1') { ReadChar(); bits.Add(Fixnum.Make(1)); }
-            else if (ch != -1 && !IsTerminating(ch) && !char.IsWhiteSpace((char)ch))
+            else if (ch != -1 && !IsTerminating(ch))
             {
                 // Non-bit constituent character (e.g., '2'): signal error
                 throw MakeReaderError($"Invalid bit character '{(char)ch}' in bit vector");
@@ -1506,12 +1582,7 @@ public class Reader
         else if (str is LispVector vec && vec.IsCharVector)
             nameStr = vec.ToCharString();
         if (nameStr != null)
-        {
-            // Detect logical pathname strings
-            if (Runtime.IsLogicalPathnameString(nameStr))
-                return LispLogicalPathname.FromLogicalString(nameStr);
-            return LispPathname.FromString(nameStr);
-        }
+            return Runtime.FromNamestring(nameStr);
         throw MakeReaderError($"#P requires a string argument, got: {str}");
     }
 
@@ -1519,6 +1590,14 @@ public class Reader
     {
         // #. form: read and evaluate at read time
         // CLHS 2.4.8.6: signal reader-error if *read-eval* is NIL
+        // CLHS *read-suppress*: a skipped form is parsed, never evaluated
+        if (_readSuppress)
+        {
+            if (PeekSkipWhitespaceOnly() == -1)
+                throw MakeEndOfFileError("EOF after #.");
+            Read();
+            return new Symbol("NIL");
+        }
         var readEvalSym = Startup.Sym("*READ-EVAL*");
         var readEval = DynamicBindings.Get(readEvalSym);
         if (readEval is Nil)
@@ -1527,7 +1606,6 @@ public class Reader
         if (PeekSkipWhitespaceOnly() == -1)
             throw MakeEndOfFileError("EOF after #.");
         var form = Read();
-        if (_readSuppress) return new Symbol("NIL"); // suppress mode: return dummy
         var value = Runtime.Eval(form);
         // A reader macro that produces NO values has read no object at all, and
         // the reader carries on as if the characters had been whitespace -- the
@@ -1706,7 +1784,7 @@ public class Reader
         LispObject feature;
         try { feature = Read(); }
         finally { DynamicBindings.Pop(pkgSym); }
-        bool hasFeature = EvaluateFeature(feature);
+        bool hasFeature = EvaluateFeature(feature, !_readSuppress);
         bool shouldInclude = positive ? hasFeature : !hasFeature;
 
         if (shouldInclude)
@@ -1732,7 +1810,7 @@ public class Reader
     ///   (AND f1 f2..) -> all sub-features match
     ///   (NOT f)       -> sub-feature does not match
     /// </summary>
-    private static bool EvaluateFeature(LispObject feature)
+    private static bool EvaluateFeature(LispObject feature, bool record = false)
     {
         if (feature is Symbol sym)
         {
@@ -1748,9 +1826,13 @@ public class Reader
                 if (c.Car is Symbol fs
                     && string.Equals(fs.Name, sym.Name, StringComparison.Ordinal)
                     && ReferenceEquals(fs.HomePackage, sym.HomePackage))
+                {
+                    if (record) HostFeatures.NoteAtom(sym.Name, true);
                     return true;
+                }
                 cur = c.Cdr;
             }
+            if (record) HostFeatures.NoteAtom(sym.Name, false);
             return false;
         }
 
@@ -1764,7 +1846,7 @@ public class Reader
                     LispObject rest = cons.Cdr;
                     while (rest is Cons c)
                     {
-                        if (EvaluateFeature(c.Car)) return true;
+                        if (EvaluateFeature(c.Car, record)) return true;
                         rest = c.Cdr;
                     }
                     return false;
@@ -1774,7 +1856,7 @@ public class Reader
                     LispObject rest = cons.Cdr;
                     while (rest is Cons c)
                     {
-                        if (!EvaluateFeature(c.Car)) return false;
+                        if (!EvaluateFeature(c.Car, record)) return false;
                         rest = c.Cdr;
                     }
                     return true;
@@ -1782,7 +1864,7 @@ public class Reader
                 case "NOT":
                 {
                     if (cons.Cdr is Cons nc)
-                        return !EvaluateFeature(nc.Car);
+                        return !EvaluateFeature(nc.Car, record);
                     return true; // (NOT) with no arg -> true
                 }
             }
@@ -1806,6 +1888,13 @@ public class Reader
         var imag = Read();
         SkipWhitespace();
         if (ReadChar() != ')') throw MakeReaderError("Expected ) in #C(...)");
+
+        if (real is LispComplex || imag is LispComplex)
+        {
+            var bad = real is LispComplex ? real : imag;
+            throw new LispErrorException(new LispTypeError(
+                $"#C: {bad} is not of type REAL", bad, Startup.Sym("REAL")));
+        }
 
         if (real is not Number rn || imag is not Number im)
             throw MakeReaderError("#C requires numeric arguments");
@@ -2065,7 +2154,7 @@ public class Reader
                     System.Globalization.CultureInfo.InvariantCulture, out var dv))
             {
                 // No exponent marker: use *read-default-float-format*
-                result = IsDefaultFloatDouble() ? new DoubleFloat(dv) : new SingleFloat((float)dv);
+                result = MakeFloatOrThrow(dv, IsDefaultFloatDouble(), token);
                 return true;
             }
         }
@@ -2169,11 +2258,24 @@ public class Reader
         if (double.TryParse(normalized.ToString(), System.Globalization.NumberStyles.Float,
                 System.Globalization.CultureInfo.InvariantCulture, out var dv))
         {
-            result = isDouble ? new DoubleFloat(dv) : new SingleFloat((float)dv);
+            result = MakeFloatOrThrow(dv, isDouble, token);
             return true;
         }
 
         return false;
+    }
+
+    // A literal out of range signals READER-ERROR; arithmetic still gives infinities.
+    private Number MakeFloatOrThrow(double value, bool isDouble, string token)
+    {
+        if (double.IsInfinity(value))
+            throw MakeReaderError($"Float overflow in token: {token}");
+        if (isDouble)
+            return new DoubleFloat(value);
+        var single = (float)value;
+        if (float.IsInfinity(single))
+            throw MakeReaderError($"Float overflow in token: {token}");
+        return new SingleFloat(single);
     }
 
     /// <summary>Check if *read-default-float-format* is double-float or long-float.</summary>
@@ -2320,7 +2422,7 @@ public class Reader
         var slots = new List<LispObject>();
         for (var rest = head.Cdr; rest is Cons c; rest = c.Cdr)
             slots.Add(c.Car);
-        return new LispStruct(typeSym, slots.ToArray());
+        return LispStruct.Create(typeSym, slots.ToArray());
     }
 
     internal LispObject ReadFaslUninterned(int? n)
@@ -2375,7 +2477,7 @@ public class Reader
         if (_readSuppress && st != SyntaxType.Whitespace && st != SyntaxType.TerminatingMacro)
         {
             // In suppress mode, undefined but valid sub-characters: consume next token/object and return NIL
-            Read();
+            if (!TryRead(out _)) return null;
             return Nil.Instance;
         }
         throw MakeReaderError($"Unknown {dispChar} dispatch character: {(char)ch}");

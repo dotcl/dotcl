@@ -107,6 +107,10 @@
       (%unuse-package pkg-to-remove pkg)))
 ; reverse and string are implemented in C# (Runtime.Sequences.cs / Runtime.cs)
 (defun apply (fn &rest args)
+  (unless args
+    (error 'program-error
+           :format-control "APPLY: too few arguments (expected a function and an argument list)"
+           :format-arguments nil))
   (if (cdr args)
       (apply fn (apply #'list* args))
       (apply fn (car args))))
@@ -142,7 +146,7 @@
       ((atom p) nil)
     (when (eq (car p) key) (return p))))
 
-(defun %check-key-list (tail)
+(defun %check-key-list (tail &optional allow-non-symbol)
   "Signal PROGRAM-ERROR unless TAIL is a well-formed keyword argument list.
    The part of an argument list that a destructuring lambda list's &KEY consumes
    must be a proper list of even length whose keys are symbols (CLHS 3.4.1.4.1,
@@ -155,17 +159,35 @@
    -- what a component form reads as when a #+FEATURE datum before :DEPENDS-ON
    is absent -- bound PATHNAME to :DEPENDS-ON and DEPENDS-ON to NIL, and the
    mistake surfaced much later as a complaint about whatever the shifted value
-   was then passed to."
+   was then passed to. ALLOW-NON-SYMBOL skips the symbol check only (CLHS 3.5.1.5)."
   (do ((a tail (cddr a)))
       ((null a) tail)
     (unless (and (consp a) (consp (cdr a)))
       (error 'program-error
              :format-control "odd number of keyword arguments: ~s"
              :format-arguments (list tail)))
-    (unless (symbolp (car a))
+    (unless (or allow-non-symbol (symbolp (car a)))
       (error 'program-error
              :format-control "keyword argument name is not a symbol: ~s"
              :format-arguments (list (car a))))))
+
+(defun %db-allow-other-keys (plist)
+  "The value of the leftmost :ALLOW-OTHER-KEYS in the keyword argument list."
+  (do ((p plist (cddr p)))
+      ((atom p) nil)
+    (when (eq (car p) :allow-other-keys)
+      (return (cadr p)))))
+
+(defun %check-key-arguments (tail allowed-keys allow-other-keys-p)
+  "Reject a keyword argument not in ALLOWED-KEYS unless other keys are allowed."
+  (unless (or allow-other-keys-p (%db-allow-other-keys tail))
+    (do ((p tail (cddr p)))
+        ((atom p) nil)
+      (let ((key (car p)))
+        (unless (or (eq key :allow-other-keys) (member key allowed-keys))
+          (error 'program-error
+                 :format-control "unknown keyword: ~s; expected one of ~s"
+                 :format-arguments (list key allowed-keys)))))))
 
 (defun %db-count-message (nreq max)
   (cond ((eql nreq max) (format nil "exactly ~D" nreq))
@@ -222,20 +244,29 @@
   (unless (listp list)
     (error 'type-error :datum list :expected-type 'list))
   (%check-index n "BUTLAST")
-  (let ((lead list))
-    (dotimes (i n)
-      (unless (consp lead) (return-from butlast nil))
-      (setq lead (cdr lead)))
-    (let ((result nil))
-      (do ((lag list (cdr lag)))
-          ((not (consp lead)) (nreverse result))
-        (push (car lag) result)
-        (setq lead (cdr lead))))))
+  (if (zerop n)
+      (let ((head nil) (tail nil))
+        (do ((cur list (cdr cur)))
+            ((not (consp cur))
+             (if tail (progn (rplacd tail cur) head) cur))
+          (let ((cell (cons (car cur) nil)))
+            (if tail (rplacd tail cell) (setq head cell))
+            (setq tail cell))))
+      (let ((lead list))
+        (dotimes (i n)
+          (unless (consp lead) (return-from butlast nil))
+          (setq lead (cdr lead)))
+        (let ((result nil))
+          (do ((lag list (cdr lag)))
+              ((not (consp lead)) (nreverse result))
+            (push (car lag) result)
+            (setq lead (cdr lead)))))))
 
 (defun nbutlast (list &optional (n 1))
   (unless (listp list)
     (error 'type-error :datum list :expected-type 'list))
   (%check-index n "NBUTLAST")
+  (when (zerop n) (return-from nbutlast list))
   (let ((lead list))
     (dotimes (i n)
       (unless (consp lead) (return-from nbutlast nil))
@@ -879,7 +910,24 @@
         (coerce list 'vector)
         (coerce list (list 'vector etype)))))
 
+(defun %check-vector-result-length (result-type result)
+  "Check RESULT's length and rank against a VECTOR/ARRAY result type."
+  (when (and (consp result-type) (consp (cdr result-type)) (consp (cddr result-type)))
+    (let* ((base-name (symbol-name (car result-type)))
+           (arrayp (member base-name '("ARRAY" "SIMPLE-ARRAY") :test #'string=))
+           (spec (caddr result-type))
+           (required-length
+             (cond ((not arrayp) (and (integerp spec) spec))
+                   ((and (consp spec) (integerp (car spec)) (null (cdr spec)))
+                    (car spec))
+                   (t nil))))
+      (when (and arrayp (integerp spec) (/= spec 1))
+        (error 'type-error :datum result :expected-type result-type))
+      (when (and required-length (/= (length result) required-length))
+        (error 'type-error :datum result :expected-type result-type)))))
+
 (defun map (result-type function &rest sequences)
+  (when (null sequences) (error 'program-error))
   (let* ((result-type (if result-type (%typexpand-full result-type) result-type))
          (result nil)
          (cat (%map-rt-category result-type)))
@@ -936,21 +984,7 @@
        ;; a length constraint is spelled (simple-array elt (N)). SBCL's
        ;; perfectly-hashable maps into (simple-array (unsigned-byte 32) 1);
        ;; rank 1, any length.
-       (when (and (consp result-type) (consp (cdr result-type)) (consp (cddr result-type)))
-         (let* ((base-name (symbol-name (car result-type)))
-                (arrayp (member base-name '("ARRAY" "SIMPLE-ARRAY") :test #'string=))
-                (spec (caddr result-type))
-                (required-length
-                  (cond ((not arrayp) (and (integerp spec) spec))
-                        ;; (array elt (N)): single-dimension length
-                        ((and (consp spec) (integerp (car spec)) (null (cdr spec)))
-                         (car spec))
-                        (t nil))))
-           ;; (array elt RANK) with rank /= 1 is not a sequence type
-           (when (and arrayp (integerp spec) (/= spec 1))
-             (error 'type-error :datum result :expected-type result-type))
-           (when (and required-length (/= (length result) required-length))
-             (error 'type-error :datum result :expected-type result-type))))
+       (%check-vector-result-length result-type result)
        (%coerce-to-rt-vector result result-type))
       ((eq cat :list) result)
       (t
@@ -1103,11 +1137,7 @@
            (error 'type-error :datum result :expected-type result-type))
          (coerce result 'bit-vector))
         ((eq cat :vector)
-         ;; Check compound size constraint: (vector * n)
-         (when (and (consp result-type) (consp (cdr result-type)) (consp (cddr result-type))
-                    (integerp (caddr result-type))
-                    (/= (length result) (caddr result-type)))
-           (error 'type-error :datum result :expected-type result-type))
+         (%check-vector-result-length result-type result)
          (%coerce-to-rt-vector result result-type))
         (t
          ;; Unknown/compound type (e.g. (or (vector t 5) (vector t 10)))
@@ -1621,6 +1651,76 @@ Also expands element types within compound type specifiers like (VECTOR etype si
              (eq (symbol-package symbol) (find-package "COMMON-LISP")))
     (let ((table (cdr (assoc kind (%cl-builtin-doc-tables) :test #'string=))))
       (and table (values (gethash symbol table))))))
+
+;; Lambda lists for the operators of the COMMON-LISP package, set only by
+;; compiler/cl-lambda-lists.lisp in the same way as the docstrings above, and
+;; for those of the DOTCL, DOTNET, DOTCL-MOP and DOTCL-CLTL2 packages, set only
+;; by compiler/ext-lambda-lists.lisp as ((package-name entry ...) ...).
+;; DOTCL:FUNCTION-LAMBDA-LIST asks %CL-BUILTIN-LAMBDA-LIST first.
+(defvar *cl-builtin-lambda-lists* nil)
+(defvar *ext-builtin-lambda-lists* nil)
+(defvar *cl-builtin-lambda-list-tables* nil)
+
+;; "A (B &KEY C)" -> (A (B &KEY C)). A name that is an external symbol of
+;; COMMON-LISP is that symbol; any other name is a fresh uninterned symbol, so
+;; reading the table interns nothing.
+(defun %parse-builtin-lambda-list (text)
+  (let ((cl (find-package "COMMON-LISP"))
+        (stack (list nil))
+        (i 0)
+        (n (length text)))
+    (loop while (< i n)
+          do (let ((c (char text i)))
+               (cond ((char= c #\Space) (incf i))
+                     ((char= c #\() (push nil stack) (incf i))
+                     ((char= c #\))
+                      (let ((inner (nreverse (pop stack))))
+                        (push inner (car stack)))
+                      (incf i))
+                     (t
+                      (let* ((end (or (position-if (lambda (ch) (member ch '(#\Space #\( #\))))
+                                                   text :start i)
+                                      n))
+                             (name (subseq text i end)))
+                        (multiple-value-bind (sym status) (find-symbol name cl)
+                          (push (if (eq status :external) sym (make-symbol name))
+                                (car stack)))
+                        (setq i end))))))
+    (nreverse (car stack))))
+
+;; (symbol -> lambda list . function object -> symbol), built on first use.
+;; A function object two names share answers as the first of them, so the
+;; COMMON-LISP entries come first.
+(defun %cl-builtin-lambda-list-tables ()
+  (or *cl-builtin-lambda-list-tables*
+      (let ((by-symbol (make-hash-table :test 'eq))
+            (by-function (make-hash-table :test 'eq)))
+        (dolist (section (cons (cons "COMMON-LISP" (funcall *cl-builtin-lambda-lists*))
+                               (and *ext-builtin-lambda-lists*
+                                    (funcall *ext-builtin-lambda-lists*))))
+          (let ((pkg (find-package (car section))))
+            (when pkg
+              (dolist (entry (cdr section))
+                (multiple-value-bind (sym status) (find-symbol (car entry) pkg)
+                  (when (and (eq status :external) (eq (symbol-package sym) pkg))
+                    (setf (gethash sym by-symbol) (%parse-builtin-lambda-list (cadr entry)))
+                    (when (and (fboundp sym) (not (special-operator-p sym)))
+                      (let ((fn (or (macro-function sym) (fdefinition sym))))
+                        (unless (gethash fn by-function)
+                          (setf (gethash fn by-function) sym))))))))))
+        (setq *cl-builtin-lambda-list-tables* (cons by-symbol by-function)))))
+
+;; The table's lambda list for a fbound external CL symbol, or for the function
+;; or macro function one names, as a one-element list; NIL when it has none.
+(defun %cl-builtin-lambda-list (fn-or-name)
+  (when *cl-builtin-lambda-lists*
+    (let* ((tables (%cl-builtin-lambda-list-tables))
+           (sym (if (symbolp fn-or-name)
+                    (and (fboundp fn-or-name) fn-or-name)
+                    (values (gethash fn-or-name (cdr tables))))))
+      (when sym
+        (multiple-value-bind (ll found) (gethash sym (car tables))
+          (and found (list ll)))))))
 
 ;; --- DOCUMENTATION methods ---
 
@@ -2174,6 +2274,9 @@ against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
                                 (nreverse kw-names)
                                 apo-indices lambda-list))))
 
+(defun %ensure-gf-lambda-list (gf)
+  (funcall (symbol-function (find-symbol "FUNCTION-LAMBDA-LIST" "DOTCL")) gf))
+
 (defun ensure-generic-function (name &rest args)
   ;; Odd number of keyword args -> program-error
   (when (oddp (length args))
@@ -2216,10 +2319,15 @@ against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
                               its class cannot be changed to ~S."
                              name (class-name (class-of fn)) (class-name gf-class)))
                     (when (or lambda-list-p apo-p)
-                      (%ensure-gf-apply-lambda-list fn lambda-list apo-params))
+                      (%ensure-gf-apply-lambda-list
+                       fn
+                       (if lambda-list-p lambda-list (%ensure-gf-lambda-list fn))
+                       apo-params))
                     fn)
                   ;; Create new GF
-                  (let* ((ll (if lambda-list-p lambda-list '()))
+                  (let* ((ll (cond (lambda-list-p lambda-list)
+                                   (apo-p apo-params)
+                                   (t '())))
                          (arity (length (%ensure-gf-required-params ll)))
                          ;; AMOP: the name and lambda list reach an instance of
                          ;; the requested class as initargs, as with DEFGENERIC.
@@ -2248,7 +2356,9 @@ against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
                     (remove-if-not (lambda (sd)
                                      (member (slot-definition-name sd) slot-names))
                                    all-slots)
-                    all-slots))
+                    (remove-if (lambda (sd)
+                                 (eq (slot-definition-allocation sd) :class))
+                               all-slots)))
          (bound-slots (remove-if-not (lambda (sd)
                                        (slot-boundp object (slot-definition-name sd)))
                                      slots))
@@ -2347,7 +2457,28 @@ DOTNET-VALID-TYPED-LOCALS), an alist (name-string . type-string)."
              ((%dotnet-in-pkg (car x) "INVOKE")
               (let ((rty (%dotnet-invoke-return-type x env)))
                 (and rty (cons rty x))))
+             ;; (dotnet:static "T" "M" ...): the same, for a static member
+             ((%dotnet-in-pkg (car x) "STATIC")
+              (let ((rty (%dotnet-static-return-type x env)))
+                (and rty (cons rty x))))
              (t nil)))))
+
+(defun %dotnet-typed-args (args env)
+  "When every form of ARGS is statically typed, (values PARAM-TYPES EXPRS T)."
+  (let ((param-types '()) (exprs '()))
+    (dolist (a args (values (nreverse param-types) (nreverse exprs) t))
+      (let ((at (%dotnet-static-type a env)))
+        (if at
+            (progn (push (car at) param-types) (push (cdr at) exprs))
+            (return (values nil nil nil)))))))
+
+(defun %dotnet-static-return-type (x env)
+  "Like %DOTNET-INVOKE-RETURN-TYPE, for (dotnet:static \"T\" \"M\" ARG...)."
+  (and (consp (cdr x)) (stringp (cadr x))
+       (consp (cddr x)) (stringp (caddr x))
+       (multiple-value-bind (param-types exprs ok) (%dotnet-typed-args (cdddr x) env)
+         (declare (ignore exprs))
+         (and ok (%dotnet-method-return-type (cadr x) (caddr x) param-types t)))))
 
 (defun %dotnet-invoke-return-type (x env)
   "If X is (dotnet:invoke R \"M\" ARG...) with a statically typed receiver R and
@@ -2393,10 +2524,25 @@ overload), so this never changes behaviour, only speed."
                                       ,(cdr rt) ,@(reverse arg-exprs))
                 form))))))
 
+(defun %dotnet-static-direct-cm (form env)
+  "Compiler macro for DOTNET:STATIC: with a literal type and member name and every
+argument statically typed (see %DOTNET-INVOKE-DIRECT-CM), rewrite to
+%DOTNET-STATIC-DIRECT, which the assembler resolves to a direct call, getter or
+field load, falling back to the dynamic path when it cannot."
+  (let ((type (cadr form)) (member (caddr form)))
+    (if (not (and (stringp type) (stringp member)))
+        form
+        (multiple-value-bind (param-types exprs ok) (%dotnet-typed-args (cdddr form) env)
+          (if ok
+              `(%dotnet-static-direct ,type ,member ,param-types ,@exprs)
+              form)))))
+
 (let ((pkg (find-package "DOTNET")))
   (when pkg
     (let ((sym (find-symbol "INVOKE" pkg)))
-      (when sym (%register-compiler-macro-rt sym #'%dotnet-invoke-direct-cm)))))
+      (when sym (%register-compiler-macro-rt sym #'%dotnet-invoke-direct-cm)))
+    (let ((sym (find-symbol "STATIC" pkg)))
+      (when sym (%register-compiler-macro-rt sym #'%dotnet-static-direct-cm)))))
 
 ;;; dotnet:handler-bind: handler-bind that dispatches on specific .NET exception
 ;;; types (dotcl/dotcl#45). Each clause is ("Type.Name" (var) body...). When a
@@ -2595,7 +2741,9 @@ overload), so this never changes behaviour, only speed."
      (if (and form (not (eq form t)) (not (keywordp form)))
          (multiple-value-bind (exp expanded)
              (%mea-macroexpand-1 form (cons macros symbol-macros))
-           (if expanded (%mea exp macros symbol-macros fns) form))
+           (if (and expanded (not (equal exp form)))
+               (%mea exp macros symbol-macros fns)
+               form))
          form))
     ((atom form) form)
     (t
@@ -2609,7 +2757,8 @@ overload), so this never changes behaviour, only speed."
                   (not (eq head 'lambda)))
          (multiple-value-bind (exp expanded)
              (%mea-macroexpand-1 form (cons macros symbol-macros))
-           (when expanded
+           ;; A fixed-point expansion is an ordinary call: walk its subforms.
+           (when (and expanded (not (equal exp form)))
              (return-from %mea (%mea exp macros symbol-macros fns)))))
        (case head
          ((quote go declare) form)
@@ -2732,9 +2881,10 @@ and symbol-macro scope is used as the starting point."
 
 ;;; --- xref (who-calls) runtime tables ---
 ;;;
-;;; The compiler records CALLER->CALLEE edges while compiling each named
-;;; function and plants a load-time (dotcl:%xref-note caller callees) call in
-;;; the compiled output. The tables live here; registration replaces the
+;;; The compiler records CALLER->CALLEE edges, and the global variables and
+;;; macros the body uses, while compiling each named function, and plants a
+;;; load-time (dotcl:%xref-note caller callees [uses]) call in the compiled
+;;; output. The tables live here; registration replaces the
 ;;; caller's whole edge set, so redefinition / fasl reload drops stale edges
 ;;; naturally. Keys are function names: symbols or (setf sym) lists; hence
 ;;; EQUAL tables (equal on interned symbols is identity).
@@ -2749,34 +2899,123 @@ and symbol-macro scope is used as the starting point."
 
 (defvar *xref-lock* (%make-lock "dotcl-xref"))
 
-(defun %xref-note (caller callees)
-  "Replace CALLER's recorded callee set with CALLEES and update the reverse
-   index. Called from compiled code at load time; also usable directly."
+(defvar *xref-use-tables* (list (cons :references (make-hash-table :test 'equal))
+                                  (cons :sets (make-hash-table :test 'equal))
+                                  (cons :binds (make-hash-table :test 'equal))
+                                  (cons :macroexpands (make-hash-table :test 'equal)))
+  "kind -> (name -> list of caller names), for the uses besides calls.")
+
+(defvar *xref-caller-uses* (make-hash-table :test 'equal)
+  "caller name -> its uses as (KIND (NAME ...) ...).")
+
+(defun %xref-use-table (kind)
+  (cdr (assoc kind *xref-use-tables*)))
+
+(defvar *xref-pending* '()
+  "Registrations not yet in the tables, newest first: (CALLER CALLEES USES).
+   Loading only queues them; the first query after a load indexes them.")
+
+(defun %xref-note (caller &optional callees uses)
+  "Replace CALLER's recorded callee set with CALLEES, and its other uses (a
+   plist of :REFERENCES, :SETS, :BINDS and :MACROEXPANDS to lists of names)
+   with USES. Called from compiled code at load time; also usable directly.
+   Compiled code passes a string instead of CALLER, holding all three, which is
+   read back when the registration is indexed."
   (%acquire-lock *xref-lock* t)
   (unwind-protect
-       (progn
-         ;; drop the old edges of this caller from the reverse index
-         (dolist (old (gethash caller *xref-callee-table*))
-           (setf (gethash old *xref-caller-table*)
-                 (remove caller (gethash old *xref-caller-table*) :test #'equal)))
-         (setf (gethash caller *xref-callee-table*) callees)
-         (dolist (callee callees)
-           (pushnew caller (gethash callee *xref-caller-table*) :test #'equal))
-         caller)
+       (progn (push (list caller callees uses) *xref-pending*)
+              caller)
     (%release-lock *xref-lock*)))
+
+(defun %xref-unpack (packed)
+  "(CALLER CALLEES . USES) from a string the compiler's %XREF-PACK made, or NIL
+   when it no longer reads (its package is gone)."
+  (ignore-errors
+    (multiple-value-bind (pname pos) (read-from-string packed)
+      (let ((pkg (find-package pname)))
+        (when pkg
+          (with-standard-io-syntax
+            (let ((*package* pkg) (*read-eval* nil))
+              (values (read-from-string packed t nil :start pos)))))))))
+
+(defun %xref-index-1 (caller callees uses)
+  (when (stringp caller)
+    (let ((all (%xref-unpack caller)))
+      (unless all (return-from %xref-index-1 nil))
+      (setf caller (first all) callees (second all) uses (cddr all))))
+  ;; drop the old edges of this caller from the reverse indexes
+  (dolist (old (gethash caller *xref-callee-table*))
+    (setf (gethash old *xref-caller-table*)
+          (remove caller (gethash old *xref-caller-table*) :test #'equal)))
+  (setf (gethash caller *xref-callee-table*) callees)
+  (dolist (callee callees)
+    (pushnew caller (gethash callee *xref-caller-table*) :test #'equal))
+  (loop for (kind names) on (gethash caller *xref-caller-uses*) by #'cddr
+        for table = (%xref-use-table kind)
+        when table
+          do (dolist (name names)
+               (setf (gethash name table)
+                     (remove caller (gethash name table) :test #'equal))))
+  (if uses
+      (setf (gethash caller *xref-caller-uses*) uses)
+      (remhash caller *xref-caller-uses*))
+  (loop for (kind names) on uses by #'cddr
+        for table = (%xref-use-table kind)
+        when table
+          do (dolist (name names)
+               (pushnew caller (gethash name table) :test #'equal))))
+
+(defun %xref-flush ()
+  "Index the queued registrations, oldest first. Call with *XREF-LOCK* held."
+  (when *xref-pending*
+    (let ((pending (nreverse *xref-pending*)))
+      (setf *xref-pending* '())
+      (dolist (p pending)
+        (%xref-index-1 (first p) (second p) (third p))))))
+
+(defun %xref-scope (name value)
+  "What (%XREF-SCOPE 'NAME FORM) evaluates to when it is not compiled: VALUE."
+  (declare (ignore name))
+  value)
+
+(defun %xref-who-uses (kind name)
+  (%acquire-lock *xref-lock* t)
+  (unwind-protect
+       (let ((table (%xref-use-table kind)))
+         (%xref-flush)
+         (and table (copy-list (gethash name table))))
+    (%release-lock *xref-lock*)))
+
+(defun %xref-who-references (name)
+  "List of function names whose definitions read the global variable NAME."
+  (%xref-who-uses :references name))
+
+(defun %xref-who-sets (name)
+  "List of function names whose definitions assign the global variable NAME."
+  (%xref-who-uses :sets name))
+
+(defun %xref-who-binds (name)
+  "List of function names whose definitions bind the special variable NAME."
+  (%xref-who-uses :binds name))
+
+(defun %xref-who-macroexpands (name)
+  "List of function names whose definitions expand the global macro NAME."
+  (%xref-who-uses :macroexpands name))
 
 (defun %xref-who-calls (name)
   "List of function names whose definitions call (or take #' of) NAME."
   (%acquire-lock *xref-lock* t)
   (unwind-protect
-       (copy-list (gethash name *xref-caller-table*))
+       (progn (%xref-flush)
+              (copy-list (gethash name *xref-caller-table*)))
     (%release-lock *xref-lock*)))
 
 (defun %xref-who-is-called-by (name)
   "List of function names that NAME's definition calls (or takes #' of)."
   (%acquire-lock *xref-lock* t)
   (unwind-protect
-       (copy-list (gethash name *xref-callee-table*))
+       (progn (%xref-flush)
+              (copy-list (gethash name *xref-callee-table*)))
     (%release-lock *xref-lock*)))
 
 (let ((pkg (find-package "DOTCL")))
@@ -2788,7 +3027,16 @@ and symbol-macro scope is used as the starting point."
       (setf (symbol-function who) #'%xref-who-calls)
       (setf (symbol-function by) #'%xref-who-is-called-by)
       (export who pkg)
-      (export by pkg))))
+      (export by pkg)
+      (loop for (pname fn) in (list (list "WHO-REFERENCES" #'%xref-who-references)
+                                    (list "WHO-SETS" #'%xref-who-sets)
+                                    (list "WHO-BINDS" #'%xref-who-binds)
+                                    (list "WHO-MACROEXPANDS" #'%xref-who-macroexpands))
+            do (let ((sym (intern pname pkg)))
+                 (setf (symbol-function sym) fn)
+                 (export sym pkg)))
+      (import (list '*record-xref* '*record-xref-standard*) pkg)
+      (export (list '*record-xref* '*record-xref-standard*) pkg))))
 
 ;;; --- Default reports for the standard condition types ---
 ;;;
@@ -3036,3 +3284,27 @@ needs a newer DotCL.Runtime than this one, which cannot load it at all.")
       (setf (documentation load-as-is 'function)
             "Invoke the LOAD-AS-IS restart: load a fasl another dotcl compiled as it is.")
       (export (list name pathname-reader built-by-reader load-as-is) pkg))))
+
+;;; Warned by LOAD for a fasl whose #+ / #- chose by a host feature that has another
+;;; truth on this host than where it was compiled.
+(let ((pkg (find-package "DOTCL")))
+  (when pkg
+    (let ((name (intern "FASL-HOST-MISMATCH" pkg))
+          (pathname-reader (intern "FASL-HOST-MISMATCH-PATHNAME" pkg))
+          (features-reader (intern "FASL-HOST-MISMATCH-FEATURES" pkg)))
+      (%register-class
+       (%make-class name
+                    (list (%find-or-forward-class 'simple-warning))
+                    (list (%slot-def-attrs (%make-slot-def '%fasl-pathname (list :pathname) nil)
+                                           nil nil nil nil)
+                          (%slot-def-attrs (%make-slot-def '%fasl-features (list :features) nil)
+                                           nil nil nil nil))))
+      (setf (symbol-function pathname-reader)
+            (lambda (condition) (slot-value condition '%fasl-pathname)))
+      (setf (symbol-function features-reader)
+            (lambda (condition) (slot-value condition '%fasl-features)))
+      (setf (documentation name 'type)
+            "Warned (by WARN) when LOAD is given a fasl whose source chose definitions by a
+host feature (#+x86-64, #+windows, ...) that is true or false differently on this host.
+The fasl is loaded anyway. Bind DOTCL:*WARN-HOST-DEPENDENT-FASL* to NIL to silence it.")
+      (export (list name pathname-reader features-reader) pkg))))

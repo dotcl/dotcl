@@ -354,7 +354,7 @@ public static partial class Runtime
     // Like %ffi-call but takes an IntPtr function pointer instead of dll+func name.
     public static LispObject FfiCallPtr(LispObject[] args)
     {
-        if (args.Length < 2)
+        if (args.Length < 3)
             throw new LispErrorException(new LispProgramError(
                 "dotnet:%ffi-call-ptr: requires at least func-ptr, arg-types, ret-type"));
         var funcPtr = new IntPtr(AddressArg(args[0], "dotnet:%ffi-call-ptr", "function pointer"));

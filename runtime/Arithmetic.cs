@@ -212,7 +212,7 @@ public static class Arithmetic
         {
             BigInteger r;
             if (lx <= 128 && ly <= 128) r = Multiply128(mx, my);
-            else if (words >= 20 && lx > 32 && ly > 32) r = MultiplyWords(mx, my, lx, ly);
+            else if (words >= 80 && lx > 32 && ly > 32) r = MultiplyWords(mx, my, lx, ly);
             else return x * y;
             return (x.Sign ^ y.Sign) < 0 ? -r : r;
         }
@@ -221,9 +221,8 @@ public static class Arithmetic
     }
 
 #if !NETSTANDARD2_0
-    // BigInteger multiplies in 32-bit limbs. With 64-bit limbs a product of up
-    // to 4 x 4 limbs is faster, once the 32-bit limb products number 9 or more
-    // (two-limb operands) or 20 or more (wider ones).
+    // BigInteger multiplies in 32-bit limbs; the 64-bit-limb paths win at 9 or
+    // more such limb products for 128 bits, and at 80 or more for wider operands.
     [SkipLocalsInit]
     private static BigInteger Multiply128(BigInteger x, BigInteger y)
     {

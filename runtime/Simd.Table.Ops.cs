@@ -30,22 +30,22 @@ public static partial class SimdTable
         void Bin(string suffix, SimdOp op)
         {
             string f = n + suffix;
-            Def(t, f, 2, a => SimdOps.Binary(op, SimdInfo.Cast(k, a[0], f), SimdInfo.Cast(k, a[1], f)));
+            Def(t, f, 2, "A B", a => SimdOps.Binary(op, SimdInfo.Cast(k, a[0], f), SimdInfo.Cast(k, a[1], f)));
         }
         void Un(string suffix, SimdOp op)
         {
             string f = n + suffix;
-            Def(t, f, 1, a => SimdOps.Unary(op, SimdInfo.Cast(k, a[0], f)));
+            Def(t, f, 1, "A", a => SimdOps.Unary(op, SimdInfo.Cast(k, a[0], f)));
         }
         void Cmp(string suffix, SimdOp op)
         {
             string f = n + suffix;
-            Def(t, f, 2, a => SimdOps.Compare(op, SimdInfo.Cast(k, a[0], f), SimdInfo.Cast(k, a[1], f)));
+            Def(t, f, 2, "A B", a => SimdOps.Compare(op, SimdInfo.Cast(k, a[0], f), SimdInfo.Cast(k, a[1], f)));
         }
         void Hor(string suffix, SimdOp op)
         {
             string f = n + suffix;
-            Def(t, f, 1, a => SimdOps.Horizontal(op, SimdInfo.Cast(k, a[0], f)));
+            Def(t, f, 1, "PACK", a => SimdOps.Horizontal(op, SimdInfo.Cast(k, a[0], f)));
         }
 
         Bin("+", SimdOp.Add); Bin("-", SimdOp.Sub); Bin("*", SimdOp.Mul);
@@ -57,7 +57,7 @@ public static partial class SimdTable
         Hor("-HORIZONTAL+", SimdOp.Add); Hor("-HORIZONTAL-MIN", SimdOp.Min); Hor("-HORIZONTAL-MAX", SimdOp.Max);
 
         string ifName = n + "-IF";
-        Def(t, ifName, 3, a => SimdOps.Select(SimdInfo.Cast(mk, a[0], ifName),
+        Def(t, ifName, 3, "MASK A B", a => SimdOps.Select(SimdInfo.Cast(mk, a[0], ifName),
             SimdInfo.Cast(k, a[1], ifName), SimdInfo.Cast(k, a[2], ifName)));
 
         if (fl)
@@ -70,8 +70,8 @@ public static partial class SimdTable
         else
         {
             string l = n + "-SHIFTL", r = n + "-SHIFTR";
-            Def(t, l, 2, a => SimdOps.Shift(true, SimdInfo.Cast(k, a[0], l), ShiftCount(k, a[1], l)));
-            Def(t, r, 2, a => SimdOps.Shift(false, SimdInfo.Cast(k, a[0], r), ShiftCount(k, a[1], r)));
+            Def(t, l, 2, "PACK COUNT", a => SimdOps.Shift(true, SimdInfo.Cast(k, a[0], l), ShiftCount(k, a[1], l)));
+            Def(t, r, 2, "PACK COUNT", a => SimdOps.Shift(false, SimdInfo.Cast(k, a[0], r), ShiftCount(k, a[1], r)));
         }
     }
 
@@ -80,7 +80,7 @@ public static partial class SimdTable
         foreach (var (to, from) in Conversions)
         {
             string f = SimdInfo.Name(to) + "-FROM-" + SimdInfo.Name(from);
-            Def(t, f, 1, a => SimdOps.Convert(to, SimdInfo.Cast(from, a[0], f)));
+            Def(t, f, 1, "PACK", a => SimdOps.Convert(to, SimdInfo.Cast(from, a[0], f)));
         }
     }
 }

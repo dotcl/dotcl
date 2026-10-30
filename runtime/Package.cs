@@ -309,6 +309,10 @@ public class Package : LispObject
         return null;
     }
 
+    /// <summary>The physical name the current unit's source spelling NAME stands for.</summary>
+    public static string PhysicalNameOfSource(string name)
+        => _unitsInUse ? PhysicalNameFor(name, _currentUnit.Value) : name;
+
     private static string PhysicalNameFor(string text, Unit? cur)
     {
         int sep = text.IndexOf(UnitSeparator);
@@ -447,20 +451,53 @@ public class Package : LispObject
             }
 
             // Check for name conflicts in packages that use this package
-            foreach (var usingPkg in UsedByList())
+            while (true)
             {
-                // Skip if the using package has a shadowing symbol for this name
-                if (usingPkg.IsShadowing(sym.Name))
-                    continue;
-
-                var (theirSym, theirStatus) = usingPkg.FindSymbol(sym.Name);
-                if (theirStatus != SymbolStatus.None && !ReferenceEquals(theirSym, sym))
+                Package? conflictPkg = null;
+                Symbol? conflictOld = null;
+                SymbolStatus oldStatus = SymbolStatus.None;
+                foreach (var usingPkg in UsedByList())
                 {
-                    // Name conflict - signal package-error
-                    var err = new LispError($"EXPORT: exporting symbol {sym.Name} from package {Name} would cause a name conflict in package {usingPkg.Name}");
-                    err.ConditionTypeName = "PACKAGE-ERROR";
-                    err.PackageRef = new LispString(Name);
-                    throw new LispErrorException(err);
+                    // Skip if the using package has a shadowing symbol for this name
+                    if (usingPkg.IsShadowing(sym.Name))
+                        continue;
+
+                    var (theirSym, theirStatus) = usingPkg.FindSymbol(sym.Name);
+                    if (theirStatus != SymbolStatus.None && !ReferenceEquals(theirSym, sym)
+                        && !BridgeConflictIsSilent(theirSym, sym))
+                    {
+                        conflictPkg = usingPkg;
+                        conflictOld = theirSym;
+                        oldStatus = theirStatus;
+                        break;
+                    }
+                }
+                if (conflictPkg == null) break;
+
+                var old = conflictOld!;
+                var result = Runtime.SignalNameConflict(
+                    conflictPkg, "EXPORT", sym, old,
+                    new[] { sym, old },
+                    keepOld: true, takeNew: true, importChoices: false,
+                    resolve: true, continueRestart: true);
+                switch (result.Choice)
+                {
+                    case Runtime.NameConflictChoice.KeepOld:
+                        conflictPkg.Shadow(sym.Name);
+                        break;
+                    case Runtime.NameConflictChoice.TakeNew:
+                    case Runtime.NameConflictChoice.Continue:
+                        if (oldStatus is SymbolStatus.Internal or SymbolStatus.External)
+                            conflictPkg.Unintern(old);
+                        else
+                            conflictPkg.ShadowingImport(sym);
+                        break;
+                    case Runtime.NameConflictChoice.Resolve:
+                        Runtime.ResolveUseExportConflict(
+                            conflictPkg, result.Chosen ?? sym);
+                        break;
+                    default:
+                        break;
                 }
             }
 
@@ -510,15 +547,75 @@ public class Package : LispObject
         }
     }
 
+    /// <summary>Import SYM after its name conflict has been resolved.</summary>
+    internal void ImportForce(Symbol sym)
+    {
+        lock (_pkgLock)
+        {
+            _internalSymbols[sym.Name] = sym;
+            if (sym.HomePackage == null)
+                sym.HomePackage = this;
+        }
+    }
+
+    /// <summary>Dotcl's own namespaces (CL, DOTNET, DOTCL) share names that a
+    /// package using two of them has always silently kept the first of.</summary>
+    private static bool BridgeConflictIsSilent(Symbol oldSymbol, Symbol newSymbol)
+        => oldSymbol.HomePackage?.IsBridgeSource == true
+           && newSymbol.HomePackage?.IsBridgeSource == true;
+
     public void UsePackage(Package pkg)
     {
         lock (_pkgLock)
         {
-            if (!_useList.Contains(pkg))
+            if (_useList.Contains(pkg)) return;
+
+            while (true)
             {
-                _useList.Add(pkg);
-                _useSnapshot = _useList.ToArray();
+                Symbol? conflictNew = null, conflictOld = null;
+                SymbolStatus oldStatus = SymbolStatus.None;
+                foreach (var sym in pkg.ExternalSymbols)
+                {
+                    var (existing, status) = FindSymbol(sym.Name);
+                    if (status == SymbolStatus.None || ReferenceEquals(existing, sym)
+                        || IsShadowing(sym.Name) || BridgeConflictIsSilent(existing, sym))
+                        continue;
+                    conflictNew = sym;
+                    conflictOld = existing;
+                    oldStatus = status;
+                    break;
+                }
+                if (conflictNew == null) break;
+
+                var newSym = conflictNew;
+                var old = conflictOld!;
+                var result = Runtime.SignalNameConflict(
+                    this, "USE-PACKAGE", newSym, old,
+                    new[] { newSym, old },
+                    keepOld: true, takeNew: true, importChoices: false,
+                    resolve: true, continueRestart: true);
+                switch (result.Choice)
+                {
+                    case Runtime.NameConflictChoice.KeepOld:
+                        Shadow(newSym.Name);
+                        break;
+                    case Runtime.NameConflictChoice.TakeNew:
+                    case Runtime.NameConflictChoice.Continue:
+                        if (oldStatus is SymbolStatus.Internal or SymbolStatus.External)
+                            Unintern(old);
+                        else
+                            ShadowingImport(newSym);
+                        break;
+                    case Runtime.NameConflictChoice.Resolve:
+                        Runtime.ResolveUseExportConflict(this, result.Chosen ?? newSym);
+                        break;
+                    default:
+                        break;
+                }
             }
+
+            _useList.Add(pkg);
+            _useSnapshot = _useList.ToArray();
         }
     }
 
@@ -604,23 +701,45 @@ public class Package : LispObject
     public bool IsExternalSymbol(string name) => _externalSymbols.ContainsKey(name);
 
     // Local nickname API (CDR 5)
-    public void AddLocalNickname(string nickname, Package pkg) =>
-        _localNicknames[nickname] = pkg;
-    public bool RemoveLocalNickname(string nickname) =>
-        _localNicknames.TryRemove(nickname, out _);
+    // ConcurrentDictionary.IsEmpty takes every bucket lock when the dictionary is
+    // empty, and FindPackageNamed asks on each lookup, so threads interning in
+    // parallel queued on it. The flag is rewritten under one lock by every writer.
+    private volatile bool _hasLocalNicknames;
+    private void NoteLocalNicknames() => _hasLocalNicknames = !_localNicknames.IsEmpty;
+
+    public void AddLocalNickname(string nickname, Package pkg)
+    {
+        lock (_localNicknames) { _localNicknames[nickname] = pkg; NoteLocalNicknames(); }
+    }
+    public bool RemoveLocalNickname(string nickname)
+    {
+        lock (_localNicknames)
+        {
+            bool removed = _localNicknames.TryRemove(nickname, out _);
+            NoteLocalNicknames();
+            return removed;
+        }
+    }
     public Package? FindLocalNickname(string nickname) =>
-        !_localNicknames.IsEmpty && _localNicknames.TryGetValue(nickname, out var p) ? p : null;
-    public bool HasLocalNicknames => !_localNicknames.IsEmpty;
+        _hasLocalNicknames && _localNicknames.TryGetValue(nickname, out var p) ? p : null;
+    public bool HasLocalNicknames => _hasLocalNicknames;
     /// <summary>Drop every local nickname that names PKG; true if any was.</summary>
     public bool RemoveLocalNicknamesFor(Package pkg)
     {
-        bool any = false;
-        foreach (var kv in _localNicknames)
-            if (ReferenceEquals(kv.Value, pkg) && _localNicknames.TryRemove(kv.Key, out _))
-                any = true;
-        return any;
+        lock (_localNicknames)
+        {
+            bool any = false;
+            foreach (var kv in _localNicknames)
+                if (ReferenceEquals(kv.Value, pkg) && _localNicknames.TryRemove(kv.Key, out _))
+                    any = true;
+            NoteLocalNicknames();
+            return any;
+        }
     }
-    public void ClearLocalNicknames() => _localNicknames.Clear();
+    public void ClearLocalNicknames()
+    {
+        lock (_localNicknames) { _localNicknames.Clear(); NoteLocalNicknames(); }
+    }
     public IEnumerable<(string Nick, Package Pkg)> LocalNicknames =>
         _localNicknames.Select(kv => (kv.Key, kv.Value));
 
@@ -669,39 +788,83 @@ public class Package : LispObject
             bool isExternal = _externalSymbols.TryGetValue(name, out sym);
             if (!isExternal && !_internalSymbols.TryGetValue(name, out sym))
                 return false;  // symbol not present
+            return RemoveSymbol(sym!, isExternal);
+        }
+    }
 
-            // Check for shadowing conflict before removing
-            if (_shadowingSymbols.Contains(name))
+    /// <summary>Remove SYM itself from this package; a different symbol of the
+    /// same name is left alone (CLHS UNINTERN removes the symbol).</summary>
+    public bool Unintern(Symbol sym)
+    {
+        lock (_pkgLock)
+        {
+            bool isExternal = _externalSymbols.TryGetValue(sym.Name, out var present)
+                              && ReferenceEquals(present, sym);
+            if (!isExternal
+                && !(_internalSymbols.TryGetValue(sym.Name, out present)
+                     && ReferenceEquals(present, sym)))
+                return false;
+            return RemoveSymbol(sym, isExternal);
+        }
+    }
+
+    private bool RemoveSymbol(Symbol sym, bool isExternal)
+    {
+        string name = sym.Name;
+
+        // Check for shadowing conflict before removing
+        if (_shadowingSymbols.Contains(name))
+        {
+            // Count distinct inherited symbols with this name
+            var inherited = new List<Symbol>();
+            foreach (var pkg in _useList)
             {
-                // Count distinct inherited symbols with this name
-                var inherited = new List<Symbol>();
-                foreach (var pkg in _useList)
+                if (pkg._externalSymbols.TryGetValue(name, out var iSym))
                 {
-                    if (pkg._externalSymbols.TryGetValue(name, out var iSym))
-                    {
-                        if (!inherited.Any(s => ReferenceEquals(s, iSym)))
-                            inherited.Add(iSym);
-                    }
-                }
-                if (inherited.Count > 1)
-                {
-                    var err = new LispError(
-                        $"UNINTERN: removing shadowing symbol {name} from {Name} would cause a name conflict");
-                    err.ConditionTypeName = "PACKAGE-ERROR";
-                    err.PackageRef = new LispString(Name);
-                    throw new LispErrorException(err);
+                    if (!inherited.Any(s => ReferenceEquals(s, iSym)))
+                        inherited.Add(iSym);
                 }
             }
+            if (inherited.Count > 1)
+            {
+                var result = Runtime.SignalNameConflict(
+                    this, "UNINTERN", sym, inherited[0], inherited,
+                    keepOld: false, takeNew: false, importChoices: false,
+                    resolve: true, continueRestart: true);
+                if (result.Choice == Runtime.NameConflictChoice.Resolve)
+                {
+                    ResolveUninternConflict(result.Chosen ?? sym);
+                    return true;
+                }
+            }
+        }
 
-            // OK to proceed
-            if (isExternal)
-                _externalSymbols.TryRemove(name, out _);
+        // OK to proceed
+        if (isExternal)
+            _externalSymbols.TryRemove(name, out _);
+        else
+            _internalSymbols.TryRemove(name, out _);
+        _shadowingSymbols.Remove(name);
+        if (ReferenceEquals(sym.HomePackage, this)) sym.HomePackage = null;
+        BumpMappingEpoch();
+        return true;
+    }
+
+    /// <summary>Keep one candidate accessible instead of removing the shadowing
+    /// symbol, as SBCL's RESOLVE-CONFLICT restart does.</summary>
+    private void ResolveUninternConflict(Symbol chosen)
+    {
+        var (present, status) = FindSymbol(chosen.Name);
+        if (status is SymbolStatus.Internal or SymbolStatus.External)
+        {
+            if (ReferenceEquals(present, chosen))
+                Shadow(chosen.Name);
             else
-                _internalSymbols.TryRemove(name, out _);
-            _shadowingSymbols.Remove(name);
-            if (sym!.HomePackage == this) sym.HomePackage = null;
-            BumpMappingEpoch();
-            return true;
+                ShadowingImport(chosen);
+        }
+        else
+        {
+            ShadowingImport(chosen);
         }
     }
 

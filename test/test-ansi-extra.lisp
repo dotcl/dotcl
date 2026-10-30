@@ -338,12 +338,13 @@
       (assert (functionp fn) () "pprint-dispatch fn should be a function, got ~s" fn))))
 
 (check "pprint-dispatch/no-match"
-  ;; Without matching entry, returns (NIL NIL)
+  ;; Without a matching entry, FOUND-P is NIL and the function prints the
+  ;; object as if by PRINT-OBJECT (CLHS PPRINT-DISPATCH).
   (let ((d (copy-pprint-dispatch)))
     (multiple-value-bind (fn match)
       (pprint-dispatch 42 d)
       (assert (null match) () "pprint-dispatch no-match: match should be NIL, got ~s" match)
-      (assert (null fn) () "pprint-dispatch no-match: fn should be NIL, got ~s" fn))))
+      (assert (functionp fn) () "pprint-dispatch no-match: fn should be a function, got ~s" fn))))
 
 ;;; ============================================================
 ;;; Ch.21 Streams: make-broadcast-stream writes to all streams

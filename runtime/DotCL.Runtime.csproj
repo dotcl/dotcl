@@ -1,5 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
+  <Import Project="$(MSBuildThisFileDirectory)../scripts/UnicodeData.props" />
+
   <PropertyGroup>
     <OutputType>Library</OutputType>
     <!-- net10.0 = full dev runtime (compiler/emitter). net8.0 = embeddable runtime
@@ -131,6 +133,9 @@
          pack errors on the missing file instead of silently dropping it (#44). -->
     <None Include="build-tasks/bin/$(Configuration)/net10.0/DotCL.Build.Tasks.dll"
           Pack="true" PackagePath="tasks/" />
+    <!-- What lets the SDK run the task assembly as a program (LispLibrary). -->
+    <None Include="build-tasks/bin/$(Configuration)/net10.0/DotCL.Build.Tasks.runtimeconfig.json"
+          Pack="true" PackagePath="tasks/" />
   </ItemGroup>
 
   <!-- Build the in-process project-core MSBuild task and pack it under tasks/.
@@ -235,20 +240,27 @@
        have no non-emit callers. CilAssembler is split: CilAssembler.cs keeps the
        function registry / constant pool / runtime-codegen guards (used everywhere,
        emit-free) and stays; CilAssembler.Emit.cs holds the ILGenerator body and is
-       removed here. compile-file / save-application in Runtime.Misc.cs are gated by
+       removed here. compile-file / save-application (Runtime.CompileFile.cs, Runtime.SaveApplication.cs) are gated by
        #if DOTCL_EMIT. -->
   <ItemGroup Condition="'$(DotclEmit)' != 'true'">
     <Compile Remove="Emitter/FaslAssembler.cs" />
     <!-- Writing a bundle is writing a FASL, so it goes with FaslAssembler. LOADING
-         one stays: the reader lives in Runtime.Misc.cs and works emit-free, which
+         one stays: the reader lives in Runtime.Load.cs and works emit-free, which
          is the whole point of shipping bundles to an AOT/WebGL target. -->
     <Compile Remove="Emitter/FaslBundle.cs" />
     <Compile Remove="Emitter/CompilerEnv.cs" />
     <Compile Remove="Emitter/IlDisasm.cs" />
     <Compile Remove="Emitter/CilAssembler.Emit.cs" />
+    <Compile Remove="Emitter/CilAssembler.Composite.cs" />
+    <Compile Remove="Emitter/CilAssembler.Constants.cs" />
+    <Compile Remove="Emitter/CilAssembler.FaslData.cs" />
+    <Compile Remove="Emitter/CilAssembler.Resolution.cs" />
+    <Compile Remove="Emitter/CilAssembler.StaticTables.cs" />
+    <Compile Remove="Emitter/CilAssembler.StructIntern.cs" />
     <Compile Remove="Emitter/CilAssembler.Tail.cs" />
     <Compile Remove="Emitter/CilAssembler.SelfFrame.cs" />
     <Compile Remove="Emitter/IlLocalAccess.cs" />
+    <Compile Remove="Emitter/LibraryAbiIL.cs" />
     <Compile Remove="Emitter/CilAssembler.LocalSlots.cs" />
     <Compile Remove="Emitter/CilAssembler.StackTemps.cs" />
     <!-- Runtime .NET class generation (AssemblyBuilder/TypeBuilder); emit-only;
@@ -309,7 +321,7 @@
       <_GenOutPath>$(MSBuildThisFileDirectory)Generated/UnicodeCharNames.g.cs</_GenOutPath>
     </PropertyGroup>
     <MakeDir Directories="$(MSBuildThisFileDirectory)Generated" />
-    <Exec Command="dotnet run --project &quot;$(_GenUtilsProj)&quot; -- download https://unicode.org/Public/UCD/latest/ucd/UnicodeData.txt &quot;$(_UnicodeDataTxt)&quot;"
+    <Exec Command="dotnet run --project &quot;$(_GenUtilsProj)&quot; -- download &quot;$(UnicodeDataUrl)&quot; &quot;$(_UnicodeDataTxt)&quot; $(UnicodeDataSha256)"
           Condition="!Exists('$(_UnicodeDataTxt)')" />
     <Exec Command="dotnet run --project &quot;$(_GenUtilsProj)&quot; -- char-names &quot;$(_UnicodeDataTxt)&quot; &quot;$(_GenOutPath)&quot;" />
   </Target>

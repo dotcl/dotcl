@@ -92,9 +92,9 @@
   (destructuring-bind (a &rest r &key b) '(1 :b 2) (list a r b))
   (1 (:b 2) 2))
 
-(deftest destructuring-bind-key-shape.unrecognized-key-still-accepted
-  (destructuring-bind (a &key b) '(1 :b 2 :zzz 3) (list a b))
-  (1 2))
+(deftest destructuring-bind-key-shape.unrecognized-key-rejected
+  (%dbks (lambda () (destructuring-bind (a &key b) '(1 :b 2 :zzz 3) (list a b))))
+  :program-error)
 
 (deftest destructuring-bind-key-shape.aux-after-key
   (destructuring-bind (a &key b &aux (c 5)) '(1 :b 2) (list a b c))

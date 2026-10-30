@@ -27,6 +27,10 @@
 
 (in-package :cl-user)
 
+(load (merge-pathnames "../steady.lisp"
+                       (or *load-truename* *compile-file-truename*
+                           *default-pathname-defaults*)))
+
 ;;; --- Kernels -----------------------------------------------------------
 
 (defun k-tak (x y z)
@@ -171,6 +175,7 @@
 ;;; bench/ablation is the harness for taking a kernel apart once you are there.
 
 (defparameter *parity-runs* 5)
+(defparameter *parity-since* nil)
 
 (defun parity-ms (repeats thunk)
   (let ((start (get-internal-real-time)))
@@ -180,16 +185,25 @@
        internal-time-units-per-second)))
 
 (defun parity-report (name repeats thunk)
-  ;; One warmup block, discarded: it pays for JIT compilation and for
-  ;; first-touch of whatever the kernel allocates.
-  (parity-ms repeats thunk)
-  (let ((best nil))
-    (dotimes (i *parity-runs*)
-      (let ((ms (parity-ms repeats thunk)))
-        (when (or (null best) (< ms best))
-          (setq best ms))))
-    (format t "~A~C~,3F~%" name #\Tab best)
-    (finish-output *standard-output*)))
+  (if (ledger-steady:env "LEDGER_STEADY")
+      (multiple-value-bind (best runs stable)
+          (ledger-steady:measure
+           (lambda () (dotimes (i repeats) (funcall thunk)))
+           :since *parity-since*)
+        (format t "STEADY ~A ~,3F ~D ~A~%"
+                name (* 1000d0 best) runs
+                (if stable "stable" "unstable")))
+      (progn
+        ;; One warmup block, discarded: it pays for JIT compilation and for
+        ;; first-touch of whatever the kernel allocates.
+        (parity-ms repeats thunk)
+        (let ((best nil))
+          (dotimes (i *parity-runs*)
+            (let ((ms (parity-ms repeats thunk)))
+              (when (or (null best) (< ms best))
+                (setq best ms))))
+          (format t "~A~C~,3F~%" name #\Tab best))))
+  (finish-output *standard-output*))
 
 ;;; --- Inputs ------------------------------------------------------------
 ;;;
@@ -222,6 +236,8 @@
       (setf (schar s i) (code-char (+ 32 (mod i 64)))))))
 
 (defparameter *k-point* (make-k-point 1 2))
+
+(setq *parity-since* (get-internal-real-time))
 
 ;;; --- Main --------------------------------------------------------------
 

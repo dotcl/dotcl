@@ -325,11 +325,14 @@
 ;; The fetch happens once. The loop body is emitted twice, a fast copy and a
 ;; copy for a missing array (struct-raw-backing-unswitch.lisp), so each access
 ;; appears twice.
+;; SRH and SRH-MIX have at most four raw slots, so their instances keep them
+;; in fields: the fetch hands back the instance and the accesses are
+;; RawInlineAt / RawInlineSet. The long[] form is struct-raw-backing-wide.
 (deftest-emitting-only struct-raw-backing-hoist.fetched-once
   (let ((r (%srh-sil #'%srh-rmw)))
-    (list (%srh-count "Runtime.StructRawBacking" r)
-          (%srh-count "LDELEM-I8" r)
-          (%srh-count "STELEM-I8" r)))
+    (list (%srh-count "Runtime.StructRawInline" r)
+          (%srh-count "Runtime.RawInlineAt" r)
+          (%srh-count "Runtime.RawInlineSet" r)))
   (1 4 2))
 
 ;; The excluded shapes emit no fetch at all.
@@ -345,8 +348,8 @@
 ;; loop over the raw slots, so it is emitted twice, and every count doubles.
 (deftest-emitting-only struct-raw-backing-hoist.boxed-slot-keeps-the-old-path
   (let ((r (%srh-sil #'%srh-mix-raw)))
-    (list (%srh-count "Runtime.StructRawBacking" r)
-          (%srh-count "LDELEM-I8" r)
+    (list (%srh-count "Runtime.StructRawInline" r)
+          (%srh-count "Runtime.RawInlineAt" r)
           (%srh-count "Runtime.StructRefI" r)))
   (1 6 2))
 

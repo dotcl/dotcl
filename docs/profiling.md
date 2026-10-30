@@ -19,7 +19,7 @@ Collect a CPU profile by launching your program under it:
 
 ```
 dotnet-trace collect --format speedscope -o app.nettrace -- \
-    dotcl run app.lisp
+    dotcl app.lisp
 ```
 
 The trace stops when the program exits (or press Enter). To attach to an
@@ -108,7 +108,7 @@ For "what is my hot loop allocating", the runtime has a per-type counter that is
 cheaper to read than a full allocation profile:
 
 ```
-DOTCL_ALLOC_PROF=1 dotcl run app.lisp
+DOTCL_ALLOC_PROF=1 dotcl app.lisp
 ```
 
 and in the program, around the region of interest:
@@ -125,7 +125,7 @@ A count says what is being allocated, not who allocates it. To get the callers,
 name one type to sample stacks for:
 
 ```
-DOTCL_ALLOC_PROF=1 DOTCL_ALLOC_STACK=LispFunction dotcl run app.lisp
+DOTCL_ALLOC_PROF=1 DOTCL_ALLOC_STACK=LispFunction dotcl app.lisp
 ```
 
 and print them with `(dotcl:alloc-stacks)` (optionally with how many stacks to

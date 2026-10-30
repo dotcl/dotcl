@@ -20,6 +20,15 @@
 ;;; the lock file. Unit names are case-insensitive; a unit's packages print
 ;;; with the upcased name as prefix (X@2!X). A system the lock does not name is
 ;;; loaded as ASDF finds it, with a SYSTEM-NOT-IN-LOCK style warning.
+;;;
+;;; Without a lock file, ADD-UNIT puts the systems of one .asd file in a unit
+;;; of their own and leaves everything else as ASDF finds it:
+;;;
+;;;   (dotcl-lock:add-unit "swank@new" "/src/slime/swank.asd")
+;;;   (dotcl-lock:call-in-unit "swank@new"
+;;;     (lambda () (asdf:load-system "swank")
+;;;                (uiop:symbol-call :swank :create-server :port 4006)))
+;;;
 ;;; Experimental; the format may change.
 
 (require "asdf")
@@ -27,7 +36,7 @@
 
 (defpackage :dotcl-lock
   (:use :cl)
-  (:export #:use-lock #:find-unit #:call-in-unit #:unit-name
+  (:export #:use-lock #:add-unit #:find-unit #:call-in-unit #:unit-name
            #:system-unit #:call-in-system-unit
            #:system-not-in-lock #:system-not-in-lock-name))
 
@@ -116,11 +125,17 @@ nested way back to the global namespace.")
 
 (defun initial-values (unit)
   (flet ((v (name package) (symbol-value (asdf-var name package))))
-    (let ((own-system (lambda (n) (owned-system-p unit n)))
-          (own-package (lambda (n) (owned-package-p unit n)))
-          (translations (progn (asdf:ensure-output-translations)
-                               (v "*OUTPUT-TRANSLATIONS*" "ASDF/OUTPUT-TRANSLATIONS"))))
-      (list (copy-table-without (v "*REGISTERED-SYSTEMS*" "ASDF/SYSTEM-REGISTRY") own-system)
+    (let* ((registered (v "*REGISTERED-SYSTEMS*" "ASDF/SYSTEM-REGISTRY"))
+           (own-system (lambda (n) (owned-system-p unit n)))
+           ;; A system from a .asd is reached through a proxy, so a unit made
+           ;; after it was loaded does not compile and load it again.
+           (not-copied (lambda (n)
+                         (or (owned-system-p unit n)
+                             (asdf:system-source-file (gethash n registered)))))
+           (own-package (lambda (n) (owned-package-p unit n)))
+           (translations (progn (asdf:ensure-output-translations)
+                                (v "*OUTPUT-TRANSLATIONS*" "ASDF/OUTPUT-TRANSLATIONS"))))
+      (list (copy-table-without registered not-copied)
             (copy-table-without (v "*PRELOADED-SYSTEMS*" "ASDF/SYSTEM-REGISTRY") own-system)
             (copy-table-without (v "*IMMUTABLE-SYSTEMS*" "ASDF/SYSTEM-REGISTRY") own-system)
             nil
@@ -276,7 +291,8 @@ so they are loaded here, once, in this plan's order."
 
 (defun note-not-in-lock (name)
   (let ((primary (asdf:primary-system-name name)))
-    (unless (or (find primary (getf *lock* :systems) :key #'first :test #'string=)
+    (unless (or (not (getf *lock* :complete))
+                (find primary (getf *lock* :systems) :key #'first :test #'string=)
                 (asdf:registered-system primary)
                 (member primary *warned-not-in-lock* :test #'string=))
       (push primary *warned-not-in-lock*)
@@ -294,7 +310,7 @@ so they are loaded here, once, in this plan's order."
 
 (defun unit-only-system-p (name)
   "True outside every unit for a system the lock loads only inside units."
-  (and *lock* (null *unit*)
+  (and *lock* (getf *lock* :complete) (null *unit*)
        (let* ((primary (asdf:primary-system-name name))
               (entries (remove primary (getf *lock* :systems) :key #'first :test-not #'string=)))
          (and entries
@@ -312,7 +328,9 @@ some version of it."
 (defun use-lock (pathname)
   "Read the lock file at PATHNAME, make its units, and have ASDF find the
 systems it names there. Call it once, before loading any system it names."
-  (when *lock* (error "dotcl-lock: a lock is already in use"))
+  (when *lock*
+    (error "dotcl-lock: ~:[units from ADD-UNIT are~;a lock is~] already in use; ~
+            call USE-LOCK once, before ADD-UNIT" (getf *lock* :complete)))
   (let* ((pathname (merge-pathnames pathname))
          (base (uiop:pathname-directory-pathname pathname))
          (lock (read-lock pathname)))
@@ -336,6 +354,107 @@ systems it names there. Call it once, before loading any system it names."
                                                  collect (first e)))))
         (setf (unit-object unit) (make-unit name (unit-packages unit) (initial-values unit))
               (gethash name *units*) unit)))
-    (setf *lock* lock)
+    (setf *lock* (list* :complete t lock))
     (pushnew 'sysdef-lock-search asdf:*system-definition-search-functions*)
     pathname))
+
+;;; Units without a lock file
+
+(defun blank-p (c) (member c '(#\Space #\Tab #\Newline #\Return #\Page)))
+
+(defun token-end (text start)
+  (or (position-if (lambda (c) (or (blank-p c) (member c '(#\( #\) #\' #\"))))
+                   text :start start)
+      (length text)))
+
+(defun name-at (text start)
+  "The name the token after START spells -- FOO, :FOO, #:FOO or \"Foo\" -- as a
+string, whether it was a string, and where it ends."
+  (let ((start (or (position-if-not #'blank-p text :start start) (length text))))
+    (cond ((>= start (length text)) nil)
+          ((char= (char text start) #\")
+           (let ((end (position #\" text :start (1+ start))))
+             (and end (values (subseq text (1+ start) end) t (1+ end)))))
+          (t (let* ((s (cond ((eql (search "#:" text :start2 start :end2 (min (length text) (+ start 2)))
+                                   start)
+                              (+ start 2))
+                             ((char= (char text start) #\:) (1+ start))
+                             (t start)))
+                    (end (token-end text s)))
+               (and (< s end) (values (string-upcase (subseq text s end)) nil end)))))))
+
+(defun scan-forms (file operators &optional lists)
+  "The names the forms in FILE whose operator (in any package) is one of
+OPERATORS define, as (name . stringp), and every name in the forms whose
+operator is one of LISTS. The text is scanned, not read, so a form whose
+package or reader macro does not exist yet still counts."
+  (let ((text (uiop:read-file-string file :external-format :latin-1))
+        (found '()))
+    (loop for open = (position #\( text) then (position #\( text :start (1+ open))
+          while open
+          do (let* ((s (1+ open))
+                    (e (token-end text s))
+                    (op (string-upcase (subseq text s e)))
+                    (op (subseq op (1+ (or (position #\: op :from-end t) -1))))
+                    (all (member op lists :test #'string=)))
+               (when (or all (member op operators :test #'string=))
+                 (loop (multiple-value-bind (name stringp end) (name-at text e)
+                         (unless name (return))
+                         (push (cons name stringp) found)
+                         (unless all (return))
+                         (setf e end))))))
+    (nreverse found)))
+
+(defun defined-packages (directory)
+  "The names and nicknames of the packages the Lisp files under DIRECTORY
+define, and the modules they provide: a unit owns the modules its packages
+name."
+  (let ((names '()))
+    (dolist (file (directory (merge-pathnames "**/*.lisp" directory)))
+      (loop for (name . nil) in (scan-forms file '("DEFPACKAGE" "DEFINE-PACKAGE" "MAKE-PACKAGE"
+                                                   "PROVIDE")
+                                            '("NICKNAMES"))
+            do (pushnew name names :test #'string=)))
+    (sort names #'string<)))
+
+(defun defined-systems (asd)
+  "The primary names of the systems ASD defines."
+  (let ((names '()))
+    (loop for (name . stringp) in (scan-forms asd '("DEFSYSTEM"))
+          do (pushnew (asdf:primary-system-name (if stringp name (string-downcase name)))
+                      names :test #'string=))
+    (nreverse names)))
+
+(defun add-unit (name asd &key packages systems)
+  "Make a unit NAME in which the systems the .asd file ASD defines are loaded
+from ASD, and return NAME upcased. Inside the unit the packages of those
+systems have their plain names; outside it they print as NAME!PACKAGE.
+PACKAGES (names of packages and modules; a trailing * matches any suffix)
+defaults to the names the DEFPACKAGE, DEFINE-PACKAGE, MAKE-PACKAGE, PROVIDE
+and :NICKNAMES forms under ASD's directory spell; SYSTEMS to the systems ASD
+defines. Any other system is found and loaded as ASDF finds it, once,
+outside every unit. Call ASDF and the entry
+points of the systems in the unit with CALL-IN-UNIT."
+  (let* ((name (string-upcase name))
+         (asd (or (probe-file (merge-pathnames asd))
+                  (error "dotcl-lock: no .asd file ~A" asd)))
+         (systems (or systems (defined-systems asd)
+                      (error "dotcl-lock: ~A defines no system" asd)))
+         (packages (or packages
+                       (defined-packages (uiop:pathname-directory-pathname asd))
+                       (error "dotcl-lock: no package definition under ~A; pass :PACKAGES"
+                              (uiop:pathname-directory-pathname asd)))))
+    (unless *lock*
+      (setf *global* nil)
+      (ensure-global-unit)
+      (setf *lock* (list :systems '()))
+      (pushnew 'sysdef-lock-search asdf:*system-definition-search-functions*))
+    (when (find name (getf *lock* :systems) :key (lambda (e) (getf (rest e) :unit)) :test #'equal)
+      (error "dotcl-lock: there is already a unit ~A" name))
+    (let ((unit (%make-unit :name name :packages packages :systems systems)))
+      (setf (unit-object unit) (make-unit name packages (initial-values unit))
+            (gethash name *units*) unit))
+    (setf (getf *lock* :systems)
+          (append (getf *lock* :systems)
+                  (loop for s in systems collect (list s :asd asd :unit name))))
+    name))

@@ -50,3 +50,12 @@ coarser than one per line: the arms of an `if` do not currently carry their own
 points, so a line inside a branch that never ran can still be reported as
 covered. Treat the output as reliable at the level of "was this function
 exercised", and as approximate within a function.
+
+## Which runtime calls the regression suite reaches
+
+A separate, dotcl-internal measure: `make call-coverage` runs the compiled
+regression suite with `DOTCL_CALL_COVERAGE=<dir>` set. The assembler then counts
+every `CALL` / `CALLVIRT` it emits and puts a counter in front of each, and each
+process writes its counts to `<dir>` on exit. The report in `out/call-coverage/`
+lists the methods named by the compiler that no generated code ran. Without the
+variable the generated code is unchanged.

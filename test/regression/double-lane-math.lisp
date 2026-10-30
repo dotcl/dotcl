@@ -48,6 +48,10 @@
   (declare (double-float x))
   (+ (exp x) 0d0))
 
+(defun %dlm-exp-3 (x)
+  (declare (double-float x) (optimize (safety 3)))
+  (+ (exp x) 0d0))
+
 (defun %dlm-log (x)
   (declare (double-float x))
   (+ (log x) 0d0))
@@ -62,7 +66,7 @@
 (deftest-emitting-only double-lane-math.shape
   (list (%dlm-has "Math.SinDouble" #'%dlm-trig)
         (%dlm-has "Math.TanhDouble" #'%dlm-trig)
-        (%dlm-has "Runtime.ExpDouble" #'%dlm-trig)
+        (%dlm-has "Math.ExpDouble" #'%dlm-trig)
         (%dlm-has "Runtime.Add" #'%dlm-trig)
         (%dlm-has "Runtime.Add" #'%dlm-float-sum)
         (%dlm-has "Runtime.Add" #'%dlm-sin-sum)
@@ -99,10 +103,11 @@
           (%dlm-exp -1000d0)))
   (t 90d0 t 3d0 3d0 t t 0d0))
 
-(deftest double-lane-math.exp-overflow-signals
-  (handler-case (progn (%dlm-exp 1000d0) :no-error)
-    (floating-point-overflow () :overflow))
-  :overflow)
+(deftest-compiled-only double-lane-math.exp-overflow-signals
+  (list (handler-case (progn (%dlm-exp-3 1000d0) :no-error)
+          (floating-point-overflow () :overflow))
+        (> (%dlm-exp 1000d0) most-positive-double-float))
+  (:overflow t))
 
 (deftest double-lane-math.complex-results-stay-generic
   (list (complexp (%dlm-log -1d0))
@@ -130,13 +135,24 @@
         (%dlm-has "LogDouble" #'%dlm-log))
   (t t nil nil))
 
+(defun %dlm-log-the-safe (x)
+  (declare (double-float x) (optimize (safety 3)))
+  (+ (the double-float (log x)) 0d0))
+
+;; Zero is the IEEE -inf below (safety 3) and DIVISION-BY-ZERO at it.
 (deftest double-lane-math.log-values
   (list (= (%dlm-log-the 2.5d0) (log 2.5d0))
         (%dlm-log-the 1d0)
-        (handler-case (progn (%dlm-log-the 0d0) :no-error)
-          (division-by-zero () :division-by-zero))
-        (handler-case (progn (%dlm-log-the-unsafe 0d0) :no-error)
-          (division-by-zero () :division-by-zero))
+        (%dlm-log-the 0d0)
+        (%dlm-log-the-unsafe 0d0)
         (handler-case (progn (%dlm-log-the -1d0) :no-error)
           (type-error () :type-error)))
-  (t 0d0 :division-by-zero :division-by-zero :type-error))
+  (t 0d0 #.dotcl:double-float-negative-infinity #.dotcl:double-float-negative-infinity
+   :type-error))
+
+(deftest-compiled-only double-lane-math.log-zero-safety-3
+  (list (handler-case (progn (%dlm-log-the-safe 0d0) :no-error)
+          (division-by-zero () :division-by-zero))
+        (handler-case (progn (%dlm-log-the-safe -1d0) :no-error)
+          (type-error () :type-error)))
+  (:division-by-zero :type-error))

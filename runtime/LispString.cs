@@ -79,14 +79,14 @@ public sealed class LispString : LispObject
     {
         EnsureMutable();
         for (int i = start; i < end; i++)
-            _chars![i] = char.ToUpperInvariant(_chars[i]);
+            _chars![i] = CharCase.Upcase(_chars[i]);
     }
 
     public void ToLowerInPlace(int start, int end)
     {
         EnsureMutable();
         for (int i = start; i < end; i++)
-            _chars![i] = char.ToLowerInvariant(_chars[i]);
+            _chars![i] = CharCase.Downcase(_chars[i]);
     }
 
     public void ToCapitalizeInPlace(int start, int end)
@@ -100,7 +100,7 @@ public sealed class LispString : LispObject
             char c = _chars![i];
             if (char.IsLetter(c))
             {
-                _chars[i] = wordBoundary ? char.ToUpperInvariant(c) : char.ToLowerInvariant(c);
+                _chars[i] = wordBoundary ? CharCase.Upcase(c) : CharCase.Downcase(c);
                 wordBoundary = false;
             }
             else if (char.IsDigit(c))

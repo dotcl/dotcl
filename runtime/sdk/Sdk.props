@@ -30,6 +30,14 @@
        OutputType to Library, TFM to empty). The consumer's own PropertyGroups
        run AFTER this whole file, so any of these remains overridable. -->
   <PropertyGroup>
+    <UsingDotCLSdk>true</UsingDotCLSdk>
+    <!-- A project with <LispLibrary> or <LispSystem> items is a .NET library
+         written in Lisp (see Sdk.targets). Items are not visible while
+         properties are evaluated, so the project file is read for the
+         element; a project that gets those items from an import sets
+         <DotclLispLibrary>true</DotclLispLibrary> itself. -->
+    <DotclLispLibrary Condition="'$(DotclLispLibrary)' == '' and Exists('$(MSBuildProjectFullPath)') and ($([System.IO.File]::ReadAllText('$(MSBuildProjectFullPath)').Contains('&lt;LispLibrary')) or $([System.IO.File]::ReadAllText('$(MSBuildProjectFullPath)').Contains('&lt;LispSystem')))">true</DotclLispLibrary>
+    <OutputType Condition="'$(OutputType)' == '' and '$(DotclLispLibrary)' == 'true'">Library</OutputType>
     <!-- A CL app is an executable by default (a Lisp entry point hosted by a
          thin C# Main). Set <OutputType>Library</OutputType> for a library. -->
     <OutputType Condition="'$(OutputType)' == ''">Exe</OutputType>
@@ -45,6 +53,17 @@
     <Nullable Condition="'$(Nullable)' == ''">enable</Nullable>
   </PropertyGroup>
 
+  <!-- A Lisp library's assembly is written by dotcl, not by the C# compiler:
+       no C# sources, no reference assembly or PDB from csc, and its
+       dependencies (DotCL.Runtime) copied beside it like a plugin's. -->
+  <PropertyGroup Condition="'$(DotclLispLibrary)' == 'true'">
+    <EnableDefaultCompileItems Condition="'$(EnableDefaultCompileItems)' == ''">false</EnableDefaultCompileItems>
+    <ProduceReferenceAssembly Condition="'$(ProduceReferenceAssembly)' == ''">false</ProduceReferenceAssembly>
+    <DebugType Condition="'$(DebugType)' == ''">none</DebugType>
+    <DebugSymbols Condition="'$(DebugSymbols)' == ''">false</DebugSymbols>
+    <CopyLocalLockFileAssemblies Condition="'$(CopyLocalLockFileAssemblies)' == ''">true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
   <Import Project="Sdk.props" Sdk="Microsoft.NET.Sdk" />
 
   <PropertyGroup>
@@ -54,6 +73,6 @@
          <DotCLRuntimeVersion> to pin a different runtime.
          NOTE: kept in sync with the SDK package version at pack time; the literal
          below is the fallback for a locally built SDK. -->
-    <DotCLRuntimeVersion Condition="'$(DotCLRuntimeVersion)' == ''">0.1.35</DotCLRuntimeVersion>
+    <DotCLRuntimeVersion Condition="'$(DotCLRuntimeVersion)' == ''">0.1.36</DotCLRuntimeVersion>
   </PropertyGroup>
 </Project>

@@ -65,6 +65,10 @@ public static partial class Runtime
         // (error 'condition-type) or (error 'condition-type :initarg val ...); create condition instance
         if (args[0] is Symbol sym)
         {
+            var conditionType = Startup.Sym("CONDITION");
+            if (Subtypep(sym, conditionType) == Nil.Instance)
+                throw new LispErrorException(new LispTypeError(
+                    $"{sym} does not designate a condition class", sym, conditionType));
             var initargs = args.SubArray(1);
             return MakeConditionFromType(sym, initargs);
         }
@@ -91,7 +95,10 @@ public static partial class Runtime
             return simpleErr;
         }
         if (FormatControlText(args[0]) is not string fmtText)
-            return new LispError(args[0].ToString());
+            throw new LispErrorException(new LispTypeError(
+                $"{args[0]} is not a condition designator", args[0],
+                List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("FUNCTION"),
+                     Startup.Sym("SYMBOL"), Startup.Sym("CONDITION"))));
         string message;
         try { message = ((LispString)Format(Nil.Instance, args)).Value; }
         catch { message = fmtText; }
@@ -124,7 +131,7 @@ public static partial class Runtime
         LispRestart? restart;
         if (name is LispRestart r)
         {
-            restart = RestartClusterStack.FindRestart(name, null) as LispRestart;
+            restart = RestartClusterStack.IsActive(r) ? r : null;
         }
         else
         {
@@ -369,22 +376,24 @@ public static partial class Runtime
             {
                 var lic = new LispInstanceCondition(li);
                 // Store format-control/format-arguments/package on wrapper
+                bool wfcSeen = false, wfaSeen = false, wpkgSeen = false, wpathSeen = false,
+                     wopSeen = false, woperandsSeen = false;
                 for (int j = 0; j + 1 < initargs.Length; j += 2)
                 {
                     if (initargs[j] is Symbol ik)
                     {
-                        if (ik.Name == "FORMAT-CONTROL")
-                            lic.FormatControl = initargs[j+1];
-                        else if (ik.Name == "FORMAT-ARGUMENTS")
-                            lic.FormatArguments = initargs[j+1];
-                        else if (ik.Name == "PACKAGE")
-                            lic.PackageRef = initargs[j+1];
-                        else if (ik.Name == "PATHNAME")
-                            lic.FileErrorPathnameRef = initargs[j+1];
-                        else if (ik.Name == "OPERATION")
-                            lic.OperationRef = initargs[j+1];
-                        else if (ik.Name == "OPERANDS")
-                            lic.OperandsRef = initargs[j+1];
+                        if (!wfcSeen && ik.Name == "FORMAT-CONTROL")
+                        { lic.FormatControl = initargs[j+1]; wfcSeen = true; }
+                        else if (!wfaSeen && ik.Name == "FORMAT-ARGUMENTS")
+                        { lic.FormatArguments = initargs[j+1]; wfaSeen = true; }
+                        else if (!wpkgSeen && ik.Name == "PACKAGE")
+                        { lic.PackageRef = initargs[j+1]; wpkgSeen = true; }
+                        else if (!wpathSeen && ik.Name == "PATHNAME")
+                        { lic.FileErrorPathnameRef = initargs[j+1]; wpathSeen = true; }
+                        else if (!wopSeen && ik.Name == "OPERATION")
+                        { lic.OperationRef = initargs[j+1]; wopSeen = true; }
+                        else if (!woperandsSeen && ik.Name == "OPERANDS")
+                        { lic.OperandsRef = initargs[j+1]; woperandsSeen = true; }
                     }
                 }
                 return lic;
@@ -403,19 +412,22 @@ public static partial class Runtime
         // Extract :format-control and :format-arguments if provided
         LispObject formatControl = Nil.Instance;
         LispObject formatArguments = Nil.Instance;
+        bool fcSeen = false, faSeen = false;
         for (int i = 0; i + 1 < initargs.Length; i += 2)
         {
             if (initargs[i] is Symbol k)
             {
-                if (k.Name == "FORMAT-CONTROL")
+                if (!fcSeen && k.Name == "FORMAT-CONTROL")
                 {
                     formatControl = initargs[i+1];
                     if (FormatControlText(initargs[i+1]) is string fs)
                         msg = fs;
+                    fcSeen = true;
                 }
-                else if (k.Name == "FORMAT-ARGUMENTS")
+                else if (!faSeen && k.Name == "FORMAT-ARGUMENTS")
                 {
                     formatArguments = initargs[i+1];
+                    faSeen = true;
                 }
             }
         }
@@ -435,18 +447,19 @@ public static partial class Runtime
         result.FormatControl = formatControl;
         result.FormatArguments = formatArguments;
         // Extract :PACKAGE and :PATHNAME initargs for condition-specific slots
+        bool pkgSeen = false, pathSeen = false, opSeen = false, operandsSeen = false;
         for (int i = 0; i + 1 < initargs.Length; i += 2)
         {
             if (initargs[i] is Symbol pk)
             {
-                if (pk.Name == "PACKAGE")
-                    result.PackageRef = initargs[i+1];
-                else if (pk.Name == "PATHNAME")
-                    result.FileErrorPathnameRef = initargs[i+1];
-                else if (pk.Name == "OPERATION")
-                    result.OperationRef = initargs[i+1];
-                else if (pk.Name == "OPERANDS")
-                    result.OperandsRef = initargs[i+1];
+                if (!pkgSeen && pk.Name == "PACKAGE")
+                { result.PackageRef = initargs[i+1]; pkgSeen = true; }
+                else if (!pathSeen && pk.Name == "PATHNAME")
+                { result.FileErrorPathnameRef = initargs[i+1]; pathSeen = true; }
+                else if (!opSeen && pk.Name == "OPERATION")
+                { result.OperationRef = initargs[i+1]; opSeen = true; }
+                else if (!operandsSeen && pk.Name == "OPERANDS")
+                { result.OperandsRef = initargs[i+1]; operandsSeen = true; }
             }
         }
         // Set the CL condition type name so TYPE-OF returns correctly
@@ -459,12 +472,13 @@ public static partial class Runtime
     {
         LispObject? datum = null;
         LispObject? expectedType = null;
+        bool datumSeen = false, expectedSeen = false;
         for (int i = 0; i + 1 < initargs.Length; i += 2)
         {
             if (initargs[i] is Symbol k)
             {
-                if (k.Name == "DATUM") datum = initargs[i+1];
-                else if (k.Name == "EXPECTED-TYPE") expectedType = initargs[i+1];
+                if (!datumSeen && k.Name == "DATUM") { datum = initargs[i+1]; datumSeen = true; }
+                else if (!expectedSeen && k.Name == "EXPECTED-TYPE") { expectedType = initargs[i+1]; expectedSeen = true; }
             }
         }
         return new LispTypeError(msg, datum ?? Nil.Instance, expectedType ?? Nil.Instance);
@@ -564,6 +578,34 @@ public static partial class Runtime
         return ConditionSystem.Warn(warn);
     }
 
+    /// <summary>Run HOOK-SYMBOL's function with the condition and the hook,
+    /// binding the variable to NIL while it runs, as SBCL's RUN-HOOK does.</summary>
+    private static void RunDebuggerHook(Symbol hookSymbol, LispObject condition)
+    {
+        if (!DynamicBindings.TryGet(hookSymbol, out var hookVal) || hookVal is Nil) return;
+        DynamicBindings.Push(hookSymbol, Nil.Instance);
+        try
+        {
+            if (hookVal is LispFunction fn)
+                fn.InvokeNoFrame(condition, hookVal);
+            else
+                Runtime.Funcall(hookVal, new[] { condition, hookVal });
+        }
+        finally
+        {
+            DynamicBindings.Pop(hookSymbol);
+        }
+    }
+
+    /// <summary>INVOKE-DEBUGGER's body: run dotcl:*INVOKE-DEBUGGER-HOOK*, then
+    /// *DEBUGGER-HOOK*, then enter the debugger.</summary>
+    private static LispObject EnterDebuggerWithHooks(LispObject condition)
+    {
+        RunDebuggerHook(Startup.SymInPkg("*INVOKE-DEBUGGER-HOOK*", "DOTCL"), condition);
+        RunDebuggerHook(Startup.Sym("*DEBUGGER-HOOK*"), condition);
+        return Debugger.Enter(condition);
+    }
+
     internal static void RegisterConditionsBuiltins()
     {
         // CERROR: continuable error
@@ -576,106 +618,26 @@ public static partial class Runtime
                 var datum = args[1];
                 var restArgs = args.Length > 2 ? args.SubArray(2) : Array.Empty<LispObject>();
 
-                string continueDescription;
-                if (Runtime.FormatControlText(continueFormatString) is string cfsText)
-                {
-                    try
-                    {
-                        var fmtResult = Runtime.Format(Nil.Instance,
-                            new LispObject[] { continueFormatString }.Concat(restArgs).ToArray());
-                        continueDescription = fmtResult is LispString ls ? ls.Value : fmtResult.ToString();
-                    }
-                    catch
-                    {
-                        continueDescription = cfsText;
-                    }
-                }
-                else
-                {
-                    continueDescription = continueFormatString?.ToString() ?? "Continue";
-                }
+                // Same construction and validation as ERROR.
+                var condition = ErrorCondition(
+                    new LispObject[] { datum }.Concat(restArgs).ToArray());
 
-                LispCondition condition;
-                if (datum is LispCondition cond)
-                {
-                    condition = cond;
-                }
-                else if (datum is LispInstance errInst)
-                {
-                    condition = new LispInstanceCondition(errInst);
-                }
-                else if (datum is Symbol sym)
-                {
-                    condition = Runtime.MakeConditionFromType(sym, restArgs);
-                }
-                else if (Runtime.FormatControlText(datum) is string template)
-                {
-                    var errFmt = datum;
-                    try
-                    {
-                        var fmtResult = Runtime.Format(Nil.Instance,
-                            new LispObject[] { errFmt }.Concat(restArgs).ToArray());
-                        var msg = fmtResult is LispString ls2 ? ls2.Value : fmtResult.ToString();
-                        var err = new LispError(msg);
-                        err.ConditionTypeName = "SIMPLE-ERROR";
-                        err.FormatControl = errFmt;
-                        err.FormatArguments = Runtime.List(restArgs);
-                        condition = err;
-                    }
-                    catch
-                    {
-                        condition = new LispError(template);
-                    }
-                }
-                else if (datum is LispFunction fmtFn)
-                {
-                    try
-                    {
-                        var fmtResult = Runtime.Format(Nil.Instance,
-                            new LispObject[] { datum }.Concat(restArgs).ToArray());
-                        var msg = fmtResult is LispString ls3 ? ls3.Value : fmtResult.ToString();
-                        var err = new LispError(msg);
-                        err.ConditionTypeName = "SIMPLE-ERROR";
-                        err.FormatControl = datum;
-                        err.FormatArguments = Runtime.List(restArgs);
-                        condition = err;
-                    }
-                    catch
-                    {
-                        condition = new LispError("Error (function format control)");
-                    }
-                }
-                else
-                {
-                    condition = new LispError(datum?.ToString() ?? "Unknown error");
-                }
+                var reportControl = continueFormatString;
+                var reportArgs = restArgs;
+                var reportFunction = new LispFunction(ra => Runtime.Format(ra[0],
+                    new LispObject[] { reportControl }.Concat(reportArgs).ToArray()),
+                    "CERROR-REPORT", 1);
 
                 var restart = new LispRestart("CONTINUE",
                     _ => Nil.Instance,
-                    description: continueDescription);
+                    description: null);
+                restart.ReportFunction = reportFunction;
                 RestartClusterStack.PushCluster(new[] { restart });
                 try
                 {
                     HandlerClusterStack.Signal(condition);
                     // No handler took it: enter debugger with CONTINUE restart still on stack.
-                    // *debugger-hook* is called first (matching invoke-debugger behaviour).
-                    var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
-                    if (DynamicBindings.TryGet(hookSym, out var hookVal) && hookVal is not Nil)
-                    {
-                        DynamicBindings.Push(hookSym, Nil.Instance);
-                        try
-                        {
-                            if (hookVal is LispFunction hookFn)
-                                hookFn.InvokeNoFrame(condition, hookVal);
-                            else
-                                Runtime.Funcall(hookVal, new[] { condition, hookVal });
-                        }
-                        finally
-                        {
-                            DynamicBindings.Pop(hookSym);
-                        }
-                    }
-                    Debugger.Enter(condition);
+                    EnterDebuggerWithHooks(condition);
                     // Defensive: Debugger.Enter does not return. The handlers
                     // have seen this condition already.
                     throw LispErrorException.WithoutSignal(condition);
@@ -793,12 +755,12 @@ public static partial class Runtime
             if (args.Length > 1)
                 return Runtime.FindRestart(args[0], args[1]);
             return Runtime.FindRestart(args[0]);
-        }, "FIND-RESTART", -1));
+        }, "FIND-RESTART", -1).WithArgCount(1, 2));
         Emitter.CilAssembler.RegisterFunction("COMPUTE-RESTARTS", new LispFunction(args => {
             if (args.Length > 0)
                 return Runtime.ComputeRestarts(args[0]);
             return Runtime.ComputeRestarts();
-        }, "COMPUTE-RESTARTS", -1));
+        }, "COMPUTE-RESTARTS", -1).WithArgCount(0, 1));
         Startup.RegisterUnary("PACKAGE-ERROR-PACKAGE", obj => Runtime.PackageErrorPackage(obj));
         Startup.RegisterUnary("ARITHMETIC-ERROR-OPERATION", obj => {
             {
@@ -821,25 +783,9 @@ public static partial class Runtime
             return Nil.Instance;
         });
         Startup.RegisterUnary("INVOKE-DEBUGGER", condition => {
-            var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
-            if (DynamicBindings.TryGet(hookSym, out var hookVal) && hookVal is not Nil)
-            {
-                DynamicBindings.Push(hookSym, Nil.Instance);
-                try
-                {
-                    if (hookVal is LispFunction fn)
-                        fn.InvokeNoFrame(condition, hookVal);
-                    else
-                        Runtime.Funcall(hookVal, new[] { condition, hookVal });
-                }
-                finally
-                {
-                    DynamicBindings.Pop(hookSym);
-                }
-            }
             // Hook returned or was NIL -> enter standard debugger
             // Debugger.Enter never returns normally (exits via restart invocation)
-            return Debugger.Enter(condition);
+            return EnterDebuggerWithHooks(condition);
         });
         DotCL.Emitter.CilAssembler.RegisterFunction("BREAK", new LispFunction(args => {
             // Build condition message
@@ -864,12 +810,13 @@ public static partial class Runtime
             RestartClusterStack.PushCluster(new[] { continueRestart });
             try
             {
-                // Bind *debugger-hook* to NIL and enter debugger directly
+                // Bind *debugger-hook* to NIL, as CLHS requires for BREAK, and
+                // let the invoke-debugger path run *invoke-debugger-hook*.
                 var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
                 DynamicBindings.Push(hookSym, Nil.Instance);
                 try
                 {
-                    Debugger.Enter(condition);
+                    EnterDebuggerWithHooks(condition);
                 }
                 finally
                 {
@@ -889,15 +836,15 @@ public static partial class Runtime
         Startup.RegisterUnary("RESTART-NAME", obj => {
             if (obj is LispRestart r)
             {
-                if (r.NameSymbol != null) return r.NameSymbol;
-                return r.Name != null ? (LispObject)Startup.Sym(r.Name) : Nil.Instance;
+                if (r.NameSymbol != null) return CanonicalizeSymbol(r.NameSymbol);
+                return r.Name != null ? Startup.SymValue(r.Name) : Nil.Instance;
             }
             throw new LispErrorException(new LispTypeError("RESTART-NAME: not a restart", obj));
         });
         Startup.RegisterUnary("INVOKE-RESTART-INTERACTIVELY", obj => {
             LispRestart? restart = null;
             if (obj is LispRestart r)
-                restart = r;
+                restart = RestartClusterStack.IsActive(r) ? r : null;
             else
             {
                 string name = obj is Symbol s ? s.Name : obj is LispString ls ? ls.Value : obj.ToString()!;
@@ -925,7 +872,7 @@ public static partial class Runtime
             if (restart == null) return Nil.Instance;
             if (restart.IsBindRestart) return restart.Handler(new[] { val });
             throw new RestartInvocationException(restart.Tag, new[] { val });
-        }, "STORE-VALUE", -1));
+        }, "STORE-VALUE", -1).WithArgCount(1, 2));
         Emitter.CilAssembler.RegisterFunction("USE-VALUE", new LispFunction(args => {
             var val = args.Length > 0 ? args[0] : Nil.Instance;
             LispObject? condition = args.Length > 1 ? args[1] : null;
@@ -933,14 +880,14 @@ public static partial class Runtime
             if (restart == null) return Nil.Instance;
             if (restart.IsBindRestart) return restart.Handler(new[] { val });
             throw new RestartInvocationException(restart.Tag, new[] { val });
-        }, "USE-VALUE", -1));
+        }, "USE-VALUE", -1).WithArgCount(1, 2));
         Emitter.CilAssembler.RegisterFunction("CONTINUE", new LispFunction(args => {
             LispObject? condition = args.Length > 0 ? args[0] : null;
             var restart = RestartClusterStack.FindRestartByName("CONTINUE", condition);
             if (restart == null) return Nil.Instance;
             if (restart.IsBindRestart) return restart.Handler(Array.Empty<LispObject>());
             throw new RestartInvocationException(restart.Tag, Array.Empty<LispObject>());
-        }, "CONTINUE", -1));
+        }, "CONTINUE", -1).WithArgCount(0, 1));
         Emitter.CilAssembler.RegisterFunction("ABORT", new LispFunction(args => {
             LispObject? condition = args.Length > 0 ? args[0] : null;
             var restart = RestartClusterStack.FindRestartByName("ABORT", condition);
@@ -948,7 +895,7 @@ public static partial class Runtime
                 throw new LispErrorException(new LispControlError("ABORT restart not found"));
             if (restart.IsBindRestart) return restart.Handler(Array.Empty<LispObject>());
             throw new RestartInvocationException(restart.Tag, Array.Empty<LispObject>());
-        }, "ABORT", -1));
+        }, "ABORT", -1).WithArgCount(0, 1));
         Emitter.CilAssembler.RegisterFunction("MUFFLE-WARNING", new LispFunction(args => {
             LispObject? condition = args.Length > 0 ? args[0] : null;
             var restart = RestartClusterStack.FindRestartByName("MUFFLE-WARNING", condition);
@@ -956,7 +903,7 @@ public static partial class Runtime
                 throw new LispErrorException(new LispControlError("MUFFLE-WARNING restart not found"));
             if (restart.IsBindRestart) return restart.Handler(Array.Empty<LispObject>());
             throw new RestartInvocationException(restart.Tag, Array.Empty<LispObject>());
-        }, "MUFFLE-WARNING", -1));
+        }, "MUFFLE-WARNING", -1).WithArgCount(0, 1));
         // with-condition-restarts helper functions
         Emitter.CilAssembler.RegisterFunction("%ASSOCIATE-CONDITION-RESTARTS", new LispFunction(args => {
             RestartClusterStack.AssociateConditionRestarts(args[0], args[1]);

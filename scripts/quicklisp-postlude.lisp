@@ -99,6 +99,49 @@ stock-only quicklisp home; nothing is installed and nothing is printed.")
 (defun dotcl-dist ()
   (ql-dist:find-dist "dotcl"))
 
+(defun %auto-preference-file (dist)
+  (ql-dist::relative-to dist "dotcl-auto-preference.txt"))
+
+(defun %auto-preference (dist)
+  (let ((file (%auto-preference-file dist)))
+    (when (probe-file file)
+      (with-open-file (stream file :if-does-not-exist nil)
+        (when stream
+          (ignore-errors (parse-integer (read-line stream nil) :junk-allowed t)))))))
+
+(defun %write-auto-preference (dist value)
+  (let ((file (%auto-preference-file dist)))
+    (ensure-directories-exist file)
+    (with-open-file (stream file :direction :output :if-exists :supersede)
+      (format stream "~D" value))))
+
+(defun ensure-dotcl-dist-preferred ()
+  "Raise the dotcl dist above every other enabled dist.
+
+A dist whose preference is above the value last written here was preferred
+afterwards, so it is left alone."
+  (let ((ours (dotcl-dist)))
+    (when ours
+      (let ((others (remove ours (ql-dist:enabled-dists))))
+        (when others
+          (let ((highest (reduce #'max others :key #'ql-dist:preference))
+                (auto (%auto-preference ours)))
+            (unless (or (> (ql-dist:preference ours) highest)
+                        (and auto (> highest auto)))
+              (let ((preference (1+ highest)))
+                (setf (ql-dist:preference ours) preference)
+                (%write-auto-preference ours preference)))))))
+    ours))
+
+(defvar *client-install-dist* (fdefinition 'ql-dist:install-dist)
+  "The client's INSTALL-DIST, before the preference wrapper below replaced it.")
+
+(defun %install-dist-keeping-dotcl-first (&rest args)
+  (multiple-value-prog1 (apply *client-install-dist* args)
+    (ensure-dotcl-dist-preferred)))
+
+(setf (fdefinition 'ql-dist:install-dist) #'%install-dist-keeping-dotcl-first)
+
 (defun install-dotcl-dist ()
   "Install the overlay dist and give it priority over the stock one.
 
@@ -111,13 +154,7 @@ further is needed; the preference is stored in the quicklisp home, so every
 later session picks the patched releases without asking."
   (unless (dotcl-dist)
     (ql-dist:install-dist *dotcl-dist-url* :prompt nil))
-  (let ((ours (dotcl-dist))
-        (stock (ql-dist:find-dist "quicklisp")))
-    (when (and ours stock)
-      ;; Set once, at install time. Re-asserting it on every load would undo a
-      ;; deliberate change by the user.
-      (setf (ql-dist:preference ours) (+ 10 (ql-dist:preference stock))))
-    ours))
+  (ensure-dotcl-dist-preferred))
 
 (defun %report-missing-overlay (stream)
   (format stream
@@ -320,6 +357,15 @@ turning that into a failed SETUP would strand the user with no dist at all."
 
 (setf (fdefinition 'quicklisp:quickload) #'%quickload-initializing-home)
 
+;; An empty home skips SETUP, so register the searchers it would have added.
+(defun %register-asdf-searchers ()
+  (unless (member 'ql-dist:system-definition-searcher
+                  asdf:*system-definition-search-functions*)
+    (setf asdf:*system-definition-search-functions*
+          (append asdf:*system-definition-search-functions*
+                  (list 'quicklisp:local-projects-searcher
+                        'ql-dist:system-definition-searcher)))))
+
 ;; dists-initialized-p is the client's own predicate for "has a dist been
 ;; installed here", reused rather than reimplemented so the two cannot drift.
 (if (quicklisp::dists-initialized-p)
@@ -328,6 +374,9 @@ turning that into a failed SETUP would strand the user with no dist at all."
       ;; present this touches the network for nothing, and require must keep it
       ;; that way. Installing the overlay is (ql:setup)'s job.
       (funcall *client-setup*)
+      (ensure-dotcl-dist-preferred)
       (when (and *offer-dotcl-dist* (not (dotcl-dist)))
         (%report-missing-overlay *error-output*)))
-    (%report-uninitialized-home *error-output*))
+    (progn
+      (%register-asdf-searchers)
+      (%report-uninitialized-home *error-output*)))

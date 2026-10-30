@@ -26,7 +26,8 @@ the Lisp side are always the same version. In dotcl:
 is on your machine:
 
 ```lisp
-(progn (require "quicklisp") ql:*quicklisp-home*)
+(require "quicklisp")
+ql:*quicklisp-home*
 ```
 
 It is `~/.local/share/dotcl/quicklisp/` on macOS and Linux (or

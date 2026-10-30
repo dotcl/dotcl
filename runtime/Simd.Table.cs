@@ -19,14 +19,27 @@ public static partial class SimdTable
     static LispErrorException ArgCount(string name, int got, string expected) =>
         new(new LispProgramError($"{name}: wrong number of arguments: {got} (expected {expected})"));
 
-    internal static void Def(Dictionary<string, LispFunction> t, string name, int arity, Func<LispObject[], LispObject> f)
+    internal static void Def(Dictionary<string, LispFunction> t, string name, int arity, string lambdaList,
+        Func<LispObject[], LispObject> f)
     {
         t[name] = new LispFunction(args =>
         {
             if (arity >= 0 && args.Length != arity) throw ArgCount(name, args.Length, arity.ToString());
             return f(args);
-        }, "DOTCL-SIMD:" + name, arity);
+        }, "DOTCL-SIMD:" + name, arity) { StoredLambdaList = LambdaList(lambdaList) };
     }
+
+    // "A &REST B" -> (#:A &REST #:B)
+    static LispObject LambdaList(string text)
+    {
+        LispObject r = Nil.Instance;
+        var names = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        for (int i = names.Length - 1; i >= 0; i--)
+            r = new Cons(names[i][0] == '&' ? Startup.Sym(names[i]) : new Symbol(names[i]), r);
+        return r;
+    }
+
+    static readonly string[] LaneNames = { "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P" };
 
     static Dictionary<string, LispFunction> Build()
     {
@@ -36,22 +49,22 @@ public static partial class SimdTable
             var k = (SimdKind)ki;
             string n = SimdInfo.Name(k);
             int lanes = SimdInfo.Lanes(k);
-            Def(t, n + "P", 1, a => Runtime.Primary(a[0]) is LispSimdPack p && p.Kind == k ? T.Instance : Nil.Instance);
-            Def(t, n, 1, a => SimdInfo.Cast(k, a[0], n));
-            Def(t, "MAKE-" + n, lanes, a =>
+            Def(t, n + "P", 1, "OBJECT", a => Runtime.Primary(a[0]) is LispSimdPack p && p.Kind == k ? T.Instance : Nil.Instance);
+            Def(t, n, 1, "X", a => SimdInfo.Cast(k, a[0], n));
+            Def(t, "MAKE-" + n, lanes, string.Join(" ", LaneNames, 0, lanes), a =>
             {
                 var l = new ulong[lanes];
                 for (int i = 0; i < lanes; i++) l[i] = SimdInfo.LaneFromLisp(k, a[i], "MAKE-" + n);
                 return SimdInfo.FromLanes(k, l);
             });
-            Def(t, n + "-VALUES", 1, a =>
+            Def(t, n + "-VALUES", 1, "PACK", a =>
             {
                 var p = SimdInfo.Cast(k, a[0], n + "-VALUES");
                 var v = new LispObject[lanes];
                 for (int i = 0; i < lanes; i++) v[i] = SimdInfo.LaneToLisp(k, SimdInfo.Lane(p, i));
                 return Runtime.Values(v);
             });
-            Def(t, n + "!", 1, a =>
+            Def(t, n + "!", 1, "X", a =>
             {
                 var o = Runtime.Primary(a[0]);
                 if (o is LispSimdPack p) return new LispSimdPack(k, p.Lo, p.Hi);

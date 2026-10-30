@@ -15,6 +15,87 @@ public partial class CilAssembler
     /// <summary>The typed body method being assembled, the target of
     /// (:call-typed-self). Null outside a typed body.</summary>
     internal MethodInfo? _typedSelfMethod;
+    // The typed body being assembled. A nested self-call grows the stack with no
+    // frame and so meets no depth check of an entry: the body makes its own.
+    internal TypedForm? _typedForm;
+
+    static readonly MethodInfo s_typedSelfDepth = typeof(LispFunction).GetMethod("TypedSelfDepth")!;
+    static readonly MethodInfo s_typedSelfCount = typeof(LispFunction).GetMethod("TypedSelfCount")!;
+
+    /// <summary>For a SelfFree body, the receiver of a self-call: one less than
+    /// its own count of self-calls left before a stack check.</summary>
+    private void EmitTypedSelfDepth(TypedForm f)
+    {
+        _il.Emit(OpCodes.Ldarg_0);
+        _il.Emit(OpCodes.Ldc_I4_1);
+        _il.Emit(OpCodes.Sub);
+    }
+
+    /// <summary>Assemble the body of F; a SelfFree one first checks the stack
+    /// when its count has run out.</summary>
+    internal void AssembleTypedBody(TypedForm f)
+    {
+        _typedForm = f;
+        if (f.SelfFree)
+        {
+            _il.Emit(OpCodes.Ldarg_0);
+            _il.Emit(OpCodes.Ldstr, string.Intern(f.Name));
+            _il.Emit(OpCodes.Call, s_typedSelfDepth);
+            _il.Emit(OpCodes.Starg, 0);
+        }
+        Assemble(f.Body);
+    }
+
+    private void EmitTypedSelfCount(TypedForm f)
+    {
+        _il.Emit(OpCodes.Ldstr, string.Intern(f.Name));
+        _il.Emit(OpCodes.Call, s_typedSelfCount);
+    }
+
+    /// <summary>Call the body with self (argument 0 of the caller), or a fresh
+    /// count for a SelfFree one, and the raw arguments the caller pushes with PUSHARGS.</summary>
+    internal static void EmitTypedBodyCall(ILGenerator il, TypedForm f, MethodInfo body, Action pushArgs)
+    {
+        if (f.SelfFree) il.Emit(OpCodes.Ldc_I4, LispFunction.TypedSelfInterval);
+        else il.Emit(OpCodes.Ldarg_0);
+        pushArgs();
+        il.Emit(OpCodes.Call, body);
+    }
+
+    /// <summary>The method for the typed entry delegate: BODY, or for a SelfFree
+    /// one a wrapper of the TypedEntrySig signature.</summary>
+    internal static MethodInfo TypedEntryMethod(TypedForm f, MethodInfo body, Func<MethodInfo> defineWrapper,
+                                                Func<MethodInfo, ILGenerator> ilOf)
+    {
+        if (!f.SelfFree) return body;
+        var w = defineWrapper();
+        var il = ilOf(w);
+        EmitTypedBodyCall(il, f, body, () => { for (int i = 1; i <= f.ParamCount; i++) il.Emit(OpCodes.Ldarg, i); });
+        il.Emit(OpCodes.Ret);
+        return w;
+    }
+
+    /// <summary>BODY calls itself, and every (:ldarg 0) of it is the receiver of
+    /// a self-call: followed by the N argument loads and (:call-typed-self).</summary>
+    static bool SelfOnlyForSelfCalls(LispObject body, int n)
+    {
+        bool any = false;
+        for (var cur = body; cur is Cons c; cur = c.Cdr)
+        {
+            if (c.Car is not Cons ic || ic.Car is not Symbol s) continue;
+            if (s.Name is "LDARGA" or "STARG" && Cadr(ic) is Fixnum { Value: 0 }) return false;
+            if (s.Name != "LDARG" || Cadr(ic) is not Fixnum { Value: 0 }) continue;
+            var k = c.Cdr;
+            for (int i = 0; i < n; i++)
+            {
+                if (k is not Cons kc || kc.Car is not Cons kl || kl.Car is not Symbol ks || ks.Name != "LDLOC") return false;
+                k = kc.Cdr;
+            }
+            if (k is not Cons cc || cc.Car is not Cons cl || cl.Car is not Symbol cs || cs.Name != "CALL-TYPED-SELF") return false;
+            any = true;
+        }
+        return any;
+    }
 
     internal sealed class TypedForm
     {
@@ -29,6 +110,13 @@ public partial class CilAssembler
         public long[] Hi = Array.Empty<long>();
         public bool[] Ranged = Array.Empty<bool>();
         public LispObject Body = Nil.Instance;
+        // The body method takes the self-call depth in place of the function.
+        public bool SelfFree;
+        // A speculative entry: the ordinary body, run by the shell for an
+        // argument the typed body does not take. GenericSelf: it takes the
+        // function as its leading argument.
+        public LispObject? Generic;
+        public bool GenericSelf;
         public int ParamCount => Params.Count;
     }
 
@@ -59,11 +147,14 @@ public partial class CilAssembler
                 case "CHECKS": f.Checks = val is not Nil; break;
                 case "ARG-RANGES": ranges = val; break;
                 case "BODY": body = val; break;
+                case "GENERIC": f.Generic = val; break;
+                case "GENERIC-SELF": f.GenericSelf = val is not Nil; break;
             }
             plist = Cddr(pc);
         }
         if (body == null) throw new Exception("DEFMETHOD-TYPED: missing :body");
         f.Body = body;
+        f.SelfFree = SelfOnlyForSelfCalls(body, f.Params.Count);
         int n = f.Params.Count;
         if (!TypedEntrySig.IsValid(f.Sig) || f.Sig.Length - 2 != n)
             throw new Exception($"DEFMETHOD-TYPED: signature {f.Sig} does not fit {n} parameters");
@@ -107,9 +198,34 @@ public partial class CilAssembler
     /// around the body (see Function.SelfFramed.cs), so that callers reach it
     /// through the entry pointer instead of InvokeN's framed path.</summary>
     internal static void EmitTypedShell(ILGenerator il, TypedForm f, MethodInfo typed,
-                                        bool selfFramed = false, bool unit = false)
+                                        bool selfFramed = false, bool unit = false, MethodInfo? generic = null)
     {
         int n = f.ParamCount;
+        Label gen = default;
+        if (generic != null)
+        {
+            gen = il.DefineLabel();
+            for (int i = 0; i < n; i++)
+            {
+                if (f.Sig[i] == 'O') continue;
+                il.Emit(OpCodes.Ldarg, i + 1);
+                il.Emit(OpCodes.Isinst, f.Sig[i] == 'D' ? typeof(DoubleFloat) : typeof(Fixnum));
+                il.Emit(OpCodes.Brfalse, gen);
+                if (f.Sig[i] == 'L' && f.Ranged[i])
+                {
+                    il.Emit(OpCodes.Ldarg, i + 1);
+                    il.Emit(OpCodes.Castclass, typeof(Fixnum));
+                    il.Emit(OpCodes.Call, FixnumGetValueTMI);
+                    il.Emit(OpCodes.Ldc_I8, f.Lo[i]);
+                    il.Emit(OpCodes.Blt, gen);
+                    il.Emit(OpCodes.Ldarg, i + 1);
+                    il.Emit(OpCodes.Castclass, typeof(Fixnum));
+                    il.Emit(OpCodes.Call, FixnumGetValueTMI);
+                    il.Emit(OpCodes.Ldc_I8, f.Hi[i]);
+                    il.Emit(OpCodes.Bgt, gen);
+                }
+            }
+        }
         LocalBuilder? fr = null;
         if (selfFramed)
         {
@@ -120,26 +236,27 @@ public partial class CilAssembler
             for (int i = 1; i <= n; i++) il.Emit(OpCodes.Ldarg, i);
             il.Emit(OpCodes.Call, (unit ? s_enterNU : s_enterN)[n]);
         }
-        il.Emit(OpCodes.Ldarg_0);
-        for (int i = 0; i < n; i++)
+        EmitTypedBodyCall(il, f, typed, () =>
         {
-            il.Emit(OpCodes.Ldarg, i + 1);
-            if (f.Sig[i] == 'O') continue;
-            if (f.Sig[i] == 'D')
+            for (int i = 0; i < n; i++)
             {
-                if (f.Checks) il.Emit(OpCodes.Call, TypedArgDMI);
-                else { il.Emit(OpCodes.Castclass, typeof(DoubleFloat)); il.Emit(OpCodes.Call, DoubleGetValueTMI); }
+                il.Emit(OpCodes.Ldarg, i + 1);
+                if (f.Sig[i] == 'O') continue;
+                if (f.Sig[i] == 'D')
+                {
+                    if (f.Checks) il.Emit(OpCodes.Call, TypedArgDMI);
+                    else { il.Emit(OpCodes.Castclass, typeof(DoubleFloat)); il.Emit(OpCodes.Call, DoubleGetValueTMI); }
+                }
+                else if (f.Checks && f.Ranged[i])
+                {
+                    il.Emit(OpCodes.Ldc_I8, f.Lo[i]);
+                    il.Emit(OpCodes.Ldc_I8, f.Hi[i]);
+                    il.Emit(OpCodes.Call, TypedArgLRMI);
+                }
+                else if (f.Checks) il.Emit(OpCodes.Call, TypedArgLMI);
+                else { il.Emit(OpCodes.Castclass, typeof(Fixnum)); il.Emit(OpCodes.Call, FixnumGetValueTMI); }
             }
-            else if (f.Checks && f.Ranged[i])
-            {
-                il.Emit(OpCodes.Ldc_I8, f.Lo[i]);
-                il.Emit(OpCodes.Ldc_I8, f.Hi[i]);
-                il.Emit(OpCodes.Call, TypedArgLRMI);
-            }
-            else if (f.Checks) il.Emit(OpCodes.Call, TypedArgLMI);
-            else { il.Emit(OpCodes.Castclass, typeof(Fixnum)); il.Emit(OpCodes.Call, FixnumGetValueTMI); }
-        }
-        il.Emit(OpCodes.Call, typed);
+        });
         if (fr != null)
         {
             il.Emit(OpCodes.Ldloca, fr);
@@ -147,6 +264,85 @@ public partial class CilAssembler
         }
         if (f.Sig[n + 1] == 'D') il.Emit(OpCodes.Newobj, DoubleCtorTMI);
         else if (f.Sig[n + 1] == 'L') il.Emit(OpCodes.Call, FixnumMakeTMI);
+        il.Emit(OpCodes.Ret);
+        if (generic != null)
+        {
+            il.MarkLabel(gen);
+            for (int i = 0; i <= n; i++) il.Emit(OpCodes.Ldarg, i);
+            il.Emit(OpCodes.Call, generic);
+            il.Emit(OpCodes.Ret);
+        }
+    }
+
+    /// <summary>Set up ASM to assemble the generic body of F into a method
+    /// LispObject (LispFunction self, LispObject a1..an), the way a
+    /// DEFMETHOD-DIRECT body with a self argument is assembled.</summary>
+    internal static void SetupGenericBody(CilAssembler asm, TypedForm f, bool selfFramed, bool unit)
+    {
+        if (selfFramed)
+        {
+            asm._selfFrameName = string.Intern(f.Name);
+            asm._selfFrameArgc = f.ParamCount;
+            asm._selfFrameUnit = unit;
+        }
+        if (!f.GenericSelf) asm._argShift = 1;
+    }
+
+    internal static Type[] GenericBodyParamTypes(int n)
+    {
+        var t = new Type[n + 1];
+        t[0] = typeof(LispFunction);
+        for (int i = 0; i < n; i++) t[i + 1] = typeof(LispObject);
+        return t;
+    }
+
+    /// <summary>The shell of a leaf links no frame while every argument has the
+    /// raw type it declares: it unboxes them and calls LEAF, the leaf copy of the
+    /// body, which links one only on a path that signals. Any other argument goes
+    /// on to FRAMED, the framed shell, which signals the type error. That is a
+    /// method of its own: a frame local here would be zeroed on every call.</summary>
+    internal static void EmitLeafShell(ILGenerator il, TypedForm f, MethodInfo leaf, MethodInfo framed)
+    {
+        int n = f.ParamCount;
+        var slow = il.DefineLabel();
+        var boxed = new LocalBuilder?[n];
+        for (int i = 0; i < n; i++)
+        {
+            char k = f.Sig[i];
+            if (k == 'O') continue;
+            var t = k == 'D' ? typeof(DoubleFloat) : typeof(Fixnum);
+            boxed[i] = il.DeclareLocal(t);
+            il.Emit(OpCodes.Ldarg, i + 1);
+            il.Emit(OpCodes.Isinst, t);
+            il.Emit(OpCodes.Dup);
+            il.Emit(OpCodes.Stloc, boxed[i]!);
+            il.Emit(OpCodes.Brfalse, slow);
+            if (k != 'D' && f.Checks && f.Ranged[i])
+            {
+                il.Emit(OpCodes.Ldloc, boxed[i]!);
+                il.Emit(OpCodes.Call, FixnumGetValueTMI);
+                il.Emit(OpCodes.Ldc_I8, f.Lo[i]);
+                il.Emit(OpCodes.Blt, slow);
+                il.Emit(OpCodes.Ldloc, boxed[i]!);
+                il.Emit(OpCodes.Call, FixnumGetValueTMI);
+                il.Emit(OpCodes.Ldc_I8, f.Hi[i]);
+                il.Emit(OpCodes.Bgt, slow);
+            }
+        }
+        il.Emit(OpCodes.Ldarg_0);
+        for (int i = 0; i < n; i++)
+        {
+            if (boxed[i] == null) { il.Emit(OpCodes.Ldarg, i + 1); continue; }
+            il.Emit(OpCodes.Ldloc, boxed[i]!);
+            il.Emit(OpCodes.Call, f.Sig[i] == 'D' ? DoubleGetValueTMI : FixnumGetValueTMI);
+        }
+        il.Emit(OpCodes.Call, leaf);
+        if (f.Sig[n + 1] == 'D') il.Emit(OpCodes.Newobj, DoubleCtorTMI);
+        else if (f.Sig[n + 1] == 'L') il.Emit(OpCodes.Call, FixnumMakeTMI);
+        il.Emit(OpCodes.Ret);
+        il.MarkLabel(slow);
+        for (int i = 0; i <= n; i++) il.Emit(OpCodes.Ldarg, i);
+        il.Emit(OpCodes.Call, framed);
         il.Emit(OpCodes.Ret);
     }
 
@@ -170,8 +366,7 @@ public partial class CilAssembler
             il.Emit(OpCodes.Ldarg_0);
             il.Emit(OpCodes.Call, s_enterUnit);
         }
-        for (int i = 0; i <= n; i++) il.Emit(OpCodes.Ldarg, i);
-        il.Emit(OpCodes.Call, typed);
+        EmitTypedBodyCall(il, f, typed, () => { for (int i = 1; i <= n; i++) il.Emit(OpCodes.Ldarg, i); });
         il.Emit(OpCodes.Ldloca, fr);
         il.Emit(OpCodes.Call, s_leaveFrame);
         il.Emit(OpCodes.Ret);
@@ -190,6 +385,9 @@ public partial class CilAssembler
                                    "FloorFixnumL", "TruncateFixnumL", "ModFixnumL", "RemFixnumL",
                                    "CheckLongRange" })
             d["Runtime." + op] = typeof(LispFunction).GetMethod("Leaf" + op)!;
+        foreach (var op in new[] { "AddD", "SubtractD", "MultiplyD", "DivideD",
+                                   "AddS", "SubtractS", "MultiplyS", "DivideS", "NarrowD" })
+            d["FloatLane." + op] = typeof(LispFunction).GetMethod("Leaf" + op)!;
         return d;
     }
 
@@ -199,11 +397,16 @@ public partial class CilAssembler
         "POP", "DUP", "RET", "ADD", "SUB", "MUL", "AND", "OR", "XOR", "NOT", "NEG",
         "SHL", "SHR", "SHR-UN", "CEQ", "CGT", "CLT", "CGT-UN", "CLT-UN",
         "CONV-I1", "CONV-I2", "CONV-U1", "CONV-U2", "CONV-U4", "CONV-U8", "CONV-I8", "CONV-I",
-        "CONV-I4", "CONV-R4", "CONV-R8", "TYPED-TAIL-SELF",
+        "CONV-I4", "CONV-R4", "CONV-R8", "TYPED-TAIL-SELF", "LDNULL", "LDSFLD", "LOAD-CONST",
+        "LOAD-SYM-KEYWORD",
     };
 
     // Calls that cannot signal, kept as they are in a leaf.
-    static readonly HashSet<string> s_leafPureCalls = new() { "Math.MinLong", "Math.MaxLong" };
+    static readonly HashSet<string> s_leafPureCalls = new()
+    {
+        "Math.MinLong", "Math.MaxLong", "MultipleValues.Reset", "MultipleValues.PrimaryAlone",
+        "FloatLane.NonFiniteD", "FloatLane.NonFiniteS",
+    };
 
     static readonly HashSet<string> s_leafBranchOps = new()
     {
@@ -214,8 +417,20 @@ public partial class CilAssembler
     /// <summary>A typed body that calls nothing but the checked helpers of
     /// s_leafOps and has no loop: nothing in it can look at the frame list
     /// except those helpers' slow paths.</summary>
-    internal static bool IsTypedLeaf(LispObject body)
+    /// <summary>A signature a leaf copy can take: at most four raw arguments (the
+    /// narrow frame of LispFunction.InLeafFrame holds them), any result.</summary>
+    internal static bool IsLeafSig(string sig)
     {
+        int n = sig.Length - 2;
+        return n <= TypedEntrySig.MaxNarrowArgs && sig.IndexOf('O') is var o && (o < 0 || o > n);
+    }
+
+    internal static bool IsTypedLeaf(LispObject body, bool cachedConsts = false)
+    {
+#if NET9_0_OR_GREATER
+        // A leaf's frame is built on demand by runtime helpers a library does not call.
+        if (LibraryAbiIL.Active) return false;
+#endif
         var seen = new HashSet<string>();
         for (var cur = body; cur is Cons c; cur = c.Cdr)
         {
@@ -226,16 +441,115 @@ public partial class CilAssembler
             else if (op == "CALL")
             {
                 var callee = GetString(Cadr(ic));
-                if (!s_leafOps.ContainsKey(callee) && !s_leafPureCalls.Contains(callee)) return false;
+                if (!s_leafOps.ContainsKey(callee) && !s_leafPureCalls.Contains(callee) && callee != "Runtime.Car")
+                    return false;
             }
+            else if (op == "LOAD-CONST-CACHED") { if (!cachedConsts || !IsLtvFetch(Cadr(ic))) return false; }
             else if (!s_leafPlainOps.Contains(op)) return false;
         }
         return true;
     }
 
+    static readonly HashSet<string> s_directLeafOps = new()
+    {
+        "LDARG", "LDLOC", "STLOC", "DECLARE-LOCAL", "LDC-I4", "LDC-I8", "POP", "DUP", "RET",
+        "CEQ", "CGT", "CLT", "LDNULL", "LOAD-CONST", "TAIL-SELF", "LDSFLD", "LOAD-SYM-KEYWORD",
+    };
+
+    /// <summary>An untyped DEFUN body that calls nothing but MultipleValues.Reset /
+    /// PrimaryAlone, EQ / EQL, CAR and the argument type check, reads constants
+    /// and has no loop: its entry links no frame, and the two that can signal link one on
+    /// their slow path (LispFunction.LeafCarD / LeafCheckArgType).</summary>
+    internal static bool IsDirectLeaf(LispObject body, bool cachedConsts)
+    {
+#if NET9_0_OR_GREATER
+        // A leaf's frame is built on demand by runtime helpers a library does not call.
+        if (LibraryAbiIL.Active) return false;
+#endif
+        var seen = new HashSet<string>();
+        for (var cur = body; cur is Cons c; cur = c.Cdr)
+        {
+            if (c.Car is not Cons ic || ic.Car is not Symbol s) return false;
+            var op = s.Name;
+            if (op == "LABEL") seen.Add(GetSymbolName(Cadr(ic)));
+            else if (s_leafBranchOps.Contains(op)) { if (seen.Contains(GetSymbolName(Cadr(ic)))) return false; }
+            else if (op == "CALL")
+            {
+                var callee = GetString(Cadr(ic));
+                if (callee is not ("MultipleValues.Reset" or "MultipleValues.PrimaryAlone" or "Runtime.Car"
+                    or "MultipleValues.TakeMode" or "Runtime.CheckArgType" or "Runtime.IsTrueEq" or "Runtime.IsTrueEql" or "Runtime.Eq"
+                    or "Runtime.Eql" or "Runtime.IsTruthy" or "Runtime.IsNotNil" or "Runtime.UnwrapMv")) return false;
+            }
+            else if (op == "LOAD-CONST-CACHED") { if (!cachedConsts || !IsLtvFetch(Cadr(ic))) return false; }
+            else if (!s_directLeafOps.Contains(op)) return false;
+        }
+        return true;
+    }
+
+    /// <summary>The recipe of a LOAD-TIME-VALUE cell in a fasl, run once by its
+    /// cached constant: a call of DOTCL-INTERNAL::%GET-LTV-SLOT-IN on a string and
+    /// an integer.</summary>
+    static bool IsLtvFetch(LispObject recipe) => MatchesShape(recipe, s_ltvFetch) || MatchesShape(recipe, s_ltvFetchMode);
+
+    static readonly string[] s_ltvFetch =
+    {
+        "LOAD-SYM-PKG %GET-LTV-SLOT-IN", "CASTCLASS Symbol", "CALL CilAssembler.GetFunctionBySymbol",
+        "CALL MultipleValues.Reset", "LOAD-CONST", "LDC-I8", "CALL Fixnum.Make",
+        "CALLVIRT LispFunction.Invoke2", "CALL Runtime.UnwrapMv",
+    };
+
+    // In a tail position the fetch passes on the value mode.
+    static readonly string[] s_ltvFetchMode =
+    {
+        "LOAD-SYM-PKG %GET-LTV-SLOT-IN", "CASTCLASS Symbol", "CALL CilAssembler.GetFunctionBySymbol",
+        "CALL MultipleValues.Reset", "LOAD-CONST", "LDC-I8", "CALL Fixnum.Make",
+        "LDLOC", "CALLVIRT LispFunction.Invoke2M",
+    };
+
+    static bool MatchesShape(LispObject recipe, string[] shape)
+    {
+        int i = 0;
+        for (var cur = recipe; cur is Cons c; cur = c.Cdr, i++)
+        {
+            if (i >= shape.Length || c.Car is not Cons ic || ic.Car is not Symbol s) return false;
+            var want = shape[i];
+            int sp = want.IndexOf(' ');
+            var wantOp = sp < 0 ? want : want.Substring(0, sp);
+            if (s.Name != wantOp) return false;
+            if (sp >= 0 && !(Cadr(ic) is LispString arg && arg.Value == want.Substring(sp + 1))) return false;
+            if (wantOp == "LOAD-CONST" && Cadr(ic) is not LispString) return false;
+        }
+        return i == shape.Length;
+    }
+
+    // Set while assembling an untyped leaf body (IsDirectLeaf): its name and
+    // argument count, for the frame LeafCarD / LeafCheckArgType link.
+    internal (string Name, int Argc)? _directLeaf;
+
+    static readonly MethodInfo s_leafCar = typeof(LispFunction).GetMethod("LeafCar")!;
+    static readonly MethodInfo s_leafCarD = typeof(LispFunction).GetMethod("LeafCarD")!;
+    static readonly MethodInfo s_leafCheckArgType = typeof(LispFunction).GetMethod("LeafCheckArgType")!;
+
     private bool TryEmitLeafCall(string name)
     {
-        if (_leafEntry is not { } f || !s_leafOps.TryGetValue(name, out var leaf)) return false;
+        if (_directLeaf is { } d)
+        {
+            var m = name == "Runtime.Car" ? s_leafCarD : name == "Runtime.CheckArgType" ? s_leafCheckArgType : null;
+            if (m == null) return false;
+            _il.Emit(OpCodes.Ldstr, string.Intern(d.Name));
+            _il.Emit(OpCodes.Ldc_I4, d.Argc);
+            for (int i = 1; i <= 4; i++)
+            {
+                if (i > d.Argc) _il.Emit(OpCodes.Ldnull);
+                else _il.Emit(OpCodes.Ldarg, i);
+            }
+            _il.Emit(OpCodes.Call, m);
+            return true;
+        }
+        if (_leafEntry is not { } f) return false;
+        MethodInfo? leaf;
+        if (name == "Runtime.Car") leaf = s_leafCar;
+        else if (!s_leafOps.TryGetValue(name, out leaf)) return false;
         _il.Emit(OpCodes.Ldstr, string.Intern(f.Name));
         _il.Emit(OpCodes.Ldc_I4, TypedEntrySig.Code(f.Sig));
         _il.Emit(OpCodes.Ldc_I4, f.ParamCount);
@@ -280,11 +594,15 @@ public partial class CilAssembler
         }
 
         var typedDm = new DynamicMethod(f.Name + "_typed", TypedEntrySig.ReturnType(f.Sig),
-            TypedEntrySig.ParamTypes(f.Sig), typeof(CilAssembler).Module, true);
+            TypedEntrySig.BodyParamTypes(f.Sig, f.SelfFree), typeof(CilAssembler).Module, true);
         var innerAsm = new CilAssembler();
-        innerAsm._il = typedDm.GetILGenerator();
+        innerAsm._il = typedDm.GetILGenerator().ForLibrary();
         innerAsm._typedSelfMethod = typedDm;
-        innerAsm.Assemble(f.Body);
+        innerAsm.AssembleTypedBody(f);
+        var typedEntryDm = TypedEntryMethod(f, typedDm,
+            () => new DynamicMethod(f.Name + "_typedw", TypedEntrySig.ReturnType(f.Sig),
+                                    TypedEntrySig.ParamTypes(f.Sig), typeof(CilAssembler).Module, true),
+            m => ((DynamicMethod)m).GetILGenerator().ForLibrary());
 
         var shellTypes = new Type[n + 1];
         shellTypes[0] = typeof(LispFunction);
@@ -292,18 +610,41 @@ public partial class CilAssembler
         var shellDm = new DynamicMethod(f.Name + "_shell", typeof(LispObject), shellTypes,
             typeof(CilAssembler).Module, true);
         bool selfFramed = CanSelfFrame(f.Name, n, f.NoFrame);
-        EmitTypedShell(shellDm.GetILGenerator(), f, typedDm, selfFramed, unit: true);
+        bool leaf = selfFramed && f.Generic == null && IsLeafSig(f.Sig) && IsTypedLeaf(f.Body);
+        DynamicMethod? genericDm = null;
+        if (f.Generic != null)
+        {
+            genericDm = new DynamicMethod(f.Name + "_generic", typeof(LispObject), GenericBodyParamTypes(n),
+                typeof(CilAssembler).Module, true);
+            var genAsm = new CilAssembler();
+            genAsm._il = genericDm.GetILGenerator().ForLibrary();
+            SetupGenericBody(genAsm, f, selfFramed, unit: true);
+            genAsm.Assemble(f.Generic);
+        }
+        DynamicMethod? entryDm = null;
+        if (CanTypedFrame(f.Name, n, f.NoFrame))
+        {
+            entryDm = new DynamicMethod(f.Name + "_tentry", TypedEntrySig.ReturnType(f.Sig),
+                TypedEntrySig.ParamTypes(f.Sig), typeof(CilAssembler).Module, true);
+            if (leaf) EmitLeafEntry(entryDm.GetILGenerator().ForLibrary(), f);
+            else EmitTypedFramedEntry(entryDm.GetILGenerator().ForLibrary(), f, typedDm, unit: true);
+        }
+        if (leaf)
+        {
+            var framedDm = new DynamicMethod(f.Name + "_shellf", typeof(LispObject), shellTypes,
+                typeof(CilAssembler).Module, true);
+            EmitTypedShell(framedDm.GetILGenerator().ForLibrary(), f, typedDm, selfFramed, unit: true);
+            EmitLeafShell(shellDm.GetILGenerator().ForLibrary(), f, entryDm!, framedDm);
+        }
+        else EmitTypedShell(shellDm.GetILGenerator().ForLibrary(), f, typedDm, selfFramed, unit: true, generic: genericDm);
 
         var fn = BuildSelfDirectFunction(shellDm, f.Name, n);
         if (selfFramed) fn.SetSelfFramedEntry(DynamicMethodEntry(shellDm), n);
-        fn.SetTypedEntry(typedDm.CreateDelegate(TypedEntrySig.DelegateType(f.Sig)),
+        if (leaf) fn.MarkLeafEntry(n);
+        fn.SetTypedEntry(((DynamicMethod)typedEntryDm).CreateDelegate(TypedEntrySig.DelegateType(f.Sig)),
             TypedEntrySig.Code(f.Sig));
-        if (selfFramed)
+        if (entryDm != null)
         {
-            var entryDm = new DynamicMethod(f.Name + "_tentry", TypedEntrySig.ReturnType(f.Sig),
-                TypedEntrySig.ParamTypes(f.Sig), typeof(CilAssembler).Module, true);
-            if (!TypedEntrySig.IsWide(f.Sig) && IsTypedLeaf(f.Body)) EmitLeafEntry(entryDm.GetILGenerator(), f);
-            else EmitTypedFramedEntry(entryDm.GetILGenerator(), f, typedDm, unit: true);
             s_typedEntryOwners.Add(fn, entryDm);
             var r = TypedArgRanges(f);
             fn.SetTypedArgRanges(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);

@@ -1,0 +1,78 @@
+;; One run of bench/order-effects/run.lisp on Linux x64, 6 logical CPUs,
+;; .NET 10.0.402, dotcl 8e08b16, DOTNET_gcServer=0, Release runtime.
+;; Command:
+;;   make cross-compile bench-build
+;;   DOTNET_gcServer=0 runtime/bin/Release/net10.0/runtime \
+;;     --asm compiler/cil-out.sil bench/order-effects/run.lisp < /dev/null
+;; Times are seconds; heap and allocated bytes are MiB; pause is the
+;; dotcl:gc-stats pause delta across the timed region.
+
+;; round 1 alone dderiv
+;; round 1 suite 
+;; round 1 suite-gc 
+;; round 1 alone deriv
+;; round 2 suite 
+;; round 2 suite-gc 
+;; round 2 alone deriv
+;; round 2 alone dderiv
+;; round 3 suite-gc 
+;; round 3 alone deriv
+;; round 3 alone dderiv
+;; round 3 suite 
+;; round 4 alone deriv
+;; round 4 alone dderiv
+;; round 4 suite 
+;; round 4 suite-gc 
+;; round 5 alone dderiv
+;; round 5 suite 
+;; round 5 suite-gc 
+;; round 5 alone deriv
+
+timing (seconds, 5 processes)
+benchmark           mode      min       median    runs      
+dderiv              alone          0.199     0.205         5
+dderiv              suite          0.224     0.228         5
+dderiv              suite-gc       0.204     0.206         5
+deriv               alone          0.174     0.177         5
+deriv               suite          0.191     0.197         5
+deriv               suite-gc       0.174     0.178         5
+
+gc state around the timed region
+run benchmark mode      g0     g1     g2     heap MiB g0     g1     g2     heap MiB alloc MiBpause s  
+                        before                        after                                           
+   1dderiv    alone         105     44      6    244.8    155     45      6    242.8    396.7    0.014
+   2dderiv    alone         105     44      6    244.8    155     45      6    242.7    396.7    0.014
+   3dderiv    alone         105     44      6    244.8    155     45      6    242.8    396.7    0.014
+   4dderiv    alone         105     44      6    245.2    155     45      6    243.0    396.7    0.015
+   5dderiv    alone         105     44      6    244.3    155     45      6    242.3    396.7    0.015
+   1dderiv    suite         125     52      7     39.8    175     52      7     37.7    396.7    0.029
+   2dderiv    suite         124     53      6    248.1    174     53      6    246.0    396.7    0.029
+   3dderiv    suite         124     51      6    248.0    174     51      6    245.9    396.7    0.030
+   4dderiv    suite         125     52      7     39.7    175     52      7     37.6    396.7    0.029
+   5dderiv    suite         125     54      7     39.8    175     54      7     37.7    396.7    0.029
+   1dderiv    suite-gc      139     64     22     34.4    188     64     22     40.4    396.7    0.011
+   2dderiv    suite-gc      139     64     22     34.3    188     64     22     40.3    396.7    0.011
+   3dderiv    suite-gc      139     64     22     34.4    188     64     22     40.4    396.7    0.012
+   4dderiv    suite-gc      139     64     22     34.4    188     64     22     40.4    396.7    0.012
+   5dderiv    suite-gc      139     64     22     34.3    188     64     22     40.3    396.7    0.011
+   1deriv     alone         105     44      6    245.0    152     45      6    243.9    373.8    0.015
+   2deriv     alone         105     44      6    245.2    152     45      6    244.0    373.8    0.014
+   3deriv     alone         105     44      6    244.5    152     45      6    243.5    373.8    0.014
+   4deriv     alone         105     44      6    244.8    152     45      6    243.8    373.8    0.013
+   5deriv     alone         105     44      6    244.8    152     45      6    243.7    373.8    0.014
+   1deriv     suite         175     52      7     37.7    222     52      7     36.7    373.8    0.028
+   2deriv     suite         174     53      6    246.0    221     53      6    244.9    373.8    0.027
+   3deriv     suite         174     51      6    245.9    221     51      6    244.8    373.8    0.028
+   4deriv     suite         175     52      7     37.6    222     52      7     36.5    373.8    0.028
+   5deriv     suite         175     54      7     37.7    222     54      7     36.6    373.8    0.028
+   1deriv     suite-gc      190     66     24     34.4    236     66     24     41.4    373.8    0.010
+   2deriv     suite-gc      190     66     24     34.3    236     66     24     41.3    373.8    0.010
+   3deriv     suite-gc      190     66     24     34.4    236     66     24     41.4    373.8    0.011
+   4deriv     suite-gc      190     66     24     34.4    236     66     24     41.4    373.8    0.010
+   5deriv     suite-gc      190     66     24     34.4    236     66     24     41.3    373.8    0.010
+
+suite wall time (seconds, 5 processes)
+mode        min suite med suite min wall  med wall  
+suite            2.382     2.429    10.192    10.319
+suite-gc         3.367     3.392    11.117    11.198
+full-GC overhead: suite +0.963 s median, 1.086 s spent in explicit GC

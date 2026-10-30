@@ -125,7 +125,7 @@ public partial class Runtime
         => (i < args.Length ? args[i] : Nil.Instance) as LispAtomicLong
            ?? throw new LispErrorException(new LispTypeError(
                $"{fn}: not an ATOMIC-LONG", i < args.Length ? args[i] : Nil.Instance,
-               Startup.Sym("T")));
+               T.Instance));
     private static long AtomicLongInt(LispObject o, string fn) => o switch
     {
         Fixnum f => f.Value,
@@ -147,7 +147,7 @@ public partial class Runtime
     {
         var al = (args[0] as LispAtomicLong) ?? (args.Length > 1 ? args[1] as LispAtomicLong : null)
                  ?? throw new LispErrorException(new LispTypeError(
-                     "SET-ATOMIC-LONG-VALUE: no ATOMIC-LONG argument", args[0], Startup.Sym("T")));
+                     "SET-ATOMIC-LONG-VALUE: no ATOMIC-LONG argument", args[0], T.Instance));
         var nv = ReferenceEquals(al, args[0]) ? args[1] : args[0];
         al.Write(AtomicLongInt(nv, "SET-ATOMIC-LONG-VALUE"));
         return nv;
@@ -170,7 +170,7 @@ public partial class Runtime
     // arg; the delta-less form is the common one.
     private static LispAtomicLong AtomicLong1(LispObject o, string fn)
         => o as LispAtomicLong ?? throw new LispErrorException(new LispTypeError(
-               $"{fn}: not an ATOMIC-LONG", o, Startup.Sym("T")));
+               $"{fn}: not an ATOMIC-LONG", o, T.Instance));
     internal static LispObject AtomicLongIncf1(LispObject a)
         => AtomicLongResult(AtomicLong1(a, "ATOMIC-LONG-INCF").Add(1L));
     internal static LispObject AtomicLongIncf2(LispObject a, LispObject b)
@@ -207,10 +207,14 @@ public partial class Runtime
 
         var fn = args[0];
         string name = "Anonymous";
+        bool nameSeen = false;
         for (int i = 1; i + 1 < args.Length; i += 2)
         {
-            if (args[i] is Symbol s && s.Name == "NAME")
+            if (!nameSeen && args[i] is Symbol s && s.Name == "NAME")
+            {
                 name = StringValueOrNull(args[i + 1]) ?? args[i + 1].ToString();
+                nameSeen = true;
+            }
         }
 
         LispThread? lispThread = null;
@@ -697,10 +701,14 @@ public partial class Runtime
     public static LispObject MakeConditionVariable(LispObject[] args)
     {
         string name = "anonymous";
+        bool nameSeen = false;
         for (int i = 0; i + 1 < args.Length; i += 2)
         {
-            if (args[i] is Symbol s && s.Name == "NAME")
+            if (!nameSeen && args[i] is Symbol s && s.Name == "NAME")
+            {
                 name = StringValueOrNull(args[i + 1]) ?? args[i + 1].ToString()!;
+                nameSeen = true;
+            }
         }
         return new LispConditionVariable(name);
     }
@@ -717,9 +725,10 @@ public partial class Runtime
                 "CONDITION-WAIT: requires (cv lock)"));
         // Optional :timeout seconds
         double? timeoutSec = null;
+        bool timeoutSeen = false;
         for (int i = 2; i + 1 < args.Length; i += 2)
         {
-            if (args[i] is Symbol s && s.Name == "TIMEOUT")
+            if (!timeoutSeen && args[i] is Symbol s && s.Name == "TIMEOUT")
             {
                 var v = args[i + 1];
                 timeoutSec = v switch
@@ -730,6 +739,7 @@ public partial class Runtime
                     Ratio r => Arithmetic.RatioToDouble(r),
                     _ => (double?)null
                 };
+                timeoutSeen = true;
             }
         }
 
@@ -800,14 +810,21 @@ public partial class Runtime
     {
         string name = "anonymous";
         int count = 0;
+        bool nameSeen = false, countSeen = false;
         for (int i = 0; i + 1 < args.Length; i += 2)
         {
             if (args[i] is Symbol s)
             {
-                if (s.Name == "NAME")
+                if (!nameSeen && s.Name == "NAME")
+                {
                     name = StringValueOrNull(args[i + 1]) ?? args[i + 1].ToString()!;
-                else if (s.Name == "COUNT" && args[i + 1] is Fixnum f)
+                    nameSeen = true;
+                }
+                else if (!countSeen && s.Name == "COUNT" && args[i + 1] is Fixnum f)
+                {
                     count = (int)f.Value;
+                    countSeen = true;
+                }
             }
         }
         if (count < 0)
@@ -832,9 +849,10 @@ public partial class Runtime
         if (args.Length < 1 || args[0] is not LispSemaphore sem)
             throw new LispErrorException(new LispProgramError("WAIT-ON-SEMAPHORE: requires a semaphore"));
         double? timeoutSec = null;
+        bool timeoutSeen = false;
         for (int i = 1; i + 1 < args.Length; i += 2)
         {
-            if (args[i] is Symbol s && s.Name == "TIMEOUT")
+            if (!timeoutSeen && args[i] is Symbol s && s.Name == "TIMEOUT")
             {
                 var v = args[i + 1];
                 timeoutSec = v switch
@@ -845,6 +863,7 @@ public partial class Runtime
                     Ratio r => Arithmetic.RatioToDouble(r),
                     _ => (double?)null
                 };
+                timeoutSeen = true;
             }
         }
         bool got = true, interrupted = false;

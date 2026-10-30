@@ -32,7 +32,9 @@ public partial class LispFunction : LispObject
     // straight from _directDel + Environment (see MakeDirectClosure): building
     // an args-array wrapper for it meant a closure object and a delegate on
     // every closure creation, for a path most closures never take.
-    private readonly Func<LispObject[], LispObject>? _func;
+    // Not readonly only so WithArgCount can put a guard in front of it right
+    // after construction.
+    private Func<LispObject[], LispObject>? _func;
 
     // Direct-params closure body: Func<object[] env, LispObject a0..aN-1, LispObject>.
     internal Delegate? _directDel;
@@ -189,6 +191,58 @@ public partial class LispFunction : LispObject
         Name = name;
         Arity = arity;
         DotCL.Diagnostics.AllocCounter.Inc("LispFunction");
+    }
+
+    /// <summary>Check the argument count of a call through the args-array entry
+    /// against MIN and MAX (MAX &lt; 0: no upper bound) before the body runs, for a
+    /// C# builtin whose body indexes the array without checking its length.
+    /// Calls through a direct delegate (_funcN) are not affected. Returns this.</summary>
+    public LispFunction WithArgCount(int min, int max)
+    {
+        if (_func == null || _func.Target is ArgCountGuard)
+            throw new InvalidOperationException("WithArgCount: not an unguarded args-array function");
+        _func = new ArgCountGuard(this, min, max, _func).Call;
+        return this;
+    }
+
+    /// <summary>WithArgCount for a builtin with keyword parameters: at least MIN
+    /// arguments, and the arguments after the first POSITIONAL ones form the keyword
+    /// part, which must have an even length and, unless ALLOWOTHERKEYS or a true
+    /// :ALLOW-OTHER-KEYS argument, name only KEYS (CLHS 3.5.1.4, 3.5.1.6).</summary>
+    public LispFunction WithKeyArgs(int min, int positional, bool allowOtherKeys, params string[] keys)
+    {
+        WithArgCount(min, -1);
+        var g = ArgCount!;
+        g.KeyStart = positional; g.Keys = keys; g.AllowOtherKeys = allowOtherKeys;
+        return this;
+    }
+
+    // The bounds WithArgCount installed, or null.
+    internal ArgCountGuard? ArgCount => _func?.Target as ArgCountGuard;
+
+    internal sealed class ArgCountGuard
+    {
+        private readonly LispFunction _owner;
+        private readonly Func<LispObject[], LispObject> _body;
+        internal readonly int Min, Max;
+        // Set by WithKeyArgs; Keys is null when there is no keyword part to check.
+        internal int KeyStart;
+        internal string[]? Keys;
+        internal bool AllowOtherKeys;
+
+        internal ArgCountGuard(LispFunction owner, int min, int max, Func<LispObject[], LispObject> body)
+        {
+            _owner = owner; Min = min; Max = max; _body = body;
+        }
+
+        internal LispObject Call(LispObject[] args)
+        {
+            if (args.Length < Min || (Max >= 0 && args.Length > Max))
+                Runtime.ThrowArgCount(_owner.Name ?? _owner.StatsName ?? "anonymous", args.Length, Min, Max);
+            if (Keys != null && args.Length > KeyStart)
+                Runtime.CheckKeywordArgs(_owner.Name ?? _owner.StatsName ?? "anonymous", args, KeyStart, Keys, AllowOtherKeys);
+            return _body(args);
+        }
     }
 
     // Direct-params closure: the body delegate and the environment are held as
@@ -596,11 +650,11 @@ public partial class LispFunction : LispObject
     {
         switch (args.Length)
         {
-            case 0: if ((_sfMask & 1) != 0 && _func0 is { } f0) { CallTls.Borrow = 2; return f0(); } break;
-            case 1: if ((_sfMask & 2) != 0 && _func1 is { } f1) { CallTls.Borrow = 2; return f1(args[0]); } break;
-            case 2: if ((_sfMask & 4) != 0 && _func2 is { } f2) { CallTls.Borrow = 2; return f2(args[0], args[1]); } break;
-            case 3: if ((_sfMask & 8) != 0 && _func3 is { } f3) { CallTls.Borrow = 2; return f3(args[0], args[1], args[2]); } break;
-            case 4: if ((_sfMask & 16) != 0 && _func4 is { } f4) { CallTls.Borrow = 2; return f4(args[0], args[1], args[2], args[3]); } break;
+            case 0: if ((_sfMask & 1) != 0 && _func0 is { } f0) { if ((_sfMask & (1 << LeafShift)) == 0) CallTls.Borrow = 2; return f0(); } break;
+            case 1: if ((_sfMask & 2) != 0 && _func1 is { } f1) { if ((_sfMask & (2 << LeafShift)) == 0) CallTls.Borrow = 2; return f1(args[0]); } break;
+            case 2: if ((_sfMask & 4) != 0 && _func2 is { } f2) { if ((_sfMask & (4 << LeafShift)) == 0) CallTls.Borrow = 2; return f2(args[0], args[1]); } break;
+            case 3: if ((_sfMask & 8) != 0 && _func3 is { } f3) { if ((_sfMask & (8 << LeafShift)) == 0) CallTls.Borrow = 2; return f3(args[0], args[1], args[2]); } break;
+            case 4: if ((_sfMask & 16) != 0 && _func4 is { } f4) { if ((_sfMask & (16 << LeafShift)) == 0) CallTls.Borrow = 2; return f4(args[0], args[1], args[2], args[3]); } break;
         }
         return null;
     }
@@ -1476,7 +1530,7 @@ public partial class LispFunction : LispObject
     {
         ConditionSystem.PollInterrupt();
         var top = s_top;
-        if (self != null && top != null && top->Lent) CallTls.Borrow = 1;
+        if (self != null && top != null && top->Lent && (callee._sfMask & (bit << LeafShift)) == 0) CallTls.Borrow = 1;
         if (mode >= 0 && (callee._mvModeMask & bit) != 0) MultipleValues.SetMode(mode);
         return TailKindDirect;
     }
@@ -1536,7 +1590,11 @@ public partial class LispFunction : LispObject
         if ((_sfMask & (1 << arity)) != 0)
         {
             if (mode >= 0 && (_mvModeMask & (1 << arity)) != 0) MultipleValues.SetMode(mode);
-            if (owned) CallTls.Borrow = 1;
+            if (owned)
+            {
+                if ((_sfMask & (1 << (arity + LeafShift))) == 0) CallTls.Borrow = 1;
+                else top->Lend();
+            }
             return kind;
         }
         var unit = RetainUnit;

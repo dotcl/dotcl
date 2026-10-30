@@ -4,7 +4,7 @@
 ;;;
 ;;; Provides DOTCL-GRAY package with the full Gray stream class hierarchy
 ;;; and generic functions (AMOP/Gray streams protocol).
-;;; The C# runtime (GrayStream.cs, Runtime.Misc.cs) dispatches to these
+;;; The C# runtime (GrayStream.cs, Runtime.Reader.cs) dispatches to these
 ;;; generic functions when a CLOS instance inheriting from the classes
 ;;; defined here is passed to CL stream functions (read-char, write-char, etc.).
 

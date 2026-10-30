@@ -92,3 +92,36 @@ when the draw was found."
             "Let the test see style-warnings its forms signal.")
           (getf (regression-test::props entry) :notes))))
 (in-package :cl-user)
+
+;;; ENCODE-UNIVERSAL-TIME.1 and .3 draw a date from 1900 on and a zone from
+;;; -24 to 24 hours, and mean to keep the zone non-negative on 1900-01-01 so
+;;; the time stays a universal time. The guard tests (= date 0) (= month 0),
+;;; which never holds, so an early hour of 1900-01-01 with an eastern zone
+;;; asks for a negative time; dotcl and SBCL both signal TYPE-ERROR there.
+;;; Rewrite the guard to the day it was written for, with the same
+;;; self-invalidating check as the printer tests above.
+(in-package :cl-test)
+
+(defun fix-encode-time-guard (form)
+  (let ((found nil))
+    (labels ((rew (x)
+               (cond ((equal x '(and (= year 1900) (= date 0) (= month 0)))
+                      (setf found t)
+                      '(and (= year 1900) (= date 1) (= month 1)))
+                     ((atom x) x)
+                     (t (cons (rew (car x)) (rew (cdr x)))))))
+      (values (rew form) found))))
+
+(dolist (name '(encode-universal-time.1 encode-universal-time.3))
+  (let* ((entry (cadr (gethash name regression-test::*entries-table*)))
+         (form (and entry (regression-test::form entry))))
+    (multiple-value-bind (new-form found) (and form (fix-encode-time-guard form))
+      (if found
+          (regression-test::add-entry
+           (regression-test::make-entry :pend t :name name
+                                        :props (regression-test::props entry)
+                                        :form new-form
+                                        :vals (regression-test::vals entry)))
+          (format t "~&;; note: ~A no longer carries the 1900 zone guard; ~
+                     leaving the upstream test as is~%" name)))))
+(in-package :cl-user)

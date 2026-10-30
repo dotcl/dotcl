@@ -67,8 +67,11 @@ set -eu
 mode=run
 if [ "${1:-}" = "--judge" ]; then mode=judge; shift; fi
 root="${1:-.}"
-# Note filters (scrub_note), shared with the other stage.
+# Note filters (scrub_note) and the native-library classifier, shared with the
+# other stages.
 . "$(dirname "$0")/scrub.sh"
+. "$(dirname "$0")/native.sh"
+. "$(dirname "$0")/net.sh"
 . "$(dirname "$0")/dists.sh"
 here="$root/bench/library-status"
 targets="$here/targets.txt"
@@ -643,6 +646,13 @@ DRVEOF
   (cd "$work/cwd" && "$timeout" "$per" "$work/lisp" "$work/drv.lisp") > "$log" 2>&1 < /dev/null
   code=$?
   set -e
+  if [ "$code" -ne 124 ] && grep -q '^LIBTEST-LOAD-FAIL' "$log" && net_failure "$log"; then
+    sleep "${LIBRARY_STATUS_NET_PAUSE:-30}"
+    set +e
+    (cd "$work/cwd" && "$timeout" "$per" "$work/lisp" "$work/drv.lisp") > "$log" 2>&1 < /dev/null
+    code=$?
+    set -e
+  fi
   t1=$(now_seconds)
   elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN { printf "%.1f", b - a }')
 
@@ -652,6 +662,7 @@ DRVEOF
   elif grep -q '^LIBTEST-LOAD-FAIL' "$log"; then
     set -- load-fail - 0 0
     note=$(sed -n 's/^LIBTEST-LOAD-FAIL //p' "$log" | head -1)
+    if net_failure "$log"; then note="$NET_NOTE_PREFIX$note"; fi
   else
     # shellcheck disable=SC2046
     set -- $(judge "$log")
@@ -663,9 +674,16 @@ DRVEOF
   fi
   verdict=$1; framework=$2; passed=$3; failed=$4
   tsys=$(sed -n 's/^LIBTEST-TEST-SYSTEMS *//p; s/^LIBTEST-EXTRA-SYSTEM //p' "$log" | tr '\n' ' ')
+  native=""
+  case "$verdict" in
+    pass|no-tests|timeout) ;;
+    *) native=$(native_missing "$log") ;;
+  esac
+  native_json=null
+  [ -n "$native" ] && native_json="\"$(jstr "$native")\""
 
-  printf '  {"system": "%s", "checked": "%s", "verdict": "%s", "framework": "%s", "passed": %d, "failed": %d, "test-systems": "%s", "note": "%s", "dists": "%s", "runtime": "%s", "seconds": %s}\n' \
-    "$sys" "$checked" "$verdict" "$framework" "$passed" "$failed" "$(jstr "$tsys")" "$(jstr "${note:-}")" "$dists_desc" "$runtime_desc" "$elapsed" >> "$work/entries"
+  printf '  {"system": "%s", "checked": "%s", "verdict": "%s", "framework": "%s", "passed": %d, "failed": %d, "test-systems": "%s", "note": "%s", "native": %s, "dists": "%s", "runtime": "%s", "seconds": %s}\n' \
+    "$sys" "$checked" "$verdict" "$framework" "$passed" "$failed" "$(jstr "$tsys")" "$(jstr "${note:-}")" "$native_json" "$dists_desc" "$runtime_desc" "$elapsed" >> "$work/entries"
   write_json
   ran=$((ran + 1))
 
@@ -679,4 +697,5 @@ echo "run-tests: $ran systems in $((finished - started))s ($skipped already reco
 for s in pass fail error no-result no-tests timeout load-fail; do
   printf '  %-10s %s\n' "$s" "$(grep -c "\"verdict\": \"$s\"" "$work/entries" || true)"
 done
+printf '  %-10s %s\n' native "$(grep -c '"native": "' "$work/entries" || true)"
 echo "  logs       $logdir"

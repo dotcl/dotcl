@@ -21,8 +21,11 @@ is a good guide to what its dotcl backend calls:
   `wait-for-input` over several sockets
 - conditions: `socket-error` and a subclass per kind (`connection-refused-error`,
   `operation-timeout-error`, `address-in-use-error`, ...), `name-service-error`
-  and `host-not-found-error`. `socket-error-from-exception` translates a .NET
-  exception raised elsewhere, such as by a read on a socket stream
+  and `host-not-found-error`. `socket-timeout` is a `stream-error` signalled by
+  a read or write on a socket stream when its receive or send timeout expires,
+  so both existing `stream-error` handlers and timeout-specific ones see it.
+  `socket-error-from-exception` translates a .NET exception raised elsewhere,
+  such as by a read on a socket stream
 
 ```lisp
 (require "dotcl-bsd-sockets")

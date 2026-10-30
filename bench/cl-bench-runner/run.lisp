@@ -4,17 +4,28 @@
 ;;;   make bench                    # all suites (dotcl)
 ;;;   make bench SUITE=gabriel      # one suite
 ;;;   make bench BENCH=tak          # one benchmark
+;;;   make bench BENCH_GC_EACH=1    # full GC before each timed iteration
 ;;;   make bench-state              # run both dotcl & SBCL, generate bench-state.json
 ;;;
 ;;; Or directly:
 ;;;   dotnet run --project runtime -- --asm compiler/cil-out.sil bench/cl-bench-runner/run.lisp
 ;;;   ros run --load bench/cl-bench-runner/run.lisp --eval '(quit)'
 
+(load (merge-pathnames "../steady.lisp"
+                       (or *load-truename* *default-pathname-defaults*)))
+(defvar *bench-steady* (ledger-steady:env "LEDGER_STEADY")
+  "When true, each benchmark repeats in the process until its time is stable.")
 (defvar *bench-suite* nil "Suite to run: :gabriel :math :bignum :hash :arrays :clos :richards, or NIL for all")
 (defvar *bench-name* nil  "Specific benchmark name to run (string), a list of names, or NIL for all in suite")
 (defvar *bench-runs* nil  "If non-nil integer N, survey mode: emit N samples as JSON array. NIL = scalar output (default).")
 (defvar *bench-warmup* 1  "Number of warmup iterations to discard before recording N samples. Ignored in scalar mode.")
 (defvar *bench-consed* t  "When true, also measure bytes allocated per benchmark (emitted as \"<name>/consed\").")
+(defvar *bench-gc-each* nil  "When true, run a full GC before each timed iteration (the GC itself is not timed).")
+(defvar *bench-fasl-dir* (ledger-steady:env "BENCH_FASL_DIR")
+  "When set, each suite file is compiled with COMPILE-FILE into this directory and
+the fasl is loaded, instead of loading the source.")
+(defvar *bench-load-finished* nil
+  "Internal time when the current suite's files finished loading.")
 
 ;;; --- Allocation measurement ---
 ;;;
@@ -35,6 +46,11 @@
 (defun bench-bytes-consed ()
   #+dotcl (nth 4 (dotcl:gc-stats))
   #+(and sbcl (not dotcl)) (sb-ext:get-bytes-consed)
+  #-(or dotcl sbcl) nil)
+
+(defun bench-full-gc ()
+  #+dotcl (dotcl:gc)
+  #+(and sbcl (not dotcl)) (sb-ext:gc :full t)
   #-(or dotcl sbcl) nil)
 
 ;;; --- Results tracking ---
@@ -98,6 +114,11 @@
   (format *error-output* "  ~S: null" name)
   (finish-output *error-output*))
 
+(defun bench-emit-steady (name seconds runs stable)
+  (format t "~&STEADY ~A ~,6F ~D ~A~%"
+          name seconds runs (if stable "stable" "unstable"))
+  (finish-output))
+
 ;;; --- Timing macro ---
 ;;; Scalar mode (*bench-runs* = NIL): one measurement emitted as "name": 0.123
 ;;; Survey mode (*bench-runs* = N):   N samples emitted as   "name": [s1, s2, ...]
@@ -107,16 +128,21 @@
 ;;; turns that off).
 
 (defmacro bench (name times &body body)
-  ;; The allocation counter is read outside the timed region on both ends, so
-  ;; reading it (which itself conses a little) is not charged to the benchmark.
+  ;; The allocation counter, timer and optional full GC all sit outside the timed region.
   `(when (or (null *bench-name*)
              (if (listp *bench-name*)
                  (member ,name *bench-name* :test #'string-equal)
                  (string-equal *bench-name* ,name)))
      (handler-case
-       (if (and *bench-runs* (> *bench-runs* 0))
+       (if *bench-steady*
+           (multiple-value-bind (best runs stable)
+               (ledger-steady:measure (lambda () (dotimes (i ,times) ,@body))
+                                      :since *bench-load-finished*)
+             (bench-emit-steady ,name best runs stable))
+         (if (and *bench-runs* (> *bench-runs* 0))
            (let (samples consed)
              (dotimes (run (+ *bench-warmup* *bench-runs*))
+               (when *bench-gc-each* (bench-full-gc))
                (let* ((c0 (and *bench-consed* (bench-bytes-consed)))
                       (start (get-internal-real-time)))
                  (dotimes (i ,times) ,@body)
@@ -128,24 +154,37 @@
                      (when (and c0 c1) (push (- c1 c0) consed))))))
              (bench-emit-samples ,name (nreverse samples) ,times)
              (when consed (bench-emit-consed-samples ,name (nreverse consed))))
-           (let* ((c0 (and *bench-consed* (bench-bytes-consed)))
-                  (start (get-internal-real-time)))
-             (dotimes (i ,times) ,@body)
-             (let* ((elapsed (float (/ (- (get-internal-real-time) start)
-                                       internal-time-units-per-second)))
-                    (c1 (and *bench-consed* (bench-bytes-consed))))
-               (bench-emit-scalar ,name elapsed ,times
-                                  (and c0 c1 (- c1 c0))))))
+           (progn
+             (when *bench-gc-each* (bench-full-gc))
+             (let* ((c0 (and *bench-consed* (bench-bytes-consed)))
+                    (start (get-internal-real-time)))
+               (dotimes (i ,times) ,@body)
+               (let* ((elapsed (float (/ (- (get-internal-real-time) start)
+                                         internal-time-units-per-second)))
+                      (c1 (and *bench-consed* (bench-bytes-consed))))
+                 (bench-emit-scalar ,name elapsed ,times
+                                    (and c0 c1 (- c1 c0))))))))
        (error (e)
          (bench-emit-null ,name)
          (format t "~&~25A ERROR: ~A~%" ,name e)))))
 
 ;;; --- Suite runner ---
 
+(defun bench-load (file)
+  (if *bench-fasl-dir*
+      (let ((dir (pathname (concatenate 'string (string-right-trim "/" *bench-fasl-dir*) "/"))))
+        (ensure-directories-exist dir)
+        (load (compile-file file :output-file
+                            (merge-pathnames (make-pathname :name (pathname-name file)
+                                                            :type "fasl")
+                                             dir))))
+      (load file)))
+
 (defmacro with-suite ((key load-files) &body benchmarks)
   `(when (or (null *bench-suite*) (eq *bench-suite* ,key))
-     ,@(mapcar (lambda (f) `(load ,f))
+     ,@(mapcar (lambda (f) `(bench-load ,f))
                (if (listp load-files) load-files (list load-files)))
+     (setq *bench-load-finished* (get-internal-real-time))
      (format t "~&;; --- ~A ---~%" ,key)
      ,@benchmarks))
 
@@ -159,6 +198,8 @@
   (format t ";; suite: ~A~%" *bench-suite*))
 (when *bench-name*
   (format t ";; name:  ~A~%" *bench-name*))
+(when *bench-gc-each*
+  (format t ";; gc:    full collection before each timed iteration~%"))
 (format t ";; ----------------------------------------~%")
 
 ;;; --- Gabriel benchmarks ---

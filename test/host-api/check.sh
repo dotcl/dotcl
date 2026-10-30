@@ -263,6 +263,56 @@ while :; do
 done
 echo "PASS (ensurecore): 8 threads calling EnsureCore at once load the core once, 20 rounds"
 
+# A host that has used up the runtime's small inline TLS area before dotcl
+# starts (an MSBuild task does) gets dotcl's per-call thread statics in a GC
+# heap array, which moves. The innermost-frame word must not move with it.
+TLS="$WORK2/tls"
+mkdir -p "$TLS"
+cat > "$TLS/Program.cs" <<'CSEOF9'
+using DotCL;
+
+static class H0 { [ThreadStatic] public static long V; }
+static class H1 { [ThreadStatic] public static long V; }
+static class H2 { [ThreadStatic] public static long V; }
+static class H3 { [ThreadStatic] public static long V; }
+static class H4 { [ThreadStatic] public static long V; }
+static class H5 { [ThreadStatic] public static long V; }
+static class H6 { [ThreadStatic] public static long V; }
+static class H7 { [ThreadStatic] public static long V; }
+static class P
+{
+    static void TakeTls() { H0.V = 1; H1.V = 1; H2.V = 1; H3.V = 1; H4.V = 1; H5.V = 1; H6.V = 1; H7.V = 1; }
+    static void Main()
+    {
+        TakeTls();
+        DotclHost.EnsureCore();
+        DotclHost.Register("host-gc", _ => { GC.Collect(2, GCCollectionMode.Forced, true, true); return null; });
+        DotclHost.Register("host-nop", _ => null);
+        DotclHost.EvalString("(defun tls-down0 (n) (if (= n 0) (progn (host-nop) 0) (1+ (tls-down0 (1- n)))))");
+        DotclHost.EvalString("(defun tls-down (n) (if (= n 0) (progn (host-gc) 0) (1+ (tls-down (1- n)))))");
+        DotclHost.EvalString("(defun tls-outer0 () (tls-down0 5) (length (dotcl:backtrace)))");
+        DotclHost.EvalString("(defun tls-outer () (tls-down 5) (length (dotcl:backtrace)))");
+        int bad = 0;
+        for (int i = 0; i < 10; i++)
+        {
+            string r = "";
+            var t = new Thread(() =>
+            {
+                for (int k = 0; k < 20000; k++) GC.KeepAlive(new byte[64]);
+                r = DotclHost.EvalString("(let ((a (tls-outer0)) (b (tls-outer))) (if (= a b) \"same\" (format nil \"~a/~a\" a b)))").ToString();
+            });
+            t.Start(); t.Join();
+            if (r != "\"same\"") { bad++; Console.WriteLine($"TLS-DIFF {r}"); }
+        }
+        Console.WriteLine($"TLS-BAD {bad}");
+    }
+}
+CSEOF9
+emit_csproj "$TLS"
+out="$(build_and_run "tls" "$TLS")"
+want "tls" "$out" "TLS-BAD 0"
+echo "PASS (tls): the frame chain survives a compacting GC when the host has used up the inline TLS area"
+
 # -- what a condition looks like on the .NET side ---------------------------
 # Its own process for the same reason: the debugger hook is process-wide state.
 echo "=== conditions (typed exception, wrapped .NET exception, handled in Lisp) ==="

@@ -90,4 +90,188 @@ public partial class LispFunction
         Leave(ref fr);
         return r;
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double LeafAddD(double a, double b, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        double r = a + b;
+        if (!(System.Math.Abs(r) <= double.MaxValue)
+            && (double.IsNaN(r) ? !double.IsNaN(a) && !double.IsNaN(b) : !double.IsInfinity(a) && !double.IsInfinity(b)))
+            throw InLeafFrameOverflow('+', a, b, r, name, code, argc, r0, r1, r2, r3);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float LeafAddS(float a, float b, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        float r = a + b;
+        if (!(System.Math.Abs(r) <= float.MaxValue)
+            && (float.IsNaN(r) ? !float.IsNaN(a) && !float.IsNaN(b) : !float.IsInfinity(a) && !float.IsInfinity(b)))
+            throw InLeafFrameOverflow('+', a, b, r, name, code, argc, r0, r1, r2, r3);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double LeafSubtractD(double a, double b, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        double r = a - b;
+        if (!(System.Math.Abs(r) <= double.MaxValue)
+            && (double.IsNaN(r) ? !double.IsNaN(a) && !double.IsNaN(b) : !double.IsInfinity(a) && !double.IsInfinity(b)))
+            throw InLeafFrameOverflow('-', a, b, r, name, code, argc, r0, r1, r2, r3);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float LeafSubtractS(float a, float b, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        float r = a - b;
+        if (!(System.Math.Abs(r) <= float.MaxValue)
+            && (float.IsNaN(r) ? !float.IsNaN(a) && !float.IsNaN(b) : !float.IsInfinity(a) && !float.IsInfinity(b)))
+            throw InLeafFrameOverflow('-', a, b, r, name, code, argc, r0, r1, r2, r3);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double LeafMultiplyD(double a, double b, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        double r = a * b;
+        if (!(System.Math.Abs(r) <= double.MaxValue)
+            && (double.IsNaN(r) ? !double.IsNaN(a) && !double.IsNaN(b) : !double.IsInfinity(a) && !double.IsInfinity(b)))
+            throw InLeafFrameOverflow('*', a, b, r, name, code, argc, r0, r1, r2, r3);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float LeafMultiplyS(float a, float b, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        float r = a * b;
+        if (!(System.Math.Abs(r) <= float.MaxValue)
+            && (float.IsNaN(r) ? !float.IsNaN(a) && !float.IsNaN(b) : !float.IsInfinity(a) && !float.IsInfinity(b)))
+            throw InLeafFrameOverflow('*', a, b, r, name, code, argc, r0, r1, r2, r3);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double LeafDivideD(double a, double b, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        double r = a / b;
+        if (!(System.Math.Abs(r) <= double.MaxValue)
+            && (double.IsNaN(r) ? !double.IsNaN(a) && !double.IsNaN(b) : !double.IsInfinity(a) && !double.IsInfinity(b)))
+            throw InLeafFrameOverflow('/', a, b, r, name, code, argc, r0, r1, r2, r3);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float LeafDivideS(float a, float b, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        float r = a / b;
+        if (!(System.Math.Abs(r) <= float.MaxValue)
+            && (float.IsNaN(r) ? !float.IsNaN(a) && !float.IsNaN(b) : !float.IsInfinity(a) && !float.IsInfinity(b)))
+            throw InLeafFrameOverflow('/', a, b, r, name, code, argc, r0, r1, r2, r3);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float LeafNarrowD(double d, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        float f = (float)d;
+        if (float.IsInfinity(f) && !double.IsInfinity(d))
+            throw InLeafFrameNarrow(d, name, code, argc, r0, r1, r2, r3);
+        return f;
+    }
+
+    // Signals inside the frame the leaf would have linked; never returns.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static Exception InLeafFrameOverflow(char op, double a, double b, double r, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        Frame fr = default;
+        TypedFrameArgs ta = default;
+        ta.R0 = r0; ta.R1 = r1; ta.R2 = r2; ta.R3 = r3;
+        EnterTypedCore(ref fr, ref ta, name, argc, code);
+        throw FloatLane.Fault(op, a, b, r);
+    }
+
+    // Signals inside the frame the leaf would have linked; never returns.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static Exception InLeafFrameOverflow(char op, float a, float b, float r, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        Frame fr = default;
+        TypedFrameArgs ta = default;
+        ta.R0 = r0; ta.R1 = r1; ta.R2 = r2; ta.R3 = r3;
+        EnterTypedCore(ref fr, ref ta, name, argc, code);
+        throw FloatLane.Fault(op, a, b, r);
+    }
+
+    // Signals inside the frame the leaf would have linked; never returns.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static Exception InLeafFrameNarrow(double d, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        Frame fr = default;
+        TypedFrameArgs ta = default;
+        ta.R0 = r0; ta.R1 = r1; ta.R2 = r2; ta.R3 = r3;
+        EnterTypedCore(ref fr, ref ta, name, argc, code);
+        throw Runtime.FloatingPointOverflow("FLOAT", new DoubleFloat(d), new SingleFloat(1f));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject LeafCar(LispObject x, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        if (x is Cons c) return c.Car;
+        if (ReferenceEquals(x, Nil.Instance)) return x;
+        return InLeafFrameCar(x, name, code, argc, r0, r1, r2, r3);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static LispObject InLeafFrameCar(LispObject x, string name, int code, int argc, long r0, long r1, long r2, long r3)
+    {
+        Frame fr = default;
+        TypedFrameArgs ta = default;
+        ta.R0 = r0; ta.R1 = r1; ta.R2 = r2; ta.R3 = r3;
+        EnterTypedCore(ref fr, ref ta, name, argc, code);
+        var r = Runtime.Car(x);
+        Leave(ref fr);
+        return r;
+    }
+
+    // The same for an untyped body that is a leaf (CilAssembler.IsDirectLeaf):
+    // the frame holds its boxed arguments.
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static LispObject LeafCarD(LispObject x, string name, int argc,
+                                      LispObject? a0, LispObject? a1, LispObject? a2, LispObject? a3)
+    {
+        if (x is Cons c) return c.Car;
+        if (ReferenceEquals(x, Nil.Instance)) return x;
+        return InLeafFrameCarD(x, name, argc, a0, a1, a2, a3);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static LispObject InLeafFrameCarD(LispObject x, string name, int argc,
+                                      LispObject? a0, LispObject? a1, LispObject? a2, LispObject? a3)
+    {
+        Frame fr = default;
+        EnterLeafDirect(ref fr, name, argc, a0, a1, a2, a3);
+        var r = Runtime.Car(x);
+        Leave(ref fr);
+        return r;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static void LeafCheckArgType(LispObject v, LispObject spec, string name, int argc,
+                                        LispObject? a0, LispObject? a1, LispObject? a2, LispObject? a3)
+    {
+        Frame fr = default;
+        EnterLeafDirect(ref fr, name, argc, a0, a1, a2, a3);
+        Runtime.CheckArgType(v, spec);
+        Leave(ref fr);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void EnterLeafDirect(ref Frame fr, string name, int argc,
+                                LispObject? a0, LispObject? a1, LispObject? a2, LispObject? a3)
+    {
+        fr.Name = name; fr._argc = argc; fr._a0 = a0; fr._a1 = a1; fr._a2 = a2; fr._a3 = a3;
+        LinkTop(ref fr);
+        if ((fr.Depth & 255) == 0 || ConditionSystem.PollGate != 0) EnterSlow(ref fr);
+    }
 }

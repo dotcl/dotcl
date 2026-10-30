@@ -2722,12 +2722,23 @@
   (0.0d0 0.0d0 0.0d0 0.0 0.0d0))
 
 ;; Overflow still signals (SBCL default traps overflow); only underflow changed.
-(deftest expt-overflow-still-signals
-  (list (handler-case (progn (expt 10d0 400d0) :no-error)
-          (floating-point-overflow () :overflow))
-        (handler-case (progn (exp 800d0) :no-error)
-          (floating-point-overflow () :overflow)))
-  (:overflow :overflow))
+(defun %exp-overflow-safety-3 (x)
+  (declare (optimize (safety 3)))
+  (handler-case (progn (exp x) :no-error)
+    (floating-point-overflow () :overflow)))
+
+(defun %expt-overflow-safety-3 (x y)
+  (declare (optimize (safety 3)))
+  (handler-case (progn (expt x y) :no-error)
+    (floating-point-overflow () :overflow)))
+
+(deftest-compiled-only expt-overflow-still-signals
+  (%expt-overflow-safety-3 10d0 400d0)
+  :overflow)
+
+(deftest-compiled-only exp-overflow-signals-at-safety-3
+  (%exp-overflow-safety-3 800d0)
+  :overflow)
 
 ;;; A local-function &optional/&key default init-form that references an outer
 ;;; lexical variable must read the SHARED (boxed) cell at call time, not snapshot
@@ -2768,19 +2779,19 @@
 ;;; value, so </>/=/min/max compare as doubles instead of rationalizing. (Maxima's
 ;;; float-inf-p does (< x 0), which broke string/fortran output of any inf float.)
 (deftest float-infinity-vs-rational-compare
-  (let ((inf (* 1d300 1d300)))
+  (let ((inf dotcl:double-float-positive-infinity))
     (list (< inf 0) (> inf 5) (<= inf 0) (= inf 0) (< 0 inf) (< inf 1/2)
           (min inf 0) (max inf 0)))
-  (nil t nil nil t nil 0 #.(* 1d300 1d300)))
+  (nil t nil nil t nil 0 #.dotcl:double-float-positive-infinity))
 
 ;; f-roundings of a non-finite float return the value itself (no rationalize/throw).
 ;; Integer-result floor/truncate of infinity still signal (matching SBCL).
 (deftest float-infinity-frounding-and-integer-floor
-  (let ((inf (* 1d300 1d300)))
+  (let ((inf dotcl:double-float-positive-infinity))
     (list (ftruncate inf)
           (ffloor inf)
           (handler-case (floor inf) (arithmetic-error () :signaled))))
-  (#.(* 1d300 1d300) #.(* 1d300 1d300) :signaled))
+  (#.dotcl:double-float-positive-infinity #.dotcl:double-float-positive-infinity :signaled))
 
 ;;; Complex abs must use a scaled hypot, not naive sqrt(re^2+im^2), so extreme
 ;;; magnitudes don't under/overflow the intermediate squares to 0 / +inf.
@@ -2811,7 +2822,7 @@
 ;;; non-finite branch added for infinity used double.CompareTo, which ranks NaN
 ;;; below everything and wrongly made (< nan 0) true. = stays false too.
 (deftest nan-ordering-is-unordered
-  (let ((nan (- (* 1d300 1d300) (* 1d300 1d300))))
+  (let ((nan (- dotcl:double-float-positive-infinity dotcl:double-float-positive-infinity)))
     (list (< nan 0) (<= nan 0) (> nan 0) (>= nan 0) (= nan 0)
           (< 0 nan) (< nan 1/2) (minusp nan) (plusp nan)
           (< 1 2 nan 3)))             ; n-ary with a NaN in the middle
@@ -2819,7 +2830,7 @@
 
 ;; Guard: infinity is still ORDERED (it is not NaN), and finite comparisons work.
 (deftest infinity-and-finite-still-ordered
-  (let ((inf (* 1d300 1d300)))
+  (let ((inf dotcl:double-float-positive-infinity))
     (list (< inf 5) (> inf 5) (< 1 2) (< 2 1) (< 1 2 3) (<= 2 2)))
   (nil t t nil t t))
 

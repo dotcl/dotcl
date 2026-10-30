@@ -172,6 +172,46 @@ CONNECT-HOST, and the accepted server side."
       (%dns-close client accepted server)))
   (3/10 dotcl-bsd-sockets:operation-timeout-error))
 
+(deftest dotcl-bsd-sockets.stream-read-timeout-condition
+  (multiple-value-bind (server client accepted) (%dns-pair "127.0.0.1" "127.0.0.1")
+    (unwind-protect
+         (let ((stream (dotcl-bsd-sockets:socket-make-stream client)))
+           (setf (dotcl-bsd-sockets:sockopt-receive-timeout client) 0.2)
+           (list (handler-case (read-char stream)
+                   (dotcl-bsd-sockets:socket-timeout (e)
+                     (list (type-of e)
+                           (typep e 'stream-error)
+                           (eq (stream-error-stream e) stream)
+                           (multiple-value-list
+                            (subtypep 'dotcl-bsd-sockets:socket-timeout 'stream-error)))))
+                 (handler-case (progn (read-char stream) :read)
+                   (stream-error (e)
+                     (typep e 'dotcl-bsd-sockets:socket-timeout)))))
+      (%dns-close client accepted server)))
+  ((dotcl-bsd-sockets:socket-timeout t t (t t)) t))
+
+(deftest dotcl-bsd-sockets.stream-write-timeout-condition
+  (multiple-value-bind (server client accepted) (%dns-pair "127.0.0.1" "127.0.0.1")
+    (unwind-protect
+         (let ((stream (dotcl-bsd-sockets:socket-make-stream
+                        client :element-type '(unsigned-byte 8)))
+               (buffer (make-array 65536 :element-type '(unsigned-byte 8))))
+           (setf (dotcl-bsd-sockets:sockopt-send-timeout client) 0.2)
+           (dotnet:invoke (dotcl-bsd-sockets:socket-handle client) "set_SendBufferSize" 4096)
+           (dotnet:invoke (dotcl-bsd-sockets:socket-handle accepted) "set_ReceiveBufferSize" 4096)
+           (handler-case
+               (dotimes (i 200 :no-timeout)
+                 (write-sequence buffer stream)
+                 (finish-output stream))
+             (dotcl-bsd-sockets:socket-timeout (e)
+               (list (type-of e)
+                     (typep e 'stream-error)
+                     (typep e 'dotcl-bsd-sockets:socket-timeout)))
+             (stream-error (e)
+               (list :other-stream-error (type-of e)))))
+      (%dns-close client accepted server)))
+  (dotcl-bsd-sockets:socket-timeout t t))
+
 (deftest dotcl-bsd-sockets.timeout-option-off
   (let ((s (dotcl-bsd-sockets:udp-open :local-host "127.0.0.1")))
     (unwind-protect

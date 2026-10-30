@@ -1,9 +1,10 @@
 // gen-utils: code generation utilities for dotcl build
 // Usage:
-//   gen-utils download   <url> <output-file>
+//   gen-utils download   <url> <output-file> <sha256>
 //   gen-utils char-names <ucd-file> <output-cs-file>
 
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 
 return args.Length == 0 ? Usage() : args[0] switch
@@ -15,11 +16,40 @@ return args.Length == 0 ? Usage() : args[0] switch
 
 static async Task<int> CmdDownload(string[] args)
 {
-    if (args.Length != 2) return Fail("download <url> <output-file>");
-    var (url, path) = (args[0], args[1]);
+    if (args.Length != 3) return Fail("download <url> <output-file> <sha256>");
+    var (url, path, expected) = (args[0], args[1], args[2]);
     Console.WriteLine($"Downloading {url}");
-    using var client = new HttpClient();
-    var text = await client.GetStringAsync(url);
+    using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+    const int attempts = 3;
+    byte[] payload = [];
+    for (int attempt = 1; attempt <= attempts; attempt++)
+    {
+        try
+        {
+            payload = await client.GetByteArrayAsync(url);
+            break;
+        }
+        catch (Exception ex)
+        {
+            if (attempt == attempts)
+            {
+                Console.Error.WriteLine($"error: could not download {url} after {attempts} attempts: {ex.Message}");
+                return 1;
+            }
+            Console.Error.WriteLine($"Download failed ({ex.Message}); retrying in 2s...");
+            await Task.Delay(TimeSpan.FromSeconds(2));
+        }
+    }
+    var actual = Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant();
+    if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+    {
+        Console.Error.WriteLine($"error: SHA-256 mismatch for {url}");
+        Console.Error.WriteLine($"  expected {expected}");
+        Console.Error.WriteLine($"  actual   {actual}");
+        return 1;
+    }
+    var text = Encoding.UTF8.GetString(payload);
+    if (text.Length > 0 && text[0] == '\uFEFF') text = text[1..];
     File.WriteAllText(path, text, Encoding.UTF8);
     Console.WriteLine($"Wrote {new FileInfo(path).Length / 1024}KB -> {path}");
     return 0;
@@ -106,7 +136,7 @@ static int CmdCharNames(string[] args)
 static int Usage()
 {
     Console.Error.WriteLine("Usage:");
-    Console.Error.WriteLine("  gen-utils download   <url> <output-file>");
+    Console.Error.WriteLine("  gen-utils download   <url> <output-file> <sha256>");
     Console.Error.WriteLine("  gen-utils char-names <ucd-file> <output-cs-file>");
     return 1;
 }

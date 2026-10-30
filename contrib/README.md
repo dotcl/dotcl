@@ -10,8 +10,8 @@ Libraries for your programs:
   `dotcl-float`, `dotcl-rotate-byte`, `dotcl-simd`
 - The REPL and editors: `dotcl-repl`, `dotcl-code-info`, `dotcl-lsp`,
   `dotcl-lsp-coalton`
-- .NET: `dotnet-class`, `dotnet-ffi`, `dotnet-nuget`, `asdf-nuget`,
-  `dotnet-cs`
+- .NET: `dotnet-class`, `dotnet-library`, `dotnet-ffi`, `dotnet-nuget`,
+  `asdf-nuget`, `dotnet-cs`
 
 Under socket libraries such as usocket, not for direct use:
 `dotcl-bsd-sockets`. Under `dotcl-dap` and `dotcl-lsp`: `dotcl-jsonrpc`.

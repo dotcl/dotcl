@@ -27,6 +27,9 @@ public sealed class MvReturn : LispObject
             case 2: _v0 = values[0]; _v1 = values[1]; break;
             default: _rest = values; break;
         }
+#if DEBUG
+        foreach (var v in values) Runtime.AssertNotTableTNil(v);
+#endif
         DotCL.Diagnostics.AllocCounter.Inc("MvReturn");
     }
 
@@ -34,6 +37,9 @@ public sealed class MvReturn : LispObject
     public MvReturn(LispObject v0, LispObject v1)
     {
         _v0 = v0; _v1 = v1;
+#if DEBUG
+        Runtime.AssertNotTableTNil(v0); Runtime.AssertNotTableTNil(v1);
+#endif
         DotCL.Diagnostics.AllocCounter.Inc("MvReturn");
     }
 
@@ -407,6 +413,7 @@ public static class MultipleValues
     }
 
     /// <summary>BOXED followed by RUNTIME.UNWRAPMV: the primary value, alone.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispObject PrimaryAlone(LispObject primary)
     {
         _count = -1;

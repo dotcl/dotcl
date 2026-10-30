@@ -39,7 +39,7 @@
   (list (%ce-state (%ce-mk0 1)) (%ce-state (%ce-mk1 1)) (%ce-state (%ce-mk4 1))
         (%ce-state (%ce-mk5 1)) (%ce-state (%ce-mkopt 1))
         (%ce-state (let ((k 1)) (lambda (a) (list k a)))))
-  ("closure-entry" "closure-entry" "closure-entry" "none" "none" "none"))
+  ("closure-entry" "closure-entry" "closure-entry" "none" "none" "closure-entry"))
 
 (deftest-compiled-only closure-entry.calls
   (let ((f1 (%ce-mk1 :k)) (f2 (%ce-mk2 :k)) (f4 (%ce-mk4 :k)))

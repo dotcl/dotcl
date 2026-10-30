@@ -117,6 +117,10 @@ public sealed class Symbol : LispObject
 
     private volatile Symbol? _structParent;
 
+    /// <summary>The slot layout LispStruct.RegisterLayout recorded for this
+    /// structure name, or null.</summary>
+    internal volatile int[]? StructLayout;
+
     /// <summary>This structure type's :INCLUDE parent, or null if not a structure.</summary>
     public Symbol? StructParent
     {

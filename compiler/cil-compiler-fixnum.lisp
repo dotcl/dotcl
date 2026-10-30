@@ -626,13 +626,15 @@
     ((and (consp expr) (eq (car expr) 'the)
           (let ((ty (cadr expr)))
             (or (eq ty 'fixnum)
-                (and (consp ty) (eq (car ty) 'integer))
-                ;; (the (signed-byte N) E) etc.: only int64-fitting widths.
-                ;; A wide type like (signed-byte 100) can hold a bignum at
+                ;; (the (signed-byte N) E), (the (integer LO HI) E) etc.: only
+                ;; int64-fitting ranges. A wide or half-open type like
+                ;; (signed-byte 100) or (integer * -1) can hold a bignum at
                 ;; runtime; bitwise/compare ops skip the overflow gate, so a
                 ;; bare unbox-fixnum there would corrupt the value.
                 (let ((r (declared-integer-range ty)))
-                  (and r (range-fits-int64-p r))))))
+                  (and r (range-fits-int64-p r)))
+                (and (consp ty) (eq (car ty) 'integer)
+                     (fixnum-typed-p (caddr expr))))))
      t)
     ;; +, -, *: fixnum-typed operands are not enough. COMPILE-AS-LONG computes
     ;; them with the raw int64 op, which wraps, so the result is exact only
@@ -1364,7 +1366,7 @@
          (push (list l :bits expr nil
                      `(,@(compile-struct-object (car ref) (struct-slot-ref-type expr))
                        (:ldc-i4 ,(cdr ref))
-                       (:call "Runtime.StructRefU64")))
+                       ,@(%raw-struct-call "Runtime.StructRefU64" (struct-slot-ref-owner expr))))
                *u64-leaves*)
          (list :leaf l :bits)))
       ;; A call to an INLINE function whose body is arithmetic in the lane:
@@ -1880,6 +1882,17 @@
     (setf *long-code-owned* (and head (cons head tail)))
     head))
 
+(defun %arith-leaves-fixnum-typed-p (e)
+  "True when E is FIXNUM-TYPED-P or every leaf of its + - * 1+ 1- tree is, or E
+   is no such arithmetic at all."
+  (cond ((not (and (consp e) (member (car e) '(+ - * 1+ 1-)) (cdr e))) t)
+        ((fixnum-typed-p e) t)
+        (t (every (lambda (a)
+                    (if (and (consp a) (member (car a) '(+ - * 1+ 1-)))
+                        (%arith-leaves-fixnum-typed-p a)
+                        (fixnum-typed-p a)))
+                  (cdr e)))))
+
 (defun compile-as-long (expr)
   "Compile EXPR leaving an int64 on the stack. Caller must have verified
    fixnum-typed-p; this routine assumes the invariant."
@@ -1968,14 +1981,14 @@
     ;; instead of the slot's LispObject through UnwrapMv and an unbox.
     ((struct-slot-ref expr)
      (let ((ref (struct-slot-ref expr)))
-       (compile-struct-slot-as-long (car ref) (cdr ref) (struct-slot-ref-type expr))))
-    ;; (if c a b), both arms fixnum-typed: branch with a raw int64 on each path
-    ;; instead of boxing at the merge. The condition goes through the same
-    ;; compile-boolean-branch the ordinary IF uses, so fused comparisons and
-    ;; and/or/not chains behave identically here.
-    ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4)
-          (fixnum-typed-p (caddr expr))
-          (fixnum-typed-p (cadddr expr)))
+       (compile-struct-slot-as-long (car ref) (cdr ref) (struct-slot-ref-type expr)
+                                    (struct-slot-ref-owner expr))))
+    ;; (if c a b): branch with a raw int64 on each path instead of boxing at
+    ;; the merge. The condition goes through the same compile-boolean-branch the
+    ;; ordinary IF uses, so fused comparisons and and/or/not chains behave
+    ;; identically here. The arms are not asked FIXNUM-TYPED-P again: the caller
+    ;; asked it of the IF, possibly under *FIXNUM-WRAP-LICENSED*.
+    ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4))
      (let ((else-label (gen-label "LONGELSE"))
            (end-label (gen-label "LONGEND")))
        `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
@@ -1994,7 +2007,14 @@
      ;; Previously this always took compile-expr+unbox, forcing e.g.
      ;; (the fixnum (1- x)) through a box->Runtime.Decrement->unbox round-trip
      ;; (a method call) in hot fixnum loops like tak/stak.
-     (compile-as-long (caddr expr)))
+     ;; The assertion is about E's value, not its operands, which may be
+     ;; bignums: arithmetic on operands not known to be fixnums goes boxed.
+     (let ((e (caddr expr)))
+       (if (%arith-leaves-fixnum-typed-p e)
+           (compile-as-long e)
+           `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                 (compile-expr e))
+             (:unbox-fixnum)))))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
      (let ((op (ecase (car expr) (+ :add) (- :sub) (* :mul))))
        (compile-long-binop op (cadr expr) (caddr expr))))
@@ -2132,16 +2152,15 @@
     ;; integer the caller wants raw: its last form is compiled as an int64
     ;; instead of being boxed and unboxed again.
     ((compile-as-long-structured expr))
+    ;; A long value is consumed as one value, so it takes no mode.
     ((let ((*in-tail-position* nil) (*in-mv-context* nil))
        (%funcall-aref-long-plan expr))
      (let ((*in-tail-position* nil) (*in-mv-context* nil))
-       (compile-funcall-aref (cadr expr) (%funcall-aref-long-plan expr)
-                             (%call-site-mv-mode (cdr expr)) t)))
+       (compile-funcall-aref (cadr expr) (%funcall-aref-long-plan expr) nil t)))
     ((let ((*in-tail-position* nil) (*in-mv-context* nil))
        (%funcall-long-arg-expr-p expr))
      (let ((*in-tail-position* nil) (*in-mv-context* nil))
-       (compile-funcall-long-arg (cadr expr) (caddr expr)
-                                 (%call-site-mv-mode (cdr expr)) t)))
+       (compile-funcall-long-arg (cadr expr) (caddr expr) nil t)))
     (t
      (multiple-value-bind (code raw) (%compile-raw-typed-call expr :long)
        (cond (raw code)
@@ -2360,23 +2379,20 @@
       ,@body)))
 
 (defun literal-symbol-operand (expr)
-  "If EXPR is a quoted symbol literal other than T and NIL, return that symbol.
-   T and NIL are excluded because EQ and EQL bridge the T and NIL objects to
-   the T and NIL symbols, which a plain reference comparison does not do."
+  "If EXPR is a quoted symbol literal other than NIL, return that symbol.
+   NIL is left to the IsNilObj test the caller tries first."
   (and (consp expr)
        (eq (car expr) 'quote)
        (let ((s (cadr expr)))
-         (and (symbolp s) (not (null s)) (not (eq s t)) s))))
+         (and (symbolp s) (not (null s)) s))))
 
 (defun compile-sym-eq (args)
   "Emit an inline reference comparison for (EQ x 'SYM) / (EQL x 'SYM).
    Leaves an i4 (0 or 1) on stack; the same contract as COMPILE-FIXNUM-CMP.
 
-   Runtime.IsTrueEq is Primary on both sides, ReferenceEquals, then a bridge
-   that can only fire when one side is the T or NIL symbol; IsTrueEql adds the
-   number and character cases after that. So against any other symbol literal
-   the whole call reduces to Primary + a reference compare, and the literal
-   side needs neither. What is saved is the call itself, which CASE pays once
+   Runtime.IsTrueEq is a reference compare; IsTrueEql adds the number and
+   character cases after that. So against a symbol literal the whole call
+   reduces to Primary + a reference compare, and the literal side needs neither. What is saved is the call itself, which CASE pays once
    for every clause it walks past.
 
    CEQ is symmetric, but the operands are still emitted in source order.

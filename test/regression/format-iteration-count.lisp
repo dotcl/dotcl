@@ -26,3 +26,16 @@
 (deftest format-iteration-count.sublists-consume-their-list
   (format nil "~3:{/A~}" '((x)))
   "/A")
+
+;;; A counted ~v{ accepts a non-nil non-list when its body reads no elements.
+(deftest format-iteration-count.v-parameter-non-list-atom
+  (list (format nil "~v{-~}" 3 4)
+        (format nil "~v{-~}" 3 nil)
+        (format nil "~3{-~}" 5))
+  ("---" "" "---"))
+
+(deftest format-iteration-count.v-parameter-non-list-inside-iteration
+  (list (format nil "~{~v{-~}~^+~:*~}" '(3 4 0))
+        (format nil "~{<~v{-~}>~}" '(3 4))
+        (format nil "~{<~v{-~}>~}" '(3 4 5 6)))
+  ("---+----" "<--->" "<---><----->"))

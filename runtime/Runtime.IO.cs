@@ -21,6 +21,7 @@ public static partial class Runtime
     [ThreadStatic] private static int _pprintBufferNestLevel;   // nesting level (0 = outermost)
     [ThreadStatic] private static int _pprintBufferStart;       // StringWriter position at outermost block start
     [ThreadStatic] private static List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)>? _pprintDeferredNewlines;
+    [ThreadStatic] private static List<int>? _pprintBlockStarts;
     // Saved state stack for nested logical blocks
     [ThreadStatic] private static Stack<(int col, int blockCol, int indent, bool active, TextWriter? stream, string? perLinePrefix,
         bool pendingFill, int colAtFillCheck)>? _pprintStack;
@@ -99,14 +100,17 @@ public static partial class Runtime
             _pprintBufferNestLevel = 0;
             _pprintBufferStart = sw.GetStringBuilder().Length;
             _pprintDeferredNewlines = new();
+            _pprintBlockStarts = new();
             // Record block-start for the outermost block
             _pprintDeferredNewlines.Add((sw.GetStringBuilder().Length, "BLOCK_START", _pprintBlockColumn, _pprintIndent, _pprintPerLinePrefix, 0));
+            _pprintBlockStarts.Add(_pprintDeferredNewlines.Count - 1);
         }
         else if (_pprintBuffering && writer is StringWriter sw2)
         {
             _pprintBufferNestLevel++;
             // Record inner block start
             _pprintDeferredNewlines?.Add((sw2.GetStringBuilder().Length, "BLOCK_START", _pprintBlockColumn, _pprintIndent, _pprintPerLinePrefix, 0));
+            _pprintBlockStarts?.Add(_pprintDeferredNewlines!.Count - 1);
         }
     }
 
@@ -125,17 +129,11 @@ public static partial class Runtime
     /// <summary>Set the suffix length for the current block (used for fit/break calculations).</summary>
     public static void PprintSetBlockSuffix(int suffixLen)
     {
-        if (_pprintDeferredNewlines == null) return;
-        // Find the most recent BLOCK_START at the current nesting level
-        for (int i = _pprintDeferredNewlines.Count - 1; i >= 0; i--)
-        {
-            if (_pprintDeferredNewlines[i].kind == "BLOCK_START")
-            {
-                var tok = _pprintDeferredNewlines[i];
-                _pprintDeferredNewlines[i] = (tok.pos, tok.kind, tok.blockCol, tok.indent, tok.plp, suffixLen);
-                break;
-            }
-        }
+        var starts = _pprintBlockStarts;
+        if (_pprintDeferredNewlines == null || starts == null || starts.Count == 0) return;
+        int i = starts[starts.Count - 1];
+        var tok = _pprintDeferredNewlines[i];
+        _pprintDeferredNewlines[i] = (tok.pos, tok.kind, tok.blockCol, tok.indent, tok.plp, suffixLen);
     }
 
     /// <summary>End a pretty-printing logical block. Processes XP buffer if outermost.</summary>
@@ -146,12 +144,14 @@ public static partial class Runtime
         {
             _pprintDeferredNewlines?.Add((sw.GetStringBuilder().Length, "BLOCK_END", 0, 0, null, 0));
 
+            _pprintBlockStarts?.RemoveAt(_pprintBlockStarts.Count - 1);
             if (_pprintBufferNestLevel == 0)
             {
                 // Outermost block: process the full XP buffer
                 ProcessXpBuffer(sw);
                 _pprintBuffering = false;
                 _pprintDeferredNewlines = null;
+                _pprintBlockStarts = null;
             }
             else
             {
@@ -214,6 +214,37 @@ public static partial class Runtime
         return true;
     }
 
+    /// <summary>The indent of a pending fill newline, when one is waiting.</summary>
+    internal static bool PprintPendingFill(out int indent)
+    {
+        indent = 0;
+        if (!_pprintBuffering || _pprintDeferredNewlines == null) return false;
+        for (int i = _pprintDeferredNewlines.Count - 1; i >= 0; i--)
+        {
+            var kind = _pprintDeferredNewlines[i].kind;
+            if (kind == "FILL") { indent = _pprintDeferredNewlines[i].indent; return true; }
+            if (kind == "LINEAR" || kind == "MANDATORY" || kind == "MISER") return false;
+            if (kind == "BLOCK_START" || kind == "BLOCK_END" || kind.StartsWith("TAB:")) continue;
+        }
+        return false;
+    }
+
+    /// <summary>The column the next output will start at once pending deferred
+    /// newlines are decided, so a nested object is laid out against the real line.</summary>
+    internal static int PprintAnticipatedColumn()
+    {
+        if (!_pprintBuffering || _pprintDeferredNewlines == null) return _pprintColumn;
+        for (int i = _pprintDeferredNewlines.Count - 1; i >= 0; i--)
+        {
+            var kind = _pprintDeferredNewlines[i].kind;
+            if (kind == "LINEAR" || kind == "MANDATORY") return _pprintDeferredNewlines[i].indent;
+            if (kind == "MISER") return IsMiserMode() ? _pprintDeferredNewlines[i].indent : _pprintColumn;
+            if (kind == "FILL") return _pprintColumn;
+            if (kind == "BLOCK_START" || kind == "BLOCK_END" || kind.StartsWith("TAB:")) continue;
+        }
+        return _pprintColumn;
+    }
+
     /// <summary>Update column position after writing a single character.</summary>
     public static void PprintTrackWriteChar(char c)
     {
@@ -271,7 +302,8 @@ public static partial class Runtime
     public static void PprintMandatoryNewline(TextWriter writer)
     {
         if (!_pprintActive) return;
-        PprintTrimTrailingWhitespace(writer);
+        // XP fit tests measure the spaces before the newline; layout trims them.
+        if (!_pprintBuffering) PprintTrimTrailingWhitespace(writer);
         writer.Write('\n');
         int col = 0;
         if (_pprintPerLinePrefix != null)
@@ -290,12 +322,20 @@ public static partial class Runtime
     }
 
     /// <summary>Get *print-right-margin* value, defaulting to 80 (as SBCL does
-    /// for a stream whose line length is unknown).</summary>
+    /// for a stream whose line length is unknown). Values beyond the int range
+    /// are clamped, so any non-negative integer margin disables wrapping.</summary>
     internal static int GetPrintRightMargin()
     {
         var rmSym = Startup.Sym("*PRINT-RIGHT-MARGIN*");
         var val = DynamicBindings.TryGet(rmSym, out var rmVal) ? rmVal : rmSym.Value;
-        if (val is Fixnum f) return (int)f.Value;
+        if (val is Fixnum f)
+            return f.Value > int.MaxValue ? int.MaxValue
+                 : f.Value < int.MinValue ? int.MinValue
+                 : (int)f.Value;
+        if (val is Bignum b)
+            return b.Value > int.MaxValue ? int.MaxValue
+                 : b.Value < int.MinValue ? int.MinValue
+                 : (int)b.Value;
         return 80; // default
     }
 
@@ -336,8 +376,9 @@ public static partial class Runtime
             // rarely exceeds a few lines, so this catches runaway buffering (e.g. circular
             // structures or deeply nested output) before it causes memory exhaustion.
             int bufSize = sw.GetStringBuilder().Length - _pprintBufferStart;
-            if (bufSize > GetPrintRightMargin() * PprintBufferMarginMultiplier)
+            if ((long)bufSize > (long)GetPrintRightMargin() * PprintBufferMarginMultiplier)
             {
+                TrimBufferedMandatorySpaces(sw, _pprintDeferredNewlines);
                 _pprintBuffering = false;
                 _pprintDeferredNewlines = null;
                 // Fall through to non-buffered handling below
@@ -396,9 +437,11 @@ public static partial class Runtime
         int margin = GetPrintRightMargin();
         string content = sb.ToString(_pprintBufferStart, sb.Length - _pprintBufferStart);
 
+        int[] sectionEnds = ComputeXpSectionEnds(content, tokens, _pprintBufferStart);
         // Process the token stream, handling nested blocks recursively
         var result = new System.Text.StringBuilder();
-        int col = ProcessXpBlock(content, tokens, 0, tokens.Count, _pprintBufferStart, margin, result);
+        int col = ProcessXpBlock(content, tokens, sectionEnds, 0, tokens.Count, _pprintBufferStart, margin, result,
+                                  tokens[0].suffixLen);
 
         // Replace content in StringWriter
         sb.Length = _pprintBufferStart;
@@ -407,9 +450,73 @@ public static partial class Runtime
         _pprintColumn = col;
     }
 
+    /// <summary>Remove the spaces kept before buffered mandatory newlines when buffering stops.</summary>
+    private static void TrimBufferedMandatorySpaces(StringWriter sw,
+        List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)>? tokens)
+    {
+        if (tokens == null) return;
+        var sb = sw.GetStringBuilder();
+        for (int i = tokens.Count - 1; i >= 0; i--)
+        {
+            if (tokens[i].kind != "MANDATORY") continue;
+            int pos = System.Math.Min(tokens[i].pos, sb.Length);
+            int nl = -1;
+            for (int k = pos - 1; k >= 0; k--)
+                if (sb[k] == '\n') { nl = k; break; }
+            if (nl < 0) continue;
+            int end = nl;
+            while (end > 0 && sb[end - 1] == ' ') end--;
+            if (end < nl) sb.Remove(end, nl - end);
+        }
+    }
+
+    private static bool IsXpNewline(string kind)
+        => kind is "FILL" or "LINEAR" or "MISER" or "MANDATORY"
+           or "STD:FILL" or "STD:LINEAR" or "STD:MISER";
+
+    /// <summary>Section end for each block start and newline: next newline at depth <= its depth.</summary>
+    private static int[] ComputeXpSectionEnds(string content,
+        List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)> tokens, int bufStart)
+    {
+        int n = tokens.Count;
+        var depth = new int[n];
+        int open = 0, maxDepth = 0;
+        for (int i = 0; i < n; i++)
+        {
+            string kind = tokens[i].kind;
+            if (kind == "BLOCK_START") depth[i] = open++;
+            else if (kind == "BLOCK_END") depth[i] = --open;
+            else depth[i] = open;
+            if (depth[i] > maxDepth) maxDepth = depth[i];
+        }
+
+        var sectionEnds = new int[n];
+        var next = new int[maxDepth + 2];
+        for (int d = 0; d < next.Length; d++) next[d] = -1;
+        for (int i = n - 1; i >= 0; i--)
+        {
+            string kind = tokens[i].kind;
+            bool newline = IsXpNewline(kind);
+            if (kind == "BLOCK_START" || newline)
+                sectionEnds[i] = next[depth[i]];
+            if (newline)
+            {
+                int pos = tokens[i].pos - bufStart;
+                if (kind == "MANDATORY")
+                {
+                    int nl = pos > 0 ? content.LastIndexOf('\n', System.Math.Min(pos, content.Length) - 1) : -1;
+                    if (nl >= 0) pos = nl;
+                }
+                for (int d = depth[i]; d < next.Length; d++) next[d] = pos;
+            }
+        }
+        return sectionEnds;
+    }
+
     /// <summary>Process a single block within the XP buffer. Returns final column.</summary>
     /// <param name="content">Full buffer content</param>
     /// <param name="tokens">All tokens</param>
+    /// <param name="sectionEnds">Section end position for each token, -1 for none</param>
     /// <param name="tokenStart">Index of BLOCK_START token for this block</param>
     /// <param name="tokenEnd">Index past BLOCK_END token for this block</param>
     /// <param name="bufStart">Buffer offset (to convert token positions)</param>
@@ -417,7 +524,8 @@ public static partial class Runtime
     /// <param name="result">Output StringBuilder</param>
     /// <returns>Column position after output</returns>
     private static int ProcessXpBlock(string content, List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)> tokens,
-        int tokenStart, int tokenEnd, int bufStart, int margin, System.Text.StringBuilder result, int colOverride = -1)
+        int[] sectionEnds, int tokenStart, int tokenEnd, int bufStart, int margin, System.Text.StringBuilder result,
+        int rootSuffixLen, int colOverride = -1)
     {
         // Find the BLOCK_START token to get block parameters
         if (tokenStart >= tokenEnd) return 0;
@@ -425,7 +533,7 @@ public static partial class Runtime
         if (startToken.kind != "BLOCK_START") return 0;
 
         int blockCol = colOverride >= 0 ? colOverride : startToken.blockCol;
-        int indent = colOverride >= 0 ? colOverride : startToken.indent;
+        int blockIndent = colOverride >= 0 ? colOverride : startToken.indent;
         // When colOverride shifts the block, compute offset to adjust token indents
         int colShift = colOverride >= 0 ? colOverride - startToken.blockCol : 0;
         string? plp = startToken.plp;
@@ -472,15 +580,35 @@ public static partial class Runtime
             }
         }
 
-        // Check if this block fits on one line (including suffix)
+        // A queued tab adds spaces not in the content, so such a block uses tokens.
         bool hasHardNewline = blockContent.Contains('\n');
-        bool blockFits = !hasHardNewline && (blockCol + blockContent.Length + suffixLen <= margin);
+        bool hasTab = false;
+        for (int ti = tokenStart; ti < tokenEnd; ti++)
+            if (tokens[ti].kind.StartsWith("TAB:", StringComparison.Ordinal)) { hasTab = true; break; }
+        int blockSectionEnd = tokenStart < sectionEnds.Length ? sectionEnds[tokenStart] : -1;
+        int fitEnd = blockSectionEnd >= contentStart ? blockSectionEnd : content.Length;
+        int fitWidth = MeasureXpWidth(content, tokens, bufStart, contentStart, fitEnd, blockCol);
+        if (blockSectionEnd < 0) fitWidth += rootSuffixLen;
+        string flatBlock = blockContent;
+        bool blockFits;
+        if (!hasHardNewline && hasTab)
+        {
+            // A block whose tabs fit flat prints as one line, tabs expanded.
+            (flatBlock, int flatCol) = ExpandFlatBlock(content, tokens, tokenStart, tokenEnd,
+                                                       bufStart, contentStart, contentEnd, blockCol);
+            blockFits = flatCol + suffixLen <= margin;
+        }
+        else
+        {
+            blockFits = !hasHardNewline && !hasTab
+                        && (blockCol + fitWidth <= margin);
+        }
 
         if (blockFits)
         {
             // Block fits: output as-is, no conditional newlines fire
-            result.Append(blockContent);
-            return blockCol + blockContent.Length;
+            result.Append(flatBlock);
+            return blockCol + flatBlock.Length;
         }
 
         // Check if this block is in miser mode (using resolved blockCol)
@@ -533,12 +661,13 @@ public static partial class Runtime
             else if (nestLevel == 0)
             {
                 // Own-level conditional newline: adjust indent by colShift
-                ownTokens2.Add((tok.pos - bufStart, tok.kind, Math.Max(0, tok.indent + colShift), tok.plp, -1, -1));
+                ownTokens2.Add((tok.pos - bufStart, tok.kind, Math.Max(0, tok.indent + colShift), tok.plp, i, -1));
             }
         }
 
         // Output content with breaks at own-level tokens
         int col = blockCol;
+        int sectionStart = blockCol; // start of the current pprint section
         int lastPos = contentStart;
         // Set when output since this block's last own newline (conditional break or
         // mandatory newline) spans lines: an inner block broke, or a literal newline
@@ -553,27 +682,95 @@ public static partial class Runtime
 
             string segment = content[lastPos..adjPos];
             bool doBreak = false;
+            bool std = kind.StartsWith("STD:", StringComparison.Ordinal);
+            string kindBase = std ? kind[4..] : kind;
 
-            if (kind == "MANDATORY")
+            if (kind.StartsWith("STDINDENT:", StringComparison.Ordinal))
+            {
+                result.Append(segment);
+                col = CountColumnAfter(segment, col);
+                if (segment.Contains('\n')) sectionStart = col;
+                var ip = kind.Split(':');
+                int amount = int.Parse(ip[2]);
+                blockIndent = System.Math.Max(0, (ip[1] == "BLOCK" ? blockCol : col) + amount);
+                lastPos = adjPos;
+                continue;
+            }
+            else if (kind.StartsWith("TAB:", StringComparison.Ordinal))
+            {
+                result.Append(segment);
+                col = CountColumnAfter(segment, col);
+                if (segment.Contains('\n')) sectionStart = col;
+                var tabParts = kind.Split(':');
+                string tabKind = tabParts[1];
+                int colnum = int.Parse(tabParts[2]);
+                int colinc = int.Parse(tabParts[3]);
+                int target;
+                if (tabKind == "LINE")
+                {
+                    target = col < colnum ? colnum
+                        : colinc <= 0 ? col
+                        : colnum + (col - colnum + colinc) / colinc * colinc;
+                }
+                else if (tabKind == "SECTION")
+                {
+                    int sectionCol = col - sectionStart;
+                    target = sectionCol < colnum ? sectionStart + colnum
+                        : colinc <= 0 ? col
+                        : sectionStart + colnum + (sectionCol - colnum + colinc) / colinc * colinc;
+                }
+                else if (tabKind == "LINE-RELATIVE")
+                {
+                    int newcol = col + colnum;
+                    target = colinc <= 0 ? newcol
+                        : newcol + (newcol % colinc == 0 ? 0 : colinc - newcol % colinc);
+                }
+                else
+                {
+                    int sectionCol = col - sectionStart;
+                    int newSectionCol = sectionCol + colnum;
+                    target = sectionStart + (colinc <= 0 ? newSectionCol
+                        : newSectionCol + (newSectionCol % colinc == 0 ? 0 : colinc - newSectionCol % colinc));
+                }
+                if (target > col) result.Append(' ', target - col);
+                col = Math.Max(col, target);
+                lastPos = adjPos;
+                continue;
+            }
+            else if (kind == "MANDATORY")
             {
                 // The segment ends just after a mandatory newline (and its prefix and
                 // indentation), which starts a new section.
+                int nl = segment.LastIndexOf('\n');
+                if (nl >= 0)
+                {
+                    bool onlySpaces = true;
+                    for (int k = 0; k < nl; k++)
+                        if (segment[k] != ' ') { onlySpaces = false; break; }
+                    if (onlySpaces)
+                        while (result.Length > 0 && result[result.Length - 1] == ' ')
+                            result.Length--;
+                    int spaces = nl;
+                    while (spaces > 0 && segment[spaces - 1] == ' ') spaces--;
+                    if (spaces < nl) segment = segment[..spaces] + segment[nl..];
+                }
                 result.Append(segment);
                 col = CountColumnAfter(segment, col);
+                sectionStart = col;
                 innerBlockBroke = false;
                 lastPos = adjPos;
                 continue;
             }
-            else if (kind == "LINEAR")
+            else if (kindBase == "LINEAR")
             {
                 doBreak = true;
             }
-            else if (kind == "MISER")
+            else if (kindBase == "MISER")
             {
                 // MISER: break only if this block is in miser mode
                 doBreak = blockMiserMode;
             }
-            else if (kind == "FILL")
+            else if (kindBase == "FILL")
             {
                 // In miser mode, FILL becomes mandatory (like LINEAR)
                 if (blockMiserMode)
@@ -596,18 +793,11 @@ public static partial class Runtime
                     }
                     else
                     {
-                        int nextEnd = contentEnd;
-                        for (int ni = ti + 1; ni < ownTokens2.Count; ni++)
-                        {
-                            if (ownTokens2[ni].kind != "INNER_BLOCK")
-                            {
-                                nextEnd = ownTokens2[ni].adjustedPos;
-                                break;
-                            }
-                        }
-                        int nextWidth = MeasureSegmentWidth(content[adjPos..nextEnd]);
-                        // If this is the last section (extends to block end), include suffix
-                        if (nextEnd == contentEnd) nextWidth += suffixLen;
+                        int sec = tokenIdx >= 0 && tokenIdx < sectionEnds.Length ? sectionEnds[tokenIdx] : -1;
+                        int nextEnd = sec >= adjPos ? sec : content.Length;
+                        int nextWidth = MeasureXpWidth(content, tokens, bufStart, adjPos, nextEnd, tempCol);
+                        // The outermost block's suffix is outside the buffer.
+                        if (sec < 0) nextWidth += rootSuffixLen;
                         doBreak = (tempCol + nextWidth > margin);
                     }
                 }
@@ -617,11 +807,11 @@ public static partial class Runtime
                 // Inner block: output preceding segment, then process block recursively
                 result.Append(segment);
                 col = CountColumnAfter(segment, col);
-                if (segment.Contains('\n')) innerBlockBroke = true;
+                if (segment.Contains('\n')) { innerBlockBroke = true; sectionStart = col; }
 
                 // Process inner block recursively with current actual column
                 var innerResult = new System.Text.StringBuilder();
-                col = ProcessXpBlock(content, tokens, tokenIdx, tokenEndIdx, bufStart, margin, innerResult, col);
+                col = ProcessXpBlock(content, tokens, sectionEnds, tokenIdx, tokenEndIdx, bufStart, margin, innerResult, rootSuffixLen, col);
                 // Track if inner block produced multi-line output
                 for (int ri = 0; ri < innerResult.Length; ri++)
                 {
@@ -652,7 +842,7 @@ public static partial class Runtime
                 if (!remainingStartsNewline)
                 {
                     string? breakPlp = tokPlp;
-                    int breakIndent = tokIndent;
+                    int breakIndent = std ? blockIndent : tokIndent;
                     int breakPlpLen = breakPlp?.Length ?? 0;
                     if (breakPlp != null) result.Append(breakPlp);
                     int indentSpaces = Math.Max(0, breakIndent - breakPlpLen);
@@ -671,6 +861,8 @@ public static partial class Runtime
                 if (segment.Contains('\n')) innerBlockBroke = true;
             }
 
+            // Only an emitted newline starts a new section.
+            if (doBreak || segment.Contains('\n')) sectionStart = col;
             lastPos = adjPos;
         }
 
@@ -682,6 +874,81 @@ public static partial class Runtime
         }
 
         return col;
+    }
+
+    /// <summary>Expand a block that fits on one line, including its queued tabs.</summary>
+    private static (string text, int col) ExpandFlatBlock(string content,
+        List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)> tokens,
+        int tokenStart, int tokenEnd, int bufStart, int contentStart, int contentEnd, int blockCol)
+    {
+        var result = new System.Text.StringBuilder();
+        int col = blockCol;
+        var sections = new List<int> { blockCol };
+        int lastPos = contentStart;
+        for (int i = tokenStart + 1; i < tokenEnd; i++)
+        {
+            var tok = tokens[i];
+            int pos = tok.pos - bufStart;
+            if (pos < lastPos || pos > contentEnd) continue;
+            string segment = content[lastPos..pos];
+            result.Append(segment);
+            col = CountColumnAfter(segment, col);
+            if (tok.kind.StartsWith("TAB:", StringComparison.Ordinal))
+            {
+                var tp = tok.kind.Split(':');
+                int target = TabTarget(tp[1], col, sections[^1], int.Parse(tp[2]), int.Parse(tp[3]));
+                if (target > col) result.Append(' ', target - col);
+                col = Math.Max(col, target);
+            }
+            else if (tok.kind == "BLOCK_START")
+            {
+                sections.Add(col);
+            }
+            else if (tok.kind == "BLOCK_END")
+            {
+                if (sections.Count > 1) sections.RemoveAt(sections.Count - 1);
+            }
+            else if (tok.kind is "FILL" or "LINEAR" or "MISER"
+                     or "STD:FILL" or "STD:LINEAR" or "STD:MISER")
+            {
+                sections[^1] = col;
+            }
+            lastPos = pos;
+        }
+        if (lastPos < contentEnd)
+        {
+            string rest = content[lastPos..contentEnd];
+            result.Append(rest);
+            col = CountColumnAfter(rest, col);
+        }
+        return (result.ToString(), col);
+    }
+
+    /// <summary>Column a pprint tab reaches from COL, relative to SECTIONSTART.</summary>
+    private static int TabTarget(string kind, int col, int sectionStart, int colnum, int colinc)
+    {
+        if (kind == "LINE")
+        {
+            return col < colnum ? colnum
+                : colinc <= 0 ? col
+                : colnum + (col - colnum + colinc) / colinc * colinc;
+        }
+        if (kind == "LINE-RELATIVE")
+        {
+            int newcol = col + colnum;
+            return colinc <= 0 ? newcol
+                : newcol + (newcol % colinc == 0 ? 0 : colinc - newcol % colinc);
+        }
+        if (kind == "SECTION")
+        {
+            int sectionCol = col - sectionStart;
+            return sectionCol < colnum ? sectionStart + colnum
+                : colinc <= 0 ? col
+                : sectionStart + colnum + (sectionCol - colnum + colinc) / colinc * colinc;
+        }
+        int sc = col - sectionStart + colnum;
+        return sectionStart + (colinc <= 0 ? sc
+            : sc + (sc % colinc == 0 ? 0 : colinc - sc % colinc));
     }
 
     /// <summary>Count column after writing text, accounting for newlines.</summary>
@@ -704,6 +971,47 @@ public static partial class Runtime
         {
             if (segment[i] == '\n') width = 0;
             else width++;
+        }
+        return width;
+    }
+
+    /// <summary>Width of a buffered section, expanding queued line-relative
+    /// tabs at the columns the layout will put them.</summary>
+    private static int MeasureXpWidth(string content,
+        List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)> tokens,
+        int bufStart, int startPos, int endPos, int startCol)
+    {
+        int col = startCol;
+        int width = 0;
+        int lastPos = startPos;
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            int pos = tokens[i].pos - bufStart;
+            if (pos <= startPos || pos >= endPos || pos < lastPos) continue;
+            string segment = content[lastPos..pos];
+            foreach (char c in segment)
+            {
+                if (c == '\n') { col = 0; width = 0; }
+                else { col++; width++; }
+            }
+            if (tokens[i].kind.StartsWith("TAB:", StringComparison.Ordinal))
+            {
+                var tp = tokens[i].kind.Split(':');
+                if (tp[1] == "LINE" || tp[1] == "LINE-RELATIVE")
+                {
+                    int target = TabTarget(tp[1], col, 0, int.Parse(tp[2]), int.Parse(tp[3]));
+                    if (target > col) { width += target - col; col = target; }
+                }
+            }
+            lastPos = pos;
+        }
+        if (lastPos < endPos)
+        {
+            foreach (char c in content[lastPos..endPos])
+            {
+                if (c == '\n') { col = 0; width = 0; }
+                else { col++; width++; }
+            }
         }
         return width;
     }
@@ -741,6 +1049,14 @@ public static partial class Runtime
     public static void PprintTab(TextWriter writer, string kind, int colnum, int colinc)
     {
         if (!_pprintActive) return;
+        // XP buffering: a tab after an undecided conditional newline must be
+        // resolved after that newline is, so queue it rather than writing now.
+        if (_pprintBuffering && writer is StringWriter sw)
+        {
+            _pprintDeferredNewlines?.Add((sw.GetStringBuilder().Length,
+                "TAB:" + kind + ":" + colnum + ":" + colinc, 0, 0, null, 0));
+            return;
+        }
         int col = _pprintColumn;
         int target;
         if (kind == "LINE")
@@ -1010,14 +1326,48 @@ public static partial class Runtime
         catch (System.Net.Sockets.SocketException ex) { throw StreamIOError(stream, ex); }
     }
 
-    private static LispErrorException StreamIOError(LispObject stream, Exception ex) =>
-        new LispErrorException(new LispError(ex.Message)
+    // The CLR wraps a socket timeout in an IOException around a SocketException;
+    // use the contrib's typed condition when that class is loaded.
+    private static bool IsSocketTimeout(Exception ex)
+    {
+        for (var e = ex; e != null; e = e.InnerException)
+            if (e is System.Net.Sockets.SocketException se
+                && (se.SocketErrorCode == System.Net.Sockets.SocketError.TimedOut
+                    || se.SocketErrorCode == System.Net.Sockets.SocketError.WouldBlock))
+                return true;
+        return false;
+    }
+
+    private static LispCondition? SocketTimeoutCondition(LispObject stream, Exception ex)
+    {
+        var pkg = Package.FindPackage("DOTCL-BSD-SOCKETS");
+        if (pkg is null) return null;
+        var (sym, status) = pkg.FindSymbol("SOCKET-TIMEOUT");
+        if (status == SymbolStatus.None) return null;
+        if (Runtime.FindClassOrNil(sym) is not LispClass cls || cls.IsBuiltIn) return null;
+        var inst = new LispInstance(cls);
+        if (cls.SlotIndex.TryGetValue("STREAM", out var idx))
+            inst.Slots[idx] = stream;
+        return new LispInstanceCondition(inst)
+        {
+            StreamErrorStreamRef = stream,
+            ClrExceptionType = ex.GetType(),
+            ClrException = ex
+        };
+    }
+
+    private static LispErrorException StreamIOError(LispObject stream, Exception ex)
+    {
+        var timeout = IsSocketTimeout(ex) ? SocketTimeoutCondition(stream, ex) : null;
+        if (timeout != null) return new LispErrorException(timeout);
+        return new LispErrorException(new LispError(ex.Message)
         {
             ConditionTypeName = "STREAM-ERROR",
             StreamErrorStreamRef = stream,
             ClrExceptionType = ex.GetType(),
             ClrException = ex
         });
+    }
 
     /// <summary>Map a CL external-format designator to a .NET Encoding. Returns null
     /// for :default, so the stream keeps the implementation default (UTF-8) and its
@@ -1052,22 +1402,14 @@ public static partial class Runtime
     // unencodable character or a malformed byte sequence becomes the format's
     // replacement (? or U+FFFD), as .NET's encoders do.
 
-    /// <summary>The value of keyword KEY in the plist ARGS[FROM..], or null.
-    /// Signals on an odd plist or an unknown keyword, naming WHO.</summary>
-    private static LispObject? OctetsKeyArg(LispObject[] args, int from, string key, string who,
-                                            string[] allowed)
+    /// <summary>The value of the first keyword KEY in the plist ARGS[FROM..], or null.
+    /// The plist was checked on entry (WithKeyArgs).</summary>
+    private static LispObject? OctetsKeyArg(LispObject[] args, int from, string key)
     {
-        if ((args.Length - from) % 2 != 0)
-            throw new LispErrorException(new LispProgramError($"{who}: odd number of keyword arguments"));
-        LispObject? found = null;
-        for (int i = from; i < args.Length; i += 2)
-        {
-            if (args[i] is not Symbol k || k.HomePackage != Startup.KeywordPkg
-                || Array.IndexOf(allowed, k.Name) < 0)
-                throw new LispErrorException(new LispProgramError($"{who}: unknown keyword argument {args[i]}"));
-            if (found == null && k.Name == key) found = args[i + 1];
-        }
-        return found;
+        for (int i = from; i + 1 < args.Length; i += 2)
+            if (args[i] is Symbol k && k.HomePackage == Startup.KeywordPkg && k.Name == key)
+                return args[i + 1];
+        return null;
     }
 
     private static System.Text.Encoding OctetsEncoding(LispObject? spec, string who)
@@ -1089,8 +1431,6 @@ public static partial class Runtime
         return (start, end);
     }
 
-    private static readonly string[] StringToOctetsKeys = { "EXTERNAL-FORMAT", "START", "END", "NULL-TERMINATE" };
-    private static readonly string[] OctetsToStringKeys = { "EXTERNAL-FORMAT", "START", "END" };
 
     /// <summary>(dotcl:string-to-octets string &amp;key external-format start end null-terminate)</summary>
     public static LispObject StringToOctets(LispObject[] args)
@@ -1104,10 +1444,10 @@ public static partial class Runtime
             LispVector v when v.IsCharVector => v.ToCharString(),
             _ => throw new LispErrorException(new LispTypeError($"{who}: not a string", args[0], Startup.Sym("STRING")))
         };
-        var enc = OctetsEncoding(OctetsKeyArg(args, 1, "EXTERNAL-FORMAT", who, StringToOctetsKeys), who);
-        var (start, end) = OctetsBounds(OctetsKeyArg(args, 1, "START", who, StringToOctetsKeys),
-                                        OctetsKeyArg(args, 1, "END", who, StringToOctetsKeys), text.Length, who);
-        var nt = OctetsKeyArg(args, 1, "NULL-TERMINATE", who, StringToOctetsKeys);
+        var enc = OctetsEncoding(OctetsKeyArg(args, 1, "EXTERNAL-FORMAT"), who);
+        var (start, end) = OctetsBounds(OctetsKeyArg(args, 1, "START"),
+                                        OctetsKeyArg(args, 1, "END"), text.Length, who);
+        var nt = OctetsKeyArg(args, 1, "NULL-TERMINATE");
         byte[] bytes = enc.GetBytes(text.ToCharArray(start, end - start));
         // NULL-TERMINATE appends the encoding of a NUL character (one byte in
         // UTF-8, two in UTF-16), as SBCL does.
@@ -1129,9 +1469,9 @@ public static partial class Runtime
                                      Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(8)));
         if (args[0] is not LispVector vec || vec.Rank != 1)
             throw new LispErrorException(new LispTypeError($"{who}: not a vector of octets", args[0], octetType));
-        var enc = OctetsEncoding(OctetsKeyArg(args, 1, "EXTERNAL-FORMAT", who, OctetsToStringKeys), who);
-        var (start, end) = OctetsBounds(OctetsKeyArg(args, 1, "START", who, OctetsToStringKeys),
-                                        OctetsKeyArg(args, 1, "END", who, OctetsToStringKeys), vec.Length, who);
+        var enc = OctetsEncoding(OctetsKeyArg(args, 1, "EXTERNAL-FORMAT"), who);
+        var (start, end) = OctetsBounds(OctetsKeyArg(args, 1, "START"),
+                                        OctetsKeyArg(args, 1, "END"), vec.Length, who);
         if (vec._numKind == 1 && vec._displacedTo == null && vec._numData is byte[] raw)
             return new LispString(enc.GetString(raw, start, end - start));
         var bytes = new byte[end - start];
@@ -1423,20 +1763,22 @@ public static partial class Runtime
         }
     }
 
+    private static readonly string[] OpenKeys =
+        { "DIRECTION", "ELEMENT-TYPE", "IF-EXISTS", "IF-DOES-NOT-EXIST", "EXTERNAL-FORMAT" };
+
     private static LispObject OpenFileCore(LispObject path, LispObject[] options)
     {
+        // Checked here, not on the function object: compiled calls to OPEN come
+        // straight to OpenFile.
+        CheckNoUnknownKeys("OPEN", options, 0, OpenKeys);
         string filePath = ResolvePhysicalPath(path);
 
         // Resolve the original pathname object for storing on the stream
         LispPathname? originalPathname = null;
         if (path is LispPathname pn) originalPathname = pn;
-        else if (path is LispString ps)
-            originalPathname = IsLogicalPathnameString(ps.Value) ? LispLogicalPathname.FromLogicalString(ps.Value) : LispPathname.FromString(ps.Value);
+        else if (path is LispString ps) originalPathname = FromNamestring(ps.Value);
         else if (path is LispVector pv && pv.IsCharVector)
-        {
-            var pvs = pv.ToCharString();
-            originalPathname = IsLogicalPathnameString(pvs) ? LispLogicalPathname.FromLogicalString(pvs) : LispPathname.FromString(pvs);
-        }
+            originalPathname = FromNamestring(pv.ToCharString());
         else if (path is LispFileStream pfs)
             originalPathname = pfs.OriginalPathname ?? LispPathname.FromString(pfs.FilePath);
 
@@ -1447,6 +1789,7 @@ public static partial class Runtime
         LispObject? externalFormat = null; // null means :default
         System.Text.Encoding? encoding = null;
         NewlineStyle newline = NewlineStyle.Lf;
+        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
 
         for (int j = 0; j < options.Length - 1; j += 2)
         {
@@ -1455,6 +1798,7 @@ public static partial class Runtime
                 Symbol s => s.Name,
                 _ => options[j].ToString()
             };
+            if (!seenKeys.Add(key)) continue;
             if (key == "ELEMENT-TYPE")
             {
                 var etVal = options[j + 1];
@@ -1485,16 +1829,16 @@ public static partial class Runtime
                 case "DIRECTION": direction = val; break;
                 case "IF-EXISTS": ifExists = val; break;
                 case "IF-DOES-NOT-EXIST": ifDoesNotExist = val; break;
-                default:
-                    throw new LispErrorException(new LispProgramError($"OPEN: unknown keyword argument :{key}"));
             }
         }
 
-        // Resolve default if-exists based on direction (CL spec: implementation-defined for output/io)
+        // CLHS: :NEW-VERSION for a :NEWEST version, :ERROR for any other version.
         if (ifExists == "DEFAULT")
         {
+            bool newest = originalPathname?.Version is Symbol vs
+                && vs.Name == "NEWEST" && vs.HomePackage?.Name == "KEYWORD";
             if (direction == "OUTPUT" || direction == "IO")
-                ifExists = "SUPERSEDE"; // implementation choice: supersede is safest default
+                ifExists = newest ? "NEW-VERSION" : "ERROR";
             else
                 ifExists = "ERROR"; // not used for input/probe, but set a safe value
         }
@@ -1520,7 +1864,7 @@ public static partial class Runtime
         {
             case "INPUT":
             {
-                if (!File.Exists(filePath))
+                if (!File.Exists(filePath) && ifDoesNotExist != "CREATE")
                 {
                     if (ifDoesNotExist == "NIL") return Nil.Instance;
                     var err = new LispError($"File not found: {filePath}");
@@ -1528,7 +1872,10 @@ public static partial class Runtime
                     err.FileErrorPathnameRef = path is LispPathname ? path : (LispObject)LispPathname.FromString(filePath);
                     throw new LispErrorException(err);
                 }
-                var netFsIn = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                // CLHS: :IF-DOES-NOT-EXIST :CREATE makes an empty file and goes on
+                // as if it had existed; :IF-EXISTS does not apply to :INPUT.
+                var inMode = ifDoesNotExist == "CREATE" ? FileMode.OpenOrCreate : FileMode.Open;
+                var netFsIn = new FileStream(filePath, inMode, FileAccess.Read, FileShare.ReadWrite);
                 var reader = MakeReader(netFsIn, encoding, binaryElement, newline);
                 var fs = new LispFileStream(reader, filePath);
                 fs.ElementType = elementType;
@@ -1538,15 +1885,28 @@ public static partial class Runtime
             }
             case "OUTPUT":
             {
-                if (File.Exists(filePath))
+                bool fileExisted = File.Exists(filePath);
+                string? backupPath = null;
+                string? abortDeletePath = null;
+                bool keepBackup = false;
+                if (fileExisted)
                 {
                     switch (ifExists)
                     {
                         case "SUPERSEDE":
                         case "NEW-VERSION":
-                        case "RENAME":
                         case "RENAME-AND-DELETE":
-                            break; // overwrite (truncate below)
+                            CheckNotReadOnly(filePath);
+                            backupPath = SupersedeBackupPath(filePath);
+                            Compat.MoveFile(filePath, backupPath, overwrite: true);
+                            abortDeletePath = filePath;
+                            break;
+                        case "RENAME":
+                            backupPath = RenameBackupPath(filePath);
+                            Compat.MoveFile(filePath, backupPath, overwrite: true);
+                            abortDeletePath = filePath;
+                            keepBackup = true;
+                            break;
                         case "OVERWRITE":
                         {
                             var netFs = new FileStream(filePath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
@@ -1601,12 +1961,18 @@ public static partial class Runtime
                     fs.ElementType = elementType;
                     fs.ExternalFormat = externalFormat;
                     fs.OriginalPathname = originalPathname;
+                    fs.AbortDeletePath = abortDeletePath ?? (fileExisted ? null : filePath);
+                    fs.BackupPath = backupPath;
+                    fs.KeepBackup = keepBackup;
                     return fs;
                 }
             }
             case "IO":
             {
                 bool fileExists = File.Exists(filePath);
+                string? backupPath = null;
+                string? abortDeletePath = null;
+                bool keepBackup = false;
                 if (fileExists)
                 {
                     switch (ifExists)
@@ -1621,9 +1987,21 @@ public static partial class Runtime
                         }
                         case "SUPERSEDE":
                         case "NEW-VERSION":
-                        case "RENAME":
                         case "RENAME-AND-DELETE":
+                        case "RENAME":
                         {
+                            if (ifExists == "RENAME")
+                            {
+                                backupPath = RenameBackupPath(filePath);
+                                keepBackup = true;
+                            }
+                            else
+                            {
+                                CheckNotReadOnly(filePath);
+                                backupPath = SupersedeBackupPath(filePath);
+                            }
+                            Compat.MoveFile(filePath, backupPath, overwrite: true);
+                            abortDeletePath = filePath;
                             var netFsTrunc = CreateForOutput(filePath, FileAccess.ReadWrite);
                             var readerTrunc = MakeReader(netFsTrunc, encoding, binaryElement, newline);
                             var writerTrunc = MakeWriter(netFsTrunc, encoding, newline); writerTrunc.AutoFlush = true;
@@ -1631,6 +2009,9 @@ public static partial class Runtime
                             fsTrunc.ElementType = elementType;
                             fsTrunc.ExternalFormat = externalFormat;
                             fsTrunc.OriginalPathname = originalPathname;
+                            fsTrunc.AbortDeletePath = abortDeletePath;
+                            fsTrunc.BackupPath = backupPath;
+                            fsTrunc.KeepBackup = keepBackup;
                             return fsTrunc;
                         }
                         case "OVERWRITE":
@@ -1674,6 +2055,7 @@ public static partial class Runtime
                     fs.ElementType = elementType;
                     fs.ExternalFormat = externalFormat;
                     fs.OriginalPathname = originalPathname;
+                    fs.AbortDeletePath = fileExists ? null : filePath;
                     return fs;
                 }
             }
@@ -1711,11 +2093,19 @@ public static partial class Runtime
         }
     }
 
-    public static LispObject CloseStream(LispObject stream)
+    public static LispObject CloseStream(LispObject stream) => CloseStreamWithAbort(stream, abort: false);
+
+    public static LispObject CloseStreamWithAbort(LispObject stream, bool abort)
     {
         if (stream is LispStream ls && ls.IsClosed) return T.Instance;
 
-        if (stream is LispFileStream fs) { fs.Close(); return T.Instance; }
+        if (stream is LispFileStream fs)
+        {
+            fs.Close();
+            if (abort) AbortFileStream(fs);
+            else CommitFileStream(fs);
+            return T.Instance;
+        }
         if (stream is LispInputStream ins) { ins.IsClosed = true; try { ins.Reader.Close(); } catch (ObjectDisposedException) { } return T.Instance; }
         if (stream is LispOutputStream outs) { outs.IsClosed = true; try { outs.Writer.Close(); } catch (ObjectDisposedException) { } return T.Instance; }
         if (stream is LispBidirectionalStream bidi)
@@ -1782,6 +2172,8 @@ public static partial class Runtime
         // Peek would wait for the peer (see LISTEN).
         if (reader is BivalentStreamReader bsr && bsr.DataReady() == false)
             return Nil.Instance;
+        if (StdinNotReady(reader))
+            return Nil.Instance;
         // For string streams and most .NET streams, Peek tells us if data is available
         int p = reader.Peek();
         if (p == -1)
@@ -1799,6 +2191,19 @@ public static partial class Runtime
             echoWriter.Write((char)c);
         }
         return LispChar.Make((char)c);
+    }
+
+    /// <summary>Set by the host that owns standard input: false when reading it now
+    /// would wait for the user or the writer end of a pipe, true when a character
+    /// or the end of input is available, null when it cannot tell.</summary>
+    public static Func<bool?>? StdinDataReady;
+
+    private static bool StdinNotReady(TextReader reader)
+    {
+        var ready = StdinDataReady;
+        if (ready == null) return false;
+        if (reader is EchoingTextReader er) reader = er.Inner;
+        return reader == Console.In && ready() == false;
     }
 
     public static LispObject Listen(LispObject stream)
@@ -1876,6 +2281,8 @@ public static partial class Runtime
         if (resolved is null)
             throw new LispErrorException(new LispError(
                 "LISTEN: synonym stream symbol has no value"));
+        if (IsBinaryStream(resolved))
+            return ListenBinary(resolved);
         TextReader reader = GetTextReader(resolved);
         // A socket has nothing to read yet more often than it is at end of file,
         // and Peek would wait for the peer: ask the socket instead. Code that
@@ -1883,8 +2290,39 @@ public static partial class Runtime
         // buffered streams do), and hung on the first request.
         if (reader is BivalentStreamReader bsr && bsr.DataReady() == false)
             return Nil.Instance;
+        if (StdinNotReady(reader))
+            return Nil.Instance;
         int p = reader.Peek();
         return p == -1 ? Nil.Instance : T.Instance;
+    }
+
+    /// <summary>LISTEN on a binary stream, which must not consume a byte to peek.</summary>
+    private static LispObject ListenBinary(LispObject stream)
+    {
+        switch (stream)
+        {
+            case LispFileStream fs when fs.IsInput:
+                if (fs.IsClosed) throw new LispErrorException(MakeStreamError(stream, "LISTEN"));
+                return fs.InputReader is ByteTrackingReader btr && btr.HasReadableData()
+                    ? T.Instance : Nil.Instance;
+            case LispBinaryStream bin:
+                if (bin.IsClosed) throw new LispErrorException(MakeStreamError(stream, "LISTEN"));
+                if (!bin.BaseStream.CanSeek) return T.Instance;
+                return bin.BaseStream.Position < bin.BaseStream.Length ? T.Instance : Nil.Instance;
+            case LispTwoWayStream tw: return ListenBinary(tw.InputStream);
+            case LispEchoStream es: return ListenBinary(es.InputStream);
+            case LispSynonymStream ss: return ListenBinary(DynamicBindings.Get(ss.Symbol));
+            case LispConcatenatedStream cs:
+                while (cs.CurrentIndex < cs.Streams.Length)
+                {
+                    var r = ListenBinary(cs.Streams[cs.CurrentIndex]);
+                    if (r is not Nil) return r;
+                    cs.CurrentIndex++;
+                }
+                return Nil.Instance;
+            default:
+                return T.Instance;
+        }
     }
 
     public static LispObject ClearInput(LispObject stream)
@@ -2248,12 +2686,15 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError($"{funcName}: odd number of keyword arguments"));
         bool allowOtherKeys = false;
         bool hasUnknownKeys = false;
-        // First pass: check for :allow-other-keys
+        // First pass: check for :allow-other-keys (first occurrence wins)
         for (int i = kwStart; i < args.Length; i += 2)
         {
             string key = args[i] is Symbol ks ? ks.Name : args[i].ToString();
-            if (key == "ALLOW-OTHER-KEYS" && args[i + 1] is not Nil)
-                allowOtherKeys = true;
+            if (key == "ALLOW-OTHER-KEYS")
+            {
+                allowOtherKeys = args[i + 1] is not Nil;
+                break;
+            }
         }
         // Second pass: validate all keywords (first occurrence wins per CL spec)
         bool startSeen = false, endSeen = false;
@@ -2548,8 +2989,9 @@ public static partial class Runtime
             {
                 var elem = vecCh.GetElement(i);
                 if (elem is LispChar lc) writer.Write(lc.Value);
-                else if (elem is Fixnum li) writer.Write((char)li.Value);
-                else writer.Write(elem.ToString());
+                else throw new LispErrorException(new LispTypeError(
+                    $"WRITE-SEQUENCE: {elem} can not be written to a character stream",
+                    elem, Startup.Sym("CHARACTER")));
             }
         }
         else if (seq is Cons)
@@ -2565,7 +3007,9 @@ public static partial class Runtime
             for (int i = start; i < end && cell is Cons cc; i++)
             {
                 if (cc.Car is LispChar lc) writer.Write(lc.Value);
-                else writer.Write(cc.Car.ToString());
+                else throw new LispErrorException(new LispTypeError(
+                    $"WRITE-SEQUENCE: {cc.Car} can not be written to a character stream",
+                    cc.Car, Startup.Sym("CHARACTER")));
                 cell = cc.Cdr;
             }
         }
@@ -2573,8 +3017,12 @@ public static partial class Runtime
     }
 
     public static LispObject ReadPreservingWhitespace(LispObject stream, LispObject eofErrorP, LispObject eofValue)
-        => GuardStreamIO(stream, stream, eofErrorP, eofValue,
-                         static (st, ee, ev) => ReadPreservingWhitespaceUnguarded(st, ee, ev));
+        => ReadPreservingWhitespaceRecursive(stream, eofErrorP, eofValue, false);
+
+    public static LispObject ReadPreservingWhitespaceRecursive(LispObject stream, LispObject eofErrorP,
+                                                               LispObject eofValue, bool recursiveP)
+        => GuardStreamIO(stream, stream, eofErrorP, eofValue, recursiveP,
+                         static (st, ee, ev, rp) => ReadPreservingWhitespaceUnguarded(st, ee, ev, rp));
 
     /// <summary>The TextReader a Lisp READer should consume for STREAM. Same as
     /// GetTextReader, except that reading through an echo-stream echoes; the Lisp
@@ -2589,7 +3037,8 @@ public static partial class Runtime
         return echoWriter == null ? inner : new EchoingTextReader(inner, echoWriter);
     }
 
-    private static LispObject ReadPreservingWhitespaceUnguarded(LispObject stream, LispObject eofErrorP, LispObject eofValue)
+    private static LispObject ReadPreservingWhitespaceUnguarded(LispObject stream, LispObject eofErrorP,
+                                                                 LispObject eofValue, bool recursiveP)
     {
         Reader lispReader;
         if (stream is LispStream ls2 && ls2.CachedReader != null)
@@ -2612,6 +3061,7 @@ public static partial class Runtime
             lispReader.UnreadChar(ls.UnreadCharValue);
             ls.UnreadCharValue = -1;
         }
+        using var shareScope = !recursiveP && lispReader.InRead ? lispReader.PushShareScope() : null;
         if (lispReader.TryRead(out var result))
         {
             // The delimiter stays in the stream: the Reader pushes back the
@@ -3352,8 +3802,11 @@ public static partial class Runtime
         {
             if (i + 1 >= args.Length) break;
             var key = args[i] is Symbol ks ? ks.Name : args[i].ToString();
-            if (key == "ALLOW-OTHER-KEYS" && IsTruthy(args[i + 1]))
-                allowOtherKeys = true;
+            if (key == "ALLOW-OTHER-KEYS")
+            {
+                allowOtherKeys = IsTruthy(args[i + 1]);
+                break;
+            }
         }
         for (int i = 2; i < args.Length; i += 2)
         {
@@ -3427,8 +3880,11 @@ public static partial class Runtime
         {
             if (i + 1 >= args.Length) break;
             var key = args[i] is Symbol ks ? ks.Name : args[i].ToString();
-            if (key == "ALLOW-OTHER-KEYS" && IsTruthy(args[i + 1]))
-                allowOtherKeys = true;
+            if (key == "ALLOW-OTHER-KEYS")
+            {
+                allowOtherKeys = IsTruthy(args[i + 1]);
+                break;
+            }
         }
         for (int i = 2; i < args.Length; i += 2)
         {
@@ -3527,11 +3983,67 @@ public static partial class Runtime
         return result;
     }
 
+    private static bool IsWildComponent(LispObject? component)
+        => component is Symbol sym && sym.Name == "WILD";
+
+    private static bool WildMatch(string pattern, string value, bool ignoreCase)
+    {
+        int p = 0, v = 0, star = -1, mark = 0;
+        while (v < value.Length)
+        {
+            if (p < pattern.Length && (pattern[p] == '?'
+                || (ignoreCase ? char.ToUpperInvariant(pattern[p]) == char.ToUpperInvariant(value[v])
+                               : pattern[p] == value[v])))
+            {
+                p++;
+                v++;
+            }
+            else if (p < pattern.Length && pattern[p] == '*')
+            {
+                star = p++;
+                mark = v;
+            }
+            else if (star >= 0)
+            {
+                p = star + 1;
+                v = ++mark;
+            }
+            else
+            {
+                return false;
+            }
+        }
+        while (p < pattern.Length && pattern[p] == '*') p++;
+        return p == pattern.Length;
+    }
+
+    /// <summary>Match one pathname component against one filesystem component.</summary>
+    private static bool ComponentMatch(LispObject? pattern, LispObject? value, bool ignoreCase)
+    {
+        if (pattern == null || pattern is Nil) return value == null || value is Nil;
+        if (IsWildComponent(pattern)) return true;
+        if (pattern is not LispString ps || value is not LispString vs) return false;
+        if (ps.Value.Contains('*') || ps.Value.Contains('?'))
+            return WildMatch(ps.Value, vs.Value, ignoreCase);
+        return string.Equals(ps.Value, vs.Value,
+            ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+    }
+
+    /// <summary>True when a directory entry matches the name and type of a pathname.</summary>
+    private static bool EntryMatchesPathname(string entry, LispPathname pattern)
+    {
+        var name = Path.GetFileName(entry);
+        if (string.IsNullOrEmpty(name)) return false;
+        var candidate = LispPathname.FromString(name);
+        return ComponentMatch(pattern.NameComponent, candidate.NameComponent, Compat.IsWindows())
+            && ComponentMatch(pattern.TypeComponent, candidate.TypeComponent, Compat.IsWindows());
+    }
+
     /// <summary>
     /// Expand a directory path containing wildcards and find matching files.
     /// E.g. "/foo/*/bar" with pattern "*.txt" matches "/foo/x/bar/*.txt".
     /// </summary>
-    private static string[] ExpandWildDirectory(string dirPath, string filePattern)
+    private static string[] ExpandWildDirectory(string dirPath, LispPathname filePattern)
     {
         // Split directory path into segments
         var sep = Path.DirectorySeparatorChar;
@@ -3550,7 +4062,7 @@ public static partial class Runtime
         }
         if (firstWild < 0)
             return System.IO.Directory.Exists(dirPath)
-                ? System.IO.Directory.GetFiles(dirPath, filePattern)
+                ? System.IO.Directory.GetFiles(dirPath).Where(f => EntryMatchesPathname(f, filePattern)).ToArray()
                 : Array.Empty<string>();
 
         // Build the non-wild root
@@ -3588,7 +4100,8 @@ public static partial class Runtime
         {
             try
             {
-                result.AddRange(System.IO.Directory.GetFiles(d, filePattern));
+                result.AddRange(System.IO.Directory.GetFiles(d)
+                    .Where(f => EntryMatchesPathname(f, filePattern)));
             }
             catch { }
         }
@@ -3878,15 +4391,14 @@ public static partial class Runtime
             err.FileErrorPathnameRef = pn;
             throw new LispErrorException(err);
         }
-        // CLHS: returns the pathname (coerced from designator, not the raw string input)
-        LispPathname resultPn = pn;
+        // CLHS: the primary value is the given pathspec, not a coerced pathname.
         var dir = Path.GetDirectoryName(filePath);
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
         {
             Directory.CreateDirectory(dir);
-            return MultipleValues.Values2(resultPn, T.Instance);
+            return MultipleValues.Values2(pathSpec, T.Instance);
         }
-        return MultipleValues.Values2(resultPn, Nil.Instance);
+        return MultipleValues.Values2(pathSpec, Nil.Instance);
     }
 
     /// <summary>(dotcl:delete-directory pathspec &amp;key recursive): delete the
@@ -3897,16 +4409,9 @@ public static partial class Runtime
     /// directory form. The same contract as SBCL's SB-EXT:DELETE-DIRECTORY.</summary>
     public static LispObject DeleteDirectoryFn(LispObject[] args)
     {
-        if (args.Length < 1 || (args.Length - 1) % 2 != 0)
-            throw new LispErrorException(new LispProgramError(
-                "DELETE-DIRECTORY: expected a pathname designator and keyword arguments"));
         bool recursive = false;
         for (int i = 1; i + 1 < args.Length; i += 2)
-        {
-            if (args[i] is Symbol k && k.Name == "RECURSIVE") recursive = args[i + 1] is not Nil;
-            else throw new LispErrorException(new LispProgramError(
-                $"DELETE-DIRECTORY: unknown keyword argument {args[i]}"));
-        }
+            if (args[i] is Symbol k && k.Name == "RECURSIVE") { recursive = args[i + 1] is not Nil; break; }
         var path = args[0];
         string dirPath = ResolvePhysicalPath(path);
         if (!Path.IsPathRooted(dirPath))
@@ -3932,6 +4437,63 @@ public static partial class Runtime
         catch (IOException e) { throw Fail(e.Message); }
         catch (UnauthorizedAccessException e) { throw Fail(e.Message); }
         return LispPathname.FromString(dirPath + Path.DirectorySeparatorChar);
+    }
+
+    /// <summary>Refuse to replace a file the file system marks read-only.</summary>
+    private static void CheckNotReadOnly(string filePath)
+    {
+        if ((File.GetAttributes(filePath) & FileAttributes.ReadOnly) != 0)
+            throw new IOException($"file is read-only: {filePath}");
+    }
+
+    /// <summary>The name SBCL gives a file preserved by :IF-EXISTS :RENAME.</summary>
+    private static string RenameBackupPath(string filePath) => filePath + ".bak";
+
+    /// <summary>A hidden temporary name for the original of a superseded file.</summary>
+    private static string SupersedeBackupPath(string filePath)
+    {
+        var full = Path.GetFullPath(filePath);
+        var dir = Path.GetDirectoryName(full) ?? ".";
+        var name = Path.GetFileName(full);
+        return Path.Combine(dir, "." + name + ".dotcl-backup-"
+                            + Guid.NewGuid().ToString("N").Substring(0, 8));
+    }
+
+    /// <summary>Delete PATH, falling back to MoveAside for a mapped Windows fasl.</summary>
+    private static bool TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path)) File.Delete(path);
+            return true;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            if (!Compat.IsWindows() || !Compat.MayMoveAside(path)) return false;
+            try { Compat.MoveAside(path); return true; } catch { return false; }
+        }
+    }
+
+    /// <summary>Finish a normal close of an output file stream.</summary>
+    private static void CommitFileStream(LispFileStream fs)
+    {
+        if (fs.BackupPath is string backup && !fs.KeepBackup)
+            TryDeleteFile(backup);
+    }
+
+    /// <summary>Undo an abortive close: delete a created file, restore a superseded one.</summary>
+    private static void AbortFileStream(LispFileStream fs)
+    {
+        if (fs.BackupPath is string backup && fs.AbortDeletePath is string original)
+        {
+            if (!TryDeleteFile(original)) return;
+            try { Compat.MoveFile(backup, original, overwrite: true); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
+        else if (fs.AbortDeletePath is string created)
+        {
+            TryDeleteFile(created);
+        }
     }
 
     /// <summary>A new file at FILEPATH for :IF-EXISTS :SUPERSEDE and the like. A
@@ -4121,7 +4683,30 @@ public static partial class Runtime
         // semantics, as SBCL/CCL do), and asdf's atomic-write idiom (write temp ->
         // rename onto the final path) depends on this: without overwrite the
         // second build of any system throws "file already exists" from load-asd.
-        Compat.MoveFile(oldFile, targetFile, overwrite: true);
+        try
+        {
+            if (Directory.Exists(oldFile))
+            {
+                var from = oldFile.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                var to = targetFile.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                Directory.Move(from, to);
+            }
+            else
+            {
+                Compat.MoveFile(oldFile, targetFile, overwrite: true);
+            }
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            var err = new LispError($"RENAME-FILE: {e.Message}");
+            err.ConditionTypeName = "FILE-ERROR";
+            // The offending file is the missing source, otherwise the target.
+            bool sourceMissing = !File.Exists(oldFile) && !Directory.Exists(oldFile);
+            err.FileErrorPathnameRef = sourceMissing
+                ? (filespec is LispPathname ? filespec : (LispObject)LispPathname.FromString(oldFile))
+                : (LispObject)LispPathname.FromString(targetFile);
+            throw new LispErrorException(err);
+        }
 #if NET9_0_OR_GREATER
         NoteFileRenamed(oldFile, targetFile);
 #endif
@@ -4156,7 +4741,12 @@ public static partial class Runtime
         else if (Directory.Exists(filePath))
             dt = Directory.GetLastWriteTimeUtc(filePath);
         else
-            return Nil.Instance;
+        {
+            var err = new LispError($"FILE-WRITE-DATE: file not found: {filePath}");
+            err.ConditionTypeName = "FILE-ERROR";
+            err.FileErrorPathnameRef = path is LispPathname ? path : (LispObject)LispPathname.FromString(filePath);
+            throw new LispErrorException(err);
+        }
         // Return as Universal Time (seconds since 1900-01-01)
         var epoch = new DateTime(1900, 1, 1, 0, 0, 0, DateTimeKind.Utc);
         long seconds = (long)(dt - epoch).TotalSeconds;
@@ -4207,11 +4797,15 @@ public static partial class Runtime
         return Runtime.List(keyed.Select(k => k.Entry).ToArray());
     }
 
+    private static readonly string[] DirectoryKeys = { "RESOLVE-SYMLINKS" };
+
     public static LispObject DirectoryFunc(LispObject[] args)
     {
         if (args.Length == 0)
             throw new LispErrorException(new LispProgramError("DIRECTORY: wrong number of arguments"));
 
+        // Compiled calls to DIRECTORY come straight here, past the function object.
+        CheckNoUnknownKeys("DIRECTORY", args, 1, DirectoryKeys);
         ValidateDirectoryComponent(args[0]);
         // DIRECTORY answers truenames (CLHS), so a symbolic link along an
         // entry's name is replaced by its target, as SBCL does by default.
@@ -4228,6 +4822,7 @@ public static partial class Runtime
         // Get pathname from first arg: translate logical pathnames
         string namestring = ResolvePhysicalPath(args[0]);
         if (string.IsNullOrEmpty(namestring)) namestring = ".";
+        var patternPn = args[0] as LispPathname ?? LispPathname.FromString(namestring);
 
         // Detect directory-only search: pathname has no name/type component.
         // e.g. (directory "path/*/") has name=NIL, type=NIL: return directories, not files.
@@ -4287,7 +4882,6 @@ public static partial class Runtime
             }
 
             string dirPath = Path.GetDirectoryName(namestring) ?? ".";
-            string pattern = Path.GetFileName(namestring) ?? "*";
             if (string.IsNullOrEmpty(dirPath)) dirPath = ".";
 
             // The wildcard is not always in the last segment: quicklisp finds its
@@ -4297,7 +4891,7 @@ public static partial class Runtime
             // for their own cases and neither noticed the other's gap.
             if (dirPath.Contains('*') || dirPath.Contains('?'))
             {
-                foreach (var file in ExpandWildDirectory(dirPath, pattern))
+                foreach (var file in ExpandWildDirectory(dirPath, patternPn))
                     entries.Add(EntryPathname(file, resolve));
                 return SortedDirectoryEntries(entries);
             }
@@ -4306,14 +4900,16 @@ public static partial class Runtime
             if (namestring.Contains("**"))
             {
                 foreach (var file in Directory.EnumerateFileSystemEntries(
-                    dirPath, pattern, SearchOption.AllDirectories))
+                    dirPath, "*", SearchOption.AllDirectories)
+                    .Where(f => EntryMatchesPathname(f, patternPn)))
                 {
                     entries.Add(EntryPathname(file, resolve));
                 }
             }
             else
             {
-                foreach (var file in Directory.EnumerateFileSystemEntries(dirPath, pattern))
+                foreach (var file in Directory.EnumerateFileSystemEntries(dirPath, "*")
+                    .Where(f => EntryMatchesPathname(f, patternPn)))
                 {
                     entries.Add(EntryPathname(file, resolve));
                 }
@@ -4328,9 +4924,14 @@ public static partial class Runtime
     }
 
     public static LispObject MakeStringOutputStream()
+        => MakeStringOutputStreamWithElementType(null);
+
+    public static LispObject MakeStringOutputStreamWithElementType(string? elementTypeName)
     {
-        var sw = new StringWriter();
-        return new LispStringOutputStream(sw);
+        StringWriter sw = elementTypeName is "BASE-CHAR" or "STANDARD-CHAR"
+            ? new BaseCharCheckingStringWriter()
+            : new StringWriter();
+        return new LispStringOutputStream(sw, elementTypeName);
     }
 
     public static LispObject MakeStringOutputStreamToString(LispObject str)
@@ -4406,9 +5007,10 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("DOTCL-DELETE-DIRECTORY",
             new LispFunction(args => Runtime.DeleteDirectory(args[0])));
         Emitter.CilAssembler.RegisterFunction("RENAME-FILE",
-            new LispFunction(args => { Runtime.CheckArityMin("RENAME-FILE", args, 2); return Runtime.RenameFile(args[0], args[1]); }));
+            new LispFunction(args => Runtime.RenameFile(args[0], args[1])).WithArgCount(2, 2));
         Emitter.CilAssembler.RegisterFunction("ENSURE-DIRECTORIES-EXIST",
-            new LispFunction(args => Runtime.EnsureDirectoriesExist(args), "ENSURE-DIRECTORIES-EXIST", -1));
+            new LispFunction(args => Runtime.EnsureDirectoriesExist(args), "ENSURE-DIRECTORIES-EXIST", -1)
+                .WithKeyArgs(1, 1, false, "VERBOSE"));
 
         // --- READ-SEQUENCE, WRITE-SEQUENCE ---
         Emitter.CilAssembler.RegisterFunction("READ-SEQUENCE",
@@ -4454,12 +5056,7 @@ public static partial class Runtime
             {
                 streamObj = DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
             }
-            // recursive-p (args[2]) needs no separate handling: what it asks for is
-            // that this read take part in the enclosing one, and the part that is
-            // observable here is #n= / #n# label scope. Adopting the stream's share
-            // tables gives that for every call, recursive or not: a #n# inside the
-            // delimited list resolves against a label defined outside it, which a
-            // fresh Reader could not see.
+            // recursive-p true keeps the enclosing #n= scope; false starts a new outermost one.
             //
             // The stream's live reader is used when it has one, as READ does. A
             // reader macro that calls READ-DELIMITED-LIST runs inside a read on
@@ -4490,6 +5087,8 @@ public static partial class Runtime
                 lispReader.UnreadChar(unreadStream.UnreadCharValue);
                 unreadStream.UnreadCharValue = -1;
             }
+            using var shareScope = args.Length >= 3 && args[2] is not Nil
+                ? null : lispReader.PushShareScope();
             var items = new System.Collections.Generic.List<LispObject>();
             // The elements are read recursively, so a #n= in one of them is still
             // in scope for a #n# in the next. Without this each element is a fresh
@@ -4513,7 +5112,8 @@ public static partial class Runtime
                     lispReader.ReadChar();
                     break;
                 }
-                if (lispReader.TryRead(out var obj))
+                // A skipped form reads no object; the delimiter may follow directly.
+                if (lispReader.TryReadStep(out var obj))
                     items.Add(obj);
             }
             } finally { lispReader.ExitRecursiveRead(); }
@@ -4711,8 +5311,11 @@ public static partial class Runtime
                 for (int i = 0; i < args.Length; i += 2)
                 {
                     var key = args[i] is Symbol ks ? ks.Name : "";
-                    if (key == "ALLOW-OTHER-KEYS" && Runtime.IsTruthy(args[i + 1]))
-                        allowOtherKeys = true;
+                    if (key == "ALLOW-OTHER-KEYS")
+                    {
+                        allowOtherKeys = Runtime.IsTruthy(args[i + 1]);
+                        break;
+                    }
                 }
                 if (!allowOtherKeys)
                 {
@@ -4725,11 +5328,13 @@ public static partial class Runtime
                 }
                 // Extract :element-type if provided
                 string? elemType = null;
+                bool elemTypeSeen = false;
                 for (int i = 0; i < args.Length; i += 2)
                 {
                     var key = args[i] is Symbol ks2 ? ks2.Name : "";
-                    if (key == "ELEMENT-TYPE")
+                    if (!elemTypeSeen && key == "ELEMENT-TYPE")
                     {
+                        elemTypeSeen = true;
                         var val = args[i + 1];
                         if (val is Nil) elemType = "NIL";
                         // BASE-CHAR and STANDARD-CHAR strings are arrays of their own
@@ -4742,10 +5347,7 @@ public static partial class Runtime
                         }
                     }
                 }
-                var stream = Runtime.MakeStringOutputStream();
-                if (elemType != null && stream is LispStringOutputStream sso)
-                    sso.ElementTypeName = elemType;
-                return stream;
+                return Runtime.MakeStringOutputStreamWithElementType(elemType);
             }));
         Startup.RegisterUnary("MAKE-STRING-OUTPUT-STREAM-TO-STRING", Runtime.MakeStringOutputStreamToString);
 
@@ -4809,23 +5411,22 @@ public static partial class Runtime
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
                 if (recursiveP is not Nil) eofErrorP = T.Instance;
-                return Runtime.ReadPreservingWhitespace(stream, eofErrorP, eofValue);
+                return Runtime.ReadPreservingWhitespaceRecursive(stream, eofErrorP, eofValue, recursiveP is not Nil);
             }));
 
         // --- OPEN, CLOSE, PROBE-FILE, TRUENAME, FILE-WRITE-DATE, GET-OUTPUT-STREAM-STRING ---
         Emitter.CilAssembler.RegisterFunction("OPEN",
             new LispFunction(args => {
-                if (args.Length < 1)
-                    throw new LispErrorException(new LispProgramError("OPEN: wrong number of arguments: 0 (expected at least 1)"));
                 var options = new LispObject[args.Length - 1];
                 Array.Copy(args, 1, options, 0, options.Length);
                 return Runtime.OpenFile(args[0], options);
-            }, "OPEN", -1));
+            }, "OPEN", -1).WithArgCount(1, -1));
         Emitter.CilAssembler.RegisterFunction("CLOSE", new LispFunction(args => {
-            if (args.Length < 1)
-                throw new LispErrorException(new LispProgramError("CLOSE: wrong number of arguments: 0 (expected at least 1)"));
-            return Runtime.CloseStream(args[0]);
-        }, "CLOSE", -1));
+            bool abort = false;
+            for (int i = 1; i < args.Length; i += 2)
+                if (args[i] is Symbol k && k.Name == "ABORT") { abort = args[i + 1] is not Nil; break; }
+            return Runtime.CloseStreamWithAbort(args[0], abort);
+        }, "CLOSE", -1).WithKeyArgs(1, 1, false, "ABORT"));
         Startup.RegisterUnary("PROBE-FILE", Runtime.ProbeFile);
         Startup.RegisterUnary("TRUENAME", Runtime.Truename);
         Startup.RegisterUnary("FILE-WRITE-DATE", Runtime.FileWriteDate);
@@ -4841,7 +5442,7 @@ public static partial class Runtime
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
                 var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
                 if (recursiveP is not Nil) eofErrorP = T.Instance;
-                var readValue = Runtime.ReadFromStream(stream, eofErrorP, eofValue);
+                var readValue = Runtime.ReadFromStreamRecursive(stream, eofErrorP, eofValue, recursiveP is not Nil);
                 // READ returns exactly one value. Inside, "no value" is how a reader
                 // macro that consumed only whitespace or a comment reports itself, and
                 // a Lisp-level macro function (what GET-MACRO-CHARACTER hands back, so

@@ -106,3 +106,33 @@ error and the exit status."
         (or (search "0] " *rpd-runtime-out*) (search "0] " *rpd-runtime-err*))
         (and (integerp *rpd-runtime-code*) (/= *rpd-runtime-code* 0)))
   (nil nil t))
+
+;;; A form that spans lines, or a #+ whose skipped form is on the next line,
+;;; is incomplete when its first line is read. That is a request for more
+;;; input and never reaches *DEBUGGER-HOOK*. SBCL's make.sh pipes files like
+;;; that into a REPL whose hook ends the process.
+(defvar *rpd-hook-out*)
+(defvar *rpd-hook-err*)
+(defvar *rpd-hook-code*)
+
+(multiple-value-setq (*rpd-hook-out* *rpd-hook-err* *rpd-hook-code*)
+  (rpd-run '("(setf *debugger-hook* (lambda (c h) (declare (ignore h)) (format t \"HOOK:~A~%\" (type-of c)) (finish-output) (dotcl:quit 3)))"
+             "(list 1"
+             " 2)"
+             "#+nope"
+             "(foo)"
+             "(print :after)"
+             "(car 1)"
+             "(print :not-reached)")))
+
+(deftest rpd-multiline-form-not-hooked
+  (list (and (search "(1 2)" *rpd-hook-out*) t)
+        (and (search ":AFTER" *rpd-hook-out*) t)
+        (search "HOOK:END-OF-FILE" *rpd-hook-out*))
+  (t t nil))
+
+(deftest rpd-hook-still-runs-for-errors
+  (list (and (search "HOOK:TYPE-ERROR" *rpd-hook-out*) t)
+        (search ":NOT-REACHED" *rpd-hook-out*)
+        *rpd-hook-code*)
+  (t nil 3))

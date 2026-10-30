@@ -67,3 +67,39 @@ hook
   (0 "first
 third
 "))
+
+;;; SIGTERM and SIGHUP end the process through the exit hooks, status
+;;; 128 + signal. The child signals itself, then waits.
+
+#-windows
+(deftest exit-hooks.sigterm
+  (exh-run "sigterm.lisp"
+           (format nil "(push (lambda () (write-line \"hook\")) dotcl:*exit-hooks*)
+(dotcl:run-process \"/bin/kill\" (list \"-TERM\" (princ-to-string (dotnet:static \"System.Environment\" \"ProcessId\"))))
+(sleep 30)
+(write-line \"not reached\")
+"))
+  (143 "hook
+"))
+
+;;; Under nohup the process starts with SIGHUP ignored, the child inherits that,
+;;; and the runtime then keeps it ignored. Probe with a shell that sends itself
+;;; SIGHUP: if it survives, SIGHUP is ignored here and the test is skipped.
+#-windows
+(defvar *exh-hup-ignored*
+  (let ((out (second (dotcl:run-process "/bin/sh"
+                                        (list "-c" "kill -HUP $$; echo alive")))))
+    (and (search "alive" (or out "")) t)))
+
+#-windows
+(if *exh-hup-ignored*
+    (format t "~&;; exit-hooks.sighup: SIGHUP is ignored in this process (nohup), test skipped~%")
+    (deftest exit-hooks.sighup
+  (exh-run "sighup.lisp"
+           (format nil "(push (lambda () (write-line \"hook\")) dotcl:*exit-hooks*)
+(dotcl:run-process \"/bin/kill\" (list \"-HUP\" (princ-to-string (dotnet:static \"System.Environment\" \"ProcessId\"))))
+(sleep 30)
+(write-line \"not reached\")
+"))
+  (129 "hook
+")))

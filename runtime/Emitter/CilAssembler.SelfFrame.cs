@@ -38,7 +38,11 @@ public partial class CilAssembler
     private static readonly FieldInfo s_tailLendMarker = typeof(LispFunction).GetField("TailLendMarker")!;
 
     internal static bool CanSelfFrame(string name, int paramCount, bool noFrame) =>
-        !noFrame && paramCount <= 4
+        paramCount <= 4 && CanTypedFrame(name, paramCount, noFrame);
+
+    /// <summary>The framed typed entry links a frame of the typed arguments, any count.</summary>
+    internal static bool CanTypedFrame(string name, int paramCount, bool noFrame) =>
+        !noFrame && paramCount <= TypedEntrySig.MaxArgs
         && !name.StartsWith("%MINI-", StringComparison.Ordinal)
         && !name.StartsWith("%CALL-WITH-", StringComparison.Ordinal);
 
@@ -195,7 +199,7 @@ public partial class CilAssembler
     /// <summary>(:CALL-SAME-FILE PKG NAME N [:MODE]): an InvokeN[M] whose callee
     /// is a DEFUN this fasl compiled earlier. Shape and the function this file
     /// defined, if known.</summary>
-    private (int n, bool mode, (MethodInfo Body, int Arity, bool Mv, FieldInfo Fn)? target) SameFileCall(Cons instr)
+    private (int n, bool mode, (MethodInfo Body, int Arity, bool Mv, FieldInfo Fn, bool Leaf)? target) SameFileCall(Cons instr)
     {
         var rest = Cdr(Cdr(Cdr(instr)));
         int n = GetInt(Car(rest));
@@ -220,7 +224,8 @@ public partial class CilAssembler
         var callN = typeof(LispFunction).GetMethod("Call" + n + (mode ? "M" : ""))!;
         if (target is not { } t)
         {
-            _il.Emit(OpCodes.Call, callN);
+            var stub = _faslStructMap?.SameFileForwardStub(GetString(Cadr(instr)), GetString(Caddr(instr)), n, mode);
+            _il.Emit(OpCodes.Call, stub ?? callN);
             return;
         }
         var il = _il;
@@ -252,6 +257,24 @@ public partial class CilAssembler
         il.MarkLabel(done);
     }
 
+    /// <summary>(:SAME-FILE-IS PKG NAME): the Symbol on the stack is replaced by
+    /// whether it still names the function the DEFUN of NAME earlier in this
+    /// fasl made. False when there is no such DEFUN here.</summary>
+    private void EmitSameFileIs(Cons instr)
+    {
+        if (_faslStructMap != null
+            && _faslStructMap.SameFileBodies.TryGetValue((GetString(Cadr(instr)), GetString(Caddr(instr))), out var b))
+        {
+            _il.Emit(OpCodes.Ldsfld, b.Fn);
+            _il.Emit(OpCodes.Call, s_isSameFileFunction);
+            return;
+        }
+        _il.Emit(OpCodes.Pop);
+        _il.Emit(OpCodes.Ldc_I4_0);
+    }
+
+    private static readonly MethodInfo s_isSameFileFunction = typeof(CilAssembler).GetMethod("IsSameFileFunction")!;
+
     private static readonly MethodInfo s_passMode = typeof(MultipleValues).GetMethod("PassMode")!;
     private static readonly MethodInfo s_sameFileTail = typeof(LispFunction).GetMethod("SameFileTail")!;
     private static readonly MethodInfo s_sameFileTailFrom = typeof(LispFunction).GetMethod("SameFileTailFrom")!;
@@ -277,6 +300,27 @@ public partial class CilAssembler
         il.EmitLoc(OpCodes.Ldloc, fn);
         il.Emit(OpCodes.Ldsfld, t.Fn);
         il.Emit(OpCodes.Bne_Un, other);
+        if (t.Leaf)
+        {
+            // A leaf takes no frame from its caller: an ordinary call, which
+            // cannot grow the stack further.
+            il.EmitLoc(OpCodes.Ldloc, fn);
+            for (int k = 0; k < n; k++) il.EmitLoc(OpCodes.Ldloc, args[k]);
+            if (mode && t.Mv)
+            {
+                il.EmitLoc(OpCodes.Ldloc, modeLocal!);
+                il.Emit(OpCodes.Call, s_passMode);
+            }
+            il.Emit(OpCodes.Call, t.Body);
+            EmitLeaveOwnFrame();
+            il.Emit(OpCodes.Ret);
+            il.MarkLabel(other);
+            il.EmitLoc(OpCodes.Ldloc, fn);
+            for (int k = 0; k < n; k++) il.EmitLoc(OpCodes.Ldloc, args[k]);
+            if (mode) il.EmitLoc(OpCodes.Ldloc, modeLocal!);
+            EmitTailInvoke(InvokeShape(n, mode));
+            return;
+        }
         if (_selfFrameLocal != null)
         {
             il.EmitLoc(OpCodes.Ldloca, _selfFrameLocal);

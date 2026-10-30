@@ -22,13 +22,53 @@ internal static unsafe class CallTls
 {
     [ThreadStatic] internal static int MvCount;
     [ThreadStatic] internal static int StackCheck;
-    // A LispFunction.Frame*, typed nint so that its address can be taken without
-    // a pin (a struct-typed thread static would be boxed on the GC heap).
-    [ThreadStatic] internal static nint TopWord;
+    // Address of this thread's innermost-frame word (a LispFunction.Frame*).
+    // Frames keep it (Frame._slot), so the word must not move; a thread static
+    // itself moves with the GC once the TLS area above is used up by the host.
+    [ThreadStatic] internal static nint TopCell;
+#if NET5_0_OR_GREATER
+    [ThreadStatic] private static nint[]? s_topCellArray;
+#else
+    [ThreadStatic] private static TopCellHolder? s_topCellHolder;
+    private sealed class TopCellHolder
+    {
+        internal readonly nint Cell = System.Runtime.InteropServices.Marshal.AllocHGlobal(IntPtr.Size);
+        ~TopCellHolder() { System.Runtime.InteropServices.Marshal.FreeHGlobal(Cell); }
+    }
+#endif
+
+    internal static LispFunction.Frame** TopSlot
+    {
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            var c = TopCell;
+            return c != 0 ? (LispFunction.Frame**)c : NewTopCell();
+        }
+    }
+
     internal static ref LispFunction.Frame* Top
     {
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-        get => ref *(LispFunction.Frame**)System.Runtime.CompilerServices.Unsafe.AsPointer(ref TopWord);
+        get => ref *TopSlot;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispFunction.Frame** NewTopCell()
+    {
+#if NET5_0_OR_GREATER
+        var a = GC.AllocateArray<nint>(1, pinned: true);
+        s_topCellArray = a;
+        var c = (nint)System.Runtime.CompilerServices.Unsafe.AsPointer(
+            ref System.Runtime.InteropServices.MemoryMarshal.GetArrayDataReference(a));
+#else
+        var h = new TopCellHolder();
+        s_topCellHolder = h;
+        var c = h.Cell;
+        *(nint*)c = 0;
+#endif
+        TopCell = c;
+        return (LispFunction.Frame**)c;
     }
     // See LispFunction.LinkOwn.
     [ThreadStatic] internal static int Borrow;
@@ -44,7 +84,8 @@ internal static unsafe class CallTls
     {
         MvCount = 0;
         StackCheck = 0;
-        TopWord = 0;
+        TopCell = 0;
+        NewTopCell();
         Borrow = 0;
         Mode = 0;
         BindCount = 0;

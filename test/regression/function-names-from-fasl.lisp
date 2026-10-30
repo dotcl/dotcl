@@ -66,3 +66,49 @@
           (eq (second (first (second ll))) (find-symbol "KV" pkg))
           (eq (third (second ll)) (find-symbol "KV-P" pkg))))
   (&key t t))
+
+;;; Loaded into a package the compiling process never saw: the package is
+;;; deleted between COMPILE-FILE and LOAD, as a fresh process (or ASDF reading
+;;; its cached FASL) would see it. The parameter names still come back as the
+;;; source's symbols, not uninterned ones.
+
+(defun %fnf-fresh-load ()
+  (let ((src (regression-temp-file "fnf-fresh.lisp")))
+    (with-open-file (s src :direction :output :if-exists :supersede)
+      (write-string "(defpackage :fnf-fresh (:use :cl))
+(in-package :fnf-fresh)
+(defun fresh-fact (fresh-n) (if (<= fresh-n 1) 1 (* fresh-n (fresh-fact (1- fresh-n)))))
+(defun fresh-opt (fresh-a &optional (fresh-b 2 fresh-b-p) &rest fresh-r &key ((:k fresh-c) 3))
+  (list fresh-a fresh-b fresh-b-p fresh-r fresh-c))
+(defparameter *fresh-lambda* (lambda (fresh-x &optional (fresh-y 1)) (list fresh-x fresh-y)))
+" s))
+    (let ((fasl (compile-file src :output-file (regression-temp-file "fnf-fresh.fasl"))))
+      (delete-package "FNF-FRESH")
+      (load fasl)
+      t)))
+
+(deftest-emitting-only fnf-fresh-load
+  (%fnf-fresh-load)
+  t)
+
+(defun %fnf-fresh-sym (name) (find-symbol name "FNF-FRESH"))
+
+(deftest-emitting-only fnf-fresh-lambda-list-required
+  (let ((ll (dotcl:function-lambda-list (%fnf-fresh-sym "FRESH-FACT"))))
+    (list (length ll)
+          (eq (first ll) (%fnf-fresh-sym "FRESH-N"))
+          (eq (symbol-package (first ll)) (find-package "FNF-FRESH"))))
+  (1 t t))
+
+(deftest-emitting-only fnf-fresh-lambda-list-full
+  (equal (dotcl:function-lambda-list (%fnf-fresh-sym "FRESH-OPT"))
+         (list (%fnf-fresh-sym "FRESH-A")
+               '&optional (list (%fnf-fresh-sym "FRESH-B") 2 (%fnf-fresh-sym "FRESH-B-P"))
+               '&rest (%fnf-fresh-sym "FRESH-R")
+               '&key (list (list :k (%fnf-fresh-sym "FRESH-C")) 3)))
+  t)
+
+(deftest-emitting-only fnf-fresh-lambda-list-anonymous
+  (equal (dotcl:function-lambda-list (symbol-value (%fnf-fresh-sym "*FRESH-LAMBDA*")))
+         (list (%fnf-fresh-sym "FRESH-X") '&optional (list (%fnf-fresh-sym "FRESH-Y") 1)))
+  t)

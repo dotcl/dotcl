@@ -33,7 +33,7 @@ public static partial class Runtime
         var p = ResolvePackage(pkg, "DO-EXTERNAL-SYMBOLS");
         LispObject result = Nil.Instance;
         foreach (var s in p.ExternalSymbols)
-            result = new Cons(s, result);
+            result = new Cons(CanonicalizeSymbol(s), result);
         return result;
     }
 
@@ -42,16 +42,16 @@ public static partial class Runtime
         var p = ResolvePackage(pkg, "DO-SYMBOLS");
         LispObject result = Nil.Instance;
         foreach (var s in p.ExternalSymbols)
-            result = new Cons(s, result);
+            result = new Cons(CanonicalizeSymbol(s), result);
         foreach (var s in p.InternalSymbols)
-            result = new Cons(s, result);
+            result = new Cons(CanonicalizeSymbol(s), result);
         foreach (var used in p.UseList)
             foreach (var s in used.ExternalSymbols)
             {
                 // Only include if not shadowed by a directly present symbol
                 var (_, status) = p.FindSymbol(s.Name);
                 if (status == SymbolStatus.Inherited)
-                    result = new Cons(s, result);
+                    result = new Cons(CanonicalizeSymbol(s), result);
             }
         return result;
     }
@@ -81,14 +81,17 @@ public static partial class Runtime
         var cur2 = symTypes;
         while (cur2 is Cons c2)
         {
-            if (c2.Car is Symbol s)
+            if (c2.Car is not Symbol s)
+                throw new LispErrorException(new LispProgramError(
+                    $"WITH-PACKAGE-ITERATOR: {c2.Car} is not a symbol type"));
+            switch (s.Name)
             {
-                switch (s.Name)
-                {
-                    case "INTERNAL": wantInternal = true; break;
-                    case "EXTERNAL": wantExternal = true; break;
-                    case "INHERITED": wantInherited = true; break;
-                }
+                case "INTERNAL": wantInternal = true; break;
+                case "EXTERNAL": wantExternal = true; break;
+                case "INHERITED": wantInherited = true; break;
+                default:
+                    throw new LispErrorException(new LispProgramError(
+                        $"WITH-PACKAGE-ITERATOR: unknown symbol type {s.Name}"));
             }
             cur2 = c2.Cdr;
         }
@@ -105,7 +108,7 @@ public static partial class Runtime
             {
                 foreach (var sym in pkg.ExternalSymbols)
                 {
-                    var entry = new Cons(sym, new Cons(externalKw, new Cons(pkg, Nil.Instance)));
+                    var entry = new Cons(CanonicalizeSymbol(sym), new Cons(externalKw, new Cons(pkg, Nil.Instance)));
                     result = new Cons(entry, result);
                 }
             }
@@ -113,7 +116,7 @@ public static partial class Runtime
             {
                 foreach (var sym in pkg.InternalSymbols)
                 {
-                    var entry = new Cons(sym, new Cons(internalKw, new Cons(pkg, Nil.Instance)));
+                    var entry = new Cons(CanonicalizeSymbol(sym), new Cons(internalKw, new Cons(pkg, Nil.Instance)));
                     result = new Cons(entry, result);
                 }
             }
@@ -127,7 +130,7 @@ public static partial class Runtime
                         var (_, status) = pkg.FindSymbol(sym.Name);
                         if (status == SymbolStatus.Inherited)
                         {
-                            var entry = new Cons(sym, new Cons(inheritedKw, new Cons(pkg, Nil.Instance)));
+                            var entry = new Cons(CanonicalizeSymbol(sym), new Cons(inheritedKw, new Cons(pkg, Nil.Instance)));
                             result = new Cons(entry, result);
                         }
                     }
@@ -192,47 +195,198 @@ public static partial class Runtime
         throw new LispErrorException(err);
     }
 
+    internal enum NameConflictChoice
+    {
+        KeepOld,
+        TakeNew,
+        ShadowingImport,
+        DontImport,
+        Continue,
+        Resolve
+    }
+
+    internal readonly struct NameConflictResolution
+    {
+        public NameConflictChoice Choice { get; }
+        public Symbol? Chosen { get; }
+
+        public NameConflictResolution(NameConflictChoice choice, Symbol? chosen = null)
+        {
+            Choice = choice;
+            Chosen = chosen;
+        }
+    }
+
+    /// <summary>Signal a name conflict and answer the restart's choice.</summary>
+    internal static NameConflictResolution SignalNameConflict(
+        Package pkg, string function, Symbol newSymbol, Symbol oldSymbol,
+        IReadOnlyList<Symbol> conflictSymbols,
+        bool keepOld, bool takeNew, bool importChoices,
+        bool resolve, bool continueRestart)
+    {
+        var restarts = new List<LispRestart>();
+        LispRestart? keepOldRestart = null, takeNewRestart = null,
+                     shadowingImportRestart = null, dontImportRestart = null,
+                     resolveRestart = null, continueRestartObj = null;
+
+        if (keepOld)
+        {
+            keepOldRestart = new LispRestart("KEEP-OLD", _ => Nil.Instance,
+                description: $"Keep {oldSymbol} accessible in {pkg.Name} (shadowing {newSymbol}).");
+            restarts.Add(keepOldRestart);
+        }
+        if (takeNew)
+        {
+            takeNewRestart = new LispRestart("TAKE-NEW", _ => Nil.Instance,
+                description: $"Make {newSymbol} accessible in {pkg.Name} (uninterning or shadowing {oldSymbol}).");
+            restarts.Add(takeNewRestart);
+        }
+        if (importChoices)
+        {
+            shadowingImportRestart = new LispRestart("SHADOWING-IMPORT-IT", _ => Nil.Instance,
+                description: $"Shadowing-import {newSymbol}, uninterning {oldSymbol}.");
+            dontImportRestart = new LispRestart("DONT-IMPORT-IT", _ => Nil.Instance,
+                description: $"Don't import {newSymbol}, keeping {oldSymbol}.");
+            restarts.Add(shadowingImportRestart);
+            restarts.Add(dontImportRestart);
+        }
+        if (resolve)
+        {
+            resolveRestart = new LispRestart("RESOLVE-CONFLICT", _ => Nil.Instance,
+                description: "Resolve conflict.");
+            restarts.Add(resolveRestart);
+        }
+        if (continueRestart)
+        {
+            continueRestartObj = new LispRestart("CONTINUE", _ => Nil.Instance,
+                description: $"Continue, resolving the conflict in favor of {newSymbol}.");
+            restarts.Add(continueRestartObj);
+        }
+
+        LispObject symbolList = Nil.Instance;
+        for (int i = conflictSymbols.Count - 1; i >= 0; i--)
+            symbolList = new Cons(CanonicalValue(conflictSymbols[i]), symbolList);
+
+        RestartClusterStack.PushCluster(restarts.ToArray());
+        try
+        {
+            var condition = MakeConditionFromType(
+                Startup.Sym("SIMPLE-PACKAGE-ERROR"),
+                new LispObject[] {
+                    Startup.Keyword("PACKAGE"), pkg,
+                    Startup.Keyword("FORMAT-CONTROL"),
+                    new LispString($"~A: ~A causes a name conflict in package ~A between the following symbols: ~A."),
+                    Startup.Keyword("FORMAT-ARGUMENTS"),
+                    new Cons(new LispString(function),
+                        new Cons(CanonicalValue(newSymbol),
+                            new Cons(pkg, new Cons(symbolList, Nil.Instance))))
+                });
+            ConditionSystem.Error(condition);
+            return new NameConflictResolution(NameConflictChoice.Continue);
+        }
+        catch (RestartInvocationException rie)
+        {
+            if (keepOldRestart != null && ReferenceEquals(rie.Tag, keepOldRestart.Tag))
+                return new NameConflictResolution(NameConflictChoice.KeepOld);
+            if (takeNewRestart != null && ReferenceEquals(rie.Tag, takeNewRestart.Tag))
+                return new NameConflictResolution(NameConflictChoice.TakeNew);
+            if (shadowingImportRestart != null && ReferenceEquals(rie.Tag, shadowingImportRestart.Tag))
+                return new NameConflictResolution(NameConflictChoice.ShadowingImport);
+            if (dontImportRestart != null && ReferenceEquals(rie.Tag, dontImportRestart.Tag))
+                return new NameConflictResolution(NameConflictChoice.DontImport);
+            if (resolveRestart != null && ReferenceEquals(rie.Tag, resolveRestart.Tag))
+            {
+                var chosen = rie.Arguments.Length > 0 ? rie.Arguments[0] as Symbol : null;
+                return new NameConflictResolution(NameConflictChoice.Resolve, chosen);
+            }
+            if (continueRestartObj != null && ReferenceEquals(rie.Tag, continueRestartObj.Tag))
+                return new NameConflictResolution(NameConflictChoice.Continue);
+            throw;
+        }
+        finally
+        {
+            RestartClusterStack.PopCluster();
+        }
+    }
+
+    /// <summary>Resolve an IMPORT conflict in favor of CHOSEN (CLHS 11.1.1.2.5).</summary>
+    internal static void ResolveImportConflict(Package pkg, Symbol chosen)
+    {
+        var (existing, status) = pkg.FindSymbol(chosen.Name);
+        bool present = status is SymbolStatus.Internal or SymbolStatus.External;
+        if (present)
+        {
+            if (!ReferenceEquals(existing, chosen))
+                pkg.ShadowingImport(chosen);
+        }
+        else
+        {
+            pkg.ImportForce(chosen);
+        }
+    }
+
+    /// <summary>Resolve a USE-PACKAGE or EXPORT conflict in favor of CHOSEN.</summary>
+    internal static void ResolveUseExportConflict(Package pkg, Symbol chosen)
+    {
+        var (existing, status) = pkg.FindSymbol(chosen.Name);
+        bool present = status is SymbolStatus.Internal or SymbolStatus.External;
+        if (!present)
+        {
+            pkg.ShadowingImport(chosen);
+            return;
+        }
+        if (ReferenceEquals(existing, chosen))
+        {
+            pkg.Shadow(chosen.Name);
+            return;
+        }
+        if (ReferenceEquals(existing.HomePackage, pkg))
+        {
+            pkg.Unintern(existing);
+            return;
+        }
+        pkg.ShadowingImport(chosen);
+    }
+
     public static LispObject PackageImport(LispObject pkg, LispObject sym)
     {
         var p = ResolvePackage(pkg, "IMPORT");
         var s = ResolveSymbol(sym, "IMPORT");
 
-        retry:
-        var (existing, status) = p.FindSymbol(s.Name);
-        if (status != SymbolStatus.None && !ReferenceEquals(existing, s))
+        while (true)
         {
-            // Name conflict: signal correctable error with CONTINUE restart
-            var restart = new LispRestart("CONTINUE",
-                _ => Nil.Instance,
-                description: $"Unintern {existing} from {p.Name} and import {s}.");
-            RestartClusterStack.PushCluster(new[] { restart });
-            try
+            var (existing, status) = p.FindSymbol(s.Name);
+            if (status == SymbolStatus.None || ReferenceEquals(existing, s))
             {
-                var condition = MakeConditionFromType(
-                    Startup.Sym("SIMPLE-PACKAGE-ERROR"),
-                    new LispObject[] {
-                        Startup.Keyword("PACKAGE"), p,
-                        Startup.Keyword("FORMAT-CONTROL"),
-                        new LispString($"IMPORT: importing ~A into package ~A conflicts with existing symbol ~A."),
-                        Startup.Keyword("FORMAT-ARGUMENTS"),
-                        new Cons(s, new Cons(new LispString(p.Name), new Cons(existing!, Nil.Instance)))
-                    });
-                ConditionSystem.Error(condition);
+                p.Import(s);
+                return T.Instance;
             }
-            catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, restart.Tag))
+
+            var result = SignalNameConflict(
+                p, "IMPORT", s, existing,
+                new[] { s, existing },
+                keepOld: false, takeNew: false, importChoices: true,
+                resolve: true, continueRestart: true);
+            switch (result.Choice)
             {
-                // CONTINUE restart: unintern existing and retry
-                p.Unintern(existing!.Name);
-                goto retry;
-            }
-            finally
-            {
-                RestartClusterStack.PopCluster();
+                case NameConflictChoice.DontImport:
+                    return T.Instance;
+                case NameConflictChoice.ShadowingImport:
+                    p.ShadowingImport(s);
+                    return T.Instance;
+                case NameConflictChoice.Continue:
+                    if (status is SymbolStatus.Internal or SymbolStatus.External)
+                        p.Unintern(existing);
+                    p.ImportForce(s);
+                    return T.Instance;
+                case NameConflictChoice.Resolve:
+                    ResolveImportConflict(p, result.Chosen ?? s);
+                    return T.Instance;
+                default:
+                    // Only the import choices above can be returned for IMPORT.
+                    break;
             }
         }
-
-        p.Import(s);
-        return T.Instance;
     }
 
     public static LispObject PackageShadow(LispObject pkg, LispObject name)
@@ -543,6 +697,12 @@ public static partial class Runtime
         ReferenceEquals(sym, Startup.NIL_SYM) ? Nil.Instance :
         ReferenceEquals(sym, Startup.T_SYM) ? (LispObject)T.Instance : sym;
 
+    /// <summary>CanonicalizeSymbol for a value of any type: the object a Lisp
+    /// caller may see in place of OBJ.</summary>
+    internal static LispObject CanonicalValue(LispObject obj) =>
+        ReferenceEquals(obj, Startup.NIL_SYM) ? Nil.Instance :
+        ReferenceEquals(obj, Startup.T_SYM) ? (LispObject)T.Instance : obj;
+
     // --- Package operations for UIOP ---
 
     private static string ToStringDesignator(LispObject obj)
@@ -631,11 +791,18 @@ public static partial class Runtime
         // Parse keyword args - collect nicknames and use lists
         LispObject? nicknames = null;
         LispObject? use = null;
+        bool nicknamesSeen = false, useSeen = false;
         for (int i = kwStart; i < args.Length; i += 2)
         {
             var kw = ((Symbol)args[i]).Name;
-            if (kw == "NICKNAMES") nicknames = args[i + 1];
-            else if (kw == "USE") use = args[i + 1];
+            if (kw == "NICKNAMES")
+            {
+                if (!nicknamesSeen) { nicknames = args[i + 1]; nicknamesSeen = true; }
+            }
+            else if (kw == "USE")
+            {
+                if (!useSeen) { use = args[i + 1]; useSeen = true; }
+            }
         }
 
         // Process nicknames - check for conflicts
@@ -855,8 +1022,10 @@ public static partial class Runtime
     {
         // (unintern symbol &optional package)
         if (args.Length < 1 || args.Length > 2) throw MakeProgramError("UNINTERN", 1, 2, args.Length);
-        string name = args[0] is Symbol sym ? sym.Name : args[0] is LispString s ? s.Value : args[0] is LispChar uc ? uc.Value.ToString() : args[0] is LispVector uv && uv.IsCharVector ? uv.ToCharString() : args[0].ToString()!;
         var pkg = args.Length > 1 ? ResolvePackage(args[1], "UNINTERN") : CurrentPackage("UNINTERN");
+        if (args[0] is Symbol sym)
+            return pkg.Unintern(sym) ? T.Instance : Nil.Instance;
+        string name = args[0] is LispString s ? s.Value : args[0] is LispChar uc ? uc.Value.ToString() : args[0] is LispVector uv && uv.IsCharVector ? uv.ToCharString() : args[0].ToString()!;
         return pkg.Unintern(name) ? T.Instance : Nil.Instance;
     }
 
@@ -909,7 +1078,7 @@ public static partial class Runtime
         foreach (var name in p.ShadowingSymbolNames)
         {
             var (sym, _) = p.FindSymbol(name);
-            if (sym != null) result = new Cons(sym, result);
+            if (sym != null) result = new Cons(CanonicalizeSymbol(sym), result);
         }
         return result;
     }

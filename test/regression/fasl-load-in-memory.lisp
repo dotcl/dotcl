@@ -66,6 +66,10 @@
            (out (flm-compile "flm-c.lisp" "flm-c.fasl" "(defun flm-c-f () :compiled)"))
            (n (flm-in-memory-count)))
       (flm-copy-file other out)
+      ;; A same-size copy can share the compile's coarse timestamp.
+      (dotnet:static "System.IO.File" "SetLastWriteTimeUtc" (namestring out)
+                     (dotnet:invoke (dotnet:static "System.DateTime" "UtcNow")
+                                    "AddSeconds" 10))
       (load out)
       (list (- (flm-in-memory-count) n) (funcall (find-symbol "FLM-C-F")))))
   (0 :replaced))

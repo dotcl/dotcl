@@ -47,7 +47,7 @@
 (deftest format-directive-consing.empty-parameters
   (list (format nil "~,,2a|" "ab")
         (format nil "~,,,'-a|" "ab")
-        (format nil "~,,1,'xd|" 42))
+        (format nil "~,,,1d|" 42))
   ("ab  |" "ab|" "42|"))
 
 ;;; V and # parameters consume or count arguments while being resolved.

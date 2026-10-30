@@ -17,7 +17,99 @@
     <PackageReference Include="DotCL.Runtime" Version="$(DotCLRuntimeVersion)" />
   </ItemGroup>
 
+  <PropertyGroup Condition="'$(DotclLispLibrary)' == 'true'">
+    <!-- csc still runs as a step, but compiles nothing: DotclBuildLibrary
+         writes @(IntermediateAssembly) right after it. -->
+    <SkipCompilerExecution>true</SkipCompilerExecution>
+  </PropertyGroup>
+
   <Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />
+
+  <!--
+    Lisp libraries: <LispLibrary Include="plugin.lisp" /> makes the project's
+    assembly the DLL the dotnet:library form in those files defines.
+    <LispSystem Include="greeter.asd" /> does the same for an ASDF system: the
+    system is loaded, then the file of its (:dotnet-library ...) component
+    (what (asdf:make ...) does with the dotnet-library contrib). Systems it
+    depends on are found in the <DotclAsdSearchPath> directories. Every
+    function of those sources the library's bodies reach is compiled in.
+
+    The files are loaded in order by `build-library` (the same entry as
+    `dotcl build-library` and dotcl:build-library), in a process of its own,
+    after every non-framework reference of the project (ProjectReference,
+    Reference, PackageReference) is loaded, so the sources can name their
+    types. The library's assembly name has to be the project's AssemblyName.
+
+    Where the build-time pieces come from. Defaults are the DotCL.Runtime
+    package's; a checkout of dotcl points them at its own build:
+      DotclBuildTool   the program that runs build-library (tasks/DotCL.Build.Tasks.dll)
+      DotclBaseCore    the core it boots (dotclassets/dotcl.core)
+      DotclContribDir  where REQUIRE finds dotnet-class (dotclassets/contrib)
+    The runtime it runs on is the DotCL.Runtime the project references, the
+    one the library is built against and shipped with.
+  -->
+  <PropertyGroup Condition="'$(DotclLispLibrary)' == 'true'">
+    <DotclBuildTool Condition="'$(DotclBuildTool)' == '' and '$(DotclAssetsDir)' != ''">$(DotclAssetsDir)../tasks/DotCL.Build.Tasks.dll</DotclBuildTool>
+    <DotclBaseCore Condition="'$(DotclBaseCore)' == '' and '$(DotclAssetsDir)' != ''">$(DotclAssetsDir)dotcl.core</DotclBaseCore>
+    <DotclContribDir Condition="'$(DotclContribDir)' == '' and '$(DotclAssetsDir)' != ''">$(DotclAssetsDir)contrib</DotclContribDir>
+    <_DotclDotnetHost>$(DOTNET_HOST_PATH)</_DotclDotnetHost>
+    <_DotclDotnetHost Condition="'$(_DotclDotnetHost)' == ''">dotnet</_DotclDotnetHost>
+  </PropertyGroup>
+
+  <Target Name="_DotclLibraryInputs" Condition="'$(DotclLispLibrary)' == 'true'">
+    <Error Condition="'@(LispLibrary)' == '' and '@(LispSystem)' == ''"
+           Text="DotclLispLibrary is true but the project has no LispLibrary or LispSystem items." />
+    <Error Condition="'@(LispLibrary)' != '' and '@(LispSystem)' != ''"
+           Text="A project builds its Lisp library from LispLibrary files or from one LispSystem, not both." />
+    <Error Condition="'@(LispSystem->Count())' &gt; 1"
+           Text="A project builds one Lisp library: it has more than one LispSystem item." />
+    <Error Condition="'$(OutputType)' != 'Library'"
+           Text="A project with LispLibrary items builds a library; OutputType is '$(OutputType)'. Remove it, or set &lt;OutputType&gt;Library&lt;/OutputType&gt;." />
+    <ItemGroup>
+      <_DotclLibraryRuntime Include="@(ReferencePath)" Condition="'%(Filename)' == 'DotCL.Runtime'" />
+      <_DotclLibraryReference Include="@(ReferenceCopyLocalPaths)"
+                              Condition="'%(Extension)' == '.dll' and '%(Filename)' != 'DotCL.Runtime'" />
+      <_DotclLibraryReference Include="@(ReferencePath)" KeepDuplicates="false"
+                              Condition="'%(ReferencePath.FrameworkReferenceName)' == '' and '%(Filename)' != 'DotCL.Runtime'" />
+    </ItemGroup>
+    <Error Condition="'@(_DotclLibraryRuntime)' == ''"
+           Text="A Lisp library needs a reference to DotCL.Runtime (the SDK adds it unless DisableImplicitDotCLRuntimeReference is set)." />
+    <Error Condition="'$(DotclBuildTool)' == '' or !Exists('$(DotclBuildTool)')"
+           Text="DotclBuildTool not found: '$(DotclBuildTool)'." />
+    <Error Condition="'$(DotclBaseCore)' == '' or !Exists('$(DotclBaseCore)')"
+           Text="DotclBaseCore not found: '$(DotclBaseCore)'." />
+    <ItemGroup Condition="'@(LispSystem)' != ''">
+      <_DotclLibrarySource Include="%(LispSystem.RootDir)%(LispSystem.Directory)**/*.lisp;%(LispSystem.RootDir)%(LispSystem.Directory)**/*.asd"
+                           Exclude="%(LispSystem.RootDir)%(LispSystem.Directory)bin/**;%(LispSystem.RootDir)%(LispSystem.Directory)obj/**" />
+      <_DotclLibrarySource Include="%(DotclAsdSearchPath.FullPath)/**/*.lisp;%(DotclAsdSearchPath.FullPath)/**/*.asd"
+                           Condition="'@(DotclAsdSearchPath)' != ''" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_DotclLibrarySourceArgs Condition="'@(LispSystem)' != ''">--system &quot;@(LispSystem->'%(FullPath)')&quot; @(DotclAsdSearchPath->'--search-path &quot;%(FullPath)&quot;', ' ') --asdf-output &quot;$([System.IO.Path]::GetFullPath('$(IntermediateOutputPath)asdf-cache'))&quot;</_DotclLibrarySourceArgs>
+      <_DotclLibrarySourceArgs Condition="'@(LispSystem)' == ''">@(LispLibrary->'&quot;%(FullPath)&quot;', ' ')</_DotclLibrarySourceArgs>
+    </PropertyGroup>
+  </Target>
+
+  <Target Name="DotclBuildLibrary"
+          AfterTargets="CoreCompile"
+          DependsOnTargets="_DotclLibraryInputs"
+          Condition="'$(DotclLispLibrary)' == 'true'"
+          Inputs="@(LispLibrary);@(LispSystem);@(_DotclLibrarySource);@(_DotclLibraryReference);@(_DotclLibraryRuntime);$(DotclBaseCore);$(DotclBuildTool);$(MSBuildProjectFullPath)"
+          Outputs="@(IntermediateAssembly)">
+    <Exec Command="&quot;$(_DotclDotnetHost)&quot; &quot;$(DotclBuildTool)&quot; --runtime &quot;@(_DotclLibraryRuntime->'%(FullPath)')&quot; --core &quot;$(DotclBaseCore)&quot; --contrib &quot;$(DotclContribDir)&quot; build-library $(_DotclLibrarySourceArgs) @(_DotclLibraryReference->'--reference &quot;%(FullPath)&quot;', ' ') --output &quot;@(IntermediateAssembly->'%(FullPath)')&quot;"
+          StandardOutputImportance="low" />
+  </Target>
+
+  <!-- The package's dotcl.core and contrib tree are for applications that boot
+       a core; a library runs without one, so they stay out of its output. -->
+  <Target Name="_DotclLibraryDropAssets" BeforeTargets="AssignTargetPaths"
+          Condition="'$(DotclLispLibrary)' == 'true' and '$(DotclAssetsDir)' != ''">
+    <ItemGroup>
+      <_DotclAssetNone Include="@(None)"
+                       Condition="$([System.String]::Copy('%(None.FullPath)').StartsWith($([System.IO.Path]::GetFullPath('$(DotclAssetsDir)'))))" />
+      <None Remove="@(_DotclAssetNone)" />
+    </ItemGroup>
+  </Target>
 
   <!--
     Public extension seam.

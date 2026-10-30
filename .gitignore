@@ -49,24 +49,30 @@ bench-state.json
 !scripts/build-quicklisp.sh
 !scripts/contrib-resolve.sh
 !scripts/drop-stale-fasls.sh
+!scripts/stage-core-source.sh
 !scripts/check-host-defs.sh
 !scripts/dist-package.sh
 !ci/d-number.sh
 !ci/mirror-scrub-workflows.sh
 !ci/windows-ci.sh
+!runtime/sdk/dev-feed.sh
 !test/ansi-failures.sh
 !test/ansi-gate.sh
+!test/call-coverage/run.sh
+!test/call-coverage/report.sh
 !bench/cl-bench-runner/make-state.sh
 !bench/gate/check-ratios.sh
 !bench/il-parity/check-counts.sh
 !bench/coalton/compare.sh
 !bench/sil-shapes/count-sil.sh
+!bench/library-status/native.sh
 !bench/csharp-parity/make-parity-state.sh
 !bench/gate/process-modes.sh
 !bench/gate/regression-time.sh
 !bench/gate/test-modes.sh
 !bench/library-status/run-quickload.sh
 !bench/library-status/run-tests.sh
+!bench/library-status/net.sh
 !bench/library-status/scrub.sh
 !bench/library-status/check-scrub.sh
 !bench/library-status/run-forks.sh
@@ -77,9 +83,14 @@ bench-state.json
 !bench/library-status/ffi/run.sh
 !bench/ledger/run.sh
 !bench/ledger/remote.sh
+!bench/ledger/doc.sh
+!bench/jit-tiering/run.sh
+!bench/jit-tiering/gc-matrix.sh
 !samples/**/*.sh
 !test/*/check.sh
 !test/pack-nuspec/tool-deps.sh
+!test/package-units-swank/run.sh
+!test/package-units-swank/setup.sh
 
 ## qlot (dependency management)
 qlfile
@@ -149,6 +160,8 @@ contrib/*/lib/
 ## Sample project build outputs
 samples/*/bin/
 samples/*/obj/
+samples/*/*/bin/
+samples/*/*/obj/
 
 ## Source Generator (build artifacts)
 runtime.docgen/bin/
@@ -167,3 +180,9 @@ templates/obj/
 
 scripts/ilverify-filter/bin/
 scripts/ilverify-filter/obj/
+runtime/cil-stdlib.lisp
+runtime/cil-stdlib.generation
+
+# Written by runtime/sdk/dev-feed.sh
+samples/PluginHostDemo/global.json
+samples/PluginHostDemo/nuget.config

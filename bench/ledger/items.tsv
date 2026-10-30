@@ -7,6 +7,8 @@
 # ironclad-cold / ironclad-warm (the rt suite; arg = categories or "all"),
 # imago (bic2). The id is the metric name shown in the table; group kinds
 # (parity, ironclad) report one metric per kernel / test under the id.
+# Every row is also measured in steady state (a separate process per side that repeats the work
+# until its time is stable), whatever its kind.
 cl-bench/tak	clbench	tak	600
 cl-bench/takl	clbench	takl	600
 cl-bench/stak	clbench	stak	600

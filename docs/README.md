@@ -29,6 +29,8 @@ Guides and reference for dotcl: Common Lisp for .NET applications.
 - [Benchmarks](benchmarks.md): measured numbers, and how to reproduce them
 - [Profiling](profiling.md): CPU and allocation profiles; your Lisp function
   names appear in the stacks as-is
+- [GC settings for compute-heavy programs](gc-tuning.md): environment
+  variables that speed up allocation-heavy code, and what they cost
 - [Ahead-of-time compiled FASLs](readytorun.md): ReadyToRun siblings, what
   ships with one, how to tell they are being used
 

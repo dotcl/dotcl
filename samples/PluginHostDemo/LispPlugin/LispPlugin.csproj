@@ -1,0 +1,6 @@
+<Project Sdk="DotCL.Sdk">
+  <ItemGroup>
+    <LispLibrary Include="plugin.lisp" />
+    <ProjectReference Include="../PluginHost.Abstractions/PluginHost.Abstractions.csproj" />
+  </ItemGroup>
+</Project>

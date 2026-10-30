@@ -1139,11 +1139,30 @@ collected result will be returned as the value of the LOOP."
 	  *loop-wrappers* nil)))
 
 (defun loop-variable-p (name)
-  (do ((entry *loop-bind-stack* (cdr entry))) (nil)
-    (cond ((null entry)
-	   (return nil))
-	  ((assoc name (caar entry) :test #'eq)
-	   (return t)))))
+  (labels ((pattern-has-p (var pattern)
+	     (cond ((null pattern) nil)
+		   ((eq var pattern) t)
+		   ((consp pattern)
+		    (or (pattern-has-p var (car pattern))
+			(pattern-has-p var (cdr pattern))))))
+	   (in-crocks-p (var crocks)
+	     (do ((c crocks (cddr c)))
+		 ((null c) nil)
+	       (when (pattern-has-p var (car c)) (return t))))
+	   (symbol-used-p (var)
+	     (or (assoc var *loop-variables* :test #'eq)
+		 (in-crocks-p var *loop-desetq-crocks*)
+		 (do ((entry *loop-bind-stack* (cdr entry)))
+		     ((null entry) nil)
+		   (when (or (assoc var (caar entry) :test #'eq)
+			     (in-crocks-p var (caddar entry)))
+		     (return t)))))
+	   (any-used-p (pattern)
+	     (cond ((null pattern) nil)
+		   ((atom pattern) (and (symbolp pattern) (symbol-used-p pattern)))
+		   (t (or (any-used-p (car pattern))
+			  (any-used-p (cdr pattern)))))))
+    (any-used-p name)))
 
 (defun loop-make-variable (name initialization dtype &optional iteration-variable-p)
   (cond ((null name)
@@ -1281,7 +1300,7 @@ collected result will be returned as the value of the LOOP."
     (setq *loop-names* (list name))))
 
 (defun loop-do-return ()
-  (loop-pseudo-body (loop-construct-return (loop-get-form))))
+  (loop-emit-body (loop-construct-return (loop-get-form))))
 
 
 ;;;; Value Accumulation: List
@@ -1295,8 +1314,28 @@ collected result will be returned as the value of the LOOP."
   (history nil)
   (tempvars nil)
   dtype
+  specified-type
   (data nil))						;collector-specific data
 
+
+(defun loop-type-union (a b)
+  (multiple-value-bind (a-subtype-b a-known) (subtypep a b)
+    (multiple-value-bind (b-subtype-a b-known) (subtypep b a)
+      (cond ((and a-subtype-b a-known) b)
+	    ((and b-subtype-a b-known) a)
+	    (t 'number)))))
+
+(defun loop-redeclare-variable (name dtype)
+  (flet ((retype (decls)
+	   (mapcar (lambda (decl)
+		     (if (and (consp decl) (eq (car decl) 'type)
+			      (eq (third decl) name))
+			 `(type ,dtype ,name)
+			 decl))
+		   decls)))
+    (setq *loop-declarations* (retype *loop-declarations*))
+    (dolist (entry *loop-bind-stack*)
+      (setf (second entry) (retype (second entry))))))
 
 (defun loop-get-collection-info (collector class default-type)
   (let ((form (loop-get-form))
@@ -1308,31 +1347,44 @@ collected result will be returned as the value of the LOOP."
       (loop-error "Value accumulation recipient name, ~S, is not a symbol." name))
     (unless name
       (loop-disallow-aggregate-booleans))
-    (unless dtype
-      (setq dtype (or (loop-optional-type) default-type)))
-    (let ((cruft (find (the symbol name) *loop-collection-cruft*
-		       :key #'loop-collector-name)))
-      (cond ((not cruft)
-	     (when (and name (loop-variable-p name))
-	       (loop-error "Variable ~S cannot be used in INTO clause" name))
-	     (push (setq cruft (make-loop-collector
-				 :name name :class class
-				 :history (list collector) :dtype dtype))
-		   *loop-collection-cruft*))
-	    (t (unless (eq (loop-collector-class cruft) class)
-		 (loop-error
-		   "Incompatible kinds of LOOP value accumulation specified for collecting~@
-		    ~:[as the value of the LOOP~;~:*INTO ~S~]: ~S and ~S."
-		   name (car (loop-collector-history cruft)) collector))
-	       (unless (equal dtype (loop-collector-dtype cruft))
-		 (loop-warn
-		   "Unequal datatypes specified in different LOOP value accumulations~@
-		   into ~S: ~S and ~S."
-		   name dtype (loop-collector-dtype cruft))
-		 (when (eq (loop-collector-dtype cruft) t)
-		   (setf (loop-collector-dtype cruft) dtype)))
-	       (push collector (loop-collector-history cruft))))
-      (values cruft form))))
+    (let ((specified-type dtype))
+      (unless dtype
+	(setq specified-type (loop-optional-type)
+	      dtype (or specified-type default-type)))
+      (let ((cruft (find (the symbol name) *loop-collection-cruft*
+			 :key #'loop-collector-name)))
+	(cond ((not cruft)
+	       (when (and name (loop-variable-p name))
+		 (loop-error "Variable ~S cannot be used in INTO clause" name))
+	       (push (setq cruft (make-loop-collector
+				   :name name :class class
+				   :history (list collector)
+				   :specified-type specified-type
+				   :dtype dtype))
+		     *loop-collection-cruft*))
+	      (t (unless (eq (loop-collector-class cruft) class)
+		   (loop-error
+		     "Incompatible kinds of LOOP value accumulation specified for collecting~@
+		      ~:[as the value of the LOOP~;~:*INTO ~S~]: ~S and ~S."
+		     name (car (loop-collector-history cruft)) collector))
+		 (unless (equal dtype (loop-collector-dtype cruft))
+		   (cond ((and (null specified-type)
+			       (null (loop-collector-specified-type cruft)))
+			  (let ((union (loop-type-union
+					dtype (loop-collector-dtype cruft))))
+			    (setf (loop-collector-dtype cruft) union)
+			    (when (loop-collector-tempvars cruft)
+			      (loop-redeclare-variable
+			       (car (loop-collector-tempvars cruft)) union))))
+			 (t
+			  (loop-warn
+			    "Unequal datatypes specified in different LOOP value accumulations~@
+			     into ~S: ~S and ~S."
+			    name dtype (loop-collector-dtype cruft))
+			  (when (eq (loop-collector-dtype cruft) t)
+			    (setf (loop-collector-dtype cruft) dtype)))))
+		 (push collector (loop-collector-history cruft))))
+	(values cruft form)))))
 
 
 (defun loop-list-collection (specifically)	;NCONC, LIST, or APPEND
@@ -2228,8 +2280,8 @@ collected result will be returned as the value of the LOOP."
 			 (appending (loop-list-collection append))
 			 (nconc (loop-list-collection nconc))
 			 (nconcing (loop-list-collection nconc))
-			 (count (loop-sum-collection count ,*loop-real-data-type* fixnum))
-			 (counting (loop-sum-collection count ,*loop-real-data-type* fixnum))
+			 (count (loop-sum-collection count number fixnum))
+			 (counting (loop-sum-collection count number fixnum))
 			 (sum (loop-sum-collection sum number number))
 			 (summing (loop-sum-collection sum number number))
 			 (maximize (loop-maxmin-collection max))

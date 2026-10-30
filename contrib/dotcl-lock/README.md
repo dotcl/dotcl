@@ -39,3 +39,33 @@ from it follow the unit of the caller. Call an entry point that does either
 
 `dotcl-lock:system-unit` names that unit (NIL outside every unit); a system the
 lock loads in more than one unit is an error there.
+
+## Without a lock file
+
+`add-unit` puts the systems of one `.asd` file in a unit of their own and
+leaves every other system as ASDF finds it (Quicklisp, a source registry),
+loaded once outside every unit. Two versions of swank, each on its own port:
+
+    (asdf:load-system "swank")       ; the version ASDF finds, global
+    (require "dotcl-lock")
+    (dotcl-lock:add-unit "swank@git" "/src/slime/swank.asd")
+    (dotcl-lock:call-in-unit "swank@git"
+      (lambda ()
+        (asdf:load-system "swank")
+        (uiop:symbol-call :swank :create-server :port 4006 :dont-close t)))
+    (swank:create-server :port 4005 :dont-close t)
+
+Code outside the unit is read before the unit's packages exist, so it names
+them at run time (`uiop:symbol-call`, `find-symbol`) inside `call-in-unit`.
+The unit owns the packages and modules that the `defpackage`,
+`define-package`, `make-package`, `provide` and `:nicknames` forms under the
+directory of the `.asd` spell; pass `:packages` when the library makes others
+(a trailing `*` matches any suffix). Both versions can also be put in units
+with two `add-unit` calls. `test/package-units-swank/` connects SLIME 2.31 and
+the current SLIME to such an image at the same time.
+
+What a unit does not separate: global variables of CL and of shared
+libraries (`*debugger-hook*`, `*features*`, `*readtable*`), methods both
+versions add to a shared generic function for a shared class, and the
+process (current directory, environment, ports). An object made by one
+version is not of the other version's types, so do not pass one across.

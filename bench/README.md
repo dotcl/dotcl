@@ -6,7 +6,8 @@ per job:
 
 - `cl-bench-runner/`: runs the cl-bench suites on dotcl and SBCL and merges the
   times into `bench-state.json` (`make bench`, `make bench-state`,
-  `make bench-survey`).
+  `make bench-survey`). See [its README](cl-bench-runner/README.md) for the
+  `BENCH_GC_EACH` option.
 - `coalton/`: small Coalton programs and Coalton's ray tracer, timed on dotcl
   and SBCL with the same Coalton checkout (`make bench-coalton`).
 - `csharp-parity/`: small kernels written in fully declared Lisp and in C#,

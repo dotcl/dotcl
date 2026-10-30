@@ -1,0 +1,16 @@
+;;; Compiled with COMPILE-FILE by direct-leaf.lisp.
+
+(defun %dlf-ord (a b)
+  (declare (type (member :lt :eq :gt) a b))
+  (if (eq a b) t nil))
+(defun %dlf-first (x) (car x))
+(defun %dlf-ltv (a)
+  (declare (type (member :x :y) a))
+  (if (eq a :x) (load-time-value (list 1 2)) :none))
+(defun %dlf-ltv-car (a)
+  (declare (type (member :x :y) a))
+  (if (eq a :x) (car (load-time-value (list 1 2))) :none))
+(defun %dlf-ltv-let () (let ((b (load-time-value (list 3 4)))) (car b)))
+(defun %dlf-tail (a b) (%dlf-ord a b))
+(defun %dlf-let-tail (a b) (values (%dlf-ord a b)))
+(defun %dlf-t0 (f g a b) (funcall f g a b))

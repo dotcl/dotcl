@@ -338,6 +338,13 @@ public partial class LispFunction
         return k;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void EnterTypedW5<A0, A1, A2, A3, A4>(ref Frame fr, ref TypedFrameArgsW ta, string name, int code, A0 a0, A1 a1, A2 a2, A3 a3, A4 a4)
+    {
+        PutW(ref ta.R0, ref ta.X0, a0); PutW(ref ta.R1, ref ta.X1, a1); PutW(ref ta.R2, ref ta.X2, a2); PutW(ref ta.R3, ref ta.X3, a3); PutW(ref ta.R4, ref ta.X4, a4);
+        EnterTypedCoreW(ref fr, ref ta, name, 5, code);
+    }
+
     public static unsafe R InvokeTypedW6<A0, A1, A2, A3, A4, A5, R>(LispFunction fn, A0 a0, A1 a1, A2 a2, A3 a3, A4 a4, A5 a5, int code)
     {
         if (fn._nativeArity != code) return UnboxRawW<R>(fn.Invoke6(BoxRawW(a0), BoxRawW(a1), BoxRawW(a2), BoxRawW(a3), BoxRawW(a4), BoxRawW(a5)));
@@ -387,6 +394,13 @@ public partial class LispFunction
         int k = callee.TailPrepTypedCoreW(code, self, 6, out var ta);
         if (ta != null) { PutW(ref ta->R0, ref ta->X0, a0); PutW(ref ta->R1, ref ta->X1, a1); PutW(ref ta->R2, ref ta->X2, a2); PutW(ref ta->R3, ref ta->X3, a3); PutW(ref ta->R4, ref ta->X4, a4); PutW(ref ta->R5, ref ta->X5, a5); }
         return k;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void EnterTypedW6<A0, A1, A2, A3, A4, A5>(ref Frame fr, ref TypedFrameArgsW ta, string name, int code, A0 a0, A1 a1, A2 a2, A3 a3, A4 a4, A5 a5)
+    {
+        PutW(ref ta.R0, ref ta.X0, a0); PutW(ref ta.R1, ref ta.X1, a1); PutW(ref ta.R2, ref ta.X2, a2); PutW(ref ta.R3, ref ta.X3, a3); PutW(ref ta.R4, ref ta.X4, a4); PutW(ref ta.R5, ref ta.X5, a5);
+        EnterTypedCoreW(ref fr, ref ta, name, 6, code);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

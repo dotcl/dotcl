@@ -96,6 +96,188 @@ public static class DotclBuild
         => ReadSystemMetaCore(system, searchPaths, out error);
 
     /// <summary>
+    /// Build a .NET library DLL from Lisp source files: load each of
+    /// <paramref name="references"/>, so their types can be named, then load
+    /// <paramref name="files"/> in order with every <c>dotnet:library</c> form
+    /// writing to <paramref name="output"/> instead of its own <c>:path</c>.
+    /// Exactly one library has to be written, and its assembly name has to be
+    /// the output's file name. What <c>dotcl build-library</c>,
+    /// <c>dotcl:build-library</c> and the SDK's <c>LispLibrary</c> items run.
+    /// </summary>
+    public static void BuildLibrary(string[] files, string[]? references, string output)
+        => BuildLibrary(files, references, output, null, null, null);
+
+    /// <summary>
+    /// <see cref="BuildLibrary(string[], string[], string)"/>, or with
+    /// <paramref name="system"/> (a system name, or the path of its .asd) the
+    /// library an ASDF system defines: the system is loaded, then the files of
+    /// its <c>(:dotnet-library ...)</c> components, as <c>(asdf:make ...)</c>
+    /// does through the dotnet-library contrib's LIBRARY-OP. Each function of the
+    /// files, or of the system and the systems it depends on, that the library's
+    /// bodies reach is compiled into the DLL. <paramref name="output"/> may be
+    /// null with a system: the system's :build-pathname, or else the
+    /// dotnet:library form's :path, names the DLL. <paramref name="searchPaths"/>
+    /// are directories ASDF looks for systems in, and
+    /// <paramref name="asdfOutput"/> where it puts the fasls it compiles.
+    /// Returns the path written.
+    /// </summary>
+    public static string BuildLibrary(string[] files, string[]? references, string? output,
+                                      string? system, string[]? searchPaths, string? asdfOutput)
+    {
+        if (system == null && files.Length == 0)
+            throw new ArgumentException("build-library: no source files");
+        if (system != null && files.Length > 0)
+            throw new ArgumentException("build-library: give a system or source files, not both");
+        if (system == null && output == null)
+            throw new ArgumentException("build-library: no output path");
+        var absFiles = files.Select(f => System.IO.Path.GetFullPath(f)).ToArray();
+        foreach (var f in absFiles)
+            if (!System.IO.File.Exists(f))
+                throw new System.IO.FileNotFoundException($"build-library: file not found: {f}", f);
+        string? absOut = output == null ? null : System.IO.Path.GetFullPath(output);
+        var outDir = absOut == null ? null : System.IO.Path.GetDirectoryName(absOut);
+        if (!string.IsNullOrEmpty(outDir)) System.IO.Directory.CreateDirectory(outDir);
+
+        LoadLibraryReferences(references);
+
+        var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
+        var oldHook = DynamicBindings.Get(hookSym);
+        DynamicBindings.Set(hookSym, ConditionSystem.ReportingDebuggerHook(new LispFunction(hookArgs =>
+        {
+            var cond = hookArgs[0];
+            throw new LispErrorException(
+                cond is LispCondition lc ? lc : new LispError(cond.ToString()));
+        }, "*BUILD-DEBUGGER-HOOK*", 2)));
+        try
+        {
+            EvalLisp("(require \"dotnet-class\")");
+            LispObject written;
+            LispObject outArg = absOut == null ? Nil.Instance : new LispString(absOut.Replace("\\", "/"));
+            if (system != null)
+            {
+                EvalLisp("(require \"asdf\")");
+                PinBundledAsdf();
+                if (asdfOutput != null) RedirectAsdfOutput(asdfOutput);
+                RegisterAsdSearchPaths(searchPaths);
+                EvalLisp("(require \"dotnet-library\")");
+                LispObject sysArg;
+                if (system.EndsWith(".asd", StringComparison.OrdinalIgnoreCase))
+                {
+                    var absAsd = System.IO.Path.GetFullPath(system);
+                    if (!System.IO.File.Exists(absAsd))
+                        throw new System.IO.FileNotFoundException($"build-library: system definition not found: {absAsd}", absAsd);
+                    var asdLisp = absAsd.Replace("\\", "/");
+                    var asdDir = System.IO.Path.GetDirectoryName(absAsd)!.Replace("\\", "/").TrimEnd('/') + "/";
+                    EvalLisp($"(pushnew #p\"{asdDir}\" asdf:*central-registry* :test #'equal)");
+                    EvalLisp(RootSystemHelper);
+                    EvalLisp($"(asdf:load-asd \"{asdLisp}\")");
+                    sysArg = MultipleValues.Primary(Runtime.Eval(MultipleValues.Primary(
+                        Runtime.ReadFromString(new LispObject[] { new LispString(
+                            $"(asdf:component-name (%root-system-of \"{asdLisp}\"))") }))));
+                }
+                else sysArg = new LispString(system);
+                written = Runtime.Funcall(Startup.SymInPkg("BUILD-SYSTEM", "DOTNET-LIBRARY"),
+                    sysArg, Startup.Keyword("OUTPUT"), outArg);
+            }
+            else
+            {
+                LispObject fileList = Nil.Instance;
+                for (int i = absFiles.Length - 1; i >= 0; i--)
+                    fileList = new Cons(new LispString(absFiles[i].Replace("\\", "/")), fileList);
+                written = Runtime.Funcall(Startup.SymInPkg("%BUILD-LIBRARY", "DOTNET"), fileList, outArg);
+            }
+            return written is LispString ws ? ws.Value : absOut ?? "";
+        }
+        finally
+        {
+            DynamicBindings.Set(hookSym, oldHook);
+        }
+    }
+
+    /// <summary>Load reference assemblies so a library's sources can name their
+    /// types. One already loaded under the same simple name (the runtime, the
+    /// framework) is skipped, and so is a reference-only assembly, which cannot be
+    /// loaded for execution: a type of it that the sources use is then reported as
+    /// not found.</summary>
+    private static void LoadLibraryReferences(string[]? references)
+    {
+        if (references == null) return;
+        var loaded = new HashSet<string>(
+            AppDomain.CurrentDomain.GetAssemblies().Select(a => a.GetName().Name ?? ""),
+            StringComparer.OrdinalIgnoreCase);
+        foreach (var r in references)
+        {
+            if (string.IsNullOrEmpty(r)) continue;
+            var abs = System.IO.Path.GetFullPath(r);
+            if (!System.IO.File.Exists(abs))
+                throw new System.IO.FileNotFoundException($"build-library: reference not found: {abs}", abs);
+            var name = System.IO.Path.GetFileNameWithoutExtension(abs);
+            if (!loaded.Add(name)) continue;
+            var dir = System.IO.Path.GetDirectoryName(abs);
+            if (!string.IsNullOrEmpty(dir) && !Runtime.AssemblyProbeSearchPaths.Contains(dir!))
+                Runtime.AssemblyProbeSearchPaths.Add(dir!);
+            try { RuntimeLoadContext.LoadFrom(abs); }
+            catch (BadImageFormatException) { }
+        }
+    }
+
+    /// <summary>
+    /// <c>FILE... [--reference DLL]... --output PATH</c>, the arguments of
+    /// <c>dotcl build-library</c>: build the library, report a failure on
+    /// <paramref name="err"/> in MSBuild's diagnostic format, and return the
+    /// process exit code. The core must already be loaded.
+    /// </summary>
+    public static int RunBuildLibraryCommand(IReadOnlyList<string> args, System.IO.TextWriter err)
+    {
+        const string usage = "  usage: build-library FILE... [--reference DLL]... --output PATH\n"
+            + "         build-library --system NAME|FILE.asd [--search-path DIR]... [--reference DLL]... [--output PATH]";
+        var files = new List<string>();
+        var refs = new List<string>();
+        var searchPaths = new List<string>();
+        string? output = null, system = null, asdfOutput = null;
+        for (int i = 0; i < args.Count; i++)
+        {
+            var a = args[i];
+            if ((a == "--reference" || a == "-r") && i + 1 < args.Count) refs.Add(args[++i]);
+            else if ((a == "--output" || a == "-o") && i + 1 < args.Count) output = args[++i];
+            else if (a == "--system" && i + 1 < args.Count) system = args[++i];
+            else if (a == "--search-path" && i + 1 < args.Count) searchPaths.Add(args[++i]);
+            else if (a == "--asdf-output" && i + 1 < args.Count) asdfOutput = args[++i];
+            else if (a.StartsWith("-", StringComparison.Ordinal))
+            {
+                err.WriteLine($"build-library: unknown option '{a}'");
+                err.WriteLine(usage);
+                return 2;
+            }
+            else files.Add(a);
+        }
+        if (system == null ? files.Count == 0 || output == null : files.Count > 0)
+        {
+            err.WriteLine(usage);
+            return 2;
+        }
+        var origin = system ?? files[0];
+        try
+        {
+            BuildLibrary(files.ToArray(), refs.ToArray(), output, system, searchPaths.ToArray(), asdfOutput);
+            return 0;
+        }
+        catch (LispSourceException lse)
+        {
+            err.WriteLine(lse.FormatMsBuildDiagnostic());
+        }
+        catch (LispErrorException lee)
+        {
+            err.WriteLine($"{origin} : error DOTCL: {lee.Message}");
+        }
+        catch (Exception ex)
+        {
+            err.WriteLine($"{origin} : error DOTCL: {ex.Message}");
+        }
+        return 1;
+    }
+
+    /// <summary>
     /// Why NuGet cannot serve <paramref name="version"/>, or null when it can.
     ///
     /// Only meant for a version taken from a .asd's <c>:version</c>, which ASDF

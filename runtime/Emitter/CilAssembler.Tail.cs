@@ -223,6 +223,13 @@ public partial class CilAssembler
     /// its arguments (and the value mode, for InvokeNM) are on the stack.</summary>
     private void EmitTailInvoke(LispObject instr)
     {
+#if NET9_0_OR_GREATER
+        if (LibraryAbiIL.Active)
+        {
+            EmitLibraryTailInvoke(instr);
+            return;
+        }
+#endif
         if (instr is Cons sc && sc.Car is Symbol ss && ss.Name == "CALL-SAME-FILE")
         {
             EmitSameFileTail(sc);
@@ -291,6 +298,119 @@ public partial class CilAssembler
         il.Emit(OpCodes.Callvirt, DirectClosureDelegateType(n).GetMethod("Invoke")!);
         il.Emit(OpCodes.Ret);
     }
+
+#if NET9_0_OR_GREATER
+    private static readonly MethodInfo s_abiTailPrep = typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.TailPrep))!;
+    private static readonly MethodInfo s_abiTailDirect = typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.TailDirect))!;
+    private static readonly MethodInfo s_abiTailClosure = typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.TailClosure))!;
+    private static readonly MethodInfo s_abiEnvironment = typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.Environment))!;
+    private static readonly MethodInfo s_abiSelfTailEntry = typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.SelfTailEntry))!;
+    private static readonly MethodInfo s_abiSelfTailPrepare = typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.SelfTailPrepare))!;
+    private static readonly MethodInfo s_abiLend = typeof(LibraryAbi).GetProperty(nameof(LibraryAbi.Lend))!.GetGetMethod()!;
+
+    /// <summary>EmitTailInvoke in a library: the same tail call, made through LibraryAbi.</summary>
+    private void EmitLibraryTailInvoke(LispObject instr)
+    {
+        var (n, mode) = instr is Cons sc && sc.Car is Symbol ss && ss.Name == "CALL-SAME-FILE"
+            ? (SameFileCall(sc).n, SameFileCall(sc).mode)
+            : TailInvokeShape(instr);
+        var il = _il;
+        _tailFn ??= il.DeclareLocal(typeof(LispFunction));
+        _tailArgs ??= new LocalBuilder?[8];
+        if (mode) { _tailMode ??= il.DeclareLocal(typeof(int)); il.EmitLoc(OpCodes.Stloc, _tailMode); }
+        for (int k = n - 1; k >= 0; k--)
+            il.EmitLoc(OpCodes.Stloc, _tailArgs[k] ??= il.DeclareLocal(typeof(LispObject)));
+        il.EmitLoc(OpCodes.Stloc, _tailFn);
+        void LoadArgs() { for (int k = 0; k < n; k++) il.EmitLoc(OpCodes.Ldloc, _tailArgs[k]!); }
+        void LoadMode() { if (mode) il.EmitLoc(OpCodes.Ldloc, _tailMode!); else il.Emit(OpCodes.Ldc_I4_M1); }
+        var directType = s_tailDirectTypes[n];
+        void TailDirect()
+        {
+            il.EmitLoc(OpCodes.Ldloc, _tailFn);
+            il.Emit(OpCodes.Ldc_I4, n);
+            il.Emit(OpCodes.Call, s_abiTailDirect.MakeGenericMethod(directType));
+            LoadArgs();
+            il.Emit(OpCodes.Tailcall);
+            il.Emit(OpCodes.Callvirt, directType.GetMethod("Invoke")!);
+            il.Emit(OpCodes.Ret);
+        }
+
+        LocalBuilder? selfLocal = null;
+        if (_selfFrameLocal != null)
+        {
+            var noEntry = il.DefineLabel();
+            if (n <= 4)
+            {
+                il.EmitLoc(OpCodes.Ldloca, _selfFrameLocal);
+                il.EmitLoc(OpCodes.Ldloc, _tailFn);
+                il.Emit(OpCodes.Ldc_I4, n);
+                LoadMode();
+                il.Emit(OpCodes.Call, s_abiSelfTailEntry);
+                il.Emit(OpCodes.Brfalse, noEntry);
+                TailDirect();
+            }
+            il.MarkLabel(noEntry);
+            selfLocal = il.DeclareLocal(typeof(string));
+            var prep = il.DefineLabel();
+            il.EmitLoc(OpCodes.Ldloca, _selfFrameLocal);
+            il.EmitLoc(OpCodes.Ldloc, _tailFn);
+            il.Emit(OpCodes.Ldstr, Track(_selfFrameName!));
+            il.Emit(OpCodes.Call, s_abiSelfTailPrepare);
+            il.Emit(OpCodes.Dup);
+            il.EmitLoc(OpCodes.Stloc, selfLocal);
+            il.Emit(OpCodes.Call, s_abiLend);
+            il.Emit(OpCodes.Bne_Un, prep);
+            il.EmitLoc(OpCodes.Ldloc, _tailFn);
+            LoadArgs();
+            if (mode) il.EmitLoc(OpCodes.Ldloc, _tailMode!);
+            il.Emit(OpCodes.Callvirt, typeof(LispFunction).GetMethod("Invoke" + n + (mode ? "M" : ""))!);
+            EmitLeaveOwnFrame();
+            il.Emit(OpCodes.Ret);
+            il.MarkLabel(prep);
+        }
+
+        il.EmitLoc(OpCodes.Ldloc, _tailFn);
+        il.Emit(OpCodes.Ldc_I4, n);
+        LoadMode();
+        if (selfLocal != null) il.EmitLoc(OpCodes.Ldloc, selfLocal);
+        else if (_tailSelf == null) il.Emit(OpCodes.Ldnull);
+        else il.Emit(OpCodes.Ldstr, Track(_tailSelf));
+        for (int k = 0; k < 8; k++)
+        {
+            if (k < n) il.EmitLoc(OpCodes.Ldloc, _tailArgs[k]!);
+            else il.Emit(OpCodes.Ldnull);
+        }
+        il.Emit(OpCodes.Call, s_abiTailPrep);
+        var direct = il.DefineLabel();
+        var closure = il.DefineLabel();
+        il.Emit(OpCodes.Ldc_I4_1);
+        il.Emit(OpCodes.Sub);
+        il.Emit(OpCodes.Switch, n <= 6 ? new[] { direct, closure } : new[] { direct });
+
+        il.EmitLoc(OpCodes.Ldloc, _tailFn);
+        LoadArgs();
+        if (mode) il.EmitLoc(OpCodes.Ldloc, _tailMode!);
+        il.Emit(OpCodes.Tailcall);
+        il.Emit(OpCodes.Callvirt, typeof(LispFunction).GetMethod("Invoke" + n + (mode ? "M" : ""))!);
+        il.Emit(OpCodes.Ret);
+
+        il.MarkLabel(direct);
+        TailDirect();
+
+        if (n > 6) return;
+        il.MarkLabel(closure);
+        var closureType = DirectClosureDelegateType(n);
+        il.EmitLoc(OpCodes.Ldloc, _tailFn);
+        il.Emit(OpCodes.Ldc_I4, n);
+        il.Emit(OpCodes.Call, s_abiTailClosure.MakeGenericMethod(closureType));
+        il.EmitLoc(OpCodes.Ldloc, _tailFn);
+        il.Emit(OpCodes.Call, s_abiEnvironment);
+        LoadArgs();
+        il.Emit(OpCodes.Tailcall);
+        il.Emit(OpCodes.Callvirt, closureType.GetMethod("Invoke")!);
+        il.Emit(OpCodes.Ret);
+    }
+#endif
 
     private string? _typedTailSelf;
 

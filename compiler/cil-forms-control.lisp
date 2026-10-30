@@ -58,9 +58,11 @@
           ;; stacked dispatches (see compile-catch).
           (:begin-filter-block)
           ,@(%filter-exception-to-local)
+          (:call "ControlFlowFilters.Transfer")
           (:ldloc ,tag-key)
           (:call "ControlFlowFilters.BlockTagMatches")
           (:begin-filter-handler)
+          (:call "ControlFlowFilters.TakeTransfer")
           (:castclass "BlockReturnException")
           (:declare-local ,ex-key "BlockReturnException")
           (:stloc ,ex-key)
@@ -146,11 +148,11 @@
   (let ((last (car (last instrs))))
     (and (consp last) (eq (car last) :callvirt)
          (cdr (assoc (second last)
-                     '(("LispFunction.Invoke0" . "ThrowReturn.Call0")
-                       ("LispFunction.Invoke1" . "ThrowReturn.Call1")
-                       ("LispFunction.Invoke2" . "ThrowReturn.Call2")
-                       ("LispFunction.Invoke3" . "ThrowReturn.Call3")
-                       ("LispFunction.Invoke4" . "ThrowReturn.Call4"))
+                     '(("LispFunction.Invoke0" . "ThrowReturn.Call0S")
+                       ("LispFunction.Invoke1" . "ThrowReturn.Call1S")
+                       ("LispFunction.Invoke2" . "ThrowReturn.Call2S")
+                       ("LispFunction.Invoke3" . "ThrowReturn.Call3S")
+                       ("LispFunction.Invoke4" . "ThrowReturn.Call4S"))
                      :test #'equal)))))
 
 (defun compile-catch (tag-expr body)
@@ -176,30 +178,30 @@
                             (*throw-return-forward* nil))
                         (compile-progn body)))
          (call (%throw-return-call body-instrs))
-         (idx-key (and call (gen-local "CIDX"))))
+         (state-key (gen-local "CST")))
     `((:declare-local ,tag-key "LispObject")
       ,@(compile-expr tag-expr)
       (:stloc ,tag-key)
       ;; Register tag so (throw ...) inside (eval ...) can propagate to this catch
       (:ldloc ,tag-key)
-      ,@(if call
-            `((:declare-local ,idx-key "Int32")
-              (:call "CatchTagStack.PushIndex")
-              (:stloc ,idx-key))
-            '((:call "CatchTagStack.Push")))
+      (:declare-local ,state-key "Object")
+      (:call "CatchTagStack.Enter")
+      (:stloc ,state-key)
       (:declare-local ,result-key "LispObject")
       (:begin-exception-block)
       ,@(if call
-            `(,@(butlast body-instrs) (:ldloc ,idx-key) (:call ,call))
+            `(,@(butlast body-instrs) (:ldloc ,state-key) (:call ,call))
             body-instrs)
       (:stloc ,result-key)
       (:leave ,end-label)
       ;; Filter: exception on the stack, answer 1 (mine) / 0 (keep unwinding).
       (:begin-filter-block)
       ,@(%filter-exception-to-local)
+      (:call "ControlFlowFilters.Transfer")
       (:ldloc ,tag-key)
       (:call "ControlFlowFilters.CatchTagMatches")
       (:begin-filter-handler)
+      (:call "ControlFlowFilters.TakeTransfer")
       (:castclass "CatchThrowException")
       (:declare-local ,ex-key "CatchThrowException")
       (:stloc ,ex-key)
@@ -207,7 +209,8 @@
       (:stloc ,result-key)
       (:leave ,end-label)
       (:begin-finally-block)
-      (:call "CatchTagStack.Pop")
+      (:ldloc ,state-key)
+      (:call "CatchTagStack.Leave")
       (:end-exception-block)
       (:label ,end-label)
       (:ldloc ,result-key))))
@@ -237,11 +240,11 @@
       (:stloc ,res-key)
       ,@(let ((tr (and (not *in-finally-block*) (cstate-throw-return))))
           (when tr
-            (destructuring-bind (claim-key exit-label value-key used) tr
+            (destructuring-bind (claim-key exit-label value-key used state-key) tr
               (setf (car used) t)
               (let ((throw-label (gen-label "TTHROW")))
-                `((:ldloc ,tag-key) (:ldloc ,claim-key)
-                  (:call "ThrowReturn.CanReturn")
+                `((:ldloc ,tag-key) (:ldloc ,claim-key) (:ldloc ,state-key)
+                  (:call "ThrowReturn.CanReturnS")
                   (:brfalse ,throw-label)
                   (:ldloc ,res-key) (:stloc ,value-key)
                   (:leave ,exit-label)
@@ -613,9 +616,11 @@ leave a protected region, and balance means the GO is not inside one."
       ;; 50000 killed the process (see compile-catch).
       (:begin-filter-block)
       ,@(%filter-exception-to-local)
+      (:call "ControlFlowFilters.Transfer")
       (:ldloc ,tb-id-key)
       (:call "ControlFlowFilters.GoTagbodyMatches")
       (:begin-filter-handler)
+      (:call "ControlFlowFilters.TakeTransfer")
       (:castclass "GoException")
       (:declare-local ,ex-key "GoException")
       (:stloc ,ex-key)
@@ -856,6 +861,7 @@ leave a protected region, and balance means the GO is not inside one."
       ;; uncatchable .NET StackOverflowException.
       (:begin-filter-block)
       (:stloc ,exobj-key) (:ldloc ,exobj-key)
+      (:call "ControlFlowFilters.Transfer")
       (:ldloc ,specs-key)
       (:call "ControlFlowFilters.HandlerCaseClauseCluster")
       (:stloc ,ci-key)
@@ -864,6 +870,7 @@ leave a protected region, and balance means the GO is not inside one."
       (:pop)
       ;; The clause variable binds the condition the filter matched on.
       (:ldloc ,exobj-key)
+      (:call "ControlFlowFilters.TakeTransfer")
       (:call "ControlFlowFilters.HandlerCaseCondition")
       (:stloc ,cond-key)
       ,@(loop for label in clause-labels
@@ -932,6 +939,7 @@ leave a protected region, and balance means the GO is not inside one."
                                   ;; Set *in-try-block* before compiling body so TCO hooks
                                   ;; emit `leave` instead of `br` (mirrors compile-let).
                                   (let ((tmp-key (gen-local "HCTMP")))
+                                    (xref-record-use :binds var)
                                     `((:declare-local ,tmp-key "LispObject")
                                       (:ldloc ,cond-key) (:stloc ,tmp-key)
                                       ,@(compile-let-with-specials
@@ -957,17 +965,54 @@ leave a protected region, and balance means the GO is not inside one."
 ;;; restart-case
 ;;; ============================================================
 
-(defun %cstate-unbox-names (names)
-  "*CSTATE* with NAMES dropped from the boxed variables: a new plain binding of
-   a name shadows an enclosing boxed variable of that name, and a reference
-   must not read it as a box."
-  (if (some #'boxed-var-p names)
-      (cstate-with *cstate* +cs-boxed-vars+
-                   (remove-if (lambda (x)
-                                (member (if (symbolp x) (var-name x) x)
-                                        names :key #'var-name :test #'string=))
-                              (cstate-boxed-vars)))
-      *cstate*))
+(defun %compile-restart-clause (name params handler-body args-key)
+  "Bind the clause's ordinary lambda list to ARGS-KEY and compile its body."
+  (multiple-value-bind (required optional key rest-param aux allow-other-keys-p has-key-p)
+      (parse-lambda-list params)
+    ;; Declarations are handled by the surrounding compiler state, as before.
+    (let ((effective-body handler-body))
+      (loop while (and effective-body
+                       (consp (car effective-body))
+                       (eq (caar effective-body) 'declare))
+            do (pop effective-body))
+      (let* ((all-params (append required
+                                 (mapcar #'car optional)
+                                 (remove nil (mapcar #'third optional))
+                                 (mapcar #'second key)
+                                 (remove nil (mapcar #'fourth key))
+                                 (when rest-param (list rest-param))))
+             (param-names (mapcar #'var-name all-params))
+             (local-keys (gen-param-local-keys all-params))
+             (needs-boxing (params-needs-boxing effective-body all-params))
+             (*cstate* (cstate-with *cstate*
+                         +cs-locals+ (append local-keys (cstate-locals))
+                         +cs-boxed-vars+
+                         (append (params-boxed-vars all-params needs-boxing)
+                                 (remove-if (lambda (v)
+                                              (member (var-name v) param-names
+                                                      :test #'string=))
+                                            (cstate-boxed-vars)))))
+             (*symbol-macros* (%symbol-macros-without all-params))
+             (n-required (length required))
+             (key-start (+ n-required (length optional)))
+             (args-array `((:ldloc ,args-key)))
+             (param-instrs
+               (compile-args-param-instrs
+                required optional key rest-param local-keys n-required key-start
+                (lambda (i) `((:ldloc ,args-key) (:ldc-i4 ,i) (:ldelem-ref)))
+                args-array
+                (lambda (masked)
+                  (remove-if (lambda (entry)
+                               (member (var-name (car entry)) masked :test #'string=))
+                             (cstate-locals)))))
+             (arity-instrs
+               (compile-args-arity-instrs name optional key rest-param has-key-p
+                                          n-required args-array))
+             (key-check-instrs
+               (compile-args-key-check-instrs name key has-key-p allow-other-keys-p
+                                              key-start args-array)))
+        `(,@arity-instrs ,@key-check-instrs ,@param-instrs
+          ,@(compile-progn (wrap-aux-body aux effective-body)))))))
 
 (defun compile-restart-case (body-form clauses)
   "Compile (restart-case body (name (params...) body...) ...).
@@ -1120,6 +1165,7 @@ leave a protected region, and balance means the GO is not inside one."
       ;; recursion descends ten times over.
       (:begin-filter-block)
       (:stloc ,exobj-key) (:ldloc ,exobj-key)
+      (:call "ControlFlowFilters.Transfer")
       (:ldloc ,tags-key)
       (:call "ControlFlowFilters.RestartCaseTag")
       (:stloc ,ri-key)
@@ -1128,6 +1174,7 @@ leave a protected region, and balance means the GO is not inside one."
       (:pop)
       ;; Save arguments array
       (:ldloc ,exobj-key)
+      (:call "ControlFlowFilters.TakeTransfer")
       (:castclass "RestartInvocationException")
       (:callvirt "RestartInvocationException.get_Arguments")
       (:stloc ,args-key)
@@ -1156,125 +1203,12 @@ leave a protected region, and balance means the GO is not inside one."
       ;; Clause bodies (AFTER try-catch, with PopCluster before handler body)
       ,@(loop for (name params handler-body report interactive name-sym test-fn) in parsed
               for label in clause-labels
-              append (if (and params (car params))
-                         ;; Has parameters: bind args via Runtime.RestartArg
-                         (let ((*cstate* (%cstate-unbox-names
-                                          (loop for p in params
-                                                unless (member p lambda-list-keywords)
-                                                  collect (if (consp p) (car p) p))))
-                               ;; Each parameter shadows a symbol macro of the
-                               ;; same name from its binding on (CLHS 3.4.2):
-                               ;; removed below as the parameters are bound.
-                               (*symbol-macros* *symbol-macros*)
-                               (param-bindings nil))
-                           ;; Process declare forms at start of handler-body
-                           (let ((effective-body handler-body))
-                             (loop while (and effective-body
-                                             (consp (car effective-body))
-                                             (eq (caar effective-body) 'declare))
-                                   do (pop effective-body))
-                             ;; Parse lambda list: split into positional, optional, rest, key, aux
-                             (let ((positional nil)
-                                   (optional nil)
-                                   (rest-var nil)
-                                   (key-params nil)
-                                   (aux-params nil)
-                                   (mode :positional))
-                               (dolist (p params)
-                                 (cond ((eq p '&rest)  (setq mode :rest))
-                                       ((eq p '&optional) (setq mode :optional))
-                                       ((eq p '&key) (setq mode :key))
-                                       ((eq p '&aux) (setq mode :aux))
-                                       ((eq p '&allow-other-keys) nil)
-                                       ((eq mode :positional) (push p positional))
-                                       ((eq mode :optional) (push p optional))
-                                       ((eq mode :rest) (setq rest-var p))
-                                       ((eq mode :key) (push p key-params))
-                                       ((eq mode :aux) (push p aux-params))))
-                               (setq positional (nreverse positional))
-                               (setq optional (nreverse optional))
-                               (setq key-params (nreverse key-params))
-                               (setq aux-params (nreverse aux-params))
-                               ;; Bind positional params
-                               (let ((idx 0))
-                                 (dolist (var positional)
-                                   (let ((var-key (gen-local "RCV")))
-                                     (setf *cstate* (cstate-with *cstate* +cs-locals+
-                                                                 (acons var var-key (cstate-locals))))
-                                     (setf *symbol-macros* (%symbol-macros-without (list var)))
-                                     (push `((:declare-local ,var-key "LispObject")
-                                             (:ldloc ,args-key)
-                                             (:ldc-i4 ,idx)
-                                             (:call "Runtime.RestartArg")
-                                             (:stloc ,var-key))
-                                           param-bindings))
-                                   (incf idx))
-                                 ;; Bind optional params (RestartArg returns NIL for out-of-bounds)
-                                 (dolist (var optional)
-                                   (let* ((var-name (if (consp var) (car var) var))
-                                          (var-key (gen-local "RCV")))
-                                     (setf *cstate* (cstate-with *cstate* +cs-locals+
-                                                                 (acons var-name var-key (cstate-locals))))
-                                     (setf *symbol-macros* (%symbol-macros-without (list var-name)))
-                                     (push `((:declare-local ,var-key "LispObject")
-                                             (:ldloc ,args-key)
-                                             (:ldc-i4 ,idx)
-                                             (:call "Runtime.RestartArg")
-                                             (:stloc ,var-key))
-                                           param-bindings))
-                                   (incf idx))
-                                 ;; Bind &rest param
-                                 (when rest-var
-                                   (let ((var-key (gen-local "RCV")))
-                                     (setf *cstate* (cstate-with *cstate* +cs-locals+
-                                                                 (acons rest-var var-key (cstate-locals))))
-                                     (setf *symbol-macros* (%symbol-macros-without (list rest-var)))
-                                     (push `((:declare-local ,var-key "LispObject")
-                                             (:ldloc ,args-key)
-                                             (:ldc-i4 ,idx)
-                                             (:call "Runtime.RestartArgsAsList")
-                                             (:stloc ,var-key))
-                                           param-bindings)))
-                                 ;; Bind &key params via Runtime.RestartKeyArg
-                                 (dolist (kp key-params)
-                                   (let* ((var-name (if (consp kp) (car kp) kp))
-                                          (keyword-name (intern (symbol-name var-name) "KEYWORD"))
-                                          (var-key (gen-local "RCV")))
-                                     (setf *cstate* (cstate-with *cstate* +cs-locals+
-                                                                 (acons var-name var-key (cstate-locals))))
-                                     (setf *symbol-macros* (%symbol-macros-without (list var-name)))
-                                     (push `((:declare-local ,var-key "LispObject")
-                                             (:ldloc ,args-key)
-                                             ,@(compile-expr (list 'quote keyword-name))
-                                             (:ldc-i4 ,idx)
-                                             (:call "Runtime.RestartKeyArg")
-                                             (:stloc ,var-key))
-                                           param-bindings)))
-                                 ;; Bind &aux params via compile-expr of init form
-                                 (dolist (ap aux-params)
-                                   (let* ((var-name (if (consp ap) (car ap) ap))
-                                          (init-form (if (consp ap) (cadr ap) nil))
-                                          (var-key (gen-local "RCV")))
-                                     (setf *cstate* (cstate-with *cstate* +cs-locals+
-                                                                 (acons var-name var-key (cstate-locals))))
-                                     (setf *symbol-macros* (%symbol-macros-without (list var-name)))
-                                     (push `((:declare-local ,var-key "LispObject")
-                                             ,@(compile-expr init-form)
-                                             (:stloc ,var-key))
-                                           param-bindings)))))
-                             `((:label ,label)
-                               ;; cluster already popped by the finally on the
-                               ;; catch's :leave to this clause label
-                               ,@(apply #'append (nreverse param-bindings))
-                               ,@(compile-progn effective-body)
-                               (:stloc ,result-key)
-                               (:br ,done-label))))
-                         ;; No parameter
-                         `((:label ,label)
-                           ;; cluster already popped by the finally (see above)
-                           ,@(compile-progn handler-body)
-                           (:stloc ,result-key)
-                           (:br ,done-label))))
+              append `((:label ,label)
+                       ;; cluster already popped by the finally on the
+                       ;; catch's :leave to this clause label
+                       ,@(%compile-restart-clause name params handler-body args-key)
+                       (:stloc ,result-key)
+                       (:br ,done-label)))
       (:label ,done-label)
       (:ldloc ,result-key))))
 
@@ -1423,6 +1357,13 @@ leave a protected region, and balance means the GO is not inside one."
   `(,@(unless (single-value-form-p form) '((:call "Runtime.UnwrapMv")))
     (:call "MultipleValues.Reset")))
 
+;; The truth test of FORM's value after %ONLY-PRIMARY-VALUE: a reference
+;; comparison when that went through UnwrapMv.
+(defun %primary-truth-test (form)
+  (if (single-value-form-p form)
+      '(:call "Runtime.IsTruthy")
+      '(:call "Runtime.IsNotNil")))
+
 ;; A test COMPILE-BOOLEAN-BRANCH lowers without building its value, and whose
 ;; value is T when true: a fused comparison or predicate, or NOT / NULL.
 (defun %t-or-nil-test-form-p (form)
@@ -1495,7 +1436,7 @@ leave a protected region, and balance means the GO is not inside one."
                               ,@(%only-primary-value arg)
                               (:stloc ,result-key)
                               (:ldloc ,result-key)
-                              (:call "Runtime.IsTruthy")
+                              ,(%primary-truth-test arg)
                               (:brtrue ,end-label))
                    else
                      ;; Last arg: pass through all values (tail position kept)
@@ -1538,7 +1479,7 @@ leave a protected region, and balance means the GO is not inside one."
                         ,@(%only-primary-value test)
                         (:stloc ,tmp)
                         (:ldloc ,tmp)
-                        (:call "Runtime.IsTruthy")
+                        ,(%primary-truth-test test)
                         (:brfalse ,else-label)
                         (:ldloc ,tmp)
                         (:br ,end-label)

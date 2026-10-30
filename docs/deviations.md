@@ -12,13 +12,14 @@ open and dotcl reads it differently.
 | Area | dotcl | CLHS / SBCL | Why | State |
 | --- | --- | --- | --- | --- |
 | `defgeneric` over a name that already has an ordinary function | Warns, removes the function definition, and defines the generic function | CLHS 7.6.1 says an error is signaled; SBCL warns | Widely used libraries (cl-ppcre among them) reach this case while loading, and erroring stops them dead | permanent |
-| Floating-point underflow | `exp` and `expt` flush to zero | CLHS 12.1.4.3 permits signaling `floating-point-underflow`; SBCL, CCL and ECL flush | The IEEE underflow trap is masked by default on every host dotcl runs on, and dotcl's own multiplication already flushed -- only `exp` and `expt` signalled, which is worse than either answer. Overflow still signals | permanent |
+| Floating-point exceptions | One rule. In code compiled at `(safety 3)`, a float operation whose operands are finite and not NaN signals when its value is not: `floating-point-overflow` for a result too large for its format, `division-by-zero` for a quotient by zero, `floating-point-invalid-operation` for a NaN (`(/ 0.0 0.0)`, `(- inf inf)`, `(sin inf)`), each with the operation and operands. This covers `+ - * /` declared or not, `coerce`, `float`, `scale-float`, `exp`, `expt`, `log` (of zero: `division-by-zero`), `sin`, `cos`, `tan`, `sinh` and `cosh`. At `(safety 0)` to `(safety 2)`, the default included, in the interpreter, and through `funcall` or `apply` of `#'+` and the like even from `(safety 3)` code, the value is the IEEE infinity or NaN. At every safety an infinite or NaN operand propagates, underflow flushes to zero, and the operations with no float value to return signal: rational division by zero, including `expt` of a rational zero to a negative rational power, and `floor` / `truncate` / `mod` / `rem` and their float variants by zero (`division-by-zero`) | CLHS 12.1.4.3 says overflow and division by zero should be signalled; by 1.4.2 that requires a signal only in safe code, compiled at the highest safety. It permits flushing underflow to zero. SBCL traps in hardware and signals at every safety, and flushes underflow | .NET has no floating-point trap, so a signal costs a test on every result: 5-120% on declared float loops at `(safety 1)` (Coalton compiles its standard library at `(safety 1)`). Safe code pays it; other code keeps the speed. Underflow is not signalled: the trap is masked by default on every host dotcl runs on, as it is in SBCL, CCL and ECL | permanent |
 | Arithmetic `loop` variable seen by `finally` | The value after the final step: `(loop for x from 1 to 5 do (progn) finally (return x))` is 6 | The conformance suite expects the last in-body value; CLHS 6.1.2.1.1 does not settle it, and the suite tags those tests as a spec problem itself. SBCL and ABCL return the stepped value | Libraries are written against what the implementations do -- babel's unibyte encoders read the stepped value | permanent |
 | Printing a circular list with `*print-circle*` nil | Stops and prints `...`. The cut is found inside the cycle rather than at its entry, so a few more elements are printed than a per-cons table would emit | The standard leaves printing circular structure without `*print-circle*` undefined | Terminating beats printing forever, and the two-pointer guard that finds the cycle costs no allocation, so ordinary list printing does not pay for it | permanent |
 | Printing infinities and NaN | `#.DOTCL:DOUBLE-FLOAT-POSITIVE-INFINITY` and friends, which read back; with `*read-eval*` nil, an unreadable `#<...>` form; with `*print-readably*` also true, `print-not-readable` | The standard gives these no external representation; SBCL prints a constant from its own package | The printed form has to read back whatever `*package*` is, and an unqualified name does not: dotcl's `CL-USER` does not use `DOTCL` | permanent |
 | `~E` with an explicit digit count | Rounds the exact binary value | SBCL rounds the shortest representation that reads back, then pads with zeros | The conformance suite checks `~E` output against the rational the float denotes, so the exact value is what passes there. `~F` follows SBCL, since nothing checks it against a rational | permanent |
 | `open :direction :output :if-exists :append`: moving the position | Every write goes to the end of the file as it is at that moment, so another appender's data is never overwritten. `file-position` reports that end; setting it to anything else returns `nil` | SBCL opens with `O_APPEND` too, but setting the position returns `t` and the next write still goes to the end | Answering `t` would promise a write position that the OS does not honour. The end-of-file guarantee comes from the OS: an append-only handle on Windows, `O_APPEND` on Linux and macOS. Elsewhere (other Unix systems, WebAssembly) the stream seeks to the end once, at open, which is right only while it is the sole writer. `:direction :io` with `:if-exists :append` also still seeks once | until a caller needs the other answer |
 | `~G`: how many digits a value with no short exact form gets, and which way an exact tie rounds | `(format nil "~g" 123456789.0)` gives `123456792.` (the exact single-float value); `(format nil "~,3g" 1234.5)` gives `1.234e+3` | SBCL gives `123456790.` (the shortest form that reads back) and `1.235e+3` | CLHS 22.3.3.3 decides neither, and dotcl's own format tests already record the direction of an exact tie as free. Every other `~G` form measured against SBCL agrees | until a caller needs one |
+| A call, in a file compiled with `compile-file`, to a small function defined earlier in the same file | The function's body is substituted at the call, without an `inline` declaration, behind a check that the name still holds that function; so a later redefinition, `trace` or `(setf fdefinition)` still takes effect. The substituted function has no frame of its own in a backtrace. `notinline`, or `(debug 3)` at the definition or the call, keeps the call | CLHS 3.2.2.3 permits it; SBCL substitutes only functions declared `inline` | The call costs more than a small body on .NET | permanent |
 | `subtypep` with `real` against `(or rational float)` | `(subtypep 'real '(or rational float))` is `nil t`: `dotcl:decimal` is a third kind of real, neither rational nor float (see numbers.md) | SBCL answers `t t` | The answer has to agree with `typep`: `#m0.5` is a real in no member of the union, and a `t t` would let the compiler drop a case it can reach | permanent |
 
 ## Library backends
@@ -47,7 +48,7 @@ its own table in [DESIGN.md](../DESIGN.md), section 3.11.
 
 ## Where the conformance suite is adjusted
 
-dotcl runs the ansi-test suite unmodified, from a fresh clone. Four
+dotcl runs the ansi-test suite unmodified, from a fresh clone. Five
 adjustments are made in the harness instead, and they follow from the table
 above:
 
@@ -66,6 +67,14 @@ above:
   exponential notation. The remaining draws still run, and the override
   checks that the upstream test still carries the draw it was written with,
   so a change upstream is reported rather than silently shadowed.
+- **Two `ENCODE-UNIVERSAL-TIME` tests get their 1900 guard corrected.**
+  `ENCODE-UNIVERSAL-TIME.{1,3}` draw dates from 1900 on with zones from -24
+  to 24 hours, and keep the zone non-negative on 1900-01-01 so the result
+  stays a universal time, but the guard tests for date 0 of month 0, which
+  never occurs. An early hour of 1900-01-01 with an eastern zone then asks
+  for a negative universal time, which dotcl and SBCL both reject with a
+  `type-error`; the harness tests for January 1 instead. The override checks
+  the upstream guard the same way as the printer tests.
 - **One `COMPILE-FILE` test is run without the harness muffling its
   style-warnings.** It checks that a style-warning makes `COMPILE-FILE` return
   a true warnings-p, while the harness muffles every style-warning around a

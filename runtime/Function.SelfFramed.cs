@@ -16,8 +16,13 @@ public partial class LispFunction
     internal nint _entry;
     internal int _entryKey;   // arity + 1 while _entry is set
     internal bool _selfFramed;   // the array entry too
-    internal int _sfMask;        // bit N: _funcN links its own frame
+    internal int _sfMask;        // bit N: _funcN links its own frame; bit LeafShift + N: only where it signals
+    internal const int LeafShift = 16;
     internal bool _closureEntry; // _entry is a closure body's: no frame, no _funcN
+
+    /// <summary>The arity-ARITY entry of this self-framed function links its frame
+    /// only on the path that signals, so it is never handed a borrowed frame.</summary>
+    public void MarkLeafEntry(int arity) => _sfMask |= 1 << (arity + LeafShift);
 
     public void SetSelfFramedEntry(System.IntPtr entry, int arity)
     {
@@ -78,6 +83,44 @@ public partial class LispFunction
         }
         finally { if (mode != 0) MultipleValues.SetMode(mode); }
     }
+
+    /// <summary>What a typed body passes to a nested self-call: the self-calls
+    /// left before the next stack check, counted down from TypedSelfInterval.
+    /// Those calls link no frame, so no other check sees the depth.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int TypedSelfDepth(int left, string name)
+    {
+        if (left == 0) left = TypedSelfDepthCheck(name);
+        return left;
+    }
+
+    public const int TypedSelfInterval = 256;
+
+    /// <summary>The same check for a typed body that does not take its depth.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void TypedSelfCount(string name)
+    {
+        if (++CallTls.StackCheck % 256 == 0) TypedSelfDepthCheck(name);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    public static int TypedSelfDepthCheck(string name)
+    {
+        int mode = MultipleValues.TakeMode();
+        try
+        {
+            if (!Compat.TryEnsureSufficientExecutionStackWithMargin())
+                throw new LispErrorException(new LispStorageCondition(
+                    $"Stack overflow in function {name}"));
+            ConditionSystem.CheckInterrupt();
+        }
+        finally { if (mode != 0) MultipleValues.SetMode(mode); }
+        return TypedSelfInterval;
+    }
+
+    /// <summary>For tests: whether the entry of ARITY links its frame only where it signals.</summary>
+    public static bool LeafEntryP(LispObject fn, int arity) =>
+        fn is LispFunction f && (f._sfMask & (1 << (arity + LeafShift))) != 0;
 
     /// <summary>For tests: "entry", "closure-entry", "self-framed" (no entry) or "none".</summary>
     public static string EntryState(LispObject fn) =>
@@ -141,7 +184,8 @@ public partial class LispFunction
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe bool SelfTailEntry(ref Frame fr, LispFunction callee, int arity, int mode)
     {
-        if (callee._entryKey != arity + 1 || callee._closureEntry) return false;
+        if (callee._entryKey != arity + 1 || callee._closureEntry
+            || (fr.Depth == 0 && (callee._sfMask & (1 << (arity + LeafShift))) != 0)) return false;
         ConditionSystem.PollInterrupt();
         if (mode >= 0 && (callee._mvModeMask & (1 << arity)) != 0) MultipleValues.SetMode(mode);
         if (fr.Depth == 0) CallTls.Borrow = 1;
@@ -247,7 +291,7 @@ public partial class LispFunction
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe void LinkTop(ref Frame fr)
     {
-        var slot = (Frame**)Unsafe.AsPointer(ref CallTls.TopWord);
+        var slot = CallTls.TopSlot;
         fr._slot = slot;
         var p = *slot;
         fr.Prev = p;
@@ -323,7 +367,7 @@ public partial class LispFunction
     {
         var how = CallTls.Borrow;
         CallTls.Borrow = 0;
-        fixed (Frame** pt = &CallTls.Top) fr._slot = pt;
+        fr._slot = CallTls.TopSlot;
         var top = CallTls.Top;
         fr.Prev = top;
         if (how == 1 && top != null)

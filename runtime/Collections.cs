@@ -4,7 +4,7 @@ using static DotCL.NumStorage;
 
 namespace DotCL;
 
-public sealed class LispStruct : LispObject
+public class LispStruct : LispObject
 {
     public Symbol TypeName { get; }
 
@@ -98,6 +98,338 @@ public sealed class LispStruct : LispObject
 
     public int SlotCount => _slots.Length;
 
+    /// <summary>The most slots an instance keeps in its own fields (LispStruct1..4)
+    /// instead of an array. Only a structure with no layout entry (no raw slot,
+    /// never redefined) is built that way; _slots is then a shared array that
+    /// only carries the count.</summary>
+    internal const int MaxInlineSlots = 4;
+
+    private static readonly LispObject[][] s_inlineCounts =
+        { new LispObject[0], new LispObject[1], new LispObject[2], new LispObject[3], new LispObject[4] };
+
+    private protected LispStruct(Symbol typeName, int inlineCount)
+    {
+        TypeName = typeName;
+        _slots = s_inlineCounts[inlineCount];
+        DotCL.Diagnostics.AllocCounter.Inc("LispStruct");
+    }
+
+    /// <summary>Whether this is a LispStruct1..4 (boxed slots in fields).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool IsInline() => GetType() != typeof(LispStruct) && GetType() != typeof(LispStructR);
+
+    /// <summary>Whether this is a LispStructR (raw slots in fields).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal bool IsRawInline() => GetType() == typeof(LispStructR);
+
+    /// <summary>The most raw slots an instance keeps in its own fields
+    /// (LispStructR) instead of a long[].</summary>
+    internal const int MaxInlineRawSlots = 4;
+
+    /// <summary>The representation bit of LispStructR in a mask (IsKnown).</summary>
+    internal const int RawInlineMask = 32;
+
+    /// <summary>False if the runtime does not lay out _r0.._r3 contiguously, in
+    /// which case no LispStructR instance is ever built.</summary>
+    private static readonly bool s_rawInlineOk = CheckRawInlineLayout();
+
+    private static bool CheckRawInlineLayout()
+    {
+        var r = new LispStructR(null!, s_inlineCounts[0], Array.Empty<int>());
+        return Unsafe.ByteOffset(ref r._r0, ref r._r1) == (IntPtr)8
+               && Unsafe.ByteOffset(ref r._r0, ref r._r2) == (IntPtr)16
+               && Unsafe.ByteOffset(ref r._r0, ref r._r3) == (IntPtr)24;
+    }
+
+    /// <summary>Whether OBJ is a LispStructR and MASK allows one.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool IsRawInline(LispObject? obj, int mask)
+        => (mask & RawInlineMask) != 0 && obj is not null && obj.GetType() == typeof(LispStructR);
+
+    /// <summary>The raw cell at POS (below MaxInlineRawSlots) of a LispStructR.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static ref long RawInlineCell(LispObject s, int pos)
+        => ref Unsafe.Add(ref Unsafe.As<LispStructR>(s)._r0, pos);
+
+    /// <summary>OBJ as a LispStructR, when MASK allows one, whose slot PACKED is
+    /// raw of KIND at the version PACKED carries; the position of its cell in POS.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool TryRawInline(LispObject? obj, int mask, int packed, int kind, out int pos)
+    {
+        if (IsRawInline(obj, mask))
+        {
+            var layout = Unsafe.As<LispStruct>(obj)!._layout!;
+            int idx = packed & SlotPosMaskIndex;
+            if ((uint)idx < (uint)layout.Length)
+            {
+                pos = layout[idx] ^ (packed & LayoutVersionMask) ^ kind;
+                if ((uint)pos < (uint)MaxInlineRawSlots) return true;
+            }
+        }
+        pos = 0;
+        return false;
+    }
+
+    private const int SlotPosMaskIndex = 0xFFFF;
+
+    /// <summary>The storage of raw slot POS, wherever this instance keeps it.</summary>
+    private ref long RawCell(int pos)
+    {
+        var longs = _longs;
+        if (longs != null) return ref longs[pos];
+        if (!IsRawInline() || (uint)pos >= (uint)MaxInlineRawSlots)
+            throw new InvalidOperationException("structure has no raw storage at " + pos);
+        return ref RawInlineCell(this, pos);
+    }
+
+    /// <summary>The number of raw slots in a layout, when an instance of it is
+    /// built as a LispStructR; else 0.</summary>
+    internal static int RawInlineCountOf(int[] map)
+    {
+        if (!s_rawInlineOk) return 0;
+        int k = 0;
+        foreach (var e in map) if ((e & SlotPosMask) != SlotBoxed) k++;
+        return k <= MaxInlineRawSlots ? k : 0;
+    }
+
+    private static bool RawFits(int entry, LispObject v)
+        => (entry & SlotKindU64) == SlotKindU64 ? Runtime.IsU64(v)
+            : (entry & SlotKindDouble) != 0 ? v is DoubleFloat
+            : entry < 0 ? v is SingleFloat
+            : v is Fixnum;
+
+    private static long RawBitsOf(int entry, LispObject v)
+        => (entry & SlotKindU64) == SlotKindU64 ? Runtime.Low64(v)
+            : (entry & SlotKindDouble) != 0 ? BitConverter.DoubleToInt64Bits(((DoubleFloat)v).Value)
+            : entry < 0 ? Compat.SingleToInt32Bits(((SingleFloat)v).Value)
+            : ((Fixnum)v).Value;
+
+    /// <summary>A LispStructR of TYPENAME from the first N of A..D, when every
+    /// slot of its layout is raw and every value fits; else null.</summary>
+    internal static LispStruct? TryCreateAllRaw(Symbol typeName, int n, LispObject a, LispObject b,
+                                                LispObject c, LispObject d)
+    {
+        if (typeName.StructLayout is not { } map || map.Length != n || RawInlineCountOf(map) != n)
+            return null;
+        if (!RawFits(map[0], a) || (n > 1 && !RawFits(map[1], b))
+            || (n > 2 && !RawFits(map[2], c)) || (n > 3 && !RawFits(map[3], d)))
+            return null;
+        var s = new LispStructR(typeName, NoBoxedSlots(n), map);
+        RawInlineCell(s, map[0] & SlotPosMask) = RawBitsOf(map[0], a);
+        if (n > 1) RawInlineCell(s, map[1] & SlotPosMask) = RawBitsOf(map[1], b);
+        if (n > 2) RawInlineCell(s, map[2] & SlotPosMask) = RawBitsOf(map[2], c);
+        if (n > 3) RawInlineCell(s, map[3] & SlotPosMask) = RawBitsOf(map[3], d);
+        return s;
+    }
+
+    /// <summary>A LispStructR of TYPENAME holding SLOTS under MAP, or null when
+    /// a value does not fit its raw slot (the array form keeps it boxed).</summary>
+    private static LispStruct? TryCreateRawInline(Symbol typeName, LispObject[] slots, int[] map)
+    {
+        int k = RawInlineCountOf(map);
+        if (k == 0) return null;
+        for (int i = 0; i < slots.Length; i++)
+        {
+            int entry = map[i];
+            if ((entry & SlotPosMask) == SlotBoxed) continue;
+            if (!RawFits(entry, slots[i])) return null;
+        }
+        var s = new LispStructR(typeName, k == slots.Length ? NoBoxedSlots(slots.Length) : slots, map);
+        for (int i = 0; i < slots.Length; i++)
+        {
+            int entry = map[i];
+            int pos = entry & SlotPosMask;
+            if (pos == SlotBoxed) continue;
+            RawInlineCell(s, pos) = RawBitsOf(entry, slots[i]);
+        }
+        return s;
+    }
+
+    /// <summary>A LispStructR built by compiled code from raw values R0..R3 (by raw
+    /// position), or null when TYPENAME's registered layout is not version VERSION.</summary>
+    internal static LispStruct? TryMakeRawInline(Symbol typeName, LispObject[]? slots, long r0, long r1,
+                                                  long r2, long r3, int version, int n, int nraw)
+    {
+        if (!s_rawInlineOk || nraw < 1 || nraw > MaxInlineRawSlots
+            || typeName.StructLayout is not { } map || map.Length != n || n == 0
+            || ((map[0] >> LayoutVersionShift) & SlotPosMask) != (version & SlotPosMask))
+            return null;
+        return new LispStructR(typeName, slots ?? NoBoxedSlots(n), map)
+            { _r0 = r0, _r1 = r1, _r2 = r2, _r3 = r3 };
+    }
+
+    /// <summary>Whether OBJ is a structure, and OBJ as one. Use this rather than
+    /// `is LispStruct`: on a class that has subclasses that is a runtime call
+    /// whenever the object is not exactly a LispStruct, which on the hot paths is
+    /// every inline instance and every non-structure.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static bool TryAs(LispObject? obj, out LispStruct s)
+    {
+        // Each test spelled as obj.GetType() == typeof(...): that is the shape the
+        // JIT folds to a compare of the method table.
+        if (obj is not null
+            && (obj.GetType() == typeof(LispStruct) || obj.GetType() == typeof(LispStruct1)
+                || obj.GetType() == typeof(LispStruct2) || obj.GetType() == typeof(LispStruct3)
+                || obj.GetType() == typeof(LispStruct4) || obj.GetType() == typeof(LispStructR)))
+        {
+            s = Unsafe.As<LispStruct>(obj);
+            return true;
+        }
+        s = null!;
+        return false;
+    }
+
+    /// <summary>TryAs for an array-backed instance only (the only kind with raw
+    /// slots): one compare, and small enough to stay inlined in large callers.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool TryAsArrayBacked(LispObject? obj, out LispStruct s)
+    {
+        if (obj is not null && obj.GetType() == typeof(LispStruct))
+        {
+            s = Unsafe.As<LispStruct>(obj);
+            return true;
+        }
+        s = null!;
+        return false;
+    }
+
+    /// <summary>The type name of OBJ when it is a structure, else null: the
+    /// compiled inline TYPEP.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Symbol? TypeNameOf(LispObject? obj) => TryAs(obj, out var s) ? s.TypeName : null;
+
+    /// <summary>Type name of OBJ when exactly array-backed, else the general test.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Symbol? TypeNameOfStruct(LispObject? obj)
+        => obj is not null && obj.GetType() == typeof(LispStruct)
+            ? Unsafe.As<LispStruct>(obj).TypeName : TypeNameOf(obj);
+
+    /// <summary>Type name of OBJ when exactly a LispStructR, else the general test.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Symbol? TypeNameOfRawInline(LispObject? obj)
+        => obj is not null && obj.GetType() == typeof(LispStructR)
+            ? Unsafe.As<LispStruct>(obj).TypeName : TypeNameOf(obj);
+
+    /// <summary>Whether OBJ has one of the representations in MASK: bit 0 is
+    /// exact LispStruct, bit N is LispStructN, bit 5 is LispStructR.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool IsKnown(LispObject? obj, int mask, out LispStruct s)
+    {
+        if (obj is not null)
+        {
+            if ((mask & 2) != 0 && obj.GetType() == typeof(LispStruct1)) { s = Unsafe.As<LispStruct>(obj); return true; }
+            if ((mask & 4) != 0 && obj.GetType() == typeof(LispStruct2)) { s = Unsafe.As<LispStruct>(obj); return true; }
+            if ((mask & 8) != 0 && obj.GetType() == typeof(LispStruct3)) { s = Unsafe.As<LispStruct>(obj); return true; }
+            if ((mask & 16) != 0 && obj.GetType() == typeof(LispStruct4)) { s = Unsafe.As<LispStruct>(obj); return true; }
+            if ((mask & 1) != 0 && obj.GetType() == typeof(LispStruct)) { s = Unsafe.As<LispStruct>(obj); return true; }
+            if ((mask & RawInlineMask) != 0 && obj.GetType() == typeof(LispStructR)) { s = Unsafe.As<LispStruct>(obj); return true; }
+        }
+        s = null!;
+        return false;
+    }
+
+    /// <summary>The type name of OBJ when its representation is in MASK, else
+    /// the general test.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Symbol? TypeNameOfKnown(LispObject? obj, int mask)
+        => IsKnown(obj, mask, out var s) ? s.TypeName : TypeNameOf(obj);
+
+    /// <summary>Whether this inline instance has slot INDEX, from its type alone:
+    /// with INDEX a constant at the call site this is at most two compares of a
+    /// method table already loaded, and no load of the count.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool HasInlineSlot(int index) => index switch
+    {
+        0 => true,
+        1 => GetType() != typeof(LispStruct1),
+        2 => GetType() == typeof(LispStruct3) || GetType() == typeof(LispStruct4),
+        3 => GetType() == typeof(LispStruct4),
+        _ => false,
+    };
+
+    /// <summary>Slot INDEX of an inline instance; INDEX is below SlotCount.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private LispObject InlineGet(int index) => index switch
+    {
+        0 => Unsafe.As<LispStruct1>(this)._s0,
+        1 => Unsafe.As<LispStruct2>(this)._s1,
+        2 => Unsafe.As<LispStruct3>(this)._s2,
+        _ => Unsafe.As<LispStruct4>(this)._s3,
+    };
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void InlineSet(int index, LispObject value)
+    {
+        switch (index)
+        {
+            case 0: Unsafe.As<LispStruct1>(this)._s0 = value; break;
+            case 1: Unsafe.As<LispStruct2>(this)._s1 = value; break;
+            case 2: Unsafe.As<LispStruct3>(this)._s2 = value; break;
+            default: Unsafe.As<LispStruct4>(this)._s3 = value; break;
+        }
+    }
+
+    /// <summary>A new structure of TYPENAME holding SLOTS (handed over, as to the
+    /// public constructor): in its own fields when it is short and its type has
+    /// no layout entry, else exactly what the constructor builds.</summary>
+    internal static LispStruct Create(Symbol typeName, LispObject[] slots)
+    {
+        int n = slots.Length;
+        if (typeName.StructLayout is { } registered && registered.Length == n)
+            return TryCreateRawInline(typeName, slots, registered) ?? new LispStruct(typeName, slots);
+        if (n == 0 || n > MaxInlineSlots)
+            return new LispStruct(typeName, slots);
+        return NewInline(typeName, slots);
+    }
+
+    /// <summary>COPY-STRUCTURE: an instance of SOURCE's shape and layout.</summary>
+    internal static LispStruct Copy(LispStruct source)
+    {
+        if (source.IsInline())
+            return source._slots.Length switch
+            {
+                1 => new LispStruct1(source.TypeName, source.InlineGet(0)),
+                2 => new LispStruct2(source.TypeName, source.InlineGet(0), source.InlineGet(1)),
+                3 => new LispStruct3(source.TypeName, source.InlineGet(0), source.InlineGet(1),
+                                     source.InlineGet(2)),
+                _ => new LispStruct4(source.TypeName, source.InlineGet(0), source.InlineGet(1),
+                                     source.InlineGet(2), source.InlineGet(3)),
+            };
+        if (source.IsRawInline())
+        {
+            var map = source._layout!;
+            var boxed = source._slots;
+            if (RawInlineCountOf(map) != boxed.Length)
+            {
+                var b = new LispObject[boxed.Length];
+                Array.Copy(boxed, b, boxed.Length);
+                boxed = b;
+            }
+            var r = Unsafe.As<LispStructR>(source);
+            return new LispStructR(source.TypeName, boxed, map)
+                { _r0 = r._r0, _r1 = r._r1, _r2 = r._r2, _r3 = r._r3 };
+        }
+        // Array.Clone goes through MemberwiseClone, a runtime call that reads the
+        // array's type at run time; allocating and copying is the same work.
+        var src = source.SlotsSnapshot();
+        var dst = new LispObject[src.Length];
+        Array.Copy(src, dst, src.Length);
+        return new LispStruct(source, dst);
+    }
+
+    private static LispStruct NewInline(Symbol typeName, LispObject[] v) => v.Length switch
+    {
+        1 => new LispStruct1(typeName, v[0]),
+        2 => new LispStruct2(typeName, v[0], v[1]),
+        3 => new LispStruct3(typeName, v[0], v[1], v[2]),
+        _ => new LispStruct4(typeName, v[0], v[1], v[2], v[3]),
+    };
+
+    /// <summary>Whether a 1- to 4-slot structure of TYPENAME is built inline
+    /// (no layout entry), for the compiled constructors.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static bool BuildsInline(Symbol typeName) => typeName.StructLayout == null;
+
     public LispObject GetSlot(int index)
     {
         if (_layout != null)
@@ -105,15 +437,21 @@ public sealed class LispStruct : LispObject
             int entry = _layout[index];
             int pos = entry & SlotPosMask;
             if (pos != SlotBoxed)
+            {
+                long bits = RawCell(pos);
                 return (entry & SlotKindU64) == SlotKindU64
-                    ? Runtime.BoxU64(_longs![pos])
+                    ? Runtime.BoxU64(bits)
                     : (entry & SlotKindDouble) != 0
-                    ? new DoubleFloat(BitConverter.Int64BitsToDouble(_longs![pos]))
+                    ? new DoubleFloat(BitConverter.Int64BitsToDouble(bits))
                     : entry < 0
-                    ? new SingleFloat(Compat.Int32BitsToSingle((int)_longs![pos]))
-                    : Fixnum.Make(_longs![pos]);
+                    ? new SingleFloat(Compat.Int32BitsToSingle((int)bits))
+                    : Fixnum.Make(bits);
+            }
         }
-        return _slots[index];
+        // An inline instance's _slots holds only nulls, so the array read is its
+        // bounds check too, and a plain instance pays no type test.
+        var v = _slots[index];
+        return v is not null || !IsInline() ? v! : InlineGet(index);
     }
 
     public void SetSlot(int index, LispObject value)
@@ -135,7 +473,7 @@ public sealed class LispStruct : LispObject
                         throw new LispErrorException(new LispTypeError(
                             $"{TypeName}: slot {index} holds a raw (unsigned-byte 64), got {value}",
                             value, Runtime.SizedByte("UNSIGNED-BYTE", 64)));
-                    _longs![pos] = Runtime.Low64(value);
+                    RawCell(pos) = Runtime.Low64(value);
                     return;
                 }
                 if ((entry & SlotKindDouble) != 0)
@@ -144,7 +482,7 @@ public sealed class LispStruct : LispObject
                         throw new LispErrorException(new LispTypeError(
                             $"{TypeName}: slot {index} holds a raw double, got {value}",
                             value, Startup.Sym("DOUBLE-FLOAT")));
-                    _longs![pos] = BitConverter.DoubleToInt64Bits(d.Value);
+                    RawCell(pos) = BitConverter.DoubleToInt64Bits(d.Value);
                     return;
                 }
                 if (entry < 0)
@@ -153,18 +491,21 @@ public sealed class LispStruct : LispObject
                         throw new LispErrorException(new LispTypeError(
                             $"{TypeName}: slot {index} holds a raw single-float, got {value}",
                             value, Startup.Sym("SINGLE-FLOAT")));
-                    _longs![pos] = Compat.SingleToInt32Bits(sf.Value);
+                    RawCell(pos) = Compat.SingleToInt32Bits(sf.Value);
                     return;
                 }
                 if (value is not Fixnum f)
                     throw new LispErrorException(new LispTypeError(
                         $"{TypeName}: slot {index} holds a raw integer, got {value}",
                         value, Startup.Sym("FIXNUM")));
-                _longs![pos] = f.Value;
+                RawCell(pos) = f.Value;
                 return;
             }
         }
-        _slots[index] = value;
+        var slots = _slots;
+        if (!IsInline()) slots[index] = value;
+        else if ((uint)index >= (uint)slots.Length) throw new IndexOutOfRangeException();
+        else InlineSet(index, value);
     }
 
     /// <summary>The layout entry for slot INDEX: version and position in one
@@ -184,6 +525,8 @@ public sealed class LispStruct : LispObject
     internal LispObject? BoxedSlotOrNull(int packed)
     {
         int idx = packed & 0xFFFF;
+        if (IsInline())
+            return (packed & 0x7FFF0000) == 0 && HasInlineSlot(idx) ? InlineGet(idx) : null;
         var layout = _layout;
         if (layout != null)
         {
@@ -202,6 +545,12 @@ public sealed class LispStruct : LispObject
     internal bool TrySetBoxedSlot(int packed, LispObject value)
     {
         int idx = packed & 0xFFFF;
+        if (IsInline())
+        {
+            if ((packed & 0x7FFF0000) != 0 || !HasInlineSlot(idx)) return false;
+            InlineSet(idx, value);
+            return true;
+        }
         var layout = _layout;
         if (layout != null)
         {
@@ -271,8 +620,8 @@ public sealed class LispStruct : LispObject
     /// intercept.</summary>
     public LispObject[] SlotsSnapshot()
     {
-        if (_layout == null) return _slots;
-        // A structure with raw slots has no single array holding every value,
+        if (_layout == null && !IsInline()) return _slots;
+        // A structure with raw or inline slots has no single array holding every value,
         // so the snapshot is built. The callers are the cold ones -- printing,
         // COPY-STRUCTURE, the FASL literal writer, EQUALP -- and they want the
         // values, not the storage.
@@ -285,9 +634,10 @@ public sealed class LispStruct : LispObject
     // Uses WeakReference values so GC can collect structs no longer referenced elsewhere.
     private static readonly ConcurrentDictionary<string, WeakReference<LispStruct>> _internCache = new();
 
-    /// <summary>Slot layouts by structure name. A DEFSTRUCT with at least one
-    /// slot whose declared type fits an int64 registers one at load time; every
-    /// other structure never appears here and reads a null layout.
+    /// <summary>Slot layouts by structure name, kept on the name
+    /// (Symbol.StructLayout). A DEFSTRUCT with at least one slot whose declared
+    /// type fits an int64 registers one at load time; every other structure
+    /// reads a null layout.
     ///
     /// The lookup happens once per structure CREATED, not per slot accessed --
     /// the instance carries the layout reference afterwards. That is why the
@@ -295,8 +645,6 @@ public sealed class LispStruct : LispObject
     /// literal, COPY-STRUCTURE and the reader all build structures through
     /// here, and a structure built by one of them has to have the same shape as
     /// one built by the constructor function.</summary>
-    private static readonly ConcurrentDictionary<Symbol, int[]> _layouts = new();
-
     /// <summary>Record which slots of TYPENAME are raw, and which definition of
     /// TYPENAME this is. POS has one entry per slot: the position in the raw
     /// array, or -1 for a boxed slot. KIND says what the bits at that position
@@ -329,9 +677,9 @@ public sealed class LispStruct : LispObject
                                             : kind[i] == RawSingle ? SlotKindSingle
                                             : kind[i] == RawU64 ? SlotKindU64 : 0)
                                 : SlotBoxed);
-            _layouts[typeName] = entries;
+            typeName.StructLayout = entries;
         }
-        else _layouts.TryRemove(typeName, out _);
+        else typeName.StructLayout = null;
     }
 
     /// <summary>A layout map with every slot boxed, carrying VERSION. Used when
@@ -350,7 +698,7 @@ public sealed class LispStruct : LispObject
 
     public LispStruct(Symbol typeName, LispObject[] slots)
         : this(typeName, slots,
-               _layouts.TryGetValue(typeName, out var registered)
+               typeName.StructLayout is { } registered
                && registered.Length == slots.Length ? registered : null)
     {
     }
@@ -377,6 +725,14 @@ public sealed class LispStruct : LispObject
         DotCL.Diagnostics.AllocCounter.Inc("LispStruct");
     }
 
+    private protected LispStruct(Symbol typeName, LispObject[] slots, int[] map, bool rawInline)
+    {
+        TypeName = typeName;
+        _slots = slots;
+        _layout = map;
+        DotCL.Diagnostics.AllocCounter.Inc("LispStruct");
+    }
+
     // One array of nulls per length, the _slots of a structure whose slots are all raw:
     // nothing reads or writes _slots at a raw slot.
     private static LispObject[]?[] s_noBoxedSlots = new LispObject[]?[8];
@@ -400,9 +756,18 @@ public sealed class LispStruct : LispObject
     internal static LispStruct MakeRaw(Symbol typeName, LispObject[]? slots, long[] raws,
                                        int version, long kinds, int n)
     {
-        if (_layouts.TryGetValue(typeName, out var map) && map.Length == n && n > 0
+        if (typeName.StructLayout is { } map && map.Length == n && n > 0
             && ((map[0] >> LayoutVersionShift) & SlotPosMask) == (version & SlotPosMask))
+        {
+            int k = RawInlineCountOf(map);
+            if (k != 0 && k == raws.Length)
+            {
+                var inl = new LispStructR(typeName, slots ?? NoBoxedSlots(n), map);
+                for (int i = 0; i < k; i++) RawInlineCell(inl, i) = raws[i];
+                return inl;
+            }
             return new LispStruct(typeName, slots ?? NoBoxedSlots(n), map, raws);
+        }
         var boxed = new LispObject[n];
         int r = 0;
         for (int i = 0; i < n; i++)
@@ -415,7 +780,7 @@ public sealed class LispStruct : LispObject
                 default: boxed[i] = new SingleFloat(Compat.Int32BitsToSingle((int)raws[r++])); break;
             }
         }
-        return new LispStruct(typeName, boxed);
+        return Create(typeName, boxed);
     }
 
     private LispStruct(Symbol typeName, LispObject[] slots, int[]? map)
@@ -497,7 +862,7 @@ public sealed class LispStruct : LispObject
         if (_internCache.TryGetValue(key, out var weakRef) && weakRef.TryGetTarget(out var existing))
             return existing;
         var typeSym = (Symbol)typeNameObj;
-        var result = new LispStruct(typeSym, slots);
+        var result = Create(typeSym, slots);
         var newWeak = new WeakReference<LispStruct>(result);
         _internCache[key] = newWeak;
         return result;
@@ -523,7 +888,7 @@ public sealed class LispStruct : LispObject
             return existing;
         var obj = Runtime.TryCallConstantForm(form, out var called)
             ? Runtime.UnwrapMv(called) : Runtime.Eval(form);
-        if (obj is LispStruct result)
+        if (LispStruct.TryAs(obj, out var result))
         {
             _internCache[key] = new WeakReference<LispStruct>(result);
             return result;
@@ -549,6 +914,47 @@ public sealed class LispStruct : LispObject
         }
         finally { _printing.Remove(this); }
     }
+}
+
+/// <summary>A structure of one to four slots, kept in these fields. Each level
+/// adds one, so slot K is the same field whichever of them the instance is.</summary>
+internal class LispStruct1 : LispStruct
+{
+    internal LispObject _s0;
+    internal LispStruct1(Symbol typeName, LispObject a) : base(typeName, 1) { _s0 = a; }
+    private protected LispStruct1(Symbol typeName, int n, LispObject a) : base(typeName, n) { _s0 = a; }
+}
+
+internal class LispStruct2 : LispStruct1
+{
+    internal LispObject _s1;
+    internal LispStruct2(Symbol typeName, LispObject a, LispObject b) : base(typeName, 2, a) { _s1 = b; }
+    private protected LispStruct2(Symbol typeName, int n, LispObject a, LispObject b) : base(typeName, n, a) { _s1 = b; }
+}
+
+internal class LispStruct3 : LispStruct2
+{
+    internal LispObject _s2;
+    internal LispStruct3(Symbol typeName, LispObject a, LispObject b, LispObject c)
+        : base(typeName, 3, a, b) { _s2 = c; }
+    private protected LispStruct3(Symbol typeName, int n, LispObject a, LispObject b, LispObject c)
+        : base(typeName, n, a, b) { _s2 = c; }
+}
+
+internal sealed class LispStruct4 : LispStruct3
+{
+    internal LispObject _s3;
+    internal LispStruct4(Symbol typeName, LispObject a, LispObject b, LispObject c, LispObject d)
+        : base(typeName, 4, a, b, c) { _s3 = d; }
+}
+
+/// <summary>A structure whose raw slots (one to four) are kept in these fields
+/// instead of a long[]: raw position K is _rK. Boxed slots, if any, stay in
+/// _slots.</summary>
+internal sealed class LispStructR : LispStruct
+{
+    internal long _r0, _r1, _r2, _r3;
+    internal LispStructR(Symbol typeName, LispObject[] slots, int[] map) : base(typeName, slots, map, true) { }
 }
 
 public sealed class LispVector : LispObject
@@ -940,14 +1346,18 @@ public sealed class LispVector : LispObject
     /// was given. A (complex single-float) or (complex double-float) array starts
     /// out as complex zeros, the way a double-float array starts out as 0.0d0:
     /// an array of that element type must never hold NIL, and code that hands
-    /// the storage to foreign routines as work space reads every element.</summary>
-    internal static LispObject DefaultElement(string elementType) =>
-        Runtime.ComplexElementPartClass(elementType) switch
+    /// the storage to foreign routines as work space reads every element. A bit
+    /// array's is the 0 bit, so a grown bit array stays a bit array.</summary>
+    internal static LispObject DefaultElement(string elementType)
+    {
+        if (elementType == "BIT") return Fixnum.Make(0);
+        return Runtime.ComplexElementPartClass(elementType) switch
         {
             'D' => LispComplex.OfDoubles(0.0, 0.0),
             'S' => LispComplex.Of(SingleFloat.Box(0f), SingleFloat.Box(0f)),
             _ => Nil.Instance
         };
+    }
 
     public LispVector(int size, LispObject initialElement, string elementType)
     {
@@ -1102,6 +1512,16 @@ public sealed class LispVector : LispObject
     private static Exception BitTypeError(LispObject val) =>
         new LispErrorException(new LispTypeError(
             "array of element-type BIT: value is not a bit", val, Startup.Sym("BIT")));
+
+    /// <summary>The bits ADJUST-ARRAY gives the elements it adds: 0 when no
+    /// :INITIAL-ELEMENT was supplied, otherwise 0 or 1.</summary>
+    private static long BitFill(LispObject? initialElement)
+    {
+        if (initialElement is null) return 0;
+        if (initialElement is not Fixnum f || (ulong)f.Value > 1UL)
+            throw BitTypeError(initialElement);
+        return f.Value;
+    }
 
     /// <summary>The first Length elements of a BIT or (unsigned-byte 8) vector as
     /// bytes, bit I of a bit vector in bit I%8 of byte I/8. False for any other
@@ -1284,7 +1704,7 @@ public sealed class LispVector : LispObject
         for (int i = start; i < end; i++)
         {
             var elem = RawGet(i);
-            if (elem is LispChar c) RawSet(i, LispChar.Make(char.ToUpperInvariant(c.Value)));
+            if (elem is LispChar c) RawSet(i, LispChar.Make(CharCase.Upcase(c.Value)));
         }
     }
 
@@ -1293,7 +1713,7 @@ public sealed class LispVector : LispObject
         for (int i = start; i < end; i++)
         {
             var elem = RawGet(i);
-            if (elem is LispChar c) RawSet(i, LispChar.Make(char.ToLowerInvariant(c.Value)));
+            if (elem is LispChar c) RawSet(i, LispChar.Make(CharCase.Downcase(c.Value)));
         }
     }
 
@@ -1306,7 +1726,7 @@ public sealed class LispVector : LispObject
             char c = lc.Value;
             if (char.IsLetter(c))
             {
-                RawSet(i, LispChar.Make(wordBoundary ? char.ToUpperInvariant(c) : char.ToLowerInvariant(c)));
+                RawSet(i, LispChar.Make(wordBoundary ? CharCase.Upcase(c) : CharCase.Downcase(c)));
                 wordBoundary = false;
             }
             else if (char.IsDigit(c))
@@ -1387,23 +1807,27 @@ public sealed class LispVector : LispObject
                 catch { _numKind = oldKind; _numData = oldNum; _numLen = oldLen; throw; }
                 _elements = Array.Empty<LispObject>();
             }
-            else if (_bitData != null)
+            else if (ElementTypeName == "BIT")
             {
                 var newBits = new ulong[(newSize + 63) / 64];
                 var oldSize = _declaredSize;
                 for (int i = 0; i < Math.Min(oldSize, newSize); i++)
                 {
-                    if (((_displacedTo._bitData != null
-                          ? (_displacedTo._bitData[(i + _displacedOffset) >> 6] >> ((i + _displacedOffset) & 63)) & 1
-                          : (RawGet(i) is Fixnum f && f.Value != 0 ? 1UL : 0UL)) != 0))
+                    var e = RawGet(i);
+                    if (e is not Fixnum bf || (ulong)bf.Value > 1UL)
+                        throw BitTypeError(e);
+                    if (bf.Value != 0)
                         newBits[i >> 6] |= 1UL << (i & 63);
                 }
-                long fillBit = initialElement is Fixnum fi ? fi.Value : 0;
+                long fillBit = BitFill(initialElement);
                 if (fillBit != 0)
                     for (int i = oldSize; i < newSize; i++)
                         newBits[i >> 6] |= 1UL << (i & 63);
                 _bitData = newBits;
                 _elements = Array.Empty<LispObject>();
+                _numData = null;
+                _numLen = 0;
+                _numKind = 0;
             }
             else
             {
@@ -1431,7 +1855,7 @@ public sealed class LispVector : LispObject
                 // New bits take the initial element. The last old word can hold
                 // set bits past the old size (a constructor that fills whole
                 // words), so each new bit is written, not only the 1s.
-                long fillBit = initialElement is Fixnum fi ? fi.Value : 0;
+                long fillBit = BitFill(initialElement);
                 for (int i = oldSize; i < newSize; i++)
                     if (fillBit != 0) newBits[i >> 6] |= 1UL << (i & 63);
                     else newBits[i >> 6] &= ~(1UL << (i & 63));
@@ -2110,14 +2534,40 @@ public sealed class LispHashTable : LispObject
         // add-lisp-color-aliases inserts aliases while mapping the color table).
         // Iterating Dictionary live would throw InvalidOperationException
         // ("Collection was modified"); snapshotting matches the other impls.
-        //
-        // The snapshot buffer is reused per thread: MAPHASH is an iteration, and
-        // allocating an array of every entry on each call made walking a table
-        // cost more than the walk. A nested walk (the action maps another table,
-        // or the same one) finds the buffer in use and allocates its own.
-        int n = _dict.Count;
+        var buf = RentEntries(out int n, out bool pooled);
+        try
+        {
+            for (int i = 0; i < n; i++)
+                action(state, (LispObject)buf[i].Key, (LispObject)buf[i].Value);
+        }
+        finally
+        {
+            ReturnEntries(buf, n, pooled);
+        }
+    }
+
+    /// <summary>A snapshot of the entries, for a walk that may change the table.
+    /// The buffer is reused per thread: MAPHASH is an iteration, and allocating
+    /// an array of every entry on each call made walking a table cost more than
+    /// the walk. A nested walk (the action maps another table, or the same one)
+    /// finds the buffer in use and gets its own. Hand it back with ReturnEntries.</summary>
+    internal KeyValuePair<object, object>[] RentEntries(out int n, out bool pooled)
+    {
+        if (Synchronized || Weakness != null)
+        {
+            KeyValuePair<LispObject, LispObject>[] snap;
+            if (Synchronized) { lock (_lock) snap = SnapshotAlive(); }
+            else snap = SnapshotAlive();
+            var copy = new KeyValuePair<object, object>[snap.Length];
+            for (int i = 0; i < snap.Length; i++)
+                copy[i] = new KeyValuePair<object, object>(snap[i].Key, snap[i].Value);
+            n = copy.Length;
+            pooled = false;
+            return copy;
+        }
+        n = _dict.Count;
         KeyValuePair<object, object>[] buf;
-        bool pooled = false;
+        pooled = false;
         if (!_forEachBufInUse)
         {
             if (_forEachBuf == null || _forEachBuf.Length < n)
@@ -2130,18 +2580,15 @@ public sealed class LispHashTable : LispObject
         {
             buf = new KeyValuePair<object, object>[n];
         }
-        try
-        {
-            ((System.Collections.Generic.ICollection<KeyValuePair<object, object>>)_dict)
-                .CopyTo(buf, 0);
-            for (int i = 0; i < n; i++)
-                action(state, (LispObject)buf[i].Key, (LispObject)buf[i].Value);
-        }
-        finally
-        {
-            // Do not keep the entries alive through the pooled buffer.
-            if (pooled) { Array.Clear(buf, 0, n); _forEachBufInUse = false; }
-        }
+        ((System.Collections.Generic.ICollection<KeyValuePair<object, object>>)_dict)
+            .CopyTo(buf, 0);
+        return buf;
+    }
+
+    internal static void ReturnEntries(KeyValuePair<object, object>[] buf, int n, bool pooled)
+    {
+        // Do not keep the entries alive through the pooled buffer.
+        if (pooled) { Array.Clear(buf, 0, n); _forEachBufInUse = false; }
     }
 
     [ThreadStatic] private static KeyValuePair<object, object>[]? _forEachBuf;
@@ -2206,9 +2653,9 @@ public sealed class LispHashTable : LispObject
             if (a is Number na) return b is Number nb && NumbersEqualp(na, nb);
             if (a is Symbol || a is Nil || a is T) return Runtime.IsTrueEq(a, b);
             if (a is LispSimdPack simdA) return b is LispSimdPack simdB && simdA.SameBits(simdB);
-            if (a is LispStruct sa)
+            if (LispStruct.TryAs(a, out var sa))
             {
-                if (b is not LispStruct sb) return false;
+                if (!LispStruct.TryAs(b, out var sb)) return false;
                 if (!SameStructType(sa.TypeName, sb.TypeName)) return false;
                 if (sa.SlotCount != sb.SlotCount) return false;
                 for (int i = 0; i < sa.SlotCount; i++)
@@ -2292,7 +2739,7 @@ public sealed class LispHashTable : LispObject
     }
 
     private static bool CharEqualp(char x, char y)
-        => x == y || char.ToUpperInvariant(x) == char.ToUpperInvariant(y);
+        => x == y || CharCase.Fold(x) == CharCase.Fold(y);
 
     // = plus EQL, so a NaN is still EQUALP to a bit-identical NaN.
     private static bool NumbersEqualp(Number a, Number b)
@@ -2352,26 +2799,20 @@ public sealed class LispHashTable : LispObject
             return _test(x, y);
         }
 
-        // Normalize T.Instance/Nil.Instance to their symbol forms so EQ/EQL
-        // hash tables treat them as the same key.
-        private static LispObject Canonical(LispObject obj) =>
-            obj is T ? (LispObject)(Startup.T_SYM ?? obj) :
-            obj is Nil ? (Startup.NIL_SYM ?? (LispObject)obj) : obj;
-
         public int GetHashCode(LispObject obj)
         {
             if (_hash != null) return UserHash(obj);
             switch (_kind)
             {
                 case KindEq:
-                    return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Canonical(obj));
+                    return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
                 case KindEql:
                     // Only numbers and characters hash by value; test for them
                     // with two type checks before trying each number type.
                     if (obj is Number || obj is LispChar || obj is LispSimdPack)
                         return NumericOrCharHash(obj)
                                ?? System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
-                    return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(Canonical(obj));
+                    return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
                 case KindEqual: return GetEqualHash(obj);
                 case KindEqualp: return GetEqualpHash(obj);
                 default: return obj.GetHashCode();
@@ -2417,7 +2858,7 @@ public sealed class LispHashTable : LispObject
                 // char-array backed, and VALUE would build a System.String of
                 // it on every lookup.
                 LispString s => Compat.StringHash(s.Chars),
-                LispVector v when v.IsCharVector => v.ToCharString().GetHashCode(),
+                LispVector v when v.IsCharVector => Compat.StringHash(v.ToCharString()),
                 Cons c => HashCode.Combine(GetEqualHash(c.Car, depth - 1), GetEqualHash(c.Cdr, depth - 1)),
                 LispVector bv when bv.IsBitVector => HashBitVector(bv),
                 LispPathname pn => PathnameHash(pn, depth),
@@ -2470,7 +2911,7 @@ public sealed class LispHashTable : LispObject
         private static int UpcaseHash(ReadOnlySpan<char> cs)
         {
             int h = cs.Length;
-            foreach (var c in cs) h = h * 31 + char.ToUpperInvariant(c);
+            foreach (var c in cs) h = h * 31 + CharCase.Fold(c);
             return h;
         }
 
@@ -2482,7 +2923,7 @@ public sealed class LispHashTable : LispObject
             for (int i = 0; i < n; i++)
             {
                 var e = v.ElementAt(i);
-                h = h * 31 + (e is LispChar c ? char.ToUpperInvariant(c.Value) : GetEqualpHash(e, depth - 1));
+                h = h * 31 + (e is LispChar c ? CharCase.Fold(c.Value) : GetEqualpHash(e, depth - 1));
             }
             return h;
         }
@@ -2494,7 +2935,7 @@ public sealed class LispHashTable : LispObject
             {
                 LispString s => UpcaseHash(s.Chars),
                 LispVector v => ArrayEqualpHash(v, depth),
-                LispChar c => char.ToUpperInvariant(c.Value),
+                LispChar c => CharCase.Fold(c.Value),
                 // A complex has to hash by its parts: EQUALP compares numbers with
                 // =, so #C(1 2) and #C(1.0d0 2.0d0) are EQUALP and must land in
                 // the same bucket. It also has to agree with a REAL when the
@@ -2787,4 +3228,42 @@ internal static class NumStorage
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static T[] ArrayCast<T>(Array? a) =>
         a != null && a.GetType() == typeof(T[]) ? Unsafe.As<T[]>(a) : (T[])a!;
+}
+
+/// <summary>The state of an opened MAPHASH (Runtime.HashWalkBegin): a snapshot
+/// of the entries and the position in it.</summary>
+public sealed class HashTableWalk : LispObject
+{
+    private KeyValuePair<object, object>[]? _buf;
+    private readonly int _n;
+    private readonly bool _pooled;
+    private readonly int _thread;
+    private int _i = -1;
+
+    public HashTableWalk(LispHashTable table)
+    {
+        _buf = table.RentEntries(out _n, out _pooled);
+        _thread = Environment.CurrentManagedThreadId;
+    }
+
+    public bool MoveNext() => _buf != null && ++_i < _n;
+
+    public LispObject Key => (LispObject)_buf![_i].Key;
+
+    public LispObject Value => (LispObject)_buf![_i].Value;
+
+    public void End()
+    {
+        if (_buf == null) return;
+        // The pool is per thread; a walk resumed elsewhere (an await in the
+        // body) leaves the owner's buffer marked in use rather than freeing
+        // another thread's.
+        if (_thread == Environment.CurrentManagedThreadId)
+            LispHashTable.ReturnEntries(_buf, _n, _pooled);
+        else
+            Array.Clear(_buf, 0, _n);
+        _buf = null;
+    }
+
+    public override string ToString() => "#<HASH-TABLE-WALK>";
 }

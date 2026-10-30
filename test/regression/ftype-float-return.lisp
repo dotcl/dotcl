@@ -48,6 +48,7 @@
 (defun %ffr-flet (a)
   (declare (double-float a))
   (flet ((%ffr-d (x) (declare (ignore x)) 7))
+    (declare (notinline %ffr-d))
     (+ (%ffr-d a) a)))
 
 ;;; ---- inferred only ----
@@ -86,10 +87,12 @@
 
 ;;; ---- emitted code ----
 
+;; The parameters are raw doubles, passed raw to the typed entries, whose raw
+;; results are added: nothing is unboxed.
 (deftest-emitting-only ftype-float-return.double-is-r8
   (let ((r (%ffr-sil #'%ffr-dsum)))
     (list (%ffr-count "Runtime.Add" r) (%ffr-count "UNBOX-DOUBLE" r)))
-  (0 2))
+  (0 0))
 
 (deftest-emitting-only ftype-float-return.single-is-r4
   (let ((r (%ffr-sil #'%ffr-ssum)))
@@ -99,9 +102,8 @@
 (deftest-emitting-only ftype-float-return.long-and-range-are-r8
   (let ((r (%ffr-sil #'%ffr-lr)))
     (list (%ffr-count "Runtime.Mul" r) (%ffr-count "UNBOX-DOUBLE" r)))
-  ;; A for each typed entry, and the boxed result of %FFR-R (its range has no
-  ;; raw result kind).
-  (0 3))
+  ;; Only the boxed result of %FFR-R (its range has no raw result kind).
+  (0 1))
 
 (deftest-emitting-only ftype-float-return.declaim-after-defun-is-r8
   (%ffr-count "Runtime.Add" (%ffr-sil #'%ffr-late-use))

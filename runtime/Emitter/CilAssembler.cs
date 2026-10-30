@@ -288,7 +288,7 @@ public partial class CilAssembler
             if (FindInDefiningPackage(targetName) is Symbol defSym
                 && defSym.SetfFunction is LispFunction setfFnPkg) return setfFnPkg;
             if (FindSetfFunctionAcrossPackages(targetName) is LispFunction setfFn) return setfFn;
-            throw new LispErrorException(new LispUndefinedFunction(SetfNameCons(targetSym)));
+            return Runtime.UndefinedFunctionError(SetfNameCons(targetSym));
         }
         var sym = Startup.Sym(name);
         if (sym.Function is LispFunction symFn) return symFn;
@@ -301,7 +301,7 @@ public partial class CilAssembler
         // (Startup.Sym resolves by exact name, no transformation).
         if (FindFunctionAcrossPackages(sym) is LispFunction otherFn)
             return otherFn;
-        throw new LispErrorException(new LispUndefinedFunction(sym));
+        return Runtime.UndefinedFunctionError(sym);
     }
 
     /// <summary>
@@ -317,9 +317,12 @@ public partial class CilAssembler
     public static LispFunction GetFunctionBySymbol(Symbol sym)
         => sym._callee ?? ThrowUndefinedFunction(sym);
 
+    public static bool IsSameFileFunction(Symbol sym, LispFunction? fn)
+        => fn != null && ReferenceEquals(sym._callee, fn);
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static LispFunction ThrowUndefinedFunction(Symbol sym) =>
-        throw new LispErrorException(new LispUndefinedFunction(sym));
+        Runtime.UndefinedFunctionError(sym);
 
     /// <summary>Symbol-based setf function lookup: sym.SetfFunction is authoritative.</summary>
     public static LispFunction GetSetfFunctionBySymbol(Symbol sym)
@@ -334,7 +337,7 @@ public partial class CilAssembler
             sym.SetfFunction = gfFn; // cache for subsequent lookups
             return gfFn;
         }
-        throw new LispErrorException(new LispUndefinedFunction(setfName));
+        return Runtime.UndefinedFunctionError(setfName);
     }
 
     /// <summary>

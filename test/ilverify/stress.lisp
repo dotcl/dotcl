@@ -227,3 +227,23 @@
 ;; A lambda that closes over nothing, passed as a value: its function object is
 ;; cached in a LispFunction-typed static field after its direct entry is set.
 (defun lambda-arg (x l) (member x l :test (lambda (n e) (eq n e))))
+
+;; POSITION / FIND on a literal string pass the compiler's table as a LispString
+;; argument, so the constant has to be narrowed at the call.
+(defun literal-position-mixed (c s)
+  (let* ((n (length s))
+         (last (and (plusp n) (char s (1- n)))))
+    (declare (type fixnum n))
+    (list n last
+          (position c "0123456789abcdef" :test #'char-equal :start 2 :end 12)
+          (find c "0123456789abcdef" :test #'char= :from-end t))))
+
+;; TYPECASE over structure names: the :INCLUDE-parent walk leaves a Symbol on
+;; the stack at the loop join, so it must not be widened to LispObject.
+(defstruct (ilv-typecase-a (:constructor make-ilv-typecase-a ())) x)
+(defstruct (ilv-typecase-b (:constructor make-ilv-typecase-b ())) y)
+(defun struct-typecase-join (v)
+  (typecase v
+    (ilv-typecase-a :a)
+    (ilv-typecase-b :b)
+    (t :other)))
