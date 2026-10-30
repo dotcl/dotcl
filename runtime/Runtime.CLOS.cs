@@ -2397,22 +2397,25 @@ public static partial class Runtime
 
     /// <summary>
     /// True when slot access on an instance of CLS has to go through the
-    /// *-USING-CLASS generic functions rather than reading the slot vector:
-    /// the class has a custom metaclass, or the program has defined a method on
-    /// one of those functions that applies to its instances. The second is
-    /// ordinary AMOP use on a STANDARD-CLASS class -- an :AFTER method on
-    /// (SETF SLOT-VALUE-USING-CLASS) specialized on the instance, to observe
+    /// *-USING-CLASS generic functions rather than reading the slot vector: the
+    /// program has defined a method on one of those functions that applies to
+    /// its instances, under its metaclass, for one of its slot definitions.
+    /// On a STANDARD-CLASS class that is ordinary AMOP use -- an :AFTER method
+    /// on (SETF SLOT-VALUE-USING-CLASS) specialized on the instance, to observe
     /// slot writes -- and skipping the protocol for it made such a method never
-    /// run. The answer is cached on the class against the method epoch, which
-    /// every method added or removed anywhere advances, so the common case costs
-    /// one compare.
+    /// run. A custom metaclass is asked the same question: one that defines no
+    /// such method (it adds slots or options to its classes, say) would only
+    /// reach dotcl's own defaults, which read and write the slot vector exactly
+    /// as the direct path does. The answer is cached on the class against the
+    /// method epoch, which every method added or removed anywhere, and every
+    /// class finalization, advances, so the common case costs one compare.
     /// </summary>
     // Until the program defines a method on one of these functions, which most
-    // never do, the answer is no for every standard class: a field read and a
-    // static read, inlined into the slot access, and nothing else.
+    // never do, the answer is no for every class: a static read, inlined into
+    // the slot access, and nothing else.
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal static bool UsesSlotProtocol(LispClass cls)
-        => cls.Metaclass != null || (_programSlotProtocolMethods && UsesSlotProtocolSlow(cls));
+        => _programSlotProtocolMethods && UsesSlotProtocolSlow(cls);
 
     private static bool UsesSlotProtocolSlow(LispClass cls)
     {
@@ -2433,10 +2436,13 @@ public static partial class Runtime
             || AnyApplicableSlotProtocolMethod(Startup.Sym("SLOT-MAKUNBOUND-USING-CLASS").Function as GenericFunction, 1, cls);
     }
 
-    /// <summary>Does GF hold a method of the program's whose instance
-    /// specializer (argument OBJECT-INDEX) admits instances of CLS? An EQL
-    /// specializer is counted as admitting them: it can name one of them, and
-    /// taking the protocol for a class that did not need it costs only speed.</summary>
+    /// <summary>Does GF hold a method of the program's that applies to a slot
+    /// access on an instance of CLS: its class specializer (argument
+    /// OBJECT-INDEX - 1) admits CLS's metaclass, its instance specializer admits
+    /// CLS, and its slot specializer admits the class of one of CLS's effective
+    /// slot definitions? An EQL specializer is counted as admitting: it can name
+    /// one of them, and taking the protocol for a class that did not need it
+    /// costs only speed.</summary>
     private static bool AnyApplicableSlotProtocolMethod(GenericFunction? gf, int objectIndex, LispClass cls)
     {
         if (gf == null) return false;
@@ -2444,16 +2450,29 @@ public static partial class Runtime
         {
             if (SlotProtocolDefaults.Contains(m)) continue;
             if (m.Specializers.Length <= objectIndex + 1) continue;
-            // The class argument is a STANDARD-CLASS and the slot argument a
-            // standard effective slot definition here; a method specialized on
-            // a custom metaclass or slot class (the usual reason to define one)
-            // does not apply, and counting it would send every class's slot
-            // access through the protocol.
-            if (!SpecializerAdmits(m.Specializers[objectIndex - 1], StandardClassClass())) continue;
-            if (!SpecializerAdmits(m.Specializers[objectIndex + 1], StandardEffectiveSlotClass())) continue;
+            // A method specialized on some other metaclass or slot class (the
+            // usual reason to define one) does not apply, and counting it would
+            // send every class's slot access through the protocol.
+            if (!SpecializerAdmits(m.Specializers[objectIndex - 1], cls.Metaclass ?? StandardClassClass())) continue;
+            if (!SlotSpecializerAdmits(m.Specializers[objectIndex + 1], cls)) continue;
             if (SpecializerAdmits(m.Specializers[objectIndex], cls)) return true;
         }
         return false;
+    }
+
+    /// <summary>Could SPEC match one of CLS's effective slot definitions? Each is
+    /// of its own slot-definition class when the metaclass chose one
+    /// (EFFECTIVE-SLOT-DEFINITION-CLASS), STANDARD-EFFECTIVE-SLOT-DEFINITION
+    /// otherwise.</summary>
+    private static bool SlotSpecializerAdmits(LispObject spec, LispClass cls)
+    {
+        bool standard = false;
+        foreach (var slot in cls.EffectiveSlots)
+        {
+            if (slot.MetaClass is { } mc) { if (SpecializerAdmits(spec, mc)) return true; }
+            else standard = true;
+        }
+        return standard && SpecializerAdmits(spec, StandardEffectiveSlotClass());
     }
 
     /// <summary>Could SPEC match an argument whose class is CLS? An EQL
@@ -2722,8 +2741,8 @@ public static partial class Runtime
     /// last time and the method-system epoch unchanged, the slot is read straight from
     /// the instance vector, with no GF resolution, no dispatch, and no name->index lookup.
     /// A miss re-resolves the accessor and refills the cell; anything that isn't a plain
-    /// instance-allocated simple reader (redefined/extended accessor, custom metaclass,
-    /// class-allocated or unbound slot) falls through to a normal 1-arg invocation, so
+    /// instance-allocated simple reader (redefined/extended accessor, a class whose slot
+    /// access takes the *-USING-CLASS protocol, class-allocated or unbound slot) falls through to a normal 1-arg invocation, so
     /// semantics are identical to calling the GF directly.</summary>
     public static LispObject ReaderIC(LispObject obj, ReaderCache cell)
     {
@@ -2800,8 +2819,8 @@ public static partial class Runtime
     /// order (new value first, object second) so the call site evaluates its argument forms
     /// in exactly the order the normal call would. On a hit the slot is written straight
     /// into the instance vector; a miss re-resolves the writer, and anything that is not a
-    /// plain instance-allocated simple writer (extended accessor, custom metaclass,
-    /// class-allocated slot, newval-specialized method) falls through to a normal 2-arg
+    /// plain instance-allocated simple writer (extended accessor, a class whose slot
+    /// access takes the *-USING-CLASS protocol, class-allocated slot, newval-specialized method) falls through to a normal 2-arg
     /// invocation, so semantics are identical to calling the GF.</summary>
     public static LispObject WriterIC(LispObject newval, LispObject obj, WriterCache cell)
     {
