@@ -1,7 +1,9 @@
 ;;; Generic atomic operations on arbitrary CL places.
 ;;; dotcl:compare-and-swap / atomic-incf / atomic-decf expand through
 ;;; get-setf-expansion, so every SETF-able place works; a single global monitor
-;;; makes them correct under concurrency (lock-based, not lock-free).
+;;; makes them correct under concurrency (lock-based, not lock-free).  (CAR X) and
+;;; (CDR X) are the exception: the runtime swaps the cons's field directly, with no
+;;; lock (see the end of this file).
 ;;; compare-and-swap returns the PRIOR value (sb-ext/CCL convention): success is
 ;;; (eq old ret), and a failed CAS returns the current value for the next retry.
 
@@ -161,7 +163,8 @@
 ;; dotcl-thread used to define these three macros again, with a lock of its own:
 ;; code expanded before (require "dotcl-thread") and code expanded after it then
 ;; took different locks for the same place, so neither excluded the other. Every
-;; expansion now names the runtime's one lock.
+;; expansion that takes a lock now names the runtime's one lock; a cons field
+;; takes none (the next section).
 
 (defun %cas-lock-names (tree)
   (let ((names '()))
@@ -175,12 +178,13 @@
 
 (deftest cas-one-lock-for-every-expansion
   (mapcar (lambda (form) (%cas-lock-names (macroexpand-1 form)))
-          '((dotcl:compare-and-swap (car x) 1 2)
-            (dotcl:atomic-incf (car x))
+          '((dotcl:compare-and-swap (svref v 0) 1 2)
+            (dotcl:atomic-incf (gethash k h))
             (dotcl:atomic-decf (svref v 0) 2)
             (dotcl:compare-and-swap *cas-special* 1 2)
-            (dotcl:atomic-incf *cas-special*)))
-  (("*CAS-LOCK*") ("*CAS-LOCK*") ("*CAS-LOCK*") ("*CAS-LOCK*") ("*CAS-LOCK*")))
+            (dotcl:atomic-incf *cas-special*)
+            (dotcl:compare-and-swap (cadr x) 1 2)))
+  (("*CAS-LOCK*") ("*CAS-LOCK*") ("*CAS-LOCK*") ("*CAS-LOCK*") ("*CAS-LOCK*") ("*CAS-LOCK*")))
 
 ;; A globally special variable is read and written by the runtime under that
 ;; lock; the result is what the general expansion gives.
@@ -193,3 +197,82 @@
           (list (dotcl:compare-and-swap *cas-sv* 100 101) *cas-sv*))
         *cas-sv*)
   (1 2 2 2 7 6 (100 101) 6))
+
+;; --- cons fields: no lock ---
+;; (CAR X), (CDR X), (FIRST X) and (REST X) expand to the runtime's %CAS-CAR /
+;; %CAS-CDR (and %ATOMIC-DELTA-CAR / -CDR), which swap the field with
+;; Interlocked.CompareExchange. The comparison is still EQL (the tests above run
+;; through them), and they exclude one another on the same cell.
+
+(deftest cas-cons-fields-take-no-lock
+  (mapcar (lambda (form)
+            (let ((expansion (macroexpand-1 form)))
+              (list (symbol-name (car expansion)) (%cas-lock-names expansion))))
+          '((dotcl:compare-and-swap (car x) 1 2)
+            (dotcl:compare-and-swap (first x) 1 2)
+            (dotcl:compare-and-swap (cdr x) 1 2)
+            (dotcl:compare-and-swap (rest x) 1 2)
+            (dotcl:atomic-incf (car x))
+            (dotcl:atomic-decf (cdr x) 2)))
+  (("%CAS-CAR" nil) ("%CAS-CAR" nil) ("%CAS-CDR" nil) ("%CAS-CDR" nil)
+   ("%ATOMIC-DELTA-CAR" nil) ("%ATOMIC-DELTA-CDR" nil)))
+
+;; The place's subform is evaluated once, before OLD and NEW.
+(deftest cas-car-evaluation-order
+  (let ((log '()) (cell (list 1)))
+    (list (dotcl:compare-and-swap (car (progn (push :place log) cell))
+                                  (progn (push :old log) 1)
+                                  (progn (push :new log) 2))
+          (car cell) (reverse log)))
+  (1 2 (:place :old :new)))
+
+(deftest cas-first-rest-and-incf-on-fields
+  (let ((cell (list 10 20)))
+    (list (dotcl:compare-and-swap (first cell) 10 11)
+          (dotcl:compare-and-swap (rest cell) (cdr cell) '(21))
+          (dotcl:atomic-incf (car cell) 4)
+          (dotcl:atomic-decf (car cell))
+          cell))
+  (10 (20) 15 14 (14 21)))
+
+(deftest cas-car-of-non-cons-is-a-type-error
+  (list (handler-case (dotcl:compare-and-swap (car (eval 5)) 1 2)
+          (type-error () :type-error))
+        (handler-case (dotcl:atomic-incf (cdr (eval :k)))
+          (type-error () :type-error)))
+  (:type-error :type-error))
+
+;; 8 threads x 5000 increments of one car: atomic-incf and a CAS retry loop at
+;; the same time, so the two have to exclude each other. The count passes the
+;; boxed-fixnum cache on the way, so the EQL comparison is exercised under
+;; contention too.
+(deftest cas-car-concurrent-mixed-increments
+  (let ((cell (list 0)))
+    (flet ((cas-incf ()
+             (loop for old = (car cell)
+                   until (eql (dotcl:compare-and-swap (car cell) old (1+ old)) old))))
+      (let ((threads
+              (loop for k below 8
+                    collect (let ((k k))
+                              (dotcl-thread:make-thread
+                               (lambda ()
+                                 (dotimes (i 5000)
+                                   (if (evenp k) (dotcl:atomic-incf (car cell)) (cas-incf)))))))))
+        (dolist (th threads) (dotcl-thread:thread-join th))))
+    (car cell))
+  40000)
+
+;; A lock-free push onto a list held in a cdr; every push must land.
+(deftest cas-cdr-concurrent-push
+  (let ((head (list :head)))
+    (let ((threads
+            (loop repeat 8
+                  collect (dotcl-thread:make-thread
+                           (lambda ()
+                             (dotimes (i 5000)
+                               (loop for old = (cdr head)
+                                     until (eq (dotcl:compare-and-swap (cdr head) old (cons i old))
+                                               old))))))))
+      (dolist (th threads) (dotcl-thread:thread-join th)))
+    (length (cdr head)))
+  40000)

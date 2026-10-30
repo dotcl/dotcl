@@ -34,13 +34,19 @@ public sealed class OnceCell
 
 public sealed class Cons : LispObject
 {
-    public LispObject Car { get; set; }
-    public LispObject Cdr { get; set; }
+    // Fields behind the properties so DOTCL:COMPARE-AND-SWAP can hand them to
+    // Interlocked.CompareExchange by ref (Runtime.CasCar / CasCdr); C# cannot
+    // take a ref to a property.
+    internal LispObject _car;
+    internal LispObject _cdr;
+
+    public LispObject Car { get => _car; set => _car = value; }
+    public LispObject Cdr { get => _cdr; set => _cdr = value; }
 
     public Cons(LispObject car, LispObject cdr)
     {
-        Car = car;
-        Cdr = cdr;
+        _car = car;
+        _cdr = cdr;
         DotCL.Diagnostics.AllocCounter.Inc("Cons");
     }
 

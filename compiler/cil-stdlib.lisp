@@ -1348,13 +1348,18 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 
 ;;; ===== Generic atomic operations on arbitrary CL places =====
 ;;;
-;;; dotcl:compare-and-swap / atomic-incf / atomic-decf. Lock-based (a single
-;;; global monitor): correct among concurrent atomic operations, but NOT
-;;; lock-free. Because these expand through GET-SETF-EXPANSION, every place SETF
-;;; understands works uniformly: a special/lexical variable, CAR/CDR, SVREF/AREF,
-;;; GETHASH, SLOT-VALUE, a struct slot, etc. The place subforms are captured to
-;;; temporaries up front, so the read-compare-write runs under the lock on a
-;;; consistent snapshot. For a single 64-bit counter the lock-free
+;;; dotcl:compare-and-swap / atomic-incf / atomic-decf. (CAR X) and (CDR X)
+;;; (spelled CAR, CDR, FIRST or REST) are lock-free: the runtime swaps the cons's
+;;; field with Interlocked.CompareExchange (%CAS-CAR and friends). Every other
+;;; place is lock-based (a single global monitor): correct among concurrent
+;;; atomic operations, but NOT lock-free. Because those expand through
+;;; GET-SETF-EXPANSION, every place SETF understands works uniformly: a
+;;; special/lexical variable, SVREF/AREF, GETHASH, SLOT-VALUE, a struct slot, etc.
+;;; The place subforms are captured to temporaries up front, so the
+;;; read-compare-write runs under the lock on a consistent snapshot. A cons field
+;;; reached by another spelling, such as (CADR X) or (NTH 0 X), goes through the
+;;; lock, which does not exclude %CAS-CAR on the same field: name a cons field the
+;;; same way wherever it is swapped. For a single 64-bit counter the lock-free
 ;;; MAKE-ATOMIC-LONG primitive is the faster path.
 ;;;
 ;;; The DOTCL-package macro names are interned and registered at runtime rather
@@ -1373,6 +1378,13 @@ Also expands element types within compound type specifiers like (VECTOR etype si
        (not (keywordp place))
        (not (constantp place))
        (global-special-p place)))
+
+(defun %cas-cons-field (place)
+  "For (CAR X) or (FIRST X) answer :CAR, for (CDR X) or (REST X) :CDR; else NIL."
+  (and (consp place) (consp (cdr place)) (null (cddr place))
+       (case (car place)
+         ((car first) :car)
+         ((cdr rest) :cdr))))
 
 (defun %cas-expand (place old new)
   ;; Returns the PRIOR value of PLACE (sb-ext / CCL / Interlocked.CompareExchange
@@ -1394,6 +1406,10 @@ Also expands element types within compound type specifiers like (VECTOR etype si
   (when (%cas-special-variable-p place)
     (return-from %cas-expand
       `(%cas-symbol-value *cas-lock* ',place ,old ,new)))
+  ;; A cons field: the runtime swaps it without the lock, comparing by EQL.
+  (case (%cas-cons-field place)
+    (:car (return-from %cas-expand `(%cas-car ,(cadr place) ,old ,new)))
+    (:cdr (return-from %cas-expand `(%cas-cdr ,(cadr place) ,old ,new))))
   (multiple-value-bind (temps vals stores setter getter) (get-setf-expansion place)
     (let ((s (car stores)) (o (gensym "OLD")) (n (gensym "NEW")) (cur (gensym "CUR")))
       `(let* (,@(mapcar #'list temps vals) (,o ,old) (,n ,new))
@@ -1410,6 +1426,12 @@ Also expands element types within compound type specifiers like (VECTOR etype si
   (when (%cas-special-variable-p place)
     (return-from %atomic-delta-expand
       `(%atomic-delta-symbol-value *cas-lock* ',place ,delta ,(eq op '-))))
+  ;; A cons field: a CAS loop in the runtime, so it excludes %CAS-CAR / %CAS-CDR.
+  (case (%cas-cons-field place)
+    (:car (return-from %atomic-delta-expand
+            `(%atomic-delta-car ,(cadr place) ,delta ,(eq op '-))))
+    (:cdr (return-from %atomic-delta-expand
+            `(%atomic-delta-cdr ,(cadr place) ,delta ,(eq op '-)))))
   (multiple-value-bind (temps vals stores setter getter) (get-setf-expansion place)
     (let ((s (car stores)) (d (gensym "D")) (r (gensym "NEW")))
       `(let* (,@(mapcar #'list temps vals) (,d ,delta))
