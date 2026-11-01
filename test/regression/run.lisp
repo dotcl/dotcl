@@ -230,6 +230,7 @@
 (load "test/regression/frame-specials.lisp")
 (load-skip-under-interp "test/regression/dynamic-slots.lisp")
 (load "test/regression/svuc-methods-on-standard-class.lisp")
+(load "test/regression/metaclass-without-slot-methods.lisp")
 ;;; DOTNET:DEFINE-CLASS builds a .NET type at run time (AssemblyBuilder /
 ;;; TypeBuilder), so these files cannot even load on a build without an emitter.
 ;;; They define their classes at top level, which is why the guard is per file
