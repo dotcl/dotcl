@@ -257,7 +257,7 @@ Threads:
 - `dotcl:make-lock`, `dotcl:acquire-lock`, `dotcl:release-lock`, `dotcl:lockp`, `dotcl:make-recursive-lock`, `dotcl:recursive-lock-p`: locks.
 - `dotcl:make-condition-variable`, `dotcl:condition-wait`, `dotcl:condition-notify`, `dotcl:condition-broadcast`, `dotcl:condition-variable-p`: condition variables.
 - `dotcl:make-semaphore`, `dotcl:signal-semaphore`, `dotcl:wait-on-semaphore`, `dotcl:semaphore-p`: semaphores.
-- `dotcl:compare-and-swap`, `dotcl:atomic-incf`, `dotcl:atomic-decf`: atomic operations on a place.
+- `dotcl:compare-and-swap`, `dotcl:atomic-incf`, `dotcl:atomic-decf`: atomic operations on a place. On a cons field named by a standard accessor (`car`, `cdr`, `first`, `rest`, `cadr` and the other `c[ad]r` compositions, `second` to `tenth`, `nth`) they are lock-free, an interlocked compare-exchange on the cons; on any other place they take one global lock.
 - `dotcl:make-atomic-long`, `dotcl:atomic-long-value`, `dotcl:set-atomic-long-value`, `dotcl:atomic-long-cas`, `dotcl:atomic-long-incf`, `dotcl:atomic-long-decf`, `dotcl:atomic-long-p`: a 64-bit cell with atomic operations.
 - `dotcl:call-on-main-thread`, `dotcl:main-thread-p`: run a function on the thread the process started on, which macOS UI work needs. [UI threads](dotnet-package.md#ui-threads)
 - `dotcl:set-parallel-eval`, `dotcl:parallel-eval-p`: let `eval` and `compile` run on several threads at once instead of one at a time.

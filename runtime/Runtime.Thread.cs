@@ -649,6 +649,75 @@ public partial class Runtime
         }
     }
 
+    // (%CAS-CAR cons old new) and (%CAS-CDR cons old new): DOTCL:COMPARE-AND-SWAP
+    // on (CAR X) and (CDR X), without the global CAS lock. The comparison stays
+    // EQL (see %CAS-EXPAND): read the current value; if it is not EQL to OLD,
+    // return it; otherwise swap against the very object read, so a boxed number
+    // that is EQL to OLD but not EQ to it still swaps, and retry if another
+    // thread changed the cell in between. Returns the value read.
+    public static LispObject CasCar(LispObject cell, LispObject old, LispObject @new)
+    {
+        if (cell is not Cons c)
+            throw new LispErrorException(new LispTypeError("COMPARE-AND-SWAP: not a cons", cell, Startup.Sym("CONS")));
+        while (true)
+        {
+            var cur = System.Threading.Volatile.Read(ref c._car);
+            if (!IsTrueEql(cur, old)) return cur;
+            if (ReferenceEquals(System.Threading.Interlocked.CompareExchange(ref c._car, @new, cur), cur))
+                return cur;
+        }
+    }
+
+    public static LispObject CasCdr(LispObject cell, LispObject old, LispObject @new)
+    {
+        if (cell is not Cons c)
+            throw new LispErrorException(new LispTypeError("COMPARE-AND-SWAP: not a cons", cell, Startup.Sym("CONS")));
+        while (true)
+        {
+            var cur = System.Threading.Volatile.Read(ref c._cdr);
+            if (!IsTrueEql(cur, old)) return cur;
+            if (ReferenceEquals(System.Threading.Interlocked.CompareExchange(ref c._cdr, @new, cur), cur))
+                return cur;
+        }
+    }
+
+    // (%ATOMIC-DELTA-CAR cons delta subtract-p) and %ATOMIC-DELTA-CDR:
+    // DOTCL:ATOMIC-INCF / ATOMIC-DECF on (CAR X) and (CDR X), as a CAS loop on the
+    // field, so they exclude %CAS-CAR / %CAS-CDR on the same cell as the lock did.
+    // Returns the new value.
+    public static LispObject AtomicDeltaCar(LispObject cell, LispObject delta, LispObject subtract)
+    {
+        if (cell is not Cons c)
+            throw new LispErrorException(new LispTypeError("ATOMIC-INCF: not a cons", cell, Startup.Sym("CONS")));
+        while (true)
+        {
+            var cur = System.Threading.Volatile.Read(ref c._car);
+            var r = subtract is Nil ? Add(cur, delta) : Subtract(cur, delta);
+            if (ReferenceEquals(System.Threading.Interlocked.CompareExchange(ref c._car, r, cur), cur))
+                return r;
+        }
+    }
+
+    public static LispObject AtomicDeltaCdr(LispObject cell, LispObject delta, LispObject subtract)
+    {
+        if (cell is not Cons c)
+            throw new LispErrorException(new LispTypeError("ATOMIC-INCF: not a cons", cell, Startup.Sym("CONS")));
+        while (true)
+        {
+            var cur = System.Threading.Volatile.Read(ref c._cdr);
+            var r = subtract is Nil ? Add(cur, delta) : Subtract(cur, delta);
+            if (ReferenceEquals(System.Threading.Interlocked.CompareExchange(ref c._cdr, r, cur), cur))
+                return r;
+        }
+    }
+
+    private static LispObject CasArgs(LispObject[] args, string who, Func<LispObject, LispObject, LispObject, LispObject> fn)
+    {
+        if (args.Length != 3)
+            throw new LispErrorException(new LispProgramError($"{who}: requires three arguments"));
+        return fn(args[0], args[1], args[2]);
+    }
+
     // (%ATOMIC-DELTA-SYMBOL-VALUE lock symbol delta subtract-p): DOTCL:ATOMIC-INCF
     // (or ATOMIC-DECF when SUBTRACT-P) on a globally special variable, under LOCK,
     // for the reason CasSymbolValue gives. Returns the new value.
@@ -941,6 +1010,15 @@ public partial class Runtime
             new LispFunction(Runtime.CasSymbolValue, "%CAS-SYMBOL-VALUE", 4));
         Emitter.CilAssembler.RegisterFunction("%ATOMIC-DELTA-SYMBOL-VALUE",
             new LispFunction(Runtime.AtomicDeltaSymbolValue, "%ATOMIC-DELTA-SYMBOL-VALUE", 4));
+        foreach (var (name, fn) in new (string, Func<LispObject, LispObject, LispObject, LispObject>)[] {
+                     ("%CAS-CAR", Runtime.CasCar), ("%CAS-CDR", Runtime.CasCdr),
+                     ("%ATOMIC-DELTA-CAR", Runtime.AtomicDeltaCar), ("%ATOMIC-DELTA-CDR", Runtime.AtomicDeltaCdr) })
+        {
+            var who = name;
+            var lf = new LispFunction(args => Runtime.CasArgs(args, who, fn), name, 3);
+            lf.SetDirectDelegate(fn);
+            Emitter.CilAssembler.RegisterFunction(name, lf);
+        }
         Emitter.CilAssembler.RegisterFunction("%THREAD-JOIN",
             new LispFunction(Runtime.ThreadJoin, "%THREAD-JOIN"));
         Emitter.CilAssembler.RegisterFunction("%THREAD-YIELD",

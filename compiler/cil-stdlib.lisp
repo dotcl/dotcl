@@ -1378,13 +1378,19 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 
 ;;; ===== Generic atomic operations on arbitrary CL places =====
 ;;;
-;;; dotcl:compare-and-swap / atomic-incf / atomic-decf. Lock-based (a single
-;;; global monitor): correct among concurrent atomic operations, but NOT
-;;; lock-free. Because these expand through GET-SETF-EXPANSION, every place SETF
-;;; understands works uniformly: a special/lexical variable, CAR/CDR, SVREF/AREF,
-;;; GETHASH, SLOT-VALUE, a struct slot, etc. The place subforms are captured to
-;;; temporaries up front, so the read-compare-write runs under the lock on a
-;;; consistent snapshot. For a single 64-bit counter the lock-free
+;;; dotcl:compare-and-swap / atomic-incf / atomic-decf. A cons field named by a
+;;; standard accessor (CAR, CDR, FIRST, REST, CADR and the other C[AD]R
+;;; compositions, SECOND .. TENTH, NTH) is lock-free: the runtime swaps the cons's
+;;; field with Interlocked.CompareExchange (%CAS-CAR and friends). Every other
+;;; place is lock-based (a single global monitor): correct among concurrent
+;;; atomic operations, but NOT lock-free. Because those expand through
+;;; GET-SETF-EXPANSION, every place SETF understands works uniformly: a
+;;; special/lexical variable, SVREF/AREF, GETHASH, SLOT-VALUE, a struct slot, etc.
+;;; The place subforms are captured to temporaries up front, so the
+;;; read-compare-write runs under the lock on a consistent snapshot. A cons field
+;;; reached through a user-defined macro, setf function or setf expander goes
+;;; through the lock, which does not exclude %CAS-CAR on the same field: swap such
+;;; a field through one of the standard accessors. For a single 64-bit counter the lock-free
 ;;; MAKE-ATOMIC-LONG primitive is the faster path.
 ;;;
 ;;; The DOTCL-package macro names are interned and registered at runtime rather
@@ -1403,6 +1409,33 @@ Also expands element types within compound type specifiers like (VECTOR etype si
        (not (keywordp place))
        (not (constantp place))
        (global-special-p place)))
+
+(defun %cas-cons-field (place)
+  "When PLACE is a standard accessor of one cons field -- CAR, CDR, FIRST, REST,
+   the C[AD]{2,4}R compositions, SECOND .. TENTH, or NTH -- return :CAR or :CDR
+   and a form for the cons that holds the field. Else NIL."
+  (when (and (consp place) (symbolp (car place)) (consp (cdr place))
+             (eq (symbol-package (car place)) (find-package "COMMON-LISP")))
+    (let* ((op (car place)) (args (cdr place)) (name (symbol-name op)) (len (length name))
+           (nth-index (position op '(first second third fourth fifth
+                                     sixth seventh eighth ninth tenth))))
+      (cond
+        ((eq op 'nth)
+         (when (and (consp (cdr args)) (null (cddr args)))
+           (values :car `(nthcdr ,(car args) ,(cadr args)))))
+        ((cdr args) nil)
+        ((eql nth-index 0) (values :car (car args)))
+        (nth-index (values :car `(nthcdr ,nth-index ,(car args))))
+        ((eq op 'rest) (values :cdr (car args)))
+        ((and (<= 3 len 6) (char= (char name 0) #\C) (char= (char name (1- len)) #\R)
+              (every (lambda (ch) (or (char= ch #\A) (char= ch #\D)))
+                     (subseq name 1 (1- len))))
+         ;; (CADDR X) is the car of (CDR (CDR X)): the first letter names the
+         ;; field, the rest walk to its cons, innermost last.
+         (let ((form (car args)))
+           (loop for i from (- len 2) downto 2
+                 do (setq form (list (if (char= (char name i) #\A) 'car 'cdr) form)))
+           (values (if (char= (char name 1) #\A) :car :cdr) form)))))))
 
 (defun %cas-expand (place old new)
   ;; Returns the PRIOR value of PLACE (sb-ext / CCL / Interlocked.CompareExchange
@@ -1424,6 +1457,11 @@ Also expands element types within compound type specifiers like (VECTOR etype si
   (when (%cas-special-variable-p place)
     (return-from %cas-expand
       `(%cas-symbol-value *cas-lock* ',place ,old ,new)))
+  ;; A cons field: the runtime swaps it without the lock, comparing by EQL.
+  (multiple-value-bind (field cell) (%cas-cons-field place)
+    (case field
+      (:car (return-from %cas-expand `(%cas-car ,cell ,old ,new)))
+      (:cdr (return-from %cas-expand `(%cas-cdr ,cell ,old ,new)))))
   (multiple-value-bind (temps vals stores setter getter) (get-setf-expansion place)
     (let ((s (car stores)) (o (gensym "OLD")) (n (gensym "NEW")) (cur (gensym "CUR")))
       `(let* (,@(mapcar #'list temps vals) (,o ,old) (,n ,new))
@@ -1440,6 +1478,13 @@ Also expands element types within compound type specifiers like (VECTOR etype si
   (when (%cas-special-variable-p place)
     (return-from %atomic-delta-expand
       `(%atomic-delta-symbol-value *cas-lock* ',place ,delta ,(eq op '-))))
+  ;; A cons field: a CAS loop in the runtime, so it excludes %CAS-CAR / %CAS-CDR.
+  (multiple-value-bind (field cell) (%cas-cons-field place)
+    (case field
+      (:car (return-from %atomic-delta-expand
+              `(%atomic-delta-car ,cell ,delta ,(eq op '-))))
+      (:cdr (return-from %atomic-delta-expand
+              `(%atomic-delta-cdr ,cell ,delta ,(eq op '-))))))
   (multiple-value-bind (temps vals stores setter getter) (get-setf-expansion place)
     (let ((s (car stores)) (d (gensym "D")) (r (gensym "NEW")))
       `(let* (,@(mapcar #'list temps vals) (,d ,delta))
