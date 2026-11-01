@@ -566,6 +566,7 @@ public static partial class Runtime
         // per-class make-instance fast-path caches (else already-instantiated
         // classes silently skip it).
         InvalidateSimpleInitCaches(gf);
+        InvalidateSlotAccessShortcuts(gf);
         NotifyDirectMethod(method, adding: true);
         NotifyDiscriminatingFunction(gf);
         NotifyDependents(gf, Startup.Sym("ADD-METHOD"), method);
@@ -589,6 +590,17 @@ public static partial class Runtime
                 c.CachedHasCustomInitMethods = null; // the fast-path gate itself
             }
         }
+    }
+
+    // Called after ADD-METHOD / REMOVE-METHOD. An accessor generic function's
+    // dispatch cache can hold a reader or writer shortcut that reads the slot
+    // vector directly, chosen because no slot-access method applied to the class
+    // when the entry was made (UsesSlotProtocol). Those entries are not keyed on
+    // the method epoch, so a method added to (or removed from) one of the
+    // *-USING-CLASS generic functions has to clear them in every generic function.
+    private static void InvalidateSlotAccessShortcuts(GenericFunction gf)
+    {
+        if (SlotProtocolGFs.Contains(gf)) InvalidateAllDispatchCaches();
     }
 
     public static LispObject RemoveMethod(LispObject gfObj, LispObject methodObj)
@@ -619,6 +631,7 @@ public static partial class Runtime
         // Removing an INITIALIZE-INSTANCE / SHARED-INITIALIZE method also changes
         // the make-instance fast-path eligibility: invalidate the per-class caches.
         InvalidateSimpleInitCaches(gf);
+        InvalidateSlotAccessShortcuts(gf);
         NotifyDirectMethod(method, adding: false);
         NotifyDiscriminatingFunction(gf);
         NotifyDependents(gf, Startup.Sym("REMOVE-METHOD"), method);

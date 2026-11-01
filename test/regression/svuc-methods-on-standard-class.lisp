@@ -50,3 +50,38 @@
       (setf (slot-value w 'foo) 5)
       (list (slot-value w 'foo) (remove :read *svucs-log*))))
   (5 nil))
+
+;; A method added after the accessor has been called. The accessor's generic
+;; function also has a method of another kind, so a compiled call site does not
+;; cache the slot itself and the call goes through the generic function's own
+;; dispatch cache, which held a direct reader / writer for the class from the
+;; calls before the method existed: the new method did not run until something
+;; else cleared that cache.
+(defclass svucs-late () ((foo :initform 1 :accessor svucs-late-foo)))
+(defclass svucs-late-other () ())
+(defmethod svucs-late-foo ((o svucs-late-other)) :other)
+(defmethod (setf svucs-late-foo) (v (o svucs-late-other)) v)
+(defun %svucs-late-read (o) (svucs-late-foo o))
+(defun %svucs-late-write (v o) (setf (svucs-late-foo o) v))
+
+(deftest svuc-method-added-after-accessor-calls
+  (let ((o (make-instance 'svucs-late)) (*svucs-log* nil))
+    (%svucs-late-read o) (%svucs-late-read o)
+    (%svucs-late-write 2 o) (%svucs-late-write 3 o)
+    (let ((r (defmethod dotcl-mop:slot-value-using-class :around
+                 ((c standard-class) (o svucs-late) s)
+               (declare (ignore c s))
+               (push :read *svucs-log*)
+               (call-next-method)))
+          (w (defmethod (setf dotcl-mop:slot-value-using-class) :after
+                 (v (c standard-class) (o svucs-late) s)
+               (declare (ignore c s))
+               (push (list :write v) *svucs-log*))))
+      (let ((with (list (%svucs-late-read o) (%svucs-late-write 4 o)))
+            (log-with (reverse *svucs-log*)))
+        (remove-method #'dotcl-mop:slot-value-using-class r)
+        (remove-method #'(setf dotcl-mop:slot-value-using-class) w)
+        (setq *svucs-log* nil)
+        (list with log-with
+              (list (%svucs-late-read o) (%svucs-late-write 5 o)) *svucs-log*))))
+  ((3 4) (:read (:write 4)) (4 5) nil))
