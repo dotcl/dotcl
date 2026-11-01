@@ -116,9 +116,10 @@ INSTANCES-OF when only the count matters."
 ;;; surprises you, not for anything in a loop.
 ;;;
 ;;; Auto-properties are read through their compiler-generated backing field
-;;; (`<Cdr>k__BackingField`), not the property name. Reading the property name
+;;; (`<Name>k__BackingField`), not the property name. Reading the property name
 ;;; does not error, it just returns nothing: which silently looks like a fast
-;;; pass over an empty heap.
+;;; pass over an empty heap. A cons keeps its fields in `_car` / `_cdr`; older
+;;; runtimes had auto-properties there, so both names are tried.
 
 (defun %type-name (obj)
   (let ((ty (dotnet:invoke obj "get_Type")))
@@ -179,8 +180,10 @@ rather than one."
       (let ((o (dotnet:invoke lst "get_Item" i)))
         (when (equal (%type-name o) "DotCL.Cons")
           (let* ((addr (dotnet:invoke o "get_Address"))
-                 (cdr-obj (ignore-errors
-                           (dotnet:invoke o "ReadObjectField" "<Cdr>k__BackingField")))
+                 (cdr-obj (or (ignore-errors
+                               (dotnet:invoke o "ReadObjectField" "_cdr"))
+                              (ignore-errors
+                               (dotnet:invoke o "ReadObjectField" "<Cdr>k__BackingField"))))
                  (cdr-addr (and cdr-obj
                                 (ignore-errors (dotnet:invoke cdr-obj "get_Address")))))
             (setf (gethash addr cdr-of) (or cdr-addr 0))))))
