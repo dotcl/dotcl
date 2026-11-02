@@ -191,7 +191,12 @@ public class LispPathname : LispObject
                         continue;
                     }
                 }
-                if (c.Car is Symbol upSym && upSym.Name == "UP")
+                // :BACK left in a directory (one MergeDirectories could not
+                // fold, or one made with MAKE-PATHNAME) names the parent on a
+                // POSIX file system just as :UP does.  Dropping it made
+                // (truename #P"/a/b/..") -- directory (:absolute "a" "b" :back)
+                // -- answer /a/b/.
+                if (c.Car is Symbol upSym && (upSym.Name == "UP" || upSym.Name == "BACK"))
                     sb.Append("../");
                 else if (c.Car is Symbol wildSym && wildSym.Name == "WILD")
                     sb.Append("*/");
@@ -257,11 +262,19 @@ public class LispPathname : LispObject
                     result.Add(c.Car);
                     cur = c.Cdr;
                 }
-                // Append relative parts (skip :relative keyword)
+                // Append relative parts (skip :relative keyword).  CLHS
+                // MERGE-PATHNAMES: a :BACK that follows a directory name is
+                // removed together with that name, so (:relative :back)
+                // merged into (:absolute "a" "b") is (:absolute "a").  :UP
+                // stays: it is syntactic, and the file system resolves it.
                 cur = dirCons.Cdr;
                 while (cur is Cons c)
                 {
-                    result.Add(c.Car);
+                    if (c.Car is Symbol backSym && backSym.Name == "BACK"
+                        && result.Count > 1 && result[^1] is LispString)
+                        result.RemoveAt(result.Count - 1);
+                    else
+                        result.Add(c.Car);
                     cur = c.Cdr;
                 }
                 return Runtime.List(result.ToArray());
