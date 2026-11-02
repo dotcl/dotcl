@@ -3382,17 +3382,22 @@ public static partial class Runtime
                         var body2 = ParseCaseBody(template, ref i);
                         bool upAndOut = false;
                         string inner;
-                        int caseSubIdx = 0;
+                        // The body consumes the same arguments as the directives
+                        // around it, as ~[ does: format it against the whole list
+                        // from the current position, so a ~:* at its start backs up
+                        // over an argument used before the ~( ("~D time~(~:*~P~)").
+                        // A sub-array starting here had nothing behind the cursor.
+                        int caseSubIdx = argIdx;
                         try
                         {
-                            inner = FormatString(body2, args.SubArray(argIdx), ref caseSubIdx);
+                            inner = FormatString(body2, args, ref caseSubIdx);
                         }
                         catch (FormatUpAndOutException ex)
                         {
                             inner = ex.PartialOutput;
                             upAndOut = true;
                         }
-                        argIdx += caseSubIdx;
+                        argIdx = caseSubIdx;
                         string converted = ApplyCaseConversion(inner, colonMod, atMod);
                         sb.Append(converted);
                         if (upAndOut)
