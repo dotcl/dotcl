@@ -810,6 +810,7 @@
 (load-skip-under-interp "test/regression/format-directive-consing.lisp")
 (load-skip-under-interp "test/regression/format-up-and-out.lisp")
 (load-skip-under-interp "test/regression/format-missing-argument.lisp")
+(load "test/regression/format-case-conversion-arguments.lisp")
 (load-skip-under-interp "test/regression/make-array-no-dims-array.lisp")
 (load "test/regression/multiple-values-direct.lisp")
 (load "test/regression/the-multiple-values.lisp")
