@@ -110,6 +110,7 @@
 (load-skip-under-interp "test/regression/probe-file-directory.lisp")
 (load-skip-under-interp "test/regression/logical-pathname-designator.lisp")
 (load-skip-under-interp "test/regression/merge-pathnames-version.lisp")
+(load "test/regression/merge-pathnames-back.lisp")
 (load-skip-under-interp "test/regression/uiop-native-namestring-windows.lisp")
 (load "test/regression/dotcl-native-namestring.lisp")
 (when (find :dotcl-emit *features*) (load-skip-under-interp "test/regression/cli-script-arguments.lisp"))
