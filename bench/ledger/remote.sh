@@ -12,7 +12,7 @@
 # be committed. LEDGER_BASELINE names another local file to use instead, both as
 # the previous run sent to the machine and as the place the new one is saved.
 #
-# LEDGER_ROUNDS, LEDGER_ONLY, LEDGER_SAVE, LEDGER_REG_PCT, LEDGER_APPEND and the
+# LEDGER_ROUNDS, LEDGER_STARTUP_COUNT, LEDGER_ONLY, LEDGER_SAVE, LEDGER_REG_PCT, LEDGER_APPEND and the
 # LEDGER_* threshold and steady-detection variables are passed on.
 # LEDGER_PUBLISH=1 replaces the ledger issue body from here, after the copy back
 # (gh is run on this machine, not on the measuring one).
@@ -42,7 +42,7 @@ if [ "${LEDGER_NOBUILD:-0}" != 1 ]; then
     ${lock:+flock $lock} bash -c 'make setup-asdf cross-compile compile-asdf-fasl compile-quicklisp-fasl < /dev/null > $wd/build.log 2>&1 && make bench-build compile-core-fasl < /dev/null >> $wd/build.log 2>&1'"
 fi
 pass=""
-for v in LEDGER_ROUNDS LEDGER_ONLY LEDGER_SAVE LEDGER_REG_PCT LEDGER_APPEND \
+for v in LEDGER_ROUNDS LEDGER_STARTUP_COUNT LEDGER_ONLY LEDGER_SAVE LEDGER_REG_PCT LEDGER_APPEND \
          LEDGER_COLD_MAX LEDGER_STEADY_MAX LEDGER_STEADY_STRONG \
          LEDGER_STEADY_TOLERANCE LEDGER_STEADY_WINDOW \
          LEDGER_STEADY_MIN_RUNS LEDGER_STEADY_MIN_SECONDS \

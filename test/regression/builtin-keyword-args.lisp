@@ -10,8 +10,8 @@
 
 (defun kwargs-noop (&rest r) (declare (ignore r)) nil)
 
-;; Not called at all: they build or save an application.
-(defparameter *kwargs-not-called* '("SAVE-APPLICATION" "BUILD-LIBRARY"))
+;; Not called at all: they build or save an application, or end the process.
+(defparameter *kwargs-not-called* '("SAVE-APPLICATION" "BUILD-LIBRARY" "QUIT" "EXIT"))
 
 ;; Their NONE / UNKNOWN-AOK calls fail with a PROGRAM-ERROR of their own (no
 ;; lock held, no such program, no compiler on the emit-free build).

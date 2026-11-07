@@ -96,7 +96,7 @@ outside; the reader then signals a `reader-error` on `#.` instead:
 
 ```lisp
 (let ((*read-eval* nil))
-  (read-from-string untrusted-text))
+  (read-from-string "#.(+ 1 2)"))        ; => signals a reader-error
 ```
 
 The same applies to `EvalString`: it reads before it evaluates, so text you

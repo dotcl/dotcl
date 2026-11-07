@@ -24,6 +24,11 @@ public static partial class Runtime
             return Bignum.MakeInteger(new System.Numerics.BigInteger(fa.Value) + fb.Value);
         if (a is DoubleFloat da && b is DoubleFloat db)
             return new DoubleFloat(da.Value + db.Value);
+        // A fixnum with a double: the fixnum is exact as a double up to 2^53.
+        if (a is Fixnum mfa && b is DoubleFloat mdb && mfa.Value >= -(1L << 53) && mfa.Value <= (1L << 53))
+            return new DoubleFloat((double)mfa.Value + mdb.Value);
+        if (a is DoubleFloat mda && b is Fixnum mfb && mfb.Value >= -(1L << 53) && mfb.Value <= (1L << 53))
+            return new DoubleFloat(mda.Value + (double)mfb.Value);
         if (a is SingleFloat sfa && b is SingleFloat sfb)
             return new SingleFloat(sfa.Value + sfb.Value);
         if (a is Bignum or Fixnum && b is Bignum or Fixnum)
@@ -57,6 +62,11 @@ public static partial class Runtime
             return Bignum.MakeInteger(new System.Numerics.BigInteger(fa.Value) - fb.Value);
         if (a is DoubleFloat da && b is DoubleFloat db)
             return new DoubleFloat(da.Value - db.Value);
+        // A fixnum with a double: the fixnum is exact as a double up to 2^53.
+        if (a is Fixnum mfa && b is DoubleFloat mdb && mfa.Value >= -(1L << 53) && mfa.Value <= (1L << 53))
+            return new DoubleFloat((double)mfa.Value - mdb.Value);
+        if (a is DoubleFloat mda && b is Fixnum mfb && mfb.Value >= -(1L << 53) && mfb.Value <= (1L << 53))
+            return new DoubleFloat(mda.Value - (double)mfb.Value);
         if (a is SingleFloat sfa && b is SingleFloat sfb)
             return new SingleFloat(sfa.Value - sfb.Value);
         if (a is Bignum or Fixnum && b is Bignum or Fixnum)
@@ -365,6 +375,11 @@ public static partial class Runtime
         }
         if (a is DoubleFloat da && b is DoubleFloat db)
             return new DoubleFloat(da.Value * db.Value);
+        // A fixnum with a double: the fixnum is exact as a double up to 2^53.
+        if (a is Fixnum mfa && b is DoubleFloat mdb && mfa.Value >= -(1L << 53) && mfa.Value <= (1L << 53))
+            return new DoubleFloat((double)mfa.Value * mdb.Value);
+        if (a is DoubleFloat mda && b is Fixnum mfb && mfb.Value >= -(1L << 53) && mfb.Value <= (1L << 53))
+            return new DoubleFloat(mda.Value * (double)mfb.Value);
         if (a is SingleFloat sfa && b is SingleFloat sfb)
             return new SingleFloat(sfa.Value * sfb.Value);
         if (a is Bignum or Fixnum && b is Bignum or Fixnum)
@@ -878,6 +893,21 @@ public static partial class Runtime
         return false;
     }
 
+    // The one-argument forms of + * = < ... LOGIOR ... only check their argument; the compiler emits these.
+    public static LispObject CheckNumber1(LispObject a) { AsNumber(a); return a; }
+    public static LispObject CheckReal1(LispObject a)
+    {
+        var n = AsNumber(a);
+        if (n is LispComplex)
+            throw new LispErrorException(new LispTypeError("not a real number", a, Startup.Sym("REAL")));
+        return a;
+    }
+    public static LispObject CheckInteger1(LispObject a)
+    {
+        if (a is Fixnum || a is Bignum) return a;
+        throw new LispErrorException(new LispTypeError("not an integer", a, Startup.Sym("INTEGER")));
+    }
+
     // --- Variadic comparison (for #'= etc. via funcall with any arg count) ---
 
     private static void RequireAtLeastOne(string name, LispObject[] args)
@@ -1037,14 +1067,16 @@ public static partial class Runtime
         => RandomImpl(limit, GetCurrentRandomState());
     public static LispObject Random2(LispObject limit, LispObject state)
     {
-        var rs = state is LispRandomState r ? r : GetCurrentRandomState();
+        if (state is not LispRandomState rs)
+            throw new LispErrorException(new LispTypeError("RANDOM: not a random-state", state, Startup.Sym("RANDOM-STATE")));
         return RandomImpl(limit, rs);
     }
     public static double RandomDoubleRaw(double limit)
         => RandomDoubleImpl(limit, GetCurrentRandomState());
     public static double RandomDoubleRaw2(double limit, LispObject state)
     {
-        var rs = state is LispRandomState r ? r : GetCurrentRandomState();
+        if (state is not LispRandomState rs)
+            throw new LispErrorException(new LispTypeError("RANDOM: not a random-state", state, Startup.Sym("RANDOM-STATE")));
         return RandomDoubleImpl(limit, rs);
     }
     static bool TryMulLong(long a, long b, out long r)
@@ -1166,7 +1198,18 @@ public static partial class Runtime
                     ? Arithmetic.ToDouble(lcpw.Real)
                     : Arithmetic.ToDouble(AsNumber(power));
                 if (powerReal > 0)
-                    return Arithmetic.Multiply(AsNumber(baseObj), AsNumber(power));
+                {
+                    var zeroProduct = Arithmetic.Multiply(AsNumber(baseObj), AsNumber(power));
+                    // pow(-0, y) is -0 only for an odd integer y; for any other positive
+                    // power the sign of the zero is lost, as (expt -0.0 2) = 0.0.
+                    bool negativeZeroBase = (baseObj is SingleFloat nsz && Compat.IsNegative((double)nsz.Value))
+                        || (baseObj is DoubleFloat ndz && Compat.IsNegative(ndz.Value));
+                    bool oddIntegerPower = !(power is LispComplex) && powerReal == Math.Floor(powerReal)
+                        && Math.Abs(powerReal % 2.0) == 1.0;
+                    if (negativeZeroBase && !oddIntegerPower)
+                        return Arithmetic.Multiply(zeroProduct, Fixnum.Make(-1));
+                    return zeroProduct;
+                }
                 if (power is LispComplex)
                     throw new LispErrorException(new LispError("EXPT: division by zero (0 raised to a non-positive complex power)") { ConditionTypeName = "DIVISION-BY-ZERO" });
                 if (powerReal < 0 && baseIsExact && powerIsExact)
@@ -1236,7 +1279,10 @@ public static partial class Runtime
                     var result = System.Numerics.BigInteger.Pow(bigBase, (int)bigPow);
                     return MakeInteger(result);
                 }
-                // Huge exponent: fall through to double
+                // Huge exponent: the exact integer cannot be built. Silently answering a
+                // float (infinity) for integer arguments is the wrong type; say so.
+                if (bigBase.IsZero) return Fixnum.Make(0);
+                throw new LispErrorException(new LispStorageCondition("EXPT: the result is too large to represent"));
             }
             else if (bigPow < 0)
             {
@@ -1248,7 +1294,8 @@ public static partial class Runtime
                     var denom = System.Numerics.BigInteger.Pow(bigBase, (int)(-bigPow));
                     return Ratio.Make(System.Numerics.BigInteger.One, denom);
                 }
-                // Huge negative exponent: fall through to double
+                // Huge negative exponent: the exact ratio cannot be built either.
+                throw new LispErrorException(new LispStorageCondition("EXPT: the result is too large to represent"));
             }
         }
 
@@ -1312,6 +1359,20 @@ public static partial class Runtime
     /// <summary>ASH of an int64 by a count in [-63, 63] whose result the compiler proved fits.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long AshLong(long x, long n) => n >= 0 ? x << (int)n : x >> (int)-n;
+
+    /// <summary>ABS of an int64 whose absolute value fits (the compiler proves it).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long AbsFixnumL(long a) => a < 0 ? -a : a;
+
+    /// <summary>ISQRT of a non-negative int64.</summary>
+    public static long IsqrtFixnumL(long n)
+    {
+        if (n < 2) return n;
+        long r = (long)Math.Sqrt((double)n);
+        while (r > 0 && (ulong)r * (ulong)r > (ulong)n) r--;
+        while ((ulong)(r + 1) * (ulong)(r + 1) <= (ulong)n) r++;
+        return r;
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long ModFixnumL(long a, long b)
@@ -1395,8 +1456,91 @@ public static partial class Runtime
     // OP entry returns both values; the OPPRIMARY entry is what the peephole
     // swaps in when the call site is in single-value position, where the MvReturn
     // would be built and unwrapped in consecutive instructions.
+    // FLOOR / TRUNCATE / CEILING / ROUND of a float by 1 (the one-argument form): the integer part
+    // and the remainder are computed in the float's own format, without the rational arithmetic of the
+    // general route. MODE 0 floor, 1 truncate, 2 ceiling, 3 round (to even). False for anything else
+    // (another divisor, a ratio, a non-finite float), which takes the general route.
+    private static bool FloatByOne(LispObject a, LispObject b, int mode, out LispObject q, out LispObject r)
+    {
+        q = r = null!;
+        if (b is not Fixnum one || one.Value != 1) return false;
+        if (a is DoubleFloat da)
+        {
+            double d = da.Value;
+            if (double.IsNaN(d) || double.IsInfinity(d)) return false;
+            double t = mode == 0 ? Math.Floor(d) : mode == 1 ? Math.Truncate(d)
+                     : mode == 2 ? Math.Ceiling(d) : Math.Round(d, MidpointRounding.ToEven);
+            q = Arithmetic.FloatToInteger(t);
+            r = new DoubleFloat(t == 0 ? d : d - t);
+            return true;
+        }
+        if (a is SingleFloat sa)
+        {
+            float f = sa.Value;
+            if (float.IsNaN(f) || float.IsInfinity(f)) return false;
+            double t = mode == 0 ? Math.Floor(f) : mode == 1 ? Math.Truncate(f)
+                     : mode == 2 ? Math.Ceiling(f) : Math.Round(f, MidpointRounding.ToEven);
+            q = Arithmetic.FloatToInteger(t);
+            r = new SingleFloat(t == 0 ? f : (float)(f - t));
+            return true;
+        }
+        return false;
+    }
+
+    // The integer part alone (the single-value call site), with no remainder object.
+    private static bool FloatQuotientByOne(LispObject a, LispObject b, int mode, out LispObject q)
+    {
+        q = null!;
+        if (b is not Fixnum one || one.Value != 1) return false;
+        double d;
+        if (a is DoubleFloat da) d = da.Value;
+        else if (a is SingleFloat sa) d = sa.Value;
+        else return false;
+        if (double.IsNaN(d) || double.IsInfinity(d)) return false;
+        double t = mode == 0 ? Math.Floor(d) : mode == 1 ? Math.Truncate(d)
+                 : mode == 2 ? Math.Ceiling(d) : Math.Round(d, MidpointRounding.ToEven);
+        q = Arithmetic.FloatToInteger(t);
+        return true;
+    }
+
+    // ROUND of two fixnums (to even), in a long. False when the quotient could overflow or B is 0.
+    private static bool TryRoundLong(long a, long b, out long q, out long r)
+    {
+        q = r = 0;
+        if (b == 0 || (a == long.MinValue && b == -1)) return false;
+        q = a / b;
+        r = a % b;
+        if (r != 0)
+        {
+            ulong ab = b == long.MinValue ? 1UL << 63 : (ulong)Math.Abs(b);
+            ulong twice = (ulong)Math.Abs(r) * 2;
+            if (twice > ab || (twice == ab && (q & 1) != 0))
+            {
+                bool neg = (r < 0) != (b < 0);
+                q += neg ? -1 : 1;
+                r -= neg ? -b : b;
+            }
+        }
+        return true;
+    }
+
+    private static (LispObject Q, LispObject R) CeilingParts(LispObject a, LispObject b)
+    {
+        if (FloatByOne(a, b, 2, out var fq, out var fr)) return (fq, fr);
+        return Arithmetic.Ceiling(AsNumber(a), AsNumber(b));
+    }
+
+    private static (LispObject Q, LispObject R) RoundParts(LispObject a, LispObject b)
+    {
+        if (a is Fixnum fa && b is Fixnum fb && TryRoundLong(fa.Value, fb.Value, out long rq, out long rr))
+            return (Fixnum.Make(rq), Fixnum.Make(rr));
+        if (FloatByOne(a, b, 3, out var fq, out var fr)) return (fq, fr);
+        return Arithmetic.Round(AsNumber(a), AsNumber(b));
+    }
+
     private static (LispObject Q, LispObject R) FloorParts(LispObject a, LispObject b)
     {
+        if (FloatByOne(a, b, 0, out var fq, out var fr)) return (fq, fr);
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
@@ -1415,6 +1559,7 @@ public static partial class Runtime
     }
     public static LispObject FloorOpPrimary(LispObject a, LispObject b)
     {
+        if (FloatQuotientByOne(a, b, 0, out var fq)) return fq;
         var (q, r) = FloorParts(a, b);
         return MultipleValues.Values2Primary(q, r);
     }
@@ -1426,6 +1571,7 @@ public static partial class Runtime
 
     private static (LispObject Q, LispObject R) TruncateParts(LispObject a, LispObject b)
     {
+        if (FloatByOne(a, b, 1, out var fq, out var fr)) return (fq, fr);
         if (a is Fixnum fa && b is Fixnum fb)
         {
             long av = fa.Value, bv = fb.Value;
@@ -1444,6 +1590,7 @@ public static partial class Runtime
     }
     public static LispObject TruncateOpPrimary(LispObject a, LispObject b)
     {
+        if (FloatQuotientByOne(a, b, 1, out var fq)) return fq;
         var (q, r) = TruncateParts(a, b);
         return MultipleValues.Values2Primary(q, r);
     }
@@ -1455,32 +1602,34 @@ public static partial class Runtime
 
     public static LispObject CeilingOp(LispObject a, LispObject b)
     {
-        var (q, r) = Arithmetic.Ceiling(AsNumber(a), AsNumber(b));
+        var (q, r) = CeilingParts(a, b);
         return MultipleValues.Values2(q, r);
     }
     public static LispObject CeilingOpPrimary(LispObject a, LispObject b)
     {
-        var (q, r) = Arithmetic.Ceiling(AsNumber(a), AsNumber(b));
+        if (FloatQuotientByOne(a, b, 2, out var fq)) return fq;
+        var (q, r) = CeilingParts(a, b);
         return MultipleValues.Values2Primary(q, r);
     }
     public static LispObject CeilingOpPair(LispObject a, LispObject b)
     {
-        var (q, r) = Arithmetic.Ceiling(AsNumber(a), AsNumber(b));
+        var (q, r) = CeilingParts(a, b);
         return MultipleValues.Values2Pair(q, r);
     }
     public static LispObject RoundOp(LispObject a, LispObject b)
     {
-        var (q, r) = Arithmetic.Round(AsNumber(a), AsNumber(b));
+        var (q, r) = RoundParts(a, b);
         return MultipleValues.Values2(q, r);
     }
     public static LispObject RoundOpPrimary(LispObject a, LispObject b)
     {
-        var (q, r) = Arithmetic.Round(AsNumber(a), AsNumber(b));
+        if (FloatQuotientByOne(a, b, 3, out var fq)) return fq;
+        var (q, r) = RoundParts(a, b);
         return MultipleValues.Values2Primary(q, r);
     }
     public static LispObject RoundOpPair(LispObject a, LispObject b)
     {
-        var (q, r) = Arithmetic.Round(AsNumber(a), AsNumber(b));
+        var (q, r) = RoundParts(a, b);
         return MultipleValues.Values2Pair(q, r);
     }
     public static LispObject Lcm(LispObject a, LispObject b) => Arithmetic.Lcm(AsNumber(a), AsNumber(b));
@@ -1838,8 +1987,23 @@ public static partial class Runtime
         return Fixnum.Make((int)n.GetBitLength());
     }
 
+    /// <summary>EVENP / ODDP of an integer already known to be one (the compiler tests INTEGERP first).</summary>
+    public static LispObject IntegerEvenp(LispObject n)
+        => (n is Fixnum f ? (f.Value & 1L) == 0 : n is Bignum b ? b.Value.IsEven : ModTwoIsZero(n)) ? T.Instance : Nil.Instance;
+
+    private static bool ModTwoIsZero(LispObject n) => Mod(n, Fixnum.Make(2)) is Fixnum m && m.Value == 0;
+
     public static LispObject Logbitp(LispObject index, LispObject integer)
     {
+        // A small index into a fixnum, or into a bignum: the bit is the parity of the integer shifted down.
+        if (index is Fixnum fidx && fidx.Value >= 0 && fidx.Value <= int.MaxValue)
+        {
+            int bi0 = (int)fidx.Value;
+            if (integer is Fixnum fn)
+                return ((bi0 >= 63 ? (fn.Value < 0 ? 1L : 0L) : (fn.Value >> bi0) & 1L) != 0) ? T.Instance : Nil.Instance;
+            if (integer is Bignum bn)
+                return (bn.Value >> bi0).IsEven ? Nil.Instance : T.Instance;
+        }
         System.Numerics.BigInteger bitIdx = index is Fixnum fi ? fi.Value :
             index is Bignum bi ? bi.Value :
             throw new LispErrorException(new LispTypeError("LOGBITP: not a non-negative integer", index));
@@ -1855,7 +2019,8 @@ public static partial class Runtime
     // CL documentation storage: (symbol, doc-type-string) -> LispObject
     // ConcurrentDictionary: (setf documentation) on separate threads writes this
     // while documentation reads it: a plain Dictionary corrupts under concurrent write.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string sym, string docType), LispObject> _docs = new();
+    private static System.Collections.Concurrent.ConcurrentDictionary<(string sym, string docType), LispObject>? _lz__docs;
+    private static System.Collections.Concurrent.ConcurrentDictionary<(string sym, string docType), LispObject> _docs => System.Threading.Volatile.Read(ref _lz__docs) ?? System.Threading.Interlocked.CompareExchange(ref _lz__docs, new(), null) ?? _lz__docs!;
 
     // Function docstrings from [LispDoc] attributes, keyed by the symbol itself
     // (Symbol does not override Equals, so this is an identity table). Keying by
@@ -1940,8 +2105,6 @@ public static partial class Runtime
     {
         int colonPos = s.IndexOf(':');
         if (colonPos <= 0) return false;
-        // Drive letters like "C:" are not logical pathnames (single char)
-        if (colonPos == 1) return false;
         string host = s[..colonPos];
         // Check if host name has translations registered
         return _logicalPathnameTranslations.ContainsKey(host.ToUpperInvariant());
@@ -2347,12 +2510,14 @@ public static partial class Runtime
                 return num switch {
                     Fixnum f => (LispObject)new SingleFloat((float)f.Value),
                     Bignum b => (LispObject)new SingleFloat((float)Arithmetic.ToDouble(b)),
-                    Ratio r => (LispObject)new SingleFloat((float)Arithmetic.RatioToDouble(r)),
+                    Ratio r => (LispObject)new SingleFloat(Arithmetic.RatioToSingle(r)),
                     LispDecimal d => (LispObject)new SingleFloat((float)d.Value),
                     _ => throw new LispErrorException(new LispTypeError("FLOAT: not a number", num, Startup.Sym("REAL")))
                 };
             }
             // With prototype: convert to match prototype type
+            if (args[1] is not (SingleFloat or DoubleFloat))
+                throw new LispErrorException(new LispTypeError("FLOAT: the prototype must be a float", args[1], Startup.Sym("FLOAT")));
             bool wantDouble = args[1] is DoubleFloat;
             return num switch {
                 Fixnum f => wantDouble ? (LispObject)new DoubleFloat((double)f.Value)
@@ -2360,7 +2525,7 @@ public static partial class Runtime
                 Bignum b => wantDouble ? (LispObject)new DoubleFloat(Arithmetic.ToDouble(b))
                                        : new SingleFloat((float)Arithmetic.ToDouble(b)),
                 Ratio r => wantDouble ? (LispObject)new DoubleFloat(Arithmetic.RatioToDouble(r))
-                                      : new SingleFloat((float)Arithmetic.RatioToDouble(r)),
+                                      : new SingleFloat(Arithmetic.RatioToSingle(r)),
                 SingleFloat sf => wantDouble ? (LispObject)new DoubleFloat((double)sf.Value) : sf,
                 DoubleFloat df => wantDouble ? df : (LispObject)new SingleFloat((float)df.Value),
                 LispDecimal d => wantDouble ? (LispObject)new DoubleFloat((double)d.Value)
@@ -2424,6 +2589,18 @@ public static partial class Runtime
         });
 
         // LOG
+        // The natural logarithm of |N| for a real N, also when it is too large for a double
+        // (a bignum, or the numerator or denominator of a ratio): an integer's log is
+        // taken from its bits, not from a conversion that overflows to infinity.
+        static double LogOfRealMagnitude(Number n) => n switch
+        {
+            Bignum b => System.Numerics.BigInteger.Log(System.Numerics.BigInteger.Abs(b.Value)),
+            Ratio r => System.Numerics.BigInteger.Log(System.Numerics.BigInteger.Abs(r.Numerator))
+                       - System.Numerics.BigInteger.Log(r.Denominator),
+            _ => System.Math.Log(System.Math.Abs(Arithmetic.ToDouble(n)))
+        };
+        static bool IsHugeCapable(Number n) => n is Bignum || n is Ratio;
+
         Emitter.CilAssembler.RegisterFunction("LOG", new LispFunction(args => {
             if (args.Length == 0 || args.Length > 2)
                 throw new LispErrorException(new LispProgramError($"LOG: wrong number of arguments: {args.Length}"));
@@ -2435,6 +2612,13 @@ public static partial class Runtime
                 {
                     var z = System.Numerics.Complex.Log(Arithmetic.ToSystemComplex(lc));
                     return FloatComplexResult(z, single, keepComplex: true);
+                }
+                if (IsHugeCapable(n))
+                {
+                    double lnAbs = LogOfRealMagnitude(n);
+                    if (Arithmetic.Compare(n, Fixnum.Make(0)) < 0)
+                        return FloatComplexResult(new System.Numerics.Complex(lnAbs, System.Math.PI), single, keepComplex: true);
+                    return Startup.MakeFloat(lnAbs, args[0]);
                 }
                 double d = Arithmetic.ToDouble(n);
                 if (d < 0)
@@ -2449,6 +2633,15 @@ public static partial class Runtime
             // CLHS 12.2.3: a base of zero returns zero, even for (log 0 0).
             if (IsZeroNumber(baseNumber))
                 return useSingle ? (LispObject)new SingleFloat(0.0f) : new DoubleFloat(0.0);
+            // log 1 = 0 divides by zero (SBCL: DIVISION-BY-ZERO), not NaN.
+            if (baseNumber is Fixnum { Value: 1 })
+                throw DivisionByZero("LOG", args);
+            if ((IsHugeCapable(n) || IsHugeCapable(baseNumber)) && n is not LispComplex && baseNumber is not LispComplex
+                && Arithmetic.Compare(n, Fixnum.Make(0)) > 0 && Arithmetic.Compare(baseNumber, Fixnum.Make(0)) > 0)
+            {
+                double q = LogOfRealMagnitude(n) / LogOfRealMagnitude(baseNumber);
+                return useSingle ? (LispObject)new SingleFloat((float)q) : new DoubleFloat(q);
+            }
             bool nComplex;
             var lnN = LogComplex(n, out nComplex);
             bool baseComplex;
@@ -2597,7 +2790,7 @@ public static partial class Runtime
             if (n is LispComplex lc)
             {
                 var z = Arithmetic.ToSystemComplex(lc);
-                var r = System.Numerics.Complex.Log(z + System.Numerics.Complex.Sqrt(z * z + 1));
+                var r = Arithmetic.AsinhComplex(z);
                 return FloatComplexResult(r, !NumberHasDoublePart(n), keepComplex: true);
             }
             return Startup.MakeFloat(Compat.Asinh(Arithmetic.ToDouble(n)), obj);
@@ -2613,6 +2806,11 @@ public static partial class Runtime
                 return FloatComplexResult(Arithmetic.AcoshComplex(z), !NumberHasDoublePart(n), keepComplex: true);
             }
             double d = Arithmetic.ToDouble(n);
+            // On (-1, 1) the real part is exactly zero; the general formula leaves rounding
+            // noise there.
+            if (d > -1.0 && d < 1.0)
+                return FloatComplexResult(new System.Numerics.Complex(0.0, System.Math.Acos(d)),
+                                          !NumberHasDoublePart(n), keepComplex: true);
             if (d < 1.0)
                 return FloatComplexResult(Arithmetic.AcoshComplex(new System.Numerics.Complex(d, 0)),
                                           !NumberHasDoublePart(n), keepComplex: true);
@@ -2646,7 +2844,11 @@ public static partial class Runtime
         Startup.RegisterUnary("ISQRT", obj => {
             var num = Runtime.AsNumber(obj);
             System.Numerics.BigInteger n;
-            if (num is Fixnum f) n = f.Value;
+            if (num is Fixnum f)
+            {
+                if (f.Value >= 0) return Fixnum.Make(Runtime.IsqrtFixnumL(f.Value));
+                n = f.Value;
+            }
             else if (num is Bignum b) n = b.Value;
             else throw new LispErrorException(new LispTypeError("ISQRT: argument is not a non-negative integer", obj, Startup.Sym("INTEGER")));
             if (n < 0) throw new LispErrorException(new LispTypeError("ISQRT: argument must be a non-negative integer", obj));
@@ -2909,6 +3111,8 @@ public static partial class Runtime
                 // not promoted to double (which yields a 53-bit mantissa and a tiny
                 // exponent). That broke anything relying on the true ulp: e.g.
                 // rationalize's rounding interval on single-floats.
+                if (args[0] is not (SingleFloat or DoubleFloat))
+                    throw new LispErrorException(new LispTypeError("INTEGER-DECODE-FLOAT: not a float", args[0], Startup.Sym("FLOAT")));
                 if (args[0] is SingleFloat sfv)
                 {
                     float f = sfv.Value;
@@ -2953,6 +3157,8 @@ public static partial class Runtime
         // DECODE-FLOAT: (decode-float f) => (values significand exponent sign)
         Emitter.CilAssembler.RegisterFunction("DECODE-FLOAT",
             new LispFunction(args => {
+                if (args[0] is not (SingleFloat or DoubleFloat))
+                    throw new LispErrorException(new LispTypeError("DECODE-FLOAT: not a float", args[0], Startup.Sym("FLOAT")));
                 double d = Runtime.ObjToDouble(args[0]);
                 // Non-finite floats have no valid decode; signal like SBCL.
                 if (double.IsNaN(d) || double.IsInfinity(d))

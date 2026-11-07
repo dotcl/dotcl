@@ -102,6 +102,21 @@
    test (see %BACKING-ARM-FOR). An alias of a tested buffer shares its symbol
    and so counts as tested.")
 
+(defvar *unswitch-depth* 0
+  "How many UNSWITCH-ARRAY-BACKING bodies are being compiled around this point.")
+
+(defvar *bounded-loop-depth* 0
+  "How many %COMPILE-BOUNDED-LOOP bodies are being compiled around this point.")
+
+(defvar +unswitch-depth-limit+ 2
+  "How deep nested unswitched loop bodies go; below that the body is compiled once.")
+
+(defvar *array-backing-outer* '()
+  "The BACKING-SYMBOLs of every element buffer an enclosing UNSWITCH-ARRAY-
+   BACKING tested, whichever copy is being emitted. An alias of one of them
+   (the LET of an inlined call binding the caller's array) needs no test of its
+   own: the fast copy has the buffer, and the slow copy uses the helper.")
+
 (defvar *raw-array-plan* '()
   "Entries (KEY BACKING KIND N NAME) for the LET bindings in scope whose
    MAKE-ARRAY is held only as the bare .NET array in BACKING (%RAW-ARRAY-PLAN).")
@@ -427,11 +442,28 @@
         for idx in indices
         do (setf (gethash acc *typed-vector-struct-accessors*) idx)))
 
+(defvar *declaimed-ftype-names* (make-hash-table :test #'equal :synchronized t)
+  "Names given a global FTYPE proclamation of any shape, (FTYPE FUNCTION NAME) included.
+   A call to such a name that is not defined yet is not reported as an undefined
+   function: the declaration says the function exists.")
+
+(defun %note-declaimed-ftype-names (spec)
+  "Record the names of the proclamation SPEC when it is (FTYPE type name...)."
+  (when (and (consp spec) (eq (car spec) 'ftype) (consp (cdr spec)))
+    (dolist (name (cddr spec))
+      (when name (setf (gethash name *declaimed-ftype-names*) t)))))
+
 (defvar *function-arg-types* (make-hash-table :test #'eq :synchronized t)
   "symbol -> the argument type list of its declaimed FTYPE, (FUNCTION ARGS RET)'s
    ARGS as written. Recorded beside *FUNCTION-RETURN-TYPES* by DECLAIM and by a
    loaded fasl's PROCLAIM. A DEFUN of the name whose arguments and result are all
    numeric types gets a typed entry (TYPED-ENTRY-SPECS).")
+
+;; (SYMBOL KEY ARGS-ARG-IDX START) while the body of a function with a &REST parameter
+;; that the body never assigns is compiled: (APPLY F ... SYMBOL) in that very frame
+;; (SYMBOL still resolving to KEY) takes its arguments from the argument array
+;; instead of the list. See %REST-FORWARD-APPLY.
+(defvar *rest-forward* nil)
 
 (defvar *inferred-return-type-names* (make-hash-table :test #'eq :synchronized t)
   "symbol -> the compilation unit (see %RETURN-TYPE-UNIT) in which its
@@ -606,16 +638,37 @@
              (not (macro-function op)))
     (xref-record-call op)))
 
+;;; An EQ table that costs nothing until it is used and stays a short alist while it is small:
+;;; most compiles touch a few keys, and a hash table made for each one was the largest
+;;; allocation of a trivial COMPILE. BOX is (list nil); the car holds the alist, or the hash
+;;; table once it has grown past a few entries.
+(defun %lazy-table-get (box key)
+  (let ((tab (car box)))
+    (if (hash-table-p tab)
+        (gethash key tab)
+        (cdr (assoc key tab :test #'eq)))))
+
+(defun %lazy-table-put (box key value)
+  (let ((tab (car box)))
+    (cond ((hash-table-p tab) (setf (gethash key tab) value))
+          ((assoc key tab :test #'eq) (setf (cdr (assoc key tab :test #'eq)) value))
+          ((< (length tab) 8) (setf (car box) (cons (cons key value) tab)))
+          (t (let ((h (make-hash-table :test #'eq)))
+               (dolist (e tab) (setf (gethash (car e) h) (cdr e)))
+               (setf (gethash key h) value)
+               (setf (car box) h))))
+    value))
+
 (defvar *xref-walked* nil
-  "EQ hash set of the forms XREF-WALK has been through for the current
+  "Lazy EQ set (see %LAZY-TABLE-GET) of the forms XREF-WALK has been through for the current
    *XREF-CALLER*, made on first use.")
 
 (defun %xref-walk-all (forms seen)
   (loop for tail on forms while (consp tail) do (%xref-walk-1 (car tail) seen)))
 
 (defun %xref-walk-1 (f seen)
-  (when (and (consp f) (symbolp (car f)) (not (gethash f seen)))
-    (setf (gethash f seen) t)
+  (when (and (consp f) (symbolp (car f)) (not (%lazy-table-get seen f)))
+    (%lazy-table-put seen f t)
     (let ((op (car f)))
       (cond
         ((local-function-entry op)
@@ -650,8 +703,7 @@
    other macros and special forms, whose code COMPILE-FORM reaches itself."
   (when (and *xref-caller* *record-xref-standard* (not *xref-sink*) (consp form)
              (not *cross-compiling*))
-    (%xref-walk-1 form (or *xref-walked*
-                           (setq *xref-walked* (make-hash-table :test #'eq))))))
+    (%xref-walk-1 form (or *xref-walked* (setq *xref-walked* (list nil))))))
 
 (defun %xref-uses-plist (uses)
   "USES, a list of (KIND . NAME), as (KIND (NAME ...) ...) in recording order."
@@ -1174,6 +1226,348 @@
                       symbol-macrolet the locally load-time-value eval-when
                       multiple-value-call multiple-value-prog1 progv))
        t))
+
+(defun %form-arg-count (expr)
+  "The number of arguments of EXPR, or NIL when EXPR is a dotted or circular list."
+  (let ((c (cdr expr)) (k 0))
+    (loop
+      (cond ((null c) (return k))
+            ((and (consp c) (< k 100000)) (incf k) (setq c (cdr c)))
+            (t (return nil))))))
+
+(defun %arity-problem (expr min max)
+  "A message when EXPR has fewer than MIN or more than MAX (NIL: no limit) arguments, or is not a proper list."
+  (let ((n (%form-arg-count expr))
+        (*print-length* 6) (*print-level* 3))
+    (cond ((null n) (format nil "~S: malformed form (not a proper list): ~S" (car expr) expr))
+          ((< n min) (format nil "~S: too few arguments: ~D (expected ~D~@[ to ~D~])" (car expr) n min
+                             (and max (/= max min) max)))
+          ((and max (> n max)) (format nil "~S: too many arguments: ~D (expected ~D~@[ to ~D~])" (car expr) n min
+                                       (and (/= max min) max))))))
+
+(defun %name-problem (expr name what)
+  "A message when NAME (the WHAT of EXPR) is not a symbol."
+  (unless (symbolp name)
+    (let ((*print-length* 6) (*print-level* 3))
+      (format nil "~S: the ~A must be a symbol: ~S" (car expr) what expr))))
+
+(defun %lambda-list-key-problem (op ll)
+  "A message when a &KEY parameter of the lambda list LL is written ((keyword var) ...) with anything but exactly those two."
+  (when (%proper-list-p ll)
+    (let ((in-key nil))
+      (dolist (item ll nil)
+        (cond ((and (symbolp item) (string= (symbol-name item) "&KEY")) (setq in-key t))
+              ((and (symbolp item) (> (length (symbol-name item)) 0) (char= (char (symbol-name item) 0) #\&)) (setq in-key nil))
+              ((and in-key (consp item) (consp (car item)))
+               (let ((kv (car item)))
+                 (unless (and (%proper-list-p kv) (= (length kv) 2) (symbolp (car kv)) (symbolp (cadr kv)))
+                   (return (let ((*print-pretty* nil) (*print-length* 8) (*print-level* 4))
+                             (format nil "~S: malformed keyword parameter ~S" op item)))))))))))
+
+(defun %proper-list-p (x)
+  (and (listp x) (%form-arg-count (cons nil x)) t))
+
+(defun %type-specifier-shape-ok-p (ts)
+  "NIL when TS cannot be a type specifier (a number, string, character, or a list that does not start with a symbol)."
+  (not (or (numberp ts) (stringp ts) (characterp ts)
+           (and (consp ts) (or (not (symbolp (car ts))) (%constant-symbol-p (car ts)))))))
+
+(defun %constant-symbol-p (x)
+  (and (symbolp x) (or (null x) (eq x t) (keywordp x))))
+
+(defun %function-name-p (x)
+  (or (symbolp x)
+      (and (consp x) (symbolp (car x)) (string= (symbol-name (car x)) "SETF")
+           (consp (cdr x)) (symbolp (cadr x)) (null (cddr x)))))
+
+(defun %declare-syntax-problem (op decl)
+  "A message when a declaration specifier of the (DECLARE ...) form DECL is malformed, else NIL.
+   Only the identifiers whose arguments are names are checked."
+  (let ((*print-pretty* nil) (*print-length* 8) (*print-level* 4))
+    (cond
+      ((not (%proper-list-p (cdr decl)))
+       (format nil "~S: malformed declaration ~S" op decl))
+      (t
+       (dolist (spec (cdr decl) nil)
+         (when (and (consp spec) (symbolp (car spec)))
+           (let ((id (symbol-name (car spec))))
+             (cond
+               ((not (%proper-list-p (cdr spec)))
+                (when (member id '("SPECIAL" "IGNORE" "IGNORABLE" "DYNAMIC-EXTENT" "INLINE" "NOTINLINE" "FTYPE" "TYPE" "OPTIMIZE") :test #'string=)
+                  (return (format nil "~S: malformed declaration specifier ~S" op spec))))
+               ((string= id "SPECIAL")
+                (unless (every (lambda (x) (and (symbolp x) (not (%constant-symbol-p x)))) (cdr spec))
+                  (return (format nil "~S: ~S names something that is not a symbol" op spec))))
+               ((member id '("IGNORE" "IGNORABLE" "DYNAMIC-EXTENT") :test #'string=)
+                (unless (every (lambda (x) (or (symbolp x)
+                                               (and (consp x) (symbolp (car x)) (string= (symbol-name (car x)) "FUNCTION")
+                                                    (consp (cdr x)) (%function-name-p (cadr x)) (null (cddr x)))))
+                               (cdr spec))
+                  (return (format nil "~S: ~S names something that is not a variable or (FUNCTION name)" op spec))))
+               ((member id '("INLINE" "NOTINLINE") :test #'string=)
+                (unless (every #'%function-name-p (cdr spec))
+                  (return (format nil "~S: ~S names something that is not a function name" op spec))))
+               ((string= id "FTYPE")
+                (when (or (null (cdr spec)) (not (every #'%function-name-p (cddr spec))))
+                  (return (format nil "~S: malformed FTYPE declaration ~S" op spec))))
+               ((string= id "TYPE")
+                (when (and (consp (cdr spec)) (some #'%constant-symbol-p (cddr spec)))
+                  (return (format nil "~S: ~S declares a constant" op spec))))
+               ((member id '("FIXNUM" "INTEGER" "STRING" "SYMBOL" "LIST" "CONS" "NUMBER" "FLOAT" "DOUBLE-FLOAT" "SINGLE-FLOAT"
+                             "CHARACTER" "SIMPLE-STRING" "VECTOR" "SIMPLE-VECTOR" "REAL" "RATIONAL" "FUNCTION" "HASH-TABLE")
+                        :test #'string=)
+                (when (some #'%constant-symbol-p (cdr spec))
+                  (return (format nil "~S: ~S declares a constant" op spec))))
+               ((string= id "OPTIMIZE")
+                (unless (every (lambda (x) (or (symbolp x) (and (consp x) (symbolp (car x)) (null (cddr x)))))
+                               (cdr spec))
+                  (return (format nil "~S: malformed OPTIMIZE declaration ~S" op spec))))))))))))
+
+(defun %body-declare-problem (op body docstring-ok &optional syntax-only)
+  (let ((seen-form nil) (seen-doc nil))
+    (loop for rest = body then (cdr rest)
+          while (consp rest)
+          do (let ((f (car rest)))
+               (cond ((and (consp f) (eq (car f) 'declare))
+                      (unless seen-form
+                        (let ((p (%declare-syntax-problem op f)))
+                          (when p (return p))))
+                      (when (and seen-form (not syntax-only))
+                        (return (let ((*print-pretty* nil) (*print-length* 30) (*print-level* 6))
+                                  (format nil "~S: misplaced declaration ~S in ~S" op f body)))))
+                     ((and docstring-ok (stringp f) (not seen-doc) (not seen-form) (cdr rest))
+                      (setq seen-doc t))
+                     (t (setq seen-form t)))))))
+
+(defun %let-bindings-problem (expr)
+  "A message when the binding list of the LET / LET* form EXPR is malformed."
+  (let ((bindings (cadr expr))
+        (*print-length* 6) (*print-level* 3))
+    (cond ((not (listp bindings))
+           (format nil "~S: the binding list must be a list: ~S" (car expr) bindings))
+          ((null (%form-arg-count (cons nil bindings)))
+           (format nil "~S: the binding list is not a proper list: ~S" (car expr) bindings))
+          (t (dolist (b bindings nil)
+               (unless (or (and b (symbolp b))
+                           (and (consp b) (car b) (symbolp (car b))
+                                (listp (cdr b)) (null (cddr b))
+                                (null (cdr (last b)))))
+                 (return (format nil "~S: malformed binding ~S" (car expr) b))))))))
+
+(defun %setq-problem (expr)
+  "A message when the SETQ form EXPR has an odd number of arguments or a target that is not a symbol."
+  (let ((n (%form-arg-count expr)))
+    (cond ((null n) nil)
+          ((oddp n) (let ((*print-length* 6) (*print-level* 3))
+                      (format nil "SETQ: odd number of arguments: ~S" expr)))
+          (t (do ((c (cdr expr) (cddr c))) ((null c) nil)
+               (unless (and (symbolp (car c)) (not (%constant-symbol-p (car c))))
+                 (return (let ((*print-length* 6) (*print-level* 3))
+                           (format nil "SETQ: ~S is not a variable: ~S" (car c) expr)))))))))
+
+(defun %defsetf-problem (expr)
+  "A message when the DEFSETF form EXPR matches neither the short form (access update [doc]) nor the long form."
+  (let ((rest (cddr expr)) (*print-pretty* nil) (*print-length* 6) (*print-level* 3))
+    (cond ((null (%form-arg-count expr)) (format nil "DEFSETF: malformed form ~S" expr))
+          ((and (car rest) (symbolp (car rest)))
+           ;; short form: (defsetf access update-fn [doc])
+           (cond ((cddr rest) (format nil "DEFSETF: too many arguments in the short form: ~S" expr))
+                 ((and (cdr rest) (not (stringp (cadr rest)))) (format nil "DEFSETF: the documentation must be a string: ~S" (cadr rest)))))
+          ((listp (car rest))
+           ;; long form: (defsetf access lambda-list (store ...) body)
+           (when (or (null (cdr rest)) (not (listp (cadr rest))))
+             (format nil "DEFSETF: the long form needs a lambda list and a list of store variables: ~S" expr)))
+          (t (format nil "DEFSETF: ~S is neither an update function name nor a lambda list" (car rest))))))
+
+(defun %eval-when-situations-problem (expr)
+  "A message when the situation list of the EVAL-WHEN form EXPR is not a list of the six situation names."
+  (let ((sits (cadr expr)) (*print-length* 6) (*print-level* 3))
+    (cond ((not (listp sits))
+           (format nil "EVAL-WHEN: the situations must be a list: ~S" sits))
+          ((null (%form-arg-count (cons nil sits)))
+           (format nil "EVAL-WHEN: the situation list is not a proper list: ~S" sits))
+          (t (dolist (x sits nil)
+               (unless (and (symbolp x)
+                            (member (symbol-name x)
+                                    '("COMPILE-TOPLEVEL" "LOAD-TOPLEVEL" "EXECUTE" "COMPILE" "LOAD" "EVAL")
+                                    :test #'string=))
+                 (return (format nil "EVAL-WHEN: invalid situation ~S" x))))))))
+
+(defun %macro-form-shape-problem (expr)
+  "A message when the call EXPR of a standard macro has the wrong number of arguments, else NIL.
+   Not for use when a local function or macro of that name is in scope."
+  (case (car expr)
+    ((when unless prog prog*) (%arity-problem expr 1 nil))
+    ((case ecase ccase typecase etypecase ctypecase)
+     (or (%arity-problem expr 1 nil)
+         (dolist (clause (cddr expr) nil)
+           (when (or (and (consp clause) (null (%form-arg-count clause)))
+                     ;; the key list of CASE / ECASE / CCASE is a proper list
+                     (and (member (car expr) '(case ecase ccase))
+                          (consp clause) (consp (car clause))
+                          (null (%form-arg-count (car clause))))
+                     ;; a type specifier is a symbol or a list headed by a symbol
+                     (and (member (car expr) '(typecase etypecase ctypecase))
+                          (consp clause)
+                          ;; (a class object is a type specifier too)
+                          (let ((ts (car clause)))
+                            (or (numberp ts) (stringp ts) (characterp ts)
+                                (and (consp ts)
+                                     (or (not (symbolp (car ts)))
+                                         (%constant-symbol-p (car ts))))))))
+             (return (let ((*print-length* 6) (*print-level* 3))
+                       (format nil "~S: malformed clause ~S" (car expr) clause)))))))
+    ((and or cond prog1 prog2) (%arity-problem expr 0 nil))
+    (handler-case
+     (or (%arity-problem expr 1 nil)
+         (dolist (clause (cddr expr) nil)
+           (unless (and (consp clause) (%proper-list-p clause) (cdr clause)
+                        (listp (cadr clause))
+                        (or (eq (car clause) :no-error)
+                            (and (null (cdr (cadr clause)))
+                                 (every #'symbolp (cadr clause))
+                                 (%type-specifier-shape-ok-p (car clause)))))
+             (return (let ((*print-pretty* nil) (*print-length* 6) (*print-level* 3))
+                       (format nil "HANDLER-CASE: malformed clause ~S" clause)))))))
+    (restart-case
+     (or (%arity-problem expr 1 nil)
+         (dolist (clause (cddr expr) nil)
+           (unless (and (consp clause) (%proper-list-p clause) (cdr clause)
+                        (listp (cadr clause)))
+             (return (let ((*print-pretty* nil) (*print-length* 6) (*print-level* 3))
+                       (format nil "RESTART-CASE: malformed clause ~S" clause)))))))
+    (handler-bind
+     (or (%arity-problem expr 1 nil)
+         (and (listp (cadr expr)) (%proper-list-p (cadr expr))
+              (dolist (b (cadr expr) nil)
+                (unless (and (consp b) (%proper-list-p b) (cdr b) (null (cddr b))
+                             (%type-specifier-shape-ok-p (car b)))
+                  (return (let ((*print-pretty* nil) (*print-length* 6) (*print-level* 3))
+                            (format nil "HANDLER-BIND: malformed binding ~S" b))))))))
+    (restart-bind
+     (or (%arity-problem expr 1 nil)
+         (and (listp (cadr expr)) (%proper-list-p (cadr expr))
+              (dolist (b (cadr expr) nil)
+                (unless (and (consp b) (%proper-list-p b) (cdr b) (evenp (length (cddr b))))
+                  (return (let ((*print-pretty* nil) (*print-length* 6) (*print-level* 3))
+                            (format nil "RESTART-BIND: malformed binding ~S" b))))))))
+    (with-simple-restart
+     (or (%arity-problem expr 1 nil)
+         (let ((spec (cadr expr)))
+           (unless (and (consp spec) (consp (cdr spec)))
+             (let ((*print-pretty* nil) (*print-length* 6) (*print-level* 3))
+               (format nil "WITH-SIMPLE-RESTART: malformed restart specification ~S" spec))))))
+    ((setf psetf) (loop for c on (cdr expr) by #'cddr
+                        do (let ((m (%place-arity-problem (car c)))) (when m (return m)))))
+    ((incf decf pop) (and (consp (cdr expr)) (%place-arity-problem (cadr expr))))
+    ((push pushnew) (and (consp (cdr expr)) (consp (cddr expr)) (%place-arity-problem (caddr expr))))
+    (rotatef (dolist (p (cdr expr) nil) (let ((m (%place-arity-problem p))) (when m (return m)))))
+    (shiftf (loop for c on (cdr expr)
+                  while (cdr c)
+                  do (let ((m (%place-arity-problem (car c)))) (when m (return m)))))
+    (declaim (dolist (spec (cdr expr) nil)
+               (when (and (consp spec) (symbolp (car spec))
+                          (member (symbol-name (car spec)) '("TYPE" "FTYPE") :test #'string=)
+                          (null (cdr spec)))
+                 (return (let ((*print-pretty* nil) (*print-length* 8) (*print-level* 4))
+                           (format nil "DECLAIM: malformed declaration ~S" spec))))))
+    (destructuring-bind (or (%arity-problem expr 2 nil)
+                            (and (%proper-list-p (cdddr expr))
+                                 (%body-declare-problem 'destructuring-bind (cdddr expr) t t))))
+    (define-compiler-macro (%arity-problem expr 2 nil))
+    (defsetf (or (%arity-problem expr 2 nil) (%defsetf-problem expr)))
+    (defmacro (or (%arity-problem expr 2 nil) (%name-problem expr (cadr expr) "macro name")))
+    (define-symbol-macro (or (%arity-problem expr 2 2) (%name-problem expr (cadr expr) "symbol macro name")))
+    (define-modify-macro (or (%arity-problem expr 3 4) (%name-problem expr (cadr expr) "macro name")
+                             (and (cddddr expr) (not (stringp (car (cddddr expr))))
+                                  (format nil "DEFINE-MODIFY-MACRO: the documentation must be a string: ~S" (car (cddddr expr))))))
+    (lambda (or (%arity-problem expr 1 nil)
+                (and (not (listp (cadr expr)))
+                     (format nil "LAMBDA: the lambda list must be a list: ~S" (cadr expr)))
+                (%body-declare-problem 'lambda (cddr expr) t t)))
+    ((dolist dotimes do do*)
+     (and (consp (cdr expr)) (%proper-list-p (cddr expr))
+          (%body-declare-problem (car expr) (cddr expr) nil t)))
+    (multiple-value-bind (or (%arity-problem expr 2 nil)
+                             (%body-declare-problem 'multiple-value-bind (cdddr expr) nil)
+                             (and (not (listp (cadr expr)))
+                                  (let ((*print-length* 6) (*print-level* 3))
+                                    (format nil "MULTIPLE-VALUE-BIND: the variable list must be a list: ~S" expr)))))
+    (multiple-value-list (%arity-problem expr 1 1))
+    (multiple-value-setq (%arity-problem expr 2 2))
+    (nth-value (%arity-problem expr 2 2))
+    (defvar (or (%arity-problem expr 1 3) (%name-problem expr (cadr expr) "variable name")))
+    ((defparameter defconstant) (or (%arity-problem expr 2 3) (%name-problem expr (cadr expr) "variable name")))
+    ((defun deftype) (or (%arity-problem expr 2 nil) (%name-problem-fn expr)
+                         (and (eq (car expr) 'defun) (%proper-list-p (cdddr expr))
+                              (%body-declare-problem 'defun (cdddr expr) t t))))
+    (t nil)))
+
+(defun %name-problem-fn (expr)
+  (let ((name (cadr expr)))
+    (unless (or (and name (symbolp name))
+                (and (eq (car expr) 'defun) (consp name) (eq (car name) 'setf)
+                     (consp (cdr name)) (symbolp (cadr name)) (null (cddr name))))
+      (let ((*print-length* 6) (*print-level* 3))
+        (format nil "~S: ~S is not a valid name: ~S" (car expr) name expr)))))
+
+(defun %special-form-shape-problem (expr)
+  "A message when the special form EXPR is malformed (wrong number of arguments), else NIL.
+   Only the shape is checked; the compiler and the interpreter each handle the rest."
+  (case (car expr)
+    (quote (%arity-problem expr 1 1))
+    (if (%arity-problem expr 2 3))
+    (the (%arity-problem expr 2 2))
+    (function (%arity-problem expr 1 1))
+    (block (or (%arity-problem expr 1 nil)
+               (%name-problem expr (cadr expr) "block name")))
+    (return-from (or (%arity-problem expr 1 2)
+                     (%name-problem expr (cadr expr) "block name")))
+    (go (or (%arity-problem expr 1 1)
+            (and (not (symbolp (cadr expr))) (not (integerp (cadr expr)))
+                 (%name-problem expr nil "go tag"))))
+    (throw (%arity-problem expr 2 2))
+    ((let let*) (or (%arity-problem expr 1 nil)
+                    (%let-bindings-problem expr)
+                    (%body-declare-problem (car expr) (cddr expr) t)))
+    (setq (or (%arity-problem expr 0 nil)
+              (%setq-problem expr)))
+    (multiple-value-prog1 (%arity-problem expr 1 nil))
+    (multiple-value-call (%arity-problem expr 1 nil))
+    (progv (%arity-problem expr 2 nil))
+    (load-time-value (%arity-problem expr 1 2))
+    (eval-when (or (%arity-problem expr 1 nil)
+                   (%eval-when-situations-problem expr)))
+    ((flet labels macrolet symbol-macrolet)
+     (or (%arity-problem expr 1 nil)
+         (and (member (car expr) '(flet labels))
+              (listp (cadr expr)) (null (cdr (last (cadr expr))))
+              (dolist (def (cadr expr) nil)
+                (cond ((not (and (consp def) (consp (cdr def)) (listp (cadr def))))
+                       (return (let ((*print-pretty* nil) (*print-length* 6) (*print-level* 3))
+                                 (format nil "~S: malformed function definition ~S" (car expr) def))))
+                      (t (let ((p (or (%lambda-list-key-problem (car expr) (cadr def))
+                                      (%body-declare-problem (car expr) (cddr def) t))))
+                           (when p (return p)))))))
+         (and (consp (cdr expr)) (%proper-list-p (cddr expr))
+              (%body-declare-problem (car expr) (cddr expr) nil t))
+         (and (not (listp (cadr expr)))
+              (let ((*print-length* 6) (*print-level* 3))
+                (format nil "~S: the binding list must be a list: ~S" (car expr) (cadr expr))))
+         (and (null (%form-arg-count (cons nil (cadr expr))))
+              (let ((*print-length* 6) (*print-level* 3))
+                (format nil "~S: the binding list is not a proper list: ~S" (car expr) (cadr expr))))))
+    (tagbody (or (%arity-problem expr 0 nil)
+                 (dolist (item (cdr expr) nil)
+                   (unless (or (symbolp item) (integerp item) (consp item))
+                     (return (let ((*print-length* 6) (*print-level* 3))
+                               (format nil "TAGBODY: ~S is not a tag or a statement: ~S" item expr)))))))
+    (progn (%arity-problem expr 0 nil))
+    (locally (or (%arity-problem expr 0 nil)
+                 (%body-declare-problem 'locally (cdr expr) nil)))
+    (catch (%arity-problem expr 1 nil))
+    (unwind-protect (%arity-problem expr 1 nil))
+    (t nil)))
 
 (defun macrolet-shadowed-p (name)
   "True when NAME is bound by an enclosing MACROLET and so must expand as that
@@ -2647,6 +3041,75 @@ through to compile-sym-lookup."
            :format-arguments (list context name)))
   name)
 
+(defun %check-lambda-list-shape (params)
+  "Signal PROGRAM-ERROR for a lambda list that CLHS 3.4.1 makes malformed and that
+   the parser below would otherwise take: a variable named twice, &REST (&BODY)
+   with no variable, and an &OPTIONAL / &KEY / &AUX entry with too many elements."
+  (let ((seen '()) (state :required) (rest-pending nil) (last-rank 0) (kw-seen '()))
+    (flet ((bad (control &rest args)
+             (error 'program-error :format-control control :format-arguments args))
+           (note (v)
+             (when (and v (symbolp v) (not (keywordp v)))
+               (when (member v seen :test #'eq)
+                 (error 'program-error
+                        :format-control "lambda list: ~S is bound more than once"
+                        :format-arguments (list v)))
+               (push v seen))))
+      (dolist (p params)
+        ;; The keywords come in the order &optional, &rest / &body, &key,
+        ;; &allow-other-keys, &aux; each at most once (CLHS 3.4.1).
+        (let ((rank (case p (&optional 1) ((&rest &body) 2) (&key 3)
+                      (&allow-other-keys 4) (&aux 5))))
+          (when rank
+            (when (and rest-pending (/= rank 2))
+              (bad "lambda list: &REST must be followed by a variable"))
+            (let ((group (if (= rank 2) '&rest p)))
+              (when (member group kw-seen)
+                (bad "lambda list: ~S appears more than once" p))
+              (when (< rank last-rank)
+                (bad "lambda list: ~S is out of order" p))
+              (when (and (= rank 4) (not (member '&key kw-seen)))
+                (bad "lambda list: &ALLOW-OTHER-KEYS without &KEY"))
+              (push group kw-seen)
+              (setf last-rank rank))))
+        (cond
+          ((member p '(&rest &body))
+           (when rest-pending (bad "lambda list: ~S must be followed by a variable" p))
+           (setf state :rest rest-pending t))
+          ((and (symbolp p) p (member p lambda-list-keywords))
+           (when rest-pending (bad "lambda list: &REST must be followed by a variable"))
+           (setf state (case p (&optional :optional) (&key :key) (&aux :aux)
+                             (&allow-other-keys :aok) (t state))))
+          ((eq state :rest) (setf rest-pending nil state :done) (note p))
+          ((eq state :done)
+           (bad "lambda list: ~S follows the &REST variable" p))
+          ((eq state :aok)
+           (bad "lambda list: ~S follows &ALLOW-OTHER-KEYS" p))
+          ((eq state :required) (when (symbolp p) (note p)))
+          ((eq state :key)
+           (cond ((symbolp p) (note p))
+                 ((consp p)
+                  (when (cdddr p)
+                    (bad "lambda list: the entry ~S has too many elements" p))
+                  (when (and (consp (car p))
+                             (not (and (consp (cdar p)) (null (cddar p)))))
+                    (bad "lambda list: the keyword entry ~S must be (keyword variable)" (car p)))
+                  (note (if (consp (car p)) (cadr (car p)) (car p)))
+                  (note (caddr p)))))
+          (t                            ; :optional / :aux
+           (cond ((symbolp p) (unless (eq state :aux) (note p)))
+                 ((consp p)
+                  (when (cdddr p)
+                    (bad "lambda list: the entry ~S has too many elements" p))
+                  (when (and (eq state :aux) (cddr p))
+                    (bad "lambda list: the entry ~S has too many elements" p))
+                  ;; &AUX variables are bound one after another, so one may rebind a
+                  ;; parameter (clsql does: &aux (table (unescape table))): not a duplicate.
+                  (unless (eq state :aux)
+                    (note (car p))
+                    (note (caddr p))))))))
+      (when rest-pending (bad "lambda list: &REST must be followed by a variable")))))
+
 (defun parse-lambda-list (params)
   "Parse lambda list -> (values required optional key rest-param aux allow-other-keys-p has-key-p).
    &body is treated as &rest. rest-param is NIL if no variadic.
@@ -2655,6 +3118,7 @@ through to compile-sym-lookup."
    aux: ((name init-form) ...)
    allow-other-keys-p: T if &allow-other-keys was present
    has-key-p: T if &key was present (even if no key params listed)"
+  (%check-lambda-list-shape params)
   (let ((required '()) (optional '()) (key '()) (rest-param nil) (aux '())
         (allow-other-keys-p nil) (has-key-p nil)
         (state :required))
@@ -2737,7 +3201,8 @@ through to compile-sym-lookup."
    no others. VISIT, when non-NIL, is called as (funcall VISIT init-form scope)
    for each &optional/&key/&aux parameter that has one, with SCOPE the names
    visible at that point. Returns the scope after the whole lambda list: the
-   parameter names (as VAR-NAME strings) pushed onto BOUND, most recent first.
+   parameter SYMBOLS pushed onto BOUND (symbols, so BND-MEMBER-P tells apart same-named
+   variables of different packages), most recent first.
 
    This is the only lambda-list state machine in the compiler. It used to be
    copied per caller, and the copies had already drifted apart on what follows
@@ -2757,9 +3222,9 @@ through to compile-sym-lookup."
         ;; lambda list; ignore it rather than binding a second rest name.
         ((eq state :done) nil)
         ((eq state :required)
-         (push (var-name p) scope))
+         (push p scope))
         ((eq state :rest)
-         (push (var-name p) scope)
+         (push p scope)
          (setf state :done))
         (t                              ; :optional / :key / :aux
          (when (and visit (consp p) (cadr p))
@@ -2768,9 +3233,9 @@ through to compile-sym-lookup."
          (let ((name (if (consp p) (car p) p)))
            ;; &key ((keyword var) init supplied-p): the variable is the cadr.
            (when (consp name) (setf name (cadr name)))
-           (push (var-name name) scope))
+           (push name scope))
          (when (and (consp p) (caddr p))
-           (push (var-name (caddr p)) scope)))))
+           (push (caddr p) scope)))))
     scope))
 
 (defun extract-param-names (params)
@@ -3137,6 +3602,26 @@ the literal and the next compilation inherits it."
     (t `((:load-const ,expr)))))
 
 
+(defun %compile-set-char-code (args)
+  "(%SET-CHAR STR IDX (CODE-CHAR X)) with IDX and X statically fixnums: the code
+   goes to Runtime.SetCharCode as a raw int64 with no character object made for it
+   (a code outside 0..#xFFFF takes the general path there, with its error).
+   Else NIL."
+  (when (and (= (length args) 3)
+             (let ((v (third args)))
+               (and (consp v) (eq (car v) 'code-char) (= (length v) 2)
+                    (not (local-function-entry 'code-char))
+                    (fixnum-exact-p (second v))))
+             (fixnum-exact-p (second args)))
+    (let ((ts (gen-local "SCS")) (ti (gen-local "SCI")) (tc (gen-local "SCC")))
+      `((:declare-local ,ts "LispObject") (:declare-local ,ti "Int64") (:declare-local ,tc "Int64")
+        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
+        (:stloc ,ts)
+        ,@(compile-as-long (second args)) (:stloc ,ti)
+        ,@(compile-as-long (second (third args))) (:stloc ,tc)
+        (:ldloc ,ts) (:ldloc ,ti) (:ldloc ,tc)
+        (:call "Runtime.SetCharCode")))))
+
 (defun compile-expr (expr)
   "Compile expression. Unwraps MvReturn unless in MV-propagating position.
    Tail positions (*in-tail-position* t) propagate MV to the caller.
@@ -3486,11 +3971,12 @@ the literal and the next compilation inherits it."
          (clean-params
           (let ((result '()) (p rest-params))
             (loop
-              (when (null p) (return))
+              (when (null p) (return (nreverse result)))
+              ;; A dotted lambda list (a . rest) keeps its atom tail.
+              (when (atom p) (return (nreconc result p)))
               (cond
                 ((eq (car p) '&environment) (setq env-var (cadr p)) (setq p (cddr p)))
-                (t (push (car p) result) (setq p (cdr p)))))
-            (nreverse result))))
+                (t (push (car p) result) (setq p (cdr p))))))))
     ;; Built inside out: the lambda list proper, then &whole around it, then
     ;; &environment around that, so &environment is bound whether or not &whole
     ;; is present.
@@ -3891,7 +4377,7 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
                            (assoc name (second (cadr binder))))))
              (values :symbol-macro t nil))
             ((or special (eq global-kind :special))
-             (values :special nil (%cltl2-global-variable-decls name)))
+             (values :special nil (%merge-decls decls (%cltl2-global-variable-decls name))))
             ((or binder
                  (let ((*cstate* (cdr lexinfo))) (lookup-local name)))
              (values :lexical t decls))
@@ -4035,6 +4521,7 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
    Anything else is ignored."
   (when (consp spec)
     (%note-global-proclamation spec)
+    (%note-declaimed-ftype-names spec)
     (case (car spec)
       (ftype
        (let ((fty (cadr spec)))
@@ -4399,6 +4886,12 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
    Only a top-level, required-only, non-recursive, small body is recorded."
   (when (and *same-file-inline-defs* *compile-file-mode* (not *cross-compiling*)
              (symbolp name) name)
+    ;; A DEFUN that may not run (under a conditional) is not the definition
+    ;; later calls in the file can bind to: forget the earlier one too.
+    (unless *compile-was-toplevel*
+      (when *same-file-functions* (setf (gethash name *same-file-functions*) -1))
+      (remhash name *same-file-inline-defs*)
+      (return-from %note-same-file-inline nil))
     (if (and (<= (length params) 4)
              (every (lambda (p) (and p (symbolp p) (not (member p lambda-list-keywords))
                                      (not (constantp p))))
@@ -4859,6 +5352,20 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
                          "IMPORT" "SHADOW" "SHADOWING-IMPORT")
                        :test #'string=))
       (try-eval expr))
+    (let ((problem (and (symbolp op)
+                        (or (%special-form-shape-problem expr)
+                            (and (not (macrolet-shadowed-p op))
+                                 (not (local-function-entry op))
+                                 (%macro-form-shape-problem expr))
+                            (and (null (%form-arg-count expr))
+                                 (not (special-operator-name-p op))
+                                 (not (%lexical-macro-p op))
+                                 (not (macro-function op))
+                                 (let ((*print-length* 6) (*print-level* 3))
+                                   (format nil "~S: malformed function call (not a proper list): ~S"
+                                           op expr)))))))
+      (when problem
+        (return-from compile-form (compile-static-program-error problem))))
     ;; quote fast path
     (when *labels-demoted* (%labels-demoted-check op))
     (if (eq op 'quote)
@@ -5002,7 +5509,8 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
               ;; the array+index on the stack while the value's try was entered,
               ;; producing unverifiable IL (e.g. (setf (svref s j) (block nil ...))).
               ((string= (symbol-name op) "%SET-CHAR")
-               (compile-ternary-call (cdr expr) "Runtime.SetChar"))
+               (or (%compile-set-char-code (cdr expr))
+                   (compile-ternary-call (cdr expr) "Runtime.SetChar")))
               ((string= (symbol-name op) "%SET-ELT")
                (compile-ternary-call (cdr expr) "Runtime.SetElt"))
               ((string= (symbol-name op) "%SET-SUBSEQ")
@@ -5045,7 +5553,7 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
                ;; Skip during cross-compile (bootstrap concern, see compile-defun handler).
                (let* ((name (cadr expr))
                       (lambda-list (caddr expr))
-                      (body (cdddr expr))
+                      (body (%doc-first (cdddr expr)))
                       (has-docstring (and (not *cross-compiling*)
                                           (consp body) (stringp (car body)) (cdr body)))
                       (docstring (when has-docstring (car body)))

@@ -732,6 +732,7 @@
   "BODY with its SIMPLE-* declaration checks inserted right after its leading
    DECLARE forms, for the variables among NAMES (symbols or VAR-NAME strings)
    the form being compiled binds. BODY itself, EQ, when there is none."
+  (setf body (%check-type-retype-body body names))
   (let* ((names (mapcar (lambda (n) (if (stringp n) n (var-name n))) names))
          (first-form (find-if-not (lambda (f) (and (consp f) (eq (car f) 'declare))) body))
          (checks (and names
@@ -748,6 +749,63 @@
           (loop while (and rest (consp (car rest)) (eq (caar rest) 'declare))
                 do (push (pop rest) decls))
           (append (nreverse decls) checks rest)))))
+
+(defun %check-type-retype-body (body names)
+  "BODY with its leading (CHECK-TYPE VAR TYPE) forms, for variables among NAMES
+   (symbols or VAR-NAME strings) and TYPE a SIMPLE-* array type or an integer type inside int64, followed by the
+   rest of the body under (LET ((VAR VAR)) (DECLARE (TYPE TYPE VAR)) ...): once
+   the check has passed the value has that type, and the rebinding says so to
+   the compiler. The checks themselves stay as they are. BODY itself, EQ, when
+   there is none."
+  (let* ((names (mapcar (lambda (n) (if (stringp n) n (var-name n))) names))
+         (decls '()) (rest body) (checks '()) (retyped '()))
+    (loop while (and rest (consp (car rest)) (eq (caar rest) 'declare))
+          do (push (pop rest) decls))
+    (setf decls (nreverse decls))
+    ;; A method body is (BLOCK NAME FORM...): look inside it.
+    (when (and rest (null (cdr rest)) (consp (car rest)) (eq (caar rest) 'block)
+               (consp (cdr (car rest))) (symbolp (cadr (car rest))))
+      (let ((inner (%check-type-retype-body (cddr (car rest)) names)))
+        (return-from %check-type-retype-body
+          (if (eq inner (cddr (car rest)))
+              body
+              (append decls (list `(block ,(cadr (car rest)) ,@inner)))))))
+    (loop while (and rest (consp (car rest)) (eq (caar rest) 'check-type)
+                     (consp (cdr (car rest))) (consp (cddr (car rest))))
+          do (let* ((form (pop rest)) (v (cadr form)))
+               (push form checks)
+               (when (and v (symbolp v) (not (keywordp v))
+                          (member (var-name v) names :test #'string=)
+                          (not (assoc v retyped))
+                          (not (loop for d in decls
+                                     thereis (loop for spec in (cdr d)
+                                                   thereis (and (consp spec)
+                                                                (member (car spec) '(special ignore))
+                                                                (member v (cdr spec)))))))
+                 (let ((ty (ignore-errors (%expand-array-type (caddr form)))))
+                   (cond ((and ty (consp ty) (%simple-array-decl-spec-p ty))
+                          (push (cons v ty) retyped))
+                         ((or (eq (caddr form) 'fixnum)
+                              (let ((r (ignore-errors (declared-integer-range (caddr form)))))
+                                (and r (range-fits-int64-p r))))
+                          (push (cons v (caddr form)) retyped)))))))
+    ;; A variable the body assigns may later hold a value of another type, which
+    ;; the declaration would forbid.
+    (when (and retyped rest)
+      (let ((mutated (find-mutated-and-captured-vars
+                      rest (mapcar (lambda (r) (var-name (car r))) retyped))))
+        (setf retyped (remove-if (lambda (r) (member (var-name (car r)) mutated :test #'string=))
+                                 retyped))))
+    (if (or (null retyped) (null rest)
+            ;; already rewritten: the rest is the one rebinding LET
+            (and (null (cdr rest)) (consp (car rest)) (eq (caar rest) 'let)
+                 (consp (cadr (car rest)))
+                 (every (lambda (b) (and (consp b) (eq (car b) (cadr b)))) (cadr (car rest)))))
+        body
+        (append decls (reverse checks)
+                (list `(let ,(mapcar (lambda (r) (list (car r) (car r))) (reverse retyped))
+                         (declare ,@(mapcar (lambda (r) (list 'type (cdr r) (car r))) (reverse retyped)))
+                         ,@rest))))))
 
 (defun %hoisted-backing-entry-p (var)
   "T when VAR's element storage is hoisted in the current scope (any kind), so
@@ -1017,6 +1075,19 @@
                     (let ((r (%numeric-storage-range spec)))
                       (and r (cons rank r)))))))))
 
+(defun %declaimed-global-array-info (init earlier)
+  "For INIT a symbol naming a global (not a lexical variable, and not one of the
+   earlier bindings of the same LET*) whose proclaimed type is an array type with an
+   unboxed backing, the *numeric-array-locals* info tail of that type; else NIL."
+  (and (symbolp init) init (not (eq init t))
+       (not (keywordp init))
+       (boundp '*proclaimed-variable-types*)
+       (not (member (var-name init) earlier :key (lambda (e) (var-name (first e)))
+                                              :test #'string=))
+       (not (lookup-local init))
+       (let ((ty (gethash init *proclaimed-variable-types*)))
+         (and ty (%array-type-numeric-info ty)))))
+
 (defun infer-numeric-array-bindings (binding-info mutated outer &optional sequential-p)
   "Numeric-array environment for a let/let* body: start from OUTER, drop
    every name this let binds (shadowing), then add (NAME KEY RANK LO . HI)
@@ -1065,7 +1136,15 @@
                    (let ((info (or (%make-array-numeric-info init)
                                    (and (symbolp init)
                                         (not (member (var-name init) mutated :test #'string=))
-                                        (source-info init earlier)))))
+                                        (source-info init earlier))
+                                   ;; A global with a proclaimed array type, or a
+                                   ;; structure slot declared to hold one: the declaration
+                                   ;; is the same hint a typed parameter gives.
+                                   (%declaimed-global-array-info init earlier)
+                                   (struct-accessor-array-info init)
+                                   (and (consp init) (fboundp '%declared-init-array-spec)
+                                        (let ((ty (%declared-init-array-spec init)))
+                                          (and ty (%array-type-numeric-info ty)))))))
                      (when info
                        (push (list* (var-name var) key info) result)))))))
     result))
@@ -1825,7 +1904,80 @@
           ((%literal-dpb-form-p expr) (%literal-dpb-as-logior expr))
           ((%literal-byte-field-form-p expr) (%literal-byte-field-as-logand expr))
           ((%logical-complement-form expr))
+          ((%cond-as-if expr))
+          ((let ((r (%trivial-integer-op-operand expr))) (and r (fold-typed-operand r))))
+          ((let ((r (%logand-noop-mask-operand expr))) (and r (fold-typed-operand r))))
           (t (fold-constant-symbol expr)))))
+
+(defun %cond-as-if (expr)
+  "(COND (T1 V1...) (T2 V2...) ... (T VN...)) as nested IFs when every clause has a
+   body, so the typed-path predicates see the arms the way they see an IF; else NIL.
+   A clause without a body returns its test value, which an IF cannot say."
+  (and (consp expr) (eq (car expr) 'cond) (consp (cdr expr))
+       (not (local-function-entry 'cond))
+       (not (macrolet-shadowed-p 'cond))
+       (every (lambda (c) (and (consp c) (consp (cdr c)) (listp (cdr c)))) (cdr expr))
+       (labels ((build (clauses)
+                  (if (null clauses)
+                      nil
+                      (let* ((c (car clauses))
+                             (body (if (cddr c) `(progn ,@(cdr c)) (cadr c))))
+                        (if (eq (car c) t)
+                            body
+                            `(if ,(car c) ,body ,(build (cdr clauses))))))))
+         (build (cdr expr)))))
+
+(defun %statically-integer-p (e)
+  "Is the form E certain to be an integer when it returns: an exact fixnum, or a
+   (+ A B) / (- A B) / (1+ A) / (1- A) of exact fixnum operands (the result may
+   leave the fixnum range, but is an integer)?"
+  (or (fixnum-exact-p e)
+      (and (consp e) (symbolp (car e)) (listp (cdr e))
+           (not (local-function-entry (car e)))
+           (case (car e)
+             ((+ -) (and (= (length (cdr e)) 2) (every #'fixnum-exact-p (cdr e))))
+             ((1+ 1-) (and (= (length (cdr e)) 1) (fixnum-exact-p (cadr e))))
+             (t nil)))))
+
+(defun %trivial-integer-op-operand (expr)
+  "X when EXPR is an operation on the integer X that returns X itself and X is
+   statically an exact fixnum, so the operation cannot signal and changes nothing:
+   (ASH X 0), (LOGIOR X), (LOGXOR X), (LOGAND X), and (LOGAND MASK X) with MASK
+   2^n-1 and X provably inside [0, MASK] (an octet read masked to eight bits, the
+   way BABEL's UB-GET writes it). Else NIL."
+  (and (consp expr) (symbolp (car expr)) (listp (cdr expr))
+       (not (local-function-entry (car expr)))
+       (let ((args (cdr expr)))
+         (case (car expr)
+           (ash (and (= (length args) 2) (eql (second args) 0)
+                     (fixnum-exact-p (first args)) (first args)))
+           ;; (+ E 0), (+ 0 E), (- E 0): E itself, when E is statically an integer
+           ;; (an exact fixnum, or a sum/difference of fixnum operands, whose own
+           ;; evaluation signals for anything that is not a number).
+           (+ (and (= (length args) 2)
+                   (let ((e (cond ((eql (second args) 0) (first args))
+                                  ((eql (first args) 0) (second args)))))
+                     (and e (%statically-integer-p e) e))))
+           (- (and (= (length args) 2) (eql (second args) 0)
+                   (%statically-integer-p (first args)) (first args)))
+           ((logior logxor logand)
+            (and (= (length args) 1) (fixnum-exact-p (first args)) (first args)))
+           (t nil)))
+       ))
+
+(defun %logand-noop-mask-operand (expr)
+  "X when EXPR is (LOGAND MASK X) or (LOGAND X MASK) with MASK = 2^n-1 and the
+   range of X provably inside [0, MASK]; else NIL."
+  (and (consp expr) (eq (car expr) 'logand) (= (length expr) 3)
+       (not (local-function-entry 'logand))
+       (let ((a (second expr)) (b (third expr)))
+         (flet ((try (mask x)
+                  (and (integerp mask) (plusp mask) (< mask (ash 1 62)) (zerop (logand mask (1+ mask)))
+                       (fixnum-exact-p x)
+                       (let ((r (expr-int-range x)))
+                         (and r (<= 0 (car r)) (<= (cdr r) mask)))
+                       x)))
+           (or (try a b) (try b a))))))
 
 (defun %local-funcall-as-call (expr)
   "For EXPR (FUNCALL #'F ARG...) with F a local function, the call (F ARG...);
@@ -2038,6 +2190,22 @@
        (and ra
             (let ((r (cons (- (cdr ra)) (- (car ra)))))
               (and (range-fits-int64-p r) r)))))
+    ;; (abs X): the bounds folded to non-negative ones. (isqrt X) of a non-negative
+    ;; X: the root of the bounds.
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) 'abs)
+          (not (local-function-entry 'abs)))
+     (let ((ra (expr-int-range (cadr expr))))
+       (and ra
+            (let* ((lo (car ra)) (hi (cdr ra))
+                   (r (cond ((>= lo 0) ra)
+                            ((<= hi 0) (cons (- hi) (- lo)))
+                            (t (cons 0 (max (- lo) hi))))))
+              (and (range-fits-int64-p r) r)))))
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) 'isqrt)
+          (not (local-function-entry 'isqrt)))
+     (let ((ra (expr-int-range (cadr expr))))
+       (and ra (>= (car ra) 0)
+            (cons (isqrt (car ra)) (isqrt (cdr ra))))))
     ;; (min a b ...) / (max a b ...): the bounds of the bounds.
     ((and (consp expr) (member (car expr) '(min max)) (consp (cdr expr))
           (not (local-function-entry (car expr))))
@@ -2052,6 +2220,11 @@
     ;; shape (raw int64 on each path); without the union here every consumer
     ;; that asks for a proof -- 1+ / 1-, the binop fast path, an Int64 slot's
     ;; init -- saw no range and compiled the IF boxed, arms included.
+    ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4)
+          (%never-returns-form-p (cadddr expr)))
+     (expr-int-range (caddr expr)))
+    ((let ((b (%plain-block-body expr))) b)
+     (expr-int-range (%plain-block-body expr)))
     ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4))
      (let ((ra (expr-int-range (caddr expr))))
        (and ra

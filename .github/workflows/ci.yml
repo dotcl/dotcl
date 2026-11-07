@@ -39,62 +39,45 @@ defaults:
     shell: bash
 
 jobs:
+  # -- How the work is laid out -----------------------------------------------
+  # The push run is the job `test` alone: one build and the push set, about
+  # 20 min. Splitting it would only add a build per
+  # extra job to every push.
+  #
+  # The full run is `test` and the five `full-*` jobs below, each with its own
+  # checkout and build (~2 min each, the price of independence), each about 20
+  # min or less, measured step by step. They do not depend on one another, so
+  # the run takes as long as its longest job when there are as many runners as
+  # jobs, and about half its total (~105 job-minutes) on two runners. Passing
+  # the build between jobs as an artifact was not taken: it would put an upload
+  # and a download where the build was, save little of the wall clock, and tie
+  # every job to the one that builds.
+  #
+  # The job order below is the order the runners usually pick them up in. The
+  # two short ones go last, so on two runners they fill the gap the long ones
+  # leave instead of starting a third round.
   test:
     # The runner comes from the CI_RUNNER repository variable, falling back to
     # ubuntu-latest where it is unset. Keep the fallback: a repository without
     # the variable must still build on GitHub-hosted runners.
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
-    # 30 -> 45 -> 60 -> 90. A job that dies at the ceiling reports as a failure
-    # of whatever step happened to be running, which is the least informative
-    # red there is, so the ceiling has to stay well clear of the measurements:
-    #
-    #   push     ~24 min  (regression 245s + interpreter 161s + emit-free ~550s
-    #                      is two thirds of it), ~29 with the gates below ungated
-    #   nightly  ~41 min  measured 2026-09-13, and that was BEFORE the pack path
-    #                     (~5 min) was added below
-    #
-    # The nightly is what forced 60: at 45 the next one would have been decided
-    # by the ceiling rather than by a result. It then happened anyway. Four
-    # nightlies in a row (09-16 through 09-19) were cancelled at exactly 60,
-    # always inside ANSI, so the ANSI gate, the ansi-state.json update and the
-    # benchmarks did not run for four days and nobody noticed: a ceiling is a
-    # wall, and a wall says nothing until you are through it.
-    #
-    # What grew between 09-13 and 09-18, measured step by step:
-    #
-    #   Pack path (nightly)                 0.0 -> 10.5 min
-    #   Regression tests (emit-free build)  7.3 -> 15.7 min
-    #
-    # Neither line is a regression. The pack path is a NEW step this cycle, so
-    # 0.0 is "did not exist", not "ran instantly"; the step count went 31 -> 43
-    # between the two tags. The emit-free line is the 40 regression tests added
-    # this cycle: they exercise declarations reaching the representation, so
-    # they loop (one runs a 1e6-iteration tail self-call), and emit-free
-    # interprets rather than compiles, which is where the minutes go.
-    # ANSI is not the cause: 9.6 min on 09-13, 9.7 on 09-18. The 09-18 nightly
-    # spent 60.5 min and was cut 9.7 min into ANSI; finishing ANSI plus the
-    # benchmarks (1.9 min) puts a full nightly near 73. 90 leaves room for the
-    # suite to keep growing, which on this evidence it will.
-    #
-    # Execution time is steady -- 36-39 min per push job across the period. The
-    # spread in `gh run list` (39 to 128 min) is queue time on a single runner,
-    # which this ceiling does not govern.
-    #
-    # Since 2026-09-29 the push set is about 12 min and the full run (below) is
-    # the old nightly with nothing taken out, ~65-70 min. The ceiling is set by
-    # the full run.
-    # The full run's pack path, ANSI and benchmarks are in the job
-    # full-pack-ansi-bench below; this job is the build, the gates and the
-    # regression suite in its three modes.
-    timeout-minutes: 90
+    # Push run about 23 min (regression 14, interpreter 3, builds 5); in the
+    # full run this job is the build and the compiled suite at the full tier,
+    # about 21 min. A job that dies at the ceiling reports as a failure of
+    # whatever step happened to be running, which is the least informative red
+    # there is, so the ceiling stays well above the measurement. A shared Linux
+    # host under load ran this job 1.8x slower and 45 minutes cancelled it
+    # twice, which says nothing about the code; 75 lets a slow run finish and
+    # report a real result.
+    timeout-minutes: 75
     # RUN_FULL selects the full run: the scheduled run, a run started by hand,
     # and a push to the public mirror (which moves only at releases, so a push
     # there IS the release gate). A push or pull request run is the push set:
     # build, the ns2.0 tripwire, and the regression suite compiled and under the
     # tree-walk interpreter, with its slowest child-process files left out
-    # (DOTCL_REGRESSION_TIER below). The full run is not the push run again: it
-    # adds every step guarded by RUN_FULL and loads the files the push set
-    # leaves out.
+    # (DOTCL_REGRESSION_TIER below). In the full run this job runs the compiled
+    # suite with every file loaded, and the rest of the full run is in the
+    # full-* jobs below.
     #
     # What moved out of the push set on 2026-09-29, and why: the push run had
     # reached ~44 min on one runner, against a target of about 12. Moved to the
@@ -129,9 +112,14 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
       - name: Prune old NuGet packages
         if: runner.environment != 'github-hosted'
-        run: python3 ci/prune-nuget.py
+        run: dotnet run ci/prune-nuget.cs
 
       # A full disk fails a run somewhere unrelated, much later. Checked right
       # after the old runtime packs are pruned, on our own runners only (they
@@ -176,11 +164,6 @@ jobs:
           EOF
           echo "BASH_ENV=$RUNNER_TEMP/step-env.sh" >> "$GITHUB_ENV"
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
-
       # A runner that keeps its home directory between runs already has this, so
       # install only when it is missing (saves ~30s per run where it persists).
       - name: Setup Roswell
@@ -200,36 +183,12 @@ jobs:
       # AOT/WebGL link against. `make build` only builds the dev net10 runner, so
       # an ns2.0-only break (unguarded Reflection.Emit / a BCL overload that ns2.0
       # does not have) would otherwise surface only in a heavy AOT/IL2CPP build.
-      # Both repos, every push.
-      #
-      # Placed here, straight after Build, rather than after the three test
-      # suites: it is a compile, so nothing below can influence it, and leaving it
-      # at minute 21 meant an ns2.0-only break -- which is what it caught last --
-      # took the whole run to report. Now it reports at about minute 2.
+      # Both repos, every push. Placed straight after Build: it is a compile, so
+      # nothing below can influence it, and it reports at about minute 2.
+      # In the full run it is in full-interp, beside the other ns2.0 checks.
       - name: Build emit-free ns2.0 runtime (tripwire)
+        if: env.RUN_FULL != 'true'
         run: make build-ns2
-
-      # The compiler compiled by itself has to reproduce itself. Only this
-      # comparison sees a compiler that silently depends on SBCL being the host:
-      # a cross-compile flag that never reached the running compiler, and an
-      # intrinsic table keyed on the other half of a split package, both passed
-      # every other gate. ~1 min; the heavier selfhost-test (the suite on the
-      # self-hosting core) stays manual. Full run only since 2026-09-29, with
-      # the seed build below (3.7 min together, 2 real catches in two months).
-      - name: Self-host fixpoint
-        if: env.RUN_FULL == 'true'
-        run: make selfhost-check
-
-      # The other half of the same property: can a RELEASED dotcl build this
-      # tree? selfhost-check only proves the tree reproduces itself, which stays
-      # true even if the last released version can no longer be used as a seed;
-      # and that is what decides whether the build chain can drop its Common Lisp
-      # host. It broke silently once already: 0.1.24 built a core that then died
-      # with "Undefined function: KEY", found by hand months later. ~1 min,
-      # including fetching the pinned seed from nuget.
-      - name: Seed build (a released dotcl builds this tree)
-        if: env.RUN_FULL == 'true'
-        run: make seed-check
 
       - name: Compile asdf FASL (required by some regression tests)
         run: make compile-asdf-fasl
@@ -265,222 +224,41 @@ jobs:
       # signalled "Undefined function: %MAKE-PACKAGE", multi-threaded EVAL
       # deadlocked, and an unmatched THROW killed the process outright.
       # Compile-time-diagnostic tests opt out via DEFTEST-COMPILED-ONLY.
+      # In the full run it is in full-interp, so this job stays near 20 min.
       - name: Regression tests (tree-walk interpreter)
+        if: env.RUN_FULL != 'true'
         run: make test-regression-interp
-
-      # The suite on a runtime built WITHOUT Reflection.Emit (-p:DotclNoEmit),
-      # which is what AOT / IL2CPP / WebGL / netstandard2.0 ship. The step above
-      # only swaps the evaluator; this one removes the emitter from the build, so
-      # it also covers the runtime functions a compiled call site would otherwise
-      # have inlined past. Nothing ran it before and it was red: `(/ 1.0d0 0.0d0)`
-      # signalled here while the compiled path returned an infinity, so a file
-      # that builds an infinity could not even load.
-      #
-      # One known intermittent failure remains, and it is a real one rather than
-      # a flaky test: concurrent add-method / remove-method can corrupt a hash
-      # table that is not synchronized. It has only ever been seen while another
-      # heavy build shared the machine -- ten clean runs on a quiet one -- so a
-      # red here is worth reading rather than re-running.
-      #
-      # Full run only since 2026-09-29 (10.5 min of a 44-min push run). Its three
-      # real catches on pushes are the price: such a defect now shows within 12
-      # hours instead of on its own push.
-      - name: Regression tests (emit-free build)
-        if: env.RUN_FULL == 'true'
-        run: make test-regression-emitfree
-
-      # Assert the emitted CIL is VERIFIABLE, not merely JIT-acceptable: CoreCLR
-      # tolerates a covariant call or an i4 where an i8 is wanted, IL2CPP/WebGL
-      # do not, and a 25-minute AOT build is a terrible place to find out. The
-      # target exists since the emitter was written but nothing ran it, so two
-      # such defects sat in every fasl (a covariant Symbol call in non-top-level
-      # DEFUN, an i4 default radix in DIGIT-CHAR-P) until a real library was put
-      # through it. It now verifies the core, the stress fixture, and asdf.
-      - name: Verify emitted CIL (ilverify)
-        if: env.RUN_FULL == 'true'
-        run: |
-          dotnet tool install --global dotnet-ilverify >/dev/null 2>&1 || true
-          export PATH="$PATH:$HOME/.dotnet/tools"
-          make ilverify
-
-      # ilverify asks whether the IL is valid; this asks whether the assembly has
-      # a loadable SHAPE: no method too large to JIT cheaply, no type near the
-      # field limit, no oversized #US heap. Those bounds have been crossed four
-      # times, and every time the compile side looked healthy (total IL, fasl
-      # bytes and compile time all flat) while LOAD failed with a diagnostic that
-      # named neither the file nor the cause. All four were found by a user
-      # running out of memory, none by CI.
-      - name: Check fasl shape
-        if: env.RUN_FULL == 'true'
-        run: make test-fasl-shape
-
-      # The only test that actually builds projects the way a user does; a Lisp
-      # library consumed by a plain C# app and by a dotcl app, through MSBuild.
-      # Everything above tests the compiler and the runtime; this tests the
-      # shipping path, and it was red for an unknown length of time because
-      # nothing ran it: the build silently compiled a same-named system from
-      # somewhere else in the tree instead of the project's own sources. ~2 min.
-      # Needs the fasl core, which the target builds if absent.
-      - name: Project composition (MSBuild consumers)
-        if: env.RUN_FULL == 'true'
-        run: make compile-core-fasl test-project-compose
-
-      # The gates below were in the Makefile but in no workflow. That is not a
-      # theoretical gap: an audit of `make` targets against the workflows found 6
-      # of 17 test targets wired, and the very first unwired one run by hand was
-      # RED -- with-standard-io-syntax had been bent away from CLHS to keep an
-      # ANSI test green, and the test that says so had never executed here.
-      #
-      # Measured on the nightly of 2026-09-13, they cost 5m34s together
-      # (project-compose 1m54 incl. compile-core-fasl, save-class-lib 1m35,
-      # project-core-build 59s, core-bytes 30s, debug-pdb 23s, host-api 13s).
-      # They ran on every push until 2026-09-29 and now run in the full run
-      # (RUN_FULL above): by then they cost ~7 min per push and none of them
-      # had ever caught a real defect on a push. They still run in both
-      # repositories; a breakage they catch shows within 12 hours.
-
-      # CLHS-audit tests for behaviour ansi-test does not reach (the
-      # with-standard-io-syntax variable table, pprint dispatch, read-sequence
-      # bounds). ~10s.
-      - name: CLHS audit extras
-        if: env.RUN_FULL == 'true'
-        run: make test-ansi-extra
-
-      # AMOP protocol conformance: the metaobject generic functions real
-      # libraries call. ~10s.
-      - name: MOP protocol tests
-        if: env.RUN_FULL == 'true'
-        run: make test-mop
-
-      # The embedding API a C# host meets: EnsureCore with no prior Initialize,
-      # a function named the way it is spelled in the Lisp source, and a host
-      # with dynamic code disabled getting a Lisp condition rather than a raw
-      # PlatformNotSupportedException. Builds and runs a real C# host in both
-      # configurations. ~20s.
-      - name: Embedding API (C# host)
-        if: env.RUN_FULL == 'true'
-        run: make test-host-api
-
-      # The regression files that touch threads, frames, multiple values,
-      # structures, CLOS and conditions, run with a tiny gen0 budget (GC very
-      # often) both from the CLI and from a C# host that has used up .NET's small
-      # TLS block first. A frame-chain head kept at the address of a TLS field
-      # that the GC could move went unnoticed for weeks: the CLI always got the
-      # fixed TLS block, a host (MSBuild, an ASP.NET app) did not. ~1.5 min.
-      - name: Regression under GC stress (CLI and C# host)
-        if: env.RUN_FULL == 'true'
-        run: make test-gc-stress
-
-      # Booting from a core held in memory -- the only way in for a host with no
-      # filesystem, and the only way in at all for the emit-free runtime. ~25s.
-      - name: In-memory core boot
-        if: env.RUN_FULL == 'true'
-        run: make test-core-bytes
-
-      # What a script run does with an error nothing handled: exit code, and
-      # whether the forms after it ran. Process-level, so no regression test in
-      # the image can see it. ~15s.
-      - name: Script exit codes
-        if: env.RUN_FULL == 'true'
-        run: make test-cli-exit
-
-      # dotcl emits a .NET class library that a separate C# project references at
-      # COMPILE time (interface implemented on the C# side, delegate invoked).
-      # Nothing else here compiles C# against dotcl-emitted metadata. ~70s.
-      - name: save-class-library (C# consumes emitted metadata)
-        if: env.RUN_FULL == 'true'
-        run: make test-save-class-lib
-
-      # A C# host (knows nothing of dotcl) loads a C# plugin and a Common Lisp plugin
-      # baked into a DLL, from a folder, through AssemblyLoadContext. ~15s.
-      - name: plugin host sample (C# host, Lisp plugin)
-        if: env.RUN_FULL == 'true'
-        run: make test-plugin-host-demo
-
-      # DOTCL_EMIT_PDB: the .lisp must appear in the PDB with sequence points and
-      # named locals, which is what makes the VS / VS Code debugger show Lisp
-      # source and Locals. ~20s.
-      - name: Debug info (PDB)
-        if: env.RUN_FULL == 'true'
-        run: make test-debug-pdb
 
       - name: Disk usage (after)
         if: always()
         run: df -h / && du -sh out/ansi 2>/dev/null || true
 
       # What this job actually costs in memory, written to the step summary.
-      #
-      # Informational only, and deliberately incapable of failing the job: the
-      # body runs under `set +e` and the step ends with `exit 0`. Reporting must
-      # never decide the colour of a run, and a sizing measurement least of all.
-      #
-      # The question it answers: the push job (regression + interpreter +
-      # emit-free, two thirds of the wall clock) is the only thing that runs on
-      # every commit, while the nightly path peaks around 3.6 GB. If the push
-      # job fits well under 3 GB, a second small box can take the pushes and the
-      # bigger one can be kept for the nightly -- which is what turns a queue of
-      # master runs into two lanes. A week of these numbers decides it.
-      #
-      # memory.peak is the cgroup high-water mark, reset at the top of the job
-      # where the kernel allows it. Ancestors are printed unreset so the figure
-      # is still readable if the reset was refused, and /proc/self/cgroup is
-      # printed so it is clear which cgroup the number belongs to (the job's
-      # processes are children of a long-lived service, not of a container).
+      # Informational only; the script cannot fail the job. Every job of the
+      # full run reports it, which is what sizes a runner that takes two jobs at
+      # once.
       - name: Memory peak (informational)
         if: always()
-        run: |
-          set +e
-          show_mem() {
-            for f in memory.peak memory.current memory.max \
-                     memory.max_usage_in_bytes memory.usage_in_bytes memory.limit_in_bytes; do
-              [ -r "$1/$f" ] && echo "$1/$f = $(cat "$1/$f")"
-            done
-          }
-          {
-            echo "## Job memory"
-            echo ""
-            echo '```'
-            echo "nproc: $(nproc)"
-            echo ""
-            echo "--- /proc/self/cgroup ---"
-            cat /proc/self/cgroup
-            echo ""
-            echo "--- cgroup memory (this cgroup first, then its ancestors) ---"
-            cg2=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)
-            cg1=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ { print $3; exit }' /proc/self/cgroup)
-            for base in "/sys/fs/cgroup${cg2}" ${cg1:+"/sys/fs/cgroup/memory${cg1}"}; do
-              d="$base"
-              while : ; do
-                case "$d" in /sys/fs/cgroup*) ;; *) break ;; esac
-                show_mem "$d"
-                nd=$(dirname "$d")
-                [ "$nd" = "$d" ] && break
-                d="$nd"
-              done
-            done
-            echo ""
-            echo "--- free -m ---"
-            free -m
-            echo ""
-            echo "--- /usr/bin/time ---"
-            if [ -x /usr/bin/time ]; then
-              echo "present (the three heavy steps can be wrapped in /usr/bin/time -v)"
-            else
-              echo "absent (apt-get install time) -- the cgroup figures above are the only route"
-            fi
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY" 2>&1
-          exit 0
+        run: sh scripts/ci-memory-report.sh
 
-  # -- The second half of the full run ----------------------------------------
-  # The pack path, ANSI, the random differential test and the benchmarks. A job
-  # of its own so the full run can use both runners; the benchmarks go last.
-  full-pack-ansi-bench:
-    name: full (pack, ANSI, bench)
+  # -- Full run: the evaluators and the ns2.0 path ------------------------------
+  # Everything about the runtime that AOT / IL2CPP / WebGL ship: the ns2.0
+  # compile, the suite under the interpreter and on the emit-free build, the
+  # IL verifier, the in-memory core boot, and the suite under GC stress.
+  # Two jobs, because as one it ran into its 75 minute ceiling on a loaded
+  # shared host (interpreter 30 min, emit-free 28, ilverify 4.5, core boot 2,
+  # then GC stress): full-interp is the interpreter suite, the ns2.0 tripwire,
+  # ilverify and the in-memory core boot; full-emitfree is the emit-free suite
+  # and GC stress. Both repeat the build, the asdf FASL and contrib/dotnet-cs
+  # (about 8 min each), so the pair costs about 8 min more machine time than
+  # the one job did, and neither is near its ceiling.
+  full-interp:
+    name: full (interpreter, ilverify, core boot)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push')
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
+      DOTCL_REGRESSION_TIER: full
       DOTCL_CI: "1"
       CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") :ignore-inherited-configuration)'
     steps:
@@ -489,9 +267,14 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
       - name: Prune old NuGet packages
         if: runner.environment != 'github-hosted'
-        run: python3 ci/prune-nuget.py
+        run: dotnet run ci/prune-nuget.cs
 
       # As in the test job.
       - name: Free disk space
@@ -525,10 +308,247 @@ jobs:
           EOF
           echo "BASH_ENV=$RUNNER_TEMP/step-env.sh" >> "$GITHUB_ENV"
 
+      - name: Setup Roswell
+        run: |
+          if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
+            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          fi
+          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
+
+      - name: Cross-compile
+        run: make cross-compile
+
+      - name: Build
+        run: make build
+
+      - name: Compile asdf FASL (required by some regression tests)
+        run: make compile-asdf-fasl
+
+      # contrib/dotnet-cs/lib/ (Roslyn and the helper DLL) for the inline-cs
+      # regression tests. Without it they skip, which looked like a pass; in the
+      # full run (DOTCL_CI=1, tier full) a missing lib/ now fails the suite
+      # instead (test/regression/inline-cs-short-opcodes.lisp). The full tier
+      # needs it: it builds the runtime in Release for net10.0, which nothing
+      # else in the job has done by this point. Roslyn comes from the NuGet cache, which the
+      # pack step keeps warm on a runner that keeps its home directory.
+      # ~10s on an M1 from a clean tree with a warm cache; about 1 min expected
+      # here, going by the Build step.
+      - name: Build contrib/dotnet-cs (full run; inline-cs regression tests)
+        run: make contrib-dotnet-cs
+
+      # The ns2.0 tripwire; in the push run it is in the job test.
+      - name: Build emit-free ns2.0 runtime (tripwire)
+        run: make build-ns2
+
+      # The same suite with EVAL routed through the emit-free tree-walk
+      # interpreter; see the push run's step in the job test.
+      - name: Regression tests (tree-walk interpreter)
+        run: make test-regression-interp
+
+      # Assert the emitted CIL is VERIFIABLE, not merely JIT-acceptable: CoreCLR
+      # tolerates a covariant call or an i4 where an i8 is wanted, IL2CPP/WebGL
+      # do not, and a 25-minute AOT build is a terrible place to find out. The
+      # target exists since the emitter was written but nothing ran it, so two
+      # such defects sat in every fasl (a covariant Symbol call in non-top-level
+      # DEFUN, an i4 default radix in DIGIT-CHAR-P) until a real library was put
+      # through it. It now verifies the core, the stress fixture, and asdf.
+      - name: Verify emitted CIL (ilverify)
+        run: |
+          dotnet tool install --global dotnet-ilverify >/dev/null 2>&1 || true
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          make ilverify
+
+      # Booting from a core held in memory -- the only way in for a host with no
+      # filesystem, and the only way in at all for the emit-free runtime. ~25s.
+      - name: In-memory core boot
+        run: make test-core-bytes
+
+      - name: Disk usage (after)
+        if: always()
+        run: df -h / && du -sh out/ansi 2>/dev/null || true
+
+      - name: Memory peak (informational)
+        if: always()
+        run: sh scripts/ci-memory-report.sh
+
+
+  full-emitfree:
+    name: full (emit-free, GC stress)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push')
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 75
+    env:
+      DOTCL_REGRESSION_TIER: full
+      DOTCL_CI: "1"
+      CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") :ignore-inherited-configuration)'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+
+      - name: Prune old NuGet packages
+        if: runner.environment != 'github-hosted'
+        run: dotnet run ci/prune-nuget.cs
+
+      # As in the test job.
+      - name: Free disk space
+        if: runner.environment != 'github-hosted'
+        run: |
+          avail_kb=$(df -Pk / | awk 'NR == 2 { print $4 }')
+          echo "$((avail_kb / 1024)) MB free on /"
+          if [ "$avail_kb" -lt $((5 * 1024 * 1024)) ]; then
+            echo "::error::Less than 5 GB free on /"
+            df -h /
+            du -sh "$HOME"/.nuget/packages/* 2>/dev/null | sort -rh | head -20
+            exit 1
+          fi
+
+      - name: Runner info
+        run: |
+          echo "=== CPU ===" && lscpu | grep -E 'Model name|^CPU\(s\)|Thread'
+          echo "=== Memory ===" && free -h
+          echo "=== Disk ===" && df -h /
+          cg=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup 2>/dev/null || true)
+          echo 0 > "/sys/fs/cgroup${cg}/memory.peak" 2>/dev/null \
+            && echo "=== memory.peak reset: yes ===" \
+            || echo "=== memory.peak reset: no (kernel < 6.8, or not writable) ==="
+
+      # As in the test job.
+      - name: Per-step cache directory
+        run: |
+          cat > "$RUNNER_TEMP/step-env.sh" <<'EOF'
+          export XDG_CACHE_HOME="$RUNNER_TEMP/xdg-cache/$GITHUB_ACTION"
+          mkdir -p "$XDG_CACHE_HOME"
+          EOF
+          echo "BASH_ENV=$RUNNER_TEMP/step-env.sh" >> "$GITHUB_ENV"
+
+      - name: Setup Roswell
+        run: |
+          if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
+            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          fi
+          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
+
+      - name: Cross-compile
+        run: make cross-compile
+
+      - name: Build
+        run: make build
+
+      - name: Compile asdf FASL (required by some regression tests)
+        run: make compile-asdf-fasl
+
+      # contrib/dotnet-cs/lib/ (Roslyn and the helper DLL) for the inline-cs
+      # regression tests. Without it they skip, which looked like a pass; in the
+      # full run (DOTCL_CI=1, tier full) a missing lib/ now fails the suite
+      # instead (test/regression/inline-cs-short-opcodes.lisp). The full tier
+      # needs it: it builds the runtime in Release for net10.0, which nothing
+      # else in the job has done by this point. Roslyn comes from the NuGet cache, which the
+      # pack step keeps warm on a runner that keeps its home directory.
+      # ~10s on an M1 from a clean tree with a warm cache; about 1 min expected
+      # here, going by the Build step.
+      - name: Build contrib/dotnet-cs (full run; inline-cs regression tests)
+        run: make contrib-dotnet-cs
+
+      # The suite on a runtime built WITHOUT Reflection.Emit (-p:DotclNoEmit),
+      # which is what AOT / IL2CPP / WebGL / netstandard2.0 ship. The step above
+      # only swaps the evaluator; this one removes the emitter from the build, so
+      # it also covers the runtime functions a compiled call site would otherwise
+      # have inlined past. Nothing ran it before and it was red: `(/ 1.0d0 0.0d0)`
+      # signalled here while the compiled path returned an infinity, so a file
+      # that builds an infinity could not even load.
+      #
+      # One known intermittent failure remains, and it is a real one rather than
+      # a flaky test: concurrent add-method / remove-method can corrupt a hash
+      # table that is not synchronized. It has only ever been seen while another
+      # heavy build shared the machine -- ten clean runs on a quiet one -- so a
+      # red here is worth reading rather than re-running.
+      #
+      - name: Regression tests (emit-free build)
+        run: make test-regression-emitfree
+
+      # The regression files that touch threads, frames, multiple values,
+      # structures, CLOS and conditions, run with a tiny gen0 budget (GC very
+      # often) both from the CLI and from a C# host that has used up .NET's small
+      # TLS block first. A frame-chain head kept at the address of a TLS field
+      # that the GC could move went unnoticed for weeks: the CLI always got the
+      # fixed TLS block, a host (MSBuild, an ASP.NET app) did not. ~1.5 min.
+      - name: Regression under GC stress (CLI and C# host)
+        run: make test-gc-stress
+
+      - name: Disk usage (after)
+        if: always()
+        run: df -h / && du -sh out/ansi 2>/dev/null || true
+
+      - name: Memory peak (informational)
+        if: always()
+        run: sh scripts/ci-memory-report.sh
+
+  # -- Full run: the release pack path ----------------------------------------
+  # The pack, the nuspec rules and the library packages built from it, then
+  # the ProjectCore MSBuild tasks, which reuse the contrib fasls the pack
+  # built. ~20 min, most of it the pack.
+  full-pack:
+    name: full (pack path)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push')
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 75
+    env:
+      DOTCL_REGRESSION_TIER: full
+      DOTCL_CI: "1"
+      CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") :ignore-inherited-configuration)'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Prune old NuGet packages
+        if: runner.environment != 'github-hosted'
+        run: dotnet run ci/prune-nuget.cs
+
+      # As in the test job.
+      - name: Free disk space
+        if: runner.environment != 'github-hosted'
+        run: |
+          avail_kb=$(df -Pk / | awk 'NR == 2 { print $4 }')
+          echo "$((avail_kb / 1024)) MB free on /"
+          if [ "$avail_kb" -lt $((5 * 1024 * 1024)) ]; then
+            echo "::error::Less than 5 GB free on /"
+            df -h /
+            du -sh "$HOME"/.nuget/packages/* 2>/dev/null | sort -rh | head -20
+            exit 1
+          fi
+
+      - name: Runner info
+        run: |
+          echo "=== CPU ===" && lscpu | grep -E 'Model name|^CPU\(s\)|Thread'
+          echo "=== Memory ===" && free -h
+          echo "=== Disk ===" && df -h /
+          cg=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup 2>/dev/null || true)
+          echo 0 > "/sys/fs/cgroup${cg}/memory.peak" 2>/dev/null \
+            && echo "=== memory.peak reset: yes ===" \
+            || echo "=== memory.peak reset: no (kernel < 6.8, or not writable) ==="
+
+      # As in the test job.
+      - name: Per-step cache directory
+        run: |
+          cat > "$RUNNER_TEMP/step-env.sh" <<'EOF'
+          export XDG_CACHE_HOME="$RUNNER_TEMP/xdg-cache/$GITHUB_ACTION"
+          mkdir -p "$XDG_CACHE_HOME"
+          EOF
+          echo "BASH_ENV=$RUNNER_TEMP/step-env.sh" >> "$GITHUB_ENV"
 
       - name: Setup Roswell
         run: |
@@ -611,17 +631,109 @@ jobs:
         if: always()
         run: rm -rf out runtime/contrib
 
-      # The other half of the MSBuild story: the Project composition step in the
-      # test job builds with the legacy targets (external process), this one
+      # The other half of the MSBuild story: the Project composition step in
+      # full-hosts builds with the legacy targets (external process), this one
       # with the ProjectCore targets driving the in-process tasks -- the
       # configuration every NuGet consumer gets, and the only one that executes
       # DotCL.Build.Tasks.dll at all. Also the gate on what a failing build TELLS
       # the user: a dependency that cannot be found is the first wall a new user
       # hits, and the remedy is a build property they have no reason to know
       # about. Here, after the pack, the contrib fasls it needs are already built
-      # (~2 min; ~9 min in the test job, which has to build them first).
+      # (~3.5 min; it would cost several more in a job that had to build them
+      # first).
       - name: Project-core MSBuild tasks
         run: make test-project-core-build
+
+      - name: Disk usage (after)
+        if: always()
+        run: df -h / && du -sh out/ansi 2>/dev/null || true
+
+      - name: Memory peak (informational)
+        if: always()
+        run: sh scripts/ci-memory-report.sh
+
+  # -- Full run: ANSI, the random differential test, the benchmarks -----------
+  # With the two small CLHS / AMOP suites that ansi-test does not reach. The
+  # benchmarks go last. ~20 min.
+  full-ansi-bench:
+    name: full (ANSI, random, bench)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push')
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 75
+    env:
+      DOTCL_REGRESSION_TIER: full
+      DOTCL_CI: "1"
+      CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") :ignore-inherited-configuration)'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Prune old NuGet packages
+        if: runner.environment != 'github-hosted'
+        run: dotnet run ci/prune-nuget.cs
+
+      # As in the test job.
+      - name: Free disk space
+        if: runner.environment != 'github-hosted'
+        run: |
+          avail_kb=$(df -Pk / | awk 'NR == 2 { print $4 }')
+          echo "$((avail_kb / 1024)) MB free on /"
+          if [ "$avail_kb" -lt $((5 * 1024 * 1024)) ]; then
+            echo "::error::Less than 5 GB free on /"
+            df -h /
+            du -sh "$HOME"/.nuget/packages/* 2>/dev/null | sort -rh | head -20
+            exit 1
+          fi
+
+      - name: Runner info
+        run: |
+          echo "=== CPU ===" && lscpu | grep -E 'Model name|^CPU\(s\)|Thread'
+          echo "=== Memory ===" && free -h
+          echo "=== Disk ===" && df -h /
+          cg=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup 2>/dev/null || true)
+          echo 0 > "/sys/fs/cgroup${cg}/memory.peak" 2>/dev/null \
+            && echo "=== memory.peak reset: yes ===" \
+            || echo "=== memory.peak reset: no (kernel < 6.8, or not writable) ==="
+
+      # As in the test job.
+      - name: Per-step cache directory
+        run: |
+          cat > "$RUNNER_TEMP/step-env.sh" <<'EOF'
+          export XDG_CACHE_HOME="$RUNNER_TEMP/xdg-cache/$GITHUB_ACTION"
+          mkdir -p "$XDG_CACHE_HOME"
+          EOF
+          echo "BASH_ENV=$RUNNER_TEMP/step-env.sh" >> "$GITHUB_ENV"
+
+      - name: Setup Roswell
+        run: |
+          if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
+            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          fi
+          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
+
+      - name: Cross-compile
+        run: make cross-compile
+
+      - name: Build
+        run: make build
+
+      # CLHS-audit tests for behaviour ansi-test does not reach (the
+      # with-standard-io-syntax variable table, pprint dispatch, read-sequence
+      # bounds). ~10s.
+      - name: CLHS audit extras
+        run: make test-ansi-extra
+
+      # AMOP protocol conformance: the metaobject generic functions real
+      # libraries call. ~10s.
+      - name: MOP protocol tests
+        run: make test-mop
 
       # Fetching ansi-test is its own step so a failure there is reported as
       # what it is. It used to be a prerequisite of the run below, whose `|| true`
@@ -701,8 +813,12 @@ jobs:
       # one cannot judge another: the gate either misses real regressions or
       # fails on the luck of the draw. The baselines in
       # bench/gate/ratio-baseline.json each belong to one fixed machine.
+      # The full run's jobs go to whichever runner is free, so when runners
+      # other than the measured ones are attached, the repository variable
+      # BENCH_RUNNERS (comma-separated runner names) limits both benchmark
+      # steps to the named ones; unset, any runner of ours runs them.
       - name: Benchmarks
-        if: hashFiles('bench/cl-bench-runner/run.lisp') != '' && runner.environment != 'github-hosted'
+        if: hashFiles('bench/cl-bench-runner/run.lisp') != '' && runner.environment != 'github-hosted' && (vars.BENCH_RUNNERS == '' || contains(format(',{0},', vars.BENCH_RUNNERS), format(',{0},', runner.name)))
         run: make bench-state || true
 
       # Unlike the step above, this one is a gate and has no `|| true`. It can
@@ -729,12 +845,8 @@ jobs:
       # recorded; that is intentional, not a regression to work around by
       # re-adding the variable.
       - name: Benchmark ratio gate
-        if: hashFiles('bench/csharp-parity/kernels.lisp') != '' && runner.environment != 'github-hosted'
+        if: hashFiles('bench/csharp-parity/kernels.lisp') != '' && runner.environment != 'github-hosted' && (vars.BENCH_RUNNERS == '' || contains(format(',{0},', vars.BENCH_RUNNERS), format(',{0},', runner.name)))
         run: make bench-parity
-
-      - name: Disk usage (after)
-        if: always()
-        run: df -h / && du -sh out/ansi 2>/dev/null || true
 
       - name: Show results
         if: always()
@@ -785,58 +897,277 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Disk usage (after)
+        if: always()
+        run: df -h / && du -sh out/ansi 2>/dev/null || true
+
       - name: Memory peak (informational)
         if: always()
+        run: sh scripts/ci-memory-report.sh
+
+  # -- Full run: the build chain and the compiler's output ---------------------
+  # Does the tree reproduce itself, can a released dotcl build it, is the fasl
+  # loadable, and what a script run and the PDB look like from outside. ~8 min:
+  # one of the two short jobs that fill in on two runners.
+  full-selfhost:
+    name: full (self-host, seed, fasl shape, CLI, PDB)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push')
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      DOTCL_REGRESSION_TIER: full
+      DOTCL_CI: "1"
+      CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") :ignore-inherited-configuration)'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Prune old NuGet packages
+        if: runner.environment != 'github-hosted'
+        run: dotnet run ci/prune-nuget.cs
+
+      # As in the test job.
+      - name: Free disk space
+        if: runner.environment != 'github-hosted'
         run: |
-          set +e
-          show_mem() {
-            for f in memory.peak memory.current memory.max \
-                     memory.max_usage_in_bytes memory.usage_in_bytes memory.limit_in_bytes; do
-              [ -r "$1/$f" ] && echo "$1/$f = $(cat "$1/$f")"
-            done
-          }
-          {
-            echo "## Job memory"
-            echo ""
-            echo '```'
-            echo "nproc: $(nproc)"
-            echo ""
-            echo "--- /proc/self/cgroup ---"
-            cat /proc/self/cgroup
-            echo ""
-            echo "--- cgroup memory (this cgroup first, then its ancestors) ---"
-            cg2=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)
-            cg1=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ { print $3; exit }' /proc/self/cgroup)
-            for base in "/sys/fs/cgroup${cg2}" ${cg1:+"/sys/fs/cgroup/memory${cg1}"}; do
-              d="$base"
-              while : ; do
-                case "$d" in /sys/fs/cgroup*) ;; *) break ;; esac
-                show_mem "$d"
-                nd=$(dirname "$d")
-                [ "$nd" = "$d" ] && break
-                d="$nd"
-              done
-            done
-            echo ""
-            echo "--- free -m ---"
-            free -m
-            echo ""
-            echo "--- /usr/bin/time ---"
-            if [ -x /usr/bin/time ]; then
-              echo "present (the three heavy steps can be wrapped in /usr/bin/time -v)"
-            else
-              echo "absent (apt-get install time) -- the cgroup figures above are the only route"
-            fi
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY" 2>&1
-          exit 0
+          avail_kb=$(df -Pk / | awk 'NR == 2 { print $4 }')
+          echo "$((avail_kb / 1024)) MB free on /"
+          if [ "$avail_kb" -lt $((5 * 1024 * 1024)) ]; then
+            echo "::error::Less than 5 GB free on /"
+            df -h /
+            du -sh "$HOME"/.nuget/packages/* 2>/dev/null | sort -rh | head -20
+            exit 1
+          fi
+
+      - name: Runner info
+        run: |
+          echo "=== CPU ===" && lscpu | grep -E 'Model name|^CPU\(s\)|Thread'
+          echo "=== Memory ===" && free -h
+          echo "=== Disk ===" && df -h /
+          cg=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup 2>/dev/null || true)
+          echo 0 > "/sys/fs/cgroup${cg}/memory.peak" 2>/dev/null \
+            && echo "=== memory.peak reset: yes ===" \
+            || echo "=== memory.peak reset: no (kernel < 6.8, or not writable) ==="
+
+      # As in the test job.
+      - name: Per-step cache directory
+        run: |
+          cat > "$RUNNER_TEMP/step-env.sh" <<'EOF'
+          export XDG_CACHE_HOME="$RUNNER_TEMP/xdg-cache/$GITHUB_ACTION"
+          mkdir -p "$XDG_CACHE_HOME"
+          EOF
+          echo "BASH_ENV=$RUNNER_TEMP/step-env.sh" >> "$GITHUB_ENV"
+
+      - name: Setup Roswell
+        run: |
+          if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
+            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          fi
+          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
+
+      - name: Cross-compile
+        run: make cross-compile
+
+      - name: Build
+        run: make build
+
+      # The compiler compiled by itself has to reproduce itself. Only this
+      # comparison sees a compiler that silently depends on SBCL being the host:
+      # a cross-compile flag that never reached the running compiler, and an
+      # intrinsic table keyed on the other half of a split package, both passed
+      # every other gate. ~1 min; the heavier selfhost-test (the suite on the
+      # self-hosting core) stays manual. Full run only since 2026-09-29, with
+      # the seed build below (2 real catches in two months).
+      - name: Self-host fixpoint
+        run: make selfhost-check
+
+      # The other half of the same property: can a RELEASED dotcl build this
+      # tree? selfhost-check only proves the tree reproduces itself, which stays
+      # true even if the last released version can no longer be used as a seed;
+      # and that is what decides whether the build chain can drop its Common Lisp
+      # host. It broke silently once already: 0.1.24 built a core that then died
+      # with "Undefined function: KEY", found by hand months later. ~1 min,
+      # including fetching the pinned seed from nuget.
+      - name: Seed build (a released dotcl builds this tree)
+        run: make seed-check
+
+      - name: Compile asdf FASL (required by some regression tests)
+        run: make compile-asdf-fasl
+
+      # ilverify asks whether the IL is valid; this asks whether the assembly has
+      # a loadable SHAPE: no method too large to JIT cheaply, no type near the
+      # field limit, no oversized #US heap. Those bounds have been crossed four
+      # times, and every time the compile side looked healthy (total IL, fasl
+      # bytes and compile time all flat) while LOAD failed with a diagnostic that
+      # named neither the file nor the cause. All four were found by a user
+      # running out of memory, none by CI.
+      - name: Check fasl shape
+        run: make test-fasl-shape
+
+      # What a script run does with an error nothing handled: exit code, and
+      # whether the forms after it ran. Process-level, so no regression test in
+      # the image can see it. ~15s.
+      # repl-piped-reports runs the piped REPL on the core and counts a skip as a
+      # failure under DOTCL_CI, so the core has to exist in this job.
+      - name: Build core (for the piped REPL check)
+        run: make compile-core-fasl
+
+      - name: Script exit codes
+        run: make test-cli-exit
+
+      # DOTCL_EMIT_PDB: the .lisp must appear in the PDB with sequence points and
+      # named locals, which is what makes the VS / VS Code debugger show Lisp
+      # source and Locals. ~20s.
+      - name: Debug info (PDB)
+        run: make test-debug-pdb
+
+      - name: Disk usage (after)
+        if: always()
+        run: df -h / && du -sh out/ansi 2>/dev/null || true
+
+      - name: Memory peak (informational)
+        if: always()
+        run: sh scripts/ci-memory-report.sh
+
+  # -- Full run: dotcl as a .NET citizen --------------------------------------
+  # MSBuild consumers, the embedding API, save-class-library and the plugin
+  # host: everything that builds C# against dotcl. ~13 min.
+  full-hosts:
+    name: full (MSBuild and C# hosts)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push')
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      DOTCL_REGRESSION_TIER: full
+      DOTCL_CI: "1"
+      CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") :ignore-inherited-configuration)'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Prune old NuGet packages
+        if: runner.environment != 'github-hosted'
+        run: dotnet run ci/prune-nuget.cs
+
+      # As in the test job.
+      - name: Free disk space
+        if: runner.environment != 'github-hosted'
+        run: |
+          avail_kb=$(df -Pk / | awk 'NR == 2 { print $4 }')
+          echo "$((avail_kb / 1024)) MB free on /"
+          if [ "$avail_kb" -lt $((5 * 1024 * 1024)) ]; then
+            echo "::error::Less than 5 GB free on /"
+            df -h /
+            du -sh "$HOME"/.nuget/packages/* 2>/dev/null | sort -rh | head -20
+            exit 1
+          fi
+
+      - name: Runner info
+        run: |
+          echo "=== CPU ===" && lscpu | grep -E 'Model name|^CPU\(s\)|Thread'
+          echo "=== Memory ===" && free -h
+          echo "=== Disk ===" && df -h /
+          cg=$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup 2>/dev/null || true)
+          echo 0 > "/sys/fs/cgroup${cg}/memory.peak" 2>/dev/null \
+            && echo "=== memory.peak reset: yes ===" \
+            || echo "=== memory.peak reset: no (kernel < 6.8, or not writable) ==="
+
+      # As in the test job.
+      - name: Per-step cache directory
+        run: |
+          cat > "$RUNNER_TEMP/step-env.sh" <<'EOF'
+          export XDG_CACHE_HOME="$RUNNER_TEMP/xdg-cache/$GITHUB_ACTION"
+          mkdir -p "$XDG_CACHE_HOME"
+          EOF
+          echo "BASH_ENV=$RUNNER_TEMP/step-env.sh" >> "$GITHUB_ENV"
+
+      - name: Setup Roswell
+        run: |
+          if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
+            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          fi
+          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
+
+      - name: Cross-compile
+        run: make cross-compile
+
+      - name: Build
+        run: make build
+
+      - name: Compile asdf FASL (required by some regression tests)
+        run: make compile-asdf-fasl
+
+      # The only test that actually builds projects the way a user does; a Lisp
+      # library consumed by a plain C# app and by a dotcl app, through MSBuild.
+      # Everything above tests the compiler and the runtime; this tests the
+      # shipping path, and it was red for an unknown length of time because
+      # nothing ran it: the build silently compiled a same-named system from
+      # somewhere else in the tree instead of the project's own sources. ~2 min.
+      # Needs the fasl core, which the target builds if absent.
+      - name: Project composition (MSBuild consumers)
+        run: make compile-core-fasl test-project-compose
+
+      # The gates below were in the Makefile but in no workflow. That is not a
+      # theoretical gap: an audit of `make` targets against the workflows found 6
+      # of 17 test targets wired, and the very first unwired one run by hand was
+      # RED -- with-standard-io-syntax had been bent away from CLHS to keep an
+      # ANSI test green, and the test that says so had never executed here.
+      #
+      # Measured on the nightly of 2026-09-13, they cost 5m34s together
+      # (project-compose 1m54 incl. compile-core-fasl, save-class-lib 1m35,
+      # project-core-build 59s, core-bytes 30s, debug-pdb 23s, host-api 13s).
+      # They ran on every push until 2026-09-29 and now run in the full run
+      # (this job and the other full-* jobs): by then they cost ~7 min per push
+      # and none of them had ever caught a real defect on a push. They still run in both
+      # repositories; a breakage they catch shows within 12 hours.
+
+      # The embedding API a C# host meets: EnsureCore with no prior Initialize,
+      # a function named the way it is spelled in the Lisp source, and a host
+      # with dynamic code disabled getting a Lisp condition rather than a raw
+      # PlatformNotSupportedException. Builds and runs a real C# host in both
+      # configurations. ~20s.
+      - name: Embedding API (C# host)
+        run: make test-host-api
+
+      # dotcl emits a .NET class library that a separate C# project references at
+      # COMPILE time (interface implemented on the C# side, delegate invoked).
+      # Nothing else here compiles C# against dotcl-emitted metadata. ~70s.
+      - name: save-class-library (C# consumes emitted metadata)
+        run: make test-save-class-lib
+
+      # A C# host (knows nothing of dotcl) loads a C# plugin and a Common Lisp plugin
+      # baked into a DLL, from a folder, through AssemblyLoadContext. ~15s.
+      - name: plugin host sample (C# host, Lisp plugin)
+        run: make test-plugin-host-demo
+
+      - name: Disk usage (after)
+        if: always()
+        run: df -h / && du -sh out/ansi 2>/dev/null || true
+
+      - name: Memory peak (informational)
+        if: always()
+        run: sh scripts/ci-memory-report.sh
 
   # -- A red scheduled run opens an issue --------------------------------------
   # Nobody watches a run started by the clock. Opens an issue on the first red
   # scheduled run and comments on it after that, until someone closes it.
   # Never on the public mirror, which has no scheduled runs anyway.
   report-scheduled-failure:
-    needs: [test, full-pack-ansi-bench, playground]
+    needs: [test, full-interp, full-emitfree, full-pack, full-ansi-bench, full-selfhost, full-hosts, playground]
     if: always() && github.event_name == 'schedule' && github.repository != 'dotcl/dotcl' && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
@@ -871,9 +1202,10 @@ jobs:
   # dies at boot, so only a browser tells. Builds dotcl/playground against this
   # checkout and requires its probe to report `status: ready`.
   playground:
-    # After the shorter of the two full-run jobs, so the test job does not wait
-    # for a runner behind it; always(), so a red pack or ANSI does not skip it.
-    needs: full-pack-ansi-bench
+    # After the shortest full-run job, so it takes the runner that job frees
+    # instead of making a long job wait for one; always(), so a red there does
+    # not skip it.
+    needs: full-selfhost
     if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.repository == 'dotcl/dotcl' && github.event_name == 'push'))
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 40
@@ -883,9 +1215,14 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
       - name: Prune old NuGet packages
         if: runner.environment != 'github-hosted'
-        run: python3 ci/prune-nuget.py
+        run: dotnet run ci/prune-nuget.cs
 
       # As in the test job.
       - name: Free disk space
@@ -899,11 +1236,6 @@ jobs:
             du -sh "$HOME"/.nuget/packages/* 2>/dev/null | sort -rh | head -20
             exit 1
           fi
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -955,57 +1287,3 @@ jobs:
           grep -q '^output   : ' "$RUNNER_TEMP/probe.txt"
           ! grep -q 'TIMED OUT' "$RUNNER_TEMP/probe.txt"
 
-  # -- macOS, public full run only -------------------------------------------
-  # macOS has had no CI at all, while release.yml packs osx-x64 and osx-arm64 on
-  # every tag: the platform ships without ever having run the suite. This is the
-  # smallest thing that changes that -- one regression run. It used to be
-  # nightly; the public mirror has no schedule any more (it moves only at
-  # releases), so it runs on a push there and on a run started by hand.
-  #
-  # Public repository only: GitHub-hosted macOS bills at 10x, Actions on a public
-  # repository are free and unmetered, and the mirror is where the osx packages
-  # are published anyway.
-
-
-  # continue-on-error because the SBCL bootstrap here is unproven: the Linux job
-  # gets its host Lisp from roswell's install-for-ci.sh, which this does not use.
-  # It must not be made a required check until it has been green for a while.
-  macos:
-    if: github.repository == 'dotcl/dotcl' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    runs-on: macos-latest
-    timeout-minutes: 40
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
-
-      # The Makefile's cross-compile host is `ros -L sbcl-bin run`, so what is
-      # needed is roswell plus an sbcl-bin it can select -- not a brew-installed
-      # sbcl, which that command line would not use.
-      - name: Setup Roswell
-        run: |
-          brew install roswell
-          ros install sbcl-bin
-          echo "$HOME/.roswell/bin" >> $GITHUB_PATH
-
-      - name: Cross-compile
-        run: make cross-compile
-
-      - name: Build
-        run: make build
-
-      # Same reason as in the Linux job: some regression tests load asdf.
-      - name: Compile asdf FASL (required by some regression tests)
-        run: make compile-asdf-fasl
-
-      # Deliberately just this one: the point is "does dotcl run on macOS at
-      # all", not a second copy of the whole Linux matrix.
-      - name: Regression tests
-        run: make test-regression

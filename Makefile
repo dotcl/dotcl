@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: refresh-fasls call-coverage regression-time test-random-forms test-random-nightly test-random-type-prop il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-coverage test-ansi-all test-ansi-gate library-status library-status-tests test-library-status-dists test-ansi-full test-ansi-extra test-regression test-regression-interp test-regression-emitfree refresh-quicklisp-contrib test-pack-nuspec test-pack-library-e2e test-pack-library-previous test-dist-package-e2e test-save-class-lib test-plugin-host-demo test-samples test-project-compose test-project-core-build test-gc-stress test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check seed-macro-check cross-compile-seed loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotnet-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: refresh-fasls call-coverage regression-time test-random-forms test-random-nightly test-random-type-prop il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-reader-corpus test-coverage test-ansi-all test-ansi-gate library-status library-status-tests test-library-status-dists test-ansi-full test-ansi-extra test-ansi-beyond test-regression test-regression-interp test-regression-emitfree refresh-quicklisp-contrib test-ci-scripts test-pack-nuspec test-pack-library-e2e test-pack-library-previous test-dist-package-e2e test-save-class-lib test-plugin-host-demo test-samples test-project-compose test-project-core-build test-gc-stress test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check seed-macro-check cross-compile-seed loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotnet-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -168,6 +168,23 @@ test-regression-emitfree: refresh-fasls
 	@echo "=== Running dotcl regression tests (emit-free build) ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -p:DotclNoEmit=true -- --core $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)test/regression/run.lisp
 
+# Only the named regression files, in one mode: compiled, interp (tree-walk evaluator) or
+# emitfree (emit-free build). Prints PASSED / FAILED and the names of failing tests, exits
+# non-zero on a failure. For the files a change adds; the full targets above stay the gate.
+#   make test-regression-files FILES="test/regression/a.lisp test/regression/b.lisp" MODE=interp
+# FAST=1 skips the build / cross-compile / fasl refresh prerequisites (when they are already current).
+FILES ?=
+MODE ?= compiled
+test-regression-files: $(if $(FAST),,build $(DOTCL_ROOT)compiler/cil-out.sil refresh-fasls)
+	@test -n "$(FILES)" || { echo 'FILES="test/regression/x.lisp ..." is required'; exit 2; }
+	@echo "=== Running regression files ($(MODE)): $(FILES) ==="
+	@case "$(MODE)" in \
+	  compiled) DOTCL_FILES="$(FILES)" $(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/regression-files.lisp ;; \
+	  interp) DOTCL_FILES="$(FILES)" $(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(setq dotcl:*evaluator-mode* :interpret)' $(DOTCL_ROOT)test/regression-files.lisp ;; \
+	  emitfree) DOTCL_FILES="$(FILES)" $(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -p:DotclNoEmit=true -- --core $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)test/regression-files.lisp ;; \
+	  *) echo "MODE must be compiled, interp or emitfree"; exit 2 ;; \
+	esac
+
 # Which methods named by generated code the compiled regression suite never
 # runs: counts every CALL / CALLVIRT the assembler emits (DOTCL_CALL_COVERAGE)
 # and joins them with the names in compiler/*.lisp. Results in out/call-coverage/.
@@ -187,6 +204,12 @@ test-coverage: build $(DOTCL_ROOT)compiler/cil-out.sil
 
 # Asserts a packed tool's nuspec describes the app, not dotcl. Needs published
 # dotcl packages (`make pack`); skips cleanly when they are absent.
+# Tests of the scripts under ci/ that do not need the build.
+test-ci-scripts:
+	sh $(DOTCL_ROOT)test/bench-gate/check.sh $(DOTCL_ROOT)
+	sh $(DOTCL_ROOT)test/ci/prune-nuget.sh $(DOTCL_ROOT)
+	sh $(DOTCL_ROOT)test/ci/startup-time.sh $(DOTCL_ROOT)
+
 test-pack-nuspec: build
 	@echo "=== Running pack nuspec checks ==="
 	sh $(DOTCL_ROOT)test/pack-nuspec/check.sh $(DOTCL_ROOT)
@@ -202,7 +225,7 @@ test-pack-library-e2e: build $(DOTCL_ROOT)compiler/dotcl.core
 # The same, with the library packed by a released dotcl (installed from nuget.org)
 # and loaded by this one: the old fasls have to load and run here as they are.
 # Pinned like the seed; move it to the newest release when one ships.
-PREVIOUS_DOTCL_VERSION ?= 0.1.35
+PREVIOUS_DOTCL_VERSION ?= 0.1.36
 
 test-pack-library-previous: build $(DOTCL_ROOT)compiler/dotcl.core
 	@echo "=== Running library package check (packed by dotcl $(PREVIOUS_DOTCL_VERSION)) ==="
@@ -273,9 +296,25 @@ test-cli-exit: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running script exit-code checks ==="
 	sh $(DOTCL_ROOT)test/cli-exit/check.sh $(DOTCL_ROOT)
 
+# A net for changes to the reader: reads the sources of the Quicklisp libraries
+# (the dists bench/library-status installs) and compares with the previous run,
+# printing the files that got worse. LIMIT is how many files to read (default
+# 500, or "all"). Not in CI; run it before and after a change to the reader.
+LIMIT ?= 500
+test-reader-corpus: build $(DOTCL_ROOT)compiler/cil-out.sil
+	@echo "=== Reading library sources with the reader ==="
+	sh $(DOTCL_ROOT)test/reader-corpus/check.sh $(DOTCL_ROOT) $(LIMIT)
+
 test-ansi-extra: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running CLHS audit extra tests ==="
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/test-ansi-extra.lisp
+
+# ansi-test's beyond-ansi directory (an error for a malformed special form, a bad
+# declaration or type specifier): not in gclload2.lsp, so no other target runs
+# it. A measurement, not a gate; SBCL fails some of the same tests.
+test-ansi-beyond: build $(DOTCL_ROOT)compiler/cil-out.sil setup-ansi-test
+	@echo "=== Running ansi-test beyond-ansi ==="
+	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/test-ansi-beyond.lisp
 
 test-mop: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@echo "=== Running AMOP protocol conformance tests ==="
@@ -1004,10 +1043,10 @@ else
 # cross-compile is a real prerequisite here, unlike in the cl-bench targets: a
 # fresh clone has no cil-out.sil, and without it the dotcl half fails with a
 # missing-file error that says nothing about what to do next.
-bench-parity: cross-compile bench-build
+bench-parity: cross-compile bench-build compile-core-fasl
 	@mkdir -p $(BENCH_TMP)
 	@echo "=== Building the C# side ==="
-	@bash $(DOTCL_ROOT)bench/gate/test-modes.sh
+	@$(BENCH_RUNTIME) --core $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)bench/gate/test-modes.lisp
 	@dotnet build $(PARITY_DIR)/Parity.csproj -c Release -v:q --nologo
 	@rm -f $(BENCH_TMP)/parity-csharp.txt $(BENCH_TMP)/parity-dotcl.txt
 	@for pass in $$(seq 1 $(PARITY_PASSES)); do \
@@ -1017,10 +1056,10 @@ bench-parity: cross-compile bench-build
 	    DOTNET_gcServer=0 $(SETSID) timeout $(BENCH_TIMEOUT) $(BENCH_RUNTIME) --asm $(DOTCL_ROOT)compiler/cil-out.sil $(PARITY_DIR)/kernels.lisp < /dev/null | tee -a $(BENCH_TMP)/parity-dotcl.txt; \
 	done
 	@echo "=== per-process distribution ==="
-	@bash $(DOTCL_ROOT)bench/gate/process-modes.sh --no-compare dotcl=$(BENCH_TMP)/parity-dotcl.txt csharp=$(BENCH_TMP)/parity-csharp.txt
+	@$(BENCH_RUNTIME) --core $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)bench/gate/process-modes.lisp --no-compare dotcl=$(BENCH_TMP)/parity-dotcl.txt csharp=$(BENCH_TMP)/parity-csharp.txt
 	@extra=0; \
 	while :; do \
-	    bash $(PARITY_DIR)/make-parity-state.sh $(BENCH_TMP)/parity-csharp.txt $(BENCH_TMP)/parity-dotcl.txt $(DOTCL_ROOT)bench-state.json > $(BENCH_TMP)/parity-state-new.json && mv $(BENCH_TMP)/parity-state-new.json $(DOTCL_ROOT)bench-state.json || exit 1; \
+	    BENCH_RUNTIME=$(BENCH_RUNTIME) bash $(PARITY_DIR)/make-parity-state.sh $(BENCH_TMP)/parity-csharp.txt $(BENCH_TMP)/parity-dotcl.txt $(DOTCL_ROOT)bench-state.json > $(BENCH_TMP)/parity-state-new.json && mv $(BENCH_TMP)/parity-state-new.json $(DOTCL_ROOT)bench-state.json || exit 1; \
 	    echo "Updated bench-state.json"; \
 	    bash $(DOTCL_ROOT)bench/gate/check-ratios.sh $(DOTCL_ROOT)bench-state.json $(DOTCL_ROOT)bench/gate/ratio-baseline.json $(BENCH_PLATFORM) > $(BENCH_TMP)/parity-check.txt; rc=$$?; \
 	    if [ $$rc -ne 1 ] || [ $$extra -ge $(PARITY_EXTRA_PASSES) ]; then cat $(BENCH_TMP)/parity-check.txt; exit $$rc; fi; \
@@ -1289,11 +1328,24 @@ selfhost-test: selfhost-check
 publish:
 	dotnet publish $(DOTCL_ROOT)runtime/runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/
 
+# In a pack the source paths a fasl records (for find-definition) name where the checkout
+# happens to be, which means nothing on the machine that installs the package and makes the
+# same source give different bytes in another checkout. `make pack` maps each artifact's
+# directory to /dotcl-src/<name> (DOTCL_SOURCE_PATH_MAP); the name says whose source it was,
+# so that two libraries do not share a root. Other builds keep the real paths.
+pack: PACK_MAP := 1
+_ROOT_NOSLASH := $(patsubst %/,%,$(DOTCL_ROOT))
+# $(call PACK_PATHMAP,<directory under the root>,<name>)
+# A shipped fasl does not carry the xref records (who-calls and friends) that only a development
+# session reads: 12% of asdf.fasl, 6% of it compressed. A fasl built by hand keeps them.
+PACK_XREF_OFF = $(if $(PACK_MAP),(setq dotcl:*record-xref* nil),)
+PACK_PATHMAP = $(if $(PACK_MAP),DOTCL_SOURCE_PATH_MAP='$(_ROOT_NOSLASH)/$(1)=/dotcl-src/$(2)',)
+
 # Compile contrib/asdf/asdf.lisp -> asdf.fasl (.NET IL assembly) with dotcl
 # itself. .fasl is the shipped artifact (fastest load); .sil and .lisp are
 # not distributed. All 3 are gitignored.
 $(DOTCL_ROOT)contrib/asdf/asdf.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/asdf/asdf.lisp
-	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp")'
+	$(call PACK_PATHMAP,contrib/asdf,asdf) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(progn $(PACK_XREF_OFF) (compile-file "$(DOTCL_ROOT)contrib/asdf/asdf.lisp"))'
 
 compile-asdf-fasl: setup-asdf $(DOTCL_ROOT)contrib/asdf/asdf.fasl
 
@@ -1310,7 +1362,7 @@ compile-asdf-fasls: compile-asdf-fasl
 # (client.lisp, dist.lisp, misc.lisp, setup.lisp), exactly as upstream's
 # bootstrap loads asdf.lisp before the client files.
 $(DOTCL_ROOT)contrib/quicklisp/quicklisp.fasl: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp $(DOTCL_ROOT)contrib/asdf/asdf.fasl
-	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(progn (require "asdf") (let ((dotcl:*host-feature-ignore* (list :windows))) (compile-file "$(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp")))'
+	$(call PACK_PATHMAP,contrib/quicklisp,quicklisp) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(progn $(PACK_XREF_OFF) (require "asdf") (let ((dotcl:*host-feature-ignore* (list :windows))) (compile-file "$(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp")))'
 
 compile-quicklisp-fasl: setup-quicklisp compile-asdf-fasl $(DOTCL_ROOT)contrib/quicklisp/quicklisp.fasl
 
@@ -1347,7 +1399,7 @@ endef
 $(foreach n,$(CONTRIB_NAMES),$(eval $(call CONTRIB_ORDER_RULE,$(n))))
 
 $(DOTCL_ROOT)contrib/%.fasl: $(DOTCL_ROOT)contrib/%.lisp $(DOTCL_ROOT)compiler/cil-out.sil
-	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(compile-file "$<")'
+	$(call PACK_PATHMAP,contrib/$(firstword $(subst /, ,$*)),$(firstword $(subst /, ,$*))) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(progn $(PACK_XREF_OFF) (compile-file "$<"))'
 	@n=$$(echo '$*' | cut -d/ -f1); \
 	if [ -d "$(DOTCL_ROOT)runtime/contrib/$$n" ]; then \
 	  cp "$@" "$(DOTCL_ROOT)runtime/contrib/$$n/$$n.fasl"; \
@@ -1360,7 +1412,7 @@ compile-contrib-fasls: $(CONTRIB_FASLS)
 # because Reader parse (~1.1s) + CIL assemble (~170ms) are both skipped.
 # Ships in the pack as the default core.
 $(DOTCL_ROOT)compiler/dotcl.core: $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)runtime/Generated/UnicodeCharNames.g.cs
-	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(dotcl:sil-to-fasl "$(DOTCL_ROOT)compiler/cil-out.sil" "$(DOTCL_ROOT)compiler/dotcl.core")'
+	$(call PACK_PATHMAP,compiler,dotcl-core) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(dotcl:sil-to-fasl "$(DOTCL_ROOT)compiler/cil-out.sil" "$(DOTCL_ROOT)compiler/dotcl.core")'
 
 compile-core-fasl: $(DOTCL_ROOT)compiler/dotcl.core
 
@@ -1502,6 +1554,7 @@ compile-core-fasl-r2r-$(1): compile-core-fasl prime-crossgen2
 	  -r "$$(call runtime_ref,$(1))/*.dll" \
 	  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/runtime.dll" \
 	  -r "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/DotCL.Runtime.dll" \
+	  --inputbubble --inputbubbleref "$$(DOTCL_ROOT)runtime/bin/Release/net10.0/$(1)/publish/DotCL.Runtime.dll" \
 	  --targetos $(TARGETOS_$(1)) --targetarch $(TARGETARCH_$(1)) -O \
 	  -o $$(DOTCL_ROOT)compiler/dotcl.core.r2r-$(1)
 	rm -f $$(DOTCL_ROOT)compiler/dotcl.core.dll
@@ -1566,7 +1619,7 @@ compile-contrib-fasls-r2r-all: $(addprefix compile-contrib-fasls-r2r-,$(R2R_RIDS
 # (~9MB of Roslyn).
 contrib-dotnet-cs:
 	rm -rf $(DOTCL_ROOT)contrib/dotnet-cs/lib $(DOTCL_ROOT)contrib/dotnet-cs/bin $(DOTCL_ROOT)contrib/dotnet-cs/obj
-	dotnet publish $(DOTCL_ROOT)contrib/dotnet-cs/dotnet-cs.csproj -c Release -o $(DOTCL_ROOT)contrib/dotnet-cs/lib/ --self-contained false
+	dotnet publish $(DOTCL_ROOT)contrib/dotnet-cs/dotnet-cs.csproj -c Release $(if $(PACK_MAP),-p:ContinuousIntegrationBuild=true,) -o $(DOTCL_ROOT)contrib/dotnet-cs/lib/ --self-contained false
 	rm -f $(DOTCL_ROOT)contrib/dotnet-cs/lib/*.pdb $(DOTCL_ROOT)contrib/dotnet-cs/lib/*.deps.json
 	rm -rf $(DOTCL_ROOT)contrib/dotnet-cs/bin $(DOTCL_ROOT)contrib/dotnet-cs/obj
 
@@ -1643,14 +1696,17 @@ pack: compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-f
 	rm -rf $(DOTCL_ROOT)runtime/contrib/dotnet-cs/bin $(DOTCL_ROOT)runtime/contrib/dotnet-cs/obj
 	rm -f $(DOTCL_ROOT)runtime/contrib/dotnet-cs/*.csproj $(DOTCL_ROOT)runtime/contrib/dotnet-cs/*.cs
 	cp $(DOTCL_ROOT)contrib/asdf/asdf.fasl $(DOTCL_ROOT)runtime/contrib/asdf/asdf.fasl
-	dotnet pack $(DOTCL_ROOT)runtime/runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/ $(PACK_ARGS) $(_PACK_VERSION_ARG)
+	dotnet pack $(DOTCL_ROOT)runtime/runtime.csproj --configuration Release -p:ContinuousIntegrationBuild=true -o $(DOTCL_ROOT)out/ $(PACK_ARGS) $(_PACK_VERSION_ARG)
 	# A tool package must list no dependencies (runtime/Directory.Build.props
 	# explains how it came to list DotCL.Runtime's). Fails the pack if it does.
 	sh $(DOTCL_ROOT)test/pack-nuspec/tool-deps.sh $(DOTCL_ROOT)out $(_PACK_VERSION_EFFECTIVE)
 	# Build the in-process project-core MSBuild task before packing the
 	# library so DotCL.Runtime.csproj can bundle tasks/DotCL.Build.Tasks.dll.
-	dotnet build $(DOTCL_ROOT)runtime/build-tasks/DotCL.Build.Tasks.csproj --configuration Release
-	dotnet pack $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj --configuration Release -o $(DOTCL_ROOT)out/ $(_PACK_VERSION_ARG)
+	dotnet build $(DOTCL_ROOT)runtime/build-tasks/DotCL.Build.Tasks.csproj --configuration Release -p:ContinuousIntegrationBuild=true
+	dotnet pack $(DOTCL_ROOT)runtime/DotCL.Runtime.csproj --configuration Release -p:ContinuousIntegrationBuild=true -o $(DOTCL_ROOT)out/ $(_PACK_VERSION_ARG)
+	# dotnet pack stamps each zip entry with the time of the pack; a fixed time makes the
+	# package a function of its contents (ci/normalize-nupkg.lisp).
+	dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --core $(DOTCL_ROOT)compiler/dotcl.core $(DOTCL_ROOT)ci/normalize-nupkg.lisp $(DOTCL_ROOT)out/*.nupkg
 	rm -f $(DOTCL_ROOT)runtime/dotcl.core $(DOTCL_ROOT)runtime/cil-stdlib.lisp $(DOTCL_ROOT)runtime/cil-stdlib.generation
 	@for rid in $(R2R_RIDS); do \
 		rm -f $(DOTCL_ROOT)runtime/dotcl.core.r2r-$$rid $(DOTCL_ROOT)runtime/asdf.fasl.r2r-$$rid; \

@@ -24,8 +24,8 @@ public static class DynamicBindings
     // array-store check, and Push / Pop are on the path of every special LET.
     internal struct Entry
     {
-        public Symbol? Sym;
         public LispObject? Val;
+        public int Idx;     // the symbol's BindIndex; 0 for an empty entry
         public int Prev;
     }
 
@@ -45,7 +45,30 @@ public static class DynamicBindings
         if (idx != 0) return idx;
         int fresh = Interlocked.Increment(ref _nextBindIndex);
         int prior = Interlocked.CompareExchange(ref sym.BindIndex, fresh, 0);
-        return prior == 0 ? fresh : prior;
+        if (prior != 0) return prior;
+        RegisterSymbol(fresh, sym);
+        return fresh;
+    }
+
+    // BindIndex -> symbol, for the debugger and snapshots: an entry keeps only the
+    // index, so a push stores one reference (the value) instead of two.
+    private static Symbol?[] s_symByIndex = new Symbol?[256];
+    private static readonly object s_symLock = new();
+
+    private static void RegisterSymbol(int idx, Symbol sym)
+    {
+        lock (s_symLock)
+        {
+            if (idx >= s_symByIndex.Length)
+                Array.Resize(ref s_symByIndex, Math.Max(idx + 1, s_symByIndex.Length * 2));
+            s_symByIndex[idx] = sym;
+        }
+    }
+
+    private static Symbol? SymbolOf(int idx)
+    {
+        if (idx == 0) return null;
+        lock (s_symLock) return idx < s_symByIndex.Length ? s_symByIndex[idx] : null;
     }
 
     /// <summary>The binding stack of this thread when SYM is bound on it, with
@@ -82,15 +105,15 @@ public static class DynamicBindings
         if ((uint)r < (uint)tops.Length) tops[r] = 0;
         for (int j = 0; j < st.Top; j++)
         {
-            var s = e[j].Sym;
-            if (s != null) tops[s.BindIndex] = 0;
+            int ix = e[j].Idx;
+            if (ix != 0) tops[ix] = 0;
         }
         for (int j = 0; j < st.Top; j++)
         {
-            var s = e[j].Sym;
-            if (s == null) continue;
-            e[j].Prev = tops[s.BindIndex];
-            tops[s.BindIndex] = j + 1;
+            int ix = e[j].Idx;
+            if (ix == 0) continue;
+            e[j].Prev = tops[ix];
+            tops[ix] = j + 1;
         }
     }
 
@@ -186,7 +209,7 @@ public static class DynamicBindings
             && sym.EverDynamicallyBound && value is not UnboundSentinel)
         {
             ref var slot = ref e[top];
-            slot.Sym = sym;
+            slot.Idx = idx;
             slot.Val = value;
             slot.Prev = tops[idx];
             tops[idx] = top + 1;
@@ -210,7 +233,7 @@ public static class DynamicBindings
         int top = st.Top;
         if (top >= st.E.Length) Grow(st);
         ref var slot = ref st.E[top];
-        slot.Sym = sym;
+        slot.Idx = idx;
         slot.Val = value is UnboundSentinel ? null : value;
         slot.Prev = st.Tops[idx];
         st.Tops[idx] = top + 1;
@@ -251,9 +274,9 @@ public static class DynamicBindings
             && v1 is not UnboundSentinel && v2 is not UnboundSentinel)
         {
             ref var a = ref e[top];
-            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            a.Idx = i1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
             ref var b = ref e[top + 1];
-            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            b.Idx = i2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
             st.Top = top + 2;
             return;
         }
@@ -281,11 +304,11 @@ public static class DynamicBindings
             && v3 is not UnboundSentinel)
         {
             ref var a = ref e[top];
-            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            a.Idx = i1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
             ref var b = ref e[top + 1];
-            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            b.Idx = i2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
             ref var c = ref e[top + 2];
-            c.Sym = s3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
+            c.Idx = i3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
             st.Top = top + 3;
             return;
         }
@@ -315,13 +338,13 @@ public static class DynamicBindings
             && v3 is not UnboundSentinel && v4 is not UnboundSentinel)
         {
             ref var a = ref e[top];
-            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            a.Idx = i1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
             ref var b = ref e[top + 1];
-            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            b.Idx = i2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
             ref var c = ref e[top + 2];
-            c.Sym = s3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
+            c.Idx = i3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
             ref var d = ref e[top + 3];
-            d.Sym = s4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
+            d.Idx = i4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
             st.Top = top + 4;
             return;
         }
@@ -357,15 +380,15 @@ public static class DynamicBindings
             && v5 is not UnboundSentinel)
         {
             ref var a = ref e[top];
-            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            a.Idx = i1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
             ref var b = ref e[top + 1];
-            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            b.Idx = i2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
             ref var c = ref e[top + 2];
-            c.Sym = s3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
+            c.Idx = i3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
             ref var d = ref e[top + 3];
-            d.Sym = s4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
+            d.Idx = i4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
             ref var f = ref e[top + 4];
-            f.Sym = s5; f.Val = v5; f.Prev = tops[i5]; tops[i5] = top + 5;
+            f.Idx = i5; f.Val = v5; f.Prev = tops[i5]; tops[i5] = top + 5;
             st.Top = top + 5;
             return;
         }
@@ -403,17 +426,17 @@ public static class DynamicBindings
             && v5 is not UnboundSentinel && v6 is not UnboundSentinel)
         {
             ref var a = ref e[top];
-            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            a.Idx = i1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
             ref var b = ref e[top + 1];
-            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            b.Idx = i2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
             ref var c = ref e[top + 2];
-            c.Sym = s3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
+            c.Idx = i3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
             ref var d = ref e[top + 3];
-            d.Sym = s4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
+            d.Idx = i4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
             ref var f = ref e[top + 4];
-            f.Sym = s5; f.Val = v5; f.Prev = tops[i5]; tops[i5] = top + 5;
+            f.Idx = i5; f.Val = v5; f.Prev = tops[i5]; tops[i5] = top + 5;
             ref var g = ref e[top + 5];
-            g.Sym = s6; g.Val = v6; g.Prev = tops[i6]; tops[i6] = top + 6;
+            g.Idx = i6; g.Val = v6; g.Prev = tops[i6]; tops[i6] = top + 6;
             st.Top = top + 6;
             return;
         }
@@ -455,19 +478,19 @@ public static class DynamicBindings
             && v7 is not UnboundSentinel)
         {
             ref var a = ref e[top];
-            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            a.Idx = i1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
             ref var b = ref e[top + 1];
-            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            b.Idx = i2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
             ref var c = ref e[top + 2];
-            c.Sym = s3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
+            c.Idx = i3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
             ref var d = ref e[top + 3];
-            d.Sym = s4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
+            d.Idx = i4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
             ref var f = ref e[top + 4];
-            f.Sym = s5; f.Val = v5; f.Prev = tops[i5]; tops[i5] = top + 5;
+            f.Idx = i5; f.Val = v5; f.Prev = tops[i5]; tops[i5] = top + 5;
             ref var g = ref e[top + 5];
-            g.Sym = s6; g.Val = v6; g.Prev = tops[i6]; tops[i6] = top + 6;
+            g.Idx = i6; g.Val = v6; g.Prev = tops[i6]; tops[i6] = top + 6;
             ref var h = ref e[top + 6];
-            h.Sym = s7; h.Val = v7; h.Prev = tops[i7]; tops[i7] = top + 7;
+            h.Idx = i7; h.Val = v7; h.Prev = tops[i7]; tops[i7] = top + 7;
             st.Top = top + 7;
             return;
         }
@@ -512,21 +535,21 @@ public static class DynamicBindings
             && v7 is not UnboundSentinel && v8 is not UnboundSentinel)
         {
             ref var a = ref e[top];
-            a.Sym = s1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
+            a.Idx = i1; a.Val = v1; a.Prev = tops[i1]; tops[i1] = top + 1;
             ref var b = ref e[top + 1];
-            b.Sym = s2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
+            b.Idx = i2; b.Val = v2; b.Prev = tops[i2]; tops[i2] = top + 2;
             ref var c = ref e[top + 2];
-            c.Sym = s3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
+            c.Idx = i3; c.Val = v3; c.Prev = tops[i3]; tops[i3] = top + 3;
             ref var d = ref e[top + 3];
-            d.Sym = s4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
+            d.Idx = i4; d.Val = v4; d.Prev = tops[i4]; tops[i4] = top + 4;
             ref var f = ref e[top + 4];
-            f.Sym = s5; f.Val = v5; f.Prev = tops[i5]; tops[i5] = top + 5;
+            f.Idx = i5; f.Val = v5; f.Prev = tops[i5]; tops[i5] = top + 5;
             ref var g = ref e[top + 5];
-            g.Sym = s6; g.Val = v6; g.Prev = tops[i6]; tops[i6] = top + 6;
+            g.Idx = i6; g.Val = v6; g.Prev = tops[i6]; tops[i6] = top + 6;
             ref var h = ref e[top + 6];
-            h.Sym = s7; h.Val = v7; h.Prev = tops[i7]; tops[i7] = top + 7;
+            h.Idx = i7; h.Val = v7; h.Prev = tops[i7]; tops[i7] = top + 7;
             ref var j = ref e[top + 7];
-            j.Sym = s8; j.Val = v8; j.Prev = tops[i8]; tops[i8] = top + 8;
+            j.Idx = i8; j.Val = v8; j.Prev = tops[i8]; tops[i8] = top + 8;
             st.Top = top + 8;
             return;
         }
@@ -670,7 +693,7 @@ public static class DynamicBindings
         var e = st.E;
         for (int i = st.Top - 1; i >= 0; i--)
         {
-            var sym = e[i].Sym;
+            var sym = SymbolOf(e[i].Idx);
             if (sym != null && !snap.ContainsKey(sym))
             {
                 var val = e[i].Val;
@@ -710,7 +733,7 @@ public static class DynamicBindings
         var e = st.E;
         for (int i = st.Top - 1; i >= 0; i--)
         {
-            var sym = e[i].Sym;
+            var sym = SymbolOf(e[i].Idx);
             if (sym != null) result.Add((sym, e[i].Val ?? Unbound, i));
         }
         return result;
@@ -739,8 +762,8 @@ public static class DynamicBindings
         {
             top--;
             ref var slot = ref e[top];
-            var sym = slot.Sym;
-            if (sym != null) tops[sym.BindIndex] = slot.Prev;
+            int ix = slot.Idx;
+            if (ix != 0) tops[ix] = slot.Prev;
             slot = default;
         } while (top > depth);
         st.Top = top;

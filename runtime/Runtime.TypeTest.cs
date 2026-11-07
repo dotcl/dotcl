@@ -322,6 +322,12 @@ public static partial class Runtime
         { ClassEpoch = classEpoch; ExpanderEpoch = expanderEpoch; Package = pkg; Test = test; }
     }
 
+    /// <summary>OBJ is an integer in the inclusive range LO..HI that lies inside
+    /// int64, the range test the compiler lowers (INTEGER lo hi) and its relatives
+    /// to. Only fixnum objects can be in such a range.</summary>
+    public static bool IsFixnumInRange(LispObject obj, long lo, long hi)
+        => obj is Fixnum f && f.Value >= lo && f.Value <= hi;
+
     /// <summary>The built test for SYM as a type specifier, or null when only
     /// the general TYPEP can answer.</summary>
     internal static TypeTest? SymbolTypeTest(Symbol sym)
@@ -404,6 +410,8 @@ public static partial class Runtime
                     return new MemberTypeTest(new[] { ec.Car });
                 break;
             case "INTEGER":
+                // More than a low and a high bound is no specifier: leave it to the general path.
+                if (c.Cdr is Cons ix && ix.Cdr is Cons ix2 && ix2.Cdr is not Nil) break;
                 if (IntegerRangeBound(c.Cdr is Cons lc ? lc.Car : null, true, out long lo)
                     && IntegerRangeBound(c.Cdr is Cons lc2 && lc2.Cdr is Cons hc ? hc.Car : null, false, out long hi))
                     return new FixnumRangeTypeTest(lo, hi, spec);
@@ -417,6 +425,15 @@ public static partial class Runtime
                     if (d1.Car is Fixnum df && df.Value >= 0 && df.Value <= int.MaxValue)
                         return new SimpleVectorTypeTest(spec, (int)df.Value);
                 }
+                break;
+            case "SIMPLE-VECTOR":
+            case "SIMPLE-BIT-VECTOR":
+                // (SIMPLE-VECTOR n) / (SIMPLE-BIT-VECTOR n): the same test as the
+                // (SIMPLE-ARRAY et (n)) form, so a sized slot or argument check does
+                // not go through the general TYPEP each time.
+                if (c.Cdr is Cons sn && sn.Cdr is Nil && sn.Car is Fixnum nf
+                    && nf.Value >= 0 && nf.Value <= int.MaxValue)
+                    return new SimpleVectorTypeTest(spec, (int)nf.Value);
                 break;
             case "UNSIGNED-BYTE":
             case "SIGNED-BYTE":

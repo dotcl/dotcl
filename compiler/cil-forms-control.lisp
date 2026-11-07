@@ -26,6 +26,10 @@
          ;; returns, by falling off its end or by RETURN-FROM, is that body's
          ;; return value, so its tail VALUES can answer the mode too.
          (value-tail-p (and *in-tail-position* (%mv-mode-local) t))
+         ;; The block standing for the body of a local function that takes the
+         ;; exit protocol (see %PFN-FN-FACTS) is that body: what is in its tail
+         ;; is in the function's.
+         (pfn-body-p (and name (symbolp name) (get name 'pfn-exit) t))
          ;; Entry format: (tag-key result-key end-label local-result-key local-end-label
          ;;                needs-catch value-tail-p)
          (*cstate* (cstate-with *cstate*
@@ -34,7 +38,9 @@
                                        value-tail-p)
                             (cstate-block-tags))
                      +cs-locals+ (acons tag-var-sym tag-key (cstate-locals))))
-         (body-instrs (let ((*in-tail-position* (if value-tail-p :value nil))
+         (body-instrs (let ((*in-tail-position* (cond (pfn-body-p *in-tail-position*)
+                                                      (value-tail-p :value)
+                                                      (t nil)))
                             (*in-mv-context* t)
                             (*inlining-stack* (inline-guard-stack name)))
                         (compile-progn body))))
@@ -48,6 +54,10 @@
           (:ldsfld "Nil.Instance") (:ldsfld "Nil.Instance") (:call "Runtime.MakeCons")
           (:stloc ,tag-key)
           (:declare-local ,result-key "LispObject")
+          ;; Outer try/finally: the tag records that the block has been left, so a
+          ;; closure that outlives it signals CONTROL-ERROR instead of throwing a
+          ;; transfer nothing catches.
+          (:begin-exception-block)
           (:begin-exception-block)
           ,@body-instrs
           (:stloc ,result-key)
@@ -71,6 +81,10 @@
           (:leave ,end-label)
           (:end-exception-block)
           (:label ,end-label)
+          (:begin-finally-block)
+          (:ldloc ,tag-key)
+          (:call "ControlFlowFilters.MarkExited")
+          (:end-exception-block)
           (:ldloc ,result-key))
         ;; All returns are local: no try/catch needed
         `((:declare-local ,result-key "LispObject")
@@ -87,13 +101,54 @@
       (cons '(:call "MultipleValues.ResetOnExit") instrs)
       instrs))
 
+(defun %innermost-pfn-entry ()
+  "The block-table entry of the body of the local function being compiled when
+   it takes the exit protocol and this frame is its own, else NIL."
+  (let ((e (find-if (lambda (e) (and (car e) (symbolp (car e)) (get (car e) 'pfn-exit)))
+                    (cstate-block-tags))))
+    (and e (fourth (cdr e)) e)))
+
+(defun %with-exit-token-check (local-fn instrs)
+  "INSTRS, a call of the local function entry LOCAL-FN, followed by what looks at
+   its result when the function takes the exit protocol (element 7 of its entry,
+   (GS . BLOCKS)). A BLOCK-EXIT-TOKEN result is handed on when this frame is the
+   body of a function taking the protocol too; else it becomes the return from
+   the block it names when that is a block of this frame; else an exception."
+  (let ((info (eighth local-fn)))
+    (if (null info)
+        instrs
+        (let* ((ok (gen-label "XOK"))
+               (tok (gen-local "XTOK"))
+               (pf (and (not *in-finally-block*) (%innermost-pfn-entry))))
+          `(,@instrs
+            (:dup) (:call "ControlFlowFilters.IsExitToken") (:brfalse ,ok)
+            (:declare-local ,tok "LispObject")
+            (:stloc ,tok)
+            ,@(cond
+                (pf `((:ldloc ,tok) (:stloc ,(fourth (cdr pf))) (:leave ,(fifth (cdr pf)))))
+                (t (append
+                    (unless *in-finally-block*
+                      (loop for b in (cdr info)
+                            for e = (assoc b (cstate-block-tags))
+                            when (and e (fourth (cdr e)))
+                              append (let ((next (gen-label "XNEXT")))
+                                       `((:ldloc ,tok) (:ldloc ,(first (cdr e)))
+                                         (:call "ControlFlowFilters.TokenTagIs")
+                                         (:brfalse ,next)
+                                         (:ldloc ,tok) (:call "ControlFlowFilters.TokenValue")
+                                         (:stloc ,(fourth (cdr e)))
+                                         (:leave ,(fifth (cdr e)))
+                                         (:label ,next)))))
+                    `((:ldloc ,tok) (:call "ControlFlowFilters.TokenException") (:throw)))))
+            (:label ,ok))))))
+
 (defun compile-return-from (name value-expr)
   "Compile (return-from name value).
    Local return (same compilation unit, not in finally block) uses leave.
    Non-local return (from closure or finally block) throws BlockReturnException."
   (when *transparent-blocks* (%transparent-block-check name))
   (let ((entry (assoc name (cstate-block-tags))))
-    (unless entry (error "return-from: no block named ~s" name))
+    (unless entry (error 'program-error :format-control "return-from: no block named ~s" :format-arguments (list name)))
     (let ((tag-key (first (cdr entry)))
           (local-result-key (fourth (cdr entry)))
           (local-end-label (fifth (cdr entry))))
@@ -121,6 +176,27 @@
                     (emit-nil)))
               (:stloc ,local-result-key)
               (:leave ,local-end-label))
+            ;; Non-local return from the body of a local function that takes the
+            ;; exit protocol: the function returns a token the caller turns
+            ;; into the return (see %EXIT-TOKEN-CHECK-INSTRS).
+            (let ((pf (and (not *in-finally-block*) tag-key (%innermost-pfn-entry))))
+              (if pf
+                  (progn
+                    (when needs-catch (setf (car needs-catch) t))
+                    (let ((val-key (gen-local "RVAL")))
+                      `((:declare-local ,val-key "LispObject")
+                        ,@(if value-expr
+                              (let ((*in-mv-context* t) (*mv-mode-local* nil))
+                                (compile-expr value-expr))
+                              (emit-nil))
+                        (:stloc ,val-key)
+                        (:ldloc ,tag-key)
+                        (:call "ControlFlowFilters.CheckBlockLive")
+                        (:ldloc ,tag-key)
+                        (:ldloc ,val-key)
+                        (:call "ControlFlowFilters.MakeExitToken")
+                        (:stloc ,(fourth (cdr pf)))
+                        (:leave ,(fifth (cdr pf))))))
             ;; Non-local return: throw BlockReturnException
             (progn
               (when needs-catch (setf (car needs-catch) t))
@@ -134,9 +210,11 @@
                         (emit-nil))
                   (:stloc ,val-key)
                   (:ldloc ,tag-key)
+                  (:call "ControlFlowFilters.CheckBlockLive")
+                  (:ldloc ,tag-key)
                   (:ldloc ,val-key)
                   (:newobj "BlockReturnException")
-                  (:throw)))))))))
+                  (:throw)))))))))))
 
 ;;; ============================================================
 ;;; catch / throw
@@ -180,7 +258,9 @@
          (call (%throw-return-call body-instrs))
          (state-key (gen-local "CST")))
     `((:declare-local ,tag-key "LispObject")
-      ,@(compile-expr tag-expr)
+      ;; The tag is one value: the first of several, NIL for none (CLHS 3.1.7).
+      ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+          (compile-expr tag-expr))
       (:stloc ,tag-key)
       ;; Register tag so (throw ...) inside (eval ...) can propagate to this catch
       (:ldloc ,tag-key)
@@ -439,8 +519,11 @@ leave a protected region, and balance means the GO is not inside one."
                       (lambda (span)
                         (let ((m (ash 1 (integer-length (1- span)))))
                           (and (zerop (mod delta m)) (zerop (mod start m)) m))))))))
-    (when entries
-      (let* ((slow (gen-label "BLSLOW"))
+    ;; The body is compiled twice here (and again by the caller when the result is too long), and
+    ;; the next loop of a nest sits in it: from the third level on the loop is emitted once.
+    (when (and entries (< *bounded-loop-depth* +unswitch-depth-limit+))
+      (let* ((*bounded-loop-depth* (1+ *bounded-loop-depth*))
+             (slow (gen-label "BLSLOW"))
              (done (gen-label "BLDONE"))
              (limit-code (if (integerp limit)
                              `((:ldc-i8 ,limit))
@@ -599,6 +682,8 @@ leave a protected region, and balance means the GO is not inside one."
       (:ldc-i4 0) (:stloc ,index-key)
       (:declare-local ,done-key "Boolean")
       (:ldc-i4 0) (:stloc ,done-key)
+      ;; Outer try/finally: records that the tagbody has been left (see compile-block).
+      (:begin-exception-block)
       (:label ,loop-label)
       ,@poll-instrs
       (:ldloc ,done-key) (:brtrue ,end-label)
@@ -630,6 +715,10 @@ leave a protected region, and balance means the GO is not inside one."
       (:end-exception-block)
       (:br ,loop-label)
       (:label ,end-label)
+      (:begin-finally-block)
+      (:ldloc ,tb-id-key)
+      (:call "ControlFlowFilters.MarkExited")
+      (:end-exception-block)
       (:call "MultipleValues.Reset")  ; tagbody return is always single NIL
       ,@(emit-nil))))
 
@@ -638,7 +727,7 @@ leave a protected region, and balance means the GO is not inside one."
    Local go (5th element in *go-tags* entry present) sets index + leave.
    Non-local go (from closures, no 5th element) uses GoException throw."
   (let ((entry (assoc tag (cstate-go-tags))))
-    (unless entry (error "go: no tagbody tag named ~s" tag))
+    (unless entry (error 'program-error :format-control "go: no tagbody tag named ~s" :format-arguments (list tag)))
     ;; Format: (tag-name tb-var-name tb-id-key label-idx [index-key loop-label])
     (let ((tb-id-key (third entry))
           (label-idx (fourth entry))
@@ -663,6 +752,8 @@ leave a protected region, and balance means the GO is not inside one."
           (progn
             (when needs-catch (setf (car needs-catch) t))
             `((:ldloc ,tb-id-key)
+              (:call "ControlFlowFilters.CheckTagbodyLive")
+              (:ldloc ,tb-id-key)
               (:ldc-i4 ,label-idx)
               (:newobj "GoException")
               (:throw)))))))
@@ -1456,7 +1547,14 @@ leave a protected region, and balance means the GO is not inside one."
    shared-tmp: shared LispObject local for no-body arms."
   (if (null clauses)
       (emit-nil)
-      (let* ((clause (car clauses))
+      (let* ((clause (progn
+                       ;; Every clause must be a non-empty list, also after a T clause that ends the cond.
+                       (unless shared-tmp
+                         (dolist (c clauses)
+                           (unless (consp c) (error 'type-error :datum c :expected-type 'cons))))
+                       (if (consp (car clauses))
+                           (car clauses)
+                           (error 'type-error :datum (car clauses) :expected-type 'cons))))
              (test (car clause))
              (body (cdr clause)))
         (if (eq test t)

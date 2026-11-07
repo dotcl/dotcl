@@ -504,7 +504,7 @@
                                                         find-class %find-class-or-nil class-of class-name
                                                         slot-value slot-boundp %set-slot-value
                                                         %allocate-instance %slot-exists-p
-                                                        make-instance %make-instance-with-initargs
+                                                        make-instance %make-instance-with-initargs %make-instance-dyn
                                                         %make-gf %register-gf %set-method-combination %set-method-combination-order %set-method-combination-args %find-gf
                                                         %clear-defgeneric-inline-methods %mark-defgeneric-inline-method
                                                         %make-method %add-method
@@ -2737,7 +2737,7 @@
 ;;; compiled. Uninterned variables are left alone: macros make them.
 
 (defvar *uv-warned* nil
-  "EQ table: binding form -> the variables of it already reported.")
+  "Lazy EQ table (%LAZY-TABLE-GET): binding form -> the variables of it already reported.")
 
 (defvar *uv-warnings* nil)
 
@@ -2753,9 +2753,185 @@
 (defvar *uv-local-functions* nil
   "Function names bound by enclosing FLET / LABELS forms.")
 
+(defvar *uv-defining* nil
+  "Names being defined by the DEFVAR / DEFPARAMETER / DEFCONSTANT form the walk is in.
+   Their expansion assigns the name before the compile-time half of the definition
+   has made it special, which is not a use of an undefined variable.")
+
+;;; --- Argument counts of the COMMON-LISP functions ---
+;;; (NAME MIN MAX): MAX is NIL when the function takes &rest or &key. Used to warn about a call with
+;;; the wrong number of arguments at compile time.
+(defvar *cl-function-arities*
+  (let ((h (make-hash-table :test #'eq)))
+    (dolist (row '(
+   ("*" 0 NIL) ("+" 0 NIL) ("-" 1 NIL) ("/" 1 NIL) ("/=" 1 NIL) ("1+" 1 1) ("1-" 1 1) ("<" 1 NIL)
+   ("<=" 1 NIL) ("=" 1 NIL) (">" 1 NIL) (">=" 1 NIL) ("ABORT" 0 1) ("ABS" 1 1) ("ACONS" 3 3)
+   ("ACOS" 1 1) ("ACOSH" 1 1) ("ADJOIN" 2 NIL) ("ADJUST-ARRAY" 2 NIL) ("ADJUSTABLE-ARRAY-P" 1 1)
+   ("ALPHA-CHAR-P" 1 1) ("ALPHANUMERICP" 1 1) ("APPEND" 0 NIL) ("APPLY" 2 NIL) ("APROPOS" 1 3)
+   ("APROPOS-LIST" 1 5) ("AREF" 1 NIL) ("ARITHMETIC-ERROR-OPERANDS" 1 1)
+   ("ARITHMETIC-ERROR-OPERATION" 1 1) ("ARRAY-DIMENSION" 2 2) ("ARRAY-DIMENSIONS" 1 1)
+   ("ARRAY-DISPLACEMENT" 1 1) ("ARRAY-ELEMENT-TYPE" 1 1) ("ARRAY-HAS-FILL-POINTER-P" 1 1)
+   ("ARRAY-IN-BOUNDS-P" 1 NIL) ("ARRAY-RANK" 1 1) ("ARRAY-ROW-MAJOR-INDEX" 1 NIL)
+   ("ARRAY-TOTAL-SIZE" 1 1) ("ARRAYP" 1 1) ("ASH" 2 2) ("ASIN" 1 1) ("ASINH" 1 1) ("ASSOC" 2 NIL)
+   ("ASSOC-IF" 2 NIL) ("ASSOC-IF-NOT" 2 NIL) ("ATAN" 1 2) ("ATANH" 1 1) ("ATOM" 1 1) ("BIT" 1 NIL)
+   ("BIT-AND" 2 3) ("BIT-ANDC1" 2 3) ("BIT-ANDC2" 2 3) ("BIT-EQV" 2 3) ("BIT-IOR" 2 3)
+   ("BIT-NAND" 2 3) ("BIT-NOR" 2 3) ("BIT-NOT" 1 2) ("BIT-ORC1" 2 3) ("BIT-ORC2" 2 3)
+   ("BIT-VECTOR-P" 1 1) ("BIT-XOR" 2 3) ("BOOLE" 3 3) ("BOTH-CASE-P" 1 1) ("BOUNDP" 1 1)
+   ("BREAK" 0 NIL) ("BROADCAST-STREAM-STREAMS" 1 1) ("BUTLAST" 1 2) ("BYTE" 2 2)
+   ("BYTE-POSITION" 1 1) ("BYTE-SIZE" 1 1) ("CAAAAR" 1 1) ("CAAADR" 1 1) ("CAAAR" 1 1)
+   ("CAADAR" 1 1) ("CAADDR" 1 1) ("CAADR" 1 1) ("CAAR" 1 1) ("CADAAR" 1 1) ("CADADR" 1 1)
+   ("CADAR" 1 1) ("CADDAR" 1 1) ("CADDDR" 1 1) ("CADDR" 1 1) ("CADR" 1 1) ("CAR" 1 1)
+   ("CDAAAR" 1 1) ("CDAADR" 1 1) ("CDAAR" 1 1) ("CDADAR" 1 1) ("CDADDR" 1 1) ("CDADR" 1 1)
+   ("CDAR" 1 1) ("CDDAAR" 1 1) ("CDDADR" 1 1) ("CDDAR" 1 1) ("CDDDAR" 1 1) ("CDDDDR" 1 1)
+   ("CDDDR" 1 1) ("CDDR" 1 1) ("CDR" 1 1) ("CEILING" 1 2) ("CELL-ERROR-NAME" 1 1) ("CERROR" 2 NIL)
+   ("CHAR" 2 2) ("CHAR-CODE" 1 1) ("CHAR-DOWNCASE" 1 1) ("CHAR-EQUAL" 1 NIL)
+   ("CHAR-GREATERP" 1 NIL) ("CHAR-INT" 1 1) ("CHAR-LESSP" 1 NIL) ("CHAR-NAME" 1 1)
+   ("CHAR-NOT-EQUAL" 1 NIL) ("CHAR-NOT-GREATERP" 1 NIL) ("CHAR-NOT-LESSP" 1 NIL)
+   ("CHAR-UPCASE" 1 1) ("CHAR/=" 1 NIL) ("CHAR<" 1 NIL) ("CHAR<=" 1 NIL) ("CHAR=" 1 NIL)
+   ("CHAR>" 1 NIL) ("CHAR>=" 1 NIL) ("CHARACTER" 1 1) ("CHARACTERP" 1 1) ("CIS" 1 1)
+   ("CLASS-OF" 1 1) ("CLEAR-INPUT" 0 1) ("CLEAR-OUTPUT" 0 1) ("CLRHASH" 1 1) ("CODE-CHAR" 1 1)
+   ("COERCE" 2 2) ("COMPILE" 1 2) ("COMPILE-FILE" 1 NIL) ("COMPILE-FILE-PATHNAME" 1 NIL)
+   ("COMPILED-FUNCTION-P" 1 1) ("COMPILER-MACRO-FUNCTION" 1 2) ("COMPLEMENT" 1 1) ("COMPLEX" 1 2)
+   ("COMPLEXP" 1 1) ("COMPUTE-RESTARTS" 0 1) ("CONCATENATE" 1 NIL)
+   ("CONCATENATED-STREAM-STREAMS" 1 1) ("CONJUGATE" 1 1) ("CONS" 2 2) ("CONSP" 1 1)
+   ("CONSTANTLY" 1 1) ("CONSTANTP" 1 2) ("CONTINUE" 0 1) ("COPY-ALIST" 1 1) ("COPY-LIST" 1 1)
+   ("COPY-PPRINT-DISPATCH" 0 1) ("COPY-READTABLE" 0 2) ("COPY-SEQ" 1 1) ("COPY-STRUCTURE" 1 1)
+   ("COPY-SYMBOL" 1 2) ("COPY-TREE" 1 1) ("COS" 1 1) ("COSH" 1 1) ("COUNT" 2 NIL)
+   ("COUNT-IF" 2 NIL) ("COUNT-IF-NOT" 2 NIL) ("DECODE-FLOAT" 1 1) ("DECODE-UNIVERSAL-TIME" 1 2)
+   ("DELETE" 2 NIL) ("DELETE-DUPLICATES" 1 NIL) ("DELETE-FILE" 1 1) ("DELETE-IF" 2 NIL)
+   ("DELETE-IF-NOT" 2 NIL) ("DELETE-PACKAGE" 1 1) ("DENOMINATOR" 1 1) ("DEPOSIT-FIELD" 3 3)
+   ("DESCRIBE" 1 2) ("DIGIT-CHAR" 1 2) ("DIGIT-CHAR-P" 1 2) ("DIRECTORY" 1 NIL)
+   ("DIRECTORY-NAMESTRING" 1 1) ("DISASSEMBLE" 1 NIL) ("DPB" 3 3) ("DRIBBLE" 0 NIL)
+   ("ECHO-STREAM-INPUT-STREAM" 1 1) ("ECHO-STREAM-OUTPUT-STREAM" 1 1) ("ED" 0 1) ("EIGHTH" 1 1)
+   ("ELT" 2 2) ("ENCODE-UNIVERSAL-TIME" 6 7) ("ENDP" 1 1) ("ENOUGH-NAMESTRING" 1 2)
+   ("ENSURE-DIRECTORIES-EXIST" 1 NIL) ("ENSURE-GENERIC-FUNCTION" 1 NIL) ("EQ" 2 2) ("EQL" 2 2)
+   ("EQUAL" 2 2) ("EQUALP" 2 2) ("ERROR" 1 NIL) ("EVAL" 1 1) ("EVENP" 1 1) ("EVERY" 2 NIL)
+   ("EXP" 1 1) ("EXPORT" 1 2) ("EXPT" 2 2) ("FBOUNDP" 1 1) ("FCEILING" 1 2) ("FDEFINITION" 1 1)
+   ("FFLOOR" 1 2) ("FIFTH" 1 1) ("FILE-AUTHOR" 1 1) ("FILE-ERROR-PATHNAME" 1 1) ("FILE-LENGTH" 1 1)
+   ("FILE-NAMESTRING" 1 1) ("FILE-POSITION" 1 2) ("FILE-STRING-LENGTH" 2 2) ("FILE-WRITE-DATE" 1 1)
+   ("FILL" 2 NIL) ("FILL-POINTER" 1 1) ("FIND" 2 NIL) ("FIND-ALL-SYMBOLS" 1 1) ("FIND-CLASS" 1 3)
+   ("FIND-IF" 2 NIL) ("FIND-IF-NOT" 2 NIL) ("FIND-PACKAGE" 1 1) ("FIND-RESTART" 1 2)
+   ("FIND-SYMBOL" 1 2) ("FINISH-OUTPUT" 0 1) ("FIRST" 1 1) ("FLOAT" 1 2) ("FLOAT-DIGITS" 1 1)
+   ("FLOAT-PRECISION" 1 1) ("FLOAT-RADIX" 1 1) ("FLOAT-SIGN" 1 2) ("FLOATP" 1 1) ("FLOOR" 1 2)
+   ("FMAKUNBOUND" 1 1) ("FORCE-OUTPUT" 0 1) ("FORMAT" 2 NIL) ("FOURTH" 1 1) ("FRESH-LINE" 0 1)
+   ("FROUND" 1 2) ("FTRUNCATE" 1 2) ("FUNCALL" 1 NIL) ("FUNCTION-LAMBDA-EXPRESSION" 1 1)
+   ("FUNCTIONP" 1 1) ("GCD" 0 NIL) ("GENSYM" 0 1) ("GENTEMP" 0 2) ("GET" 2 3)
+   ("GET-DECODED-TIME" 0 0) ("GET-DISPATCH-MACRO-CHARACTER" 2 3) ("GET-INTERNAL-REAL-TIME" 0 0)
+   ("GET-INTERNAL-RUN-TIME" 0 0) ("GET-MACRO-CHARACTER" 1 2) ("GET-OUTPUT-STREAM-STRING" 1 1)
+   ("GET-PROPERTIES" 2 2) ("GET-SETF-EXPANSION" 1 2) ("GET-UNIVERSAL-TIME" 0 0) ("GETF" 2 3)
+   ("GETHASH" 2 3) ("GRAPHIC-CHAR-P" 1 1) ("HASH-TABLE-COUNT" 1 1) ("HASH-TABLE-P" 1 1)
+   ("HASH-TABLE-REHASH-SIZE" 1 1) ("HASH-TABLE-REHASH-THRESHOLD" 1 1) ("HASH-TABLE-SIZE" 1 1)
+   ("HASH-TABLE-TEST" 1 1) ("HOST-NAMESTRING" 1 1) ("IDENTITY" 1 1) ("IMAGPART" 1 1) ("IMPORT" 1 2)
+   ("INSPECT" 1 1) ("INTEGER-DECODE-FLOAT" 1 1) ("INTEGER-LENGTH" 1 1) ("INTEGERP" 1 1)
+   ("INTERN" 1 2) ("INTERSECTION" 2 NIL) ("INVALID-METHOD-ERROR" 2 NIL) ("INVOKE-DEBUGGER" 1 1)
+   ("INVOKE-RESTART" 1 NIL) ("INVOKE-RESTART-INTERACTIVELY" 1 1) ("ISQRT" 1 1) ("KEYWORDP" 1 1)
+   ("LAST" 1 2) ("LCM" 0 NIL) ("LDB" 2 2) ("LDB-TEST" 2 2) ("LDIFF" 2 2) ("LENGTH" 1 1)
+   ("LISP-IMPLEMENTATION-TYPE" 0 0) ("LISP-IMPLEMENTATION-VERSION" 0 0) ("LIST" 0 NIL)
+   ("LIST*" 1 NIL) ("LIST-ALL-PACKAGES" 0 0) ("LIST-LENGTH" 1 1) ("LISTEN" 0 1) ("LISTP" 1 1)
+   ("LOAD" 1 NIL) ("LOAD-LOGICAL-PATHNAME-TRANSLATIONS" 1 1) ("LOG" 1 2) ("LOGAND" 0 NIL)
+   ("LOGANDC1" 2 2) ("LOGANDC2" 2 2) ("LOGBITP" 2 2) ("LOGCOUNT" 1 1) ("LOGEQV" 0 NIL)
+   ("LOGICAL-PATHNAME" 1 1) ("LOGICAL-PATHNAME-TRANSLATIONS" 1 1) ("LOGIOR" 0 NIL) ("LOGNAND" 2 2)
+   ("LOGNOR" 2 2) ("LOGNOT" 1 1) ("LOGORC1" 2 2) ("LOGORC2" 2 2) ("LOGTEST" 2 2) ("LOGXOR" 0 NIL)
+   ("LONG-SITE-NAME" 0 0) ("LOWER-CASE-P" 1 1) ("MACHINE-INSTANCE" 0 0) ("MACHINE-TYPE" 0 0)
+   ("MACHINE-VERSION" 0 0) ("MACRO-FUNCTION" 1 2) ("MACROEXPAND" 1 2) ("MACROEXPAND-1" 1 2)
+   ("MAKE-ARRAY" 1 NIL) ("MAKE-BROADCAST-STREAM" 0 NIL) ("MAKE-CONCATENATED-STREAM" 0 NIL)
+   ("MAKE-CONDITION" 1 NIL) ("MAKE-DISPATCH-MACRO-CHARACTER" 1 3) ("MAKE-ECHO-STREAM" 2 2)
+   ("MAKE-HASH-TABLE" 0 NIL) ("MAKE-LIST" 1 NIL) ("MAKE-LOAD-FORM-SAVING-SLOTS" 1 NIL)
+   ("MAKE-PACKAGE" 1 NIL) ("MAKE-PATHNAME" 0 NIL) ("MAKE-RANDOM-STATE" 0 1) ("MAKE-SEQUENCE" 2 NIL)
+   ("MAKE-STRING" 1 NIL) ("MAKE-STRING-INPUT-STREAM" 1 3) ("MAKE-STRING-OUTPUT-STREAM" 0 NIL)
+   ("MAKE-SYMBOL" 1 1) ("MAKE-SYNONYM-STREAM" 1 1) ("MAKE-TWO-WAY-STREAM" 2 2) ("MAKUNBOUND" 1 1)
+   ("MAP" 3 NIL) ("MAP-INTO" 2 NIL) ("MAPC" 2 NIL) ("MAPCAN" 2 NIL) ("MAPCAR" 2 NIL)
+   ("MAPCON" 2 NIL) ("MAPHASH" 2 2) ("MAPL" 2 NIL) ("MAPLIST" 2 NIL) ("MASK-FIELD" 2 2)
+   ("MAX" 1 NIL) ("MEMBER" 2 NIL) ("MEMBER-IF" 2 NIL) ("MEMBER-IF-NOT" 2 NIL) ("MERGE" 4 NIL)
+   ("MERGE-PATHNAMES" 1 3) ("METHOD-COMBINATION-ERROR" 1 NIL) ("MIN" 1 NIL) ("MINUSP" 1 1)
+   ("MISMATCH" 2 NIL) ("MOD" 2 2) ("MUFFLE-WARNING" 0 1) ("NAME-CHAR" 1 1) ("NAMESTRING" 1 1)
+   ("NBUTLAST" 1 2) ("NCONC" 0 NIL) ("NINTERSECTION" 2 NIL) ("NINTH" 1 1) ("NOT" 1 1)
+   ("NOTANY" 2 NIL) ("NOTEVERY" 2 NIL) ("NRECONC" 2 2) ("NREVERSE" 1 1) ("NSET-DIFFERENCE" 2 NIL)
+   ("NSET-EXCLUSIVE-OR" 2 NIL) ("NSTRING-CAPITALIZE" 1 NIL) ("NSTRING-DOWNCASE" 1 NIL)
+   ("NSTRING-UPCASE" 1 NIL) ("NSUBLIS" 2 NIL) ("NSUBST" 3 NIL) ("NSUBST-IF" 3 NIL)
+   ("NSUBST-IF-NOT" 3 NIL) ("NSUBSTITUTE" 3 NIL) ("NSUBSTITUTE-IF" 3 NIL)
+   ("NSUBSTITUTE-IF-NOT" 3 NIL) ("NTH" 2 2) ("NTHCDR" 2 2) ("NULL" 1 1) ("NUMBERP" 1 1)
+   ("NUMERATOR" 1 1) ("NUNION" 2 NIL) ("ODDP" 1 1) ("OPEN" 1 NIL) ("PACKAGE-ERROR-PACKAGE" 1 1)
+   ("PACKAGE-NAME" 1 1) ("PACKAGE-NICKNAMES" 1 1) ("PACKAGE-SHADOWING-SYMBOLS" 1 1)
+   ("PACKAGE-USE-LIST" 1 1) ("PACKAGE-USED-BY-LIST" 1 1) ("PACKAGEP" 1 1) ("PAIRLIS" 2 3)
+   ("PARSE-INTEGER" 1 NIL) ("PARSE-NAMESTRING" 1 NIL) ("PATHNAME" 1 1) ("PATHNAME-DEVICE" 1 NIL)
+   ("PATHNAME-DIRECTORY" 1 NIL) ("PATHNAME-HOST" 1 NIL) ("PATHNAME-MATCH-P" 2 2)
+   ("PATHNAME-NAME" 1 NIL) ("PATHNAME-TYPE" 1 NIL) ("PATHNAME-VERSION" 1 1) ("PATHNAMEP" 1 1)
+   ("PEEK-CHAR" 0 5) ("PHASE" 1 1) ("PLUSP" 1 1) ("POSITION" 2 NIL) ("POSITION-IF" 2 NIL)
+   ("POSITION-IF-NOT" 2 NIL) ("PPRINT" 1 2) ("PPRINT-DISPATCH" 1 2) ("PPRINT-FILL" 2 4)
+   ("PPRINT-INDENT" 2 3) ("PPRINT-LINEAR" 2 4) ("PPRINT-NEWLINE" 1 2) ("PPRINT-TAB" 3 4)
+   ("PPRINT-TABULAR" 2 5) ("PRIN1" 1 2) ("PRIN1-TO-STRING" 1 1) ("PRINC" 1 2)
+   ("PRINC-TO-STRING" 1 1) ("PRINT" 1 2) ("PRINT-NOT-READABLE-OBJECT" 1 1) ("PROBE-FILE" 1 1)
+   ("PROCLAIM" 1 1) ("PROVIDE" 1 1) ("RANDOM" 1 2) ("RANDOM-STATE-P" 1 1) ("RASSOC" 2 NIL)
+   ("RASSOC-IF" 2 NIL) ("RASSOC-IF-NOT" 2 NIL) ("RATIONAL" 1 1) ("RATIONALIZE" 1 1)
+   ("RATIONALP" 1 1) ("READ" 0 4) ("READ-BYTE" 1 3) ("READ-CHAR" 0 4) ("READ-CHAR-NO-HANG" 0 4)
+   ("READ-DELIMITED-LIST" 1 3) ("READ-FROM-STRING" 1 NIL) ("READ-LINE" 0 4)
+   ("READ-PRESERVING-WHITESPACE" 0 4) ("READ-SEQUENCE" 2 NIL) ("READTABLE-CASE" 1 1)
+   ("READTABLEP" 1 1) ("REALP" 1 1) ("REALPART" 1 1) ("REDUCE" 2 NIL) ("REM" 2 2) ("REMHASH" 2 2)
+   ("REMOVE" 2 NIL) ("REMOVE-DUPLICATES" 1 NIL) ("REMOVE-IF" 2 NIL) ("REMOVE-IF-NOT" 2 NIL)
+   ("REMPROP" 2 2) ("RENAME-FILE" 2 2) ("RENAME-PACKAGE" 2 3) ("REPLACE" 2 NIL) ("REQUIRE" 1 2)
+   ("REST" 1 1) ("RESTART-NAME" 1 1) ("REVAPPEND" 2 2) ("REVERSE" 1 1) ("ROOM" 0 1) ("ROUND" 1 2)
+   ("ROW-MAJOR-AREF" 2 2) ("RPLACA" 2 2) ("RPLACD" 2 2) ("SBIT" 1 NIL) ("SCALE-FLOAT" 2 2)
+   ("SCHAR" 2 2) ("SEARCH" 2 NIL) ("SECOND" 1 1) ("SET" 2 2) ("SET-DIFFERENCE" 2 NIL)
+   ("SET-DISPATCH-MACRO-CHARACTER" 3 4) ("SET-EXCLUSIVE-OR" 2 NIL) ("SET-MACRO-CHARACTER" 2 4)
+   ("SET-PPRINT-DISPATCH" 2 4) ("SET-SYNTAX-FROM-CHAR" 2 4) ("SEVENTH" 1 1) ("SHADOW" 1 2)
+   ("SHADOWING-IMPORT" 1 2) ("SHORT-SITE-NAME" 0 0) ("SIGNAL" 1 NIL) ("SIGNUM" 1 1)
+   ("SIMPLE-BIT-VECTOR-P" 1 1) ("SIMPLE-CONDITION-FORMAT-ARGUMENTS" 1 1)
+   ("SIMPLE-CONDITION-FORMAT-CONTROL" 1 1) ("SIMPLE-STRING-P" 1 1) ("SIMPLE-VECTOR-P" 1 1)
+   ("SIN" 1 1) ("SINH" 1 1) ("SIXTH" 1 1) ("SLEEP" 1 1) ("SLOT-BOUNDP" 2 2) ("SLOT-EXISTS-P" 2 2)
+   ("SLOT-MAKUNBOUND" 2 2) ("SLOT-VALUE" 2 2) ("SOFTWARE-TYPE" 0 0) ("SOFTWARE-VERSION" 0 0)
+   ("SOME" 2 NIL) ("SORT" 2 NIL) ("SPECIAL-OPERATOR-P" 1 1) ("SQRT" 1 1) ("STABLE-SORT" 2 NIL)
+   ("STANDARD-CHAR-P" 1 1) ("STORE-VALUE" 1 2) ("STREAM-ERROR-STREAM" 1 1)
+   ("STREAM-EXTERNAL-FORMAT" 1 1) ("STREAMP" 1 1) ("STRING" 1 1) ("STRING-CAPITALIZE" 1 NIL)
+   ("STRING-DOWNCASE" 1 NIL) ("STRING-EQUAL" 2 NIL) ("STRING-GREATERP" 2 NIL)
+   ("STRING-LEFT-TRIM" 2 2) ("STRING-LESSP" 2 NIL) ("STRING-NOT-EQUAL" 2 NIL)
+   ("STRING-NOT-GREATERP" 2 NIL) ("STRING-NOT-LESSP" 2 NIL) ("STRING-RIGHT-TRIM" 2 2)
+   ("STRING-TRIM" 2 2) ("STRING-UPCASE" 1 NIL) ("STRING/=" 2 NIL) ("STRING<" 2 NIL)
+   ("STRING<=" 2 NIL) ("STRING=" 2 NIL) ("STRING>" 2 NIL) ("STRING>=" 2 NIL) ("STRINGP" 1 1)
+   ("SUBLIS" 2 NIL) ("SUBSEQ" 2 3) ("SUBSETP" 2 NIL) ("SUBST" 3 NIL) ("SUBST-IF" 3 NIL)
+   ("SUBST-IF-NOT" 3 NIL) ("SUBSTITUTE" 3 NIL) ("SUBSTITUTE-IF" 3 NIL) ("SUBSTITUTE-IF-NOT" 3 NIL)
+   ("SUBTYPEP" 2 3) ("SVREF" 2 2) ("SXHASH" 1 1) ("SYMBOL-FUNCTION" 1 1) ("SYMBOL-NAME" 1 1)
+   ("SYMBOL-PACKAGE" 1 1) ("SYMBOL-PLIST" 1 1) ("SYMBOL-VALUE" 1 1) ("SYMBOLP" 1 1)
+   ("SYNONYM-STREAM-SYMBOL" 1 1) ("TAILP" 2 2) ("TAN" 1 1) ("TANH" 1 1) ("TENTH" 1 1)
+   ("TERPRI" 0 1) ("THIRD" 1 1) ("TRANSLATE-LOGICAL-PATHNAME" 1 NIL) ("TRANSLATE-PATHNAME" 3 NIL)
+   ("TREE-EQUAL" 2 NIL) ("TRUENAME" 1 1) ("TRUNCATE" 1 2) ("TWO-WAY-STREAM-INPUT-STREAM" 1 1)
+   ("TWO-WAY-STREAM-OUTPUT-STREAM" 1 1) ("TYPE-ERROR-DATUM" 1 1) ("TYPE-ERROR-EXPECTED-TYPE" 1 1)
+   ("TYPE-OF" 1 1) ("TYPEP" 2 3) ("UNBOUND-SLOT-INSTANCE" 1 1) ("UNEXPORT" 1 2) ("UNINTERN" 1 2)
+   ("UNION" 2 NIL) ("UNREAD-CHAR" 1 2) ("UNUSE-PACKAGE" 1 2) ("UPGRADED-ARRAY-ELEMENT-TYPE" 1 2)
+   ("UPGRADED-COMPLEX-PART-TYPE" 1 2) ("UPPER-CASE-P" 1 1) ("USE-PACKAGE" 1 2) ("USE-VALUE" 1 2)
+   ("USER-HOMEDIR-PATHNAME" 0 1) ("VALUES" 0 NIL) ("VALUES-LIST" 1 1) ("VECTOR" 0 NIL)
+   ("VECTOR-POP" 1 1) ("VECTOR-PUSH" 2 2) ("VECTOR-PUSH-EXTEND" 2 3) ("VECTORP" 1 1) ("WARN" 1 NIL)
+   ("WILD-PATHNAME-P" 1 2) ("WRITE" 1 NIL) ("WRITE-BYTE" 2 2) ("WRITE-CHAR" 1 2)
+   ("WRITE-LINE" 1 NIL) ("WRITE-SEQUENCE" 2 NIL) ("WRITE-STRING" 1 NIL) ("WRITE-TO-STRING" 1 NIL)
+   ("Y-OR-N-P" 0 NIL) ("YES-OR-NO-P" 0 NIL) ("ZEROP" 1 1)
+                   ) h)
+      (let ((sym (find-symbol (first row) "COMMON-LISP")))
+        (when sym (setf (gethash sym h) (cons (second row) (third row))))))))
+
+(defun %uv-note-arity (name form)
+  "Warn when FORM calls the COMMON-LISP function NAME with too few or too many arguments."
+  (let ((entry (and (symbolp name) (eq (symbol-package name) (find-package "COMMON-LISP"))
+                    (consp form) (listp (cdr form))
+                    (gethash name *cl-function-arities*))))
+    (when (and entry
+               (not (%lexical-function-p name))
+               (not (member name *uv-local-functions* :test #'eq))
+               (not (find-macro-expander name))
+               (not (special-operator-name-p name)))
+      (let ((n (length (cdr form))) (min (car entry)) (max (cdr entry)))
+        (when (or (< n min) (and max (> n max)))
+          (warn 'simple-warning
+                :format-control "The function ~S is called with ~D argument~:P, but wants ~A."
+                :format-arguments
+                (list name n
+                      (cond ((null max) (format nil "at least ~D" min))
+                            ((= min max) (format nil "exactly ~D" min))
+                            (t (format nil "between ~D and ~D" min max))))))))))
+
 (defun %uv-note-function (name form)
   "Record NAME, called in FORM, when it is not a local operator, macro or
    function. The end of the compilation unit decides whether it stayed undefined."
+  (%uv-note-arity name form)
   (when (and *compiler-note-undefined*
              (symbolp name) name (symbol-package name)
              (not (keywordp name))
@@ -2803,7 +2979,7 @@
              (set (svref cell 1))
              (site (svref cell 2)))
         (when (and (symbol-package sym)
-                   (not (member sym (gethash site *uv-warned*) :test #'eq))
+                   (not (member sym (%lazy-table-get *uv-warned* site) :test #'eq))
                    (not (global-special-p sym))
                    (not (constantp sym)))
           (let ((msgs
@@ -2815,7 +2991,7 @@
                         (set '("The variable ~S is assigned but never read."))
                         (t '("The variable ~S is defined but never used.")))))
             (when msgs
-              (push sym (gethash site *uv-warned*))
+              (%lazy-table-put *uv-warned* site (cons sym (%lazy-table-get *uv-warned* site)))
               (dolist (m msgs)
                 (push (cons m sym) *uv-warnings*)))))))))
 
@@ -2835,7 +3011,12 @@
             (not (keywordp sym))
             (not (constantp sym))
             (not (global-special-p sym))
-            (not (boundp sym)))
+            (not (boundp sym))
+            (not (member sym *uv-defining* :test #'eq))
+            (not (nth-value 1 (gethash sym *global-symbol-macros*)))
+            ;; A SYMBOL-MACROLET around a top level form being compiled by itself
+            ;; (a DEFUN in its body): the binding is in *SYMBOL-MACROS*, not in ENV.
+            (not (assoc sym *symbol-macros* :test #'eq)))
        (funcall *compiler-note-undefined* :variable sym
                 (or *uv-current-form* sym))))))
 
@@ -3050,6 +3231,14 @@
           (dolist (f (cdr form)) (when (consp f) (%uv-walk f env))))
          ((or (eq head 'go) (eq head 'declare) (eq head 'define-symbol-macro)) nil)
          ((eq head 'load-time-value) (%uv-walk (cadr form) '()))
+         ((and (member head '(defvar defparameter defconstant)) (consp (cdr form))
+               (symbolp (cadr form)) (cadr form))
+          (let ((*uv-defining* (cons (cadr form) *uv-defining*))
+                (expander (find-macro-expander head)))
+            (let ((expanded (and expander (%walker-macroexpand form expander :none))))
+              (if (and expanded (not (equal expanded form)))
+                  (%uv-walk expanded env)
+                  (%uv-walk-list (cdr form) env)))))
          (t
           (let ((expander (find-macro-expander head)))
             (let ((expanded (and expander (%walker-macroexpand form expander :none))))
@@ -3062,17 +3251,26 @@
 (defun %compiler-warn-undefined (kind name)
   "Signal the warning for NAME, first used in the form whose source position is
    the current compiler context."
-  (if (eq kind :variable)
-      (warn 'style-warning :format-control "undefined variable: ~S"
-            :format-arguments (list name))
-      (warn 'style-warning :format-control "undefined function: ~S"
-            :format-arguments (list name))))
+  (cond ((eq kind :variable)
+         (warn 'style-warning :format-control "undefined variable: ~S"
+               :format-arguments (list name)))
+        ;; A global FTYPE proclamation says the function exists.
+        ((gethash name *declaimed-ftype-names*) nil)
+        ;; A function DEFCLASS (reader, writer, accessor), DEFGENERIC or DEFMETHOD
+        ;; defines in this image or file, noted when the form was macroexpanded.
+        ((or (gethash name *gf-call-names*)
+             (gethash name *clos-accessor-readers*)
+             (gethash name *clos-accessor-writers*))
+         nil)
+        (t
+         (warn 'style-warning :format-control "undefined function: ~S"
+               :format-arguments (list name)))))
 
 (defun note-unused-variables (form)
   "Signal the unused-variable style warnings for FORM, a top-level form that
    is about to be compiled."
   (unless *uv-warned*
-    (setf *uv-warned* (make-hash-table :test #'eq)))
+    (setf *uv-warned* (list nil)))
   (let ((*uv-warnings* '()))
     (catch '%uv-give-up
       (handler-case (%uv-walk form '())

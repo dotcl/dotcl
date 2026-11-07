@@ -37,7 +37,20 @@ public static partial class Runtime
     /// <summary>Whether TABLE's standard entries apply to OBJ (a list, or a
     /// vector printed as #(...)).</summary>
     private static bool IsStdPprintObject(LispObject obj)
-        => obj is Cons || IsStdPprintVector(obj);
+        => obj is Cons || IsStdPprintVector(obj) || IsStdPprintArray(obj) || IsStdPprintStruct(obj);
+
+    // A structure with no PRINT-OBJECT method of its own prints as #S(name :slot value ...),
+    // laid out as a logical block with a linear break before each slot.
+    private static bool IsStdPprintStruct(LispObject obj)
+    {
+        if (!LispStruct.TryAs(obj, out var st) || FaslStructSyntax) return false;
+        return !(Startup.Sym("PRINT-OBJECT")?.Function is GenericFunction gf
+                 && HasSpecializedPrintObjectMethod(gf, st));
+    }
+
+    // A rank >= 2 array printed as #nA(...), laid out as nested logical blocks.
+    private static bool IsStdPprintArray(LispObject obj)
+        => obj is LispVector v && v.Rank >= 2 && GetPrintArray() && !GetPrintReadably();
 
     internal static bool IsStdPprintObjectPublic(LispObject obj) => IsStdPprintObject(obj);
 
@@ -374,7 +387,84 @@ public static partial class Runtime
                 PprintVector((LispVector)obj);
                 return;
             }
+            if (IsStdPprintStruct(obj))
+            {
+                if (_table.Entries.Count > 0)
+                {
+                    var user = RunUserPprintDispatch(obj, _table, _escape);
+                    if (user != null) { AddText(user, PpAtom); return; }
+                }
+                if (!EnterCompound(obj, checkCircle)) return;
+                PprintStruct((LispStruct)obj);
+                return;
+            }
+            if (IsStdPprintArray(obj))
+            {
+                if (_table.Entries.Count > 0)
+                {
+                    var user = RunUserPprintDispatch(obj, _table, _escape);
+                    if (user != null) { AddText(user, PpAtom); return; }
+                }
+                if (!EnterCompound(obj, checkCircle)) return;
+                var arr = (LispVector)obj;
+                PprintArrayDim(arr, arr.Dimensions, 0, 0, $"#{arr.Rank}A(");
+                return;
+            }
             AddText(FormatAtom(obj, _escape), PpAtom);
+        }
+
+        private void PprintStruct(LispStruct st)
+        {
+            var cls = Runtime.FindClassOrNil(st.TypeName) as LispClass;
+            Symbol[]? slotNames = cls?.StructSlotNames;
+            StartBlock("#S(", ")");
+            _formatConsDepth++;
+            try
+            {
+                Text(FormatObject(st.TypeName, _escape));
+                int? printLength = GetPrintLength();
+                int slotCount = st.SlotCount;
+                for (int i = 0; i < slotCount; i++)
+                {
+                    Text(" ");
+                    Newline(NlLinear);
+                    if (printLength.HasValue && i >= printLength.Value) { Text("..."); break; }
+                    if (slotNames != null && i < slotNames.Length)
+                        Text(":" + ApplyPrintCase(slotNames[i].Name) + " ");
+                    Obj(st.GetSlot(i));
+                }
+            }
+            finally { _formatConsDepth--; }
+            EndBlock();
+        }
+
+        /// <summary>One dimension of a rank >= 2 array as a logical block; the
+        /// innermost dimension holds the elements.</summary>
+        private void PprintArrayDim(LispVector arr, int[] dims, int dimIdx, int offset, string prefix)
+        {
+            int stride = 1;
+            for (int k = dimIdx + 1; k < dims.Length; k++) stride *= dims[k];
+            if (dimIdx > 0)
+            {
+                var level = GetPrintLevel();
+                if (level.HasValue && _formatConsDepth >= level.Value) { AddText("#", PpAtom); return; }
+            }
+            StartBlock(prefix, ")");
+            _formatConsDepth++;
+            try
+            {
+                int? printLength = GetPrintLength();
+                for (int i = 0; i < dims[dimIdx]; i++)
+                {
+                    if (i > 0) { Text(" "); Newline(NlFill); }
+                    if (printLength.HasValue && i >= printLength.Value) { Text("..."); break; }
+                    int o = offset + i * stride;
+                    if (dimIdx == dims.Length - 1) Obj(arr.ElementAt(o));
+                    else PprintArrayDim(arr, dims, dimIdx + 1, o, "(");
+                }
+            }
+            finally { _formatConsDepth--; }
+            EndBlock();
         }
 
         /// <summary>The text of an element. The element's text reaches the
@@ -459,7 +549,9 @@ public static partial class Runtime
             private int _count;
             private readonly int? _printLength = GetPrintLength();
 
-            public PpList(StdPprinter p, LispObject list) { _p = p; _cur = list; _slow = list; }
+            private readonly LispObject _origin;
+
+            public PpList(StdPprinter p, LispObject list) { _p = p; _cur = list; _slow = list; _origin = list; }
 
             public bool Exhausted => _cur is Nil;
 
@@ -486,7 +578,14 @@ public static partial class Runtime
                     // would never end.
                     if (_moveSlow) _slow = ((Cons)_slow).Cdr;
                     _moveSlow = !_moveSlow;
-                    if (ReferenceEquals(c, _slow)) { _p.Text("..."); return false; }
+                    if (ReferenceEquals(c, _slow))
+                    {
+                        // Circular without *print-circle*: "..." does not read back, so
+                        // under *print-readably* this is an error (checked only here,
+                        // once the cycle is known).
+                        _p.Text(GetPrintReadably() ? SignalPrintNotReadable(_origin, true) : "...");
+                        return false;
+                    }
                 }
                 _count++;
                 item = c.Car;

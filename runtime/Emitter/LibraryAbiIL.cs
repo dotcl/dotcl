@@ -53,9 +53,14 @@ internal sealed class LibraryAbiIL : ILGenerator
 
     private readonly record struct Redirect(Kind Kind, MethodInfo Target, int N = 0);
 
-    private static readonly Dictionary<MethodBase, Redirect> s_map = BuildMap();
-    private static readonly MethodInfo s_absent = typeof(LibraryAbi).GetProperty(nameof(LibraryAbi.Absent))!.GetGetMethod()!;
-    private static readonly FieldInfo s_absentField = typeof(AbsentKey).GetField(nameof(AbsentKey.Instance))!;
+    // Built on first use: Active is read by every assembler, but the tables are
+    // only needed while a library-ABI module is being written.
+    private static Dictionary<MethodBase, Redirect>? _lazy_map;
+    private static Dictionary<MethodBase, Redirect> s_map => _lazy_map ??= BuildMap();
+    private static MethodInfo? _lazy_absent;
+    private static MethodInfo s_absent => _lazy_absent ??= typeof(LibraryAbi).GetProperty(nameof(LibraryAbi.Absent))!.GetGetMethod()!;
+    private static FieldInfo? _lazy_absentField;
+    private static FieldInfo s_absentField => _lazy_absentField ??= typeof(AbsentKey).GetField(nameof(AbsentKey.Instance))!;
 
     private static MethodInfo Abi(string name, params Type[] args) =>
         typeof(LibraryAbi).GetMethod(name, args)
@@ -360,7 +365,9 @@ internal sealed class LibraryAbiIL : ILGenerator
         Flush(); _in.EmitCall(opcode, methodInfo, optionalParameterTypes);
     }
 
-    private static readonly Dictionary<ConstructorInfo, ConstructorInfo> s_ctors = new()
+    private static Dictionary<ConstructorInfo, ConstructorInfo>? _lazy_ctors;
+    private static Dictionary<ConstructorInfo, ConstructorInfo> s_ctors => _lazy_ctors ??= BuildCtors();
+    private static Dictionary<ConstructorInfo, ConstructorInfo> BuildCtors() => new()
     {
         [typeof(HandlerBinding).GetConstructor(new[] { typeof(LispObject), typeof(LispFunction) })!] =
             typeof(LibraryAbi.Binding).GetConstructor(new[] { typeof(LispObject), typeof(LispFunction) })!,

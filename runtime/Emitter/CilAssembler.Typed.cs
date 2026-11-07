@@ -19,8 +19,10 @@ public partial class CilAssembler
     // frame and so meets no depth check of an entry: the body makes its own.
     internal TypedForm? _typedForm;
 
-    static readonly MethodInfo s_typedSelfDepth = typeof(LispFunction).GetMethod("TypedSelfDepth")!;
-    static readonly MethodInfo s_typedSelfCount = typeof(LispFunction).GetMethod("TypedSelfCount")!;
+    static MethodInfo? _lazy_s_typedSelfDepth;
+    static MethodInfo s_typedSelfDepth => _lazy_s_typedSelfDepth ??= typeof(LispFunction).GetMethod("TypedSelfDepth")!;
+    static MethodInfo? _lazy_s_typedSelfCount;
+    static MethodInfo s_typedSelfCount => _lazy_s_typedSelfCount ??= typeof(LispFunction).GetMethod("TypedSelfCount")!;
 
     /// <summary>For a SelfFree body, the receiver of a self-call: one less than
     /// its own count of self-calls left before a stack check.</summary>
@@ -184,13 +186,20 @@ public partial class CilAssembler
         return r;
     }
 
-    static readonly MethodInfo TypedArgLMI = typeof(Runtime).GetMethod("TypedArgL")!;
-    static readonly MethodInfo TypedArgLRMI = typeof(Runtime).GetMethod("TypedArgLR")!;
-    static readonly MethodInfo TypedArgDMI = typeof(Runtime).GetMethod("TypedArgD")!;
-    static readonly MethodInfo FixnumMakeTMI = typeof(Fixnum).GetMethod("Make")!;
-    static readonly MethodInfo FixnumGetValueTMI = typeof(Fixnum).GetProperty("Value")!.GetGetMethod()!;
-    static readonly MethodInfo DoubleGetValueTMI = typeof(DoubleFloat).GetProperty("Value")!.GetGetMethod()!;
-    static readonly ConstructorInfo DoubleCtorTMI = typeof(DoubleFloat).GetConstructor(new[] { typeof(double) })!;
+    static MethodInfo? _lazy_TypedArgLMI;
+    static MethodInfo TypedArgLMI => _lazy_TypedArgLMI ??= typeof(Runtime).GetMethod("TypedArgL")!;
+    static MethodInfo? _lazy_TypedArgLRMI;
+    static MethodInfo TypedArgLRMI => _lazy_TypedArgLRMI ??= typeof(Runtime).GetMethod("TypedArgLR")!;
+    static MethodInfo? _lazy_TypedArgDMI;
+    static MethodInfo TypedArgDMI => _lazy_TypedArgDMI ??= typeof(Runtime).GetMethod("TypedArgD")!;
+    static MethodInfo? _lazy_FixnumMakeTMI;
+    static MethodInfo FixnumMakeTMI => _lazy_FixnumMakeTMI ??= typeof(Fixnum).GetMethod("Make")!;
+    static MethodInfo? _lazy_FixnumGetValueTMI;
+    static MethodInfo FixnumGetValueTMI => _lazy_FixnumGetValueTMI ??= typeof(Fixnum).GetProperty("Value")!.GetGetMethod()!;
+    static MethodInfo? _lazy_DoubleGetValueTMI;
+    static MethodInfo DoubleGetValueTMI => _lazy_DoubleGetValueTMI ??= typeof(DoubleFloat).GetProperty("Value")!.GetGetMethod()!;
+    static ConstructorInfo? _lazy_DoubleCtorTMI;
+    static ConstructorInfo DoubleCtorTMI => _lazy_DoubleCtorTMI ??= typeof(DoubleFloat).GetConstructor(new[] { typeof(double) })!;
 
     /// <summary>The body of the boxed entry over a typed body method:
     /// LispObject Shell(LispFunction self, LispObject a1..an).</summary>
@@ -198,9 +207,13 @@ public partial class CilAssembler
     /// around the body (see Function.SelfFramed.cs), so that callers reach it
     /// through the entry pointer instead of InvokeN's framed path.</summary>
     internal static void EmitTypedShell(ILGenerator il, TypedForm f, MethodInfo typed,
-                                        bool selfFramed = false, bool unit = false, MethodInfo? generic = null)
+                                        bool selfFramed = false, bool unit = false, MethodInfo? generic = null,
+                                        MethodInfo? entryCheck = null)
     {
         int n = f.ParamCount;
+        // The shell of a function without a frame (debug 0) that callers enter by calli: it makes
+        // the stack and interrupt check InvokeN makes before a body.
+        if (entryCheck != null) il.Emit(OpCodes.Call, entryCheck);
         Label gen = default;
         if (generic != null)
         {
@@ -376,7 +389,8 @@ public partial class CilAssembler
     // the frame the entry stands for, handed to the LispFunction.LeafX helpers.
     internal TypedForm? _leafEntry;
 
-    static readonly Dictionary<string, MethodInfo> s_leafOps = BuildLeafOps();
+    static Dictionary<string, MethodInfo>? _lazy_s_leafOps;
+    static Dictionary<string, MethodInfo> s_leafOps => _lazy_s_leafOps ??= BuildLeafOps();
 
     static Dictionary<string, MethodInfo> BuildLeafOps()
     {
@@ -489,7 +503,17 @@ public partial class CilAssembler
     /// <summary>The recipe of a LOAD-TIME-VALUE cell in a fasl, run once by its
     /// cached constant: a call of DOTCL-INTERNAL::%GET-LTV-SLOT-IN on a string and
     /// an integer.</summary>
-    static bool IsLtvFetch(LispObject recipe) => MatchesShape(recipe, s_ltvFetch) || MatchesShape(recipe, s_ltvFetchMode);
+    static bool IsLtvFetch(LispObject recipe) =>
+        MatchesShape(recipe, s_ltvFetch) || MatchesShape(recipe, s_ltvFetchMode)
+        || MatchesShape(recipe, s_ltvFetchNoReset);
+
+    // The fetch in a single-value position: no reset in front of the call.
+    static readonly string[] s_ltvFetchNoReset =
+    {
+        "LOAD-SYM-PKG %GET-LTV-SLOT-IN", "CASTCLASS Symbol", "CALL CilAssembler.GetFunctionBySymbol",
+        "LOAD-CONST", "LDC-I8", "CALL Fixnum.Make",
+        "CALLVIRT LispFunction.Invoke2", "CALL Runtime.UnwrapMv",
+    };
 
     static readonly string[] s_ltvFetch =
     {
@@ -526,9 +550,12 @@ public partial class CilAssembler
     // argument count, for the frame LeafCarD / LeafCheckArgType link.
     internal (string Name, int Argc)? _directLeaf;
 
-    static readonly MethodInfo s_leafCar = typeof(LispFunction).GetMethod("LeafCar")!;
-    static readonly MethodInfo s_leafCarD = typeof(LispFunction).GetMethod("LeafCarD")!;
-    static readonly MethodInfo s_leafCheckArgType = typeof(LispFunction).GetMethod("LeafCheckArgType")!;
+    static MethodInfo? _lazy_s_leafCar;
+    static MethodInfo s_leafCar => _lazy_s_leafCar ??= typeof(LispFunction).GetMethod("LeafCar")!;
+    static MethodInfo? _lazy_s_leafCarD;
+    static MethodInfo s_leafCarD => _lazy_s_leafCarD ??= typeof(LispFunction).GetMethod("LeafCarD")!;
+    static MethodInfo? _lazy_s_leafCheckArgType;
+    static MethodInfo s_leafCheckArgType => _lazy_s_leafCheckArgType ??= typeof(LispFunction).GetMethod("LeafCheckArgType")!;
 
     private bool TryEmitLeafCall(string name)
     {
@@ -563,7 +590,8 @@ public partial class CilAssembler
         return true;
     }
 
-    static readonly MethodInfo s_doubleBits = typeof(BitConverter).GetMethod("DoubleToInt64Bits", new[] { typeof(double) })!;
+    static MethodInfo? _lazy_s_doubleBits;
+    static MethodInfo s_doubleBits => _lazy_s_doubleBits ??= typeof(BitConverter).GetMethod("DoubleToInt64Bits", new[] { typeof(double) })!;
 
     /// <summary>Assemble the leaf copy of F's typed body into IL: the framed
     /// entry of a leaf.</summary>

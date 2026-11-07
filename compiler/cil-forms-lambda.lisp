@@ -287,7 +287,10 @@
                                ;; &aux vars are bound in the function body scope,
                                ;; so body references to them are not free (D-fix).
                                (mapcar (lambda (a) (if (consp a) (car a) a)) aux)))
-           (bound-names (mapcar #'var-name all-params))
+           ;; The symbols themselves, not their names: BND-MEMBER-P then tells a parameter apart
+           ;; from a same-named variable of another package (a macro's lambda parameter FOO::S must
+           ;; not hide the caller's S).
+           (bound-names (copy-list all-params))
            (free-ht (list nil)))
       ;; Scan body
       (dolist (form body)
@@ -957,7 +960,7 @@
                       when inline-only
                         collect (let ((key (gen-local "NOFN")))
                                   (push key (car *closure-inline-only-keys*))
-                                  (list fn-name key fn-boxed-p nil nil nil (seventh outer-fn)))
+                                  (list fn-name key fn-boxed-p nil nil nil (seventh outer-fn) (eighth outer-fn)))
                       when captured
                       collect (let ((env-entry (assoc captured env-locals :test #'eq)))
                                 ;; A capture-lifted function cannot be reached from
@@ -969,7 +972,7 @@
                                 (when (fourth outer-fn)
                                   (throw (%lift-capture-tag outer-fn) :lift-aborted))
                                 (list fn-name (cdr env-entry) fn-boxed-p
-                                      nil nil nil (seventh outer-fn))))
+                                      nil nil nil (seventh outer-fn) (eighth outer-fn))))
                 +cs-block-tags+
                 (loop for (bname . binfo) in (compile-env-block-tags outer-env)
                       for tag-var = (block-tag-var-name bname)
@@ -1085,6 +1088,13 @@
                                                     (%float-param-keys float-plan
                                                                        param-locals)))
                  (mv-key (closure-mv-mode-key direct-p special-param-syms))
+                 ;; See *REST-FORWARD*: this frame's argument array is ldarg 1.
+                 (*rest-forward*
+                   (and rest-param (not direct-p) (not *cross-compiling*)
+                        (not (member rest-param special-param-syms))
+                        (not (member (var-name rest-param) needs-boxing :test #'string=))
+                        (null (find-mutated-and-captured-vars body (list (var-name rest-param))))
+                        (list rest-param (cdr (assoc rest-param param-locals)) 1 key-start)))
                  (body-instrs (let ((*mv-mode-local* mv-key))
                                 (call-with-param-type-locals
                                  all-params param-locals body
@@ -1313,11 +1323,28 @@
 
 ;;; (TCO defvars moved to top of file for proper SBCL special-var recognition)
 
+(defvar *lambda-doc-skip* nil
+  "The (LAMBDA ...) form whose docstring has already been taken off.")
+
 (defun compile-function-special (thing)
   "Compile (function name) or (function (lambda ...))."
   (cond
     ((and (consp thing) (eq (car thing) 'lambda))
-     (compile-lambda (cadr thing) (cddr thing)))
+     (let* ((body (%doc-first (cddr thing)))
+            (doc (and (not *cross-compiling*) (not (eq thing *lambda-doc-skip*))
+                      (consp body) (stringp (car body)) (cdr body)
+                      (car body))))
+       (if doc
+           ;; The docstring belongs to the function object, so it is attached as
+           ;; the object is made.
+           (let ((f (gensym "F"))
+                 (plain (list* 'lambda (cadr thing) (cdr body))))
+             (let ((*lambda-doc-skip* plain))
+               (compile-expr
+                `(let ((,f (function ,plain)))
+                   (funcall #'(setf documentation) ,doc ,f t)
+                   ,f))))
+           (compile-lambda (cadr thing) (cddr thing)))))
     ;; (function (named-lambda name lambda-list . body)): SBCL extension
     ;; Treat as plain lambda, discarding the name
     ((and (consp thing) (symbolp (car thing))

@@ -523,6 +523,16 @@ public partial class LispFunction : LispObject
         return frames;
     }
 
+    /// <summary>The name of the innermost Lisp frame of this thread, or null when there
+    /// is none. Constant time, unlike a snapshot of the stack.</summary>
+    internal static unsafe string? InnermostFrameName()
+    {
+        var top = s_top;
+        if (top == null) return null;
+        var f = *top;
+        return f.Name;
+    }
+
     /// <summary>Backtrace as callee-name strings, innermost first. Used by the
     /// programmatic DOTCL:BACKTRACE.</summary>
     internal static string[] GetCallStack()

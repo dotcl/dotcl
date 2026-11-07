@@ -15,12 +15,12 @@ public static partial class Runtime
     // debugger needs to jump to the definition.
     // Seq orders the records: a later definition replaces an earlier one, also
     // when the earlier one is a fasl's table resolved only at lookup (below).
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line, long Seq)>
-        s_defSources = new();
+    private static System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line, long Seq)>? _lz_s_defSources;
+    private static System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line, long Seq)> s_defSources => System.Threading.Volatile.Read(ref _lz_s_defSources) ?? System.Threading.Interlocked.CompareExchange(ref _lz_s_defSources, new(), null) ?? _lz_s_defSources!;
     // The same for the function kinds only (FUNCTION, GENERIC-FUNCTION, MACRO,
     // METHOD): what a debugger frame or FUNCTION-SOURCE-LOCATION looks for.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line, long Seq)>
-        s_defFunctionSources = new();
+    private static System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line, long Seq)>? _lz_s_defFunctionSources;
+    private static System.Collections.Concurrent.ConcurrentDictionary<Symbol, (string File, int Line, long Seq)> s_defFunctionSources => System.Threading.Volatile.Read(ref _lz_s_defFunctionSources) ?? System.Threading.Interlocked.CompareExchange(ref _lz_s_defFunctionSources, new(), null) ?? _lz_s_defFunctionSources!;
     private static long s_defSeq;
 
     // Definition tables of loaded fasls not yet resolved to symbols, and the
@@ -41,12 +41,12 @@ public static partial class Runtime
 
     // Every kind of definition a name has, each with its own location.
     // s_defSources keeps the most recent of them per name.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<DefinitionEntry, (string File, int Line, long Seq)>
-        s_defKindSources = new();
+    private static System.Collections.Concurrent.ConcurrentDictionary<DefinitionEntry, (string File, int Line, long Seq)>? _lz_s_defKindSources;
+    private static System.Collections.Concurrent.ConcurrentDictionary<DefinitionEntry, (string File, int Line, long Seq)> s_defKindSources => System.Threading.Volatile.Read(ref _lz_s_defKindSources) ?? System.Threading.Interlocked.CompareExchange(ref _lz_s_defKindSources, new(), null) ?? _lz_s_defKindSources!;
     // Definitions of uninterned names (a macro's gensym DEFUN) read from a fasl,
     // whose symbols exist only once the code runs: matched by name.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string Name, string Kind), (string File, int Line, long Seq)>
-        s_uninternedDefSources = new();
+    private static System.Collections.Concurrent.ConcurrentDictionary<(string Name, string Kind), (string File, int Line, long Seq)>? _lz_s_uninternedDefSources;
+    private static System.Collections.Concurrent.ConcurrentDictionary<(string Name, string Kind), (string File, int Line, long Seq)> s_uninternedDefSources => System.Threading.Volatile.Read(ref _lz_s_uninternedDefSources) ?? System.Threading.Interlocked.CompareExchange(ref _lz_s_uninternedDefSources, new(), null) ?? _lz_s_uninternedDefSources!;
 
     private static string? DefinerKind(Symbol head)
     {
@@ -502,6 +502,96 @@ public static partial class Runtime
         latest[sym] = (file, line, seq);
     }
 
+    /// <summary>FILE with a leading part replaced as dotcl:*source-path-map* (or, when that is
+    /// NIL, the environment variable DOTCL_SOURCE_PATH_MAP, "from=to;from=to") says. The only
+    /// place a source path enters a fasl, so a build that has to give the same bytes wherever
+    /// the checkout is maps it here. The longest matching FROM wins; a FROM matches whole
+    /// directory names only.</summary>
+    internal static string MapSourcePath(string file)
+    {
+        var pairs = new List<(string From, string To)>();
+        var sym = Startup.DotclPkg?.FindSymbol("*SOURCE-PATH-MAP*").Item1;
+        if (sym != null)
+            for (var cur = DynamicBindings.Get(sym); cur is Cons c; cur = c.Cdr)
+                if (c.Car is Cons pair && StringValueOrNull(pair.Car) is string from
+                    && StringValueOrNull(pair.Cdr) is string to)
+                    pairs.Add((from, to));
+        if (pairs.Count == 0)
+        {
+            var env = Environment.GetEnvironmentVariable("DOTCL_SOURCE_PATH_MAP");
+            if (!string.IsNullOrEmpty(env))
+                foreach (var item in env.Split(';', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    int eq = item.IndexOf('=');
+                    if (eq > 0) pairs.Add((item.Substring(0, eq), item.Substring(eq + 1)));
+                }
+        }
+        // Separators are compared as '/' on every OS, and case is ignored on Windows, whose
+        // paths are written with either separator and any case. A mapped path is written with '/'.
+        bool win = Compat.IsWindows();   // elsewhere a backslash is an ordinary file name character
+        var cmp = win ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        string Slash(string x) => win ? x.Replace('\\', '/') : x;
+        var slashed = Slash(file);
+        string? bestFrom = null, bestTo = null;
+        foreach (var (from0, to) in pairs)
+        {
+            var from = Slash(from0).TrimEnd('/');
+            if (from.Length == 0 || (bestFrom != null && from.Length <= bestFrom.Length)) continue;
+            if (slashed.Length >= from.Length
+                && slashed.StartsWith(from, cmp)
+                && (slashed.Length == from.Length || slashed[from.Length] == '/'))
+            { bestFrom = from; bestTo = to; }
+        }
+        if (bestFrom == null) return file;
+        return Slash(bestTo!).TrimEnd('/') + slashed.Substring(bestFrom.Length);
+    }
+
+    /// <summary>The prefix a packed library's source paths are mapped to: /dotcl-src/NAME/rel.</summary>
+    internal const string MappedSourceRoot = "/dotcl-src/";
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> s_sourceRoots = new();
+
+    /// <summary>Tells where the source of the library NAME is on this machine, so that the paths
+    /// /dotcl-src/NAME/... its fasl records (see MapSourcePath) lead to real files.</summary>
+    public static LispObject RegisterSourceRoot(LispObject[] args)
+    {
+        if (args.Length != 2 || StringValueOrNull(args[0]) is not string name || StringValueOrNull(args[1]) is not string dir)
+            throw new LispErrorException(new LispProgramError("REGISTER-SOURCE-ROOT: requires a name and a directory"));
+        s_sourceRoots[name] = dir;
+        return args[0];
+    }
+
+    /// <summary>The reverse of MapSourcePath: a /dotcl-src/NAME/rel path becomes the real path of
+    /// that file, when the source directory of NAME is known (REGISTER-SOURCE-ROOT, or, for a
+    /// system ASDF has loaded, asdf:system-source-directory) and the file is there. Anything
+    /// else comes back as it was.</summary>
+    internal static string UnmapSourcePath(string file)
+    {
+        if (!file.StartsWith(MappedSourceRoot, StringComparison.Ordinal)) return file;
+        int slash = file.IndexOf('/', MappedSourceRoot.Length);
+        if (slash < 0) return file;
+        var name = file.Substring(MappedSourceRoot.Length, slash - MappedSourceRoot.Length);
+        var rel = file.Substring(slash + 1);
+        if (name.Length == 0 || rel.Length == 0 || rel.Contains("..")) return file;
+        string? dir = s_sourceRoots.TryGetValue(name, out var d) ? d : AsdfSourceDirectory(name);
+        if (dir == null) return file;
+        var real = dir.TrimEnd('/', '\\') + "/" + rel;
+        return File.Exists(real) ? real : file;
+    }
+
+    private static string? AsdfSourceDirectory(string name)
+    {
+        try
+        {
+            var asdf = Package.FindPackage("ASDF");
+            var fn = asdf?.FindSymbol("SYSTEM-SOURCE-DIRECTORY").Item1?.Function as LispFunction;
+            if (fn == null) return null;
+            var r = fn.Invoke(new LispString(name));
+            return r is Nil ? null : (r is LispPathname pn ? pn.ToString() : StringValueOrNull(r));
+        }
+        catch (Exception) { return null; }
+    }
+
 #if DOTCL_EMIT
     /// <summary>Write the definitions FORM names into the fasl's definition
     /// table, with the absolute path of the source (or, for a project build that
@@ -533,7 +623,7 @@ public static partial class Runtime
             }
             else
                 file = BuildDebugSourceOverride ?? inputPath;
-            file = Path.GetFullPath(file);
+            file = MapSourcePath(Path.GetFullPath(file));
             fasl.AddDefinitionSource(file, e.Kind == "PACKAGE" ? null : (e.Sym.HomePackage as Package)?.Name, e.Sym.Name,
                 line, DefinitionKindCode(e.Kind), e.Detail);
         }
@@ -748,7 +838,7 @@ public static partial class Runtime
         if (!s_defFunctionSources.TryGetValue(name, out var loc) && !s_defSources.TryGetValue(name, out loc))
             return Nil.Instance;
         return new Cons(Startup.Keyword("FILE"),
-               new Cons(new LispString(loc.File),
+               new Cons(new LispString(UnmapSourcePath(loc.File)),
                new Cons(Startup.Keyword("LINE"),
                new Cons(Fixnum.Make(loc.Line), Nil.Instance))));
     }
@@ -822,7 +912,7 @@ public static partial class Runtime
                 items.Add(Startup.Keyword("SPECIALIZERS")); items.Add(ds.Car);
             }
         }
-        items.Add(Startup.Keyword("FILE")); items.Add(new LispString(file));
+        items.Add(Startup.Keyword("FILE")); items.Add(new LispString(UnmapSourcePath(file)));
         items.Add(Startup.Keyword("LINE")); items.Add(Fixnum.Make(line));
         LispObject r = Nil.Instance;
         for (int i = items.Count - 1; i >= 0; i--) r = new Cons(items[i], r);
@@ -1010,24 +1100,37 @@ public static partial class Runtime
     /// per-expression sequence points. Off (null) -> the Reader does no work.
     /// Thread-static: compile is single-threaded per file and this avoids sharing.
     /// </summary>
-    [ThreadStatic] internal static Dictionary<object, (int sl, int sc, int el, int ec)>? SourceLineTable;
+    // Reference types, not value tuples: a framework generic over a value type is not
+    // precompiled in a ReadyToRun image and is compiled by the JIT at startup.
+    internal sealed class SourceSpan
+    {
+        public readonly int sl, sc, el, ec;
+        public SourceSpan(int sl, int sc, int el, int ec) { this.sl = sl; this.sc = sc; this.el = el; this.ec = ec; }
+    }
+    internal sealed class SourceRange
+    {
+        public readonly int start, end;
+        public SourceRange(int start, int end) { this.start = start; this.end = end; }
+    }
+
+    [ThreadStatic] internal static Dictionary<object, SourceSpan>? SourceLineTable;
 
     /// <summary>Identity-keyed start and end character offsets for the same forms,
     /// recorded by the Reader beside SourceLineTable.</summary>
-    [ThreadStatic] internal static Dictionary<object, (int start, int end)>? SourcePositionTable;
+    [ThreadStatic] internal static Dictionary<object, SourceRange>? SourcePositionTable;
 
     /// <summary>Record FORM's source span (start line/col .. end line/col) if line
     /// tracking is active. Called by the Reader for each list it builds.</summary>
     internal static void StampSourceLine(LispObject form, int sl, int sc, int el, int ec)
     {
         var t = SourceLineTable;
-        if (t != null) t[form] = (sl, sc, el, ec);
+        if (t != null) t[form] = new SourceSpan(sl, sc, el, ec);
     }
 
     internal static void StampSourcePosition(LispObject form, int start, int end)
     {
         var t = SourcePositionTable;
-        if (t != null) t[form] = (start, end);
+        if (t != null) t[form] = new SourceRange(start, end);
     }
 
     /// <summary>The function COMPILE-FILE installs in the compiler's

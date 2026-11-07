@@ -28,7 +28,7 @@ fail=0
 
 start=$(date +%s)
 echo "=== build the package ==="
-sh "$ROOT/scripts/dist-package.sh" ironclad "$WORK/feed" > "$WORK/produce.log" 2>&1 ||
+sh "$ROOT/scripts/dist-package.sh" --allow-unreleased ironclad "$WORK/feed" > "$WORK/produce.log" 2>&1 ||
   { echo "FAIL: scripts/dist-package.sh"; cat "$WORK/produce.log"; exit 1; }
 tail -2 "$WORK/produce.log"
 echo "  built in $(( $(date +%s) - start )) s"

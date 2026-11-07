@@ -82,3 +82,33 @@
           (and (search "AFTER" (second r)) t)
           (and (search "Debugger" err) t)))
   (1 t nil nil))
+
+;;; An undefined function or an unbound variable that nothing handles gets the
+;;; same "file:line: message" report as the other errors the runtime raises,
+;;; not a bare "UNDEFINED-FUNCTION: ..." with no place.
+(deftest script-debugger-hook.undefined-names-report-location
+  (let* ((fpath (%sdh-write "sdh-undef-fn.lisp" "(print 1)
+(no-such-fn-here 1)
+"))
+         (vpath (%sdh-write "sdh-undef-var.lisp" "(print 1)
+(print no-such-var-here)
+"))
+         (fr (dotcl:run-process *sdh-exe* (list "--core" *sdh-core* fpath)))
+         (vr (dotcl:run-process *sdh-exe* (list "--core" *sdh-core* vpath))))
+    (list (first fr)
+          (and (search "sdh-undef-fn.lisp:2: Undefined function: NO-SUCH-FN-HERE" (third fr)) t)
+          (first vr)
+          (and (search "sdh-undef-var.lisp:2: Unbound variable: NO-SUCH-VAR-HERE" (third vr)) t)))
+  (1 t 1 t))
+
+;;; --eval that ends in an exit reports an unhandled error as one line and exits 1,
+;;; as a script does, without the debugger banner and restart list.
+(deftest script-debugger-hook.eval-reports-one-line
+  (let* ((r (dotcl:run-process *sdh-exe*
+                               (list "--core" *sdh-core* "--eval" "(error \"boom-eval\")")))
+         (err (third r)))
+    (list (first r)
+          (and (search "SIMPLE-ERROR: boom-eval" err) t)
+          (and (search "Debugger entered" err) nil)
+          (and (search "Available restarts" err) nil)))
+  (1 t nil nil))

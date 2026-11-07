@@ -1595,13 +1595,17 @@ public partial class CilAssembler
         }
     }
 
-    private static readonly MethodInfo _withMvModeEntry =
+    private static MethodInfo? _lazy__withMvModeEntry;
+    private static MethodInfo _withMvModeEntry => _lazy__withMvModeEntry ??=
         typeof(LispFunction).GetMethod("WithMvModeEntry")!;
-    private static readonly MethodInfo _withClosureEntry =
+    private static MethodInfo? _lazy__withClosureEntry;
+    private static MethodInfo _withClosureEntry => _lazy__withClosureEntry ??=
         typeof(LispFunction).GetMethod("WithClosureEntry")!;
-    private static readonly MethodInfo _closureEntryCheck =
+    private static MethodInfo? _lazy__closureEntryCheck;
+    private static MethodInfo _closureEntryCheck => _lazy__closureEntryCheck ??=
         typeof(LispFunction).GetMethod("ClosureEntryCheck")!;
-    private static readonly MethodInfo _getEnvironment =
+    private static MethodInfo? _lazy__getEnvironment;
+    private static MethodInfo _getEnvironment => _lazy__getEnvironment ??=
         typeof(LispFunction).GetProperty("Environment")!.GetGetMethod()!;
 
     /// <summary>A .fasl closure body's entry for LispFunction.CallN.</summary>
@@ -1623,9 +1627,12 @@ public partial class CilAssembler
     private static readonly bool s_noUnitClosureEntry =
         Environment.GetEnvironmentVariable("DOTCL_NO_UNIT_CLOSURE_ENTRY") == "1";
 
-    private static readonly MethodInfo s_getType = typeof(object).GetMethod("GetType")!;
-    private static readonly MethodInfo s_typeFromHandle = typeof(Type).GetMethod("GetTypeFromHandle")!;
-    private static readonly MethodInfo s_typeEquals = typeof(Type).GetMethod("op_Equality")!;
+    private static MethodInfo? _lazy_s_getType;
+    private static MethodInfo s_getType => _lazy_s_getType ??= typeof(object).GetMethod("GetType")!;
+    private static MethodInfo? _lazy_s_typeFromHandle;
+    private static MethodInfo s_typeFromHandle => _lazy_s_typeFromHandle ??= typeof(Type).GetMethod("GetTypeFromHandle")!;
+    private static MethodInfo? _lazy_s_typeEquals;
+    private static MethodInfo s_typeEquals => _lazy_s_typeEquals ??= typeof(Type).GetMethod("op_Equality")!;
 
     /// <summary>Start of a closure body whose first argument is the function or
     /// its environment: the stack check InvokeN makes, and the environment.
@@ -1707,7 +1714,8 @@ public partial class CilAssembler
     // environment, and which holds that argument until it returns.
     private bool _selfEnvBody;
     private LocalBuilder? _envLocal;
-    private static readonly MethodInfo s_gcKeepAlive = typeof(GC).GetMethod("KeepAlive")!;
+    private static MethodInfo? _lazy_s_gcKeepAlive;
+    private static MethodInfo s_gcKeepAlive => _lazy_s_gcKeepAlive ??= typeof(GC).GetMethod("KeepAlive")!;
 
     private void EmitLoadEnv(int index)
     {

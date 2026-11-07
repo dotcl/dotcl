@@ -1,0 +1,16 @@
+{
+  "benchmarks": {
+    "parity/array-walk-one-fast": {"csharp_ms": 32.023, "dotcl_ms": 40.097, "ratio": 1.25, "processes": 7, "csharp_split": {"fast_n": 1, "fast_ms": 32.023, "slow_n": 6, "slow_ms": 46.229}, "dotcl_split": {"fast_n": 1, "fast_ms": 40.097, "slow_n": 6, "slow_ms": 57.838}},
+    "parity/array-walk-three-fast": {"csharp_ms": 31.402, "dotcl_ms": 39.422, "ratio": 1.26, "processes": 7, "csharp_split": {"fast_n": 3, "fast_ms": 31.494, "slow_n": 4, "slow_ms": 45.982}, "dotcl_split": {"fast_n": 3, "fast_ms": 39.453, "slow_n": 4, "slow_ms": 57.608}},
+    "parity/string-walk-one-fast": {"csharp_ms": 82.492, "dotcl_ms": 103.283, "ratio": 1.25, "processes": 7, "csharp_split": {"fast_n": 1, "fast_ms": 82.492, "slow_n": 6, "slow_ms": 141.310}, "dotcl_split": {"fast_n": 1, "fast_ms": 103.283, "slow_n": 6, "slow_ms": 176.033}},
+    "parity/array-walk-high": {"csharp_ms": 30.299, "dotcl_ms": 38.194, "ratio": 1.26, "processes": 7, "csharp_split": null, "dotcl_split": null},
+    "parity/struct-slots-slow": {"csharp_ms": 89.924, "dotcl_ms": 113.195, "ratio": 1.26, "processes": 7, "csharp_split": null, "dotcl_split": null},
+    "parity/fib-wide": {"csharp_ms": 203.066, "dotcl_ms": 255.327, "ratio": 1.26, "processes": 7, "csharp_split": null, "dotcl_split": null},
+    "parity/identical": {"csharp_ms": 7.947, "dotcl_ms": 10.000, "ratio": 1.26, "processes": 4, "csharp_split": null, "dotcl_split": null},
+    "parity/two-groups": {"csharp_ms": 7.930, "dotcl_ms": 10.000, "ratio": 1.26, "processes": 4, "csharp_split": {"fast_n": 2, "fast_ms": 7.974, "slow_n": 2, "slow_ms": 12.046}, "dotcl_split": {"fast_n": 2, "fast_ms": 10.050, "slow_n": 2, "slow_ms": 15.050}},
+    "parity/one-slow-of-four": {"csharp_ms": 8.009, "dotcl_ms": 10.000, "ratio": 1.25, "processes": 4, "csharp_split": null, "dotcl_split": null},
+    "parity/two-values": {"csharp_ms": 8.024, "dotcl_ms": 10.000, "ratio": 1.25, "processes": 2, "csharp_split": null, "dotcl_split": null},
+    "parity/single": {"csharp_ms": 4.400, "dotcl_ms": 5.500, "ratio": 1.25, "processes": 1, "csharp_split": null, "dotcl_split": null},
+    "parity/even-count": {"csharp_ms": 2.424, "dotcl_ms": 3.000, "ratio": 1.24, "processes": 6, "csharp_split": null, "dotcl_split": null}
+  }
+}

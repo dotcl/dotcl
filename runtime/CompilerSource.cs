@@ -262,10 +262,49 @@ public static partial class Runtime
         PutContext(unit, CtxTopLevelForm, use.TopForm ?? Nil.Instance);
     }
 
+    // Undefined names a file's compilation found while a WITH-COMPILATION-UNIT is open: they
+    // are reported when that unit ends (CLHS 3.2.5), once per name, and only if the name is
+    // still undefined then.
+    [ThreadStatic] private static List<(bool Variable, LispObject Name)>? s_deferredUndefined;
+
+    private static bool CompilationUnitOpen()
+    {
+        var depthSym = Startup.Sym("*COMPILATION-UNIT-DEPTH*");
+        return DynamicBindings.TryGet(depthSym, out var d) && d is Fixnum { Value: > 0 };
+    }
+
+    /// <summary>WITH-COMPILATION-UNIT's end: warn about the names still undefined.</summary>
+    internal static LispObject FlushDeferredUndefined()
+    {
+        var pending = s_deferredUndefined;
+        s_deferredUndefined = null;
+        if (pending == null) return Nil.Instance;
+        var warnSym = CompilerSym("%COMPILER-WARN-UNDEFINED", "DOTCL.CIL-COMPILER");
+        if (warnSym?.Function is not LispFunction warn) return Nil.Instance;
+        var seen = new HashSet<(bool, LispObject)>();
+        foreach (var (isVar, name) in pending)
+        {
+            if (!seen.Add((isVar, name))) continue;
+            if (!isVar && IsTruthy(FboundpImpl(name))) continue;
+            if (isVar && name is Symbol vs && vs.IsBound) continue;
+            warn.Invoke(new LispObject[] { isVar ? Startup.Keyword("VARIABLE") : Startup.Keyword("FUNCTION"), name });
+        }
+        return Nil.Instance;
+    }
+
     internal static void FlushCompilerWarnings()
     {
         var unit = CurrentCompilerUnit;
         if (unit == null || (unit.Variables.Count == 0 && unit.Functions.Count == 0)) return;
+        if (CompilationUnitOpen())
+        {
+            var list = s_deferredUndefined ??= new List<(bool, LispObject)>();
+            foreach (var use in unit.Variables) list.Add((true, use.Name));
+            foreach (var use in unit.Functions) list.Add((false, use.Name));
+            unit.Variables.Clear();
+            unit.Functions.Clear();
+            return;
+        }
         var warnSym = CompilerSym("%COMPILER-WARN-UNDEFINED", "DOTCL.CIL-COMPILER");
         if (warnSym?.Function is not LispFunction warn) return;
         var variable = Startup.Keyword("VARIABLE");

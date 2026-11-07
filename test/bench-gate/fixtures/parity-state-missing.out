@@ -1,0 +1,3 @@
+bench/csharp-parity/make-parity-state.sh: no C# result for kernel 'single'
+bench/csharp-parity/make-parity-state.sh: the two halves did not measure the same set of kernels.
+rc=1

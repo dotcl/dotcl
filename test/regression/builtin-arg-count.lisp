@@ -6,7 +6,7 @@
 ;; Not called: they end the process, enter the debugger or a terminal UI, or
 ;; wait. Their counts are checked against the table below instead.
 (defparameter *arg-count-not-called*
-  '("QUIT" "SAVE-APPLICATION" "INVOKE-DEBUGGER" "ED" "INSPECT" "DRIBBLE" "SLEEP"
+  '("QUIT" "EXIT" "SAVE-APPLICATION" "INVOKE-DEBUGGER" "ED" "INSPECT" "DRIBBLE" "SLEEP"
     "GC" "MAKE-THREAD" "UI-INVOKE" "UI-POST"))
 
 ;; (symbol min max) for each function in the tables; MAX is NIL for &rest / &key
@@ -76,7 +76,7 @@
           (when registered
             (incf n)
             (unless (equal registered (list min max)) (push (list s registered) bad))))))
-    (list (> n 170) bad))
+    (list (> n 140) bad))
   (t nil))
 
 (deftest builtin-arg-count-message

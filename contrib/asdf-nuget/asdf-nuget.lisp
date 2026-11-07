@@ -511,14 +511,18 @@ unless it has a fresh one. Returns how many were written."
             (when (and (probe-file fasl) (null (%fresh-sibling fasl rid)))
               (when (dotcl:write-r2r-sibling fasl) (incf n)))))))))
 
-(defun %build-record (pairs)
+(defun %build-record (pairs &optional host-independent)
   "What a group's fasls were built by and on -- the dotcl, its compiler, and the
-OS and CPU features -- and which source each belongs to."
+OS and CPU features -- and which source each belongs to. With HOST-INDEPENDENT the
+record also says :HOST-INDEPENDENT T: the package declares that nothing in its
+fasls was decided by the machine that built them, so a consumer on another OS or
+CPU may use them."
   (with-standard-io-syntax
-    (prin1-to-string (list :dotcl-version (lisp-implementation-version)
-                           :core (funcall (find-symbol "%CORE-GENERATION" "DOTCL"))
-                           :platform (nuget::%platform-features)
-                           :fasls pairs))))
+    (prin1-to-string (list* :dotcl-version (lisp-implementation-version)
+                            :core (funcall (find-symbol "%CORE-GENERATION" "DOTCL"))
+                            :platform (nuget::%platform-features)
+                            (append (and host-independent (list :host-independent t))
+                                    (list :fasls pairs))))))
 
 (defun %package-dependencies (systems)
   "The (:nuget ...) components of SYSTEMS as nuspec dependencies. A dependency in a
@@ -551,7 +555,7 @@ file decides." (asdf:component-name s) (asdf:component-name c) v))
         (dotnet:invoke to "Dispose")))))
 
 (defun %pack-library (systems output-directory
-                      &key id version authors description (fasl t) (dependencies t) r2r)
+                      &key id version authors description (fasl t) (dependencies t) r2r host-independent)
   "Write SYSTEMS (a system or a list) as one NuGet package into OUTPUT-DIRECTORY
 and return its path.
 
@@ -572,6 +576,10 @@ sources, with dotcl-build.sexp saying which dotcl made them and on which OS and
 CPU. A consumer on the same OS and CPU loads them without compiling, also under
 another dotcl (after a NUGET:FASL-VERSION-MISMATCH warning); on another platform
 it compiles the sources, which are always there.
+
+With HOST-INDEPENDENT the build record also declares the fasls host independent: a
+consumer on another OS or CPU then loads them instead of compiling the sources. Only
+say it for systems CHECK-PORTABILITY-OP finds nothing in.
 
 With R2R, each fasl first gets a ReadyToRun sibling for this platform, compiled
 against the running dotcl -- the same dotcl the consumer has to run to use the
@@ -630,7 +638,7 @@ fasls at all -- and only that sibling goes in. Siblings for other platforms are 
                                   do (%zip-add zip from (concatenate 'string prefix
                                                                      (substitute #\/ #\\ rel))))
                             (let ((record (nuget::%combine temp (format nil "~A.record" gname))))
-                              (nuget::%write-text record (%build-record pairs))
+                              (nuget::%write-text record (%build-record pairs host-independent))
                               (%zip-add zip record
                                         (concatenate 'string prefix "dotcl-build.sexp"))))))))
         (dotnet:invoke zip "Dispose")))

@@ -171,6 +171,11 @@ public static partial class Runtime
     /// from the test built for it (Runtime.TypeTest.cs) when there is one.</summary>
     private static LispObject TypepGeneral(LispObject obj, LispObject typeSpec)
     {
+        if (typeSpec is not (Symbol or Nil or T or Cons or LispClass))
+            CheckTypeSpecifierObject(typeSpec);
+        if (typeSpec is Symbol csym && ReferenceEquals(csym.HomePackage, Startup.CL)
+            && csym.Name is "AND" or "OR" or "MEMBER" or "NOT" or "EQL" or "SATISFIES" or "MOD")
+            throw InvalidCompoundTypeSpecifier(typeSpec);
         if (typeSpec is Symbol || typeSpec is Nil || typeSpec is T)
         {
             // Structure instance against a symbol naming a structure class: the
@@ -395,13 +400,43 @@ public static partial class Runtime
             if (head is Symbol clHead && ReferenceEquals(clHead.HomePackage, Startup.CL))
             {
                 int nargs = 0;
-                for (var a = compound.Cdr; a is Cons ac; a = ac.Cdr) nargs++;
+                var tail = compound.Cdr;
+                for (; tail is Cons tc; tail = tc.Cdr) nargs++;
+                if (tail is not Nil) throw InvalidCompoundTypeSpecifier(typeSpec);
                 if (CompoundTypeArgLimits.TryGetValue(clHead.Name, out var lim))
                 {
                     if (nargs < lim.Min || nargs > lim.Max)
                         throw InvalidCompoundTypeSpecifier(typeSpec);
                     // (KEYWORD), (BOOLEAN) ...: the atomic type itself.
                     if (lim.Max == 0) return Typep(obj, clHead);
+                    if (nargs == 0 && clHead.Name == "FUNCTION") return Typep(obj, clHead);
+                    // The arguments must be what the specifier takes ((VECTOR 5 1.5),
+                    // (INTEGER 1.5) and (CONS INTEGER 0) are not types). A specifier that
+                    // passed is remembered by identity, so a quoted constant is checked once.
+                    // The last specifier that passed is kept in a plain field, so a loop over one
+                    // specifier pays one reference compare, not a table lookup.
+                    if (!ReferenceEquals(s_lastValidatedSpec, compound) && !s_validatedTypeSpecs.TryGetValue(compound, out _))
+                    {
+                        // Only the heads whose arguments are numbers or lengths: a type argument
+                        // naming a class defined later is not checked here, as before.
+                        if (clHead.Name is "INTEGER" or "RATIONAL" or "REAL" or "FLOAT" or "SHORT-FLOAT" or "SINGLE-FLOAT"
+                                or "DOUBLE-FLOAT" or "LONG-FLOAT" or "MOD" or "SIGNED-BYTE" or "UNSIGNED-BYTE"
+                                or "STRING" or "SIMPLE-STRING" or "BASE-STRING" or "SIMPLE-BASE-STRING"
+                                or "BIT-VECTOR" or "SIMPLE-BIT-VECTOR" or "SIMPLE-VECTOR"
+                            && !VtsValid(compound, 0, false))
+                            throw InvalidCompoundTypeSpecifier(typeSpec);
+                        if (clHead.Name is "VECTOR" or "ARRAY" or "SIMPLE-ARRAY" && !ArrayTypeArgsValid(clHead.Name, compound))
+                            throw InvalidCompoundTypeSpecifier(typeSpec);
+                        // A type argument that is a number, string or character is no type.
+                        if (clHead.Name is "AND" or "OR" or "NOT" or "CONS")
+                            for (var ta = compound.Cdr; ta is Cons tac; ta = tac.Cdr)
+                                if (tac.Car is Number or LispString or LispChar or LispVector
+                                    || (tac.Car is Cons { Car: var th } && (th is not Symbol || th is Symbol { Name: "*" })))
+                                    throw InvalidCompoundTypeSpecifier(typeSpec);
+                        s_validatedTypeSpecs.Add(compound, s_validatedMarker);
+                        s_lastValidatedSpec = compound;
+                    }
+                    else s_lastValidatedSpec = compound;
                 }
                 else if (!TryGetTypeExpander(clHead, out _))
                     throw InvalidCompoundTypeSpecifier(typeSpec);
@@ -454,6 +489,10 @@ public static partial class Runtime
                         try { return MultipleValues.Alone(IsTruthy(Funcall(predSym, obj)) ? T.Instance : Nil.Instance); }
                         catch (LispErrorException) { }
                     }
+                    else
+                        throw new LispErrorException(new LispTypeError(
+                            "SATISFIES: the predicate must be a symbol: " + FormatObject(pred, true),
+                            pred, Startup.Sym("SYMBOL")));
                     return Nil.Instance;
                 }
                 case "STRING":
@@ -764,6 +803,32 @@ public static partial class Runtime
     /// <summary>The argument counts each COMMON-LISP compound type specifier takes
     /// (CLHS 4.2.3), and the atomic types SBCL also accepts as a one-element list.
     /// A COMMON-LISP head missing here is not a compound type specifier.</summary>
+    /// <summary>The dimension (and, for VECTOR, size) argument of (ARRAY et dims), (SIMPLE-ARRAY et dims),
+    /// (VECTOR et size) is * or a non-negative integer, or for ARRAY / SIMPLE-ARRAY a list of those.
+    /// The element type is left to the type machinery (it may name a type defined later).</summary>
+    private static bool ArrayTypeArgsValid(string head, Cons spec)
+    {
+        if (spec.Cdr is not Cons second) return true;
+        if (second.Car is not (Symbol or Nil or T or Cons or LispClass)) return false;
+        if (second.Cdr is not Cons third) return true;
+        var dims = third.Car;
+        static bool Dim(LispObject d) =>
+            (d is Symbol { Name: "*" }) || (d is Fixnum f && f.Value >= 0);
+        if (Dim(dims)) return true;
+        if (head == "VECTOR") return false;
+        if (dims is Nil) return true;
+        for (var c = dims; c is Cons dc; c = dc.Cdr)
+        {
+            if (!Dim(dc.Car)) return false;
+            if (dc.Cdr is not (Cons or Nil)) return false;
+        }
+        return dims is Cons;
+    }
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Cons, object> s_validatedTypeSpecs = new();
+    private static readonly object s_validatedMarker = new();
+    private static Cons? s_lastValidatedSpec;
+
     private static readonly Dictionary<string, (int Min, int Max)> CompoundTypeArgLimits = new()
     {
         ["AND"] = (0, int.MaxValue), ["OR"] = (0, int.MaxValue), ["MEMBER"] = (0, int.MaxValue),
@@ -1355,11 +1420,22 @@ public static partial class Runtime
         CheckTypexpandArgs(args, "TYPEXPAND");
         var type = args[0];
         bool ever = false;
+        // A DEFTYPE that expands to itself (or grows without end) would loop here for
+        // ever: an expansion seen before, or a very long chain, is an error.
+        var seen = new System.Collections.Generic.List<LispObject>();
         while (true)
         {
             var next = PublicTypeExpandStep(type, out bool expanded);
             if (!expanded) break;
             ever = true;
+            foreach (var prior in seen)
+                if (Equal(prior, next) is not Nil)
+                    throw new LispErrorException(new LispError(
+                        "TYPEXPAND: the type specifier expands to itself: " + FormatObject(args[0], true)));
+            if (seen.Count >= 256)
+                throw new LispErrorException(new LispError(
+                    "TYPEXPAND: too many expansions of " + FormatObject(args[0], true)));
+            seen.Add(next);
             type = next;
         }
         return MultipleValues.Values2(type, ever ? T.Instance : Nil.Instance);
@@ -1791,8 +1867,42 @@ public static partial class Runtime
     public static LispObject SubtypepPair(LispObject type1, LispObject type2)
         => MultipleValues.Paired(Subtypep(type1, type2));
 
+    /// <summary>An object that can never be a type specifier (a number, character,
+    /// string, vector, hash table, package or function) given to TYPEP or SUBTYPEP.</summary>
+    /// <summary>A COMMON-LISP compound type specifier given to SUBTYPEP with the wrong
+    /// shape (a dotted argument list, the wrong number of arguments, a bare AND / OR /
+    /// MEMBER / NOT / EQL / SATISFIES, or VALUES) signals, as TYPEP does.</summary>
+    private static void CheckCompoundShape(LispObject spec, int depth)
+    {
+        if (depth > 20) return;
+        if (spec is Symbol bare && ReferenceEquals(bare.HomePackage, Startup.CL)
+            && bare.Name is "AND" or "OR" or "MEMBER" or "NOT" or "EQL" or "SATISFIES" or "MOD" or "VALUES")
+            throw InvalidCompoundTypeSpecifier(spec);
+        if (spec is not Cons c || c.Car is not Symbol head || !ReferenceEquals(head.HomePackage, Startup.CL))
+            return;
+        int n = 0;
+        var tail = c.Cdr;
+        for (; tail is Cons tc; tail = tc.Cdr) n++;
+        if (tail is not Nil) throw InvalidCompoundTypeSpecifier(spec);
+        if (CompoundTypeArgLimits.TryGetValue(head.Name, out var lim) && (n < lim.Min || n > lim.Max))
+            throw InvalidCompoundTypeSpecifier(spec);
+        if (head.Name is "AND" or "OR" or "NOT")
+            for (var a = c.Cdr; a is Cons ac; a = ac.Cdr) CheckCompoundShape(ac.Car, depth + 1);
+    }
+
+    private static void CheckTypeSpecifierObject(LispObject spec)
+    {
+        if (spec is Number or LispChar or LispString or LispVector or LispHashTable or Package or LispFunction
+            or LispPathname or LispReadtable or LispRandomState or LispStream or LispInstance or LispCondition || (LispStruct.TryAs(spec, out _) && spec is not LispClass))
+            throw new LispErrorException(new LispTypeError("invalid type specifier: " + FormatObject(spec, true), spec));
+    }
+
     private static LispObject SubtypepImpl(LispObject type1, LispObject type2)
     {
+        if (type1 is not (Symbol or Nil or T or Cons or LispClass)) CheckTypeSpecifierObject(type1);
+        if (type2 is not (Symbol or Nil or T or Cons or LispClass)) CheckTypeSpecifierObject(type2);
+        CheckCompoundShape(type1, 0);
+        CheckCompoundShape(type2, 0);
         // If both arguments are the same symbol, it's trivially a subtype of itself
         if (type1 is Symbol && ReferenceEquals(type1, type2))
         {
@@ -2280,7 +2390,17 @@ public static partial class Runtime
             var subOfInner = Subtypep(type1, inner);
             if (subOfInner != Nil.Instance)
             {
-                MultipleValues.SetPair(Nil.Instance, T.Instance);
+                // Only so if type1 holds something: an empty type is below (NOT inner) too.
+                bool known = false, empty = false;
+                try
+                {
+                    var ct1e = TypeParser.Parse(type1);
+                    empty = CTypeOps.ProvablyEmpty(ct1e);
+                    known = empty || CTypeOps.ProvablyNonEmpty(ct1e);
+                }
+                catch { }
+                if (empty) { MultipleValues.SetPair(T.Instance, T.Instance); return T.Instance; }
+                MultipleValues.SetPair(Nil.Instance, known ? T.Instance : Nil.Instance);
                 return Nil.Instance;
             }
             // Use CType disjoint check (no recursive Subtypep: pure CType algebra)
@@ -2501,6 +2621,8 @@ public static partial class Runtime
     /// <summary>A symbol outside CL (and outside DOTCL-INTERNAL, where bare-name
     /// placeholders live) that names no built-in type, class (including one a
     /// DEFCLASS earlier in the file being compiled names), or deftype.</summary>
+    internal static bool IsUnknownTypeSymbolPublic(LispObject spec) => IsUnknownTypeSymbol(spec);
+
     private static bool IsUnknownTypeSymbol(LispObject spec) =>
         spec is Symbol s
         && s.HomePackage != Startup.CL
@@ -2632,6 +2754,7 @@ public static partial class Runtime
             ["PACKAGE-ERROR"] = new[] { "ERROR", "SERIOUS-CONDITION", "CONDITION", "STANDARD-OBJECT", "T" },
             ["PARSE-ERROR"] = new[] { "ERROR", "SERIOUS-CONDITION", "CONDITION", "STANDARD-OBJECT", "T" },
             ["READER-ERROR"] = new[] { "PARSE-ERROR", "STREAM-ERROR", "ERROR", "SERIOUS-CONDITION", "CONDITION", "STANDARD-OBJECT", "T" },
+            ["READER-PACKAGE-ERROR"] = new[] { "READER-ERROR", "PARSE-ERROR", "STREAM-ERROR", "PACKAGE-ERROR", "ERROR", "SERIOUS-CONDITION", "CONDITION", "STANDARD-OBJECT", "T" },
             ["PRINT-NOT-READABLE"] = new[] { "ERROR", "SERIOUS-CONDITION", "CONDITION", "STANDARD-OBJECT", "T" },
             ["FILE-ERROR"] = new[] { "ERROR", "SERIOUS-CONDITION", "CONDITION", "STANDARD-OBJECT", "T" },
             ["STREAM-ERROR"] = new[] { "ERROR", "SERIOUS-CONDITION", "CONDITION", "STANDARD-OBJECT", "T" },

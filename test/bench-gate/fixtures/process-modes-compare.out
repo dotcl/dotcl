@@ -1,0 +1,71 @@
+array-walk-one-fast
+  dotcl        n=7   min    40.097  median    57.837  SPLIT: 1 fast at 40.097, 6 slow at 57.838 (slow/fast 1.44)
+  csharp       n=7   min    32.023  median    46.099  SPLIT: 1 fast at 32.023, 6 slow at 46.229 (slow/fast 1.44)
+  dotcl2       n=7   min    44.169  median    62.855  SPLIT: 1 fast at 44.169, 6 slow at 62.941 (slow/fast 1.43)
+  dotcl -> csharp: split (both); compare shares and groups, not medians: fast 1/7 -> 1/7, fast group 40.097 -> 32.023 (-20.1%)
+  dotcl -> dotcl2: split (both); compare shares and groups, not medians: fast 1/7 -> 1/7, fast group 40.097 -> 44.169 (+10.2%)
+array-walk-three-fast
+  dotcl        n=7   min    39.422  median    57.473  SPLIT: 3 fast at 39.453, 4 slow at 57.608 (slow/fast 1.46)
+  csharp       n=7   min    31.402  median    45.817  SPLIT: 3 fast at 31.494, 4 slow at 45.982 (slow/fast 1.46)
+  dotcl2       n=7   min    42.827  median    62.346  SPLIT: 3 fast at 43.816, 4 slow at 62.540 (slow/fast 1.43)
+  dotcl -> csharp: split (both); compare shares and groups, not medians: fast 3/7 -> 3/7, fast group 39.453 -> 31.494 (-20.2%)
+  dotcl -> dotcl2: split (both); compare shares and groups, not medians: fast 3/7 -> 3/7, fast group 39.453 -> 43.816 (+11.1%)
+string-walk-one-fast
+  dotcl        n=7   min   103.283  median   175.988  SPLIT: 1 fast at 103.283, 6 slow at 176.033 (slow/fast 1.70)
+  csharp       n=7   min    82.492  median   141.222  SPLIT: 1 fast at 82.492, 6 slow at 141.310 (slow/fast 1.71)
+  dotcl2       n=7   min   115.381  median   193.669  SPLIT: 1 fast at 115.381, 6 slow at 195.293 (slow/fast 1.69)
+  dotcl -> csharp: split (both); compare shares and groups, not medians: fast 1/7 -> 1/7, fast group 103.283 -> 82.492 (-20.1%)
+  dotcl -> dotcl2: split (both); compare shares and groups, not medians: fast 1/7 -> 1/7, fast group 103.283 -> 115.381 (+11.7%)
+array-walk-high
+  dotcl        n=7   min    38.194  median    38.667  one group
+  csharp       n=7   min    30.299  median    31.038  one group
+  dotcl2       n=7   min    41.302  median    42.322  one group
+  dotcl -> csharp: median 38.667 -> 31.038 (-19.7%), min 38.194 -> 30.299 (-20.7%)
+  dotcl -> dotcl2: median 38.667 -> 42.322 (+9.5%), min 38.194 -> 41.302 (+8.1%)
+struct-slots-slow
+  dotcl        n=7   min   113.195  median   113.612  one group
+  csharp       n=7   min    89.924  median    91.429  one group
+  dotcl2       n=7   min   121.880  median   123.027  one group
+  dotcl -> csharp: median 113.612 -> 91.429 (-19.5%), min 113.195 -> 89.924 (-20.6%)
+  dotcl -> dotcl2: median 113.612 -> 123.027 (+8.3%), min 113.195 -> 121.880 (+7.7%)
+fib-wide
+  dotcl        n=7   min   255.327  median   256.695  one group
+  csharp       n=7   min   203.066  median   206.506  one group
+  dotcl2       n=7   min   273.841  median   288.555  one group
+  dotcl -> csharp: median 256.695 -> 206.506 (-19.6%), min 255.327 -> 203.066 (-20.5%)
+  dotcl -> dotcl2: median 256.695 -> 288.555 (+12.4%), min 255.327 -> 273.841 (+7.3%)
+identical
+  dotcl        n=4   min    10.000  median    10.000  one group
+  csharp       n=4   min     7.947  median     7.992  one group
+  dotcl2       n=4   min    10.808  median    10.916  one group
+  dotcl -> csharp: median 10.000 -> 7.992 (-20.1%), min 10.000 -> 7.947 (-20.5%)
+  dotcl -> dotcl2: median 10.000 -> 10.916 (+9.2%), min 10.000 -> 10.808 (+8.1%)
+two-groups
+  dotcl        n=4   min    10.000  median    12.550  SPLIT: 2 fast at 10.050, 2 slow at 15.050 (slow/fast 1.50)
+  csharp       n=4   min     7.930  median    10.017  SPLIT: 2 fast at 7.974, 2 slow at 12.046 (slow/fast 1.51)
+  dotcl2       n=4   min    10.781  median    13.649  SPLIT: 2 fast at 10.936, 2 slow at 16.522 (slow/fast 1.51)
+  dotcl -> csharp: split (both); compare shares and groups, not medians: fast 2/4 -> 2/4, fast group 10.050 -> 7.974 (-20.7%)
+  dotcl -> dotcl2: split (both); compare shares and groups, not medians: fast 2/4 -> 2/4, fast group 10.050 -> 10.936 (+8.8%)
+one-slow-of-four
+  dotcl        n=4   min    10.000  median    10.150  one group
+  csharp       n=4   min     8.009  median     8.125  one group
+  dotcl2       n=4   min    10.925  median    11.172  one group
+  dotcl -> csharp: median 10.150 -> 8.125 (-19.9%), min 10.000 -> 8.009 (-19.9%)
+  dotcl -> dotcl2: median 10.150 -> 11.172 (+10.1%), min 10.000 -> 10.925 (+9.3%)
+two-values
+  dotcl        n=2   min    10.000  median    15.000  not checked (fewer than 3 processes)
+  csharp       n=2   min     8.024  median    12.055  not checked (fewer than 3 processes)
+  dotcl2       n=2   min    10.739  median    16.142  not checked (fewer than 3 processes)
+  dotcl -> csharp: median 15.000 -> 12.055 (-19.6%), min 10.000 -> 8.024 (-19.8%)
+  dotcl -> dotcl2: median 15.000 -> 16.142 (+7.6%), min 10.000 -> 10.739 (+7.4%)
+single
+  dotcl        n=1   min     5.500  median     5.500  not checked (fewer than 3 processes)
+  csharp       no result
+  dotcl2       n=1   min     6.163  median     6.163  not checked (fewer than 3 processes)
+  dotcl -> dotcl2: median 5.500 -> 6.163 (+12.1%), min 5.500 -> 6.163 (+12.1%)
+even-count
+  dotcl        n=6   min     3.000  median     3.250  one group
+  csharp       n=6   min     2.424  median     2.597  one group
+  dotcl2       n=6   min     3.319  median     3.559  one group
+  dotcl -> csharp: median 3.250 -> 2.597 (-20.1%), min 3.000 -> 2.424 (-19.2%)
+  dotcl -> dotcl2: median 3.250 -> 3.559 (+9.5%), min 3.000 -> 3.319 (+10.6%)

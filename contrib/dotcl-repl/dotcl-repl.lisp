@@ -3134,6 +3134,8 @@ handler of the caller's can take an error away from the REPL's debugger."
          (*query-io* io)
          (*debug-io* io)
          (*debugger-hook* nil)
+         ;; a script process's report-and-exit hook lives here, ahead of *debugger-hook*
+         (dotcl:*invoke-debugger-hook* nil)
          (*history* '())
          (*history-loaded* nil)
          (*history-file* history-file)

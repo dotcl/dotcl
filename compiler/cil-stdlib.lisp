@@ -322,7 +322,7 @@
 ;; inline two-argument op, so this is not self-recursive.
 (defun - (&rest args)
   (if (null args)
-      (error 'program-error)
+      (error 'program-error :format-control "-: wrong number of arguments: 0 (expected at least 1)")
       (if (null (cdr args))
           (- (car args))
           (let ((result (car args)))
@@ -335,17 +335,23 @@
 ;; so #'= etc. accept any arity and match (= 1 2 3) direct-call semantics. Direct
 ;; multi-arg calls are still inlined by the compiler; these defuns back funcall/apply.
 (defun = (number &rest more)
+  ;; (= x) checks that X is a number; the one-argument call is lowered inline, not a self-call.
+  (when (null more) (= number))
   (dolist (x more t) (unless (= number x) (return nil))))
 (defun < (number &rest more)
+  (when (null more) (< number))
   (let ((prev number))
     (dolist (x more t) (if (< prev x) (setq prev x) (return nil)))))
 (defun > (number &rest more)
+  (when (null more) (> number))
   (let ((prev number))
     (dolist (x more t) (if (> prev x) (setq prev x) (return nil)))))
 (defun <= (number &rest more)
+  (when (null more) (<= number))
   (let ((prev number))
     (dolist (x more t) (if (<= prev x) (setq prev x) (return nil)))))
 (defun >= (number &rest more)
+  (when (null more) (>= number))
   (let ((prev number))
     (dolist (x more t) (if (>= prev x) (setq prev x) (return nil)))))
 
@@ -426,8 +432,12 @@
                   ((null tail)
                    (error 'type-error :datum head :expected-type 'list))
                   (t
-                   (setf (cdr tail) piece)
-                   (setq tail (and (consp piece) (last piece))))))))
+                   ;; The new tail is found before PIECE is linked in: a piece
+                   ;; that is the list already collected would otherwise make
+                   ;; the result circular under LAST.
+                   (let ((new-tail (and (consp piece) (last piece))))
+                     (setf (cdr tail) piece)
+                     (setq tail new-tail)))))))
       (let ((tails (cons list more-lists))
             (result nil))
         (do ((args (%map-multi tails) (%map-multi tails)))
@@ -603,16 +613,40 @@
 ;;; passing :TEST #'EQL explicitly still takes the general path rather than
 ;;; being second-guessed.
 
+;;; A long LIST2 is indexed in a hash table when the test is EQL, EQUAL or EQUALP (the
+;;; default, or given as #'eql / 'eql and so on) and there is no :TEST-NOT: membership
+;;; is then a lookup instead of a walk of LIST2 per element of LIST1 (quadratic). The
+;;; answers are the same, and so is the order of the results, which comes from LIST1.
+(defun %set-index (list2 test test-not key)
+  ;; A dotted or circular LIST2 is left to the walk, which only errors when it gets that far.
+  (when (and (null test-not) (consp list2)
+             (let ((n (ignore-errors (list-length list2)))) (and n (> n 16))))
+    (let ((kind (cond ((or (eq test #'eql) (eq test 'eql)) 'eql)
+                      ((or (eq test #'equal) (eq test 'equal)) 'equal)
+                      ((or (eq test #'equalp) (eq test 'equalp)) 'equalp))))
+      (when kind
+        (let ((table (make-hash-table :test kind)))
+          (dolist (y list2 table)
+            (setf (gethash (funcall key y) table) t)))))))
+
+(defun %set-has (index item)
+  (values (gethash item index)))
+
 (defun union (list1 list2 &key (test nil test-p) test-not (key nil key-p))
   (let ((result (copy-list list2)))
     (if (or test-p test-not key-p)
-        (let ((test (if test-p test #'eql))
-              (key (or key #'identity)))
+        (let* ((test (if test-p test #'eql))
+               (key (or key #'identity))
+               (index (%set-index list2 test test-not key)))
           (dolist (x list1 result)
-            (unless (%set-member (funcall key x) list2 test test-not key)
+            (unless (if index
+                        (%set-has index (funcall key x))
+                        (%set-member (funcall key x) list2 test test-not key))
               (push x result))))
-        (dolist (x list1 result)
-          (unless (member x list2) (push x result))))))
+        (let ((index (%set-index list2 #'eql nil #'identity)))
+          (dolist (x list1 result)
+            (unless (if index (%set-has index x) (member x list2))
+              (push x result)))))))
 
 (defun nunion (list1 list2 &key (test nil test-p) test-not (key nil key-p))
   (if (or test-p test-not key-p)
@@ -622,13 +656,18 @@
 (defun intersection (list1 list2 &key (test nil test-p) test-not (key nil key-p))
   (let ((result nil))
     (if (or test-p test-not key-p)
-        (let ((test (if test-p test #'eql))
-              (key (or key #'identity)))
+        (let* ((test (if test-p test #'eql))
+               (key (or key #'identity))
+               (index (%set-index list2 test test-not key)))
           (dolist (x list1 (nreverse result))
-            (when (%set-member (funcall key x) list2 test test-not key)
+            (when (if index
+                      (%set-has index (funcall key x))
+                      (%set-member (funcall key x) list2 test test-not key))
               (push x result))))
-        (dolist (x list1 (nreverse result))
-          (when (member x list2) (push x result))))))
+        (let ((index (%set-index list2 #'eql nil #'identity)))
+          (dolist (x list1 (nreverse result))
+            (when (if index (%set-has index x) (member x list2))
+              (push x result)))))))
 
 (defun nintersection (list1 list2 &key (test nil test-p) test-not (key nil key-p))
   (if (or test-p test-not key-p)
@@ -638,13 +677,18 @@
 (defun set-difference (list1 list2 &key (test nil test-p) test-not (key nil key-p))
   (let ((result nil))
     (if (or test-p test-not key-p)
-        (let ((test (if test-p test #'eql))
-              (key (or key #'identity)))
+        (let* ((test (if test-p test #'eql))
+               (key (or key #'identity))
+               (index (%set-index list2 test test-not key)))
           (dolist (x list1 (nreverse result))
-            (unless (%set-member (funcall key x) list2 test test-not key)
+            (unless (if index
+                        (%set-has index (funcall key x))
+                        (%set-member (funcall key x) list2 test test-not key))
               (push x result))))
-        (dolist (x list1 (nreverse result))
-          (unless (member x list2) (push x result))))))
+        (let ((index (%set-index list2 #'eql nil #'identity)))
+          (dolist (x list1 (nreverse result))
+            (unless (if index (%set-has index x) (member x list2))
+              (push x result)))))))
 
 (defun nset-difference (list1 list2 &key (test nil test-p) test-not (key nil key-p))
   (if (or test-p test-not key-p)
@@ -657,19 +701,26 @@
   ;; so for second pass we use %set-member-rev to keep list1-key as first arg
   (let ((result nil))
     (if (or test-p test-not key-p)
-        (let ((test (if test-p test #'eql))
-              (key (or key #'identity)))
+        (let* ((test (if test-p test #'eql))
+               (key (or key #'identity))
+               (index2 (%set-index list2 test test-not key))
+               (index1 (%set-index list1 test test-not key)))
           (dolist (x list1)
-            (unless (%set-member (funcall key x) list2 test test-not key)
+            (unless (if index2
+                        (%set-has index2 (funcall key x))
+                        (%set-member (funcall key x) list2 test test-not key))
               (push x result)))
           (dolist (x list2)
-            (unless (%set-member-rev (funcall key x) list1 test test-not key)
+            (unless (if index1
+                        (%set-has index1 (funcall key x))
+                        (%set-member-rev (funcall key x) list1 test test-not key))
               (push x result))))
-        (progn
+        (let ((index2 (%set-index list2 #'eql nil #'identity))
+              (index1 (%set-index list1 #'eql nil #'identity)))
           (dolist (x list1)
-            (unless (member x list2) (push x result)))
+            (unless (if index2 (%set-has index2 x) (member x list2)) (push x result)))
           (dolist (x list2)
-            (unless (member x list1) (push x result)))))
+            (unless (if index1 (%set-has index1 x) (member x list1)) (push x result)))))
     result))
 
 (defun nset-exclusive-or (list1 list2 &key (test nil test-p) test-not (key nil key-p))
@@ -679,13 +730,18 @@
 
 (defun subsetp (list1 list2 &key (test nil test-p) test-not (key nil key-p))
   (if (or test-p test-not key-p)
-      (let ((test (if test-p test #'eql))
-            (key (or key #'identity)))
+      (let* ((test (if test-p test #'eql))
+             (key (or key #'identity))
+             (index (%set-index list2 test test-not key)))
         (dolist (x list1 t)
-          (unless (%set-member (funcall key x) list2 test test-not key)
+          (unless (if index
+                      (%set-has index (funcall key x))
+                      (%set-member (funcall key x) list2 test test-not key))
             (return nil))))
-      (dolist (x list1 t)
-        (unless (member x list2) (return nil)))))
+      (let ((index (%set-index list2 #'eql nil #'identity)))
+        (dolist (x list1 t)
+          (unless (if index (%set-has index x) (member x list2))
+            (return nil))))))
 
 ;;; ============================================================
 ;;; Tree operations
@@ -709,7 +765,7 @@
                (if (funcall test a b) t nil)))))
 
 (defun tree-equal (tree1 tree2 &key (test #'eql) test-not)
-  (%tree-equal-1 tree1 tree2 test test-not))
+  (%tree-equal-1 tree1 tree2 (or test #'eql) test-not))
 
 (defun subst (new old tree &key (test #'eql) test-not (key #'identity))
   (let ((key (or key #'identity)))
@@ -927,7 +983,12 @@
         (error 'type-error :datum result :expected-type result-type)))))
 
 (defun map (result-type function &rest sequences)
-  (when (null sequences) (error 'program-error))
+  (when (null sequences)
+    (error 'program-error :format-control "MAP: wrong number of arguments: 2 (expected at least 3)"))
+  ;; One list, vector or string, a function object, and a NIL / LIST / VECTOR result: built in the runtime.
+  (when (null (cdr sequences))
+    (let ((fast (%map1-fast result-type function (car sequences))))
+      (unless (eq fast :%no) (return-from map fast))))
   (let* ((result-type (if result-type (%typexpand-full result-type) result-type))
          (result nil)
          (cat (%map-rt-category result-type)))
@@ -1034,7 +1095,16 @@
                res))))))))
 
 (defun complement (function)
+  (unless (functionp function)
+    (error 'type-error :datum function :expected-type 'function))
   (lambda (&rest args) (not (apply function args))))
+
+(defun %check-declared-type (type value)
+  "VALUE, after checking it against TYPE; the check LET and LET* initial values of declared variables get in (SAFETY 3) code."
+  ;; A type TYPEP cannot decide ((FUNCTION ...), an undefined type) is not a reason to fail.
+  (unless (handler-case (typep value type) (error () t))
+    (error 'type-error :datum value :expected-type type))
+  value)
 
 (defun constantly (value)
   (lambda (&rest args) value))
@@ -1573,8 +1643,8 @@ Also expands element types within compound type specifiers like (VECTOR etype si
                           (coerce (imagpart n) 'single-float))
                  (coerce a 'single-float)))))))
     ((rationalp n) (cond ((plusp n) 1) ((minusp n) -1) (t 0)))
-    ((typep n 'single-float) (cond ((plusp n) 1.0) ((minusp n) -1.0) (t 0.0)))
-    ((typep n 'double-float) (cond ((plusp n) 1.0d0) ((minusp n) -1.0d0) (t 0.0d0)))
+    ((typep n 'single-float) (cond ((plusp n) 1.0) ((minusp n) -1.0) (t n)))
+    ((typep n 'double-float) (cond ((plusp n) 1.0d0) ((minusp n) -1.0d0) (t n)))
     (t (error "SIGNUM: not a number: ~S" n))))
 
 ;; SCALE-FLOAT is registered in the runtime (Runtime.Arithmetic.cs): it needs
@@ -1603,6 +1673,9 @@ Also expands element types within compound type specifiers like (VECTOR etype si
      (if (zerop x)
          0
          (multiple-value-bind (m e s) (integer-decode-float x)
+          (if (>= e 0)
+           ;; An integer-valued float is its own simplest rational.
+           (if (minusp s) (- (ash m e)) (ash m e))
            ;; X's magnitude is M*2^E; the rounding interval is a half-ulp (2^(E-1))
            ;; on each side. Find the simplest rational in it, then re-apply the sign.
            (let* ((ulp (if (minusp e) (/ 1 (ash 1 (- e))) (ash 1 e)))
@@ -1611,13 +1684,29 @@ Also expands element types within compound type specifiers like (VECTOR etype si
                   ;; The float just below X has half the ulp when X sits on a
                   ;; power-of-2 mantissa boundary (M minimal), so the lower rounding
                   ;; boundary is half as far.
-                  (lower (if (= m (ash 1 (1- (float-precision x)))) (/ half 2) half))
-                  (cand (%simplest-rational-between (- val lower) (+ val half)))
+                  ;; Below the smallest normal number the spacing no longer shrinks, so a
+                  ;; subnormal (or the smallest normal) has a neighbour as far below as above.
+                  (min-e (nth-value 1 (integer-decode-float
+                                       (if (typep x 'double-float)
+                                           least-positive-double-float
+                                           least-positive-single-float))))
+                  (lower (if (and (= m (ash 1 (1- (float-digits x)))) (> e min-e))
+                             (/ half 2)
+                             half))
+                  (lo (- val lower))
+                  (hi (+ val half))
+                  (cand (%simplest-rational-between lo hi))
                   (r (if (minusp s) (- cand) cand)))
-             ;; The result must round back to X (CLHS). If a round-to-even boundary
-             ;; case let the interval's simplest rational land on a neighbor, fall
-             ;; back to the exact rational (which always rounds to X).
-             (if (= (float r x) x) r (rational x))))))
+             ;; The result must round back to X (CLHS). The interval is closed here, but
+             ;; a boundary that rounds to even lands on the neighbour instead: look again
+             ;; strictly inside it. If that does not work either, the exact rational (which
+             ;; always rounds to X) is the answer.
+             (if (= (float r x) x)
+                 r
+                 (let* ((d (/ (- hi lo) (ash 1 100)))
+                        (cand2 (%simplest-rational-between (+ lo d) (- hi d)))
+                        (r2 (if (minusp s) (- cand2) cand2)))
+                   (if (= (float r2 x) x) r2 (rational x)))))))))
     (t (rational x))))
 
 (defun conjugate (z)
@@ -1648,6 +1737,31 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 (defun %doc-key (obj doc-type)
   (cons obj doc-type))
 
+;; Documentation of an object that has an identity of its own (a method, a
+;; generic function, a package ...) rather than a name: object -> alist of
+;; (doc-type . docstring). Weak on the object, like the table above for functions,
+;; so that a method a reload replaced is not kept alive (with the code of the old
+;; load) by the docstring it carried. Names (symbols, lists), strings and numbers
+;; keep using the EQUAL table, which has to compare them by value.
+(defvar *object-documentation*
+  (make-hash-table :test 'eq :weakness :key :synchronized t))
+
+(defun %documented-by-identity-p (x)
+  (not (or (symbolp x) (consp x) (stringp x) (numberp x) (characterp x))))
+
+(defun %object-doc (x doc-type)
+  (values (cdr (assoc doc-type (gethash x *object-documentation*) :test #'equal))))
+
+(defun %set-object-doc (x doc-type new-value)
+  (let* ((entries (gethash x *object-documentation*))
+         (rest (remove doc-type entries :key #'car :test #'equal)))
+    (if new-value
+        (setf (gethash x *object-documentation*) (acons doc-type new-value rest))
+        (if rest
+            (setf (gethash x *object-documentation*) rest)
+            (remhash x *object-documentation*))))
+  new-value)
+
 ;; Helper to get documentation (returns single value, not gethash's two values)
 (defun %get-doc (obj doc-type)
   ;; A slot definition carries its own documentation. AMOP passes it to
@@ -1657,7 +1771,9 @@ Also expands element types within compound type specifiers like (VECTOR etype si
   ;; this file free of a reference to the MOP package -- it is read by the host
   ;; Lisp during the cross compile, where that package does not exist.
   (or (%slot-def-documentation-or-nil obj)
-      (values (gethash (%doc-key obj doc-type) *documentation-table*))))
+      (if (%documented-by-identity-p obj)
+          (%object-doc obj doc-type)
+          (values (gethash (%doc-key obj doc-type) *documentation-table*)))))
 
 ;; Docstrings for the external functions, macros, special operators and
 ;; variables of the COMMON-LISP package. The text lives in one data file,
@@ -1895,11 +2011,31 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 
 (defgeneric (setf documentation) (new-value x doc-type))
 
+;; A class object's documentation is the one of the type its name denotes
+;; (DEFCLASS puts it there), so (SETF DOCUMENTATION) on the object and on the name
+;; are the same store, read back by either. An anonymous class keeps its own.
+(defun %set-class-documentation (new-value x)
+  (let ((key (or (class-name x) x)))
+    (if (%documented-by-identity-p key)
+        (%set-object-doc key 'type new-value)
+        (if new-value
+            (setf (gethash (%doc-key key 'type) *documentation-table*) new-value)
+            (remhash (%doc-key key 'type) *documentation-table*))))
+  new-value)
+
+(defmethod (setf documentation) ((new-value t) (x class) (doc-type (eql 'type)))
+  (%set-class-documentation new-value x))
+
+(defmethod (setf documentation) ((new-value t) (x class) (doc-type (eql t)))
+  (%set-class-documentation new-value x))
+
 ;; Default setter
 (defmethod (setf documentation) ((new-value t) (x t) (doc-type t))
-  (if new-value
-      (setf (gethash (%doc-key x doc-type) *documentation-table*) new-value)
-      (remhash (%doc-key x doc-type) *documentation-table*))
+  (if (%documented-by-identity-p x)
+      (%set-object-doc x doc-type new-value)
+      (if new-value
+          (setf (gethash (%doc-key x doc-type) *documentation-table*) new-value)
+          (remhash (%doc-key x doc-type) *documentation-table*)))
   new-value)
 
 ;; (setf (documentation <function> 't) val)
@@ -1983,9 +2119,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 
 ;; (setf (documentation <package> 't) val)
 (defmethod (setf documentation) ((new-value t) (x package) (doc-type (eql t)))
-  (if new-value
-      (setf (gethash (%doc-key x t) *documentation-table*) new-value)
-      (remhash (%doc-key x t) *documentation-table*))
+  (%set-object-doc x t new-value)
   new-value)
 
 ;; (documentation <symbol> 't): check function, then variable
@@ -2323,6 +2457,16 @@ against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
   (funcall (symbol-function (find-symbol "FUNCTION-LAMBDA-LIST" "DOTCL")) gf))
 
 (defun ensure-generic-function (name &rest args)
+  ;; AMOP: through ENSURE-GENERIC-FUNCTION-USING-CLASS once the program has a method
+  ;; on it that applies; until then straight to the work.
+  (let ((existing (and (fboundp name)
+                       (let ((fn (fdefinition name)))
+                         (and (typep fn 'generic-function) fn)))))
+    (if (%egf-overridden-p existing)
+        (%egf-via-protocol name existing args nil)
+        (apply #'%ensure-generic-function-core name args))))
+
+(defun %ensure-generic-function-core (name &rest args)
   ;; Odd number of keyword args -> program-error
   (when (oddp (length args))
     (error 'program-error))
@@ -2332,6 +2476,9 @@ against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
         (apo-params nil)
         (doc-p nil)
         (doc nil)
+        (mc-p nil)
+        (mc nil)
+        (method-class nil)
         (gf-class nil))
     ;; Manual keyword parsing
     (do ((rest args (cddr rest)))
@@ -2343,6 +2490,10 @@ against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
          (setf apo-params (cadr rest) apo-p t))
         ((and (eq (car rest) :documentation) (not doc-p))
          (setf doc (cadr rest) doc-p t))
+        ((and (eq (car rest) :method-combination) (not mc-p))
+         (setf mc (cadr rest) mc-p t))
+        ((and (eq (car rest) :method-class) (null method-class))
+         (setf method-class (cadr rest)))
         ((and (eq (car rest) :generic-function-class) (null gf-class))
          (setf gf-class (let ((c (cadr rest)))
                           (if (symbolp c) (find-class c) c))))))
@@ -2385,9 +2536,26 @@ against existing methods and invalidates the dispatch cache (CLHS 7.6.4)."
                     (when (or lambda-list-p apo-p)
                       (%ensure-gf-apply-lambda-list gf ll apo-params))
                     gf))))
+      ;; :METHOD-COMBINATION is a method combination object (CLHS): the generic
+      ;; function takes its type and options, as DEFGENERIC's option does.
+      (when (and mc-p mc)
+        (%ensure-gf-apply-method-combination gf mc))
+      (when method-class
+        (%set-gf-method-class gf (if (symbolp method-class) (find-class method-class) method-class)))
       (when doc-p
         (setf (documentation name 'function) doc))
       gf)))
+
+(defun %ensure-gf-apply-method-combination (gf mc)
+  (let ((type-name (if (symbolp mc) mc (method-combination-name mc)))
+        (options (if (symbolp mc) nil (method-combination-options mc))))
+    (%set-method-combination gf type-name)
+    (%set-method-combination-order
+     gf (and (consp options) (symbolp (car options))
+             (string= (symbol-name (car options)) "MOST-SPECIFIC-LAST")
+             (car options)))
+    (%set-method-combination-args gf (copy-list options))
+    gf))
 
 ;;; --- CLHS 3.2.4.2: make-load-form protocol ---
 
@@ -2960,6 +3128,13 @@ and symbol-macro scope is used as the starting point."
   "Registrations not yet in the tables, newest first: (CALLER CALLEES USES).
    Loading only queues them; the first query after a load indexes them.")
 
+(defvar *xref-pending-count* 0
+  "Length of *XREF-PENDING*.")
+
+(defconstant +xref-pending-limit+ 8192
+  "Queued registrations beyond this are indexed at once, so a program that
+   compiles in a loop does not grow the queue without bound.")
+
 (defun %xref-note (caller &optional callees uses)
   "Replace CALLER's recorded callee set with CALLEES, and its other uses (a
    plist of :REFERENCES, :SETS, :BINDS and :MACROEXPANDS to lists of names)
@@ -2969,6 +3144,8 @@ and symbol-macro scope is used as the starting point."
   (%acquire-lock *xref-lock* t)
   (unwind-protect
        (progn (push (list caller callees uses) *xref-pending*)
+              (when (> (incf *xref-pending-count*) +xref-pending-limit+)
+                (%xref-flush))
               caller)
     (%release-lock *xref-lock*)))
 
@@ -3014,7 +3191,7 @@ and symbol-macro scope is used as the starting point."
   "Index the queued registrations, oldest first. Call with *XREF-LOCK* held."
   (when *xref-pending*
     (let ((pending (nreverse *xref-pending*)))
-      (setf *xref-pending* '())
+      (setf *xref-pending* '() *xref-pending-count* 0)
       (dolist (p pending)
         (%xref-index-1 (first p) (second p) (third p))))))
 
@@ -3297,7 +3474,7 @@ NAMESTRING itself uses forward slashes on every OS.")
             "Return the pathname for STRING, a namestring in the form the operating
 system uses, as produced by NATIVE-NAMESTRING. On Windows both separators are
 accepted. Elsewhere the string is read as a Unix path with no wildcard syntax:
-empty and \".\" directory components are dropped and \"..\" becomes :BACK.
+empty directory components are dropped, \".\" is kept and \"..\" becomes :UP.
 NIL gives NIL.")
       (export (list ns pns) pkg))))
 
@@ -3353,3 +3530,33 @@ needs a newer DotCL.Runtime than this one, which cannot load it at all.")
 host feature (#+x86-64, #+windows, ...) that is true or false differently on this host.
 The fasl is loaded anyway. Bind DOTCL:*WARN-HOST-DEPENDENT-FASL* to NIL to silence it.")
       (export (list name pathname-reader features-reader) pkg))))
+
+;;; ============================================================
+;;; DRIBBLE
+;;; ============================================================
+
+;;; (dribble pathname) starts a transcript of what *STANDARD-OUTPUT* receives and
+;;; *STANDARD-INPUT* delivers in PATHNAME (appended to); (dribble) ends it. State is the
+;;; list (file saved-output saved-input).
+(defvar *%dribble* nil)
+
+(defun dribble (&optional pathname)
+  (cond (pathname
+         (when *%dribble*
+           (error "Already dribbling to ~A" (ignore-errors (namestring (car *%dribble*)))))
+         (let* ((file (open pathname :direction :output :if-exists :append
+                                     :if-does-not-exist :create))
+                (out *standard-output*)
+                (in *standard-input*))
+           (setq *%dribble* (list file out in))
+           (setq *standard-output* (make-broadcast-stream out file))
+           (setq *standard-input* (make-echo-stream in file))))
+        (t
+         (unless *%dribble*
+           (error "Not currently dribbling"))
+         (destructuring-bind (file out in) *%dribble*
+           (setq *%dribble* nil)
+           (setq *standard-output* out)
+           (setq *standard-input* in)
+           (close file))))
+  nil)

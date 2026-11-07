@@ -14,11 +14,11 @@
   ((s :accessor setf-op-form-s :initform nil)))
 
 (deftest setf-accessor-expansion-calls-through-a-symbol
-  ;; (LET ((tmp val)) (FUNCALL #'(SETF acc) tmp obj) tmp)
+  ;; (LET* ((o obj) (tmp val)) (FUNCALL #'(SETF acc) tmp o) tmp)
   (let* ((form (macroexpand-1 '(setf (setf-op-form-s obj) val)))
          (call (third form)))
     (list (car form) (car call) (symbolp (car call))))
-  (let funcall t))
+  (let* funcall t))
 
 (deftest setf-accessor-still-stores-and-returns-the-value
   (let ((o (make-instance 'setf-op-form-class)))

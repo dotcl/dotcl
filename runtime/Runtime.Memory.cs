@@ -450,11 +450,73 @@ public static partial class Runtime
 #endif
     }
 
-    // (dotcl:make-pinned-vector length element-type) -> vector
+    static long PinnedAddr(Array a) => (long)Marshal.UnsafeAddrOfPinnedArrayElement(a, 0);
+
+    static void ReleasePin(GCHandle h) { if (h.IsAllocated) h.Free(); }
+
+    /// <summary>A pinned array whose element 0 sits at a multiple of ALIGN bytes.
+    /// The runtime picks where a pinned array goes, so this steers it: a throwaway
+    /// array of the right size is allocated first so that the real one lands where
+    /// its first element is aligned (objects are laid out one after another: sync
+    /// block, method table, length, then the elements), and the result is checked,
+    /// never assumed. A misprediction costs one array and another try; if the
+    /// layout stops being predictable the loop falls back to plain retries.</summary>
+    static Array AllocPinnedAligned(Type t, int n, int align, out GCHandle handle)
+    {
+        const long Header = 24;   // sync block + method table + length: element 0 is this far into the object
+        int width = StorageElementWidth(t);
+        const int LargeFiller = 90000;   // above the size at which the heap treats an object as large
+        bool large = Header + (long)n * width >= 80000;
+        if (n == 0 || align <= 8)
+        {
+            var one = AllocPinned(t, n, out handle);
+            if (n == 0 || PinnedAddr(one) % align == 0) return one;
+            ReleasePin(handle);
+        }
+        // Every try measures where the heap is now (a throwaway empty array: the next object starts
+        // right after it), pads up to the wanted address with a second throwaway, and allocates the
+        // real array. Another thread allocating in between, or a layout that is not what is assumed
+        // here, makes a try miss; the next try measures again. After the first 64 tries the padding
+        // is chosen at random, which does not depend on the measurement being right.
+        var rng = new Random(unchecked(Environment.TickCount * 31 + n));
+        for (int attempt = 0; attempt < 4096; attempt++)
+        {
+            int probeLen = large ? LargeFiller : 0;
+            var probe = AllocPinned(typeof(byte[]), probeLen, out var ph);
+            long end = PinnedAddr(probe) - Header + ((Header + probeLen + 7) & ~7L);
+            ReleasePin(ph);
+            long z = (((-(end + Header)) % align) + align) % align;
+            if (attempt >= 64) z = rng.Next(0, align / 8 + 1) * 8L;
+            while (z < (large ? LargeFiller + Header : Header)) z += align;
+            AllocPinned(typeof(byte[]), (int)(z - Header), out var sh);   // spacer
+            ReleasePin(sh);
+            var a = AllocPinned(t, n, out handle);
+            if (PinnedAddr(a) % align == 0) return a;
+            ReleasePin(handle);
+        }
+        throw new LispErrorException(new LispError(
+            $"DOTCL:MAKE-PINNED-VECTOR: could not place a vector of {n} elements at an alignment of {align} bytes"));
+    }
+
+    // (dotcl:make-pinned-vector length element-type &key alignment) -> vector
     public static LispObject MakePinnedVector(LispObject[] args)
     {
         const string fn = "DOTCL:MAKE-PINNED-VECTOR";
-        if (args.Length != 2) throw ArgError(fn, 2, args.Length);
+        int alignment = 1;
+        if (args.Length > 2)
+        {
+            // The argument-count guard has already checked the keyword part (even length, only
+            // :ALIGNMENT unless :ALLOW-OTHER-KEYS is true); the leftmost :ALIGNMENT wins.
+            for (int i = 2; i + 1 < args.Length; i += 2)
+            {
+                if (args[i] is not Symbol { Name: "ALIGNMENT" }) continue;
+                if (args[i + 1] is not Fixnum al || al.Value < 1 || al.Value > 65536 || (al.Value & (al.Value - 1)) != 0)
+                    throw new LispErrorException(new LispTypeError(
+                        $"{fn}: alignment must be a power of two from 1 to 65536, got {args[i + 1]}", args[i + 1], Startup.Sym("FIXNUM")));
+                alignment = (int)al.Value;
+                break;
+            }
+        }
         if (args[0] is not Fixnum lenFx || lenFx.Value < 0 || lenFx.Value > int.MaxValue)
             throw new LispErrorException(new LispTypeError(
                 $"{fn}: length must be a non-negative fixnum, got {args[0]}", args[0], Startup.Sym("FIXNUM")));
@@ -466,7 +528,10 @@ public static partial class Runtime
                 $"{fn}: element type {args[1]} has no fixed-width storage. Supported: "
                 + "(unsigned-byte N) and (signed-byte N) for N up to 64, "
                 + "single-float and double-float."));
-        var storage = AllocPinned(storageType!, (int)lenFx.Value, out var handle);
+        GCHandle handle;
+        var storage = alignment == 1
+            ? AllocPinned(storageType!, (int)lenFx.Value, out handle)
+            : AllocPinnedAligned(storageType!, (int)lenFx.Value, alignment, out handle);
         var v = LispVector.WithNumStorage(et, storage, foreignWidth: true);
         _pinnedVectors.Add(v, new PinnedStorage(storage, handle));
         return v;

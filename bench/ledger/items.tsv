@@ -5,10 +5,10 @@
 # per-process rows), clbench-warm (1 warm-up + 3 runs in the
 # process), coalton (one kernel), parity (all kernels in one process),
 # ironclad-cold / ironclad-warm (the rt suite; arg = categories or "all"),
-# imago (bic2). The id is the metric name shown in the table; group kinds
+# imago (bic2), startup (empty | hello: median wall time of fresh processes, no steady state). The id is the metric name shown in the table; group kinds
 # (parity, ironclad) report one metric per kernel / test under the id.
 # Every row is also measured in steady state (a separate process per side that repeats the work
-# until its time is stable), whatever its kind.
+# until its time is stable), whatever its kind, except startup rows, which have none.
 cl-bench/tak	clbench	tak	600
 cl-bench/takl	clbench	takl	600
 cl-bench/stak	clbench	stak	600
@@ -99,3 +99,5 @@ cl-bench-suite/hash	clbench-suite	hash	1800
 cl-bench-suite/arrays	clbench-suite	arrays	1800
 cl-bench-suite/clos	clbench-suite	clos	1800
 cl-bench-suite/richards	clbench-suite	richards	1800
+startup/empty	startup	empty	300
+startup/hello	startup	hello	300

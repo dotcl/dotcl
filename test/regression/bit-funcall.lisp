@@ -15,7 +15,7 @@
   (let* ((base (make-array 8 :element-type 'bit :initial-contents '(0 1 0 1 1 0 0 1)))
          (d (make-array 4 :element-type 'bit :displaced-to base :displaced-index-offset 3))
          (m (make-array '(2 2) :element-type 'bit :initial-contents '((1 0) (0 1)))))
-    (list (funcall #'sbit d 0) (funcall #'bit d 1)
+    (list (funcall #'bit d 0) (funcall #'bit d 1)
           (funcall #'bit m 1 1) (funcall #'bit m 0 1)))
   (1 1 1 0))
 

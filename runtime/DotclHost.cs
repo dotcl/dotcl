@@ -216,7 +216,7 @@ public static class DotclHost
     }
 
     private static void LoadCoreFasl(string filePath)
-        => RunCoreModuleInit(RuntimeLoadContext.LoadFrom(filePath), $"FASL core {filePath}");
+        => RunCoreModuleInit(RuntimeLoadContext.LoadCoreFrom(filePath), $"FASL core {filePath}");
 
     /// <summary>Call a loaded core assembly's CompiledModule.ModuleInit, restoring
     /// *PACKAGE* afterwards. WHAT names the core in errors.</summary>

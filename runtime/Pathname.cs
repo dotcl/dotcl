@@ -52,10 +52,71 @@ public class LispPathname : LispObject
         return home.Replace('\\', '/') + path[1..].Replace('\\', '/');
     }
 
+    // Quoting in a name, type or directory piece (not on Windows, where \ separates directories):
+    // a backslash before * ? [ makes that character literal. The piece keeps the backslash
+    // (it is the SBCL namestring syntax); the file system sees the character alone.
+    internal static bool IsQuotable(char c) => c == '*' || c == '?' || c == '[';
+
+    /// <summary>True when S holds a * or ? that is not quoted.</summary>
+    internal static bool HasWildChar(string s)
+    {
+        // On Windows a backslash separates directories: "dir\*\f" has a wild piece.
+        bool quoting = !Compat.IsWindows();
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (quoting && s[i] == '\\' && i + 1 < s.Length && IsQuotable(s[i + 1])) { i++; continue; }
+            if (s[i] == '*' || s[i] == '?') return true;
+        }
+        return false;
+    }
+
+    /// <summary>S as a literal string for the pieces of a make-pathname argument: * ? [ are quoted.</summary>
+    internal static string QuoteLiteral(string s, bool wildOnly = false)
+    {
+        if (Compat.IsWindows()) return s;
+        var sb = new System.Text.StringBuilder();
+        foreach (var c in s)
+        {
+            if (wildOnly ? (c == '*' || c == '?') : IsQuotable(c)) sb.Append('\\');
+            sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>The file-system spelling of a namestring: the quoting backslashes removed.</summary>
+    internal static string UnquoteForFileSystem(string s)
+    {
+        if (Compat.IsWindows() || s.IndexOf('\\') < 0) return s;
+        var sb = new System.Text.StringBuilder(s.Length);
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (s[i] == '\\' && i + 1 < s.Length && IsQuotable(s[i + 1])) continue;
+            sb.Append(s[i]);
+        }
+        return sb.ToString();
+    }
+
+    // Each backslash becomes a slash unless it quotes * ? [ . Hand-written because a
+    // Regex here costs construction and generic JIT on every start.
+    private static string BackslashToSlashUnlessQuoting(string path)
+    {
+        if (path.IndexOf('\\') < 0) return path;
+        var chars = path.ToCharArray();
+        for (int i = 0; i < chars.Length; i++)
+        {
+            if (chars[i] != '\\') continue;
+            if (i + 1 < chars.Length && chars[i + 1] is '*' or '?' or '[') continue;
+            chars[i] = '/';
+        }
+        return new string(chars);
+    }
+
     public static LispPathname FromString(string path)
     {
-        // Normalize path separators
-        path = path.Replace('\\', '/');
+        // Normalize path separators. Off Windows a backslash that quotes * ? [ stays.
+        path = Compat.IsWindows()
+            ? path.Replace('\\', '/')
+            : BackslashToSlashUnlessQuoting(path);
 
         // Expand leading ~ to user home directory (shell convention)
         path = ExpandHome(path);
@@ -80,7 +141,10 @@ public class LispPathname : LispObject
         }
 
         // Extract drive letter on Windows (e.g., "C:")
-        if (path.Length >= 2 && path[1] == ':')
+        // A drive is a letter and a colon followed by a separator or nothing ("C:/x", "C:"), and on
+        // Windows also drive-relative "C:foo"; elsewhere "a:b" is a name that holds a colon.
+        if (path.Length >= 2 && path[1] == ':' && char.IsLetter(path[0])
+            && (path.Length == 2 || path[2] == '/' || Compat.IsWindows()))
         {
             device = new LispString(path[0].ToString().ToUpperInvariant());
             path = path[2..];
@@ -414,7 +478,7 @@ public class LispLogicalPathname : LispPathname
         if (Version != null && Version is not Nil && TypeComponent != null && TypeComponent is not Nil)
         {
             sb.Append('.');
-            if (Version is Symbol vs) sb.Append(vs.Name);
+            if (Version is Symbol vs) sb.Append(vs.Name == "WILD" ? "*" : vs.Name);
             else sb.Append(Version);
         }
         return sb.ToString();

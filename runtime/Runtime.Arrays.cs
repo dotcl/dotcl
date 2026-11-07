@@ -29,12 +29,24 @@ public static partial class Runtime
             $"{what}: {role} must be an integer", o, Startup.Sym("INTEGER")));
     }
 
+    /// <summary>True for a non-negative integer that does not fit a .NET array length.</summary>
+    internal static bool IsTooLargeSize(LispObject o) =>
+        (o is Fixnum f && f.Value > int.MaxValue) || (o is Bignum b && b.Value.Sign > 0);
+
+    /// <summary>The TYPE-ERROR for a size that is a valid integer but larger than the
+    /// largest sequence or array this implementation can hold.</summary>
+    internal static LispErrorException SizeTooLarge(string what, LispObject o) =>
+        new LispErrorException(new LispTypeError($"{what} {o} is too large (the limit is {int.MaxValue})", o,
+            new Cons(Startup.Sym("INTEGER"), new Cons(Fixnum.Make(0),
+                new Cons(Fixnum.Make(int.MaxValue), Nil.Instance)))));
+
     /// <summary>An array dimension: a non-negative integer. A negative or bignum
     /// dimension used to reach the allocation and fail there as a raw .NET
     /// exception.</summary>
     private static int DimArg(string what, LispObject o)
     {
         if (o is Fixnum f && f.Value >= 0 && f.Value <= int.MaxValue) return (int)f.Value;
+        if (IsTooLargeSize(o)) throw SizeTooLarge($"{what}: dimension", o);
         var expected = new Cons(Startup.Sym("INTEGER"),
             new Cons(Fixnum.Make(0), new Cons(Startup.Sym("*"), Nil.Instance)));
         throw new LispErrorException(new LispTypeError(
@@ -216,7 +228,15 @@ public static partial class Runtime
                         break;
                     case "DISPLACED-TO": if (!dtSet) { displacedTo = args[i + 1]; dtSet = true; } break;
                     case "DISPLACED-INDEX-OFFSET":
-                        if (!dioSet && args[i + 1] is Fixnum dio) { displacedOffset = (int)dio.Value; dioSet = true; } break;
+                        if (!dioSet)
+                        {
+                            if (args[i + 1] is not Fixnum { Value: >= 0 } dio)
+                                throw new LispErrorException(new LispTypeError(
+                                    "MAKE-ARRAY: :DISPLACED-INDEX-OFFSET is not a non-negative integer", args[i + 1],
+                                    Startup.Sym("UNSIGNED-BYTE")));
+                            displacedOffset = (int)dio.Value; dioSet = true;
+                        }
+                        break;
                     case "ADJUSTABLE":
                         if (!adjSet) { isAdjustable = args[i + 1] is not Nil; adjSet = true; } break;
                     case "ALLOW-OTHER-KEYS": break;
@@ -532,8 +552,14 @@ public static partial class Runtime
                         if (!adjDtSet) { displacedTo = args[i + 1]; adjDtSet = true; }
                         break;
                     case "DISPLACED-INDEX-OFFSET":
-                        if (!adjDioSet && args[i + 1] is Fixnum dio)
-                        { displacedOffset = (int)dio.Value; adjDioSet = true; }
+                        if (!adjDioSet)
+                        {
+                            if (args[i + 1] is not Fixnum { Value: >= 0 } dio)
+                                throw new LispErrorException(new LispTypeError(
+                                    "ADJUST-ARRAY: :DISPLACED-INDEX-OFFSET is not a non-negative integer", args[i + 1],
+                                    Startup.Sym("UNSIGNED-BYTE")));
+                            displacedOffset = (int)dio.Value; adjDioSet = true;
+                        }
                         break;
                     case "ALLOW-OTHER-KEYS": break;
                     default:
@@ -763,6 +789,8 @@ public static partial class Runtime
                     return v._elements[(int)li] ?? Nil.Instance;
             }
         }
+        else if (array is LispString str && index is Fixnum sf && (ulong)sf.Value < (ulong)str.Length)
+            return LispChar.Make(str[(int)sf.Value]);
         return ArefSlow(array, index);
     }
 
@@ -802,7 +830,29 @@ public static partial class Runtime
             && v._displacedTo == null && v._dimensions == null
             && (ulong)f.Value < (ulong)v.Capacity)
             return Fixnum.Make((long)((bits[(int)(f.Value >> 6)] >> (int)(f.Value & 63)) & 1));
+        CheckBitArray("BIT", array, false);
         return ArefMulti(new[] { array, index });
+    }
+
+    /// <summary>SBIT with one subscript: as Bit1, but the array has to be a simple bit array.</summary>
+    public static LispObject Sbit1(LispObject array, LispObject index)
+    {
+        if (array is LispVector v && index is Fixnum f && v._bitData is { } bits
+            && v._displacedTo == null && v._dimensions == null && v.IsSimple
+            && (ulong)f.Value < (ulong)v.Capacity)
+            return Fixnum.Make((long)((bits[(int)(f.Value >> 6)] >> (int)(f.Value & 63)) & 1));
+        CheckBitArray("SBIT", array, true);
+        return ArefMulti(new[] { array, index });
+    }
+
+    /// <summary>BIT takes a bit array, SBIT a simple one (CLHS): anything else is a TYPE-ERROR.</summary>
+    internal static void CheckBitArray(string who, LispObject array, bool simple)
+    {
+        if (array is LispVector v && v.IsBitVector && (!simple || v.IsSimple)) return;
+        throw new LispErrorException(new LispTypeError(
+            simple ? $"{who}: not a simple bit array" : $"{who}: not a bit array", array,
+            simple ? List(Startup.Sym("SIMPLE-ARRAY"), Startup.Sym("BIT"), Startup.Sym("*"))
+                   : List(Startup.Sym("ARRAY"), Startup.Sym("BIT"), Startup.Sym("*"))));
     }
 
     public static LispObject ArefMulti(LispObject[] args)
@@ -1051,6 +1101,10 @@ public static partial class Runtime
     {
         if (array is LispVector v)
             return v.GetElement(FlatIndex("AREF", v, new[] { idx0, idx1, idx2 }, 0, 3));
+        if (TryDotNetArray(array, out var narr))
+            return DotNetToLisp(narr.GetValue(IntArg("AREF", "index", idx0),
+                                              IntArg("AREF", "index", idx1),
+                                              IntArg("AREF", "index", idx2)));
         throw new LispErrorException(new LispTypeError("AREF: not an array", array));
     }
 
@@ -1098,6 +1152,14 @@ public static partial class Runtime
             v.SetElement(idx, value);
             return value;
         }
+        if (TryDotNetArray(array, out var narr))
+        {
+            narr.SetValue(LispToDotNet(value, narr.GetType().GetElementType()!),
+                          IntArg("(SETF AREF)", "index", idx0),
+                          IntArg("(SETF AREF)", "index", idx1),
+                          IntArg("(SETF AREF)", "index", idx2));
+            return value;
+        }
         throw new LispErrorException(new LispTypeError("(SETF AREF): not an array", array));
     }
 
@@ -1122,6 +1184,16 @@ public static partial class Runtime
             if (v._numData != null && (ulong)index < (ulong)v._numLen)
                 return v.NumBox((int)index);
         }
+        return ArefLNotVector(array, index);
+    }
+
+    /// <summary>ArefL for what is not a plain vector: a string within bounds reads
+    /// directly, anything else takes the general path.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LispObject ArefLNotVector(LispObject array, long index)
+    {
+        if (array is LispString str && (ulong)index < (ulong)str.Length)
+            return LispChar.Make(str[(int)index]);
         return ArefSlow(array, Fixnum.Make(index));
     }
 
@@ -2544,7 +2616,22 @@ public static partial class Runtime
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static LispObject StructRefITSlow(LispObject obj, int packed, LispObject type)
-        => StructRefI(StructOf(obj, type), packed);
+    {
+        // An instance of a structure that includes TYPE (the accessor of an included
+        // structure applied to a subtype): the parent chain says so directly.
+        if (LispStruct.TryAs(obj, out var s) && StructIncludesByChain(s.TypeName, type)
+            && s.BoxedSlotOrNull(packed) is LispObject v) return v;
+        return StructRefI(StructOf(obj, type), packed);
+    }
+
+    /// <summary>NAME has TYPE among its included structures, by the StructParent links
+    /// alone (no class lookup).</summary>
+    private static bool StructIncludesByChain(Symbol name, LispObject type)
+    {
+        for (var p = name.StructParent; p != null; p = p.StructParent)
+            if (ReferenceEquals(p, type)) return true;
+        return false;
+    }
 
     /// <summary>StructRefIT for a type whose representations are in MASK.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -2565,7 +2652,11 @@ public static partial class Runtime
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static LispObject StructSetITSlow(LispObject obj, int packed, LispObject value, LispObject type)
-        => StructSetI(StructOf(obj, type), packed, value);
+    {
+        if (LispStruct.TryAs(obj, out var s) && StructIncludesByChain(s.TypeName, type)
+            && s.TrySetBoxedSlot(packed, value)) return value;
+        return StructSetI(StructOf(obj, type), packed, value);
+    }
 
     /// <summary>StructSetIT for a type whose representations are in MASK.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

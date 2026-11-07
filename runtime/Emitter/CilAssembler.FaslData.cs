@@ -336,7 +336,8 @@ public partial class CilAssembler
     }
 
     private LocalBuilder? _icFrame;
-    private static readonly MethodInfo s_gfCallIC1 = typeof(Runtime).GetMethod("GFCallIC1")!;
+    private static MethodInfo? _lazy_s_gfCallIC1;
+    private static MethodInfo s_gfCallIC1 => _lazy_s_gfCallIC1 ??= typeof(Runtime).GetMethod("GFCallIC1")!;
 
     /// <summary>(:GF-IC1 NAME PKG [:MODE]): the function, the argument and, with
     /// :MODE, the value mode are on the stack, as for INVOKE1[M]. Calls through the
@@ -844,6 +845,11 @@ public partial class CilAssembler
         int mark = w.Mark;
         w.Str(key);
         int len = w.ReserveLength();
+        // The slot values are one literal: an object two of them contain stays one object.
+        LispObject valueList = Nil.Instance;
+        for (int i = sets.Count - 1; i >= 0; i--) valueList = new Cons(sets[i].Item2, valueList);
+        var sharedAmongSlots = CollectSharedLiteralNodes(valueList);
+        if (sharedAmongSlots.Count > 0) w.LocalShared = sharedAmongSlots;
         bool ok = w.TryValue(className);
         if (ok)
         {
@@ -851,6 +857,7 @@ public partial class CilAssembler
             foreach (var (slot, value) in sets)
                 if (!w.TryValue(slot) || !w.TryValue(value)) { ok = false; break; }
         }
+        w.LocalShared = null;
         if (!ok) { w.Reset(mark); return false; }
         w.PatchLength(len);
         return true;
@@ -889,7 +896,11 @@ public partial class CilAssembler
         {
             int mark = w.Mark;
             w.Str(key);
-            if (w.TryValue(form)) return true;
+            var sharedInForm = CollectSharedLiteralNodes(form);
+            if (sharedInForm.Count > 0) w.LocalShared = sharedInForm;
+            bool written = w.TryValue(form);
+            w.LocalShared = null;
+            if (written) return true;
             w.Reset(mark);
             return false;
         }
@@ -946,11 +957,14 @@ public partial class CilAssembler
     // A structure is interned as well as an instance, so the check asks for
     // any object under the key (TryGetInterned answers instances only and is
     // kept for fasls that already call it).
-    private static readonly MethodInfo _isInterned =
+    private static MethodInfo? _lazy__isInterned;
+    private static MethodInfo _isInterned => _lazy__isInterned ??=
         typeof(LispInstance).GetMethod("IsInterned", new[] { typeof(string) })!;
-    private static readonly MethodInfo _internAllocateInstance =
+    private static MethodInfo? _lazy__internAllocateInstance;
+    private static MethodInfo _internAllocateInstance => _lazy__internAllocateInstance ??=
         typeof(LispInstance).GetMethod("InternAllocateInstance", new[] { typeof(string), typeof(LispObject) })!;
-    private static readonly MethodInfo _setSlotValue =
+    private static MethodInfo? _lazy__setSlotValue;
+    private static MethodInfo _setSlotValue => _lazy__setSlotValue ??=
         typeof(Runtime).GetMethod("SetSlotValue", new[] { typeof(LispObject), typeof(LispObject), typeof(LispObject) })!;
 
     private static bool IsClSymbol(LispObject o, string name) =>
@@ -1407,7 +1421,8 @@ public partial class CilAssembler
     // prototype rather than inline.
     private const int MaxHtInline = 20;
 
-    private static readonly MethodInfo _htCopyLiteral =
+    private static MethodInfo? _lazy__htCopyLiteral;
+    private static MethodInfo _htCopyLiteral => _lazy__htCopyLiteral ??=
         typeof(LispHashTable).GetMethod("CopyLiteral", new[] { typeof(LispHashTable) })!;
 
     /// <summary>Methods (LispHashTable) -> void that Set, or Remove, the given

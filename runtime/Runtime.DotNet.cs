@@ -838,9 +838,10 @@ public static partial class Runtime
 
     private static readonly System.Numerics.BigInteger UInt64MaxInt = ulong.MaxValue;
 #if NET7_0_OR_GREATER
-    private static readonly System.Numerics.BigInteger Int128MinInt = (System.Numerics.BigInteger)Int128.MinValue;
-    private static readonly System.Numerics.BigInteger Int128MaxInt = (System.Numerics.BigInteger)Int128.MaxValue;
-    private static readonly System.Numerics.BigInteger UInt128MaxInt = (System.Numerics.BigInteger)UInt128.MaxValue;
+    // Built from shifts, not from Int128: a conversion from Int128 stops ReadyToRun from precompiling this class's static constructor.
+    private static readonly System.Numerics.BigInteger Int128MinInt = -(System.Numerics.BigInteger.One << 127);
+    private static readonly System.Numerics.BigInteger Int128MaxInt = (System.Numerics.BigInteger.One << 127) - 1;
+    private static readonly System.Numerics.BigInteger UInt128MaxInt = (System.Numerics.BigInteger.One << 128) - 1;
 #endif
 
     private static System.Numerics.BigInteger BigIntegerFits(
@@ -1104,8 +1105,10 @@ public static partial class Runtime
         var converted = TryUserDefinedConversion(arg, targetType);
         if (converted != null) return converted;
 
+        string shown = FormatTop(arg, true);
+        if (shown.Length > 40) shown = shown.Substring(0, 37) + "...";
         throw new LispErrorException(new LispTypeError(
-            $"Cannot convert {arg.GetType().Name} to {targetType.Name}", arg));
+            $"Cannot convert {shown} (of type {FormatTop(TypeOf(arg), true)}) to the .NET type {targetType.Name}", arg));
     }
 
     /// <summary>The result of an implicit conversion operator taking the marshalled
@@ -1168,8 +1171,14 @@ public static partial class Runtime
     /// result of SUBSEQ on either -- and interop is reached with both, so neither
     /// may fall through to ToString and arrive as a printed vector of characters.
     /// A symbol contributes its name, without the colon a keyword prints with.</summary>
+    // Types the caller passed already resolved (dotnet:resolve-type), by the name NameArg gave them.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Type> _typesPassedResolved = new();
+
     internal static string NameArg(LispObject arg) => arg switch
     {
+        // A resolved System.Type stands where a type name is taken: it keeps its identity
+        // through the name-based entry points below.
+        LispDotNetObject { Value: Type rt } => RememberResolvedType(rt),
         LispString s => s.Value,
         LispVector v when v.IsCharVector => v.ToCharString(),
         Symbol sym => sym.Name,
@@ -1469,8 +1478,16 @@ public static partial class Runtime
     internal static Type? TryResolveDotNetType(string typeName)
         => ResolveDotNetTypeOrNull(typeName);
 
+    private static string RememberResolvedType(Type t)
+    {
+        var key = t.AssemblyQualifiedName ?? t.FullName ?? t.Name;
+        _typesPassedResolved[key] = t;
+        return key;
+    }
+
     internal static Type ResolveDotNetType(string typeName)
-        => ResolveDotNetTypeOrNull(typeName)
+        => (_typesPassedResolved.TryGetValue(typeName, out var passed) ? passed : null)
+           ?? ResolveDotNetTypeOrNull(typeName)
            ?? throw new LispErrorException(new LispError($"DOTNET: type not found: {typeName}"));
 
     /// <summary>
@@ -2257,6 +2274,45 @@ public static partial class Runtime
         catch (System.Reflection.AmbiguousMatchException) { return null; }
     }
 
+    /// <summary>When no overload accepts the arguments and the cause is a value that does not fit
+    /// the parameter types of every same-arity candidate (an integer outside the width of a
+    /// fixed-width parameter, a ratio for a decimal), the TYPE-ERROR that conversion signals,
+    /// carrying the value and the type, rather than a bare "method not found". Null when some
+    /// candidate converts all arguments or the failure has another cause.</summary>
+    private static LispErrorException? ArgumentRangeError(Type type, string name, LispObject[] lispArgs, bool isStatic)
+    {
+        var flags = System.Reflection.BindingFlags.Public
+            | (isStatic ? System.Reflection.BindingFlags.Static : System.Reflection.BindingFlags.Instance);
+        LispErrorException? first = null;
+        int considered = 0;
+        foreach (var m in type.GetMethods(flags))
+        {
+            if (m.Name != name || m.IsGenericMethodDefinition) continue;
+            var ps = m.GetParameters();
+            if (ps.Length != lispArgs.Length) continue;
+            considered++;
+            LispErrorException? thrown = null;
+            LispErrorException.QuietDepth++;
+            try
+            {
+                for (int i = 0; i < ps.Length; i++)
+                {
+                    // A ratio has no exact System.Decimal.
+                    if (lispArgs[i] is Ratio && ps[i].ParameterType == typeof(decimal))
+                        throw new LispErrorException(new LispTypeError(
+                            "Cannot convert Ratio to System.Decimal", lispArgs[i], Startup.Sym("REAL")));
+                    LispToDotNetParam(lispArgs[i], ps[i].ParameterType);
+                }
+            }
+            catch (LispErrorException e) { thrown = e; }
+            catch (Exception) { return null; }
+            finally { LispErrorException.QuietDepth--; }
+            if (thrown == null || thrown.Condition is not LispTypeError) return null;
+            first ??= new LispErrorException(thrown.Condition);
+        }
+        return considered > 0 ? first : null;
+    }
+
     /// <summary>Fallback for dotnet:invoke / dotnet:static when InvokeMember finds no
     /// matching overload: locate a method NAME whose first parameters take the supplied
     /// args and whose remaining (trailing) parameters are all C# optional, then fill those
@@ -2295,12 +2351,14 @@ public static partial class Runtime
             var bps = m.GetParameters();
             var full = new object?[bps.Length];
             bool ok = true;
+            LispErrorException.QuietDepth++;
             try
             {
                 for (int i = 0; i < lispArgs.Length; i++)
                     full[i] = LispToDotNetParam(lispArgs[i], bps[i].ParameterType);
             }
             catch { ok = false; }   // supplied args not convertible to this overload
+            finally { LispErrorException.QuietDepth--; }
             if (!ok) continue;
             for (int i = lispArgs.Length; i < bps.Length; i++)
                 full[i] = bps[i].HasDefaultValue ? bps[i].DefaultValue : Type.Missing;
@@ -2364,8 +2422,10 @@ public static partial class Runtime
             bool ok = true;
             for (int i = 0; i < ps.Length; i++)
             {
+                LispErrorException.QuietDepth++;
                 try { converted[i] = LispToDotNetParam(lispArgs[i], ps[i].ParameterType); }
                 catch { ok = false; break; }
+                finally { LispErrorException.QuietDepth--; }
             }
             if (!ok) continue;
             try { result = m.Invoke(target, converted); return true; }
@@ -2374,6 +2434,71 @@ public static partial class Runtime
                 throw DotNetInvokeError($"DOTNET:{(isStatic ? "STATIC" : "INVOKE")} {type.Name}.{name}", tie);
             }
             catch (ArgumentException) { /* not this overload after all; try next typed one */ }
+        }
+        return false;
+    }
+
+    private static bool IsRawSequenceArg(LispObject a)
+        => a is Cons || (a is LispVector v && !v.IsCharVector);
+
+    private static bool IsEnumerableParam(Type t)
+        => t == typeof(System.Collections.IEnumerable)
+           || (t.IsGenericType && t.GetGenericTypeDefinition() is var d
+               && (d == typeof(IEnumerable<>) || d == typeof(IReadOnlyCollection<>)
+                   || d == typeof(IReadOnlyList<>) || d == typeof(ICollection<>) || d == typeof(IList<>)));
+
+    /// <summary>A Lisp list or vector passed to a method that has both a catch-all
+    /// (params object[]) overload and a non-generic overload taking IEnumerable&lt;T&gt; in
+    /// that position (String.Join, String.Concat): the binder takes the list as ONE
+    /// object and prints it. Calls the enumerable overload instead.</summary>
+    private static bool TryInvokeSequenceAsEnumerable(
+        Type type, string name, object? target, bool isStatic, LispObject[] lispArgs, out object? result)
+    {
+        result = null;
+        // Non-generic overloads first (Join(string, IEnumerable<string>)), then a generic
+        // one instantiated over object (Join<T>(string, IEnumerable<T>)).
+        foreach (bool generic in new[] { false, true })
+        foreach (var m0 in type.GetMethods(System.Reflection.BindingFlags.Public
+                     | (isStatic ? System.Reflection.BindingFlags.Static : System.Reflection.BindingFlags.Instance)))
+        {
+            if (m0.Name != name || m0.IsGenericMethodDefinition != generic) continue;
+            if (generic && m0.GetGenericArguments().Length != 1) continue;
+            System.Reflection.MethodInfo m = m0;
+            if (generic)
+            {
+                try { m = m0.MakeGenericMethod(typeof(object)); } catch (ArgumentException) { continue; }
+            }
+            var ps = m.GetParameters();
+            if (ps.Length != lispArgs.Length) continue;
+            bool fits = true;
+            for (int i = 0; i < ps.Length && fits; i++)
+            {
+                if (ps[i].ParameterType.IsByRef) fits = false;
+                else if (IsRawSequenceArg(lispArgs[i]) && !IsEnumerableParam(ps[i].ParameterType)) fits = false;
+            }
+            if (!fits) continue;
+            var converted = new object?[ps.Length];
+            bool ok = true;
+            for (int i = 0; i < ps.Length && ok; i++)
+            {
+                LispErrorException.QuietDepth++;
+                try
+                {
+                    var pt = ps[i].ParameterType;
+                    if (IsRawSequenceArg(lispArgs[i]))
+                    {
+                        // A list or vector becomes an array of the element type, which is an IEnumerable<T>.
+                        var elem = pt.IsGenericType ? pt.GetGenericArguments()[0] : typeof(object);
+                        converted[i] = LispToDotNetParam(lispArgs[i], elem.MakeArrayType());
+                    }
+                    else converted[i] = LispToDotNetParam(lispArgs[i], pt);
+                }
+                catch { ok = false; }
+                finally { LispErrorException.QuietDepth--; }
+            }
+            if (!ok) continue;
+            try { result = InvokeMethod(m, target, converted); return true; }
+            catch (ArgumentException) { }
         }
         return false;
     }
@@ -2439,8 +2564,10 @@ public static partial class Runtime
             bool converall = true;
             for (int i = 0; i < ps.Length; i++)
             {
+                LispErrorException.QuietDepth++;
                 try { converted[i] = LispToDotNetParam(lispArgs[i], ps[i].ParameterType); }
                 catch { converall = false; break; }
+                finally { LispErrorException.QuietDepth--; }
             }
             if (!converall) continue;
             try { result = InvokeMethod(m, target, converted); return true; }
@@ -2492,6 +2619,11 @@ public static partial class Runtime
 
         try
         {
+            if (TryInvokeGenericEnumerableOverload(type, memberName, callArgs, out var viaGenericEnum))
+                return DotNetToLisp(viaGenericEnum);
+            if (args.Skip(2).Any(IsRawSequenceArg)
+                && TryInvokeSequenceAsEnumerable(type, memberName, null, true, args.Skip(2).ToArray(), out var viaSeq))
+                return DotNetToLisp(viaSeq);
             if (TryCachedInvoke(type, memberName, null, callArgs, true, out var cached))
                 return DotNetToLisp(cached);
             // Guard against InvokeMember binding an integer/pointer arg to a
@@ -2521,6 +2653,8 @@ public static partial class Runtime
             if (args.Length >= 3 && LispToDotNetGeneric(args[2]) is object recv
                 && TryInvokeExtensionMethod(recv.GetType(), memberName, recv, rest, out var r3, type))
                 return DotNetToLisp(r3);
+            if (ArgumentRangeError(type, memberName, args.Skip(2).ToArray(), true) is { } rangeErr)
+                throw rangeErr;
             throw;
         }
         catch (NotSupportedException)
@@ -2658,6 +2792,16 @@ public static partial class Runtime
             && TryInvokeWithMarshalledArgs(type, memberName, target, args.Skip(2).ToArray(), false, out var pre))
             return DotNetToLisp(pre);
 
+        // An instance method that only takes a delegate of another arity than the Lisp function
+        // passed is not the one meant: an extension method of the right arity may be.
+        if (InstanceDelegateArityMismatch(type, memberName, args.Skip(2).ToArray())
+            && TryInvokeExtensionMethod(type, memberName, target, args.Skip(2).ToArray(), out var extByArity))
+            return DotNetToLisp(extByArity);
+
+        if (args.Skip(2).Any(IsRawSequenceArg)
+            && TryInvokeSequenceAsEnumerable(type, memberName, target, false, args.Skip(2).ToArray(), out var viaSeq))
+            return DotNetToLisp(viaSeq);
+
         // A call InvokeMember has already failed to find goes straight to the
         // fallbacks instead of throwing MissingMethodException again.
         InvokeKey? missKey = InvokeKeyFor(type, memberName, callArgs);
@@ -2685,6 +2829,8 @@ public static partial class Runtime
             if (missKey is { } k) _invokeMemberMisses.TryAdd(k, 0);
             if (TryInvokeAfterMiss(type, memberName, target, args, callArgs, out var r))
                 return r;
+            if (ArgumentRangeError(type, memberName, args.Skip(2).ToArray(), false) is { } rangeErr)
+                throw rangeErr;
             throw;
         }
         catch (NotSupportedException)
@@ -2893,6 +3039,73 @@ public static partial class Runtime
     /// <summary>True when every Lisp function passed for a delegate parameter has an arity
     /// the delegate can call. Unknown arity (-1, e.g. a closure with &amp;rest) matches
     /// anything; non-delegate parameters are not considered.</summary>
+    /// <summary>A value-type array (int[]) passed to a static method whose only overload for it
+    /// is generic over IEnumerable&lt;T&gt;: String.Join(",", int[]) has Join(string, params
+    /// object[]), which InvokeMember picks by taking the whole array as ONE object ("System.Int32[]"),
+    /// and Join&lt;T&gt;(string, IEnumerable&lt;T&gt;), which it cannot instantiate. Calls the generic one.</summary>
+    private static bool TryInvokeGenericEnumerableOverload(Type type, string name, object?[] callArgs, out object? result)
+    {
+        result = null;
+        Type? elem = null;
+        int arrayAt = -1;
+        for (int i = 0; i < callArgs.Length; i++)
+            if (callArgs[i] is Array a && a.GetType().GetElementType() is { IsValueType: true } et && a.Rank == 1)
+            { elem = et; arrayAt = i; break; }
+        if (elem == null) return false;
+        foreach (var m in type.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+        {
+            if (m.Name != name || !m.IsGenericMethodDefinition || m.GetGenericArguments().Length != 1) continue;
+            var ps = m.GetParameters();
+            if (ps.Length != callArgs.Length) continue;
+            var pt = ps[arrayAt].ParameterType;
+            if (!(pt.IsGenericType && pt.GetGenericTypeDefinition() == typeof(IEnumerable<>)
+                  && pt.GetGenericArguments()[0].IsGenericParameter)) continue;
+            System.Reflection.MethodInfo concrete;
+            try { concrete = m.MakeGenericMethod(elem); } catch { continue; }
+            var cps = concrete.GetParameters();
+            var full = new object?[cps.Length];
+            bool ok = true;
+            for (int i = 0; i < cps.Length && ok; i++)
+            {
+                if (callArgs[i] == null) { full[i] = null; continue; }
+                if (cps[i].ParameterType.IsInstanceOfType(callArgs[i])) full[i] = callArgs[i];
+                else ok = false;
+            }
+            if (!ok) continue;
+            result = concrete.Invoke(null, full);
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>True when TYPE has public instance methods NAME taking this many arguments, and
+    /// none of them has a delegate parameter whose arity matches the Lisp function passed for
+    /// it. The iterator classes behind LINQ's Range / Select carry a Where(Func&lt;T,bool&gt;) of
+    /// their own, which would take a two-argument Lisp lambda meant for the indexed
+    /// Enumerable.Where(Func&lt;T,int,bool&gt;) and fail at call time.</summary>
+    private static bool InstanceDelegateArityMismatch(Type type, string name, LispObject[] lispArgs)
+    {
+        if (!lispArgs.Any(a => a is LispFunction f && f.Arity >= 0)) return false;
+        bool any = false;
+        foreach (var m in type.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+        {
+            if (m.Name != name) continue;
+            var ps = m.GetParameters();
+            if (ps.Length != lispArgs.Length) continue;
+            any = true;
+            bool fits = true;
+            for (int i = 0; i < ps.Length && fits; i++)
+            {
+                if (lispArgs[i] is not LispFunction fn || fn.Arity < 0) continue;
+                if (!typeof(Delegate).IsAssignableFrom(ps[i].ParameterType)) continue;
+                var invoke = ps[i].ParameterType.GetMethod("Invoke");
+                if (invoke != null && invoke.GetParameters().Length != fn.Arity) fits = false;
+            }
+            if (fits) return false;
+        }
+        return any;
+    }
+
     private static bool DelegateArgArityFits(System.Reflection.ParameterInfo[] ps, LispObject[] lispArgs)
     {
         for (int i = 0; i < lispArgs.Length; i++)
@@ -2960,7 +3173,11 @@ public static partial class Runtime
                 throw new LispErrorException(new LispError(
                     $"DOTNET:INVOKE: {type.Name} implements {memberName} separately for "
                     + string.Join(" and ", candidates.Select(c => c.Name))
-                    + "; name the one you mean with dotnet:cast"));
+                    + "; name the one you mean with dotnet:cast"
+                    // No public overload took these arguments either: say so, since a wrong
+                    // argument (a value out of range, the wrong type) reads as this ambiguity.
+                    + $" (no public {memberName} overload of {type.Name} accepts "
+                    + $"({string.Join(", ", callArgs.Select(x => x == null ? "null" : x.GetType().Name))}) as given)"));
         }
 
         result = candidates[0].InvokeMember(memberName, flags, null, target, callArgs);
@@ -3079,12 +3296,14 @@ public static partial class Runtime
             var callArgs = new object?[ps.Length];
             callArgs[0] = target;
             bool ok = true;
+            LispErrorException.QuietDepth++;
             try
             {
                 for (int i = 0; i < lispArgs.Length; i++)
                     callArgs[i + 1] = LispToDotNet(lispArgs[i], ps[i + 1].ParameterType);
             }
             catch { ok = false; }
+            finally { LispErrorException.QuietDepth--; }
             if (!ok) continue;
             for (int i = lispArgs.Length + 1; i < ps.Length; i++)
                 callArgs[i] = ps[i].HasDefaultValue ? ps[i].DefaultValue : Type.Missing;
@@ -3177,12 +3396,14 @@ public static partial class Runtime
                 if (ps.Length != lispArgs.Length) continue;
                 var callArgs = new object?[ps.Length];
                 bool ok = true;
+                LispErrorException.QuietDepth++;
                 try
                 {
                     for (int i = 0; i < ps.Length; i++)
                         callArgs[i] = LispToDotNet(lispArgs[i], ps[i].ParameterType);
                 }
                 catch { ok = false; }
+                finally { LispErrorException.QuietDepth--; }
                 if (!ok) continue;                        // not this overload
                 try { setter.Invoke(target, callArgs); }
                 catch (System.Reflection.TargetInvocationException tie)
@@ -5750,14 +5971,64 @@ public static partial class Runtime
         }
         if (concrete.Count == 0)
             throw new LispErrorException(new LispError($"{context}: MakeGenericMethod failed: {makeError}"));
-        var ordered = concrete.OrderBy(SpanOverloadRank).ToList();
+        var ordered = concrete.OrderBy(c => outAware || c.GetParameters().Length == lispArgs.Length ? 0 : 1)
+                              .ThenBy(c => StringArgsNotOnStringParams(c, lispArgs))
+                              .ThenBy(SpanOverloadRank).ToList();
         var m = ordered.FirstOrDefault(c => PlausibleOverload(c, lispArgs, outAware)) ?? ordered[0];
         if (outAware) return (m, CallOutArgs(m, lispArgs));
+        // Overloads of one arity can differ only in the type of a supplied argument
+        // (Deserialize<T>(string, ...) and Deserialize<T>(JsonDocument, ...)): take the
+        // first plausible one the arguments convert to, and report the first one's error
+        // when none does.
+        foreach (var c in ordered.Where(c => PlausibleOverload(c, lispArgs, false)))
+            if (TryConvertGenericArgs(c, lispArgs, out var converted)) return (c, converted);
         var ps = m.GetParameters();
         var callArgs = new object?[ps.Length];
         for (int i = 0; i < ps.Length; i++)
-            callArgs[i] = LispToDotNetParam(lispArgs[i], ps[i].ParameterType);
+            callArgs[i] = i < lispArgs.Length
+                ? LispToDotNetParam(lispArgs[i], ps[i].ParameterType)
+                : (ps[i].HasDefaultValue ? ps[i].DefaultValue : Type.Missing);
         return (m, callArgs);
+    }
+
+    /// <summary>How many Lisp string arguments sit on a parameter that is not System.String:
+    /// the overload with fewer is the closer one.</summary>
+    private static int StringArgsNotOnStringParams(System.Reflection.MethodInfo c, LispObject[] lispArgs)
+    {
+        var ps = c.GetParameters();
+        int n = 0;
+        for (int i = 0; i < lispArgs.Length && i < ps.Length; i++)
+            if (lispArgs[i] is LispString && ps[i].ParameterType != typeof(string)) n++;
+        return n;
+    }
+
+    private static bool TryConvertGenericArgs(System.Reflection.MethodInfo c, LispObject[] lispArgs, out object?[] callArgs)
+    {
+        var ps = c.GetParameters();
+        callArgs = new object?[ps.Length];
+        LispErrorException.QuietDepth++;
+        try
+        {
+            for (int i = 0; i < ps.Length; i++)
+                callArgs[i] = i < lispArgs.Length
+                    ? LispToDotNetParam(lispArgs[i], ps[i].ParameterType)
+                    : (ps[i].HasDefaultValue ? ps[i].DefaultValue : Type.Missing);
+            return true;
+        }
+        catch (LispErrorException) { return false; }
+        finally { LispErrorException.QuietDepth--; }
+    }
+
+    /// <summary>True when M takes exactly N arguments, or more with every
+    /// parameter after the first N optional.</summary>
+    private static bool ArityFitsWithOptionals(System.Reflection.MethodInfo m, int n)
+    {
+        var ps = m.GetParameters();
+        if (ps.Length == n) return true;
+        if (ps.Length < n) return false;
+        for (int i = n; i < ps.Length; i++)
+            if (!ps[i].IsOptional) return false;
+        return true;
     }
 
     /// <summary>Every NAME overload taking INARGCOUNT in-args, in declaration order,
@@ -5906,7 +6177,7 @@ public static partial class Runtime
             .Where(m => m.Name == memberName
                      && m.IsGenericMethodDefinition
                      && m.GetGenericArguments().Length == typeArgCount
-                     && m.GetParameters().Length == lispArgs.Length)
+                     && ArityFitsWithOptionals(m, lispArgs.Length))
             .ToList();
         if (methodDefs.Count == 0)
             throw new LispErrorException(new LispError(
@@ -5962,7 +6233,7 @@ public static partial class Runtime
             .Where(m => m.Name == memberName
                      && m.IsGenericMethodDefinition
                      && m.GetGenericArguments().Length == typeArgNames.Count
-                     && m.GetParameters().Length == lispArgs.Length)
+                     && ArityFitsWithOptionals(m, lispArgs.Length))
             .ToList();
         // Not on the concrete type: it may be implemented explicitly for an
         // interface, where the method is private and only reachable through the
@@ -6105,7 +6376,7 @@ public static partial class Runtime
             : ResolveElementTypeArg(args[0]);
 
         string? kind = null, prefix = null, statics = "BOTH";
-        bool inherited = true, extensions = true, documentation = false;
+        bool inherited = true, extensions = true, documentation = false, documentationWait = false;
         for (int i = 1; i + 1 < args.Length; i += 2)
         {
             if (args[i] is not Symbol kw) continue;
@@ -6128,7 +6399,12 @@ public static partial class Runtime
                     break;
                 case "INHERITED": inherited = v != Nil.Instance; break;
                 case "EXTENSIONS": extensions = v != Nil.Instance; break;
-                case "DOCUMENTATION": documentation = v != Nil.Instance; break;
+                // T asks for the sentences already read and never waits (a completion list
+                // one keystroke behind beats a late one); :WAIT reads the file first.
+                case "DOCUMENTATION":
+                    documentation = v != Nil.Instance;
+                    documentationWait = v is Symbol { Name: "WAIT" };
+                    break;
             }
         }
 
@@ -6179,7 +6455,9 @@ public static partial class Runtime
                 Startup.Keyword("DECLARING-TYPE"), new LispString(r.Owner));
             // The sentence the framework ships for this member, when it has been
             // asked for and the file it is in has already been read.
-            var summary = documentation ? SummaryFor(type, r.Name) : null;
+            var summary = documentation
+                ? (documentationWait ? DocumentationFor(type, r.Name, wait: true)?.Summary : SummaryFor(type, r.Name))
+                : null;
             if (summary != null)
                 plist = new Cons(Startup.Keyword("DOCUMENTATION"),
                                  new Cons(new LispString(summary), plist));
@@ -6306,9 +6584,11 @@ public static partial class Runtime
         var kindClass = Startup.Keyword("CLASS");
         var nameKey = Startup.Keyword("NAME");
         var kindKey = Startup.Keyword("KIND");
-        foreach (var name in Enumerable.Reverse(types))
+        // LIMIT caps the whole answer: the namespaces first, the types in what is left.
+        var takenSpaces = namespaces.Take(limit).ToList();
+        foreach (var name in Enumerable.Reverse(types.Take(Math.Max(0, limit - takenSpaces.Count)).ToList()))
             result = new Cons(Runtime.List(nameKey, new LispString(name), kindKey, kindClass), result);
-        foreach (var space in Enumerable.Reverse(namespaces.Take(limit).ToList()))
+        foreach (var space in Enumerable.Reverse(takenSpaces))
             result = new Cons(Runtime.List(nameKey, new LispString(space), kindKey, kindNamespace), result);
         // Second value: whether this is everything. A client that speaks LSP
         // turns a NIL here into isIncomplete, which is how it learns to ask

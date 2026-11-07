@@ -1,3 +1,4 @@
+using System;
 using System.Reflection;
 using System.Collections.Generic;
 using System.IO;
@@ -35,6 +36,26 @@ internal static class FaslBundle
     /// <summary>
     /// Write OUTPUTPATH as a bundle of INPUTPATHS, in order.
     /// </summary>
+    /// <summary>The module version id: a hash of the parts' names and contents, so the same parts
+    /// bundled again give the same file.</summary>
+    private static System.Guid ContentGuid(IReadOnlyList<string> inputPaths)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        for (int i = 0; i < inputPaths.Count; i++)
+        {
+            var name = System.Text.Encoding.UTF8.GetBytes(PartName(i, Path.GetFileName(inputPaths[i])) + "\n");
+            sha.TransformBlock(name, 0, name.Length, null, 0);
+            var bytes = File.ReadAllBytes(inputPaths[i]);
+            sha.TransformBlock(bytes, 0, bytes.Length, null, 0);
+        }
+        sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+        var g = new byte[16];
+        Array.Copy(sha.Hash!, g, 16);
+        g[7] = (byte)((g[7] & 0x0F) | 0x40);
+        g[8] = (byte)((g[8] & 0x3F) | 0x80);
+        return new System.Guid(g);
+    }
+
     internal static void Write(IReadOnlyList<string> inputPaths, string outputPath)
     {
         var md = new MetadataBuilder();
@@ -52,7 +73,7 @@ internal static class FaslBundle
         md.AddModule(
             generation: 0,
             moduleName: md.GetOrAddString(Path.GetFileName(outputPath)),
-            mvid: md.GetOrAddGuid(System.Guid.NewGuid()),
+            mvid: md.GetOrAddGuid(ContentGuid(inputPaths)),
             encId: default,
             encBaseId: default);
 
@@ -89,7 +110,18 @@ internal static class FaslBundle
                 imageCharacteristics: Characteristics.ExecutableImage | Characteristics.Dll),
             metadataRootBuilder: new MetadataRootBuilder(md),
             ilStream: new BlobBuilder(),
-            managedResources: resources);
+            managedResources: resources,
+            deterministicIdProvider: content =>
+            {
+                using var sha = System.Security.Cryptography.SHA256.Create();
+                foreach (var blob in content)
+                {
+                    var seg = blob.GetBytes();
+                    sha.TransformBlock(seg.Array!, seg.Offset, seg.Count, null, 0);
+                }
+                sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+                return BlobContentId.FromHash(sha.Hash!);
+            });
 
         var peBlob = new BlobBuilder();
         pe.Serialize(peBlob);

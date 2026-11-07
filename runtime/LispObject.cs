@@ -50,8 +50,8 @@ public sealed class Cons : LispObject
 
     public Cons(LispObject car, LispObject cdr)
     {
-        _car = car;
-        _cdr = cdr;
+        Car = car;
+        Cdr = cdr;
         DotCL.Diagnostics.AllocCounter.Inc("Cons");
     }
 

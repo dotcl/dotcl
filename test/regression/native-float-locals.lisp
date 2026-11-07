@@ -139,3 +139,23 @@
   (double-float single-float))
 
 (setf dotcl:*save-sil* nil)
+
+;; An undeclared LET variable with a double-float init, whose only use is the
+;; value assigned to a variable declared DOUBLE-FLOAT, gets a raw slot too.
+(defun %nfl-setq-use (n)
+  (declare (fixnum n))
+  (let ((zr 0d0))
+    (declare (double-float zr))
+    (dotimes (i n)
+      (let ((next (+ (* zr zr) 1.5d0)))
+        (setq zr next)))
+    (if (> zr 0d0) n 0)))
+
+(deftest nfl-setq-use-boxfree-sil
+  (let ((sil (%flat-text (dotcl:function-sil #'%nfl-setq-use))))
+    (search "NEWOBJ DoubleFloat" sil))
+  nil)
+
+(deftest nfl-setq-use-result
+  (%nfl-setq-use 3)
+  3)

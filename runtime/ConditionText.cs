@@ -106,6 +106,19 @@ public static class ConditionText
     public static string Line(LispObject condition)
         => $"{TypeName(condition)}: {Report(condition)}";
 
+    /// <summary>The line a script run prints for an unhandled error: "file:line: report" for an
+    /// undefined function or unbound variable raised while a file loads (the same form an error the
+    /// runtime raises directly gets), "file:line: TYPE: report" for any other condition, and
+    /// <see cref="Line"/> outside a load.</summary>
+    public static string ScriptLine(LispObject condition)
+    {
+        if (Runtime.LoadingPlace() is string place)
+            return TypeName(condition) is "UNDEFINED-FUNCTION" or "UNBOUND-VARIABLE"
+                ? $"{place}: {Report(condition)}"
+                : $"{place}: {Line(condition)}";
+        return Line(condition);
+    }
+
     /// <summary>Text that is available without evaluating anything.</summary>
     private static string Fallback(LispObject condition)
         => condition is LispCondition lc ? lc.Message : condition.ToString();

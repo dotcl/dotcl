@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Kept in Python (the one exception to "scripts are dotcl or C#"): it drives a real pty, which neither
+# dotcl nor a plain C# program can do without the OS-specific pty calls Python wraps.
 """Integration test: Ctrl-C (SIGINT) interrupts the dotcl REPL instead of killing it.
 
 On Unix the REPL reads raw fd 0 and avoids .NET's Unix console driver, so

@@ -54,6 +54,9 @@ UIOP adds `:os-windows`, `:os-unix` and `:os-macosx` to match.
 
 ## Guidelines
 
+The examples below call UIOP and ASDF. In a fresh dotcl they are not loaded yet:
+`(require "asdf")` first (UIOP comes with it). `my-lib` stands for your own system.
+
 ### Decide the platform at run time
 
 Ask at run time, where the answer is the consumer's machine:

@@ -228,9 +228,16 @@ public static partial class Runtime
 
     public static char? NameChar(string s)
     {
-        var upper = s.ToUpper();
+        // ^X names a control character, as SBCL reads them: ^@ is code 0, ^A 1, ... ^Z 26,
+        // ^[ 27, ^] 29, ^^ 30, ^_ 31 (letters in either case; ^\ is not a token).
+        if (s.Length == 2 && s[0] == '^')
+        {
+            char c = char.ToUpperInvariant(s[1]);
+            if (c >= '@' && c <= '_' && c != '\\') return (char)(c - '@');
+        }
+        var upper = s.ToUpperInvariant();
         foreach (var (name, ch) in _charNames)
-            if (name.ToUpper() == upper) return ch;
+            if (name.ToUpperInvariant() == upper) return ch;
         // UCD lookup: normalize underscores to spaces (e.g. "LATIN_SMALL_LETTER_A" -> "LATIN SMALL LETTER A")
         if (Ucd.NameToChar.TryGetValue(upper.Replace('_', ' '), out char ucdCh))
             return ucdCh;
@@ -922,7 +929,7 @@ public static partial class Runtime
                 if (tokens.Usable && _miniExpansions.TryGetValue(cons, out var box))
                 {
                     var e = box.Entry;
-                    if (e != null && e.Tokens.SameAs(tokens) && e.EnvFree)
+                    if (e != null && e.MadeFrom(tokens) && e.EnvFree)
                         return e.Expansion;
                 }
                 var expander = Runtime.MacroFunction(sym) as LispFunction
@@ -1236,7 +1243,7 @@ public static partial class Runtime
                     throw new LispErrorException(new LispTypeError(
                         "COMPILE: not a function name", name,
                         Runtime.List(Startup.Sym("OR"), Startup.Sym("SYMBOL"), Startup.Sym("CONS"))));
-                if (args.Length > 1 && args[1] is not Nil && args[1] is not LispFunction
+                if (args.Length > 1 && args[1] is not LispFunction
                     && !(args[1] is Cons dc && dc.Car == Startup.Sym("LAMBDA")))
                     throw new LispErrorException(new LispTypeError(
                         "COMPILE: definition is not a lambda expression or a function", args[1],
@@ -1662,8 +1669,13 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("DECODE-UNIVERSAL-TIME", new LispFunction(args => {
             if (args.Length < 1 || args.Length > 2)
                 throw new LispErrorException(new LispProgramError("DECODE-UNIVERSAL-TIME: expected 1-2 args"));
-            long ut = (long)Arithmetic.ToDouble(Runtime.AsNumber(args[0]));
+            long ut = UniversalTimeInteger("DECODE-UNIVERSAL-TIME", args[0], 0);
+            if (args.Length == 2 && args[1] is not Nil) CheckTimeZone("DECODE-UNIVERSAL-TIME", args[1]);
             var epoch = new System.DateTime(1900, 1, 1, 0, 0, 0, System.DateTimeKind.Utc);
+            // The calendar here covers years 1 to 9999; a time outside it has no decoding.
+            if (ut < -59_000_000_000L || ut > 255_000_000_000L)
+                throw new LispErrorException(new LispTypeError(
+                    "DECODE-UNIVERSAL-TIME: the time is outside the years 1 to 9999", args[0], Startup.Sym("INTEGER")));
             var dtUtc = epoch.AddSeconds(ut);
             System.DateTime dt;
             LispObject daylightP;
@@ -1719,17 +1731,21 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("ENCODE-UNIVERSAL-TIME", new LispFunction(args => {
             if (args.Length < 6 || args.Length > 7)
                 throw new LispErrorException(new LispProgramError("ENCODE-UNIVERSAL-TIME: expected 6-7 args"));
-            int second = (int)Arithmetic.ToDouble(Runtime.AsNumber(args[0]));
-            int minute = (int)Arithmetic.ToDouble(Runtime.AsNumber(args[1]));
-            int hour   = (int)Arithmetic.ToDouble(Runtime.AsNumber(args[2]));
-            int date   = (int)Arithmetic.ToDouble(Runtime.AsNumber(args[3]));
-            int month  = (int)Arithmetic.ToDouble(Runtime.AsNumber(args[4]));
-            int year   = (int)Arithmetic.ToDouble(Runtime.AsNumber(args[5]));
+            int second = (int)UniversalTimeInteger("ENCODE-UNIVERSAL-TIME", args[0]);
+            int minute = (int)UniversalTimeInteger("ENCODE-UNIVERSAL-TIME", args[1]);
+            int hour   = (int)UniversalTimeInteger("ENCODE-UNIVERSAL-TIME", args[2]);
+            int date   = (int)UniversalTimeInteger("ENCODE-UNIVERSAL-TIME", args[3]);
+            int month  = (int)UniversalTimeInteger("ENCODE-UNIVERSAL-TIME", args[4]);
+            int year   = (int)UniversalTimeInteger("ENCODE-UNIVERSAL-TIME", args[5]);
+            if (args.Length == 7 && args[6] is not Nil) CheckTimeZone("ENCODE-UNIVERSAL-TIME", args[6]);
             if (year >= 0 && year <= 99) {
                 int curYear = System.DateTime.Now.Year;
                 int century = curYear - (curYear % 100);
                 year += century;
-                if (year > curYear + 50) year -= 100;
+                // CLHS: within 50 years of the current year; a year exactly 50 ahead is
+                // taken as 50 behind, as SBCL does (the window is cur-50 .. cur+49).
+                if (year > curYear + 49) year -= 100;
+                else if (year < curYear - 50) year += 100;
             }
             var epoch = new System.DateTime(1900, 1, 1, 0, 0, 0, System.DateTimeKind.Utc);
             System.DateTime dt;
@@ -1787,8 +1803,6 @@ public static partial class Runtime
             new LispFunction(args => Runtime.UntracedFunction(args[0]), "%UNTRACED-FUNCTION", 1));
         Emitter.CilAssembler.RegisterFunction("ED",
             new LispFunction(Runtime.Ed, "ED", -1));
-        Emitter.CilAssembler.RegisterFunction("DRIBBLE",
-            new LispFunction(Runtime.Dribble, "DRIBBLE", -1));
         Emitter.CilAssembler.RegisterFunction("INSPECT",
             new LispFunction(Runtime.Inspect, "INSPECT", -1));
 

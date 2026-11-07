@@ -111,3 +111,64 @@
             (error () :error))
           (prog1 (dotcl:pinned-vector-p w) (dotcl:unpin-vector w))))
   (t nil nil nil nil nil nil :error t))
+
+;;; :ALIGNMENT puts element 0 at a multiple of that many bytes, for every supported element width,
+;;; and a vector made without it is made as before.
+
+(defun %pv-aligned-p (v alignment)
+  (zerop (mod (dotcl:pinned-vector-address v) alignment)))
+
+(deftest pinned-vector.alignment-16-64-4096
+  (let ((vs (loop for al in '(16 64 4096)
+                  collect (list al (dotcl:make-pinned-vector 100 '(unsigned-byte 8) :alignment al)))))
+    (prog1 (mapcar (lambda (e) (%pv-aligned-p (second e) (first e))) vs)
+      (dolist (e vs) (dotcl:unpin-vector (second e)))))
+  (t t t))
+
+(deftest pinned-vector.alignment-for-each-element-type
+  (let ((made (loop for et in '((unsigned-byte 8) (signed-byte 8) (unsigned-byte 16) (signed-byte 32)
+                                (unsigned-byte 64) single-float double-float)
+                    collect (dotcl:make-pinned-vector 37 et :alignment 64))))
+    (prog1 (list (every (lambda (v) (%pv-aligned-p v 64)) made)
+                 (mapcar #'length made)
+                 (typep (first made) '(simple-array (unsigned-byte 8) (37))))
+      (mapc #'dotcl:unpin-vector made)))
+  (t (37 37 37 37 37 37 37) t))
+
+(deftest pinned-vector.alignment-vector-still-works
+  (let ((v (dotcl:make-pinned-vector 8 '(unsigned-byte 8) :alignment 4096)))
+    (setf (aref v 3) 9)
+    (dotnet:mem-write 7 :uint8 (dotcl:pinned-vector-address v) 5)
+    (prog1 (list (coerce v 'list) (dotcl:pinned-vector-p v))
+      (dotcl:unpin-vector v)))
+  ((0 0 0 9 0 7 0 0) t))
+
+(deftest pinned-vector.alignment-reuse-after-unpin
+  (let ((ok t))
+    (dotimes (i 20)
+      (let ((v (dotcl:make-pinned-vector (+ 10 i) '(unsigned-byte 32) :alignment 64)))
+        (unless (%pv-aligned-p v 64) (setf ok nil))
+        (dotcl:unpin-vector v)))
+    (setf ok (and ok (zerop (length (dotcl:make-pinned-vector 0 '(unsigned-byte 8) :alignment 64)))))
+    ok)
+  t)
+
+(deftest pinned-vector.alignment-1-and-none-agree
+  (list (length (dotcl:make-pinned-vector 5 '(unsigned-byte 8) :alignment 1))
+        (length (dotcl:make-pinned-vector 5 '(unsigned-byte 8))))
+  (5 5))
+
+(deftest pinned-vector.alignment-rejects-bad-values
+  (mapcar (lambda (al)
+            (handler-case (progn (dotcl:make-pinned-vector 4 '(unsigned-byte 8) :alignment al) :accepted)
+              (error () :error)))
+          '(3 0 -8 131072 :x nil))
+  (:error :error :error :error :error :error))
+
+(deftest pinned-vector.alignment-large-vectors
+  (let ((vs (list (dotcl:make-pinned-vector 200000 '(unsigned-byte 8) :alignment 4096)
+                  (dotcl:make-pinned-vector 1000000 'double-float :alignment 64)
+                  (dotcl:make-pinned-vector 300000 '(unsigned-byte 32) :alignment 16))))
+    (prog1 (list (%pv-aligned-p (first vs) 4096) (%pv-aligned-p (second vs) 64) (%pv-aligned-p (third vs) 16))
+      (mapc #'dotcl:unpin-vector vs)))
+  (t t t))

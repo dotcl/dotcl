@@ -217,7 +217,8 @@
 ;;; not signal on the way.
 (deftest condition-report.banner-no-report
   (%cr-banner (make-condition 'cr-banner-silent :x 1))
-  ("#<CR-BANNER-SILENT>" "#<CR-BANNER-SILENT>"))
+  ("Condition COMMON-LISP-USER::CR-BANNER-SILENT was signalled."
+   "Condition COMMON-LISP-USER::CR-BANNER-SILENT was signalled."))
 
 ;;; A report that signals is how one error becomes an endless one: the report
 ;;; runs while the debugger is being entered, and reaches the debugger again.

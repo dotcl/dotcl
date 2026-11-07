@@ -640,11 +640,34 @@
 
 (export 'dotnet::ref (find-package :dotnet))
 
+;;; A type whose indexer is not called Item (String and StringBuilder: Chars) names it with
+;;; DefaultMemberAttribute; PREFIX is "get_" or "set_".
+(defun dotnet::%indexer-accessor (obj prefix)
+  (let ((name (ignore-errors
+               (dotnet:invoke (dotnet:invoke (dotnet:invoke (dotnet:invoke obj "GetType")
+                                                            "GetDefaultMembers")
+                                             "GetValue" 0)
+                              "Name"))))
+    (concatenate 'string prefix (if (stringp name) name "Item"))))
+
 (defun dotnet::ref (obj &rest keys)
-  (apply #'dotnet:invoke obj "get_Item" keys))
+  (handler-case (apply #'dotnet:invoke obj "get_Item" keys)
+    (program-error (e)
+      (let ((accessor (dotnet::%indexer-accessor obj "get_")))
+        (if (string= accessor "get_Item")
+            (error e)
+            (apply #'dotnet:invoke obj accessor keys))))))
+
+(defun dotnet::%set-ref (obj keys val)
+  (handler-case (apply #'dotnet:invoke obj "set_Item" (append keys (list val)))
+    (program-error (e)
+      (let ((accessor (dotnet::%indexer-accessor obj "set_")))
+        (if (string= accessor "set_Item")
+            (error e)
+            (apply #'dotnet:invoke obj accessor (append keys (list val))))))))
 
 (defsetf dotnet::ref (obj &rest keys) (val)
-  `(progn (dotnet:invoke ,obj "set_Item" ,@keys ,val)
+  `(progn (dotnet::%set-ref ,obj (list ,@keys) ,val)
           ,val))
 
 ;;; ---------------------------------------------------------------------------

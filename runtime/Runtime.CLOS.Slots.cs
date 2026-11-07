@@ -61,7 +61,8 @@ public static partial class Runtime
             // Custom metaclass takes priority
             if (!lc.IsBuiltIn && !lc.IsStructureClass && lc.Metaclass != null)
                 return lc.Metaclass;
-            string metaName = lc.IsBuiltIn ? "BUILT-IN-CLASS"
+            string metaName = lc.IsBuiltIn && !ReferenceEquals(lc.Name, Startup.Sym("STRUCTURE-OBJECT")) ? "BUILT-IN-CLASS"
+                            : ReferenceEquals(lc.Name, Startup.Sym("STRUCTURE-OBJECT")) ? "STRUCTURE-CLASS"
                             : lc.IsStructureClass ? "STRUCTURE-CLASS"
                             : "STANDARD-CLASS";
             if (_classRegistry.TryGetValue(Startup.Sym(metaName), out var meta)) return meta;
@@ -122,6 +123,7 @@ public static partial class Runtime
             LispVector v when v.IsBitVector && v.Rank == 1 =>
                 v.IsSimple ? "SIMPLE-BIT-VECTOR" : "BIT-VECTOR",
             LispVector v when v.Rank != 1 => "ARRAY",
+            LispVector v when v.IsSimple && v.ElementTypeName == "T" => "SIMPLE-VECTOR",
             LispVector => "VECTOR",
             LispLogicalPathname => "LOGICAL-PATHNAME",
             LispPathname => "PATHNAME",
@@ -150,6 +152,9 @@ public static partial class Runtime
     {
         if (cls is not LispClass lc)
             throw new LispErrorException(new LispTypeError("ALLOCATE-INSTANCE: not a class", cls));
+        // A built-in class has no instances to make (SBCL signals here too).
+        if (lc.IsBuiltIn && !lc.IsStructureClass && !ReferenceEquals(lc.Name, Startup.Sym("STRUCTURE-OBJECT")))
+            throw new LispErrorException(new LispError("ALLOCATE-INSTANCE: cannot allocate an instance of the built-in class " + lc.Name.Name));
         // A structure-class instance must be a LispStruct, not a CLOS LispInstance:
         // equalp compares two LispStructs slot-by-slot and returns NIL if either side
         // is a LispInstance, and make-load-form-saving-slots emits allocate-instance as

@@ -57,7 +57,7 @@ jobs:
   release:
     needs: test
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: write   # required by softprops/action-gh-release
 

@@ -853,6 +853,15 @@ public class LispStruct : LispObject
         DotCL.Diagnostics.AllocCounter.Inc("LispStruct");
     }
 
+    /// <summary>Forget the structures a module of this name interned (see
+    /// LispInstance.EvictInternedModule).</summary>
+    public static void EvictInternedModule(string moduleName)
+    {
+        var prefix = moduleName + ".";
+        foreach (var k in _internCache.Keys)
+            if (k.StartsWith(prefix, StringComparison.Ordinal)) _internCache.TryRemove(k, out _);
+    }
+
     /// <summary>
     /// Intern a struct by content key for EQ preservation across FASL loads.
     /// Called from IL emitted by EmitLoadConstInline.
@@ -1655,6 +1664,83 @@ public sealed class LispVector : LispObject
         return _elements[index] ?? Nil.Instance;
     }
 
+    /// <summary>A numeric array of integers kept in a typed CLR array (not displaced; not a float,
+    /// character or (unsigned-byte 64) array).</summary>
+    internal bool IsPlainIntegerNum =>
+        _displacedTo == null && _numData != null
+        && _numKind != 0 && _numKind != 5 && _numKind != 6 && _numKind != 7 && _numKind != 11;
+
+    private static int IdxOf<T>(T[] a, T v, int start, int n, bool fromEnd) where T : IEquatable<T>
+        => fromEnd ? Array.LastIndexOf(a, v, start + n - 1, n) : Array.IndexOf(a, v, start, n);
+
+    /// <summary>Index of the first (the last when FROMEND) element of [START, END) equal to the
+    /// integer VALUE; -1 when there is none; -2 when this is not a plain integer array.</summary>
+    internal int NumIndexOf(long value, int start, int end, bool fromEnd)
+    {
+        if (!IsPlainIntegerNum) return -2;
+        int n = end - start;
+        if (n <= 0) return -1;
+        switch (_numKind)
+        {
+            case 1: return (ulong)value > byte.MaxValue ? -1 : IdxOf(ArrayCast<byte>(_numData), (byte)value, start, n, fromEnd);
+            case 2: return (ulong)value > ushort.MaxValue ? -1 : IdxOf(ArrayCast<ushort>(_numData), (ushort)value, start, n, fromEnd);
+            case 3: return value < int.MinValue || value > int.MaxValue ? -1 : IdxOf(ArrayCast<int>(_numData), (int)value, start, n, fromEnd);
+            case 4: return ArrayAs<long>(_numData) is { } la ? IdxOf(la, value, start, n, fromEnd) : -2;
+        }
+        if (fromEnd) { for (int i = end - 1; i >= start; i--) if (NumGet(i) == value) return i; }
+        else { for (int i = start; i < end; i++) if (NumGet(i) == value) return i; }
+        return -1;
+    }
+
+    /// <summary>How many elements of [START, END) equal the integer VALUE; -1 when this is not a plain integer array.</summary>
+    internal int NumCountOf(long value, int start, int end)
+    {
+        if (!IsPlainIntegerNum) return -1;
+        int count = 0;
+        switch (_numKind)
+        {
+            case 1: { if ((ulong)value > byte.MaxValue) return 0; var a = ArrayCast<byte>(_numData); byte v = (byte)value; for (int i = start; i < end; i++) if (a[i] == v) count++; return count; }
+            case 2: { if ((ulong)value > ushort.MaxValue) return 0; var a = ArrayCast<ushort>(_numData); ushort v = (ushort)value; for (int i = start; i < end; i++) if (a[i] == v) count++; return count; }
+            case 3: { if (value < int.MinValue || value > int.MaxValue) return 0; var a = ArrayCast<int>(_numData); int v = (int)value; for (int i = start; i < end; i++) if (a[i] == v) count++; return count; }
+            case 4: { if (ArrayAs<long>(_numData) is not { } a) return -1; for (int i = start; i < end; i++) if (a[i] == value) count++; return count; }
+        }
+        for (int i = start; i < end; i++) if (NumGet(i) == value) count++;
+        return count;
+    }
+
+    /// <summary>Index of the first (the last when FROMEND) element of [START, END) that is minus (OP 1),
+    /// zero (OP 0) or plus (OP 2); -1 when none; -2 when this is not a plain integer array.</summary>
+    internal int NumIndexWhereSign(int op, int start, int end, bool fromEnd)
+    {
+        if (!IsPlainIntegerNum) return -2;
+        if (end <= start) return -1;
+        // An unsigned array has no minus element.
+        if (op == 1 && (_numKind == 1 || _numKind == 2 || _numKind == 8)) return -1;
+        if (fromEnd)
+        {
+            for (int i = end - 1; i >= start; i--) { long x = NumGet(i); if (op == 1 ? x < 0 : op == 0 ? x == 0 : x > 0) return i; }
+        }
+        else
+        {
+            for (int i = start; i < end; i++) { long x = NumGet(i); if (op == 1 ? x < 0 : op == 0 ? x == 0 : x > 0) return i; }
+        }
+        return -1;
+    }
+
+    /// <summary>Store ITEM into elements [START, END) of a vector that keeps its elements as
+    /// objects (not displaced, not a bit or numeric array); false for any other vector.</summary>
+    internal bool TryFillObjects(int start, int end, LispObject item)
+    {
+        if (_displacedTo != null || _bitData != null || _numData != null || _elements == null) return false;
+#if NETSTANDARD2_0
+        var elements = _elements;
+        for (int i = start; i < end; i++) elements[i] = item;
+#else
+        System.Array.Fill(_elements, item, start, end - start);
+#endif
+        return true;
+    }
+
     private void RawSet(int index, LispObject val)
     {
         if (_displacedTo != null) { _displacedTo.RawSet(_displacedOffset + index, val); return; }
@@ -2136,6 +2222,15 @@ public sealed class LispHashTable : LispObject
     private readonly object _lock = new();
     public bool Synchronized { get; }
 
+    /// <summary>The :rehash-size and :rehash-threshold the table was made with, as
+    /// given (HASH-TABLE-REHASH-SIZE and HASH-TABLE-REHASH-THRESHOLD return them).
+    /// The table does not use them to size itself.</summary>
+    public LispObject RehashSize { get; set; } = new SingleFloat(1.5f);
+    /// <summary>The :size the table was made with, which HASH-TABLE-SIZE reports until the
+    /// table holds more entries than that; -1 when none was given.</summary>
+    public int DeclaredSize { get; set; } = -1;
+    public LispObject RehashThreshold { get; set; } = new SingleFloat(1.0f);
+
     // Bumped after every store, removal and clear. Something that remembers what
     // it read from a table (the tree-walk evaluator's expansion cache reads the
     // compiler's *MACROS*) compares this instead of reading the table again.
@@ -2478,6 +2573,27 @@ public sealed class LispHashTable : LispObject
         }
     }
 
+    /// <summary>The live entries as one array, key then value, in the order of Entries
+    /// (the order MAPHASH walks), for the hash-table iterators: no pair objects.</summary>
+    public LispObject[] FlatSnapshot()
+    {
+        if (Weakness == null && !Synchronized)
+        {
+            var arr = new LispObject[_dict.Count * 2];
+            int i = 0;
+            foreach (var kv in _dict)
+            {
+                arr[i++] = (LispObject)kv.Key;
+                arr[i++] = (LispObject)kv.Value;
+            }
+            return arr;
+        }
+        var snap = Entries is KeyValuePair<LispObject, LispObject>[] a ? a : new List<KeyValuePair<LispObject, LispObject>>(Entries).ToArray();
+        var flat = new LispObject[snap.Length * 2];
+        for (int i = 0; i < snap.Length; i++) { flat[2 * i] = snap[i].Key; flat[2 * i + 1] = snap[i].Value; }
+        return flat;
+    }
+
     private KeyValuePair<LispObject, LispObject>[] SnapshotAlive()
     {
         if (Weakness == null)
@@ -2643,6 +2759,7 @@ public sealed class LispHashTable : LispObject
             if (a is Fixnum fa) return b is Fixnum fb ? fa.Value == fb.Value : b is Number nb0 && NumbersEqualp(fa, nb0);
             if (a is Cons ca2)
             {
+                Runtime.StackGuard("EQUALP");
                 if (b is not Cons cb2 || !Equalp(ca2.Car, cb2.Car)) return false;
                 a = ca2.Cdr;
                 b = cb2.Cdr;
@@ -2658,6 +2775,7 @@ public sealed class LispHashTable : LispObject
                 if (!LispStruct.TryAs(b, out var sb)) return false;
                 if (!SameStructType(sa.TypeName, sb.TypeName)) return false;
                 if (sa.SlotCount != sb.SlotCount) return false;
+                Runtime.StackGuard("EQUALP");
                 for (int i = 0; i < sa.SlotCount; i++)
                     if (!Equalp(sa.GetSlot(i), sb.GetSlot(i))) return false;
                 return true;
@@ -2849,6 +2967,26 @@ public sealed class LispHashTable : LispObject
 
         private static int GetEqualHash(LispObject obj) => GetEqualHash(obj, EqualHashMaxDepth);
 
+        // A list hashes by its first elements, walked along the spine in a loop (a long or circular
+        // list stops after EqualHashMaxDepth conses); the elements themselves descend one level less.
+        private static int ConsEqualHash(Cons c, int depth)
+        {
+            int h = 17;
+            LispObject cur = c;
+            for (int i = 0; i < EqualHashMaxDepth && cur is Cons cc; i++, cur = cc.Cdr)
+                h = unchecked(h * 31 + GetEqualHash(cc.Car, depth - 1));
+            return h;
+        }
+
+        private static int ConsEqualpHash(Cons c, int depth)
+        {
+            int h = 17;
+            LispObject cur = c;
+            for (int i = 0; i < EqualHashMaxDepth && cur is Cons cc; i++, cur = cc.Cdr)
+                h = unchecked(h * 31 + GetEqualpHash(cc.Car, depth - 1));
+            return h;
+        }
+
         private static int GetEqualHash(LispObject obj, int depth)
         {
             if (depth == 0) return 0;
@@ -2859,7 +2997,7 @@ public sealed class LispHashTable : LispObject
                 // it on every lookup.
                 LispString s => Compat.StringHash(s.Chars),
                 LispVector v when v.IsCharVector => Compat.StringHash(v.ToCharString()),
-                Cons c => HashCode.Combine(GetEqualHash(c.Car, depth - 1), GetEqualHash(c.Cdr, depth - 1)),
+                Cons c => ConsEqualHash(c, depth),
                 LispVector bv when bv.IsBitVector => HashBitVector(bv),
                 LispPathname pn => PathnameHash(pn, depth),
                 // EQUAL falls back to EQL for numbers and characters, so they
@@ -2948,7 +3086,7 @@ public sealed class LispHashTable : LispObject
                     : HashCode.Combine(Arithmetic.ToDouble(cx.Real).GetHashCode(),
                                        Arithmetic.ToDouble(cx.Imaginary).GetHashCode()),
                 Number n => Arithmetic.ToDouble(n).GetHashCode(),
-                Cons c => HashCode.Combine(GetEqualpHash(c.Car, depth - 1), GetEqualpHash(c.Cdr, depth - 1)),
+                Cons c => ConsEqualpHash(c, depth),
                 // EQUALP compares structures slot by slot, hash tables by test,
                 // count and entries, and pathnames as EQUAL does, so none of them
                 // may hash by identity: two EQUALP keys landed in different

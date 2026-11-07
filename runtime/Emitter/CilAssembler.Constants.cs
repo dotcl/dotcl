@@ -176,14 +176,26 @@ public partial class CilAssembler
             ist.Push(c.Cdr);
             ist.Push(c.Car);
         }
-        if (literals.Count < 2) return shared;
+        if (literals.Count == 0) return shared;
 
+        // An instance made by MAKE-LOAD-FORM is built by code of its own, apart from the literal that
+        // contains it: its slot values are one more literal each, so an object a literal and an
+        // instance (or two instances) both contain is shared like one two literals contain.
         var owner = new Dictionary<LispObject, LispObject>(ReferenceEqualityComparer.Instance);
         var st = new Stack<LispObject>();
-        foreach (var root in literals)
+        var instanceRoots = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+        var work = new List<LispObject>(literals);
+        foreach (var lit in literals) if (lit is LispInstance) instanceRoots.Add(lit);
+        for (int w = 0; w < work.Count; w++)
         {
+            var root = work[w];
             var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
-            st.Push(root);
+            if (root is LispInstance rootInstance)
+            {
+                foreach (var sl in rootInstance.Slots) if (sl is LispObject so) st.Push(so);
+            }
+            else
+                st.Push(root);
             while (st.Count > 0)
             {
                 var node = st.Pop();
@@ -207,10 +219,16 @@ public partial class CilAssembler
                         foreach (var sl in ls.SlotsSnapshot()) if (sl is LispObject so) st.Push(so);
                         break;
                     case LispHashTable ht:
-                        foreach (var kv in ht.Entries) { st.Push(kv.Value); st.Push(kv.Key); }
+                        // The entries of a table in an instance's slot are left alone: the tables of many
+                        // instances are copies of one prototype the fasl keeps (see HtPrototypePart), and
+                        // making each build its entries in full for the sake of objects they share would
+                        // undo that.
+                        if (root is not LispInstance)
+                            foreach (var kv in ht.Entries) { st.Push(kv.Value); st.Push(kv.Key); }
                         break;
                     case LispInstance li:
-                        foreach (var sl in li.Slots) if (sl is LispObject so) st.Push(so);
+                        // its slots are walked as a root of their own
+                        if (instanceRoots.Add(li)) work.Add(li);
                         break;
                 }
             }

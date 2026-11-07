@@ -51,16 +51,16 @@ public static partial class Runtime
             switch (kwName)
             {
                 case "START1":
-                    if (!start1Seen) { start1 = val is Fixnum fs1 ? (int)fs1.Value : val is Nil ? 0 : throw new LispErrorException(new LispProgramError($"{fname}: :start1 must be integer")); start1Seen = true; }
+                    if (!start1Seen) { start1 = val is Fixnum fs1 ? Runtime.ClampIndex(fs1.Value) : val is Nil ? 0 : throw new LispErrorException(new LispProgramError($"{fname}: :start1 must be integer")); start1Seen = true; }
                     break;
                 case "END1":
-                    if (!end1Seen) { end1 = val is Fixnum fe1 ? (int)fe1.Value : val is Nil ? s1.Length : throw new LispErrorException(new LispProgramError($"{fname}: :end1 must be integer or nil")); end1Seen = true; }
+                    if (!end1Seen) { end1 = val is Fixnum fe1 ? Runtime.ClampIndex(fe1.Value) : val is Nil ? s1.Length : throw new LispErrorException(new LispProgramError($"{fname}: :end1 must be integer or nil")); end1Seen = true; }
                     break;
                 case "START2":
-                    if (!start2Seen) { start2 = val is Fixnum fs2 ? (int)fs2.Value : val is Nil ? 0 : throw new LispErrorException(new LispProgramError($"{fname}: :start2 must be integer")); start2Seen = true; }
+                    if (!start2Seen) { start2 = val is Fixnum fs2 ? Runtime.ClampIndex(fs2.Value) : val is Nil ? 0 : throw new LispErrorException(new LispProgramError($"{fname}: :start2 must be integer")); start2Seen = true; }
                     break;
                 case "END2":
-                    if (!end2Seen) { end2 = val is Fixnum fe2 ? (int)fe2.Value : val is Nil ? s2.Length : throw new LispErrorException(new LispProgramError($"{fname}: :end2 must be integer or nil")); end2Seen = true; }
+                    if (!end2Seen) { end2 = val is Fixnum fe2 ? Runtime.ClampIndex(fe2.Value) : val is Nil ? s2.Length : throw new LispErrorException(new LispProgramError($"{fname}: :end2 must be integer or nil")); end2Seen = true; }
                     break;
                 case "ALLOW-OTHER-KEYS": if (allowOtherKeys == null) allowOtherKeys = IsTruthy(val); break;
                 default: hasUnknown = true; break;
@@ -88,10 +88,10 @@ public static partial class Runtime
         int start1 = 0, end1 = s1.Length, start2 = 0, end2 = s2.Length;
         switch (kw.Name)
         {
-            case "START1": start1 = (int)fv.Value; break;
-            case "END1": end1 = (int)fv.Value; break;
-            case "START2": start2 = (int)fv.Value; break;
-            case "END2": end2 = (int)fv.Value; break;
+            case "START1": start1 = Runtime.ClampIndex(fv.Value); break;
+            case "END1": end1 = Runtime.ClampIndex(fv.Value); break;
+            case "START2": start2 = Runtime.ClampIndex(fv.Value); break;
+            case "END2": end2 = Runtime.ClampIndex(fv.Value); break;
             default: return false;
         }
         if (start1 < 0 || end1 > s1.Length || start1 > end1 ||
@@ -300,36 +300,49 @@ public static partial class Runtime
 
     // --- Sequence operations ---
 
+    /// <summary>A bounding index as an int. An index beyond int range is past the end of any
+    /// sequence here, so it clamps to the nearest int and fails the usual range check, instead
+    /// of wrapping to a small valid-looking index.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static int ClampIndex(long v) =>
+        unchecked((ulong)(v - int.MinValue)) <= uint.MaxValue ? (int)v : (v < 0 ? int.MinValue : int.MaxValue);
+
     public static LispObject Elt(LispObject seq, LispObject index)
     {
         if (index is not Fixnum f)
             throw new LispErrorException(new LispTypeError("ELT: index must be integer", index));
         long idx = f.Value;
-        if (idx < 0)
-            throw new LispErrorException(new LispTypeError($"ELT: index {idx} is negative", index));
-        int i = (int)idx;
+        int i;
+        if ((ulong)idx > int.MaxValue)
+        {
+            if (idx < 0)
+                throw new LispErrorException(new LispTypeError($"ELT: index {idx} is negative", index));
+            // An index beyond int is past the end of anything this implementation can hold.
+            i = int.MaxValue;
+        }
+        else i = (int)idx;
         if (seq is LispVector v)
         {
-            if (i >= v.Length) throw new LispErrorException(new LispTypeError($"ELT: index {i} out of bounds for vector of length {v.Length}", index));
+            if (i >= v.Length) throw new LispErrorException(new LispTypeError($"ELT: index {idx} out of bounds for vector of length {v.Length}", index));
             return v[i];
         }
         if (seq is LispString s)
         {
-            if (i >= s.Length) throw new LispErrorException(new LispTypeError($"ELT: index {i} out of range for string of length {s.Length}", index));
+            if (i >= s.Length) throw new LispErrorException(new LispTypeError($"ELT: index {idx} out of range for string of length {s.Length}", index));
             return LispChar.Make(s[i]);
         }
         if (seq is Nil)
-            throw new LispErrorException(new LispTypeError($"ELT: index {i} out of bounds for empty sequence", index));
+            throw new LispErrorException(new LispTypeError($"ELT: index {idx} out of bounds for empty sequence", index));
         if (seq is Cons)
         {
             var cur = seq;
             for (int j = 0; j < i; j++)
             {
-                if (cur is not Cons c) throw new LispErrorException(new LispTypeError($"ELT: index {i} out of bounds for list", index));
+                if (cur is not Cons c) throw new LispErrorException(new LispTypeError($"ELT: index {idx} out of bounds for list", index));
                 cur = c.Cdr;
             }
             if (cur is Cons cn) return cn.Car;
-            throw new LispErrorException(new LispTypeError($"ELT: index {i} out of bounds for list", index));
+            throw new LispErrorException(new LispTypeError($"ELT: index {idx} out of bounds for list", index));
         }
         throw new LispErrorException(new LispTypeError("ELT: not a sequence", seq));
     }
@@ -354,14 +367,14 @@ public static partial class Runtime
         var cur = seq;
         while (cur is Cons c) { len++; cur = c.Cdr; }
         if (cur is not Nil)
-            throw new LispErrorException(new LispTypeError($"{fname}: not a proper list", seq, Startup.Sym("LIST")));
+            throw new LispErrorException(new LispTypeError($"{fname}: not a proper list", cur, Startup.Sym("LIST")));
         return len;
     }
 
     public static LispObject Subseq(LispObject seq, LispObject start, LispObject end)
     {
-        int s = (start is Fixnum fs) ? (int)fs.Value : throw new LispErrorException(new LispTypeError("SUBSEQ: start must be integer", start));
-        int? e = end is Nil ? null : (end is Fixnum fe ? (int?)fe.Value : throw new LispErrorException(new LispTypeError("SUBSEQ: end must be integer or nil", end)));
+        int s = (start is Fixnum fs) ? Runtime.ClampIndex(fs.Value) : throw new LispErrorException(new LispTypeError("SUBSEQ: start must be integer", start));
+        int? e = end is Nil ? null : (end is Fixnum fe ? (int?)Runtime.ClampIndex(fe.Value) : throw new LispErrorException(new LispTypeError("SUBSEQ: end must be integer or nil", end)));
 
         if (seq is LispString str)
         {
@@ -379,7 +392,27 @@ public static partial class Runtime
         }
         if (seq is Cons || seq is Nil)
         {
-            // List subseq
+            // List subseq. With an END the walk stops there, so a circular list can be cut
+            // ((subseq circular 0 5) is the usual way to take a few elements of one); the length is
+            // only known, for the error message, when the list ends before END.
+            if (e is int endGiven)
+            {
+                var walk = seq;
+                // A negative START or an END below START is an error whatever the list holds.
+                if (s < 0 || endGiven < s) CheckBoundingIndices(s, endGiven, int.MaxValue, "SUBSEQ");
+                for (int i = 0; i < s; i++)
+                {
+                    if (walk is Cons wc) walk = wc.Cdr;
+                    else CheckBoundingIndices(s, endGiven, i, "SUBSEQ");
+                }
+                var taken = new LispObject[endGiven - s];
+                for (int i = 0; i < taken.Length; i++)
+                {
+                    if (walk is Cons wc) { taken[i] = wc.Car; walk = wc.Cdr; }
+                    else CheckBoundingIndices(s, endGiven, s + i, "SUBSEQ");
+                }
+                return List(taken);
+            }
             int listLen = ListLength(seq);
             CheckBoundingIndices(s, e ?? listLen, listLen, "SUBSEQ");
             LispObject cur = seq;
@@ -1285,7 +1318,8 @@ public static partial class Runtime
                     throw new LispErrorException(new LispError($"COERCE: no function bound to {funcSym.Name}"));
                 }
                 // Coerce a lambda-form (lambda ...) to function
-                if (obj is Cons lambdaCons && lambdaCons.Car is Symbol lambdaSym && lambdaSym.Name == "LAMBDA")
+                if (obj is Cons lambdaCons && lambdaCons.Car is Symbol lambdaSym && lambdaSym.Name == "LAMBDA"
+                    && lambdaCons.Cdr is Cons lambdaRest && (lambdaRest.Car is Nil || lambdaRest.Car is Cons))
                     return Eval(obj);
                 throw new LispErrorException(new LispTypeError($"COERCE: cannot coerce to function", obj));
 
@@ -1330,18 +1364,18 @@ public static partial class Runtime
         {
             case "TEST":
                 if (seen.IfForm) { seen.Unknown = true; break; }
-                if (!seen.Test) { kw.Test = CoerceToFunction(val); seen.Test = true; }
+                if (!seen.Test) { if (val is not Nil) kw.Test = CoerceToFunction(val); seen.Test = true; }
                 break;
             case "TEST-NOT":
                 if (seen.IfForm) { seen.Unknown = true; break; }
-                if (!seen.TestNot) { kw.TestNot = CoerceToFunction(val); seen.TestNot = true; }
+                if (!seen.TestNot) { if (val is not Nil) kw.TestNot = CoerceToFunction(val); seen.TestNot = true; }
                 break;
             case "KEY": if (!seen.Key) { if (val is not Nil) kw.Key = CoerceToFunction(val); seen.Key = true; } break;
             case "START":
-                if (!seen.Start) { kw.Start = (int)((Fixnum)val).Value; seen.Start = true; }
+                if (!seen.Start) { kw.Start = SeqBoundIndex(val, fnName) ?? 0; seen.Start = true; }
                 break;
             case "END":
-                if (!seen.End) { kw.End = val is Fixnum ef ? (int?)ef.Value : null; seen.End = true; }
+                if (!seen.End) { kw.End = SeqBoundIndex(val, fnName); seen.End = true; }
                 break;
             case "FROM-END":
                 if (!seen.FromEnd) { kw.FromEnd = IsTruthy(val); seen.FromEnd = true; }
@@ -1363,6 +1397,21 @@ public static partial class Runtime
 
     private static bool? AllowOtherKeysValue(LispObject key, LispObject val) =>
         key is Symbol s && s.Name == "ALLOW-OTHER-KEYS" ? IsTruthy(val) : null;
+
+    /// <summary>A :START / :END value as an int, or null for NIL. An integer outside the int range is
+    /// clamped to the nearest end of it (int.MaxValue / -1), never wrapped, so the bounding-index
+    /// check that follows reports it ((find 2 list :end (expt 2 32)) was read as 0).</summary>
+    private static int? SeqBoundIndex(LispObject val, string fnName)
+    {
+        switch (val)
+        {
+            case Nil: return null;
+            case Fixnum f: return f.Value > int.MaxValue ? int.MaxValue : f.Value < 0 ? -1 : (int)f.Value;
+            case Bignum b: return b.Value.Sign > 0 ? int.MaxValue : -1;
+            default:
+                throw new LispErrorException(new LispTypeError($"{fnName}: invalid index", val, Startup.Sym("UNSIGNED-BYTE")));
+        }
+    }
 
     private static SeqKwArgs ParseSeqKwArgs(LispObject[] args, int kwStart, string fnName, bool ifForm = false)
     {
@@ -1406,7 +1455,21 @@ public static partial class Runtime
         return kw;
     }
 
-    static LispObject? s_eqlFn, s_eqFn, s_equalFn, s_numEqFn, s_charEqFn;
+    static LispObject? s_eqlFn, s_eqFn, s_equalFn, s_numEqFn, s_charEqFn, s_equalpFn;
+
+    /// <summary>The hash-table test name that stands for KW's test (EQL when none, or EQL,
+    /// EQUAL, EQUALP), or null when the test is anything else (including :TEST-NOT) and
+    /// elements have to be compared pairwise.</summary>
+    private static string? HashableSeqTest(in SeqKwArgs kw)
+    {
+        if (kw.TestNot != null) return null;
+        var t = kw.Test;
+        if (t == null) return "EQL";
+        if (ReferenceEquals(t, SeqStandardFunction(ref s_eqlFn, "EQL"))) return "EQL";
+        if (ReferenceEquals(t, SeqStandardFunction(ref s_equalFn, "EQUAL"))) return "EQUAL";
+        if (ReferenceEquals(t, SeqStandardFunction(ref s_equalpFn, "EQUALP"))) return "EQUALP";
+        return null;
+    }
     static LispObject? s_minuspFn, s_zeropFn, s_pluspFn;
 
     private static LispObject? SeqStandardFunction(ref LispObject? cache, string name)
@@ -1437,6 +1500,101 @@ public static partial class Runtime
         if (ReferenceEquals(predFn, SeqStandardFunction(ref s_zeropFn, "ZEROP"))) return SeqPredKind.ZeroP;
         if (ReferenceEquals(predFn, SeqStandardFunction(ref s_pluspFn, "PLUSP"))) return SeqPredKind.PlusP;
         return SeqPredKind.General;
+    }
+
+    /// <summary>ITEM is a fixnum and the keywords ask for the plain EQL or = test (no :key, no :test-not):
+    /// an integer array can then be searched without boxing its elements.</summary>
+    private static bool IsPlainFixnumQuery(LispObject item, in SeqKwArgs kw, out long value)
+    {
+        value = 0;
+        if (kw.Key != null || kw.TestNot != null) return false;
+        if (kw.TestKind != SeqTestKind.Eql && kw.TestKind != SeqTestKind.NumEq) return false;
+        if (UnwrapMv(item) is not Fixnum f) return false;
+        value = f.Value;
+        return true;
+    }
+
+    private static int SignOpOf(SeqPredKind kind) => kind switch
+    {
+        SeqPredKind.MinusP => 1, SeqPredKind.ZeroP => 0, SeqPredKind.PlusP => 2, _ => -1,
+    };
+
+    /// <summary>MAP with one sequence (a list, a vector or a string), a function object, and a result type
+    /// of NIL, LIST, VECTOR or SIMPLE-VECTOR: the walk and the result are built here, with no
+    /// intermediate list. Answers the keyword :%NO when the call has another shape, and the caller
+    /// takes the general route; nothing has been called by then.</summary>
+    private static LispObject MapElem(LispObject seq, int i)
+        => seq is LispVector v ? v[i] : LispChar.Make(((LispString)seq)[i]);
+
+    public static LispObject Map1Fast(LispObject resultType, LispObject function, LispObject seq)
+    {
+        if (function is not LispFunction fn) return Startup.Keyword("%NO");
+        int kind;
+        if (resultType is Nil) kind = 0;
+        else if (resultType is Symbol rs && rs.HomePackage == Startup.CL)
+        {
+            switch (rs.Name)
+            {
+                case "LIST": kind = 1; break;
+                case "VECTOR": case "SIMPLE-VECTOR": kind = 2; break;
+                default: return Startup.Keyword("%NO");
+            }
+        }
+        else return Startup.Keyword("%NO");
+
+        if (seq is Cons || seq is Nil)
+        {
+            if (kind == 0)
+            {
+                var c0 = seq;
+                for (; c0 is Cons cc; c0 = cc.Cdr) fn.Invoke1(cc.Car);
+                if (c0 is not Nil) throw new LispErrorException(new LispTypeError("MAP: not a proper list", c0, Startup.Sym("LIST")));
+                MultipleValues.Reset();
+                return Nil.Instance;
+            }
+            if (kind == 1)
+            {
+                Cons? head = null, tail = null;
+                var cur = seq;
+                for (; cur is Cons c; cur = c.Cdr)
+                {
+                    var cell = new Cons(UnwrapMv(fn.Invoke1(c.Car)), Nil.Instance);
+                    if (tail == null) head = cell; else tail.Cdr = cell;
+                    tail = cell;
+                }
+                if (cur is not Nil) throw new LispErrorException(new LispTypeError("MAP: not a proper list", cur, Startup.Sym("LIST")));
+                return head ?? (LispObject)Nil.Instance;
+            }
+            var items = new System.Collections.Generic.List<LispObject>();
+            var cv = seq;
+            for (; cv is Cons c2; cv = c2.Cdr) items.Add(UnwrapMv(fn.Invoke1(c2.Car)));
+            if (cv is not Nil) throw new LispErrorException(new LispTypeError("MAP: not a proper list", cv, Startup.Sym("LIST")));
+            return new LispVector(items.ToArray());
+        }
+        int len;
+        if (seq is LispVector vec0) len = vec0.Length;
+        else if (seq is LispString str0) len = str0.Length;
+        else return Startup.Keyword("%NO");
+        if (kind == 0)
+        {
+            for (int i = 0; i < len; i++) fn.Invoke1(MapElem(seq, i));
+            MultipleValues.Reset();
+            return Nil.Instance;
+        }
+        if (kind == 1)
+        {
+            Cons? head = null, tail = null;
+            for (int i = 0; i < len; i++)
+            {
+                var cell = new Cons(UnwrapMv(fn.Invoke1(MapElem(seq, i))), Nil.Instance);
+                if (tail == null) head = cell; else tail.Cdr = cell;
+                tail = cell;
+            }
+            return head ?? (LispObject)Nil.Instance;
+        }
+        var arr = new LispObject[len];
+        for (int i = 0; i < len; i++) arr[i] = UnwrapMv(fn.Invoke1(MapElem(seq, i)));
+        return new LispVector(arr);
     }
 
     private static bool SeqPredicateMatch(LispFunction predFn, LispObject elem,
@@ -1596,7 +1754,7 @@ public static partial class Runtime
 
     private static LispObject FindScan(LispObject item, LispObject seq, in SeqKwArgs kw)
     {
-        int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
+        int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : SeqLengthOf(seq, "FIND");
         int start = kw.Start;
         int end = kw.End ?? len;
         CheckBoundingIndices(start, end, len, "FIND");
@@ -1613,14 +1771,20 @@ public static partial class Runtime
                 int at = CharVectorIndex(vec, ((LispChar)item).Value, ck == 2, start, end, kw.FromEnd);
                 return at < 0 ? Nil.Instance : vec[at];
             }
+            if (vec.IsPlainIntegerNum && IsPlainFixnumQuery(item, kw, out long numFind))
+            {
+                int at = vec.NumIndexOf(numFind, start, end, kw.FromEnd);
+                if (at >= -1) return at < 0 ? Nil.Instance : vec[at];
+            }
+            var m = new SeqMatcher(item, kw);
             if (kw.FromEnd)
             {
                 for (int i = end - 1; i >= start; i--)
-                    if (SeqTestMatch(item, vec[i], kw)) return vec[i];
+                    if (m.Match(vec[i], kw)) return vec[i];
                 return Nil.Instance;
             }
             for (int i = start; i < end; i++)
-                if (SeqTestMatch(item, vec[i], kw)) return vec[i];
+                if (m.Match(vec[i], kw)) return vec[i];
             return Nil.Instance;
         }
         if (seq is LispString str)
@@ -1631,32 +1795,34 @@ public static partial class Runtime
                 int at = StringCharIndex(str, ((LispChar)item).Value, ck == 2, start, end, kw.FromEnd);
                 return at < 0 ? Nil.Instance : LispChar.Make(str[at]);
             }
+            var m = new SeqMatcher(item, kw);
             if (kw.FromEnd)
             {
                 for (int i = end - 1; i >= start; i--)
                 {
                     var ch = LispChar.Make(str[i]);
-                    if (SeqTestMatch(item, ch, kw)) return ch;
+                    if (m.Match(ch, kw)) return ch;
                 }
                 return Nil.Instance;
             }
             for (int i = start; i < end; i++)
             {
                 var ch = LispChar.Make(str[i]);
-                if (SeqTestMatch(item, ch, kw)) return ch;
+                if (m.Match(ch, kw)) return ch;
             }
             return Nil.Instance;
         }
         // List
+        var ml = new SeqMatcher(item, kw);
         var cur = seq;
         for (int i = 0; i < start && cur is Cons c1; i++) cur = c1.Cdr;
         if (kw.FromEnd)
         {
             LispObject result = Nil.Instance;
-            for (int i = start; i < end && cur is Cons c; i++) { if (SeqTestMatch(item, c.Car, kw)) result = c.Car; cur = c.Cdr; }
+            for (int i = start; i < end && cur is Cons c; i++) { if (ml.Match(c.Car, kw)) result = c.Car; cur = c.Cdr; }
             return result;
         }
-        for (int i = start; i < end && cur is Cons c2; i++) { if (SeqTestMatch(item, c2.Car, kw)) return c2.Car; cur = c2.Cdr; }
+        for (int i = start; i < end && cur is Cons c2; i++) { if (ml.Match(c2.Car, kw)) return c2.Car; cur = c2.Cdr; }
         return Nil.Instance;
     }
 
@@ -1692,7 +1858,7 @@ public static partial class Runtime
 
     private static LispObject FindIfScan(LispFunction predFn, LispObject seq, in SeqKwArgs kw)
     {
-        int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
+        int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : SeqLengthOf(seq, "FIND-IF");
         int start = kw.Start;
         int end = kw.End ?? len;
         CheckBoundingIndices(start, end, len, "FIND-IF");
@@ -1700,6 +1866,11 @@ public static partial class Runtime
 
         if (seq is LispVector vec)
         {
+            if (kind != SeqPredKind.General && vec.IsPlainIntegerNum)
+            {
+                int at = vec.NumIndexWhereSign(SignOpOf(kind), start, end, kw.FromEnd);
+                if (at >= -1) return at < 0 ? Nil.Instance : vec[at];
+            }
             if (kw.FromEnd)
             {
                 // Backwards, stopping at the first match: see FindCore.
@@ -1839,6 +2010,15 @@ public static partial class Runtime
         return position ? PositionCore(item, seq, kw) : FindCore(item, seq, kw);
     }
 
+    /// <summary>Length of a list (or other non-vector sequence) for the search functions;
+    /// a non-sequence is reported under the calling function's name.</summary>
+    private static int SeqLengthOf(LispObject seq, string who)
+    {
+        if (seq is not Cons && seq is not Nil)
+            throw new LispErrorException(new LispTypeError($"{who}: not a sequence", seq, Startup.Sym("SEQUENCE")));
+        return (int)((Fixnum)Length(seq)).Value;
+    }
+
     private static LispObject PositionCore(LispObject item, LispObject seq, in SeqKwArgs kw)
     {
         var r = PositionScan(item, seq, kw);
@@ -1847,7 +2027,7 @@ public static partial class Runtime
 
     private static LispObject PositionScan(LispObject item, LispObject seq, in SeqKwArgs kw)
     {
-        int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
+        int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : SeqLengthOf(seq, "POSITION");
         int start = kw.Start;
         int end = kw.End ?? len;
         CheckBoundingIndices(start, end, len, "POSITION");
@@ -1860,14 +2040,20 @@ public static partial class Runtime
                 int at = CharVectorIndex(vec, ((LispChar)item).Value, ck == 2, start, end, kw.FromEnd);
                 return at < 0 ? Nil.Instance : Fixnum.Make(at);
             }
+            if (vec.IsPlainIntegerNum && IsPlainFixnumQuery(item, kw, out long numPos))
+            {
+                int at = vec.NumIndexOf(numPos, start, end, kw.FromEnd);
+                if (at >= -1) return at < 0 ? Nil.Instance : Fixnum.Make(at);
+            }
+            var m = new SeqMatcher(item, kw);
             if (kw.FromEnd)
             {
                 for (int i = end - 1; i >= start; i--)
-                    if (SeqTestMatch(item, vec[i], kw)) return Fixnum.Make(i);
+                    if (m.Match(vec[i], kw)) return Fixnum.Make(i);
                 return Nil.Instance;
             }
             for (int i = start; i < end; i++)
-                if (SeqTestMatch(item, vec[i], kw)) return Fixnum.Make(i);
+                if (m.Match(vec[i], kw)) return Fixnum.Make(i);
             return Nil.Instance;
         }
         if (seq is LispString str)
@@ -1878,26 +2064,28 @@ public static partial class Runtime
                 int at = StringCharIndex(str, ((LispChar)item).Value, ck == 2, start, end, kw.FromEnd);
                 return at < 0 ? Nil.Instance : Fixnum.Make(at);
             }
+            var m = new SeqMatcher(item, kw);
             if (kw.FromEnd)
             {
                 for (int i = end - 1; i >= start; i--)
-                    if (SeqTestMatch(item, LispChar.Make(str[i]), kw)) return Fixnum.Make(i);
+                    if (m.Match(LispChar.Make(str[i]), kw)) return Fixnum.Make(i);
                 return Nil.Instance;
             }
             for (int i = start; i < end; i++)
-                if (SeqTestMatch(item, LispChar.Make(str[i]), kw)) return Fixnum.Make(i);
+                if (m.Match(LispChar.Make(str[i]), kw)) return Fixnum.Make(i);
             return Nil.Instance;
         }
         // List
+        var ml = new SeqMatcher(item, kw);
         var cur = seq;
         for (int i = 0; i < start && cur is Cons c1; i++) cur = c1.Cdr;
         if (kw.FromEnd)
         {
             LispObject result = Nil.Instance;
-            for (int i = start; i < end && cur is Cons c; i++) { if (SeqTestMatch(item, c.Car, kw)) result = Fixnum.Make(i); cur = c.Cdr; }
+            for (int i = start; i < end && cur is Cons c; i++) { if (ml.Match(c.Car, kw)) result = Fixnum.Make(i); cur = c.Cdr; }
             return result;
         }
-        for (int i = start; i < end && cur is Cons c2; i++) { if (SeqTestMatch(item, c2.Car, kw)) return Fixnum.Make(i); cur = c2.Cdr; }
+        for (int i = start; i < end && cur is Cons c2; i++) { if (ml.Match(c2.Car, kw)) return Fixnum.Make(i); cur = c2.Cdr; }
         return Nil.Instance;
     }
 
@@ -1931,7 +2119,7 @@ public static partial class Runtime
 
     private static LispObject PositionIfScan(LispFunction predFn, LispObject seq, in SeqKwArgs kw)
     {
-        int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
+        int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : SeqLengthOf(seq, "POSITION-IF");
         int start = kw.Start;
         int end = kw.End ?? len;
         CheckBoundingIndices(start, end, len, "POSITION-IF");
@@ -2025,7 +2213,7 @@ public static partial class Runtime
 
     private static LispObject CountScan(LispObject item, LispObject seq, in SeqKwArgs kw)
     {
-        int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
+        int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : SeqLengthOf(seq, "COUNT");
         int start = kw.Start;
         int end = kw.End ?? len;
         CheckBoundingIndices(start, end, len, "COUNT");
@@ -2033,34 +2221,57 @@ public static partial class Runtime
 
         if (seq is LispVector vec)
         {
+            if (vec.IsPlainIntegerNum && IsPlainFixnumQuery(item, kw, out long numCount))
+            {
+                int c = vec.NumCountOf(numCount, start, end);
+                if (c >= 0) return Fixnum.Make(c);
+            }
+            var m = new SeqMatcher(item, kw);
             if (kw.FromEnd)
-                for (int i = end - 1; i >= start; i--) { if (SeqTestMatch(item, vec[i], kw)) count++; }
+                for (int i = end - 1; i >= start; i--) { if (m.Match(vec[i], kw)) count++; }
             else
-                for (int i = start; i < end; i++) { if (SeqTestMatch(item, vec[i], kw)) count++; }
+                for (int i = start; i < end; i++) { if (m.Match(vec[i], kw)) count++; }
             return Fixnum.Make(count);
         }
         if (seq is LispString str)
         {
+            // A character with EQL / CHAR= (1) or CHAR-EQUAL / EQUALP (2): count in the string.
+            int ck = StringCharTestKind(item, kw);
+            if (ck != 0)
+            {
+                char c = ((LispChar)item).Value;
+                if (ck == 2)
+                {
+                    c = FoldChar(c);
+                    for (int i = start; i < end; i++) if (FoldChar(str[i]) == c) count++;
+                }
+                else
+                    for (int i = start; i < end; i++) if (str[i] == c) count++;
+                return Fixnum.Make(count);
+            }
+            var m = new SeqMatcher(item, kw);
             if (kw.FromEnd)
-                for (int i = end - 1; i >= start; i--) { if (SeqTestMatch(item, LispChar.Make(str[i]), kw)) count++; }
+                for (int i = end - 1; i >= start; i--) { if (m.Match(LispChar.Make(str[i]), kw)) count++; }
             else
-                for (int i = start; i < end; i++) { if (SeqTestMatch(item, LispChar.Make(str[i]), kw)) count++; }
+                for (int i = start; i < end; i++) { if (m.Match(LispChar.Make(str[i]), kw)) count++; }
             return Fixnum.Make(count);
         }
+        var ml = new SeqMatcher(item, kw);
         // List - for from-end, collect elements then iterate in reverse
         if (kw.FromEnd)
         {
             var elems = new System.Collections.Generic.List<LispObject>();
-            var cur = seq;
+            var m = new SeqMatcher(item, kw);
+        var cur = seq;
             for (int i = 0; i < start && cur is Cons c1; i++) cur = c1.Cdr;
             for (int i = start; i < end && cur is Cons c2; i++) { elems.Add(c2.Car); cur = c2.Cdr; }
-            for (int i = elems.Count - 1; i >= 0; i--) { if (SeqTestMatch(item, elems[i], kw)) count++; }
+            for (int i = elems.Count - 1; i >= 0; i--) { if (ml.Match(elems[i], kw)) count++; }
         }
         else
         {
             var cur = seq;
             for (int i = 0; i < start && cur is Cons c1; i++) cur = c1.Cdr;
-            for (int i = start; i < end && cur is Cons c2; i++) { if (SeqTestMatch(item, c2.Car, kw)) count++; cur = c2.Cdr; }
+            for (int i = start; i < end && cur is Cons c2; i++) { if (ml.Match(c2.Car, kw)) count++; cur = c2.Cdr; }
         }
         return Fixnum.Make(count);
     }
@@ -2095,7 +2306,7 @@ public static partial class Runtime
 
     private static LispObject CountIfScan(LispFunction predFn, LispObject seq, in SeqKwArgs kw)
     {
-        int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : (int)((Fixnum)Length(seq)).Value;
+        int len = seq is LispVector v ? v.Length : seq is LispString ls ? ls.Length : SeqLengthOf(seq, "COUNT-IF");
         int start = kw.Start;
         int end = kw.End ?? len;
         CheckBoundingIndices(start, end, len, "COUNT-IF");
@@ -2140,7 +2351,7 @@ public static partial class Runtime
     private struct ListKwArgs
     {
         public LispFunction? Test, TestNot, Key;
-        public bool IsEqTest, IsEqlTest; // fast path flags
+        public bool IsEqTest, IsEqlTest, IsEqualTest; // fast path flags
     }
 
     private struct ListKwSeen { public bool Test, TestNot, Key, Unknown, IfForm; }
@@ -2156,11 +2367,11 @@ public static partial class Runtime
         {
             case "TEST":
                 if (seen.IfForm) { seen.Unknown = true; break; }
-                if (!seen.Test) { kw.Test = CoerceToFunction(val); seen.Test = true; }
+                if (!seen.Test) { if (val is not Nil) kw.Test = CoerceToFunction(val); seen.Test = true; }
                 break;
             case "TEST-NOT":
                 if (seen.IfForm) { seen.Unknown = true; break; }
-                if (!seen.TestNot) { kw.TestNot = CoerceToFunction(val); seen.TestNot = true; }
+                if (!seen.TestNot) { if (val is not Nil) kw.TestNot = CoerceToFunction(val); seen.TestNot = true; }
                 break;
             case "KEY": if (!seen.Key) { if (val is not Nil) kw.Key = CoerceToFunction(val); seen.Key = true; } break;
             case "ALLOW-OTHER-KEYS": break;
@@ -2170,7 +2381,7 @@ public static partial class Runtime
 
     // EQ and EQL are looked up once. FindSymbol is a hash lookup, and it ran on
     // every MEMBER/ASSOC call that passed a :test.
-    private static Symbol? s_eqlSym, s_eqSym;
+    private static Symbol? s_eqlSym, s_eqSym, s_equalLSym;
 
     /// <summary>Work out which comparison fast path the parsed keywords allow.</summary>
     private static void FinishListKw(ref ListKwArgs kw)
@@ -2181,6 +2392,7 @@ public static partial class Runtime
         s_eqSym ??= Startup.CL.FindSymbol("EQ").symbol;
         if (kw.Test == s_eqlSym?.Function) kw.IsEqlTest = true;
         else if (kw.Test == s_eqSym?.Function) kw.IsEqTest = true;
+        else if (kw.Test == (s_equalLSym ??= Startup.CL.FindSymbol("EQUAL").symbol)?.Function) kw.IsEqualTest = true;
     }
 
     private static ListKwArgs ParseListKwArgs(LispObject[] args, int kwStart, string fnName,
@@ -2230,6 +2442,8 @@ public static partial class Runtime
         var k = ApplySeqKey(kw, element);
         if (kw.TestNot != null)
             return !IsTruthy(kw.TestNot.Invoke2(item, k));
+        if (kw.IsEqualTest)
+            return IsTrueEqual(item, k);
         if (kw.Test != null)
             return IsTruthy(kw.Test.Invoke2(item, k));
         return IsTrueEql(item, k);
@@ -2475,6 +2689,18 @@ public static partial class Runtime
             if (cur is not Nil) throw new LispErrorException(new LispTypeError("ASSOC: not a proper list", cur));
             return Nil.Instance;
         }
+        // Fast path: equal test, no key
+        if (kw.IsEqualTest)
+        {
+            var cur = alist;
+            for (; cur is Cons c; cur = c.Cdr)
+            {
+                if (c.Car is Cons pair) { if (IsTrueEqual(item, pair.Car)) return pair; }
+                else CheckAssocEntry(c.Car);
+            }
+            if (cur is not Nil) throw new LispErrorException(new LispTypeError("ASSOC: not a proper list", cur));
+            return Nil.Instance;
+        }
         // General case
         {
             var cur = alist;
@@ -2631,8 +2857,8 @@ public static partial class Runtime
             {
                 case "KEY": if (!keySet) { if (args[i + 1] is not Nil) keyFn = CoerceToFunction(args[i + 1]); keySet = true; } break;
                 case "FROM-END": if (!fromEndSet) { fromEnd = IsTruthy(args[i + 1]); fromEndSet = true; } break;
-                case "START": if (!startSet) { startOpt = (int)((Fixnum)args[i + 1]).Value; startSet = true; } break;
-                case "END": if (!endSet) { endOpt = args[i + 1] is Fixnum ef ? (int?)ef.Value : null; endSet = true; } break;
+                case "START": if (!startSet) { startOpt = SeqBoundIndex(args[i + 1], "REDUCE") ?? 0; startSet = true; } break;
+                case "END": if (!endSet) { endOpt = SeqBoundIndex(args[i + 1], "REDUCE"); endSet = true; } break;
                 case "INITIAL-VALUE": if (!ivSet) { iv = args[i + 1]; hasIV = true; ivSet = true; } break;
                 case "ALLOW-OTHER-KEYS": break;
                 default: hasUnknown = true; break;
@@ -2678,6 +2904,8 @@ public static partial class Runtime
             }
             for (; cur is Cons c; cur = c.Cdr)
                 acc = UnwrapMv(fn.Invoke2(acc, ApplyKeyFn(keyFn, c.Car)));
+            if (cur is not Nil)
+                throw new LispErrorException(new LispTypeError("REDUCE: not a proper list", cur, Startup.Sym("LIST")));
             return acc;
         }
 
@@ -2791,14 +3019,61 @@ public static partial class Runtime
     // call and nothing is allocated. IElemMatch exists only to constrain it.
     private interface IElemMatch { bool Match(LispObject elem); }
 
+    /// <summary>The element test of FIND / POSITION / COUNT / REMOVE with an item: the plain EQL
+    /// test (no :key, no :test-not) on a fixnum or an object EQL compares by identity is a
+    /// pointer or value compare of its own; anything else goes through SeqTestMatch.</summary>
+    private readonly struct SeqMatcher
+    {
+        private readonly LispObject _item;
+        internal LispObject Item => _item;
+        private readonly int _mode;   // 0 general, 1 identity, 2 fixnum
+        private readonly long _fx;
+        public SeqMatcher(LispObject item, in SeqKwArgs kw)
+        {
+            _item = item; _mode = 0; _fx = 0;
+            if (kw.Key == null && kw.TestNot == null && kw.TestKind == SeqTestKind.NumEq
+                && UnwrapMv(item) is Fixnum nf)
+            {
+                // (= fixnum x): a fixnum element compares by value; anything else by =.
+                _item = nf; _mode = 3; _fx = nf.Value;
+            }
+            else if (kw.Key == null && kw.TestNot == null && kw.TestKind == SeqTestKind.Eql)
+            {
+                var it = UnwrapMv(item);
+                if (it is Fixnum f) { _item = it; _mode = 2; _fx = f.Value; }
+                else if (it is Symbol or Nil or T or Cons or LispString) { _item = it; _mode = 1; }
+            }
+        }
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        public bool Match(LispObject elem, in SeqKwArgs kw)
+        {
+            if (_mode == 2) return ReferenceEquals(elem, _item) || (elem is Fixnum g && g.Value == _fx);
+            if (_mode == 1) return ReferenceEquals(elem, _item);
+            if (_mode == 3) return elem is Fixnum g3 ? g3.Value == _fx : IsTrueNumEq(_item, elem);
+            return SeqTestMatch(_item, elem, kw);
+        }
+    }
+
     /// <summary>(REMOVE item seq ...) / (DELETE item seq ...): the element matches
     /// when the :TEST (or :TEST-NOT) says it equals ITEM, after :KEY.</summary>
     private readonly struct ItemMatch : IElemMatch
     {
-        private readonly LispObject _item;
+        private readonly SeqMatcher _m;
         private readonly SeqKwArgs _kw;
-        public ItemMatch(LispObject item, SeqKwArgs kw) { _item = item; _kw = kw; }
-        public bool Match(LispObject elem) => SeqTestMatch(_item, elem, _kw);
+        public ItemMatch(LispObject item, SeqKwArgs kw) { _kw = kw; _m = new SeqMatcher(item, kw); }
+        public bool Match(LispObject elem) => _m.Match(elem, _kw);
+
+        /// <summary>The item is a character compared with EQL or CHAR= (no :key, no :test-not):
+        /// a string can then be searched by its characters.</summary>
+        public bool TryCharItem(out char c)
+        {
+            c = '\0';
+            if (_kw.Key != null || _kw.TestNot != null) return false;
+            if (_kw.TestKind != SeqTestKind.Eql && _kw.TestKind != SeqTestKind.CharEq) return false;
+            if (UnwrapMv(_m.Item) is not LispChar lc) return false;
+            c = lc.Value;
+            return true;
+        }
     }
 
     /// <summary>(REMOVE-IF pred seq ...) and its NOT / DELETE variants: the element
@@ -3380,7 +3655,7 @@ public static partial class Runtime
                 subTail = cell;
             }
             if (cur is not Nil)
-                throw new LispErrorException(new LispTypeError("SUBSTITUTE: not a proper list", seq, Startup.Sym("LIST")));
+                throw new LispErrorException(new LispTypeError("SUBSTITUTE: not a proper list", cur, Startup.Sym("LIST")));
             return subHead ?? (LispObject)Nil.Instance;
         }
 
@@ -3406,6 +3681,26 @@ public static partial class Runtime
             if (seq is LispString sstr)
             {
                 var chars = new char[flen];
+                if (matches is ItemMatch charMatch && charMatch.TryCharItem(out char itemChar))
+                {
+                    // A character item: compare characters, and make the replacement
+                    // character only when something matches (a non-character NEWITEM is
+                    // still an error then, and only then).
+                    char newChar = '\0';
+                    bool haveNew = false;
+                    for (int i = 0; i < flen; i++)
+                    {
+                        char ch = sstr[i];
+                        if (ch == itemChar && i >= fstart && i < fend && (!maxSub.HasValue || subbed < maxSub.Value))
+                        {
+                            if (!haveNew) { newChar = ((LispChar)newitem).Value; haveNew = true; }
+                            subbed++;
+                            chars[i] = newChar;
+                        }
+                        else chars[i] = ch;
+                    }
+                    return new LispString(new string(chars));
+                }
                 for (int i = 0; i < flen; i++)
                 {
                     var elem = LispChar.Make(sstr[i]);
@@ -3452,7 +3747,7 @@ public static partial class Runtime
             var cur = seq;
             for (; cur is Cons c; cur = c.Cdr) allElems.Add(c.Car);
             if (cur is not Nil)
-                throw new LispErrorException(new LispTypeError("SUBSTITUTE: not a proper list", seq, Startup.Sym("LIST")));
+                throw new LispErrorException(new LispTypeError("SUBSTITUTE: not a proper list", cur, Startup.Sym("LIST")));
             len = allElems.Count;
         }
 
@@ -3547,8 +3842,40 @@ public static partial class Runtime
         }
         if (seq is LispString str)
         {
-            // Strings are immutable in our implementation, fall back to substitute
-            return SubstituteCore(newitem, seq, kw, matches);
+            // A string is changed in place, like any other sequence (CLHS 17.3).
+            int len = str.Length;
+            int start = kw.Start;
+            int end = kw.End ?? len;
+            CheckBoundingIndices(start, end, len, "NSUBSTITUTE");
+            var replacement = newitem as LispChar;
+            int subbed = 0;
+            if (kw.FromEnd)
+            {
+                for (int i = end - 1; i >= start; i--)
+                {
+                    if (maxSub.HasValue && subbed >= maxSub.Value) break;
+                    if (matches.Match(LispChar.Make(str[i])))
+                    {
+                        if (replacement == null)
+                            throw new LispErrorException(new LispTypeError("NSUBSTITUTE: a string takes only characters", newitem, Startup.Sym("CHARACTER")));
+                        str[i] = replacement.Value; subbed++;
+                    }
+                }
+            }
+            else
+            {
+                for (int i = start; i < end; i++)
+                {
+                    if (maxSub.HasValue && subbed >= maxSub.Value) break;
+                    if (matches.Match(LispChar.Make(str[i])))
+                    {
+                        if (replacement == null)
+                            throw new LispErrorException(new LispTypeError("NSUBSTITUTE: a string takes only characters", newitem, Startup.Sym("CHARACTER")));
+                        str[i] = replacement.Value; subbed++;
+                    }
+                }
+            }
+            return seq;
         }
         // List: modify in place via rplaca
         {
@@ -3557,7 +3884,7 @@ public static partial class Runtime
             var cur = seq;
             for (; cur is Cons c; cur = c.Cdr, listLen++) cells.Add(c);
             if (cur is not Nil)
-                throw new LispErrorException(new LispTypeError("NSUBSTITUTE: not a proper list", seq, Startup.Sym("LIST")));
+                throw new LispErrorException(new LispTypeError("NSUBSTITUTE: not a proper list", cur, Startup.Sym("LIST")));
             int start = kw.Start;
             int end = kw.End ?? listLen;
             CheckBoundingIndices(start, end, listLen, "NSUBSTITUTE");
@@ -3645,6 +3972,33 @@ public static partial class Runtime
         dup.Clear();
         int removed = 0;
 
+        // With EQL, EQUAL or EQUALP as the test the elements are looked up in a hash table, as
+        // SBCL does, instead of compared pairwise: linear instead of quadratic. The result is
+        // the same: from-end keeps the first of equal elements, otherwise the last.
+        var hashTest = end - start > 16 ? HashableSeqTest(kw) : null;
+        if (hashTest != null)
+        {
+            var seen = new LispHashTable(hashTest);
+            if (kw.FromEnd)
+            {
+                for (int i = start; i < end; i++)
+                {
+                    var ki = ApplySeqKey(kw, At(i));
+                    if (seen.Get(ki, Nil.Instance) is not Nil) { dup[i >> 6] |= 1UL << (i & 63); removed++; }
+                    else seen.Set(ki, T.Instance);
+                }
+            }
+            else
+            {
+                for (int i = end - 1; i >= start; i--)
+                {
+                    var ki = ApplySeqKey(kw, At(i));
+                    if (seen.Get(ki, Nil.Instance) is not Nil) { dup[i >> 6] |= 1UL << (i & 63); removed++; }
+                    else seen.Set(ki, T.Instance);
+                }
+            }
+        }
+        else
         for (int i = start; i < end; i++)
         {
             if ((dup[i >> 6] & (1UL << (i & 63))) != 0) continue;
@@ -3655,7 +4009,8 @@ public static partial class Runtime
                 for (int j = i + 1; j < end; j++)
                 {
                     if ((dup[j >> 6] & (1UL << (j & 63))) != 0) continue;
-                    if (SeqTestMatch2(ki, ApplySeqKey(kw, At(j)), kw))
+                    // The test is called with the later element first, as SBCL does.
+                    if (SeqTestMatch2(ApplySeqKey(kw, At(j)), ki, kw))
                     { dup[j >> 6] |= 1UL << (j & 63); removed++; }
                 }
             }
@@ -3898,10 +4253,10 @@ public static partial class Runtime
             case "TEST": if (!m.TestSet) { m.TestFn = CoerceToFunction(v); m.TestSet = true; } break;
             case "TEST-NOT": if (!m.TestNotSet) { m.TestNotFn = CoerceToFunction(v); m.TestNotSet = true; } break;
             case "KEY": if (!m.KeySet) { if (v is not Nil) m.KeyFn = CoerceToFunction(v); m.KeySet = true; } break;
-            case "START1": if (!m.S1Set) { m.S1 = (int)((Fixnum)v).Value; m.S1Set = true; } break;
-            case "END1": if (!m.E1Set) { m.E1 = v is Fixnum ef ? (int?)ef.Value : null; m.E1Set = true; } break;
-            case "START2": if (!m.S2Set) { m.S2 = (int)((Fixnum)v).Value; m.S2Set = true; } break;
-            case "END2": if (!m.E2Set) { m.E2 = v is Fixnum ef2 ? (int?)ef2.Value : null; m.E2Set = true; } break;
+            case "START1": if (!m.S1Set) { m.S1 = Runtime.ClampIndex(((Fixnum)v).Value); m.S1Set = true; } break;
+            case "END1": if (!m.E1Set) { m.E1 = v is Fixnum ef ? (int?)Runtime.ClampIndex(ef.Value) : null; m.E1Set = true; } break;
+            case "START2": if (!m.S2Set) { m.S2 = Runtime.ClampIndex(((Fixnum)v).Value); m.S2Set = true; } break;
+            case "END2": if (!m.E2Set) { m.E2 = v is Fixnum ef2 ? (int?)Runtime.ClampIndex(ef2.Value) : null; m.E2Set = true; } break;
             case "FROM-END": if (!m.FeSet) { m.FromEnd = IsTruthy(v); m.FeSet = true; } break;
             case "ALLOW-OTHER-KEYS": break;
             default: m.Unknown = true; break;
@@ -4007,6 +4362,29 @@ public static partial class Runtime
             // enough. Copying both sequences into LispObject[] first -- for a
             // walk that usually stops at the first difference -- was most of what
             // MISMATCH cost.
+            // Two strings, or two vectors, with the plain EQL test: compare in place.
+            if (testFn == null && testNotFn == null && keyFn == null)
+            {
+                int n = Math.Min(count1, count2);
+                if (seq1 is LispString a1 && seq2 is LispString a2)
+                {
+                    for (int i = 0; i < n; i++)
+                        if (a1[s1 + i] != a2[s2 + i]) return Fixnum.Make(s1 + i);
+                    return count1 == count2 ? (LispObject)Nil.Instance : Fixnum.Make(s1 + n);
+                }
+                if (seq1 is LispVector v1 && seq2 is LispVector v2)
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        var x1 = v1[s1 + i];
+                        var x2 = v2[s2 + i];
+                        if (ReferenceEquals(x1, x2)) continue;
+                        if (x1 is Fixnum f1 && x2 is Fixnum f2) { if (f1.Value == f2.Value) continue; return Fixnum.Make(s1 + i); }
+                        if (!IsTrueEql(x1, x2)) return Fixnum.Make(s1 + i);
+                    }
+                    return count1 == count2 ? (LispObject)Nil.Instance : Fixnum.Make(s1 + n);
+                }
+            }
             var cur1 = new ForwardSeqCursor(seq1, s1);
             var cur2 = new ForwardSeqCursor(seq2, s2);
             for (int i = 0; i < count1 && i < count2; i++)
@@ -4119,10 +4497,10 @@ public static partial class Runtime
             case "TEST": if (!st.TestSet) { st.TestFn = CoerceToFunction(v); st.TestSet = true; } break;
             case "TEST-NOT": if (!st.TestNotSet) { st.TestNotFn = CoerceToFunction(v); st.TestNotSet = true; } break;
             case "KEY": if (!st.KeySet) { st.KeyFn = v is Nil ? null : CoerceToFunction(v); st.KeySet = true; } break;
-            case "START1": if (!st.S1Set) { st.Start1 = (int)((Fixnum)v).Value; st.S1Set = true; } break;
-            case "END1": if (!st.E1Set && v is Fixnum f1) { st.End1 = (int)f1.Value; st.E1Set = true; } break;
-            case "START2": if (!st.S2Set) { st.Start2 = (int)((Fixnum)v).Value; st.S2Set = true; } break;
-            case "END2": if (!st.E2Set && v is Fixnum f2) { st.End2 = (int)f2.Value; st.E2Set = true; } break;
+            case "START1": if (!st.S1Set) { st.Start1 = Runtime.ClampIndex(((Fixnum)v).Value); st.S1Set = true; } break;
+            case "END1": if (!st.E1Set && v is Fixnum f1) { st.End1 = Runtime.ClampIndex(f1.Value); st.E1Set = true; } break;
+            case "START2": if (!st.S2Set) { st.Start2 = Runtime.ClampIndex(((Fixnum)v).Value); st.S2Set = true; } break;
+            case "END2": if (!st.E2Set && v is Fixnum f2) { st.End2 = Runtime.ClampIndex(f2.Value); st.E2Set = true; } break;
             case "ALLOW-OTHER-KEYS": break;
             default:
                 if (!st.AllowOtherKeys)
@@ -4210,10 +4588,10 @@ public static partial class Runtime
                 case "TEST": if (!testSet) { testFn = CoerceToFunction(args[i + 1]); testSet = true; } break;
                 case "TEST-NOT": if (!testNotSet) { testNotFn = CoerceToFunction(args[i + 1]); testNotSet = true; } break;
                 case "KEY": if (!keySet) { keyFn = args[i + 1] is Nil ? null : CoerceToFunction(args[i + 1]); keySet = true; } break;
-                case "START1": if (!s1Set) { start1 = (int)((Fixnum)args[i + 1]).Value; s1Set = true; } break;
-                case "END1": if (!e1Set && args[i + 1] is Fixnum f1) { end1 = (int)f1.Value; e1Set = true; } break;
-                case "START2": if (!s2Set) { start2 = (int)((Fixnum)args[i + 1]).Value; s2Set = true; } break;
-                case "END2": if (!e2Set && args[i + 1] is Fixnum f2) { end2 = (int)f2.Value; e2Set = true; } break;
+                case "START1": if (!s1Set) { start1 = Runtime.ClampIndex(((Fixnum)args[i + 1]).Value); s1Set = true; } break;
+                case "END1": if (!e1Set && args[i + 1] is Fixnum f1) { end1 = Runtime.ClampIndex(f1.Value); e1Set = true; } break;
+                case "START2": if (!s2Set) { start2 = Runtime.ClampIndex(((Fixnum)args[i + 1]).Value); s2Set = true; } break;
+                case "END2": if (!e2Set && args[i + 1] is Fixnum f2) { end2 = Runtime.ClampIndex(f2.Value); e2Set = true; } break;
                 case "ALLOW-OTHER-KEYS": break;
                 default:
                     if (!allowOtherKeys)
@@ -4331,7 +4709,8 @@ public static partial class Runtime
         if (obj is Symbol sym) return sym.NameString;
         if (obj is Nil || obj is T) return SymbolName(obj);
         if (obj is LispChar ch) return new LispString(ch.Value.ToString());
-        throw new LispErrorException(new LispTypeError("STRING: cannot convert to string", obj));
+        throw new LispErrorException(new LispTypeError("STRING: not a string designator", obj,
+            List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("SYMBOL"), Startup.Sym("CHARACTER"))));
     }
 
     internal static void RegisterSequenceBuiltins()
@@ -4613,6 +4992,10 @@ public static partial class Runtime
                 }
                 if (hasUnknown && allowOtherKeys != true)
                     throw new LispErrorException(new LispProgramError("MAKE-STRING: unknown keyword argument"));
+                // The element type has to be a subtype of CHARACTER.
+                if (elementType != null && !Runtime.IsTruthy(Runtime.Subtypep(elementType, Startup.Sym("CHARACTER"))))
+                    throw new LispErrorException(new LispTypeError("MAKE-STRING: :ELEMENT-TYPE is not a subtype of CHARACTER",
+                        elementType, Startup.Sym("CHARACTER")));
                 if (elementType != null && Runtime.ParseElementTypeName(elementType) == "BASE-CHAR")
                 {
                     var s = (LispString)Runtime.MakeString(size, initChar);

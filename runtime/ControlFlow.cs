@@ -4,6 +4,21 @@ namespace DotCL;
 /// Exception for block/return-from non-local exit.
 /// Tag is compared by reference identity (each block creates a unique object).
 /// </summary>
+/// <summary>
+/// What a local function (LABELS / FLET) that never escapes returns, instead of
+/// throwing a BlockReturnException, when it does a RETURN-FROM to a block outside
+/// itself. Every direct call of such a function looks at its result: a token is
+/// either handed on (the caller is such a function too) or turned into the local
+/// return of the block it names. Never visible to Lisp code.
+/// </summary>
+public sealed class BlockExitToken : LispObject
+{
+    public readonly LispObject Tag;
+    public readonly LispObject Value;
+    public BlockExitToken(LispObject tag, LispObject value) { Tag = tag; Value = value; }
+    public override string ToString() => "#<block exit>";
+}
+
 public class BlockReturnException : Exception
 {
     public object Tag { get; }
@@ -15,6 +30,18 @@ public class BlockReturnException : Exception
         Tag = tag;
         Value = value;
     }
+}
+
+/// <summary>
+/// The process is ending: DOTCL:QUIT, or a script whose error reached the
+/// debugger. It unwinds the thread that is running the script to the top, so the
+/// cleanup forms of UNWIND-PROTECT run on the way, and the top then exits with
+/// Code. Control flow, not a condition: no handler sees it.
+/// </summary>
+public sealed class ScriptExitException : Exception
+{
+    public int Code { get; }
+    public ScriptExitException(int code) : base("exit") { Code = code; }
 }
 
 /// <summary>
@@ -88,6 +115,48 @@ public static class ControlFlowFilters
     /// stacked dispatch for each level a return crossed.</summary>
     public static int BlockTagMatches(object ex, LispObject tag)
         => ex is BlockReturnException b && ReferenceEquals(b.Tag, tag) ? 1 : 0;
+
+    /// <summary>A BLOCK or TAGBODY whose tag is a cons, left: the tag's CAR becomes T.
+    /// A closure that outlives it and does a RETURN-FROM / GO to it then finds nobody to
+    /// catch the transfer; CheckLive turns that into a CONTROL-ERROR (CLHS 5.2: the
+    /// consequences are undefined; SBCL signals CONTROL-ERROR) instead of an exception
+    /// nothing catches, which ended the process.</summary>
+    public static void MarkExited(LispObject tag)
+    {
+        if (tag is Cons c) c.Car = T.Instance;
+    }
+
+    public static bool IsExitToken(LispObject x) => x is BlockExitToken;
+
+    public static LispObject MakeExitToken(LispObject tag, LispObject value)
+        => new BlockExitToken(tag, value);
+
+    public static bool TokenTagIs(LispObject token, LispObject tag)
+        => ReferenceEquals(((BlockExitToken)token).Tag, tag);
+
+    public static LispObject TokenValue(LispObject token) => ((BlockExitToken)token).Value;
+
+    /// <summary>The exception a token stands for, for a caller that cannot return it
+    /// to the block directly.</summary>
+    public static Exception TokenException(LispObject token)
+    {
+        var t = (BlockExitToken)token;
+        return new BlockReturnException(t.Tag, t.Value);
+    }
+
+    public static void CheckBlockLive(LispObject tag)
+    {
+        if (tag is Cons c && c.Car is T)
+            throw new LispErrorException(new LispControlError(
+                "RETURN-FROM: attempt to return from a block that has already exited"));
+    }
+
+    public static void CheckTagbodyLive(LispObject tag)
+    {
+        if (tag is Cons c && c.Car is T)
+            throw new LispErrorException(new LispControlError(
+                "GO: attempt to go to a tag of a TAGBODY that has already exited"));
+    }
 
     /// <summary>Filter predicate for TAGBODY: does this non-local GO target the
     /// tagbody whose id is ID? Same reasoning as CatchTagMatches.</summary>
@@ -767,7 +836,20 @@ public class LispSourceException : Exception
         // Reverse so innermost is first
         chain.Reverse();
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine($"{chain[0].file}:{chain[0].line}: {cur.Message}");
+        // An error raised inside a Lisp function is placed at that function's
+        // definition rather than at the top-level form that called it, when the
+        // definition's place is known for sure.
+        var origin = (cur as LispErrorException)?.Origin;
+        var (file0, line0) = chain[0];
+        if (origin?.Function is { } fn)
+        {
+            var found = Runtime.DefinitionSourcesForFrame(fn);
+            if (found.Count == 1) { file0 = found[0].File; line0 = found[0].Line; }
+        }
+        sb.AppendLine($"{file0}:{line0}: {cur.Message}");
+        if (origin?.Frames is { Length: > 0 } frames)
+            for (int i = 0; i < frames.Length; i++)
+                sb.AppendLine($"  {i,3}: {frames[i]}");
         for (int i = 1; i < chain.Count; i++)
             sb.AppendLine($"  from {chain[i].file}:{chain[i].line}");
         // Under dotcl:*debug-stacktrace*, append the underlying .NET exception's

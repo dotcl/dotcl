@@ -1,0 +1,61 @@
+;;; ci/normalize-nupkg.lisp makes two zips with the same contents and different entry times
+;;; byte-identical, and leaves the names, their order and the contents alone.
+
+(load "ci/normalize-nupkg.lisp")
+
+(defun %nn-make-zip (path when)
+  (when (probe-file path) (delete-file path))
+  (let* ((file (dotnet:static "System.IO.File" "Create" path))
+         (zip (dotnet:new "System.IO.Compression.ZipArchive" file
+                          (dotnet:static "System.IO.Compression.ZipArchiveMode" "Create") nil)))
+    (loop for (name . text) in '(("x.nuspec" . "<package/>")
+                                 ("lib/a.dll" . "abcabcabcabcabcabcabcabcabcabc")
+                                 ("empty.txt" . ""))
+          do (let ((entry (dotnet:invoke zip "CreateEntry" name)))
+               (setf (dotnet:invoke entry "LastWriteTime") when)
+               (let ((out (dotnet:invoke entry "Open"))
+                     (bytes (dotnet:invoke (dotnet:static "System.Text.Encoding" "UTF8") "GetBytes" text)))
+                 (dotnet:invoke out "Write" bytes 0 (dotnet:invoke bytes "Length"))
+                 (dotnet:invoke out "Dispose"))))
+    (dotnet:invoke zip "Dispose")
+    (dotnet:invoke file "Dispose")
+    path))
+
+(defun %nn-read (path)
+  (with-open-file (i path :element-type '(unsigned-byte 8))
+    (let ((v (make-array (file-length i) :element-type '(unsigned-byte 8))))
+      (read-sequence v i)
+      v)))
+
+(defun %nn-entries (path)
+  "The entries of the zip at PATH: a list of (name text year)."
+  (let* ((zip (dotnet:static "System.IO.Compression.ZipFile" "OpenRead" path))
+         (es (dotnet:invoke zip "Entries"))
+         (result (loop for i below (dotnet:invoke es "Count")
+                       for e = (dotnet:invoke es "get_Item" i)
+                       collect (let* ((in (dotnet:invoke e "Open"))
+                                      (ms (dotnet:new "System.IO.MemoryStream")))
+                                 (dotnet:invoke in "CopyTo" ms)
+                                 (dotnet:invoke in "Dispose")
+                                 (list (dotnet:invoke e "FullName")
+                                       (dotnet:invoke (dotnet:static "System.Text.Encoding" "UTF8")
+                                                      "GetString" (dotnet:invoke ms "ToArray"))
+                                       (dotnet:invoke (dotnet:invoke e "LastWriteTime") "Year"))))))
+    (dotnet:invoke zip "Dispose")
+    result))
+
+(deftest nupkg-normalize.same-contents-same-bytes
+  (let* ((dir (regression-temp-dir))
+         (a (format nil "~A/nn-a.nupkg" dir))
+         (b (format nil "~A/nn-b.nupkg" dir)))
+    (%nn-make-zip a (dotnet:new "System.DateTimeOffset" 2026 11 1 10 0 0 (dotnet:static "System.TimeSpan" "Zero")))
+    (%nn-make-zip b (dotnet:new "System.DateTimeOffset" 2026 11 3 18 30 0 (dotnet:static "System.TimeSpan" "Zero")))
+    (let ((differ-before (not (equalp (%nn-read a) (%nn-read b)))))
+      (normalize a)
+      (normalize b)
+      (list differ-before
+            (equalp (%nn-read a) (%nn-read b))
+            (%nn-entries a))))
+  (t t (("x.nuspec" "<package/>" 1980)
+        ("lib/a.dll" "abcabcabcabcabcabcabcabcabcabc" 1980)
+        ("empty.txt" "" 1980))))

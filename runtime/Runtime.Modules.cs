@@ -294,6 +294,10 @@ public static partial class Runtime
 
         if (path.EndsWith(".fasl", StringComparison.OrdinalIgnoreCase))
             s_nextFaslMismatchWarnsOnly = true;
+        // A shipped fasl records its source as /dotcl-src/NAME/...; the source ships next to it.
+        if (path.EndsWith(".fasl", StringComparison.OrdinalIgnoreCase)
+            && Path.GetDirectoryName(path) is string contribDir)
+            s_sourceRoots.TryAdd(name, contribDir);
         try { Load(new LispObject[] { new LispString(path) }); }
         finally { s_nextFaslMismatchWarnsOnly = false; }
         if (name == "quicklisp")
@@ -380,6 +384,10 @@ public static partial class Runtime
     /// </summary>
     public static List<string>? ScriptArgs = null;
 
+    /// <summary>True in an executable that carries its program (save-application :executable,
+    /// a restamped pack tool): every command-line argument belongs to that program.</summary>
+    public static bool HostIsApplication = false;
+
     /// <summary>
     /// On Windows hosts, wrap uiop:parse-unix-namestring so that strings
     /// containing `\` separators or a drive-letter prefix are normalized
@@ -419,7 +427,7 @@ public static partial class Runtime
         {
             var read = MultipleValues.Primary(
                 Runtime.ReadFromString(new LispObject[] { new LispString(patch) }));
-            Runtime.Eval(read);
+            Runtime.EvalSetupForm(read);
         }
         catch { /* ignore if uiop symbols missing */ }
     }
@@ -440,28 +448,35 @@ public static partial class Runtime
         PushDirsToCentralRegistry(dirs);
     }
 
-    private static void PushDirsToCentralRegistry(IList<string> dirs)
+    /// <summary>PUSHNEW (PATHNAME dir) onto asdf:*central-registry* :test #'equal for each of DIRS in turn,
+    /// done on the symbol's value directly: building and compiling a PUSHNEW form for each of the
+    /// 39 bundled contrib directories took longer than loading asdf itself did (the first compile of
+    /// a process pays for the JIT of the compiler). Does nothing when ASDF is not loaded.</summary>
+    private static void PushPathnamesToCentralRegistry(IList<string> dirs)
     {
         if (dirs.Count == 0) return;
-        // Build a single (dolist (p '("..." "..." ...)) (pushnew ...)) form so
-        // the eval round-trip is one call regardless of dir count.
-        var sb = new System.Text.StringBuilder();
-        sb.Append("(dolist (p '(");
-        foreach (var d in dirs)
-        {
-            sb.Append('"');
-            sb.Append(d.Replace('\\', '/').TrimEnd('/'));
-            sb.Append("/\" ");
-        }
-        sb.Append(")) (pushnew (pathname p) asdf:*central-registry* :test #'equal))");
         try
         {
-            var read = MultipleValues.Primary(
-                Runtime.ReadFromString(new LispObject[] { new LispString(sb.ToString()) }));
-            Runtime.Eval(read);
+            var asdfPkg = Package.FindPackage("ASDF");
+            if (asdfPkg == null) return;
+            var (sym, status) = asdfPkg.FindSymbol("*CENTRAL-REGISTRY*");
+            if (status == SymbolStatus.None || !DynamicBindings.TryGet(sym, out var current)) return;
+            LispObject list = current;
+            foreach (var d in dirs)
+            {
+                var pn = Runtime.Pathname(new LispString(d));
+                bool present = false;
+                for (var c = list; c is Cons cc; c = cc.Cdr)
+                    if (Runtime.IsTrueEqual(pn, cc.Car)) { present = true; break; }
+                if (!present) list = new Cons(pn, list);
+            }
+            Runtime.SetSymbolValue(sym, list);
         }
-        catch { /* ignore if asdf symbols missing */ }
+        catch { /* ignore if ASDF symbols not yet available */ }
     }
+
+    private static void PushDirsToCentralRegistry(IList<string> dirs)
+        => PushPathnamesToCentralRegistry(dirs.Select(d => d.Replace('\\', '/').TrimEnd('/') + "/").ToList());
 
     /// <summary>
     /// The bundled quicklisp client is one file with no quicklisp.asd, so a
@@ -475,7 +490,7 @@ public static partial class Runtime
         {
             var read = MultipleValues.Primary(Runtime.ReadFromString(new LispObject[] {
                 new LispString("(asdf:register-preloaded-system \"quicklisp\")") }));
-            Runtime.Eval(read);
+            Runtime.EvalSetupForm(read);
         }
         catch { /* ASDF absent: nothing to tell */ }
     }
@@ -494,25 +509,15 @@ public static partial class Runtime
         // contributions from runtime/bin/...staged copy/ + source contrib/
         // merge cleanly. Without this, a stale staged copy hides newer .asd
         // files added under source contrib/.
+        var dirs = new List<string>();
         foreach (var baseContrib in searchDirs)
         {
             var contribFull = Path.GetFullPath(baseContrib);
             if (!Directory.Exists(contribFull)) continue;
             foreach (var sub in Directory.GetDirectories(contribFull))
-            {
-                var dirPath = Path.GetFullPath(sub).Replace('\\', '/') + "/";
-                var form = $"(pushnew (pathname \"{dirPath}\") asdf:*central-registry* :test #'equal)";
-                try
-                {
-                    // ReadFromString returns multiple values; unwrap to the
-                    // primary form before passing to Eval (Eval doesn't dispatch on MvReturn).
-                    var read = MultipleValues.Primary(
-                        Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
-                    Runtime.Eval(read);
-                }
-                catch { /* ignore if ASDF symbols not yet available */ }
-            }
+                dirs.Add(Path.GetFullPath(sub).Replace('\\', '/') + "/");
         }
+        PushPathnamesToCentralRegistry(dirs);
         ResolveAsdlessContribsAsRequireSystems(searchDirs);
     }
 
@@ -563,7 +568,7 @@ public static partial class Runtime
         {
             var read = MultipleValues.Primary(
                 Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
-            Runtime.Eval(read);
+            Runtime.EvalSetupForm(read);
         }
         catch { /* ignore if ASDF symbols not yet available */ }
     }
@@ -589,7 +594,7 @@ public static partial class Runtime
         {
             var read = MultipleValues.Primary(
                 Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
-            Runtime.Eval(read);
+            Runtime.EvalSetupForm(read);
         }
         catch { /* ignore if ASDF symbols not yet available */ }
     }
@@ -624,16 +629,18 @@ public static partial class Runtime
       (src     (find-symbol ""CL-SOURCE-FILE"" ""ASDF""))
       (outs    (find-symbol ""OUTPUT-FILES"" ""ASDF"")))
   (when (and perform cop src outs)
-    (eval `(defmethod ,perform :after ((op ,cop) (c ,src))
-             (when dotcl:*compile-r2r*
-               (dolist (f (,outs op c))
-                 (when (equal (pathname-type f) ""fasl"")
-                   (ignore-errors (dotcl:write-r2r-sibling (namestring f))))))))))";
+    (dotcl.cil-compiler::%mini-eval
+     `(defmethod ,perform :after ((op ,cop) (c ,src))
+        (when dotcl:*compile-r2r*
+          (dolist (f (,outs op c))
+            (when (equal (pathname-type f) ""fasl"")
+              (ignore-errors (dotcl:write-r2r-sibling (namestring f)))))))
+     nil)))";
         try
         {
             var read = MultipleValues.Primary(
                 Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
-            Runtime.Eval(read);
+            Runtime.EvalSetupForm(read);
         }
         catch { }
     }
@@ -647,21 +654,23 @@ public static partial class Runtime
       (lop (find-symbol ""LOAD-OP"" ""ASDF""))
       (src (find-symbol ""CL-SOURCE-FILE"" ""ASDF"")))
   (when (and pwr lop src)
-    (eval `(defmethod ,pwr :around ((o ,lop) (c ,src))
-             (let ((retried nil))
-               (handler-bind ((dotcl:fasl-version-mismatch
-                                (lambda (e)
-                                  (let ((r (and (not retried)
-                                                (find-restart 'try-recompiling e))))
-                                    (when r
-                                      (setf retried t)
-                                      (invoke-restart r))))))
-                 (call-next-method)))))))";
+    (dotcl.cil-compiler::%mini-eval
+     `(defmethod ,pwr :around ((o ,lop) (c ,src))
+        (let ((retried nil))
+          (handler-bind ((dotcl:fasl-version-mismatch
+                           (lambda (e)
+                             (let ((r (and (not retried)
+                                           (find-restart 'try-recompiling e))))
+                               (when r
+                                 (setf retried t)
+                                 (invoke-restart r))))))
+            (call-next-method))))
+     nil)))";
         try
         {
             var read = MultipleValues.Primary(
                 Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
-            Runtime.Eval(read);
+            Runtime.EvalSetupForm(read);
         }
         catch { }
     }
@@ -679,7 +688,7 @@ public static partial class Runtime
         {
             var read = MultipleValues.Primary(
                 Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
-            Runtime.Eval(read);
+            Runtime.EvalSetupForm(read);
         }
         catch { /* ignore if UIOP is not there */ }
     }
@@ -724,7 +733,7 @@ public static partial class Runtime
         {
             var read = MultipleValues.Primary(
                 Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
-            Runtime.Eval(read);
+            Runtime.EvalSetupForm(read);
         }
         catch { /* ignore if ASDF symbols not yet available */ }
     }
@@ -765,7 +774,7 @@ public static partial class Runtime
         {
             var read = MultipleValues.Primary(
                 Runtime.ReadFromString(new LispObject[] { new LispString(form) }));
-            Runtime.Eval(read);
+            Runtime.EvalSetupForm(read);
         }
         catch { /* ignore if ASDF symbols not yet available */ }
     }

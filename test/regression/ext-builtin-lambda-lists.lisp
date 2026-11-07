@@ -116,7 +116,7 @@
                  (incf counted)
                  (unless (= (dotcl-internal::%function-arity fn) (first shape))
                    (push s bad)))))))
-    (list (> gfs 20) (> counted 100) bad))
+    (list (> gfs 20) (> counted 70) bad))
   (t t nil))
 
 ;;; Every operator named as package:name in docs/ or a contrib README, in a

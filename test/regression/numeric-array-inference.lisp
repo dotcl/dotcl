@@ -34,9 +34,12 @@
 
 (deftest-compiled-only nai2-bench-2d-sil
   (let ((sil (%flat-text (dotcl:function-sil #'%nai2-bench-2d))))
-    (list (notnot (search "ArefNum2DL" sil))
-          (notnot (search "ArefSetNum2DL" sil))
-          (notnot (search "Runtime.Add" sil))))
+    ;; The buffer is fetched once and the subscripts are checked and combined
+    ;; in line: no per-element helper, no boxed Aref2D, no generic add.
+    (list (notnot (search "LDELEM" sil))
+          (notnot (search "STELEM" sil))
+          (notnot (or (search "Runtime.Add" sil) (search "ArefNum2DL" sil)
+                      (search "Aref2D" sil)))))
   (t t nil))
 
 ;; 1D and 3D shapes.
@@ -202,8 +205,8 @@
 
 (deftest-compiled-only naf-2d-sil
   (let ((sil (%flat-text (dotcl:function-sil #'%naf-2d))))
-    (list (notnot (search "ArefNum2DD" sil))
-          (notnot (search "ArefSetNum2DD" sil))
+    (list (notnot (search "LDELEM-R8" sil))
+          (notnot (search "STELEM-R8" sil))
           (search "Runtime.Multiply" sil)))
   (t t nil))
 

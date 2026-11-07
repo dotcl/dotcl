@@ -4,7 +4,7 @@
        library (DotCL.Runtime.csproj), inherit this <Version> via MSBuild's automatic
        Directory.Build.props import. Bump the release version HERE only. -->
   <PropertyGroup>
-    <Version>0.1.36</Version>
+    <Version>0.1.37</Version>
   </PropertyGroup>
 
   <!-- The two packed projects in this directory must not share restore output.
@@ -55,6 +55,13 @@
            NU5100; DotCL.Build.Tasks.dll ships under tasks/ because it is an
                     MSBuild task the .targets loads by path, not a reference. -->
     <WarningsNotAsErrors>$(WarningsNotAsErrors);NU5128;NU5100</WarningsNotAsErrors>
+    <!-- IL3000 (Assembly.Location is empty in a single-file app) is an analyzer warning that
+         dotcl:save-application :executable t switches on by publishing with
+         PublishSingleFile=true; with TreatWarningsAsErrors it stopped that publish. Every
+         use of Location in this library already treats the empty string as "not on disk"
+         (shared-framework scan, doc-file lookup, loaded-assembly match), which is the
+         behaviour wanted inside a single-file app, so the warning is left off. -->
+    <NoWarn>$(NoWarn);IL3000</NoWarn>
     <!-- CS0649 (field never assigned) is off wherever the emit half is left out:
          fields only the emitter writes (CilAssembler._currentUnitId,
          Runtime.SourceLineTable, ...) are genuinely unassigned there and the warning
@@ -62,5 +69,17 @@
          -p:DotclNoEmit=true on any framework, which is how `make
          test-regression-emitfree` builds. -->
     <NoWarn Condition="'$(TargetFramework)' == 'netstandard2.0' Or '$(DotclNoEmit)' == 'true'">$(NoWarn);CS0649</NoWarn>
+  </PropertyGroup>
+
+  <!-- Reproducible builds. Deterministic is the SDK default; it is written out so that it stays
+       so. On CI (or with -p:ContinuousIntegrationBuild=true) the checkout root is mapped to /_/
+       in the paths the compiler writes (the PDB path in the debug directory, source paths), so
+       the same source gives the same assemblies wherever it is checked out. Off CI the real
+       paths stay, which is what a debugger on a developer machine wants. -->
+  <PropertyGroup>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(ContinuousIntegrationBuild)' == '' And '$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <DotclRepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../'))</DotclRepoRoot>
+    <PathMap Condition="'$(ContinuousIntegrationBuild)' == 'true'">$(DotclRepoRoot)=/_/</PathMap>
   </PropertyGroup>
 </Project>

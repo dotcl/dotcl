@@ -127,7 +127,7 @@
   (equal (list (mea '(step 1))
                (mea '(formatter "x"))
                (mea '(define-symbol-macro mea-fixed-point-sym 1)))
-         '((step 1) (formatter "x") (define-symbol-macro mea-fixed-point-sym 1)))
+         '(1 (formatter "x") (define-symbol-macro mea-fixed-point-sym 1)))
   t)
 
 ;;; MULTIPLE-VALUE-LIST has a real expansion; series drives MACROEXPAND-1 itself.

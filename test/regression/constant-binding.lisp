@@ -38,7 +38,7 @@
 (defparameter *cbn-legal*
   '((let ((x 1)) x)
     (let* ((x 1) (y x)) y)
-    (lambda (a &optional b &key c &rest r) (list a b c r))
+    (lambda (a &optional b &rest r &key c) (list a b c r))
     (lambda (&optional (x 1)) x)
     (lambda (&key (k 2)) k)
     (handler-case 1 (error () 2))

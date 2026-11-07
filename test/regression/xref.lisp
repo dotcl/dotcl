@@ -236,3 +236,11 @@
       (list (lines '%xref-t-side) (lines '%xref-t-why)
             (lines '%xref-t-mk) (lines '%xref-t-is))))
   ((4) nil nil nil))
+
+;;; COMPILE of an anonymous lambda registers its edges at once; the queue of
+;;; registrations that loading uses must not grow with the number of compiles.
+(deftest-compiled-only xref.compile-loop-keeps-queue-bounded
+  (progn
+    (dotimes (i 12000) (compile nil '(lambda (x) (1+ x))))
+    (< (length dotcl-internal::*xref-pending*) 9000))
+  t)

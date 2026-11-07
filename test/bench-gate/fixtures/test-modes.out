@@ -1,0 +1,12 @@
+=== split detection self-test (bench/gate/modes.lisp) ===
+  ok   array-walk, one fast process                     expected split 1/6  got split 1/6
+  ok   array-walk, three fast processes                 expected split 3/4  got split 3/4
+  ok   string-walk, one fast process                    expected split 1/6  got split 1/6
+  ok   array-walk, one group with a 6% high value       expected one        got one
+  ok   struct-slots, one slow process (interference)    expected one        got one
+  ok   fib, wide spread without a gap                   expected one        got one
+  ok   identical values                                 expected one        got one
+  ok   two clean groups of two                          expected split 2/2  got split 2/2
+  ok   one slow process of four is not a group          expected one        got one
+  ok   two values are not checked                       expected unchecked  got unchecked
+test-modes: ok

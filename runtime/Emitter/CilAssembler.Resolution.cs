@@ -23,7 +23,8 @@ public partial class CilAssembler
         throw new Exception($"Unknown field: {name}");
     }
 
-    private static readonly MethodInfo? _coverageHit =
+    private static MethodInfo? _lazy__coverageHit;
+    private static MethodInfo? _coverageHit => _lazy__coverageHit ??=
         CallCoverage.Enabled ? typeof(CallCoverage).GetMethod("Hit") : null;
     private bool _afterTailPrefix;
 
@@ -38,11 +39,16 @@ public partial class CilAssembler
         _il.Emit(OpCodes.Call, _coverageHit!);
     }
 
+    private static bool SimdMethod(string name, out MethodInfo? mi)
+    {
+        return Tables.TrySimdMethod(name, out mi);
+    }
+
     private void EmitCall(string name)
     {
-        if (_methodCache.TryGetValue(name, out var mi))
+        if (_methodCache.TryGetValue(name, out var mi) || SimdMethod(name, out mi))
         {
-            _il.Emit(OpCodes.Call, mi);
+            _il.Emit(OpCodes.Call, mi!);
             return;
         }
         throw new Exception($"Unknown method: {name}");
@@ -56,9 +62,9 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Callvirt, typeof(LispFunction).GetMethod("InvokeOnce" + name[^1])!);
             return;
         }
-        if (_methodCache.TryGetValue(name, out var mi))
+        if (_methodCache.TryGetValue(name, out var mi) || SimdMethod(name, out mi))
         {
-            _il.Emit(OpCodes.Callvirt, mi);
+            _il.Emit(OpCodes.Callvirt, mi!);
             return;
         }
         throw new Exception($"Unknown method for callvirt: {name}");
@@ -439,6 +445,10 @@ public partial class CilAssembler
     /// (&amp;key test key) function has the same one).</summary>
     private static int AddStringArrayConstant(string?[] arr)
     {
+        // The names are interned so CheckNoUnknownKeys can match them against the
+        // (interned) names of keyword symbols by reference.
+        for (int i = 0; i < arr.Length; i++)
+            if (arr[i] != null) arr[i] = string.Intern(arr[i]!);
         // NUL separates the entries and an empty entry stands for null, so that
         // {"A", null} and {"A B"} do not collide on one slot.
         string key = string.Join("\0", arr.Select(s => s ?? ""));
@@ -549,6 +559,7 @@ public partial class CilAssembler
     }
 
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<Type, MethodInfo> _unsafeAs = new();
-    private static readonly MethodInfo _unsafeAsDef = typeof(System.Runtime.CompilerServices.Unsafe)
+    private static MethodInfo? _lazy_unsafeAsDef;
+    private static MethodInfo _unsafeAsDef => _lazy_unsafeAsDef ??= typeof(System.Runtime.CompilerServices.Unsafe)
         .GetMethods().Single(m => m.Name == "As" && m.GetGenericArguments().Length == 1);
 }

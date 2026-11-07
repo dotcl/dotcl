@@ -3,6 +3,118 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.37 -- 2026-11-07
+
+This release makes common operations faster and many built-in forms stricter.
+Malformed special forms and wrong arguments to built-in functions now signal
+errors where they were accepted before, so code that relied on that may stop
+working; see Upgrading. The metaobject protocol is closer to AMOP, and a
+`.fasl` and the `nupkg` files are now partly reproducible.
+
+### Upgrading
+
+- **Malformed special forms and standard macros signal PROGRAM-ERROR**: dotted
+  forms (`(and . x)`, `(case x . y)`), a wrong number of arguments to `quote` /
+  `if` / `the` / `function`, bad `let` / `do` / `dotimes` / `dolist` / `prog` /
+  `cond` / `block` / `return-from` / `go` / `throw` / `catch` / `handler-case` /
+  `restart-case` forms, declarations after the body of `let`, `flet`, `labels`
+  and `locally`, and repeated lambda list parameters. A `go` or `return-from`
+  to a block or tagbody that has exited is a CONTROL-ERROR.
+- **`defstruct` rejects bad definitions** (duplicate slots, a redefined
+  included slot, a duplicate option, `:include` of an undefined structure or of
+  a different `:type`). **`defpackage` rejects unknown options, and `export`
+  signals a name conflict.** Invalid type specifiers are rejected by `typep`,
+  `subtypep`, `upgraded-array-element-type` and `:element-type`.
+- **Argument checks on built-in functions.** `write-char` / `write-string` /
+  `write-sequence` to a non-output stream, `read-byte` / `read-char` on the
+  wrong kind of stream, out-of-range `:start` / `:end`, `make-string`,
+  `digit-char-p`, `find-symbol`, `intern`, `find-package`,
+  `encode-universal-time` and `subseq` with a negative start on a list signal
+  TYPE-ERROR (PACKAGE-ERROR for a package that does not exist). An index
+  beyond `int` or a time beyond the year range signals instead of wrapping.
+- **`open` rejects an invalid `:if-exists` / `:if-does-not-exist` value and an
+  unknown `:element-type`.** `(compile name nil)`, `(compile nil nil)` and
+  `(compile-file f :output-file nil)` are errors.
+- **A `format` directive with an unclosed `~[`, `~(`, `~{` or `~<` is an
+  error.** `push`, `pop`, `incf` and `decf` check their argument counts, `setf`
+  of a standard accessor with the wrong number of arguments is an error, and
+  `setq` of a constant is an error.
+- **Generic function protocol**: `compute-class-precedence-list` is a generic
+  function and a method on a metaclass decides the order; effective slots
+  follow AMOP (inherited slots first).
+- **`*features*` has `:ansi-cl` and `:ieee-floating-point`**, so `#+ansi-cl`
+  branches change.
+- **Scripts**: `*debugger-hook*` is NIL (the reporting hook is
+  `dotcl:*invoke-debugger-hook*`), and an uncaught error exits after running
+  `unwind-protect` cleanups.
+- **Pathnames**: on Unix `*`, `?` and `[` in a name read from the file system
+  are quoted in a namestring; `probe-file`, `truename` and
+  `ensure-directories-exist` signal FILE-ERROR for a wild pathname.
+- **A `:utf-16` or `:utf-32` file written without an endianness** skips the BOM
+  when read back; `:utf-16be` writes no BOM.
+- **A `.fasl` built by dotcl 0.1.34 or later is read without a warning**; one
+  built earlier is replaced by the source.
+
+### Added
+
+- **Reproducible builds (partly).** Compiling the same file twice gives the
+  same `.fasl` bytes. `dotcl:*source-path-map*` and `DOTCL_SOURCE_PATH_MAP` map
+  the recorded source paths, and `make pack` fixes them and the `nupkg` zip
+  times. On macOS arm64, two trees give byte-identical `DotCL.Runtime`, `dotcl`
+  and `dotcl.osx-arm64` packages. Other platforms, `dotcl pack --system` and
+  the version string taken from git are not covered yet.
+- **Better errors in scripts.** An uncaught error reports `file:line` of the
+  failing Lisp function; `DOTCL_BACKTRACE=1` prints Lisp frames. Reader errors,
+  undefined functions and variables carry the position.
+- **More of the metaobject protocol.** `defclass`, `defmethod` and `defgeneric`
+  go through `ensure-class-using-class`, `add-method` and
+  `ensure-generic-function-using-class`; 31 introspection functions are
+  generic; `make-method-lambda` returns two values.
+- `dotcl:valid-type-specifier-p`, `dotcl:exit`, `(step form)`, `dribble` that
+  records, and `trace` that works on COMMON-LISP functions.
+
+### Faster
+
+Numbers are from one Mac (arm64) against v0.1.36, best of five runs.
+
+- `read-line` on a character file: 582 to 76 ns per line. `equal` on lists:
+  200 to 18 ns. `parse-integer` of nine digits: 152 to 68 ns.
+- `format "~{~a ~}"` over 40000 elements is linear again: 1.38 s to 6 ms.
+- A call with up to four `&key` pairs builds no argument array: 112 to 38 ns.
+- Typed numeric code boxes less: a five-body n-body step loop allocated 600 MB
+  over 500000 steps and now allocates nothing.
+- `compile` no longer keeps about 1 KB of memory per call.
+
+### Fixed
+
+- `format ~( ~)` no longer shares the argument list with the directives around
+  it; `~E` without a width prints the shortest digits of a single-float.
+- A class redefinition that adds a superclass, or slots to a slotless class,
+  updates the existing instances; one initarg that fills two slots fills both.
+- Loading the same fasl or system again (for example `clear-system` and
+  `load-system` after an edit) no longer leaves the old assemblies loaded: the
+  second and later loads of a file go into a collectible load context and are
+  freed after a garbage collection. The first load of each file still uses the
+  ReadyToRun image.
+
+### Known issues
+
+- Not unloaded when a fasl or system is loaded again: the assembly of each
+  path's first load, the dynamic assembly of a `defclass` made for .NET
+  interop, and the FFI callback assembly. See docs/deviations.md.
+- Recompiling a system again and again in one process (edit, `compile-file`,
+  load) keeps the literal data that the compiler evaluates, so the managed heap
+  grows with every full recompile of a large system. Restart the process after
+  many recompiles of a large system.
+- Compiling a form with about 10000 clauses fails with "Compile depth limit
+  exceeded"; the interpreter handles it.
+
+### Thanks
+
+- David John Cooper -- for four pull requests and for reporting the
+  one-initarg-two-slots, class-precedence-list, direct-slot-definition and
+  `:supersede` issues.
+
 ## v0.1.36 -- 2026-10-31
 
 This release lets you write a .NET library in Common Lisp: the function and

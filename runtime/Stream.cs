@@ -117,6 +117,19 @@ public sealed class ByteTrackingReader : TextReader
     /// has moved the stream since this reader last read from it, drop what was
     /// decoded and continue from where the stream now is, which is where the
     /// write ended.</summary>
+    /// <summary>For a reader that shares its stream with a writer, before the writer
+    /// writes: the write goes where the stream's single file position is (CLHS 21.2).
+    /// When the writer moved the stream since the last read, that is where the stream
+    /// is; when this reader read last, it is the reader's own position, not the end of
+    /// what it read ahead.</summary>
+    public void PrepareForWrite()
+    {
+        if (!SharesStreamWithWriter || !_stream.CanSeek) return;
+        long at = _stream.Position;
+        if (at != _fillEnd) { ResetTo(at); return; }
+        if (at != BytePosition) _stream.Position = BytePosition;
+    }
+
     public void SyncWithWriter()
     {
         if (SharesStreamWithWriter && _stream.CanSeek && _stream.Position != _fillEnd)
@@ -281,11 +294,55 @@ public sealed class ByteTrackingReader : TextReader
         int n = 0;
         while (n < count)
         {
+            // Between characters, in LF mode, with ASCII bytes in the buffer: widen them
+            // in a block. Everything else (a multi-byte sequence, the end of the buffer,
+            // CRLF / CR, a shared writer) goes one character at a time.
+            if (Newline == NewlineStyle.Lf && _utf8 && !SharesStreamWithWriter
+                && _pendingPos >= _pendingLen && _carryLen == 0 && _bytePos < _byteLen)
+            {
+                int avail = System.Math.Min(count - n, _byteLen - _bytePos);
+                int k = 0;
+                while (k < avail && _bytes[_bytePos + k] < 0x80)
+                {
+                    buffer[index + n + k] = (char)_bytes[_bytePos + k];
+                    k++;
+                }
+                if (k > 0)
+                {
+                    _bytePos += k;
+                    BytePosition += k;
+                    n += k;
+                    continue;
+                }
+            }
             int c = Read();
             if (c == -1) break;
             buffer[index + n++] = (char)c;
         }
         return n;
+    }
+
+    /// <summary>The rest of the current line, taken straight from the byte buffer, when
+    /// that is plain: the reader is between characters, its line end is LF, nothing is
+    /// shared with a writer, and the line (up to and including its LF) lies in the buffer
+    /// and is all ASCII. Anything else returns false with nothing consumed, and the
+    /// character-at-a-time path reads the line.</summary>
+    public bool TryReadLineAscii(out string line, out bool hadNewline)
+    {
+        line = "";
+        hadNewline = false;
+        if (Newline != NewlineStyle.Lf || !_utf8 || SharesStreamWithWriter) return false;
+        if (_pendingPos < _pendingLen || _carryLen > 0 || _bytePos >= _byteLen) return false;
+        int nl = System.Array.IndexOf(_bytes, (byte)'\n', _bytePos, _byteLen - _bytePos);
+        if (nl < 0) return false;
+        int n = nl - _bytePos;
+        for (int k = _bytePos; k < nl; k++)
+            if (_bytes[k] >= 0x80) return false;
+        line = n == 0 ? "" : System.Text.Encoding.ASCII.GetString(_bytes, _bytePos, n);
+        _bytePos = nl + 1;
+        BytePosition += n + 1;
+        hadNewline = true;
+        return true;
     }
 
     public override string? ReadLine()
@@ -351,6 +408,10 @@ public sealed class ColumnStreamWriter : StreamWriter, IColumnWriter
     // default path does no more than test it.
     private string? _eol;
 
+    /// <summary>The reader of an :IO file stream, which is told before each write (see
+    /// ByteTrackingReader.PrepareForWrite).</summary>
+    public ByteTrackingReader? SharedReader;
+
     public ColumnStreamWriter(System.IO.Stream s) : base(s) { }
     public ColumnStreamWriter(System.IO.Stream s, System.Text.Encoding enc) : base(s, enc) { }
 
@@ -370,17 +431,20 @@ public sealed class ColumnStreamWriter : StreamWriter, IColumnWriter
 
     public override void Write(char value)
     {
+        SharedReader?.PrepareForWrite();
         if (value == '\n' && _eol != null) base.Write(_eol);
         else base.Write(value);
         _col = value == '\n' ? 0 : _col + 1;
     }
     public override void Write(string? value)
     {
+        SharedReader?.PrepareForWrite();
         base.Write(_eol != null && value != null ? Translate(value) : value);
         if (value != null) _col = ColumnCount.After(_col, value.AsSpan());
     }
     public override void Write(char[] buffer, int index, int count)
     {
+        SharedReader?.PrepareForWrite();
         if (_eol != null) base.Write(Translate(new string(buffer, index, count)));
         else base.Write(buffer, index, count);
         _col = ColumnCount.After(_col, new ReadOnlySpan<char>(buffer, index, count));
@@ -393,12 +457,14 @@ public sealed class ColumnStreamWriter : StreamWriter, IColumnWriter
 #if !NETSTANDARD2_0
     public override void Write(ReadOnlySpan<char> buffer)
     {
+        SharedReader?.PrepareForWrite();
         if (_eol != null) base.Write(Translate(new string(buffer)));
         else base.Write(buffer);
         _col = ColumnCount.After(_col, buffer);
     }
     public override void WriteLine(ReadOnlySpan<char> buffer)
     {
+        SharedReader?.PrepareForWrite();
         if (_eol != null) { Write(buffer); Write('\n'); }
         else { base.WriteLine(buffer); _col = 0; }
     }
@@ -406,10 +472,11 @@ public sealed class ColumnStreamWriter : StreamWriter, IColumnWriter
     // NewLine is the line end when one is set, and the base writes it as is.
     public override void WriteLine(string? value)
     {
+        SharedReader?.PrepareForWrite();
         if (_eol != null) { Write(value); Write('\n'); }
         else { base.WriteLine(value); _col = 0; }
     }
-    public override void WriteLine() { if (_eol != null) Write('\n'); else { base.WriteLine(); _col = 0; } }
+    public override void WriteLine() { SharedReader?.PrepareForWrite(); if (_eol != null) Write('\n'); else { base.WriteLine(); _col = 0; } }
 }
 
 /// <summary>Writer in front of the console (or any host writer) that counts its
@@ -483,7 +550,10 @@ public abstract class LispStream : LispObject
     /// STREAM-EXTERNAL-FORMAT.</summary>
     public LispObject? ExternalFormat { get; set; }
     /// <summary>True if the last character written was a newline (or nothing written yet).</summary>
-    public bool AtLineStart { get; set; } = true;
+    /// <summary>True for a file stream opened with :ELEMENT-TYPE :DEFAULT, which takes both
+    /// characters and bytes.</summary>
+    public bool Bivalent { get; set; }
+    public virtual bool AtLineStart { get; set; } = true;
     /// <summary>Cached Reader instance for ReadFromStream, so pushback state is preserved across calls.</summary>
     public Reader? CachedReader { get; set; }
     /// <summary>Shared #n= labels for Reader instances on this stream, so share references work across Reader lifetimes.</summary>
@@ -520,6 +590,15 @@ public class LispBidirectionalStream : LispStream
     public TextWriter Writer { get; }
     public override bool IsInput => true;
     public override bool IsOutput => true;
+
+    /// <summary>A stream that writes through the same host writer and so shares its
+    /// line state: what one has written, the other's FRESH-LINE and ~&amp; account for.</summary>
+    public LispStream? LineStateOwner { get; set; }
+    public override bool AtLineStart
+    {
+        get => LineStateOwner?.AtLineStart ?? base.AtLineStart;
+        set { if (LineStateOwner != null) LineStateOwner.AtLineStart = value; else base.AtLineStart = value; }
+    }
 
     public LispBidirectionalStream(TextReader reader, TextWriter writer)
     {
@@ -568,6 +647,7 @@ public class LispFileStream : LispStream
         OutputWriter = writer;
         FilePath = path;
         reader.SharesStreamWithWriter = ReferenceEquals(reader.BaseStream, writer.BaseStream);
+        if (reader.SharesStreamWithWriter && writer is ColumnStreamWriter csw) csw.SharedReader = reader;
     }
 
     // Probe (no reader or writer, just path)
@@ -618,16 +698,23 @@ internal sealed class BaseCharCheckingStringWriter : StringWriter
 
 public class LispStringOutputStream : LispOutputStream
 {
-    private readonly StringWriter _sw;
+    // The writer is the base class's Writer; it is always a StringWriter.
+    private StringWriter _sw => (StringWriter)Writer;
     public string? ElementTypeName { get; set; }
 
     public LispStringOutputStream(StringWriter sw, string? elementTypeName = null) : base(sw)
     {
-        _sw = sw;
         ElementTypeName = elementTypeName;
     }
 
     public string GetString() => _sw.ToString();
+
+    /// <summary>True when the text written so far is empty or ends with a newline.</summary>
+    public bool EndsAtLineStart()
+    {
+        var sb = _sw.GetStringBuilder();
+        return sb.Length == 0 || sb[sb.Length - 1] == '\n';
+    }
 
     /// <summary>The column the text of this stream starts at on its first line.
     /// Zero for a stream of its own; the column of the destination for the
@@ -640,6 +727,9 @@ public class LispStringOutputStream : LispOutputStream
     {
         var result = _sw.ToString();
         _sw.GetStringBuilder().Clear();
+        // The stream is empty again, so it is at the start of a line (FRESH-LINE already
+        // reads the column from the now empty buffer; ~& reads this flag).
+        AtLineStart = true;
         return result;
     }
 
@@ -897,12 +987,14 @@ public class BroadcastTextWriter : TextWriter
 /// <summary>Broadcast stream: output goes to all component streams.</summary>
 public class LispBroadcastStream : LispStream
 {
-    public LispStream[] Streams { get; }
+    /// <summary>The component streams: native streams, and Gray output streams (CLOS
+    /// instances), which a broadcast stream may hold as well.</summary>
+    public LispObject[] Streams { get; }
     public override bool IsInput => false;
     public override bool IsOutput => true;
     public override string? StreamTypeName => "BROADCAST-STREAM";
 
-    public LispBroadcastStream(LispStream[] streams) => Streams = streams;
+    public LispBroadcastStream(LispObject[] streams) => Streams = streams;
 
     public override string ToString() => "#<BROADCAST-STREAM>";
 }

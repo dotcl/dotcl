@@ -437,13 +437,51 @@ code to be loaded.
 a LET-like macro, and a SETQ-like macro, which perform LOOP-style destructuring.")
 
 
+(defun loop-form-mentions-p (form syms)
+  "True when any symbol of SYMS occurs anywhere in FORM."
+  (cond ((symbolp form) (and form (member form syms :test #'eq) t))
+	((consp form) (or (loop-form-mentions-p (car form) syms)
+			  (loop-form-mentions-p (cdr form) syms)))
+	(t nil)))
+
+(defun loop-independent-steps-p (frobs)
+  "True when FROBS (var form var form ...) are all plain variables and no form
+mentions another pair's variable, so assigning them one after the other gives the
+same result as assigning them in parallel."
+  (and (cddr frobs)
+       (loop for (var nil) on frobs by #'cddr
+	     always (and var (symbolp var)))
+       (let ((vars (loop for (var nil) on frobs by #'cddr collect var)))
+	 ;; Only the counting steps the macro itself wrote: arithmetic on the variable
+	 ;; and a delta, nothing that could observe the other variables through a
+	 ;; closure or a special.
+	 (loop for (var form) on frobs by #'cddr
+	       always (and (loop-counting-step-p form var)
+			   (not (loop-form-mentions-p form (remove var vars :test #'eq))))))))
+
+(defun loop-counting-step-p (form var)
+  "True when FORM is a counting step of VAR the macro wrote: (%INDUCTION-NEXT VAR D),
+(1+ VAR), (1- VAR), or (+ / - VAR integer)."
+  (and (consp form)
+       (eq (cadr form) var)
+       (or (eq (car form) 'dotcl.cil-compiler::%induction-next)
+	   (and (member (car form) '(1+ 1-)) (null (cddr form)))
+	   (and (member (car form) '(+ -)) (= (length form) 3) (integerp (caddr form))))))
+
 (defun loop-make-psetq (frobs)
-  (and frobs
-       (loop-make-desetq
-	 (list (car frobs)
-	       (if (null (cddr frobs)) (cadr frobs)
-		   `(prog1 ,(cadr frobs)
-			   ,(loop-make-psetq (cddr frobs))))))))
+  (cond ((null frobs) nil)
+	;; dotcl: independent steps (the usual FOR I ... AND DI ... counters) are
+	;; sequential SETQs. A PROG1 chain would hold the first new value in a boxed
+	;; temporary, and the compiler could no longer see a counting step.
+	((loop-independent-steps-p frobs)
+	 `(progn ,@(loop for (var form) on frobs by #'cddr
+			 collect (loop-make-desetq (list var form)))))
+	(t
+	 (loop-make-desetq
+	   (list (car frobs)
+		 (if (null (cddr frobs)) (cadr frobs)
+		     `(prog1 ,(cadr frobs)
+			     ,(loop-make-psetq (cddr frobs)))))))))
 
 
 (defun loop-make-desetq (var-val-pairs)
@@ -1950,7 +1988,11 @@ collected result will be returned as the value of the LOOP."
 	 (:by
 	   (multiple-value-setq (form stepby-constantp stepby)
 	     (loop-constant-fold-if-possible form indexv-type))
-	   (unless stepby-constantp
+	   ;; A literal BY of zero or less is checked like any other BY value that is
+	   ;; not known to be positive (CLHS 6.1.2.1.1: BY is a positive number), so
+	   ;; the loop signals instead of stepping by zero or the wrong way for ever.
+	   (unless (and stepby-constantp
+			(not (and (realp stepby) (not (plusp stepby)))))
 	     (loop-make-variable (setq stepby (loop-gentemp 'loop-step-by-))
 				 `(dotcl.cil-compiler::%loop-by ,form) indexv-type)))
 	 (t (loop-error
@@ -2088,7 +2130,9 @@ collected result will be returned as the value of the LOOP."
 	 (loop-error "Too many prepositions!"))
 	((null prep-phrases) (loop-error "Missing OF or IN in ~S iteration path.")))
   (let ((ht-var (loop-gentemp 'loop-hashtab-))
-	(next-fn (loop-gentemp 'loop-hashtab-next-))
+	(vec-var (loop-gentemp 'loop-hashtab-vec-))
+	(idx-var (loop-gentemp 'loop-hashtab-idx-))
+	(end-var (loop-gentemp 'loop-hashtab-end-))
 	(dummy-predicate-var nil)
 	(post-steps nil))
     (multiple-value-bind (other-var other-p)
@@ -2112,7 +2156,7 @@ collected result will be returned as the value of the LOOP."
 	(if (eq which 'hash-key)
 	    (setq key-var variable val-var (and other-p other-var))
 	    (setq key-var (and other-p other-var) val-var variable))
-	(push `(with-hash-table-iterator (,next-fn ,ht-var)) *loop-wrappers*)
+	(push `(%loop-hash-walk (,vec-var ,idx-var ,end-var) ,ht-var) *loop-wrappers*)
 	(when (consp key-var)
 	  (setq post-steps `(,key-var ,(setq key-var (loop-gentemp 'loop-hash-key-temp-))
 			     ,@post-steps))
@@ -2126,19 +2170,15 @@ collected result will be returned as the value of the LOOP."
 	  ()					;pre-test
 	  ()					;parallel steps
 	  (not
-	   (multiple-value-bind (,temp-predicate-var ,temp-key-var ,temp-val-var)
-	       (,next-fn)
-	     ;; We use M-V-BIND instead of M-V-SETQ because we only
-	     ;; want to assign values to the key and val vars when we
-	     ;; are in the hash table.  When we reach the end,
-	     ;; TEMP-PREDICATE-VAR is NIL, and so are temp-key-var and
-	     ;; temp-val-var.  This might break any type declarations
-	     ;; on the key and val vars.
+	   ;; Walk the snapshot vector (key, value, key, value, ...) directly: no
+	   ;; iterator closure and no multiple values per step. KEY-VAR and VAL-VAR are
+	   ;; only assigned while there are entries left, as before.
+	   (let ((,temp-predicate-var (< ,idx-var ,end-var)))
 	     (when ,temp-predicate-var
-	       (setq ,val-var ,temp-val-var)
-	       (setq ,key-var ,temp-key-var))
-	     (setq ,dummy-predicate-var ,temp-predicate-var)
-	     ))	;post-test
+	       (setq ,val-var (svref ,vec-var (the fixnum (1+ ,idx-var))))
+	       (setq ,key-var (svref ,vec-var ,idx-var))
+	       (setq ,idx-var (the fixnum (+ ,idx-var 2))))
+	     (setq ,dummy-predicate-var ,temp-predicate-var)))	;post-test
 	  ,post-steps)))))
 
 

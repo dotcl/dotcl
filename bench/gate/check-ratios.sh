@@ -50,7 +50,7 @@
 # bench-state.json".
 #
 # A parity kernel can run at two distinct speeds depending on the process, with
-# nothing but code placement differing (bench/gate/modes.awk has the detection rule).
+# nothing but code placement differing (bench/gate/modes.lisp has the detection rule).
 # The gate still judges each ratio from the minimum over processes, which is the
 # fast group whenever one process drew it, and so is not moved by how many did.
 # What it no longer does is judge such a kernel silently: every split is printed
@@ -116,7 +116,7 @@ lookup_baseline() {
 
 echo "=== parity ratios (platform: $platform, threshold: ${threshold}x baseline) ==="
 
-# Per-process splits, as recorded by make-parity-state.sh (see bench/gate/modes.awk):
+# Per-process splits, as recorded by make-parity-state.sh (see bench/gate/modes.lisp):
 #   name csharp_ms processes  cs_fast_n cs_fast_ms cs_slow_n cs_slow_ms
 #                             d_fast_n  d_fast_ms  d_slow_n  d_slow_ms
 # with "-" in the four fields of a side that is one group. A state file from

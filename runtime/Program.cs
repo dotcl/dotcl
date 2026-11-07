@@ -104,6 +104,23 @@ class Program
         return -1;
     }
 
+    /// <summary>Index of the script file name (or `-`) in ARGS, or -1 when there is none: the first bare
+    /// token after dotcl's own options, unless it names a subcommand. Everything after it is the
+    /// script's, so a script can be given `--help`, `--version`, `--no-init` or `--color=never`
+    /// (docs/scripting.md).</summary>
+    static int ScriptNameIndex(string[] args)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            var a = args[i];
+            if (a == "--") return -1;
+            if (_globalsWithValue.Contains(a)) { i++; continue; }
+            if (a.StartsWith('-') && a != StdinScript) continue;
+            return a is "repl" or "build" or "pack" or "build-library" or "clean" ? -1 : i;
+        }
+        return -1;
+    }
+
     // The positional script meaning standard input. The bare-token rule can
     // never produce it (a bare token does not start with '-'), so a file of
     // that name has to be spelled `./-` to be run instead.
@@ -125,7 +142,7 @@ class Program
     {
         if (!_profile) return;
         var now = _profileSw.ElapsedMilliseconds;
-        Console.Error.WriteLine($"[startup-profile] {label,-28} +{now - _profileLast,5} ms  (total {now} ms)");
+        Console.Error.WriteLine($"[startup-profile] {label,-28} +{now - _profileLast,5} ms  (total {now} ms, jit {System.Runtime.JitInfo.GetCompilationTime().TotalMilliseconds:F0} ms / {System.Runtime.JitInfo.GetCompiledMethodCount()} methods)");
         _profileLast = now;
     }
 
@@ -148,10 +165,19 @@ class Program
         Console.InputEncoding  = utf8NoBom;
         Console.OutputEncoding = utf8NoBom;
         var stdinReader = new StdinReader(
-            new StdinDecoder(Console.OpenStandardInput(), utf8NoBom),
+            new StdinDecoder(StdinPoll.ClosedAtStart() ? System.IO.Stream.Null : Console.OpenStandardInput(), utf8NoBom),
             consoleEndMark: OperatingSystem.IsWindows() && !Console.IsInputRedirected);
         Console.SetIn(stdinReader);
         Runtime.StdinDataReady = stdinReader.DataReady;
+        Runtime.StdinReadByte = stdinReader.ReadRawByte;
+        // A pipe or a file on standard output (or one closed at start) is written by this
+        // process, so that a reader that went away ends the script instead of being ignored.
+        if (!OperatingSystem.IsWindows() && (StdinPoll.FdClosedAtStart(1) || Console.IsOutputRedirected))
+        {
+            var rawOut = new RawStdoutStream(closedAtStart: StdinPoll.FdClosedAtStart(1));
+            var outWriter = new System.IO.StreamWriter(rawOut, utf8NoBom, 4096) { AutoFlush = true };
+            Console.SetOut(outWriter);
+        }
 
         // Enable ANSI VT100 escape sequences on Windows legacy conhost (cmd.exe).
         // Modern .NET enables this implicitly via Console.Out, but redirected
@@ -260,6 +286,7 @@ class Program
         // Skipped when a user FASL is present: then this executable IS an
         // application and every argument belongs to it (see HasUserFasl).
         bool hasUserFasl = HasUserFasl();
+        Runtime.HostIsApplication = hasUserFasl;
 
         // Everything after `--` is the program's, never dotcl's options.
         List<string>? programArgs = null;
@@ -268,6 +295,14 @@ class Program
             programArgs = args[(dd + 1)..].ToList();
             args = args[..dd];
             Runtime.ScriptArgs = programArgs;
+        }
+
+        // What follows the script's name is the script's: dotcl's option scan below never sees it.
+        List<string> scriptTail = new();
+        if (!hasUserFasl && programArgs == null && ScriptNameIndex(args) is var sni && sni >= 0 && sni + 1 < args.Length)
+        {
+            scriptTail = args[(sni + 1)..].ToList();
+            args = args[..(sni + 1)];
         }
 
         if (!hasUserFasl && args.Any(a => a == "--help") && FirstNonGlobalArg(args) is var _packHelpAt
@@ -542,6 +577,8 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 // --load/--eval that precede the script.
                 if (AsmHasScriptFile(args))
                     InstallScriptDebuggerHook();
+                // QUIT in any of them unwinds first, so UNWIND-PROTECT cleanups run.
+                Runtime.ScriptExitThreadId = Environment.CurrentManagedThreadId;
                 for (int i = 2; i < args.Length; i++)
                 {
                     if (args[i] == "--eval" && i + 1 < args.Length)
@@ -566,6 +603,10 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                     else
                         Runtime.Load(new LispObject[] { new LispString(args[i]) });
                 }
+            }
+            catch (ScriptExitException exit)
+            {
+                Environment.Exit(exit.Code);
             }
             catch (LispSourceException lse)
             {
@@ -825,12 +866,14 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 // A file actually called `-` is still reachable as `./-`.
                 positionalScript = StdinScript;
                 positionalArgv = rest.GetRange(i + 1, rest.Count - (i + 1));
+                positionalArgv.AddRange(scriptTail);
                 break;
             }
             else if (!rest[i].StartsWith('-'))
             {
                 positionalScript = rest[i];
                 positionalArgv = rest.GetRange(i + 1, rest.Count - (i + 1));
+                positionalArgv.AddRange(scriptTail);
                 break;
             }
             else
@@ -961,14 +1004,21 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
 
             // Set *debugger-hook* to print error and exit (no interactive debugger)
             InstallScriptDebuggerHook();
+            Runtime.ScriptExitThreadId = Environment.CurrentManagedThreadId;
 
             try
             {
                 // Register #! as line comment for shebang support
-                var shebangReader = new Reader(new StringReader(
-                    "(set-dispatch-macro-character #\\# #\\! (lambda (s c n) (declare (ignore c n)) (read-line s nil nil) (values)))"));
-                if (shebangReader.TryRead(out var shebangForm))
-                    Runtime.Eval(shebangForm);
+                // Installed directly: evaluating a lambda form here made the first
+                // compile of the process (about 300 ms of JIT of the compiler) part of
+                // every script's startup.
+                if (!Runtime.InstallShebangComment())
+                {
+                    var shebangReader = new Reader(new StringReader(
+                        "(set-dispatch-macro-character #\\# #\\! (lambda (s c n) (declare (ignore c n)) (read-line s nil nil) (values)))"));
+                    if (shebangReader.TryRead(out var shebangForm))
+                        Runtime.Eval(shebangForm);
+                }
 
                 // Run any --load/--eval that preceded the script file.
                 foreach (var (kind, value) in scripts)
@@ -987,10 +1037,15 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 // and evaluation as a script file, reading the process's stdin
                 // (Console.In, which *standard-input* wraps). *load-pathname*
                 // stays NIL, as LOAD specifies for a stream.
+                if (positionalScript == StdinScript) Runtime.ScriptStreamName = "<stdin>";
                 Runtime.Load(new LispObject[] {
                     positionalScript == StdinScript
                         ? Startup.StandardInput
                         : new LispString(positionalScript!) });
+            }
+            catch (ScriptExitException exit)
+            {
+                Environment.Exit(exit.Code);
             }
             catch (LispSourceException lse)
             {
@@ -1006,6 +1061,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             // Reachable only as `dotcl repl file.lisp`, where the subcommand comes
             // before the file: after the file, `repl` is one of the file's arguments.
             // Returning without honouring it would drop the word on the floor.
+            Runtime.ScriptExitThreadId = -1;
             if (explicitRepl)
                 RunRepl(readlinePref);
             return;
@@ -1030,7 +1086,13 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         }
         ProfileMark("init-file");
 
-        // Execute actions in order
+        // Execute actions in order. QUIT inside one unwinds the stack first, so UNWIND-PROTECT
+        // cleanup forms run, as they do in a script file.
+        Runtime.ScriptExitThreadId = Environment.CurrentManagedThreadId;
+        // --eval / --load that end in an exit, not in a REPL, report an unhandled error the
+        // way a script does (one line, exit 1) instead of opening the debugger banner.
+        if (!explicitRepl && scripts.Count > 0)
+            InstallScriptDebuggerHook();
         foreach (var (kind, value) in scripts)
         {
             try
@@ -1043,6 +1105,10 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 }
                 else // "script" or "load"
                     Runtime.Load(new LispObject[] { new LispString(value) });
+            }
+            catch (ScriptExitException exit)
+            {
+                Environment.Exit(exit.Code);
             }
             catch (LispSourceException lse)
             {
@@ -1063,6 +1129,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
             }
         }
 
+        Runtime.ScriptExitThreadId = -1;
         ProfileMark("actions");
 
         // REPL only when asked for it. The `repl` subcommand exists precisely so
@@ -1131,11 +1198,29 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// script path and the --asm path so that the two cannot drift apart.</summary>
     static void InstallScriptDebuggerHook()
     {
-        var hookSym = Startup.Sym("*DEBUGGER-HOOK*");
+        // A script reports an unhandled error from the top, after its frames are
+        // gone: have each error note where it was raised. DOTCL_BACKTRACE=1 asks for
+        // the Lisp frames to be printed under the one-line report.
+        ErrorOrigin.Enabled = true;
+        ErrorOrigin.Backtrace = Environment.GetEnvironmentVariable("DOTCL_BACKTRACE") == "1";
+        // The hook lives in dotcl:*INVOKE-DEBUGGER-HOOK*, which INVOKE-DEBUGGER runs before
+        // *DEBUGGER-HOOK*, so that *DEBUGGER-HOOK* itself stays NIL in a script (as in SBCL): a
+        // library that saves and wraps it does not wrap ours. A hook the script sets in
+        // *DEBUGGER-HOOK* still gets the condition first, as it used to replace ours.
+        var hookSym = Startup.SymInPkg("*INVOKE-DEBUGGER-HOOK*", "DOTCL");
+        var userHookSym = Startup.Sym("*DEBUGGER-HOOK*");
         var hook = ConditionSystem.ReportingDebuggerHook(new LispFunction(hookArgs => {
             var cond = hookArgs[0];
-            Console.Error.WriteLine(ConditionText.Line(cond));
-            Environment.Exit(1);
+            if (DynamicBindings.TryGet(userHookSym, out var userHook) && userHook is not Nil)
+                return Nil.Instance;
+            Console.Error.WriteLine(ConditionText.ScriptLine(cond));
+            // An error inside an exit hook ends that hook only: the others run (docs/extensions.md).
+            if (Runtime.InExitHook) throw new Runtime.ExitHookAbort(null);
+            if (ErrorOrigin.Backtrace && ErrorOrigin.HasLispFrames)
+                Runtime.PrintBacktrace(Array.Empty<LispObject>());
+            // Unwind to the top of the script first, so the cleanup forms of
+            // UNWIND-PROTECT run, and exit 1 there.
+            Runtime.ExitProcess(1);
             return Nil.Instance;
         }, "*SCRIPT-DEBUGGER-HOOK*", 2));
         DynamicBindings.Set(hookSym, hook);
@@ -1933,7 +2018,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
     /// <summary>Load a pre-compiled FASL core (PE assembly) and invoke its ModuleInit.</summary>
     static void RunCoreFasl(string filePath)
     {
-        var asm = RuntimeLoadContext.LoadFrom(filePath);
+        var asm = RuntimeLoadContext.LoadCoreFrom(filePath);
         // The core's generation stamp is read off this assembly, not off the file:
         // see Startup.CoreGeneration.
         Startup.CoreAssembly = asm;
@@ -2229,6 +2314,53 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
 /// console does, and reading may go on afterwards. A pipe or a file is left
 /// alone: there the byte is data, as it is to .NET and Python.
 /// </summary>
+/// <summary>Standard output as raw write(2) calls on file descriptor 1 (Unix). .NET's own console
+/// stream swallows EPIPE, so a script writing into a pipe whose reader had gone away ran on to
+/// its end. Here a broken pipe ends the process at once with status 141 (128 + SIGPIPE, what a
+/// shell reports for SBCL), without running cleanup forms; any other write error is an
+/// IOException, and a descriptor that was closed at start reports "Bad file descriptor".</summary>
+sealed class RawStdoutStream : System.IO.Stream
+{
+    [System.Runtime.InteropServices.DllImport("libc", SetLastError = true, EntryPoint = "write")]
+    private static extern nint write_(int fd, ref byte buf, nint count);
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "_exit")]
+    private static extern void exit_(int status);
+
+    private readonly bool _closed;
+    public RawStdoutStream(bool closedAtStart) { _closed = closedAtStart; }
+
+    public override bool CanRead => false;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override void Flush() { }
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override long Seek(long offset, System.IO.SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        if (_closed) throw new System.IO.IOException("Bad file descriptor");
+        {
+            while (count > 0)
+            {
+                nint n = write_(1, ref buffer[offset], count);
+                if (n < 0)
+                {
+                    int errno = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                    if (errno == 4 /* EINTR */) continue;
+                    if (errno == 11 || errno == 35 /* EAGAIN */) { System.Threading.Thread.Sleep(1); continue; }
+                    if (errno == 32 /* EPIPE */) exit_(141);
+                    throw new System.IO.IOException(errno == 9 ? "Bad file descriptor" : $"write error {errno}");
+                }
+                offset += (int)n;
+                count -= (int)n;
+            }
+        }
+    }
+}
+
 sealed class StdinReader : System.IO.TextReader
 {
     private const int None = -2;
@@ -2250,6 +2382,19 @@ sealed class StdinReader : System.IO.TextReader
     }
 
     private bool CanLookAhead() => _dec == null || _dec.CanLookAhead();
+
+    /// <summary>READ-BYTE on standard input (see StdinDecoder.ReadRawByte).</summary>
+    public int ReadRawByte()
+    {
+        if (_dec == null) return -1;
+        if (_pending != None && _pending != -1)
+        {
+            _dec.PushBackChar();
+            _pending = None;
+        }
+        Start();
+        return _dec.ReadRawByte();
+    }
 
     private void Start()
     {
@@ -2403,6 +2548,32 @@ sealed class StdinDecoder : System.IO.TextReader
     public int Buffered => _len - _pos;
     public bool AtEof => _eof && _pos >= _len;
 
+    // Bytes of a character taken apart for READ-BYTE, handed out first.
+    private readonly System.Collections.Generic.Queue<byte> _rawQueue = new();
+
+    /// <summary>Give the character just read back (READ-BYTE after a one-character look-ahead).</summary>
+    public void PushBackChar() { if (_pos > 0) _pos--; }
+
+    /// <summary>The next byte of standard input, for READ-BYTE: -1 at the end. A character already
+    /// decoded is handed out as its UTF-8 bytes; otherwise the byte comes straight from the OS.
+    /// Characters and bytes may be mixed on a character boundary.</summary>
+    public int ReadRawByte()
+    {
+        if (_rawQueue.Count > 0) return _rawQueue.Dequeue();
+        if (_pos < _len)
+        {
+            char ch = _c[_pos++];
+            string text = ch.ToString();
+            if (char.IsHighSurrogate(ch) && _pos < _len) text += _c[_pos++];
+            foreach (var b in new System.Text.UTF8Encoding(false).GetBytes(text)) _rawQueue.Enqueue(b);
+            return _rawQueue.Dequeue();
+        }
+        if (_eof) return -1;
+        int v = _s.ReadByte();
+        if (v < 0) _eof = true;
+        return v;
+    }
+
     // Whether looking at the next character can be done without waiting.
     public bool CanLookAhead() => Buffered > 0 || _eof || StdinPoll.Ready() != false;
 
@@ -2461,6 +2632,31 @@ static class StdinPoll
 
     [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "poll")]
     private static extern int poll_(ref PollFd fds, nuint n, int timeout);
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "fcntl")]
+    private static extern int fcntl_(int fd, int cmd, int arg);
+
+    /// <summary>True on Unix when file descriptor 0 was closed when the process started (a
+    /// script run as <c>cmd 0&lt;&amp;-</c>). The runtime then opens its own files and
+    /// pipes at the lowest free descriptors, so fd 0 is one of its internal ones and a read
+    /// from it blocks for ever. A descriptor the process inherited is never close-on-exec;
+    /// one the runtime opened is, so that flag tells them apart. Stdin then reads as an
+    /// empty file, which is what SBCL reports (end of file).</summary>
+    public static bool ClosedAtStart() => FdClosedAtStart(0);
+
+    public static bool FdClosedAtStart(int fd)
+    {
+        if (OperatingSystem.IsWindows()) return false;
+        try
+        {
+            int flags = fcntl_(fd, 1 /* F_GETFD */, 0);
+            return flags < 0 || (flags & 1 /* FD_CLOEXEC */) != 0;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
 
     private static bool? UnixReady()
     {

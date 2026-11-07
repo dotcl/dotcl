@@ -87,6 +87,10 @@
       ((> nargs 3)
        (compile-static-program-error
         (format nil "TYPEP: too many arguments: ~D (expected 2-3)" nargs)))
+      ((progn
+         (when (and (consp (cadr a)) (eq (car (cadr a)) 'quote) (consp (cdr (cadr a))))
+           (warn-invalid-constant-type-spec (cadr (cadr a))))
+         nil))
       ((%typep-constant-rewrite expr)
        (compile-expr (%typep-constant-rewrite expr)))
       (t
@@ -119,6 +123,25 @@
                    (compile-unary-call (list (car a)) predicate "TYPEP")
                    (compile-binary-call (list (car a) type-arg) "Runtime.Typep"))))
            (t (compile-binary-call (list (car a) type-arg) "Runtime.Typep"))))))))
+
+(defun %rest-forward-apply (expr)
+  "(APPLY F A... REST) with REST the &REST variable of the frame being compiled (see
+   *REST-FORWARD*), as a call taking the arguments from the frame's argument array."
+  (destructuring-bind (sym key args-idx start) *rest-forward*
+    (declare (ignore sym key))
+    (let* ((f (second expr))
+           (fixed (butlast (cddr expr)))
+           (mode (and (<= 2 (length (cdr expr)) 4) (%call-site-mv-mode (cdr expr))))
+           (tf (gen-local "RFF")) (ta (gen-local "RFA")))
+      `((:declare-local ,tf "LispObject")
+        (:declare-local ,ta "LispObject[]")
+        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr f))
+        (:stloc ,tf)
+        ,@(if fixed (compile-args-array fixed) '((:ldnull)))
+        (:stloc ,ta)
+        (:ldloc ,tf) (:ldloc ,ta) (:ldarg ,args-idx) (:ldc-i4 ,start)
+        ,@mode
+        (:call ,(if mode "Runtime.ApplyArgsM" "Runtime.ApplyArgs"))))))
 
 (defun compile-aref-form (expr)
   "The AREF form handler. Numeric/float-backed array locals read the element
@@ -277,6 +300,7 @@
          (unless *cross-compiling*
            (push `(proclaim ',spec) proclaim-forms)))
         ;; (ftype (function (arg-types...) return-type) name...)
+        ((and (progn (%note-declaimed-ftype-names spec) nil)))
         ((and (consp spec) (eq (car spec) 'ftype)
               (consp (cadr spec))
               (eq (car (cadr spec)) 'function)
@@ -311,6 +335,77 @@
        (or (member ty '(integer fixnum symbol cons list character function string))
            (let ((info (gethash ty *struct-info*)))
              (and info (null (getf info :type-option)))))))
+
+;; A slot type that is a compound of simple tests (OR / AND / NOT of type names with a
+;; direct predicate, structure names, integer ranges inside a fixnum object, and
+;; DEFTYPEs that expand to those, and other type names, which go to the runtime
+;; TYPEP) is tested inline before CheckSlotType is called:
+;; the call only decides a value the inline test did not accept, so it signals
+;; as it always did.
+(defun %slot-inline-form (v spec depth)
+  "A form testing the variable V against the type SPEC made only of tests that
+   compile to a few instructions, or NIL when some part of SPEC is not one."
+  (let ((preds '((null . null) (cons . consp) (list . listp) (symbol . symbolp)
+                 (string . stringp) (character . characterp) (function . functionp)
+                 (integer . integerp) (number . numberp) (atom . atom))))
+    (cond
+      ((> depth 8) nil)
+      ((eq spec t) t)
+      ((eq spec 'fixnum) `(%fixnum-range-p ,v -9223372036854775808 9223372036854775807))
+      ((and (symbolp spec) spec (assoc spec preds))
+       `(,(cdr (assoc spec preds)) ,v))
+      ((%typep-int64-range spec)
+       (let ((r (%typep-int64-range spec))) `(%fixnum-range-p ,v ,(car r) ,(cdr r))))
+      ((and (symbolp spec) spec
+            (let ((info (gethash spec *struct-info*)))
+              (and info (null (getf info :type-option)))))
+       `(typep ,v ',spec))
+      ((and (consp spec) (listp (cdr spec)) (member (car spec) '(or and)) (cdr spec))
+       (let ((parts (mapcar (lambda (p) (%slot-inline-form v p (1+ depth))) (cdr spec))))
+         (and (every #'identity parts)
+              (cons (car spec)
+                    ;; Direct tests first in an OR: the table lookup of a class
+                    ;; name is only paid by a value none of them took.
+                    (if (eq (car spec) 'or)
+                        (append (remove-if #'%slot-generic-leaf-p parts)
+                                (remove-if-not #'%slot-generic-leaf-p parts))
+                        parts)))))
+      ((and (consp spec) (eq (car spec) 'not) (consp (cdr spec)) (null (cddr spec)))
+       (let ((p (%slot-inline-form v (cadr spec) (1+ depth))))
+         (and p `(not ,p))))
+      ;; A DEFTYPE known now is taken apart, as TYPEP of a constant type is
+      ;; (%TYPEP-SPEC-EXPANSION): compiled code may assume it keeps its definition
+      ;; (CLHS 3.2.2.3).
+      ((and (symbolp spec) spec
+            (not (eq (symbol-package spec) (find-package "COMMON-LISP")))
+            *known-type-name-p-fn* *typexpand-1-fn*
+            (eq (funcall *known-type-name-p-fn* spec) :deftype)
+            (null (find-class spec nil)))
+       (multiple-value-bind (e expanded)
+           (ignore-errors (funcall *typexpand-1-fn* spec))
+         (and expanded (not (eq e spec)) (%slot-inline-form v e (1+ depth)))))
+      ((and (consp spec) (eq (car spec) 'member) (cdr spec) (listp (cdr spec))
+            (<= (length (cdr spec)) 8))
+       `(or ,@(mapcar (lambda (o) `(,(if (symbolp o) 'eq 'eql) ,v ',o)) (cdr spec))))
+      ;; Any other type name: TYPEP of the name (Runtime.IsTrueTypep).
+      ((and (symbolp spec) spec *known-type-name-p-fn*
+            (funcall *known-type-name-p-fn* spec))
+       `(typep ,v ',spec))
+      (t nil))))
+
+(defun %slot-generic-leaf-p (form)
+  "Is FORM an inline slot test that goes to the runtime TYPEP of a class name?"
+  (and (consp form) (eq (car form) 'typep)
+       (let ((ty (cadr (caddr form))))
+         (not (and (symbolp ty) (gethash ty *struct-info*))))))
+
+(defun %slot-inline-test-form (val ty)
+  "The inline test of the variable VAL against the slot type TY, or NIL."
+  (and (not *cross-compiling*)
+       (symbolp val) val (not (eq val t)) (not (keywordp val))
+       (if (and (symbolp ty) ty (%slot-check-inline-type-p val ty))
+           `(typep ,val ',ty)
+           (and (not (eq ty t)) (%slot-inline-form val ty 0)))))
 
 (defun %slot-store-value-of-type-p (val ty)
   "True when the value of VAL, a variable or a constant, is statically of TY,
@@ -661,17 +756,17 @@
            (%map-open 'map-nil (,fn (car ,cur)) ,(caddr args)))))))
 
 (defun %maphash-lambda-expansion (args)
-  "The loop (MAPHASH (LAMBDA (K V) ...) TABLE) opens into when the lambda leaves
-   the walk with RETURN-FROM, RETURN or GO, else NIL. Inlined, such an exit is a
-   jump; from the function MAPHASH calls it is a .NET exception. The walk is the
-   snapshot MAPHASH takes (Runtime.HashWalkBegin), released by the cleanup."
+  "The loop (MAPHASH (LAMBDA (K V) ...) TABLE) opens into when the function is a literal
+   lambda of two arguments, else NIL. Inlined, an exit by RETURN-FROM, RETURN or GO is a jump
+   (from the function MAPHASH calls it is a .NET exception), and the call of the lambda per entry
+   is a jump instead of a call through the function object. The walk is the snapshot MAPHASH takes
+   (Runtime.HashWalkBegin), released by the cleanup."
   (let ((lam (and (consp args) (consp (cdr args)) (null (cddr args))
                   (%map-literal-lambda (car args)))))
     (when (and lam
                (%map-lambda-accepts-p (cadr lam) 2)
                (not (member 'maphash *notinline-functions*))
-               (not (%global-notinline-p 'maphash))
-               (%map-body-exits-p (cddr lam)))
+               (not (%global-notinline-p 'maphash)))
       (let ((fn (gensym "MAPFN"))
             (w (gensym "HWALK"))
             (top (gensym "HTOP")))
@@ -783,8 +878,11 @@
                                        ((null ,tl)
                                         (error 'type-error :datum ,r :expected-type 'list))
                                        (t
-                                        (rplacd ,tl ,x)
-                                        (setq ,tl (and (consp ,x) (last ,x))))))))
+                                        ;; The new tail first: X may be the list
+                                        ;; collected so far.
+                                        (let ((nt (and (consp ,x) (last ,x))))
+                                          (rplacd ,tl ,x)
+                                          (setq ,tl nt)))))))
                         ,@(%compile-statements
                            `((setq ,@(mapcan (lambda (c) (list c `(cdr ,c))) curs))))
                         (:br ,top)
@@ -876,6 +974,34 @@
             ,@body
             (:call "MultipleValues.Reset")
             (:ldloc ,rkey)))))))
+
+(defun %safety3-typed-bindings (bindings body)
+  "BINDINGS of a LET / LET* with each initial value of a variable whose type BODY declares wrapped in
+   (%CHECK-DECLARED-TYPE 'type init), so that (SAFETY 3) code signals a TYPE-ERROR for a value of the
+   wrong type, as safe code should (CLHS 1.4.2). A literal NIL or 0 init is left alone: LOOP binds its
+   variables to those before the first iteration, whatever their declared type. BINDINGS itself when
+   the code is not at SAFETY 3 or nothing is declared."
+  (if (not (and (compiling-at-safety-3-p) (listp bindings)))
+      bindings
+      (let ((types '()))
+        (dolist (f body)
+          (unless (and (consp f) (eq (car f) 'declare)) (return))
+          (dolist (spec (cdr f))
+            (when (and (consp spec) (symbolp (car spec)) (consp (cdr spec)))
+              (cond ((eq (car spec) 'type)
+                     (dolist (v (cddr spec)) (when (symbolp v) (push (cons v (cadr spec)) types))))
+                    ((member (symbol-name (car spec))
+                             '("FIXNUM" "INTEGER" "STRING" "SYMBOL" "LIST" "CONS" "NUMBER" "FLOAT" "DOUBLE-FLOAT" "SINGLE-FLOAT"
+                               "CHARACTER" "SIMPLE-STRING" "VECTOR" "SIMPLE-VECTOR" "REAL" "RATIONAL" "FUNCTION" "HASH-TABLE")
+                             :test #'string=)
+                     (dolist (v (cdr spec)) (when (symbolp v) (push (cons v (car spec)) types))))))))
+        (if (null types)
+            bindings
+            (mapcar (lambda (b)
+                      (if (and (consp b) (consp (cdr b)) (not (member (cadr b) '(nil 0))) (assoc (car b) types))
+                          (list (car b) (list '%check-declared-type (list 'quote (cdr (assoc (car b) types))) (cadr b)))
+                          b))
+                    bindings)))))
 
 (let ((h *compile-form-handlers*))
 
@@ -1468,12 +1594,12 @@
                               (:call "Runtime.CheckSlotType")))
                       (ty (let ((q (second (cdr expr))))
                             (and (consp q) (eq (car q) 'quote) (cadr q)))))
-                  (if (%slot-check-inline-type-p val ty)
-                      ;; TYPEP says yes for every value of the type, and
+                  (if (%slot-inline-test-form val ty)
+                      ;; The test says yes for every value of the type, and
                       ;; CheckSlotType then could not fail; a no goes to it.
                       (let ((ok (gen-label "SCOK")))
                         `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
-                              (compile-boolean-branch `(typep ,val ',ty) ok t))
+                              (compile-boolean-branch (%slot-inline-test-form val ty) ok t))
                           ,@call (:pop)
                           (:label ,ok)
                           ,@(emit-nil)))
@@ -1633,6 +1759,7 @@
                         ,@(compile-value-arg val)))
                   (:call "Runtime.StructSet"))))))
   (setf (gethash '%struct-typep h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.StructTypep")))
+  (setf (gethash '%map1-fast h) (lambda (expr) (compile-ternary-call (cdr expr) "Runtime.Map1Fast")))
   (setf (gethash '%copy-struct h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.CopyStruct")))
 
   ;; CLOS primitives
@@ -1713,6 +1840,15 @@
   (setf (gethash '%find-class-or-nil h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.FindClassOrNil")))
   (setf (gethash 'class-of h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.ClassOf")))
   (setf (gethash 'boundp h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.Boundp")))
+  ;; (parse-integer s) with no keywords is a direct call; any keyword takes the ordinary call.
+  (setf (gethash 'parse-integer h)
+        (lambda (expr)
+          (if (= (length (cdr expr)) 1)
+              (compile-unary-call (cdr expr) "Runtime.ParseInteger1")
+              (compile-named-call (car expr) (cdr expr)))))
+  (setf (gethash 'fboundp h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.FboundpDirect")))
+  (setf (gethash 'symbol-plist h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.SymbolPlistDirect")))
+  (setf (gethash 'symbol-function h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.SymbolFunction")))
   (setf (gethash 'symbol-value h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.SymbolValue")))
   (setf (gethash 'fdefinition h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.Fdefinition")))
   (setf (gethash '%getenv h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.Getenv")))
@@ -1763,7 +1899,7 @@
             ,@(compile-value-arg (third expr))
             ,@(compile-value-arg (fourth expr))
             (:call "Runtime.MakeMethod"))))
-  (setf (gethash '%add-method h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.AddMethod")))
+  (setf (gethash '%add-method h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.AddMethodProtocol")))
   (setf (gethash '%gf-methods h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.GetGFMethods")))
   (setf (gethash '%method-specializers h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.MethodSpecializers")))
   (setf (gethash '%method-qualifiers h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.MethodQualifiers")))
@@ -1799,6 +1935,48 @@
           ;; ...)). A plain call (list/mapcar) never hit this because it loads nothing
           ;; before its args.
           (let ((class-tmp (gen-local "MI-CLASS"))
+                (args-tmp (gen-local "MI-ARGS"))
+                (initargs (cddr expr)))
+            (if (and (member (length initargs) '(2 4 6))
+                     (loop for (k nil) on initargs by #'cddr
+                           always (and (keywordp k) k)))
+                ;; One to three literal keywords: the pairs travel as arguments, no
+                ;; argument array (the runtime falls back to the array path itself).
+                (let* ((n (/ (length initargs) 2))
+                       (vals (loop for (nil v) on initargs by #'cddr collect v))
+                       (tmps (loop repeat n collect (gen-local "MI-V"))))
+                  `((:declare-local ,class-tmp "LispObject")
+                    ,@(compile-value-arg (second expr))
+                    (:stloc ,class-tmp)
+                    ,@(loop for v in vals for tmp in tmps
+                            append `((:declare-local ,tmp "LispObject")
+                                     ,@(compile-value-arg v)
+                                     (:stloc ,tmp)))
+                    (:ldloc ,class-tmp)
+                    ,@(loop for (k nil) on initargs by #'cddr for tmp in tmps
+                            append `(,@(compile-value-arg k) (:ldloc ,tmp)))
+                    (:call ,(format nil "Runtime.MakeInstanceKV~D" n))))
+                `((:declare-local ,class-tmp "LispObject")
+                  ,@(compile-value-arg (second expr))
+                  (:stloc ,class-tmp)
+                  (:declare-local ,args-tmp "LispObject[]")
+                  ,@(compile-args-array initargs)
+                  (:stloc ,args-tmp)
+                  (:ldloc ,class-tmp)
+                  (:ldloc ,args-tmp)
+                  (:call "Runtime.MakeInstanceWithInitargs"))))))
+
+  (setf (gethash '%make-instance-dyn h)
+        (lambda (expr)
+          ;; Evaluate the class into a temp FIRST so the stack is empty while
+          ;; compile-args-array pre-evaluates the initarg values. An initarg value
+          ;; containing a tagbody (loop/dolist: which emit :LEAVE and labels that
+          ;; require an empty CIL stack) was otherwise compiled with the class still
+          ;; on the stack, producing an unbalanced (stack-underflow) method; invalid
+          ;; CIL, e.g. cl-ppcre's (make-instance 'alternation :choices (loop ... collect
+          ;; ...)). A plain call (list/mapcar) never hit this because it loads nothing
+          ;; before its args.
+          (let ((class-tmp (gen-local "MI-CLASS"))
                 (args-tmp (gen-local "MI-ARGS")))
             `((:declare-local ,class-tmp "LispObject")
               ,@(compile-value-arg (second expr))
@@ -1808,7 +1986,7 @@
               (:stloc ,args-tmp)
               (:ldloc ,class-tmp)
               (:ldloc ,args-tmp)
-              (:call "Runtime.MakeInstanceWithInitargs")))))
+              (:call "Runtime.MakeInstanceDyn")))))
 
   ;; Derived predicates
   (setf (gethash 'zerop h)
@@ -1826,23 +2004,29 @@
           (if (= (length (cdr expr)) 1)
               `(,@(compile-value-arg (cadr expr)) ,@(emit-fixnum 0) (:call "Runtime.LessThan"))
               (compile-named-call 'minusp (cdr expr)))))
+  (setf (gethash '%integer-evenp h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.IntegerEvenp")))
   (setf (gethash 'evenp h)
         (lambda (expr)
           (if (= (length (cdr expr)) 1)
               (let ((tmp (gensym "EVENP")))
                 (compile-expr
-                  `(let ((,tmp ,(cadr expr)))
-                     (if (integerp ,tmp) (= (mod ,tmp 2) 0)
-                         (error 'type-error :datum ,tmp :expected-type 'integer)))))
+                  ;; A fixnum-typed argument is tested on its low bit, unboxed.
+                  (if (fixnum-typed-p (cadr expr))
+                      `(= (logand ,(cadr expr) 1) 0)
+                      `(let ((,tmp ,(cadr expr)))
+                         (if (integerp ,tmp) (%integer-evenp ,tmp)
+                             (error 'type-error :datum ,tmp :expected-type 'integer))))))
               (compile-named-call 'evenp (cdr expr)))))
   (setf (gethash 'oddp h)
         (lambda (expr)
           (if (= (length (cdr expr)) 1)
               (let ((tmp (gensym "ODDP")))
                 (compile-expr
-                  `(let ((,tmp ,(cadr expr)))
-                     (if (integerp ,tmp) (not (= (mod ,tmp 2) 0))
-                         (error 'type-error :datum ,tmp :expected-type 'integer)))))
+                  (if (fixnum-typed-p (cadr expr))
+                      `(= (logand ,(cadr expr) 1) 1)
+                      `(let ((,tmp ,(cadr expr)))
+                         (if (integerp ,tmp) (not (%integer-evenp ,tmp))
+                             (error 'type-error :datum ,tmp :expected-type 'integer))))))
               (compile-named-call 'oddp (cdr expr)))))
 
   ;; Math
@@ -2076,7 +2260,8 @@
               (let ((args (cdr expr)))
                 (case (length args)
                   (0 (emit-fixnum zero-val))
-                  (1 (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args))))
+                  (1 `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
+                       (:call "Runtime.CheckInteger1")))
                   ;; Asked of the whole form, not the operands: (logand X M)
                   ;; with a non-negative M is exact even when X is not.
                   (2 (cond ((fixnum-typed-p expr)
@@ -2110,12 +2295,25 @@
         (lambda (expr)
           (if (> (length (cdr expr)) 1)
               (compile-static-program-error (format nil "TERPRI: wrong number of arguments: ~a (expected 0-1)" (length (cdr expr))))
-              `(,@(compile-args-array (cdr expr)) (:call "Runtime.Terpri")))))
+              (if (null (cdr expr))
+                  '((:call "Runtime.Terpri0"))
+                  (compile-unary-call (cdr expr) "Runtime.Terpri1")))))
   (setf (gethash 'fresh-line h)
         (lambda (expr)
           (if (> (length (cdr expr)) 1)
               (compile-static-program-error (format nil "FRESH-LINE: wrong number of arguments: ~a (expected 0-1)" (length (cdr expr))))
-              `(,@(compile-args-array (cdr expr)) (:call "Runtime.FreshLine")))))
+              (if (null (cdr expr))
+                  '((:call "Runtime.FreshLine0"))
+                  (compile-unary-call (cdr expr) "Runtime.FreshLine1")))))
+  (dolist (spec '((finish-output "FINISH-OUTPUT" "Runtime.FinishOutput0" "Runtime.FinishOutput1")
+                  (force-output "FORCE-OUTPUT" "Runtime.ForceOutput0" "Runtime.ForceOutput1")))
+    (let ((name (first spec)) (label (second spec)) (call0 (third spec)) (call1 (fourth spec)))
+      (setf (gethash name h)
+            (lambda (expr)
+              (cond ((> (length (cdr expr)) 1)
+                     (compile-named-call name (cdr expr)))
+                    ((null (cdr expr)) `((:call ,call0)))
+                    (t (compile-unary-call (cdr expr) call1)))))))
   (setf (gethash 'format h)
         (lambda (expr)
           (let ((stream-tmp (gen-local "FMTDST")) (args-tmp (gen-local "FMTARGS")))
@@ -2163,6 +2361,16 @@
               ((= nargs 2) `(,@(compile-value-args (list (cadr expr) (caddr expr) nil)) (:call "Runtime.ReadChar")))
               ((= nargs 3) `(,@(compile-value-args (list (cadr expr) (caddr expr) (cadddr expr))) (:call "Runtime.ReadChar")))
               (t (compile-static-program-error (format nil "READ-CHAR: wrong number of arguments: ~a (expected 0-4)" nargs)))))))
+  ;; (read-byte stream [eof-error-p [eof-value]]): the three-argument entry, with no
+  ;; argument array (the generic call allocated one per byte).
+  (setf (gethash 'read-byte h)
+        (lambda (expr)
+          (let ((nargs (length (cdr expr))))
+            (cond
+              ((= nargs 1) `(,@(compile-value-args (list (cadr expr) t nil)) (:call "Runtime.ReadByteDirect")))
+              ((= nargs 2) `(,@(compile-value-args (list (cadr expr) (caddr expr) nil)) (:call "Runtime.ReadByteDirect")))
+              ((= nargs 3) `(,@(compile-value-args (list (cadr expr) (caddr expr) (cadddr expr))) (:call "Runtime.ReadByteDirect")))
+              (t (compile-named-call 'read-byte (cdr expr)))))))
   (setf (gethash 'read-char-no-hang h)
         (lambda (expr)
           (let ((nargs (length (cdr expr))))
@@ -2296,6 +2504,14 @@
   (setf (gethash 'string-left-trim h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.StringLeftTrim")))
   (setf (gethash 'string-right-trim h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.StringRightTrim")))
   (setf (gethash 'char-code h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.CharCode")))
+  ;; One-argument character functions: a direct call, not a call through the function cell.
+  (dolist (spec '((alpha-char-p "Runtime.AlphaCharP") (alphanumericp "Runtime.Alphanumericp")
+                  (upper-case-p "Runtime.UpperCaseP") (lower-case-p "Runtime.LowerCaseP")
+                  (both-case-p "Runtime.BothCaseP") (graphic-char-p "Runtime.GraphicCharP")
+                  (char-upcase "Runtime.CharUpcase") (char-downcase "Runtime.CharDowncase")))
+    (let ((method (second spec)))
+      (setf (gethash (first spec) h)
+            (lambda (expr) (compile-unary-call (cdr expr) method)))))
   (setf (gethash 'code-char h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.CodeChar")))
   (setf (gethash 'digit-char-p h)
         (lambda (expr)
@@ -2336,6 +2552,7 @@
 
   ;; Package ops (eq-accessible versions; string= versions remain in compile-form fallback)
   (setf (gethash 'hash-table-pairs h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.HashTablePairs")))
+  (setf (gethash 'hash-table-flat h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.HashTableFlat")))
   (setf (gethash 'find-package h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.FindPackage")))
   (setf (gethash 'package-name h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.PackageName")))
   (setf (gethash 'package-error-package h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.PackageErrorPackage")))
@@ -2376,6 +2593,11 @@
   ;; LIST* prefix per call, for a list APPLY then walks straight back apart.
   (setf (gethash 'apply h)
         (lambda (expr &aux (last-arg (car (last expr))))
+          (if (and *rest-forward* (cddr expr) (eq last-arg (first *rest-forward*))
+                   (eq (lookup-local last-arg) (second *rest-forward*))
+                   (not (local-function-entry 'apply))
+                   (<= (length (cddr expr)) 7))
+              (%rest-forward-apply expr)
           (if (and (cddr expr) (consp last-arg) (eq (car last-arg) 'list)
                    (not (local-function-entry 'list))
                    (not (member 'list *notinline-functions* :test #'equal)))
@@ -2393,7 +2615,7 @@
             ;; The value mode goes after the arguments, before the call.
             (if mode
                 (append (butlast code) mode (last code))
-                code)))))
+                code))))))
   (setf (gethash 'maphash h)
         (lambda (expr)
           (let ((opened (%maphash-lambda-expansion (cdr expr))))
@@ -2645,21 +2867,29 @@
   (setf (gethash 'progn h) (lambda (expr) (let ((*at-toplevel* *compile-was-toplevel*)) (compile-progn (cdr expr)))))
   (setf (gethash 'let h)
         (lambda (expr)
-          (let* ((*let-subst-size-memo* (or *let-subst-size-memo* (list nil)))
-                 (form (or (let-scalar-replace-struct (cadr expr) (cddr expr))
-                           (let-substitute-single-reads (cadr expr) (cddr expr)))))
-            (if form
-                (compile-expr form)
-                (compile-let (cadr expr) (cddr expr) nil)))))
+          (let ((bad (%malformed-let-binding (cadr expr))))
+            (if bad
+                (compile-static-program-error (format nil "LET: malformed binding ~S" bad))
+                (let* ((*let-subst-size-memo* (or *let-subst-size-memo* (list nil)))
+                       (bindings (%safety3-typed-bindings (cadr expr) (cddr expr)))
+                       (form (or (let-scalar-replace-struct bindings (cddr expr))
+                                 (let-substitute-single-reads bindings (cddr expr)))))
+                  (if form
+                      (compile-expr form)
+                      (compile-let bindings (cddr expr) nil)))))))
   (setf (gethash 'let* h)
         (lambda (expr)
-          (let* ((*let-subst-size-memo* (or *let-subst-size-memo* (list nil)))
-                 (form (and (consp (cadr expr)) (null (cdr (cadr expr)))
-                            (or (let-scalar-replace-struct (cadr expr) (cddr expr))
-                                (let-substitute-single-reads (cadr expr) (cddr expr))))))
-            (if form
-                (compile-expr form)
-                (compile-let-star (cadr expr) (cddr expr))))))
+          (let ((bad (%malformed-let-binding (cadr expr))))
+            (if bad
+                (compile-static-program-error (format nil "LET*: malformed binding ~S" bad))
+                (let* ((*let-subst-size-memo* (or *let-subst-size-memo* (list nil)))
+                       (bindings (%safety3-typed-bindings (cadr expr) (cddr expr)))
+                       (form (and (consp bindings) (null (cdr bindings))
+                                  (or (let-scalar-replace-struct bindings (cddr expr))
+                                      (let-substitute-single-reads bindings (cddr expr))))))
+                  (if form
+                      (compile-expr form)
+                      (compile-let-star bindings (cddr expr))))))))
   (setf (gethash 'setq h)
         (lambda (expr)
           (let ((pairs (cdr expr)))
@@ -2671,7 +2901,7 @@
                       (loop while pairs
                             do (push `(setq ,(pop pairs) ,(pop pairs)) forms))
                       (compile-progn (nreverse forms))))))))
-  (setf (gethash 'lambda h) (lambda (expr) (compile-lambda (cadr expr) (cddr expr))))
+  (setf (gethash 'lambda h) (lambda (expr) (compile-function-special expr)))
   (setf (gethash 'funcall h) (lambda (expr) (compile-funcall (cdr expr))))
   (setf (gethash 'defun h) #'compile-defun-toplevel)
   ;; %inline-cs-spliced: dotnet-cs:inline-cs macro expansion target.
@@ -2764,6 +2994,7 @@
   (setf (gethash 'the h)
         (lambda (expr)
           (let ((form (caddr expr)))
+            (warn-invalid-constant-type-spec (cadr expr))
             (cond
               ((and (fixnum-typed-p expr)
                     (checked-long-arith-p form)
@@ -2800,6 +3031,19 @@
                        `((:ldloc ,v) (:ldloc ,last) (:beq ,ok)))
                    (:ldloc ,v) ,@(%the-array-check-instrs (cadr expr) last)
                    (:label ,ok) (:ldloc ,v))))
+              ;; Safe code (SAFETY 3, CLHS 1.4.2) signals a TYPE-ERROR for a value that is not of
+              ;; the type THE asserts. Only there: at the default safety THE is trusted, so no
+              ;; code is added to anything compiled without an explicit (SAFETY 3).
+              ((and (compiling-at-safety-3-p)
+                    (not (member (cadr expr) '(t *)))
+                    (not (and (consp (cadr expr)) (eq (car (cadr expr)) 'values)))
+                    (not (and (atom form) (not (symbolp form)))))
+               (let ((vals (gensym "THEVALS")))
+                 (compile-expr
+                  `(let ((,vals (multiple-value-list ,form)))
+                     (unless (typep (car ,vals) ',(cadr expr))
+                       (error 'type-error :datum (car ,vals) :expected-type ',(cadr expr)))
+                     (values-list ,vals)))))
               (t (let ((*mv-expect-args* (%mv-expect-for expr form)))
                    (compile-expr form)))))))
   (setf (gethash 'load-time-value h)

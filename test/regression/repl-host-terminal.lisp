@@ -257,7 +257,7 @@ Returns what the terminal was given and what went to the output stream."
          (output (make-string-output-stream))
          (thread (dotcl:make-thread
                   (lambda ()
-                    (let ((*debugger-hook* nil))
+                    (let ((*debugger-hook* nil) (dotcl:*invoke-debugger-hook* nil))
                     (dotcl::%repl-run output output nil
                                       (lambda (prompt) (declare (ignore prompt)) (pop lines))
                                       (lambda (&rest args)
@@ -319,7 +319,7 @@ Returns what the terminal was given and what went to the output stream."
                           (setf thread
                                 (dotcl:make-thread
                                  (lambda ()
-                                   (let ((*debugger-hook* nil))
+                                   (let ((*debugger-hook* nil) (dotcl:*invoke-debugger-hook* nil))
                                      (dotcl::%repl-run output output nil
                                                        (lambda (prompt)
                                                          (declare (ignore prompt))

@@ -125,6 +125,11 @@ public class LispClass : LispObject
     private static long s_creationSeq;
     /// <summary>True when (setf (class-name ...) nil) was called to clear the proper name.</summary>
     public bool NameCleared { get; set; }
+    /// <summary>The accessor methods DEFCLASS made for this class's slot options, and the
+    /// ones of its previous definition until the redefinition has made its own: those
+    /// not made again are removed (CLHS 4.3.6).</summary>
+    internal List<(GenericFunction Gf, LispMethod Method)> AccessorMethods = new();
+    internal List<(GenericFunction Gf, LispMethod Method)>? StaleAccessorMethods;
     /// <summary>The metaclass of this class. Null means STANDARD-CLASS (default).</summary>
     public LispClass? Metaclass { get; set; }
     /// <summary>Cache for Runtime.UsesSlotProtocol: (method epoch &lt;&lt; 2) | valid | answer.</summary>
@@ -132,9 +137,11 @@ public class LispClass : LispObject
     public SlotDefinition[] DirectSlots { get; set; }
     /// <summary>While a class under a custom metaclass is being initialized: the
     /// canonical :DIRECT-SLOTS plists handed to INITIALIZE-INSTANCE, each with the slot
-    /// definition it was made from. A plist that comes back unchanged keeps its slot
-    /// definition; any other plist becomes a new one. Null outside that window.</summary>
-    internal List<(LispObject Plist, SlotDefinition Slot)>? PendingSlotPlists { get; set; }
+    /// definition it was made from and a copy of its elements at that time. A plist
+    /// that comes back unchanged (the same list with the same elements) keeps its slot
+    /// definition; any other plist, including one a method edited in place, becomes a
+    /// new one. Null outside that window.</summary>
+    internal List<(LispObject Plist, SlotDefinition Slot, LispObject[] Snapshot)>? PendingSlotPlists { get; set; }
     /// <summary>While DEFCLASS makes or redefines this class: the (slot name, reader or
     /// writer) pairs its expansion defines methods for itself. Null otherwise.</summary>
     internal HashSet<(Symbol Slot, LispObject Fn)>? DefclassAccessors { get; set; }
@@ -423,7 +430,11 @@ public class LispClass : LispObject
             {
                 foreach (var ia in slot.Initargs)
                 {
-                    map.TryAdd(ia.Name, i);
+                    // One initarg naming several slots initializes all of them
+                    // (CLHS 7.1.1); the map holds one slot per name, so leave
+                    // such classes to the general path.
+                    if (!map.TryAdd(ia.Name, i) && map[ia.Name] != i)
+                        canFast = false;
                 }
             }
         }
@@ -532,7 +543,7 @@ public class LispClass : LispObject
         {
             var oldSlots = EffectiveSlots;
             var oldCpl = ClassPrecedenceList;
-            ClassPrecedenceList = ComputeCPL();
+            ClassPrecedenceList = Runtime.ComputeCplHook?.Invoke(this) ?? ComputeCPL();
             EffectiveSlots = ComputeEffectiveSlots();
             // AMOP has finalization go through COMPUTE-SLOTS, and the list it hands
             // back IS the class's effective slots -- the order included, which is the
@@ -616,7 +627,9 @@ public class LispClass : LispObject
             // to update (EffectiveSlots was empty); a re-finalization that ends up with
             // the same shape (a superclass redefined without touching our slots, an
             // accessor-only change) keeps the token, so those instances stay current.
-            if (oldSlots.Length != 0 && !SameInstanceShape(oldSlots, EffectiveSlots))
+            // Finalized before is told by the precedence list, not by having slots: a class with
+            // no slots that gains some (a superclass added) has instances to update too.
+            if (oldCpl.Length != 0 && !SameInstanceShape(oldSlots, EffectiveSlots))
                 SupersedeLayout(oldSlots, CaptureSharedValues(oldSlots, oldCpl));
             // Which methods apply to an instance of this class follows its precedence
             // list. Generic functions cache their dispatch per argument class, so a
@@ -658,6 +671,9 @@ public class LispClass : LispObject
         }
         DefaultInitargs = result.ToArray();
     }
+
+    /// <summary>The standard class precedence list (CLHS 4.3.5) for this class.</summary>
+    public LispClass[] ComputeDefaultCpl() => ComputeCPL();
 
     private LispClass[] ComputeCPL()
     {
@@ -884,6 +900,13 @@ public class LispClass : LispObject
         //
         // Slots are named by symbols: A::X and B::X are two slots. Grouping is by
         // symbol (SameSlotName), with the name string only narrowing the search.
+        //
+        // The slots come in the order AMOP gives COMPUTE-SLOTS (and SBCL, CCL and
+        // ECL produce): the classes of the precedence list are taken from the
+        // least specific to the most specific, each class's direct slots in the
+        // order written, and a slot named in several classes stays where the
+        // first of them put it. Inherited slots therefore come first. The
+        // definitions merged into one slot are still kept most specific first.
         var slotOrder = new List<List<SlotDefinition>>();
         var groupsByName = new Dictionary<string, List<List<SlotDefinition>>>();
         foreach (var cls in ClassPrecedenceList)
@@ -899,9 +922,21 @@ public class LispClass : LispObject
                 {
                     group = new List<SlotDefinition>();
                     groups.Add(group);
-                    slotOrder.Add(group);
                 }
                 group.Add(slot);
+            }
+        }
+        var placed = new HashSet<List<SlotDefinition>>(ReferenceEqualityComparer.Instance);
+        for (int ci = ClassPrecedenceList.Length - 1; ci >= 0; ci--)
+        {
+            foreach (var slot in ClassPrecedenceList[ci].DirectSlots)
+            {
+                foreach (var g in groupsByName[slot.Name.Name])
+                    if (SameSlotName(g[0].Name, slot.Name))
+                    {
+                        if (placed.Add(g)) slotOrder.Add(g);
+                        break;
+                    }
             }
         }
 
@@ -922,7 +957,14 @@ public class LispClass : LispObject
         return slots.ToArray();
     }
 
-    public override string ToString() => $"#<STANDARD-CLASS {Name.Name}>";
+    public override string ToString()
+    {
+        string meta = IsBuiltIn && !ReferenceEquals(Name, Startup.Sym("STRUCTURE-OBJECT")) ? "BUILT-IN-CLASS"
+                    : IsStructureClass || ReferenceEquals(Name, Startup.Sym("STRUCTURE-OBJECT")) ? "STRUCTURE-CLASS"
+                    : !IsBuiltIn && Metaclass is LispClass mc ? mc.Name.Name
+                    : "STANDARD-CLASS";
+        return $"#<{meta} {Name.Name}>";
+    }
 }
 
 /// <summary>A class layout token (see LispClass.Layout). Carries nothing while it is
@@ -1043,6 +1085,41 @@ internal sealed class CtorPlan
         }
         var defs = Defaults;
         if (defs.Length != 0) ApplyDefaults(slotv, initargs, ref effective);
+        var forms = Initforms;
+        for (int j = 0; j < forms.Length; j++)
+        {
+            int s = InitformSlots[j];
+            if (slotv[s] == null) Store(slotv, s, InitformValues[j] ?? LispFunction.Call0(forms[j]));
+        }
+        return inst;
+    }
+
+    private int KeySlot(LispObject key)
+    {
+        foreach (var k in Keys)
+            if (ReferenceEquals(k.Key, key)) return k.Slot;
+        return -2;
+    }
+
+    /// <summary>TryMake for one to three initargs given as arguments, so a call with
+    /// literal keywords builds no argument array. Null (and the caller takes the
+    /// array path) when the plan has :DEFAULT-INITARGS or :AFTER methods, or an
+    /// initarg has not been seen yet.</summary>
+    [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization (not in netstandard2.0)
+    public LispInstance? TryMakeKV(int n, LispObject k0, LispObject v0,
+                                   LispObject? k1, LispObject? v1, LispObject? k2, LispObject? v2)
+    {
+        if (Defaults.Length != 0 || Afters.Length != 0) return null;
+        int s0 = KeySlot(k0);
+        if (s0 == -2) return null;
+        int s1 = -1, s2 = -1;
+        if (n > 1) { s1 = KeySlot(k1!); if (s1 == -2) return null; }
+        if (n > 2) { s2 = KeySlot(k2!); if (s2 == -2) return null; }
+        var inst = new LispInstance(Class, Layout);
+        var slotv = inst.Slots;
+        if (s0 >= 0) Store(slotv, s0, v0);
+        if (n > 1 && s1 >= 0 && slotv[s1] == null) Store(slotv, s1, v1!);
+        if (n > 2 && s2 >= 0 && slotv[s2] == null) Store(slotv, s2, v2!);
         var forms = Initforms;
         for (int j = 0; j < forms.Length; j++)
         {
@@ -1209,6 +1286,17 @@ public sealed class LispInstance : LispObject
         // by its key afterwards just as an instance is.
         _internCache[key] = obj;
         return obj;
+    }
+
+    /// <summary>FASL load-time: forget the make-load-form literals a module of this
+    /// name interned. Loading a fasl creates its literals afresh (CLHS 3.2.4.2); a
+    /// second fasl of the same name, or the same fasl loaded again, must not read
+    /// the first one's objects back by key.</summary>
+    public static void EvictInternedModule(string moduleName)
+    {
+        var prefix = moduleName + ".";
+        foreach (var k in _internCache.Keys)
+            if (k.StartsWith(prefix, StringComparison.Ordinal)) _internCache.TryRemove(k, out _);
     }
 
     /// <summary>FASL load-time: whether a make-load-form literal of any kind
@@ -1569,6 +1657,10 @@ public sealed class MethodCombinationObject : LispObject
 public class GenericFunction : LispFunction
 {
     public new Symbol Name { get; internal set; }
+    /// <summary>The method class named by DEFGENERIC's :METHOD-CLASS option (or
+    /// ENSURE-GENERIC-FUNCTION's); null for the standard one. What
+    /// GENERIC-FUNCTION-METHOD-CLASS answers by default.</summary>
+    public LispClass? DeclaredMethodClass { get; set; }
 
     // Method list is copy-on-write for thread safety: dispatch reads an
     // immutable snapshot (the `Methods` property returns the current array, which
@@ -1606,6 +1698,11 @@ public class GenericFunction : LispFunction
     /// applies to it. Null until asked; cleared for every generic function when a
     /// method is added to or removed from one of the protocol generic functions.</summary>
     public bool? UsesInvocationProtocol { get; set; }
+
+    /// <summary>An introspection accessor (CLASS-SLOTS, GENERIC-FUNCTION-NAME, ...) the dispatch
+    /// protocol itself may read: it always keeps the ordinary path, or a protocol method that calls it
+    /// would dispatch through the protocol again.</summary>
+    public bool KeepsOrdinaryDispatch { get; set; }
 
     /// <summary>Slots added by a user-defined generic function class. A generic
     /// function is callable, so it cannot also be a LispInstance and carry a slot

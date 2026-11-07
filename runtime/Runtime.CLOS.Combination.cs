@@ -111,7 +111,7 @@ public static partial class Runtime
                 ? i3.Car : Nil.Instance;
             var effectiveMethodForm = mc.BodyFunction!.Invoke(
                 new LispObject[] { mcArgsList, groupsList, gf, freshVars });
-            emFn = CompileEffectiveMethodForm(effectiveMethodForm, mc.ArgumentsInfo);
+            emFn = CompileEffectiveMethodForm(effectiveMethodForm, mc.ArgumentsInfo, gf);
             // Methods that were removed or redefined leave stale entries behind;
             // bound the table rather than track them.
             if (mc.Cache.Count > 512) mc.Cache.Clear();
@@ -125,12 +125,12 @@ public static partial class Runtime
 
     /// <summary>Compile an effective method form into a function of the generic
     /// function.s arguments, with CALL-METHOD and MAKE-METHOD as local macros.</summary>
-    internal static LispFunction CompileEffectiveMethodForm(LispObject form, LispObject argumentsInfo)
+    internal static LispFunction CompileEffectiveMethodForm(LispObject form, LispObject argumentsInfo, LispObject? gf = null)
     {
         var compiler = Startup.Sym("%COMPILE-EFFECTIVE-METHOD").Function as LispFunction
             ?? throw new LispErrorException(new LispError(
                 "effective method: %COMPILE-EFFECTIVE-METHOD is not defined"));
-        var fn = compiler.Invoke(new LispObject[] { form, argumentsInfo });
+        var fn = compiler.Invoke(gf == null ? new LispObject[] { form, argumentsInfo } : new LispObject[] { form, argumentsInfo, gf });
         if (fn is MvReturn mv) fn = mv.PrimaryValue;
         return fn as LispFunction
             ?? throw new LispErrorException(new LispTypeError(

@@ -212,6 +212,8 @@
     ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs))
           (double-float-typed-p (cadr expr)))
      t)
+    ;; (sqrt x) of a double that cannot be negative is a double.
+    ((%double-sqrt-nonneg-p expr) t)
     ((%double-min-max-p expr) t)
     ;; Unary negate: (- x) where x is double-typed -> double.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '-)
@@ -472,6 +474,50 @@
        (not (local-function-entry (car expr)))
        (double-float-typed-p (cadr expr))))
 
+(defun %double-nonneg-p (expr)
+  "T when EXPR, a double-float form, can never be a negative number: it is >= 0,
+   -0.0 or a NaN. Then (SQRT EXPR) is a double -- the square root of a negative
+   double is a COMPLEX, which is what keeps (SQRT X) of a plain double untyped.
+   Recognized: a literal >= 0, a native local bound (and never assigned) to such
+   a form, (* X X) of one variable, sums and products of such forms, and the
+   absolute value of a double. Not division (1/-0.0 is negative infinity)."
+  (let ((expr (fold-nary-arith (strip-value-wrappers expr))))
+    (cond
+      ((typep expr 'double-float) (or (>= expr 0d0) (/= expr expr)))
+      ((symbolp expr)
+       (and expr (boundp '*cstate*)
+            (let ((key (native-slot-p expr (cstate-native-double-locals))))
+              (and key (member (cons :nonneg key) (cstate-native-double-locals)
+                               :test #'equal)
+                   t))))
+      ((and (consp expr) (eq (car expr) 'the) (consp (cdr expr)) (consp (cddr expr))
+            (consp (cadr expr)) (eq (car (cadr expr)) 'double-float)
+            (realp (cadr (cadr expr))) (>= (cadr (cadr expr)) 0))
+       t)
+      ((and (consp expr) (= (length expr) 3) (eq (car expr) '*)
+            (not (local-function-entry '*)))
+       (or (and (symbolp (cadr expr)) (cadr expr) (eq (cadr expr) (caddr expr))
+                (double-float-typed-p (cadr expr)))
+           (and (%double-nonneg-p (cadr expr)) (%double-nonneg-p (caddr expr))
+                (double-float-typed-p (cadr expr)) (double-float-typed-p (caddr expr)))))
+      ((and (consp expr) (= (length expr) 3) (eq (car expr) '+)
+            (not (local-function-entry '+)))
+       (and (%double-nonneg-p (cadr expr)) (%double-nonneg-p (caddr expr))
+            (double-float-typed-p (cadr expr)) (double-float-typed-p (caddr expr))))
+      ((and (consp expr) (= (length expr) 2) (eq (car expr) 'abs)
+            (not (local-function-entry 'abs)))
+       (double-float-typed-p (cadr expr)))
+      ((%double-sqrt-nonneg-p expr) t)
+      (t nil))))
+
+(defun %double-sqrt-nonneg-p (expr)
+  "T when EXPR is (SQRT X) with X a double-float that is never negative: the
+   result is a double, and Math.Sqrt gives it (NaN and -0.0 as the generic SQRT does)."
+  (and (consp expr) (= (length expr) 2) (eq (car expr) 'sqrt)
+       (not (local-function-entry 'sqrt))
+       (double-float-typed-p (cadr expr))
+       (%double-nonneg-p (cadr expr))))
+
 (defun double-sqrt-instr (&optional (op 'sqrt))
   "The call a lowered (SQRT X) emits, which is where the declaration is either
    trusted or checked. At (safety 0) a declaration is a license, as it is for
@@ -638,6 +684,9 @@
     ;; (abs x) -> raw magnitude, no box on the way in or out.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs)))
      `(,@(compile-as-double (cadr expr)) (:call "Math.AbsDouble")))
+    ;; (sqrt x) of a double that cannot be negative: the raw root, no assertion.
+    ((%double-sqrt-nonneg-p expr)
+     `(,@(compile-as-double (cadr expr)) (:call "Math.SqrtDouble")))
     ;; (sqrt x) -> raw root. Reached only from a context that has already
     ;; declared the result a double-float; see DOUBLE-SQRT-FORM-P.
     ((double-sqrt-form-p expr)
@@ -761,6 +810,48 @@
   (ignore-errors
    (let ((sym (find-symbol "DECLARATION-NAME-P" "DOTCL")))
      (and sym (fboundp sym) (symbol-function sym)))))
+
+;; Same probe for DOTCL:VALID-TYPE-SPECIFIER-P, which judges the shape of a
+;; constant compound type specifier.
+(defvar *valid-type-specifier-p-fn*
+  (ignore-errors
+   (let ((sym (find-symbol "VALID-TYPE-SPECIFIER-P" "DOTCL")))
+     (and sym (fboundp sym) (symbol-function sym)))))
+
+(defvar *checked-constant-type-specs* (make-hash-table :test #'equal :synchronized t)
+  "Constant compound type specifiers already judged by
+   WARN-INVALID-CONSTANT-TYPE-SPEC, so each distinct one is judged once.")
+
+(defun %type-spec-has-unjudged-name-p (spec)
+  "True when SPEC contains a symbol outside COMMON-LISP and KEYWORD that is not
+   known as a class: a DEFTYPE name, a name not yet defined, or plain data in a
+   MEMBER. Whether such a specifier is valid is TYPEP's to say at run time."
+  (let ((budget 1000))
+    (labels ((walk (x)
+               (cond ((<= (decf budget) 0) t)
+                     ((consp x) (or (walk (car x)) (walk (cdr x))))
+                     ((and x (symbolp x))
+                      (let ((pkg (symbol-package x)))
+                        (cond ((null pkg) t)
+                              ((member (package-name pkg) '("COMMON-LISP" "KEYWORD")
+                                       :test #'string=)
+                               nil)
+                              (t (not (eq (funcall *known-type-name-p-fn* x) :class))))))
+                     (t nil))))
+      (walk spec))))
+
+(defun warn-invalid-constant-type-spec (spec)
+  "Warn, once per distinct specifier, when the constant compound type specifier
+   SPEC of a TYPEP / THE form is not a valid type specifier (it would signal when
+   TYPEP runs). Silent on the cross-compile host, and for a specifier that names
+   something TYPEP resolves later."
+  (when (and *valid-type-specifier-p-fn* *known-type-name-p-fn* (consp spec))
+    (unless (gethash spec *checked-constant-type-specs*)
+      (setf (gethash spec *checked-constant-type-specs*) t)
+      (when (and (not (funcall *valid-type-specifier-p-fn* spec))
+                 (not (%type-spec-has-unjudged-name-p spec)))
+        (warn "Invalid type specifier: ~A"
+              (let ((*print-pretty* nil) (*print-circle* t)) (prin1-to-string spec)))))))
 
 (defvar *warned-unknown-types* (make-hash-table :test #'equal :synchronized t)
   "Symbols (uninterned ones by name) already reported by
@@ -1448,7 +1539,8 @@
 (defun compile-add (args)
   (case (length args)
     (0 (emit-fixnum 0))
-    (1 (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args))))
+    (1 `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
+         (:call "Runtime.CheckNumber1")))
     (2
      (cond
        ;; Both args known decimal -> native System.Decimal add (scale preserved).
@@ -1533,7 +1625,8 @@
 (defun compile-mul (args)
   (case (length args)
     (0 (emit-fixnum 1))
-    (1 (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args))))
+    (1 `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
+         (:call "Runtime.CheckNumber1")))
     (2
      (cond
        ((and (decimal-typed-p (first args)) (decimal-typed-p (second args))

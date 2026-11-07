@@ -5,6 +5,16 @@ start -- with two exceptions, `dotnet:ref` and `dotnet:using`, which come from a
 contrib and are marked where they appear. Every form below was run against dotcl
 and shows its real result.
 
+The snippets share a few names. `sb` and `uri` are set up once here; the other
+names (`list`, `dict`, `grid`, `path`, `buf`, `octets`, `doubles`, `a`, `b`) stand
+for objects of the kind the surrounding text describes, which you create
+yourself:
+
+```lisp
+(defvar sb (dotnet:new "System.Text.StringBuilder"))
+(defvar uri (dotnet:new "System.Uri" "http://example.com/a/b"))
+```
+
 Numbers have rules of their own, which .NET numeric types arrive as which Lisp
 types, when an integer argument is rejected, and how `System.Decimal` works.
 See [Numbers across the .NET boundary](numbers.md).
@@ -12,7 +22,7 @@ See [Numbers across the .NET boundary](numbers.md).
 ## Objects, methods, properties
 
 ```lisp
-(dotnet:new "System.Text.StringBuilder")          ; => #<DOTNET System.Text.StringBuilder>
+(dotnet:new "System.Text.StringBuilder")          ; => #<DOTNET System.Text.StringBuilder >
 (dotnet:invoke sb "Append" "hi")                  ; sb.Append("hi")
 (dotnet:invoke sb "ToString")                     ; => "hi"
 ```
@@ -109,6 +119,7 @@ is a place. Anything with an indexer works; `List<T>`, `Dictionary<K,V>`, and
 plain arrays:
 
 ```lisp
+(require "dotnet-class")                  ; once per process
 (dotnet:ref list 0)                       ; => 10
 (setf (dotnet:ref list 1) 99)
 (setf (dotnet:ref dict "a") 1)            ; Dictionary<string,int>
@@ -124,6 +135,7 @@ called on the way out, including when the body signals. Nested bindings are
 disposed innermost first.
 
 ```lisp
+(require "dotnet-class")                  ; once per process
 (dotnet:using ((stream (dotnet:new "System.IO.StreamReader" path)))
   (dotnet:invoke stream "ReadToEnd"))
 ```
@@ -279,7 +291,9 @@ When Lisp itself triggered the callback, bind
 instead:
 
 ```lisp
-(let ((dotcl:*foreign-callback-propagate* t))
+(let ((fn (dotnet:make-delegate "System.Func`2[System.Int32,System.Int32]"
+                                (lambda (x) (declare (ignore x)) (error "boom"))))
+      (dotcl:*foreign-callback-propagate* t))
   (handler-case (dotnet:invoke fn "Invoke" 5)
     (error (e) (princ-to-string e))))                           ; => "boom"
 ```

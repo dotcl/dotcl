@@ -38,3 +38,40 @@
 (deftest merge-pathnames-back.namestring-writes-it
   (namestring (make-pathname :directory '(:absolute "mpb" "a" "b" :back)))
   "/mpb/a/b/../")
+
+;;; Checked against SBCL 2.6.8.
+(deftest merge-pathnames-back.with-name-into-string-default
+  (namestring (merge-pathnames (make-pathname :directory '(:relative :back "a")
+                                              :name "f")
+                               "/x/y/z/"))
+  "/x/y/a/f")
+
+(deftest merge-pathnames-back.relative-default-folds
+  (pathname-directory
+   (merge-pathnames (make-pathname :directory '(:relative :back "a"))
+                    (make-pathname :directory '(:relative "x" "y"))))
+  (:relative "x" "a"))
+
+(deftest merge-pathnames-back.relative-default-consumed
+  (pathname-directory
+   (merge-pathnames (make-pathname :directory '(:relative :back))
+                    (make-pathname :directory '(:relative "x"))))
+  (:relative))
+
+(deftest merge-pathnames-back.after-wild-inferiors-folds-the-name-before-it
+  (pathname-directory
+   (merge-pathnames (make-pathname :directory '(:relative :back "a"))
+                    (make-pathname :directory '(:relative "x" :wild-inferiors "y"))))
+  (:relative "x" :wild-inferiors "a"))
+
+(deftest merge-pathnames-back.absolute-argument-wins
+  (pathname-directory
+   (merge-pathnames (make-pathname :directory '(:absolute "q"))
+                    (make-pathname :directory '(:absolute "x" "y"))))
+  (:absolute "q"))
+
+(deftest merge-pathnames-back.nil-directory-takes-the-default
+  (pathname-directory
+   (merge-pathnames (make-pathname :name "f")
+                    (make-pathname :directory '(:absolute "x" "y"))))
+  (:absolute "x" "y"))
