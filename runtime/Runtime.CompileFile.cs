@@ -6,6 +6,24 @@ namespace DotCL;
 
 public static partial class Runtime
 {
+    /// <summary>The 8 hex digits that keep the module names (and so the load-time-value slot
+    /// ids) of independently compiled FASLs apart: a hash of the source text, the output file
+    /// name and the compiler version. The same source compiled to the same name gives the same
+    /// suffix, which is what makes the FASL reproducible.</summary>
+    internal static string ModuleNameSuffix(string inputPath, string outputPath)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var text = System.IO.File.ReadAllBytes(inputPath);
+        var extra = System.Text.Encoding.UTF8.GetBytes(
+            "\n" + System.IO.Path.GetFileName(outputPath) + "\n"
+            + typeof(Runtime).Assembly.GetName().Version);
+        var all = new byte[text.Length + extra.Length];
+        Buffer.BlockCopy(text, 0, all, 0, text.Length);
+        Buffer.BlockCopy(extra, 0, all, text.Length, extra.Length);
+        var h = sha.ComputeHash(all);
+        return BitConverter.ToString(h, 0, 4).Replace("-", "").ToLowerInvariant();
+    }
+
     // Compile a single top-level form using the Lisp compiler
     // Cached at first use to prevent user code (e.g. SB-C::COMPILE-TOPLEVEL)
     // from overwriting the compiler's function in the flat name table.
@@ -42,7 +60,7 @@ public static partial class Runtime
     // FlattenTopLevel expands it.
     internal static LispObject TopLevelFormXrefName(string path, int line, LispObject source)
         => new Cons(Startup.Keyword("TOP-LEVEL-FORM"),
-                    new Cons(new LispString(Path.GetFullPath(path)),
+                    new Cons(new LispString(MapSourcePath(Path.GetFullPath(path))),
                              new Cons(Fixnum.Make(line), new Cons(source, Nil.Instance))));
 
     // Compile a top-level form for EVAL (preserves MvReturn in tail position).
@@ -386,6 +404,11 @@ public static partial class Runtime
             var form = args[0] as Cons;
             if (form == null) return args[0];
             var clauses = form.Cdr;
+            // Every clause must be a list, also those after a T clause.
+            for (LispObject cl = clauses; cl is Cons cc; cl = cc.Cdr)
+                if (cc.Car is not Cons)
+                    throw new LispErrorException(new LispTypeError(
+                        "COND: clause is not a list", cc.Car, Startup.Sym("CONS")));
             if (clauses is Nil) return Nil.Instance; // (cond) -> nil
             if (clauses is not Cons c1) return args[0];
             var clause = c1.Car as Cons;
@@ -874,6 +897,7 @@ public static partial class Runtime
 
         // Parse keyword arguments
         LispObject? outputFileArg = null;
+        LispObject? externalFormatArg = null;
         LispObject? verboseArg = null;
         LispObject? printArg = null;
         LispObject? targetFeaturesArg = null;
@@ -925,7 +949,7 @@ public static partial class Runtime
                 // deployment on BCLs without System.Private.CoreLib (Unity IL2CPP/
                 // WebGL). Default (null) keeps System.Private.CoreLib (CoreCLR/AOT).
                 case "CORLIB-NAME": corlibNameArg ??= args[i + 1]; break;
-                case "EXTERNAL-FORMAT": break; // accepted but ignored
+                case "EXTERNAL-FORMAT": externalFormatArg ??= args[i + 1]; break;
                 case "ALLOW-OTHER-KEYS": break; // already handled
                 default:
                     if (!allowOtherKeys)
@@ -964,9 +988,15 @@ public static partial class Runtime
 
         // Determine output path
         string? outputPath = null;
-        if (outputFileArg != null && outputFileArg is not Nil)
+        // :OUTPUT-FILE is a pathname designator; NIL is none (SBCL: TYPE-ERROR). Leaving the
+        // keyword out is how the default output name is asked for.
+        if (outputFileArg is Nil)
+            throw new LispErrorException(new LispTypeError(
+                "COMPILE-FILE: :OUTPUT-FILE is NIL, not a pathname designator", outputFileArg,
+                Runtime.List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("PATHNAME"))));
+        if (outputFileArg != null)
         {
-            outputPath = ResolvePhysicalPath(outputFileArg);
+            outputPath = ResolvePhysicalPath(CompileFilePathname(new[] { inputSpec, Startup.Keyword("OUTPUT-FILE"), outputFileArg }));
         }
 
         if (outputPath == null)
@@ -1081,7 +1111,7 @@ public static partial class Runtime
         var faslModuleName = (moduleNameArg is LispString mns && mns.Value.Length > 0)
             ? mns.Value
             : Path.GetFileNameWithoutExtension(outputPath)
-                + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+                + "_" + ModuleNameSuffix(inputPath, outputPath);
 
         // Bind *current-module-id* to the FASL's unique module name.
         // The load-time-value compiler handler uses this to namespace LTV slot IDs per module,
@@ -1104,7 +1134,7 @@ public static partial class Runtime
         try
         {
             // Read source, compile each form, and write instrList to .sil
-            var source = File.ReadAllText(inputPath);
+            var source = ReadSourceText(inputPath, externalFormatArg, "COMPILE-FILE");
             var trackingReader = new PositionTrackingReader(new StringReader(source));
             var reader = new Reader(trackingReader) { LineSource = source };
             var compileStream = new LispStringInputStream(trackingReader, 0, source, source.Length);
@@ -1156,8 +1186,8 @@ public static partial class Runtime
             var savedSourcePositions = SourcePositionTable;
             // Kept for each top level form only: nested definitions need their own
             // lines, and holding the whole file's forms would keep every cons alive.
-            SourceLineTable = new Dictionary<object, (int, int, int, int)>(ReferenceEqualityComparer.Instance);
-            SourcePositionTable = new Dictionary<object, (int, int)>(ReferenceEqualityComparer.Instance);
+            SourceLineTable = new Dictionary<object, SourceSpan>(ReferenceEqualityComparer.Instance);
+            SourcePositionTable = new Dictionary<object, SourceRange>(ReferenceEqualityComparer.Instance);
             BeginCompilerUnit(Path.GetFullPath(inputPath));
             if (emitPdb)
             {
@@ -1325,8 +1355,35 @@ public static partial class Runtime
                         () => DotCL.Emitter.CilAssembler.AssembleAndRun(instrList));
                     KeepDefinitionsMadeSince(ctBefore, preDefs);
                 }
-                while (DotCL.Diagnostics.PhaseTimer.Time("read", () => reader.TryRead(out var f) ? f : null) is { } form)
+                bool readAborted = false;
+                while (true)
                 {
+                    // An error while reading a form (a reader error, or one in the #.
+                    // evaluation) ends the compilation as SBCL does: it is reported, the
+                    // output is not kept, and COMPILE-FILE returns NIL, T, T.
+                    LispObject? readForm;
+                    var readCluster = new HandlerBinding[] {
+                        new HandlerBinding(Startup.Sym("ERROR"),
+                            new LispFunction(hargs => throw new CompileFileReadAbort((LispCondition)hargs[0])))
+                    };
+                    HandlerClusterStack.PushCluster(readCluster);
+                    try
+                    {
+                        readForm = DotCL.Diagnostics.PhaseTimer.Time("read", () => reader.TryRead(out var f) ? f : null);
+                    }
+                    catch (CompileFileReadAbort abort)
+                    {
+                        var ew = GetTextWriter(DynamicBindings.Get(Startup.Sym("*ERROR-OUTPUT*")));
+                        ew.WriteLine();
+                        ew.WriteLine("; caught ERROR:");
+                        ew.WriteLine($";   READ error during COMPILE-FILE: {abort.Condition.Message}");
+                        ew.WriteLine("; compilation aborted because of input error");
+                        ew.Flush();
+                        readAborted = true;
+                        break;
+                    }
+                    finally { HandlerClusterStack.PopCluster(); }
+                    if (readForm is not { } form) break;
                     // Line where this top-level form began: used to attribute a
                     // compile error to the source location under a project build,
                     // and to record definition locations for frame-source-location.
@@ -1375,6 +1432,12 @@ public static partial class Runtime
                     SourcePositionTable?.Clear();
                 }
 
+                if (readAborted)
+                {
+                    FlushCompilerWarnings();
+                    try { if (File.Exists(outputPath)) File.Delete(outputPath); } catch (IOException) { }
+                    return MultipleValues.Values(Nil.Instance, T.Instance, T.Instance);
+                }
                 // Emit any remaining init forms (cycle members, etc.)
                 faslAsm.FlushRemainingInitForms();
 
@@ -1524,4 +1587,12 @@ public static partial class Runtime
             searchPaths.ToArray(), null);
         return new LispString(System.IO.Path.GetFullPath(written));
     }
+}
+
+/// <summary>Thrown by the error handler COMPILE-FILE installs around the reader, to
+/// leave the read loop with the condition that stopped it.</summary>
+internal sealed class CompileFileReadAbort : Exception
+{
+    public LispCondition Condition { get; }
+    public CompileFileReadAbort(LispCondition condition) : base(condition.Message) => Condition = condition;
 }

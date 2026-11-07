@@ -66,6 +66,29 @@ public static partial class Runtime
     }
 
     // The time zone reported alongside a decoded time excludes daylight saving.
+    /// <summary>An integer argument of the universal-time functions (CLHS: the fields are
+    /// integers, the universal time a non-negative one): anything else is a TYPE-ERROR.
+    /// MIN is the least value allowed.</summary>
+    private static long UniversalTimeInteger(string who, LispObject value, long min = long.MinValue)
+    {
+        if (value is Fixnum f && f.Value >= min) return f.Value;
+        throw new LispErrorException(new LispTypeError($"{who}: not a valid integer argument",
+            value, min == 0 ? Startup.Sym("UNSIGNED-BYTE") : Startup.Sym("INTEGER")));
+    }
+
+    /// <summary>The time zone of the universal-time functions: a real number of hours
+    /// from -24 to 24 inclusive.</summary>
+    private static void CheckTimeZone(string who, LispObject zone)
+    {
+        if (zone is Fixnum or Ratio or SingleFloat or DoubleFloat)
+        {
+            double z = Arithmetic.ToDouble(Runtime.AsNumber(zone));
+            if (z >= -24.0 && z <= 24.0) return;
+        }
+        throw new LispErrorException(new LispTypeError($"{who}: the time zone is not a number of hours from -24 to 24",
+            zone, Runtime.List(Startup.Sym("REAL"), Fixnum.Make(-24), Fixnum.Make(24))));
+    }
+
     private static double StandardUtcOffsetHours(System.TimeZoneInfo tz, System.DateTime dt)
     {
         double offset = tz.GetUtcOffset(dt).TotalHours;
@@ -234,6 +257,17 @@ public static partial class Runtime
         AppDomain.CurrentDomain.ProcessExit += (_, _) => RunExitHooks(hooks);
     }
 
+    /// <summary>True while an exit hook runs on this thread: dotcl:quit or an unhandled error inside
+    /// the hook cannot call Environment.Exit again (the process is already exiting, and that call
+    /// never returns), so they abort the hook with this exception instead.</summary>
+    [ThreadStatic] public static bool InExitHook;
+
+    public sealed class ExitHookAbort : Exception
+    {
+        public int? Code { get; }
+        public ExitHookAbort(int? code) { Code = code; }
+    }
+
     private static void RunExitHooks(Symbol hooks)
     {
         if (System.Threading.Interlocked.Exchange(ref _exitHooksRan, 1) != 0) return;
@@ -244,9 +278,15 @@ public static partial class Runtime
             try
             {
                 var fn = c.Car is Symbol fs ? fs.Function : c.Car;
+                InExitHook = true;
                 if (fn is LispFunction lf) lf.Invoke();
                 else throw new LispErrorException(new LispTypeError(
                     "*EXIT-HOOKS*: not a function", c.Car, Startup.Sym("FUNCTION")));
+            }
+            catch (ExitHookAbort a)
+            {
+                // quit inside a hook sets the exit code; an error already printed its report.
+                if (a.Code.HasValue) Environment.ExitCode = a.Code.Value;
             }
             catch (Exception ex)
             {
@@ -257,6 +297,7 @@ public static partial class Runtime
                 }
                 catch { }
             }
+            finally { InExitHook = false; }
         }
         foreach (var name in new[] { "*STANDARD-OUTPUT*", "*ERROR-OUTPUT*" })
         {
@@ -296,6 +337,9 @@ public static partial class Runtime
     // 1-arg direct delegate).
     private static LispObject CompilerMacroFunctionImpl(LispObject nameArg)
     {
+        if (!(nameArg is Symbol || nameArg is Nil || nameArg is T
+              || (nameArg is Cons nc && nc.Car is Symbol { Name: "SETF" } && nc.Cdr is Cons { Cdr: Nil })))
+            throw new LispErrorException(new LispTypeError("COMPILER-MACRO-FUNCTION: not a function name", nameArg, Startup.Sym("SYMBOL")));
         // (setf foo) form: a cons (setf . (foo . nil))
         if (nameArg is Cons setfCons && setfCons.Car is Symbol setfSym && setfSym.Name == "SETF") {
             var innerSym = (setfCons.Cdr is Cons c2) ? c2.Car as Symbol : null;
@@ -308,6 +352,12 @@ public static partial class Runtime
         return _compilerMacroFunctions.TryGetValue(sym, out var fn)
             ? (LispObject)fn : Nil.Instance;
     }
+
+    /// <summary>(FBOUNDP name) with the one argument the compiler passes straight in.</summary>
+    public static LispObject FboundpDirect(LispObject obj) => FboundpImpl(obj);
+
+    /// <summary>(SYMBOL-PLIST symbol) with the one argument the compiler passes straight in.</summary>
+    public static LispObject SymbolPlistDirect(LispObject name) => GetSymbol(name, "SYMBOL-PLIST").Plist;
 
     // FBOUNDP body (shared by the args-array wrapper and the 1-arg direct delegate).
     private static LispObject FboundpImpl(LispObject obj)
@@ -664,7 +714,8 @@ public static partial class Runtime
     // Traced generic functions keep their identity: the trace wrapper is installed
     // as the generic function's discriminating function, so #'NAME stays a generic
     // function (what SBCL does). Key -> (wrapper, discriminating function it replaced).
-    private static readonly ConcurrentDictionary<string, (LispFunction Wrapper, LispFunction? Previous)> _tracedGfDispatch = new();
+    private static ConcurrentDictionary<string, (LispFunction Wrapper, LispFunction? Previous)>? _lz__tracedGfDispatch;
+    private static ConcurrentDictionary<string, (LispFunction Wrapper, LispFunction? Previous)> _tracedGfDispatch => System.Threading.Volatile.Read(ref _lz__tracedGfDispatch) ?? System.Threading.Interlocked.CompareExchange(ref _lz__tracedGfDispatch, new(), null) ?? _lz__tracedGfDispatch!;
     // Trace wrapper -> the function it wraps, so introspection on a traced name
     // (DOCUMENTATION, the lambda list) answers about the traced function, not the
     // wrapper.
@@ -694,7 +745,17 @@ public static partial class Runtime
         traceWriter.Flush();
         var result = call(wrapArgs);
         traceWriter.Write("  => ");
-        traceWriter.Write(FormatObject(result, true));
+        // Every value the call returned, not just the first (none prints nothing).
+        if (result is MvReturn mvr)
+        {
+            for (int i = 0; i < mvr.Count; i++)
+            {
+                if (i > 0) traceWriter.Write(' ');
+                traceWriter.Write(FormatObject(mvr[i], true));
+            }
+        }
+        else
+            traceWriter.Write(FormatObject(result, true));
         traceWriter.Write('\n');
         traceWriter.Flush();
         return result;
@@ -708,7 +769,23 @@ public static partial class Runtime
         return name.ToString()!;
     }
 
-    public static LispObject Trace(LispObject[] args)
+    /// <summary>TRACE and UNTRACE install and remove their wrapper on the traced name, which for
+    /// a COMMON-LISP function the package lock would refuse: SBCL's TRACE encapsulates anyway.</summary>
+    private static T WithPackageLocksDisabled<T>(Func<T> body)
+    {
+        var disabledSym = Startup.SymInPkg("*PACKAGE-LOCKS-DISABLED*", "DOTCL");
+        DynamicBindings.Push(disabledSym, Runtime_TrueObject());
+        try { return body(); }
+        finally { DynamicBindings.Pop(disabledSym); }
+    }
+
+    private static LispObject Runtime_TrueObject() => T.Instance;
+
+    public static LispObject Trace(LispObject[] args) => WithPackageLocksDisabled(() => TraceCore(args));
+
+    public static LispObject Untrace(LispObject[] args) => WithPackageLocksDisabled(() => UntraceCore(args));
+
+    private static LispObject TraceCore(LispObject[] args)
     {
         if (args.Length == 0)
         {
@@ -782,7 +859,7 @@ public static partial class Runtime
         return Trace(Array.Empty<LispObject>());
     }
 
-    public static LispObject Untrace(LispObject[] args)
+    private static LispObject UntraceCore(LispObject[] args)
     {
         if (args.Length == 0)
         {
@@ -908,7 +985,8 @@ public static partial class Runtime
     }
 
     // Documentation storage: keyed by (object identity hash + doc-type name)
-    private static readonly ConcurrentDictionary<(int, string), LispObject> _documentationStore = new();
+    private static ConcurrentDictionary<(int, string), LispObject>? _lz__documentationStore;
+    private static ConcurrentDictionary<(int, string), LispObject> _documentationStore => System.Threading.Volatile.Read(ref _lz__documentationStore) ?? System.Threading.Interlocked.CompareExchange(ref _lz__documentationStore, new(), null) ?? _lz__documentationStore!;
 
     public static LispObject GetDocumentation(LispObject[] args)
     {

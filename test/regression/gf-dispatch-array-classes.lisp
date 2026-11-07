@@ -50,8 +50,9 @@
         collect (loop for o in (%gdac-objects)
                       for name = (class-name (class-of o))
                       always (eq (car (%gdac o 0))
-                                 (if (member name '(array vector string base-string simple-base-string
-                                                    bit-vector simple-bit-vector))
-                                     (intern (symbol-name name) :keyword)
-                                     :t))))
+                                 (cond ((member name '(array vector string base-string simple-base-string
+                                                       bit-vector simple-bit-vector))
+                                        (intern (symbol-name name) :keyword))
+                                       ((eq name 'simple-vector) :vector)
+                                       (t :t)))))
   (t t))

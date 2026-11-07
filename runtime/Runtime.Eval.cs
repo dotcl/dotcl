@@ -107,11 +107,14 @@ public static partial class Runtime
         // empty body, whose value is one NIL.
         LispObject last = Nil.Instance;
         MultipleValues.Reset();
-        for (var body = pc.Cdr; body is Cons bc; body = bc.Cdr)
+        LispObject body = pc.Cdr;
+        for (; body is Cons bc; body = bc.Cdr)
         {
             last = Eval(bc.Car);
             if (bc.Cdr is Cons) MultipleValues.Reset();
         }
+        if (!(body is Nil))
+            throw new LispErrorException(new LispProgramError("PROGN: malformed form (not a proper list)"));
         return last;   // multiple values of the last form ride along
     }
 #endif
@@ -161,6 +164,17 @@ public static partial class Runtime
         var sym = Startup.SymInPkg("*EVALUATOR-MODE*", "DOTCL");
         return DynamicBindings.Get(sym) is Symbol s && s.Name == "INTERPRET";
     }
+
+    /// <summary>EVAL of a one-shot form the runtime itself runs while setting up a module (the ASDF
+    /// glue): interpreted where there is an interpreter, so the first use of the compiler (its JIT,
+    /// about 250 ms) is not paid at require time by a program that compiles nothing else. The
+    /// closures it makes are interpreted too; they are called a few times per system.</summary>
+    internal static LispObject EvalSetupForm(LispObject form)
+#if DOTCL_EMIT
+        => MiniEval(form);
+#else
+        => Eval(form);
+#endif
 
     /// <summary>Invoke the Lisp tree-walk interpreter %mini-eval on FORM with an
     /// empty lexical environment. %mini-eval is defined in the compiler sources
@@ -450,13 +464,30 @@ public static partial class Runtime
     // The expansions %MINI-MACROEXPAND-1-CACHED remembers, keyed by the form's
     // cons. Weak: an entry goes away with the form. An entry is replaced as a
     // whole, so a reader on another thread sees an old one or a new one.
+    //
+    // The function binding the expansion was made against is held weakly: the entry lives
+    // as long as its form does, and a strong reference to a function would keep the whole
+    // assembly of a replaced definition (a fasl loaded again) alive through a form that
+    // is still referenced from somewhere.
     sealed class MiniExpansion
     {
-        public readonly MiniExpansionTokens Tokens;
+        readonly MiniExpansionTokens _tokens;       // FunctionBinding is not kept here
+        readonly WeakReference<LispObject>? _function;
         public readonly bool EnvFree;
         public readonly LispObject Expansion;
         public MiniExpansion(MiniExpansionTokens tokens, bool envFree, LispObject expansion)
-        { Tokens = tokens; EnvFree = envFree; Expansion = expansion; }
+        {
+            _function = tokens.FunctionBinding == null ? null : new WeakReference<LispObject>(tokens.FunctionBinding);
+            _tokens = tokens.WithoutFunction();
+            EnvFree = envFree; Expansion = expansion;
+        }
+        /// <summary>True while nothing the expansion was made from has changed.</summary>
+        public bool MadeFrom(in MiniExpansionTokens current)
+        {
+            if (!_tokens.SameAs(current.WithoutFunction())) return false;
+            if (_function == null) return current.FunctionBinding == null;
+            return _function.TryGetTarget(out var f) && ReferenceEquals(f, current.FunctionBinding);
+        }
     }
     sealed class MiniExpansionBox { public volatile MiniExpansion? Entry; }
 
@@ -481,6 +512,8 @@ public static partial class Runtime
                 System.Threading.Volatile.Read(ref MacroEpoch), Startup.MacroTablesVersion(),
                 sym.Function, gsm, gsm?.Version ?? 0);
         }
+        public MiniExpansionTokens WithoutFunction()
+            => new MiniExpansionTokens(Epoch, Tables, null, GsmTable, GsmVersion);
         public bool SameAs(in MiniExpansionTokens o)
             => Epoch == o.Epoch && Tables == o.Tables
                && ReferenceEquals(FunctionBinding, o.FunctionBinding)

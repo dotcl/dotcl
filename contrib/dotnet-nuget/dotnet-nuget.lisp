@@ -459,9 +459,17 @@ ASDF is loaded. Returns the directories."
 ;;;
 ;;;   - Another platform (OS or CPU features), or none recorded: the sources.
 ;;;     Reading a source decides #+darwin, #+x86-64 and the like, so a fasl
-;;;     made elsewhere can be quietly wrong here.
-;;;   - Another dotcl (compiler) on the same platform: the fasls, after a
-;;;     FASL-VERSION-MISMATCH warning. A handler can pick COMPILE-FROM-SOURCE.
+;;;     made elsewhere can be quietly wrong here. Unless the record says
+;;;     :HOST-INDEPENDENT T: the package declares that nothing in its fasls was
+;;;     decided by the machine that built them, and then the platform is not asked.
+;;;   - Made by a dotcl older than 0.1.34 (or with no version that can be read):
+;;;     the sources, without a warning.
+;;;   - Made by an older dotcl, 0.1.34 or later: the fasls, as they are. A dotcl
+;;;     reads what an older one wrote.
+;;;   - Another dotcl (compiler) of the same version or a newer one on the same
+;;;     platform: the fasls, after a FASL-VERSION-MISMATCH warning (a newer one's
+;;;     fasls may still be refused by the loader). A handler can pick
+;;;     COMPILE-FROM-SOURCE.
 ;;;   - The same dotcl: the fasls.
 ;;;
 ;;; A placed fasl that then fails to load (a runtime member it calls is gone, a
@@ -524,6 +532,36 @@ compile its sources."
     (push dir *noted-recompiles*)
     (format *error-output* "~&; nuget: ~A ~A, so its sources are compiled instead~%" dir why)))
 
+(defparameter *oldest-shipped-fasl-version* '(0 1 34)
+  "The oldest dotcl whose shipped fasls a newer dotcl takes as they are.")
+
+(defvar *reading-version* nil
+  "The version of the dotcl reading a package, as a string; NIL means the running one
+(LISP-IMPLEMENTATION-VERSION). Bound by tests, which cannot choose the running version.")
+
+(defun %reading-version ()
+  (or *reading-version* (lisp-implementation-version)))
+
+(defun %version-numbers (string)
+  "The leading dotted numbers of a version string (\"0.1.36+327.g429aec7\" is (0 1 36)),
+or NIL when it does not start with one."
+  (when (stringp string)
+    (let ((out '()) (n nil))
+      (loop for c across string
+            do (cond ((digit-char-p c) (setf n (+ (* (or n 0) 10) (digit-char-p c))))
+                     ((and (char= c #\.) n) (push n out) (setf n nil))
+                     (t (return))))
+      (when n (push n out))
+      (nreverse out))))
+
+(defun %version< (a b)
+  "True when the number list A is lower than B (a missing number counts as 0)."
+  (loop for i from 0 below (max (length a) (length b))
+        for x = (or (nth i a) 0)
+        for y = (or (nth i b) 0)
+        do (cond ((< x y) (return t)) ((> x y) (return nil)))
+        finally (return nil)))
+
 (defun %place-fasls (dir)
   "Copy DIR's shipped fasls to where ASDF will look for them. Returns how many,
 or NIL when the package ships none or its sources are to be compiled instead."
@@ -537,7 +575,8 @@ or NIL when the package ships none or its sources are to be compiled instead."
           ((eq decided :source) nil)
           ((eq decided :shipped) (%put-fasls dir record cfp))
           ((or (eq recorded :unrecorded)
-               (not (equal (%platform-features recorded) (%platform-features))))
+               (and (not (getf record :host-independent))
+                    (not (equal (%platform-features recorded) (%platform-features)))))
            (%note-recompile
             dir (if (eq recorded :unrecorded)
                     (format nil "was compiled by dotcl ~A, which does not record the platform"
@@ -545,8 +584,21 @@ or NIL when the package ships none or its sources are to be compiled instead."
                     (format nil "was compiled on ~{~(~A~)~^ ~}; this is ~{~(~A~)~^ ~}"
                             (%platform-features recorded) (%platform-features))))
            (%decide dir :source record cfp))
-          ((not (equal (getf record :core)
-                       (funcall (find-symbol "%CORE-GENERATION" "DOTCL"))))
+          ((equal (getf record :core)
+                  (funcall (find-symbol "%CORE-GENERATION" "DOTCL")))
+           (%decide dir :shipped record cfp))
+          ;; Another dotcl. By its version: too old to trust, older and readable, or
+          ;; the same or newer (the case that warns).
+          ((let ((built (%version-numbers (getf record :dotcl-version))))
+             (or (null built) (%version< built *oldest-shipped-fasl-version*)))
+           (%note-recompile
+            dir (format nil "was compiled by dotcl ~A, older than ~{~D~^.~}"
+                        (getf record :dotcl-version) *oldest-shipped-fasl-version*))
+           (%decide dir :source record cfp))
+          ((%version< (%version-numbers (getf record :dotcl-version))
+                      (%version-numbers (%reading-version)))
+           (%decide dir :shipped record cfp))
+          (t
            (restart-case
                (progn (warn 'fasl-version-mismatch
                             :directory dir :built-by (getf record :dotcl-version))
@@ -556,8 +608,7 @@ or NIL when the package ships none or its sources are to be compiled instead."
                (%decide dir :shipped record cfp))
              (compile-from-source ()
                :report "Compile the package's sources instead of loading its fasls."
-               (%decide dir :source record cfp))))
-          (t (%decide dir :shipped record cfp)))))))
+               (%decide dir :source record cfp)))))))))
 
 (defun %decide (dir how record cfp)
   (setf (gethash dir *fasl-decisions*) how)

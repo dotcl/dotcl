@@ -602,30 +602,52 @@ public static class Arithmetic
     {
         if (value.IsZero) return 0.0;
         bool negative = value.Sign < 0;
-        BigInteger abs = BigInteger.Abs(value);
+        BigInteger abs = negative ? BigInteger.Negate(value) : value;
         int bitLength = (int)abs.GetBitLength();
         double result;
-        if (bitLength <= 53)
+        if (bitLength <= 64)
         {
+            // The hardware conversion of a 64-bit unsigned integer rounds to nearest even.
             result = (double)(ulong)abs;
         }
         else
         {
-            int shift = bitLength - 53;
-            BigInteger mantissa = abs >> shift;  // top 53 bits
-            // Round bit: bit just below the cut
-            bool roundBit = !((abs >> (shift - 1)).IsEven);
-            // Sticky bit: any bits below the round bit
-            bool stickyBit = shift > 1 && (abs & ((BigInteger.One << (shift - 1)) - BigInteger.One)) != BigInteger.Zero;
-            // Round-to-nearest-even
-            if (roundBit && (stickyBit || !mantissa.IsEven))
+            // The top 64 bits give the 53-bit mantissa, the round bit and 10 more bits; the
+            // bits below those 64 matter only when the round bit is set and the 10 are all zero
+            // (a possible tie), and are looked at only then.
+            int low = bitLength - 64;
+            ulong top = (ulong)(abs >> low);
+            ulong mantissa = top >> 11;
+            bool roundBit = (top & 0x400UL) != 0;
+            bool sticky = (top & 0x3FFUL) != 0;
+            if (roundBit && !sticky)
+                sticky = (abs & ((BigInteger.One << low) - BigInteger.One)) != BigInteger.Zero;
+            int shift = low + 11;
+            if (roundBit && (sticky || (mantissa & 1UL) != 0))
             {
                 mantissa++;
-                if ((int)mantissa.GetBitLength() > 53) { mantissa >>= 1; shift++; }
+                if (mantissa == (1UL << 53)) { mantissa >>= 1; shift++; }
             }
-            result = Compat.ScaleB((double)(ulong)mantissa, shift);
+            result = Compat.ScaleB((double)mantissa, shift);
         }
         return negative ? -result : result;
+    }
+
+    /// <summary>A ratio as a single-float. Below 2^-125 the result is a multiple of 2^-149
+    /// with fewer than 24 bits, and rounding through a double first would round twice.</summary>
+    internal static float RatioToSingle(Ratio r)
+    {
+        var num = BigInteger.Abs(r.Numerator);
+        var den = BigInteger.Abs(r.Denominator);
+        if (!num.IsZero && (int)num.GetBitLength() - (int)den.GetBitLength() <= -126)
+        {
+            var sq = BigInteger.DivRem(num << 149, den, out var srem);
+            int cmp = (srem << 1).CompareTo(den);
+            if (cmp > 0 || (cmp == 0 && !sq.IsEven)) sq++;
+            float sres = (float)Compat.ScaleB((double)(ulong)sq, -149);
+            return (r.Numerator.Sign < 0) ^ (r.Denominator.Sign < 0) ? -sres : sres;
+        }
+        return (float)RatioToDouble(r);
     }
 
     // Convert BigInteger ratio to double with IEEE 754 round-to-nearest-even.
@@ -647,6 +669,19 @@ public static class Arithmetic
 
         int numBits = (int)num.GetBitLength();
         int denBits = (int)den.GetBitLength();
+
+        // A result below 2^-1021 is a multiple of 2^-1074 with fewer than 53 bits: round the
+        // quotient to that grid in one step. Rounding to 53 bits first and then scaling
+        // down rounds twice, and a value just under a tie came out as the tie.
+        if (numBits - denBits <= -1022)
+        {
+            var sq = BigInteger.DivRem(num << 1074, den, out var srem);
+            var twice = srem << 1;
+            int cmp = twice.CompareTo(den);
+            if (cmp > 0 || (cmp == 0 && !sq.IsEven)) sq++;
+            double sres = Compat.ScaleB((double)(ulong)sq, -1074);
+            return negative ? -sres : sres;
+        }
 
         // Choose shift so that (num << shift) / den yields a quotient of ~54
         // bits (53 mantissa + 1 guard). For shift < 0 we shift num down and
@@ -801,6 +836,25 @@ public static class Arithmetic
         return (long)d == v;
     }
 
+    /// <summary>Sign of I - D for a finite double D, exact: up to 2^53 the long is exact
+    /// as a double; beyond that compare in the long range (D truncated, then its fraction).</summary>
+    private static int CompareLongToDouble(long i, double d)
+    {
+        if (i >= -(1L << 53) && i <= (1L << 53))
+        {
+            double x = i;
+            return x < d ? -1 : x > d ? 1 : 0;
+        }
+        if (d >= 9.2233720368547758E18) return -1;
+        if (d < -9.2233720368547758E18) return 1;
+        double t = System.Math.Truncate(d);
+        long l = (long)t;
+        if (i < l) return -1;
+        if (i > l) return 1;
+        double frac = d - t;
+        return frac > 0 ? -1 : frac < 0 ? 1 : 0;
+    }
+
     public static int Compare(Number a, Number b)
     {
         if (a is Fixnum fa && b is Fixnum fb) return fa.Value.CompareTo(fb.Value);
@@ -821,6 +875,9 @@ public static class Arithmetic
             return ToDouble(a).CompareTo(ToDouble(b));
         if (IsNonFiniteFloat(a, aFloat) || IsNonFiniteFloat(b, bFloat))
             return ToDouble(a).CompareTo(ToDouble(b));
+        // A finite float against a fixnum needs no rational: compare in the long range.
+        if (aFloat && b is Fixnum cfb) return -CompareLongToDouble(cfb.Value, ToDouble(a));
+        if (bFloat && a is Fixnum cfa) return CompareLongToDouble(cfa.Value, ToDouble(b));
         if (aFloat && !bFloat) {
             var ar = FloatToRational(a);
             var (an2, ad2) = AsRational(ar);
@@ -1212,8 +1269,15 @@ public static class Arithmetic
     }
 
     // --- GCD / LCM ---
+    private static void RequireIntegerArg(string fn, Number n)
+    {
+        if (n is not Fixnum && n is not Bignum)
+            throw new LispErrorException(new LispTypeError($"{fn}: argument is not an integer", n, Startup.Sym("INTEGER")));
+    }
+
     public static Number Gcd(Number a, Number b)
     {
+        RequireIntegerArg("GCD", a); RequireIntegerArg("GCD", b);
         var (an, _) = AsRational(a);
         var (bn, _) = AsRational(b);
         return (Number)Bignum.MakeInteger(BigInteger.GreatestCommonDivisor(an, bn));
@@ -1221,6 +1285,7 @@ public static class Arithmetic
 
     public static Number Lcm(Number a, Number b)
     {
+        RequireIntegerArg("LCM", a); RequireIntegerArg("LCM", b);
         var (an, _) = AsRational(a);
         var (bn, _) = AsRational(b);
         if (an == BigInteger.Zero || bn == BigInteger.Zero) return Fixnum.Make(0);
@@ -1237,7 +1302,7 @@ public static class Arithmetic
         // Through the double quotient, as FLOAT does (ToSingleRounded): taking
         // numerator and denominator to single-float separately overflows both to
         // infinity once they pass 3.4e38, and infinity / infinity is NaN.
-        Ratio r => (float)RatioToDouble(r),
+        Ratio r => RatioToSingle(r),
         DoubleFloat df => (float)df.Value,
         LispDecimal d => (float)d.Value,
         _ => throw new NotImplementedException($"ToSingle not implemented for {n.GetType().Name}")
@@ -1418,9 +1483,31 @@ public static class Arithmetic
     /// <summary>CLHS asin(z) = -i log(iz + sqrt(1-z)*sqrt(1+z)). Used to promote a
     /// real |x|>1 to the CL-correct complex branch (.NET Complex.Asin picks the other
     /// side of the real cut).</summary>
+    // Past this magnitude z*z overflows a double; the logarithmic form below does not.
+    private const double LargeComplexMagnitude = 1e150;
+
+    private static bool IsLargeComplex(System.Numerics.Complex z)
+        => System.Math.Abs(z.Real) > LargeComplexMagnitude || System.Math.Abs(z.Imaginary) > LargeComplexMagnitude;
+
+    /// <summary>asinh(z) = log(z + sqrt(z*z+1)); for a huge |z| that is log(2z) (or minus
+    /// log(-2z) on the left half plane, asinh being odd), computed without squaring.</summary>
+    public static System.Numerics.Complex AsinhComplex(System.Numerics.Complex z)
+    {
+        if (IsLargeComplex(z))
+        {
+            double ln2 = System.Math.Log(2.0);
+            return z.Real >= 0
+                ? System.Numerics.Complex.Log(z) + ln2
+                : -(System.Numerics.Complex.Log(-z) + ln2);
+        }
+        return System.Numerics.Complex.Log(z + System.Numerics.Complex.Sqrt(z * z + 1));
+    }
+
     public static System.Numerics.Complex AsinComplex(System.Numerics.Complex z)
     {
         var i = System.Numerics.Complex.ImaginaryOne;
+        // asin(z) = -i asinh(i z)
+        if (IsLargeComplex(z)) return -i * AsinhComplex(i * z);
         var s = System.Numerics.Complex.Sqrt(1 - z) * System.Numerics.Complex.Sqrt(1 + z);
         return -i * System.Numerics.Complex.Log(i * z + s);
     }

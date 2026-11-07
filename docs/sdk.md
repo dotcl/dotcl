@@ -170,8 +170,8 @@ A type is picked up when its name is a literal string in a type position:
 
 ```lisp
 (dotnet:new "System.Text.StringBuilder")
-(dotnet:static "System.Globalization.ISOWeek" "GetYear" date)
-(dotnet:make-generic-type "System.Collections.Generic.List" (list "MyApp.Item"))
+(dotnet:static "System.Globalization.ISOWeek" "GetYear" date)               ; date: a DateTime you have
+(dotnet:make-generic-type "System.Collections.Generic.List" (list "MyApp.Item")) ; MyApp.Item: your type
 ```
 
 The same goes for `dotnet:new-array`, `dotnet:make-array`, `dotnet:make-delegate`,

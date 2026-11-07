@@ -319,6 +319,11 @@ internal static class Compat
         if (OperatingSystem.IsWindows() || fullPath.Length == 0 || fullPath[0] != '/')
             return fullPath;
         bool trailingSlash = fullPath.Length > 1 && fullPath.EndsWith('/');
+        // One realpath(3) call walks the whole path inside libc; the component-by-component
+        // walk below stays for what it cannot answer (a missing component, a link to nothing,
+        // a cycle) and where libc is not reachable.
+        if (TryRealPath(fullPath) is { } real)
+            return trailingSlash && real.Length > 1 && !real.EndsWith('/') ? real + "/" : real;
         // Components still to walk, the next one last.
         var pending = new List<string>(fullPath.Split('/', StringSplitOptions.RemoveEmptyEntries));
         pending.Reverse();
@@ -372,6 +377,32 @@ internal static class Compat
         var result = "/" + string.Join("/", done);
         if (trailingSlash && result.Length > 1) result += "/";
         return result;
+    }
+#endif
+
+#if !NETSTANDARD2_0
+    [DllImport("libc", EntryPoint = "realpath")]
+    private static extern IntPtr RealPathNative(byte[] path, byte[] resolved);
+
+    private static bool _realPathUnavailable;
+
+    /// <summary>realpath(3) of an existing absolute path, or null when it fails or libc cannot be called.</summary>
+    private static string? TryRealPath(string fullPath)
+    {
+        if (_realPathUnavailable) return null;
+        try
+        {
+            var input = System.Text.Encoding.UTF8.GetBytes(fullPath + "\0");
+            var buf = new byte[4097];
+            if (RealPathNative(input, buf) == IntPtr.Zero) return null;
+            int n = Array.IndexOf(buf, (byte)0);
+            return n <= 0 ? null : System.Text.Encoding.UTF8.GetString(buf, 0, n);
+        }
+        catch (Exception e) when (e is DllNotFoundException or EntryPointNotFoundException)
+        {
+            _realPathUnavailable = true;
+            return null;
+        }
     }
 #endif
 
@@ -502,12 +533,30 @@ internal static class Compat
     // stack touching.
     [ThreadStatic] private static ulong t_provenStackAddress;
 
+    // How much of a thread's stack Lisp code may use before the check reports exhaustion, in
+    // bytes, measured from where the thread first made the check. The main Lisp thread has a
+    // 256 MB stack (deep macro expansion and cross-compilation need room), but running a
+    // runaway recursion to the end of it and then unwinding 2 million frames took 5 seconds;
+    // SBCL gives up at 2 MB. DOTCL_STACK_LIMIT_MB changes it (0: use the whole stack).
+    private static readonly ulong SoftStackBytes = ReadSoftStackBytes();
+    [ThreadStatic] private static ulong t_softStackLimit;
+
+    private static ulong ReadSoftStackBytes()
+    {
+        var env = Environment.GetEnvironmentVariable("DOTCL_STACK_LIMIT_MB");
+        if (env != null && ulong.TryParse(env, out var mb)) return mb * 1024UL * 1024UL;
+        return 144UL * 1024UL * 1024UL;
+    }
+
     public static unsafe bool TryEnsureSufficientExecutionStackWithMargin()
     {
         byte marker;
         ulong here = (ulong)&marker;
         ulong proven = t_provenStackAddress;
         if (proven != 0 && here >= proven) return true;
+        if (proven == 0 && SoftStackBytes != 0 && here > SoftStackBytes)
+            t_softStackLimit = here - SoftStackBytes;
+        if (t_softStackLimit != 0 && here < t_softStackLimit) return false;
         if (!ProbePadded(PadFrames)) return false;
         t_provenStackAddress = here;
         return true;

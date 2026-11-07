@@ -337,7 +337,11 @@ the two a consumer uses depends on that note:
 
 - **Same dotcl, same OS and CPU:** the fasls (and ReadyToRun images, below) are
   used as they are, and nothing of the library is compiled again.
-- **Another dotcl, same OS and CPU:** the fasls are still used as they are, after
+- **An older dotcl (0.1.34 or later), same OS and CPU:** a dotcl reads what an
+  older one wrote, so the fasls are used as they are, without a warning.
+- **A dotcl older than 0.1.34, or a version that cannot be read:** the sources
+  are compiled, and a note says so once.
+- **The same version or a newer dotcl, same OS and CPU:** the fasls are still used as they are, after
   a one-line warning. The warning is the condition `nuget:fasl-version-mismatch`
   (a subtype of `warning`), signalled with two restarts around it:
   `nuget:use-shipped-fasls` (what happens when nothing handles it) and
@@ -346,8 +350,10 @@ the two a consumer uses depends on that note:
   rather compile can say so around its load:
 
   ```lisp
+  (require "asdf")
+  (require "dotnet-nuget")                       ; defines the nuget: package
   (handler-bind ((nuget:fasl-version-mismatch #'nuget:compile-from-source))
-    (asdf:load-system "my-app"))
+    (asdf:load-system "my-app"))                 ; the package's own system
   ```
 
   The choice is made once per package per image.
@@ -357,6 +363,11 @@ the two a consumer uses depends on that note:
   another platform could be quietly wrong. [Portable fasls](portable-fasls.md) says
   how to write a library whose fasls do not depend on the platform, and how to
   check one.
+
+  A package whose author has checked that nothing in its fasls was decided by the
+  machine that built them can say so (`:host-independent t` to the packer): the
+  build note then records it, and a consumer on another OS or CPU uses the fasls
+  instead of compiling the sources.
 
 Before it writes the package, `pack --library` reads the sources of the packed
 systems for what would tie their fasls to the machine that compiled them (the

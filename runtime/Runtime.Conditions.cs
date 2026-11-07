@@ -13,7 +13,12 @@ public static partial class Runtime
     internal static LispObject ConditionSlot(LispObject obj, string slotName)
     {
         if (obj is LispInstanceCondition lic) obj = lic.Instance;
-        if (obj is not LispInstance inst) return Nil.Instance;
+        if (obj is not LispInstance inst)
+        {
+            // A condition built by the runtime holds no slot of that name; anything else is no condition at all.
+            if (obj is LispCondition) return Nil.Instance;
+            throw new LispErrorException(new LispTypeError("not a condition", obj, Startup.Sym("CONDITION")));
+        }
         inst.EnsureCurrent();
         if (inst.Class.SlotIndex.TryGetValue(slotName, out int idx) && idx < inst.Slots.Length)
             return inst.Slots[idx] ?? Nil.Instance;
@@ -508,16 +513,9 @@ public static partial class Runtime
                 throw new LispErrorException(new LispTypeError("WARN: condition type is not a subtype of WARNING", condObj, Startup.Sym("WARNING")));
             return ConditionSystem.Warn(condObj);
         }
-        // String format control => SIMPLE-WARNING
-        string? msgText = FormatControlText(msg);
-        var warn = new LispWarning(msgText ?? msg.ToString());
-        warn.ConditionTypeName = "SIMPLE-WARNING";
-        if (msgText != null)
-        {
-            warn.FormatControl = msg;
-            warn.FormatArguments = Nil.Instance;
-        }
-        return ConditionSystem.Warn(warn);
+        // A format control (a string or a function) => SIMPLE-WARNING; anything else is
+        // no condition designator.
+        return LispWarnFormat(new[] { msg });
     }
 
     public static double ObjToDouble(LispObject obj) => obj switch {
@@ -562,8 +560,29 @@ public static partial class Runtime
                 throw new LispErrorException(new LispTypeError("WARN: condition type is not a subtype of WARNING", condObj, Startup.Sym("WARNING")));
             return ConditionSystem.Warn(condObj);
         }
+        // (warn function &rest args): the function is a format control, as for ERROR.
+        if (args[0] is LispFunction wfn)
+        {
+            var wsw = new System.IO.StringWriter();
+            var wstream = new LispStringOutputStream(wsw);
+            var wcallArgs = new LispObject[args.Length];
+            wcallArgs[0] = wstream;
+            Array.Copy(args, 1, wcallArgs, 1, args.Length - 1);
+            string wmsg = "";
+            try { wfn.Invoke(wcallArgs); wmsg = wstream.GetString(); }
+            catch { /* ignore formatting errors */ }
+            var fwarn = new LispWarning(wmsg);
+            fwarn.ConditionTypeName = "SIMPLE-WARNING";
+            fwarn.FormatControl = args[0];
+            fwarn.FormatArguments = Runtime.List(args.SubArray(1));
+            return ConditionSystem.Warn(fwarn);
+        }
+        // CLHS 9.1.2.1: anything else is no condition designator; ERROR says so too.
         if (FormatControlText(args[0]) is not string fmtText)
-            return ConditionSystem.Warn(new LispWarning(args[0].ToString() ?? ""));
+            throw new LispErrorException(new LispTypeError(
+                $"{args[0]} is not a condition designator", args[0],
+                List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("FUNCTION"),
+                     Startup.Sym("SYMBOL"), Startup.Sym("CONDITION"))));
         // Render on demand, not here: the arguments are the caller's objects and
         // running the printer over them now would use the printer variables of the
         // signalling site. A reporter that binds *PRINT-CIRCLE* (SBCL's compiler does)
@@ -696,10 +715,14 @@ public static partial class Runtime
         });
         Startup.RegisterUnary("TYPE-ERROR-DATUM", obj => {
             if (obj is LispTypeError te) return te.Datum ?? Nil.Instance;
+            if (!IsTruthy(Typep(obj, Startup.Sym("TYPE-ERROR"))))
+                throw new LispErrorException(new LispTypeError("TYPE-ERROR-DATUM: not a TYPE-ERROR condition", obj, Startup.Sym("TYPE-ERROR")));
             return ConditionSlot(obj, "DATUM");
         });
         Startup.RegisterUnary("TYPE-ERROR-EXPECTED-TYPE", obj => {
             if (obj is LispTypeError te) return te.ExpectedType ?? Nil.Instance;
+            if (!IsTruthy(Typep(obj, Startup.Sym("TYPE-ERROR"))))
+                throw new LispErrorException(new LispTypeError("TYPE-ERROR-EXPECTED-TYPE: not a TYPE-ERROR condition", obj, Startup.Sym("TYPE-ERROR")));
             return ConditionSlot(obj, "EXPECTED-TYPE");
         });
         Startup.RegisterUnary("SIMPLE-CONDITION-FORMAT-CONTROL", obj => {
@@ -720,7 +743,7 @@ public static partial class Runtime
                     return inst.Slots[idx]!;
                 return Nil.Instance;
             }
-            return Nil.Instance;
+            throw new LispErrorException(new LispTypeError("not a condition", obj, Startup.Sym("CONDITION")));
         });
         Startup.RegisterUnary("SIMPLE-CONDITION-FORMAT-ARGUMENTS", obj => {
             if (obj is LispInstanceCondition lic)
@@ -740,7 +763,7 @@ public static partial class Runtime
                     return inst.Slots[idx]!;
                 return Nil.Instance;
             }
-            return Nil.Instance;
+            throw new LispErrorException(new LispTypeError("not a condition", obj, Startup.Sym("CONDITION")));
         });
 
         // Restart functions

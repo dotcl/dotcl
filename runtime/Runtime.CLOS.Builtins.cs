@@ -382,7 +382,10 @@ public static partial class Runtime
                     {
                         foreach (var slot in curInst.Class.EffectiveSlots)
                         {
-                            if (!prevInst.Class.TryGetSlotIndexExact(slot.Name, out _))
+                            // Only local slots are added: a shared slot keeps its value.
+                            if (slot.IsClassAllocation) continue;
+                            if (!prevInst.Class.TryGetSlotIndexExact(slot.Name, out int prevIdx)
+                                || prevInst.Class.EffectiveSlots[prevIdx].IsClassAllocation)
                                 addedSlots = new Cons(slot.Name, addedSlots);
                         }
                     }
@@ -474,6 +477,8 @@ public static partial class Runtime
                 new LispFunction(args => Runtime.AddMethod(args[0], args[1])));
             ((LispMethod)amDefaultMethod).RequiredCount = 2;
             Runtime.AddMethod(amGF, amDefaultMethod);
+            Runtime.AddMethodGf = amGF;
+            Runtime.AddMethodDefault = (LispMethod)amDefaultMethod;
         }
         // REMOVE-METHOD as a proper GF
         {
@@ -597,8 +602,17 @@ public static partial class Runtime
         RegClos("%SET-GF-LAMBDA-LIST-INFO", Runtime.SetGFLambdaListInfo);
         RegClos("%SET-METHOD-LAMBDA-LIST-INFO", Runtime.SetMethodLambdaListInfo);
         RegClos("%MAKE-METHOD", a => Runtime.MakeMethod(a[0], a[1], a[2]), 3);
-        RegClos("%ADD-METHOD", a => Runtime.AddMethod(a[0], a[1]), 2);
+        RegClos("%ADD-METHOD", a => Runtime.AddMethodProtocol(a[0], a[1]), 2);
+        RegClos("%PRUNE-STALE-ACCESSORS", a => Runtime.PruneStaleAccessors(a[0]), 1);
+        RegClos("%SET-GF-METHOD-CLASS", a =>
+        {
+            if (a[0] is GenericFunction g && a[1] is LispClass mc) g.DeclaredMethodClass = mc;
+            return a[0];
+        }, 2);
+        RegClos("%FLUSH-DEFERRED-UNDEFINED", a => Runtime.FlushDeferredUndefined(), 0);
         RegClos("%NOTE-METHOD-CLASS", a => Runtime.NoteMethodClass(a[0], a[1]), 2);
+        RegClos("%EGF-OVERRIDDEN-P", a => Runtime.EnsureGfOverridden(a[0]) ? T.Instance : Nil.Instance, 1);
+        RegClos("%EGF-VIA-PROTOCOL", a => Runtime.EnsureGfViaProtocol(a[0], a[1], a[2], a[3]), 4);
         RegClos("%NOTE-METHOD-COMBINATION", a => Runtime.NoteMethodCombination(a[0], a[1], a[2]), 3);
         RegClos("%MAKE-METHOD-LAMBDA-FOR", a => Runtime.MakeMethodLambdaFor(a[0], a[1]), 2);
         RegClos("%CURRENT-NEXT-METHODS", a => Runtime.CurrentNextMethods(), 0);
@@ -668,6 +682,8 @@ public static partial class Runtime
             ((LispMethod)miDefaultMethod).HasKey = true;
             ((LispMethod)miDefaultMethod).HasAllowOtherKeys = true;
             Runtime.AddMethod(miGF, miDefaultMethod);
+            Runtime.MakeInstanceGf = miGF;
+            Runtime.MakeInstanceDefaultMethod = (LispMethod)miDefaultMethod;
         }
 
         // FIND-CLASS
@@ -743,13 +759,66 @@ public static partial class Runtime
                 slotNames[i - 2] = slotSym;
                 directSlots[i - 2] = new SlotDefinition(slotSym);
             }
-            var cls = new LispClass(name, directSlots, new[] { parentCls });
+            // The class's own slots: the ones an :include parent does not already have.
+            // (All slots are passed, the inherited ones first.)
+            var ownSlots = directSlots;
+            if (parentCls.IsStructureClass && parentCls.StructSlotNames is { } parentNames)
+            {
+                var own = new System.Collections.Generic.List<SlotDefinition>();
+                for (int i = 0; i < directSlots.Length; i++)
+                    if (i >= parentNames.Length || !ReferenceEquals(parentNames[i], slotNames[i]))
+                        own.Add(directSlots[i]);
+                ownSlots = own.ToArray();
+            }
+            // Evaluating a DEFSTRUCT again with the same shape (a file loaded and then
+            // compiled, say) keeps the class object: methods are specialised on it, and
+            // a new object would leave them applicable to nothing.
+            if (Runtime.FindClassOrNil(name) is LispClass prior && prior.IsStructureClass
+                && !prior.IsBuiltIn && ReferenceEquals(prior.Name, name)
+                && prior.DirectSuperclasses.Length == 1
+                && ReferenceEquals(prior.DirectSuperclasses[0], parentCls)
+                && prior.StructSlotNames != null
+                && prior.StructSlotNames.Length == slotNames.Length)
+            {
+                bool same = true;
+                for (int i = 0; i < slotNames.Length; i++)
+                    if (!ReferenceEquals(prior.StructSlotNames[i], slotNames[i])) { same = false; break; }
+                if (same)
+                {
+                    name.StructParent = parentSym ?? Startup.Sym("STRUCTURE-OBJECT");
+                    return name;
+                }
+            }
+            var cls = new LispClass(name, ownSlots, new[] { parentCls });
             cls.IsStructureClass = true;
             cls.StructSlotNames = slotNames;
             cls.FinalizeClass();
             Runtime.RegisterClass(cls);
             name.StructParent = parentSym ?? Startup.Sym("STRUCTURE-OBJECT");
             return name;
+        }));
+
+        // The slots' default forms, in slot order, so SLOT-DEFINITION-INITFORM answers them.
+        Emitter.CilAssembler.RegisterFunction("%SET-STRUCT-SLOT-INITFORMS", new LispFunction(args => {
+            var name = (Symbol)args[0];
+            if (Runtime.FindClassOrNil(name) is not LispClass cls || cls.StructSlotNames == null) return Nil.Instance;
+            var forms = new System.Collections.Generic.List<LispObject>();
+            for (var l = args[1]; l is Cons c; l = c.Cdr) forms.Add(c.Car);
+            for (int i = 0; i < forms.Count && i < cls.StructSlotNames.Length; i++)
+            {
+                var sym = cls.StructSlotNames[i];
+                foreach (var d in cls.DirectSlots)
+                    if (ReferenceEquals(d.Name, sym)) d.Initform = forms[i];
+                foreach (var e in cls.EffectiveSlots)
+                {
+                    if (!ReferenceEquals(e.Name, sym)) continue;
+                    bool inherited = false;
+                    foreach (var k in cls.ClassPrecedenceList)
+                        if (!ReferenceEquals(k, cls) && Array.IndexOf(k.DirectSlots, e) >= 0) { inherited = true; break; }
+                    if (!inherited) e.Initform = forms[i];
+                }
+            }
+            return Nil.Instance;
         }));
 
         Emitter.CilAssembler.RegisterFunction("%REGISTER-STRUCT-READER", new LispFunction(args => {

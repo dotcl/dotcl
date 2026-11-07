@@ -52,6 +52,7 @@ bench-state.json
 !scripts/stage-core-source.sh
 !scripts/check-host-defs.sh
 !scripts/dist-package.sh
+!scripts/ci-memory-report.sh
 !ci/d-number.sh
 !ci/mirror-scrub-workflows.sh
 !ci/windows-ci.sh
@@ -67,9 +68,7 @@ bench-state.json
 !bench/sil-shapes/count-sil.sh
 !bench/library-status/native.sh
 !bench/csharp-parity/make-parity-state.sh
-!bench/gate/process-modes.sh
 !bench/gate/regression-time.sh
-!bench/gate/test-modes.sh
 !bench/library-status/run-quickload.sh
 !bench/library-status/run-tests.sh
 !bench/library-status/net.sh

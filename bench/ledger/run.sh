@@ -26,6 +26,7 @@
 #   LEDGER_PUBLISH=1 after "all", replace the body of issue LEDGER_ISSUE in LEDGER_ISSUE_REPO (both
 #                    required, no defaults); the old body goes into a comment first
 #   LEDGER_ROUNDS    alternating rounds per row (default 3)
+#   LEDGER_STARTUP_COUNT  fresh processes per startup measurement, median taken (default 10)
 #   LEDGER_ONLY      extended regex; only rows whose id matches are measured
 #   LEDGER_ITEMS     rows file (default: items.tsv next to this script)
 #   LEDGER_NOTES     id<TAB>note file shown in the note column (default: notes.tsv next to this script)
@@ -52,6 +53,7 @@ TREE=${LEDGER_TREE:-$(cd "$here/../.." && pwd)}
 WORK=${LEDGER_WORK:-$TREE/out/ledger}
 OUT=${LEDGER_OUT:-$WORK/out}
 ROUNDS=${LEDGER_ROUNDS:-3}
+STARTUP_COUNT=${LEDGER_STARTUP_COUNT:-10}
 COLD_MAX=${LEDGER_COLD_MAX:-10}
 STEADY_MAX=${LEDGER_STEADY_MAX:-2}
 STEADY_STRONG=${LEDGER_STEADY_STRONG:-3}
@@ -170,8 +172,13 @@ build_argv() {
   ARGV=()
   if [ "$side" = dotcl ]; then
     ARGV=("$RUNTIME" --core "$CORE")
+    [ "$kind" = startup ] && ARGV+=(--no-init)
     for e in ${evals[@]+"${evals[@]}"}; do ARGV+=(--eval "$e"); done
     ARGV+=("$file")
+  elif [ "$kind" = startup ]; then
+    ARGV=("${SBCL_DIRECT[@]}")
+    [ -n "${SBCL_DIRECT_CORE:-}" ] && ARGV+=(--core "$SBCL_DIRECT_CORE")
+    ARGV+=(--non-interactive --no-userinit --load "$file")
   else
     read -ra ARGV <<< "$SBCL_CMD"
     ARGV+=(--non-interactive)
@@ -180,6 +187,26 @@ build_argv() {
     ARGV+=(--load "$file")
     case $kind in clbench*) ARGV+=(--eval '(quit)');; esac
   fi
+}
+
+# The SBCL binary that ros starts, found without ros so that a startup measurement does not
+# include ros's own launch: the newest <roswell home>/impls/*/*/sbcl-bin/<version>/bin/sbcl
+# (the version comes from the SBCL_CMD banner, else any), then sbcl on PATH. Prints the
+# binary and, when it sits in a roswell tree, its core as two lines; prints nothing if none.
+sbcl_direct() {
+  local ver root bin d
+  ver=$(cd "$WORK" && $SBCL_CMD --version 2>/dev/null </dev/null | head -1 | sed -E 's/^SBCL ([0-9][0-9.]*[0-9]).*/\1/')
+  for root in "${LEDGER_ROSWELL_HOME:-$HOME/.roswell}"; do
+    for d in $(ls -d "$root"/impls/*/*/sbcl-bin/${ver:-*} 2>/dev/null | sort -r -V); do
+      if [ -x "$d/bin/sbcl" ]; then
+        echo "$d/bin/sbcl"
+        [ -f "$d/lib/sbcl/sbcl.core" ] && echo "$d/lib/sbcl/sbcl.core"
+        return 0
+      fi
+    done
+  done
+  bin=$(command -v sbcl) && echo "$bin"
+  return 0
 }
 
 # "a,b" (benchmarks that need an earlier one to define their classes) -> '("a" "b")
@@ -200,7 +227,7 @@ run_one() {
               "LEDGER_STEADY_MIN_SECONDS=$STEADY_MIN_SECONDS"
               "LEDGER_STEADY_MAX_RUNS=$STEADY_MAX_RUNS"
               "LEDGER_STEADY_MAX_SECONDS=$STEADY_MAX_SECONDS")
-  local file evals=() dir=$WORK
+  local file evals=() dir=$WORK wrap=()
   [ "$mode" = steady ] && envs+=(LEDGER_STEADY=1)
   case $kind in
     clbench)
@@ -229,9 +256,15 @@ run_one() {
     imago)
       file=$here/bic2-run.lisp
       envs+=("LEDGER_FASL=$WORK/bic2-$side.fasl");;
+    startup)
+      # median wall time of STARTUP_COUNT fresh processes running a tiny script
+      file=$here/startup-$arg.lisp
+      [ "$arg" = hello ] && envs+=(STARTUP_EXPECT=hello)
+      wrap=("$RUNTIME" --core "$CORE" --no-init "$here/startup-time.lisp" "$STARTUP_COUNT");;
     *) echo "unknown kind $kind" >&2; RC=99; return;;
   esac
   build_argv "$side" "$kind" "$file" ${evals[@]+"${evals[@]}"}
+  ARGV=(${wrap[@]+"${wrap[@]}"} "${ARGV[@]}")
   # GNU timeout is coreutils' gtimeout on macOS, and absent on a stock runner: without
   # either, run unbounded rather than failing every item with exit 127.
   local cmd
@@ -311,6 +344,8 @@ parse() {
         awk -v id="$id" '$1 == "TIME" && $5 == "ok" { printf "%s/%s/%s\t%.1f\tms\t\n", id, $2, $3, $4 * 1000 }' "$so";;
       imago)
         awk -v id="$id" '$1 == "BIC2" { printf "%s\t%s\tns\t%s\n", id, $2, $6 }' "$so";;
+      startup)
+        awk -v id="$id" '$1 == "STARTUP" { printf "%s\t%s\tms\t\n", id, $2 }' "$so";;
     esac
   fi
 }
@@ -324,6 +359,10 @@ measure() {
     date +%s > "$OUT/start.epoch"
   fi
   local id kind arg to side round so se n failed primed=" "
+  SBCL_DIRECT=(); SBCL_DIRECT_CORE=
+  { read -r sb; read -r SBCL_DIRECT_CORE; } < <(sbcl_direct)
+  [ -n "${sb:-}" ] && SBCL_DIRECT=("$sb")
+  log "startup SBCL: ${SBCL_DIRECT[*]:-none}${SBCL_DIRECT_CORE:+ --core $SBCL_DIRECT_CORE}"
   local ids=0
   while IFS=$'\t' read -r id kind arg to _note; do
     case $id in ''|'#'*) continue;; esac
@@ -343,6 +382,10 @@ measure() {
       esac
     done
     failed_dotcl=0; failed_sbcl=0
+    if [ "$kind" = startup ] && [ ${#SBCL_DIRECT[@]} = 0 ]; then
+      log "$id: no sbcl binary found without ros; recording dotcl only"
+      failed_sbcl=1
+    fi
     for round in $(seq 1 "$ROUNDS"); do
       for side in dotcl sbcl; do
         eval "failed=\$failed_$side"
@@ -365,6 +408,8 @@ measure() {
         fi
       done
     done
+    # startup has no steady state: the steady columns stay empty
+    [ "$kind" = startup ] && continue
     for side in dotcl sbcl; do
       so=$OUT/steady-$side.out; se=$OUT/steady-$side.err
       log "$id $side steady"
@@ -406,6 +451,7 @@ render() {
       if (m ~ /^parity\//) return "csharp-parity kernel cold (1 warm-up + 5 runs, min); steady repeats until stable"
       if (m ~ /^ironclad-cold\//) return "ironclad rt suite cold (1 rep per test); steady repeats each test until stable; sum of tests"
       if (m ~ /^ironclad-warm\//) return "ironclad rt suite warm (min of 4 reps per test); steady repeats each test until stable; sum of tests"
+      if (m ~ /^startup\//) return "wall time of a fresh process running a tiny script (median of several); no steady state; the ledger runs a non-ReadyToRun build, so startup is larger than the shipped tool; only the trend matters; the cold ratio is not marked"
       if (m ~ /^imago\//) return "imago bicubic cold (min of 5, warm); steady repeats until stable; ns per pixel"
       return ""
     }
@@ -490,7 +536,8 @@ render() {
         cr = (d != "" && s != "" && s + 0 > 0) ? sprintf("%.2f", d / s) : "-"
         sr = (sd != "" && ss != "" && ss + 0 > 0) ? sprintf("%.2f", sd / ss) : "-"
         mark = ""
-        if (sr != "-" && sr + 0 > strong) mark = "!!"
+        if (m ~ /^startup\//) mark = ""
+        else if (sr != "-" && sr + 0 > strong) mark = "!!"
         else if ((cr != "-" && cr + 0 > coldmax) || (sr != "-" && sr + 0 > steadymax)) mark = "!"
         note = ""
         split(m, g, "/"); hn = (m in hnote) ? hnote[m] : ((g[1] in hnote) ? hnote[g[1]] : "")
@@ -502,9 +549,10 @@ render() {
           printf "%s\t%s\t%s\t%+.0f%%\n", m, pratio[m], cr, (cr / pratio[m] - 1) * 100 > regfile
         }
         ds = (d == "") ? "failed" : sprintf("%.1f", d)
-        ssx = (s == "") ? "failed" : sprintf("%.1f", s)
+        ssx = (s == "") ? ((m ~ /^startup\// && !fail[m, "sbcl"]) ? "-" : "failed") : sprintf("%.1f", s)
         sds = (sd == "") ? "failed" : sprintf("%.1f", sd)
         sss = (ss == "") ? "failed" : sprintf("%.1f", ss)
+        if (m ~ /^startup\//) { sds = "-"; sss = "-" }
         if (m ~ /^ironclad-/) {
           if (rd[m] == "" && rs[m] == "") runs = "-"
           else if (rd[m] == rs[m]) runs = rd[m]

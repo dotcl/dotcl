@@ -353,7 +353,13 @@ public static partial class Runtime
                 // until a character is actually written, where erroring is correct.)
                 case LispInstance gi when IsGrayStream(gi):
                     return new GrayStreamTextWriter(gi);
-                default: return Console.Out;
+                // Input-only streams and plain data are not output stream designators;
+                // writing to them used to land on the console.
+                case LispInstance:
+                    return Console.Out;
+                default:
+                    throw new LispErrorException(new LispTypeError(
+                        $"{FormatObject(stream, true)} is not an output stream", stream, Startup.Sym("STREAM")));
             }
         }
     }
@@ -526,6 +532,15 @@ public static partial class Runtime
         return eofValue;
     }
 
+    /// <summary>Make #! a line comment in the current readtable (shebang lines of scripts). False when
+    /// *READTABLE* does not hold a readtable.</summary>
+    public static bool InstallShebangComment()
+    {
+        if (DynamicBindings.Get(Startup.Sym("*READTABLE*")) is not LispReadtable rt) return false;
+        rt.SetDispatchMacroCharacter('#', '!', (r, c, n) => r.ReadLineComment(c));
+        return true;
+    }
+
     public static LispObject ReadFromString(LispObject[] args)
     {
         if (args.Length < 1)
@@ -573,10 +588,10 @@ public static partial class Runtime
                 switch (kw.Name)
                 {
                     case "START":
-                        if (!startSet) { start = args[i + 1] is Fixnum fs ? (int)fs.Value : 0; startSet = true; }
+                        if (!startSet) { start = args[i + 1] is Fixnum fs ? Runtime.ClampIndex(fs.Value) : 0; startSet = true; }
                         break;
                     case "END":
-                        if (!endSet) { if (args[i + 1] is Fixnum fe) end = (int)fe.Value; endSet = true; }
+                        if (!endSet) { if (args[i + 1] is Fixnum fe) end = Runtime.ClampIndex(fe.Value); endSet = true; }
                         break;
                     case "PRESERVE-WHITESPACE":
                         if (!preserveWhitespaceSet) { preserveWhitespace = args[i + 1] is not Nil; preserveWhitespaceSet = true; }
@@ -597,6 +612,7 @@ public static partial class Runtime
 
         // Copying the whole string when :start/:end were not given is a copy of
         // the input on every READ-FROM-STRING -- and callers pass whole files.
+        CheckBoundingIndices(start, end, str.Length, "READ-FROM-STRING");
         string substring = (start == 0 && end == str.Length) ? str : str.Substring(start, end - start);
         // Count physical reads from the underlying string so the reported position
         // tracks consumption done via the stream API by reader macros (read-char/read

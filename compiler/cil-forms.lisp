@@ -580,7 +580,17 @@
                                          (cond ((null cell) init)
                                                (temps (cdr (assoc k temps)))
                                                (t (cdr cell))))))
-                 (call `(%make-struct ',struct-name ,@values))
+                 (kind (fifth entry))
+                 (call (if kind
+                           ;; A (:TYPE VECTOR) / (:TYPE LIST) structure: the elements its
+                           ;; constructor builds, with this call's values in the slot positions.
+                           `(,(if (eq kind :list) 'list 'vector)
+                             ,@(mapcar (lambda (e)
+                                         (cond ((null e) nil)
+                                               ((eq (car e) :quote) (list 'quote (cadr e)))
+                                               ((eq (car e) :s) (nth (cadr e) values))))
+                                       (sixth entry)))
+                           `(%make-struct ',struct-name ,@values)))
                  (body (if checked
                            `(progn
                               ,@(remove nil
@@ -743,6 +753,12 @@
                             `((:declare-local ,tmp "LispObject")
                               ,@(compile-expr a)
                               (:stloc ,tmp)))))))))
+
+(defun %pre-call-reset-elidable-p ()
+  "True when the call being compiled is in a single-value position: its result
+   is unwrapped right after the call and nothing reads the multiple-values
+   channel for it, so the channel need not be emptied in front of the call."
+  (and (not *in-mv-context*) (not *in-tail-position*)))
 
 (defun compile-named-call (name args)
   ;; xref: single choke point for every named call: all the fast-path
@@ -927,7 +943,7 @@
               `(,@eval-instrs
                 ,(if (eq (cstate-self-fn-local) :arg0) '(:ldarg 0)
                      `(:ldloc ,(cstate-self-fn-local)))
-                ,@(unless skip-reset '((:call "MultipleValues.Reset")))
+                ,@(unless (or skip-reset (%pre-call-reset-elidable-p)) '((:call "MultipleValues.Reset")))
                 ,@(loop for tmp in temps append `((:ldloc ,tmp)))
                 ,@(if tr
                       ;; Pass this function's claimed CATCH on to the callee; a
@@ -963,6 +979,15 @@
           (return-from compile-named-call
             (%compile-struct-read (car args) slot-idx
                                   (struct-slot-ref-type (cons name args)))))))
+    ;; Struct predicate: (pt-p x) -> (typep x 'pt), the predicate's own definition.
+    (when (and (symbolp name)
+               (= (length args) 1)
+               (not *cross-compiling*)
+               (not (local-function-entry name))
+               (not (member name *notinline-functions*)))
+      (let ((sname (gethash name *struct-predicates*)))
+        (when (and sname (not (%global-notinline-p name)))
+          (return-from compile-named-call (compile-expr `(typep ,(car args) ',sname))))))
     ;; Keyword struct constructor called with constant keywords: build the instance
     ;; here instead of calling it. The &key call is what costs, the argument array
     ;; and the keyword scan, while the constructor body is one %MAKE-STRUCT of the
@@ -972,7 +997,8 @@
                (not *cross-compiling*)
                (not (local-function-entry name))
                (not (member name *notinline-functions*)))
-      (let ((entry (gethash name *struct-keyword-ctors*)))
+      (let ((entry (or (gethash name *struct-keyword-ctors*)
+                       (gethash name *typed-struct-keyword-ctors*))))
         (when (and entry (not (%global-notinline-p name)))
           (let ((form (%struct-ctor-direct-form entry args)))
             (when form
@@ -1053,6 +1079,7 @@
           (skip-reset (single-value-form-p (cons name args))))
     (if local-fn
         ;; Local function (flet/labels): load from local or box, cast, invoke
+        (%with-exit-token-check local-fn
         (let ((key (second local-fn))
               (boxed-p (third local-fn))
               (caps (fourth local-fn)))
@@ -1078,7 +1105,7 @@
                         `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
                         `((:ldloc ,key)))
                   (:castclass "LispFunction")
-                  ,@(unless skip-reset '((:call "MultipleValues.Reset")))
+                  ,@(unless (or skip-reset (%pre-call-reset-elidable-p)) '((:call "MultipleValues.Reset")))
                   ,@(loop for tmp in temps append `((:ldloc ,tmp)))
                   ,@(%invoke-instrs n-args (unless skip-reset (%call-site-mv-mode args)))))
               `((:declare-local ,args-tmp "LispObject[]")
@@ -1087,9 +1114,9 @@
                       `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))
                       `((:ldloc ,key)))
                 (:castclass "LispFunction")
-                ,@(unless skip-reset '((:call "MultipleValues.Reset")))
+                ,@(unless (or skip-reset (%pre-call-reset-elidable-p)) '((:call "MultipleValues.Reset")))
                 (:ldloc ,args-tmp)
-                (:callvirt "LispFunction.Invoke"))))
+                (:callvirt "LispFunction.Invoke")))))
         ;; Not a local function. In a Lisp-2 the operator position never names a
         ;; lexical variable, so a symbol that is a boxed local *variable*
         ;; (mutated + captured, hence living in a LispObject[1] cell) and happens
@@ -1138,7 +1165,7 @@
                       (if (and (symbolp name) (every #'simple-expr-p args))
                           ;; Fast path: simple args -> skip temps, push directly
                           `(,@load-fn
-                            ,@(unless skip-reset '((:call "MultipleValues.Reset")))
+                            ,@(unless (or skip-reset (%pre-call-reset-elidable-p)) '((:call "MultipleValues.Reset")))
                             ,@(loop for arg in args
                                     append (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr arg)))
                             ,@call-instrs)
@@ -1147,13 +1174,13 @@
                                  (eval-instrs (cdr da)))
                             `(,@eval-instrs
                               ,@load-fn
-                              ,@(unless skip-reset '((:call "MultipleValues.Reset")))
+                              ,@(unless (or skip-reset (%pre-call-reset-elidable-p)) '((:call "MultipleValues.Reset")))
                               ,@(loop for tmp in temps append `((:ldloc ,tmp)))
                               ,@call-instrs))))
                     `((:declare-local ,args-tmp "LispObject[]")
                       ,@(compile-args-array args) (:stloc ,args-tmp)
                       ,@load-fn
-                      ,@(unless skip-reset '((:call "MultipleValues.Reset")))
+                      ,@(unless (or skip-reset (%pre-call-reset-elidable-p)) '((:call "MultipleValues.Reset")))
                       (:ldloc ,args-tmp)
                       (:callvirt "LispFunction.Invoke"))))))))
 
@@ -1324,6 +1351,22 @@
          (list :fixnum-cmp
                (ecase op (< :lt) (> :gt) (<= :le) (>= :ge) (= :eq) (/= :ne))
                args))
+        ;; (< (1+ i) n), (<= (+ i 2) n) ...: a sum or difference of fixnum variables or
+        ;; literals, which may leave the fixnum range, against such an operand:
+        ;; compared as the integers they are without making any of them an object.
+        ((and (= nargs 2)
+              (member op '(< > <= >= = /=))
+              (%sum-cmp-plan op args))
+         (list :sum-cmp (%sum-cmp-plan op args) args))
+        ;; A raw u64 local against a u64 local, a non-negative fixnum constant or
+        ;; a fixnum variable: an unsigned machine compare.
+        ((and (= nargs 2)
+              (member op '(< > <= >= = /=))
+              (u64-cmp-operands
+               (ecase op (< :lt) (> :gt) (<= :le) (>= :ge) (= :eq) (/= :ne)) args))
+         (list :u64-cmp
+               (ecase op (< :lt) (> :gt) (<= :le) (>= :ge) (= :eq) (/= :ne))
+               args))
         ;; EQL / EQUAL / EQUALP of two fixnum-typed operands is =: on integers
         ;; all three compare by value. The generic entries take objects, so a
         ;; raw slot or an Int64 local was boxed only to be compared; for EQUALP
@@ -1410,6 +1453,15 @@
                                        (stringp . "Runtime.IsTrueStringp")
                                        (characterp . "Runtime.IsTrueCharacterp")
                                        (functionp . "Runtime.IsTrueFunctionp")))) args))
+        ;; (%fixnum-range-p x LO HI): the test a (typep x '(integer LO HI)) lowers to
+        ((and (eq op '%fixnum-range-p) (= nargs 3) (integerp (second args)) (integerp (third args))
+              (not (local-function-entry op)))
+         (list :fixnum-range (cons (second args) (third args)) (list (first args))))
+        ((and (eq op 'typep) (= nargs 2) (not *cross-compiling*)
+              (let ((type-arg (second args)))
+                (and (consp type-arg) (eq (car type-arg) 'quote) (consp (cadr type-arg))
+                     (%typep-int64-range (cadr type-arg)))))
+         (list :fixnum-range (%typep-int64-range (cadr (second args))) (list (first args))))
         ;; (typep x 'struct) -> inline structure name / :INCLUDE test
         ((and (eq op 'typep) (= nargs 2)
               (let ((type-arg (second args)))
@@ -1431,6 +1483,7 @@
                                     (string . "Runtime.IsTrueStringp")
                                     (character . "Runtime.IsTrueCharacterp")
                                     (function . "Runtime.IsTrueFunctionp")
+                                    (hash-table . "Runtime.IsTrueHashTable")
                                     (atom . "Runtime.IsTrueAtom"))))))
            (if predicate
                (list :unary predicate (list (first args)))
@@ -1707,6 +1760,18 @@
   (let ((*in-tail-position* nil) (*in-mv-context* nil))
     (cond ((fixnum-exact-p x) (compile-as-long x))
           ((compile-as-long-structured x))
+          ;; (if c a b): each arm is left raw too, so an inline body that ends in
+          ;; a conditional does not box at the merge.
+          ((and (consp x) (eq (car x) 'if) (= (length x) 4)
+                (not (local-function-entry 'if)))
+           (let ((else-label (gen-label "LTAILELSE"))
+                 (end-label (gen-label "LTAILEND")))
+             `(,@(compile-boolean-branch (cadr x) else-label nil)
+               ,@(compile-long-tail-form (caddr x))
+               (:br ,end-label)
+               (:label ,else-label)
+               ,@(compile-long-tail-form (cadddr x))
+               (:label ,end-label))))
           (t `(,@(compile-expr x) (:unbox-fixnum))))))
 
 (defun compile-as-long-structured (expr)
@@ -2022,6 +2087,68 @@
                 (t (if-branch (caar clauses) `(progn ,@(cdar clauses))
                               `(cond ,@(cdr clauses))))))))))
 
+(defun %typep-int64-range (spec)
+  "(LO . HI) when the compound type SPEC names a set of integers that all lie in
+   the range of a fixnum object, else NIL."
+  (and (consp spec) (member (car spec) '(integer unsigned-byte signed-byte mod))
+       (let ((r (ignore-errors (declared-integer-range spec))))
+         (and r (integerp (car r)) (integerp (cdr r))
+              (<= (car r) (cdr r))
+              (range-fits-int64-p r)
+              r))))
+
+(defun compile-fixnum-range-test (x range)
+  "The Runtime.IsFixnumInRange test of X against RANGE = (LO . HI), as a bool."
+  `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr x))
+    (:ldc-i8 ,(car range)) (:ldc-i8 ,(cdr range))
+    (:call "Runtime.IsFixnumInRange")))
+(defun %sum-cmp-operand-p (e)
+  "A fixnum variable or an integer literal inside int64: an operand that can be
+   read in any order, any number of times, with no effect."
+  (or (typep e '(signed-byte 64))
+      (and (symbolp e) e (not (eq e t)) (not (keywordp e))
+           (fixnum-exact-p e))))
+
+(defun %sum-of (e)
+  "(A B SUBTRACT-P) when E is (+ A B), (- A B), (1+ A) or (1- A) on operands
+   %SUM-CMP-OPERAND-P accepts and the result is not itself provably a fixnum."
+  (and (consp e) (symbolp (car e)) (listp (cdr e))
+       (not (local-function-entry (car e)))
+       (let ((r (case (car e)
+                  (+ (and (= (length e) 3) (list (second e) (third e) nil)))
+                  (- (and (= (length e) 3) (list (second e) (third e) t)))
+                  (1+ (and (= (length e) 2) (list (second e) 1 nil)))
+                  (1- (and (= (length e) 2) (list (second e) 1 t)))
+                  (t nil))))
+         (and r
+              (%sum-cmp-operand-p (first r)) (%sum-cmp-operand-p (second r))
+              (not (and (integerp (first r)) (integerp (second r))))
+              (not (fixnum-typed-p e))
+              r))))
+
+(defun %sum-cmp-plan (op args)
+  "(A B C CODE) for the comparison (OP X Y) of ARGS when one side is a sum or
+   difference of simple fixnum operands (see %SUM-OF) and the other a simple
+   fixnum operand; CODE is Runtime.CmpSum's. Else NIL."
+  (when (not *cross-compiling*)
+    (let* ((x (first args)) (y (second args))
+           (sx (%sum-of x)) (sy (and (not sx) (%sum-of y)))
+           (codes '((< . 0) (<= . 1) (> . 2) (>= . 3) (= . 4) (/= . 5)))
+           (swapped '((< . >) (<= . >=) (> . <) (>= . <=) (= . =) (/= . /=))))
+      (cond ((and sx (%sum-cmp-operand-p y))
+             (list (first sx) (second sx) y
+                   (+ (cdr (assoc op codes)) (if (third sx) 8 0))))
+            ((and sy (%sum-cmp-operand-p x))
+             (list (first sy) (second sy) x
+                   (+ (cdr (assoc (cdr (assoc op swapped)) codes)) (if (third sy) 8 0))))
+            (t nil)))))
+
+(defun compile-sum-cmp (plan)
+  "Runtime.CmpSum of the three raw operands of PLAN, leaving a bool."
+  (destructuring-bind (a b c code) plan
+    `(,@(compile-as-long a) ,@(compile-as-long b) ,@(compile-as-long c)
+      (:ldc-i4 ,code) (:call "Runtime.CmpSum"))))
+
 (defun compile-boolean-branch (expr label branch-on-true)
   "Compile expr as a boolean condition and emit a branch to label.
    If branch-on-true, branch when condition is true (brtrue).
@@ -2042,9 +2169,12 @@
                (:binary (compile-binary-call (third fused) (second fused)))
                (:unary (compile-unary-call (third fused) (second fused)))
                (:fixnum-cmp (compile-fixnum-cmp (third fused) (second fused)))
+               (:u64-cmp (compile-u64-cmp (third fused) (second fused)))
                (:char-cmp (compile-char-cmp (third fused) (second fused)))
                (:sym-eq (compile-sym-eq (third fused)))
                (:double-cmp (compile-double-cmp (third fused) (second fused)))
+               (:fixnum-range (compile-fixnum-range-test (first (third fused)) (second fused)))
+               (:sum-cmp (compile-sum-cmp (second fused)))
                (:struct-typep (compile-struct-typep (first (third fused)) (second fused)))))
          (,(if branch-on-true :brtrue :brfalse) ,label)))
       ;; The value passed through unchanged: branch on it.
@@ -2189,9 +2319,12 @@
                (:binary (compile-binary-call (third fused-method) (second fused-method)))
                (:unary (compile-unary-call (third fused-method) (second fused-method)))
                (:fixnum-cmp (compile-fixnum-cmp (third fused-method) (second fused-method)))
+               (:u64-cmp (compile-u64-cmp (third fused-method) (second fused-method)))
                (:char-cmp (compile-char-cmp (third fused-method) (second fused-method)))
                (:sym-eq (compile-sym-eq (third fused-method)))
                (:double-cmp (compile-double-cmp (third fused-method) (second fused-method)))
+               (:fixnum-range (compile-fixnum-range-test (first (third fused-method)) (second fused-method)))
+               (:sum-cmp (compile-sum-cmp (second fused-method)))
                (:struct-typep (compile-struct-typep
                                (first (third fused-method)) (second fused-method)))))
          (:brfalse ,else-label))))
@@ -2241,9 +2374,12 @@
                      (:binary (compile-binary-call (third inner-fused) (second inner-fused)))
                      (:unary (compile-unary-call (third inner-fused) (second inner-fused)))
                      (:fixnum-cmp (compile-fixnum-cmp (third inner-fused) (second inner-fused)))
+                     (:u64-cmp (compile-u64-cmp (third inner-fused) (second inner-fused)))
                      (:char-cmp (compile-char-cmp (third inner-fused) (second inner-fused)))
                      (:sym-eq (compile-sym-eq (third inner-fused)))
                      (:double-cmp (compile-double-cmp (third inner-fused) (second inner-fused)))
+                     (:fixnum-range (compile-fixnum-range-test (first (third inner-fused)) (second inner-fused)))
+               (:sum-cmp (compile-sum-cmp (second inner-fused)))
                      (:struct-typep (compile-struct-typep
                                      (first (third inner-fused)) (second inner-fused)))))
                (:brtrue ,else-label))))  ;; Negate: branch to else when TRUE

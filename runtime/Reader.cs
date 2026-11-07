@@ -9,6 +9,32 @@ namespace DotCL;
 /// A token character with escape tracking (CLHS 2.2 step 8/9).
 /// Escaped characters are not eligible as package markers.
 /// </summary>
+/// <summary>The characters of a token so far. Not a List&lt;TokenChar&gt;: a framework
+/// generic over a value type is not precompiled in a ReadyToRun image, so the first
+/// token read would wait for the JIT.</summary>
+public sealed class TokenCharList
+{
+    private static readonly TokenChar[] s_empty = new TokenChar[0];
+    private TokenChar[] _items = s_empty;
+    private int _count;
+    public int Count => _count;
+    public TokenChar this[int i]
+    {
+        get { if ((uint)i >= (uint)_count) throw new ArgumentOutOfRangeException(nameof(i)); return _items[i]; }
+        set { if ((uint)i >= (uint)_count) throw new ArgumentOutOfRangeException(nameof(i)); _items[i] = value; }
+    }
+    public void Add(TokenChar c)
+    {
+        if (_count == _items.Length)
+        {
+            var bigger = new TokenChar[_count == 0 ? 4 : _count * 2];
+            System.Array.Copy(_items, bigger, _count);
+            _items = bigger;
+        }
+        _items[_count++] = c;
+    }
+}
+
 public struct TokenChar
 {
     public char Ch;
@@ -22,7 +48,7 @@ public struct TokenChar
 /// </summary>
 public class Token
 {
-    public List<TokenChar> Chars { get; } = new();
+    public TokenCharList Chars { get; } = new();
     public bool HasEscaped { get; set; }
 
     public int Length => Chars.Count;
@@ -239,7 +265,7 @@ public class Reader
 
     private LispErrorException MakeReaderError(string message)
     {
-        var err = new LispError(message);
+        var err = new LispError($"{message} (line {_line}, column {System.Math.Max(1, CurCol - 1)})");
         err.ConditionTypeName = "READER-ERROR";
         if (LispStreamRef != null) err.StreamErrorStreamRef = LispStreamRef;
         return new LispErrorException(err);
@@ -871,6 +897,7 @@ public class Reader
     /// <summary>Reader macro function for '(': read a list (CLHS 2.4.1).</summary>
     internal LispObject ReadList(char _triggerChar)
     {
+        Runtime.StackGuard("READ");
         // Line of the opening paren: used to source-map the resulting form for
         // debug info and nested definition locations (see Runtime.SourceLineTable).
         int startLine = Runtime.SourceLineTable != null && LineSource != null ? CurrentFormLine() : _line;
@@ -963,7 +990,41 @@ public class Reader
         LispObject quoted;
         try { quoted = Read(); }
         finally { s_backquoteLevel--; }
+        // A template built with #n= that refers to itself has no finite expansion;
+        // it is used as it stands (a constant), as `(quote template)`.
+        if (s_backquoteLevel == 0 && TemplateIsCircular(quoted))
+            return MakeList(Startup.QUOTE, quoted);
         return ExpandBackquote(quoted);
+    }
+
+    /// <summary>True when walking FORM's conses and general vectors does not end:
+    /// more than a million nodes are seen, which a finite template read from text
+    /// does not reach unless it shares structure through #n= references.</summary>
+    private static bool TemplateIsCircular(LispObject form)
+    {
+        if (form is not (Cons or LispVector)) return false;
+        var stack = new Stack<LispObject>();
+        stack.Push(form);
+        int budget = 1_000_000;
+        while (stack.Count > 0)
+        {
+            if (--budget < 0) return true;
+            var o = stack.Pop();
+            if (o is Cons c)
+            {
+                if (c.Cdr is Cons or LispVector) stack.Push(c.Cdr);
+                if (c.Car is Cons or LispVector) stack.Push(c.Car);
+            }
+            else if (o is LispVector v && IsBackquoteVector(v))
+            {
+                for (int i = 0; i < v.Length; i++)
+                {
+                    var e = v.ElementAt(i);
+                    if (e is Cons or LispVector) stack.Push(e);
+                }
+            }
+        }
+        return false;
     }
 
     /// <summary>
@@ -1430,13 +1491,12 @@ public class Reader
         // #n= obj: define shared structure label
         if (_readSuppress) { Read(); return Nil.Instance; }
         if (label == -1) throw MakeReaderError("#= requires a numeric label");
+        // CLHS 2.4.8.15: a label is defined once in an object being read.
+        if (ShareLabels.ContainsKey(label) || SharePlaceholders.ContainsKey(label))
+            throw MakeReaderError($"Multiply defined label: #{label}=");
         // Pre-register a placeholder so self-references (#n#) during Read() can find it
-        SharePlaceholder? ph = null;
-        if (!SharePlaceholders.TryGetValue(label, out ph))
-        {
-            ph = new SharePlaceholder(label);
-            SharePlaceholders[label] = ph;
-        }
+        var ph = new SharePlaceholder(label);
+        SharePlaceholders[label] = ph;
         var obj = Read();
         if (obj == ph)
         {
@@ -1706,6 +1766,7 @@ public class Reader
 
     internal LispObject ReadVector(int numArg = -1)
     {
+        Runtime.StackGuard("READ");
         // #( ... ) -> vector
         // #n( ... ) -> vector of length n, fill remaining with last element
         var items = new List<LispObject>();
@@ -1784,7 +1845,8 @@ public class Reader
         LispObject feature;
         try { feature = Read(); }
         finally { DynamicBindings.Pop(pkgSym); }
-        bool hasFeature = EvaluateFeature(feature, !_readSuppress);
+        // Inside a form that is being skipped the expression is not evaluated, so not checked.
+        bool hasFeature = !_readSuppress && EvaluateFeature(feature, true);
         bool shouldInclude = positive ? hasFeature : !hasFeature;
 
         if (shouldInclude)
@@ -1810,7 +1872,7 @@ public class Reader
     ///   (AND f1 f2..) -> all sub-features match
     ///   (NOT f)       -> sub-feature does not match
     /// </summary>
-    private static bool EvaluateFeature(LispObject feature, bool record = false)
+    private bool EvaluateFeature(LispObject feature, bool record = false)
     {
         if (feature is Symbol sym)
         {
@@ -1836,6 +1898,16 @@ public class Reader
             return false;
         }
 
+        // The empty list is the symbol NIL, which is never a feature: plain false.
+        if (feature is Nil)
+        {
+            if (record) HostFeatures.NoteAtom("NIL", false);
+            return false;
+        }
+
+        // CLHS 24.1.2.1: a feature expression is a symbol, (and x*), (or x*) or (not x).
+        // Like SBCL, only the parts evaluation reaches are checked, so a short-circuited
+        // operand (an implementation's own operator behind a feature test) is not an error.
         if (feature is Cons cons && cons.Car is Symbol op)
         {
             var name = op.Name.ToUpperInvariant();
@@ -1849,6 +1921,7 @@ public class Reader
                         if (EvaluateFeature(c.Car, record)) return true;
                         rest = c.Cdr;
                     }
+                    if (rest is not Nil) throw MakeReaderError($"Malformed feature expression: {feature}");
                     return false;
                 }
                 case "AND":
@@ -1859,19 +1932,20 @@ public class Reader
                         if (!EvaluateFeature(c.Car, record)) return false;
                         rest = c.Cdr;
                     }
+                    if (rest is not Nil) throw MakeReaderError($"Malformed feature expression: {feature}");
                     return true;
                 }
                 case "NOT":
                 {
-                    if (cons.Cdr is Cons nc)
+                    if (cons.Cdr is Cons nc && nc.Cdr is Nil)
                         return !EvaluateFeature(nc.Car, record);
-                    return true; // (NOT) with no arg -> true
+                    throw MakeReaderError($"Malformed feature expression: (NOT) takes exactly one operand: {feature}");
                 }
             }
+            throw MakeReaderError($"Unknown operator {op.Name} in feature expression {feature}");
         }
 
-        // Unknown feature expression form -> false
-        return false;
+        throw MakeReaderError($"Malformed feature expression: {feature}");
     }
 
     internal LispObject ReadComplex()
@@ -1904,6 +1978,8 @@ public class Reader
 
     internal LispObject ReadRadixNumber(int radix)
     {
+        if (!_readSuppress && (radix < 2 || radix > 36))
+            throw MakeReaderError($"Illegal radix for #R: {radix} (must be 2 to 36)");
         var token = ReadTokenString();
         if (_readSuppress) return Nil.Instance;
         try
@@ -1913,6 +1989,8 @@ public class Reader
             {
                 var numStr = token.Substring(0, slashPos);
                 var denStr = token.Substring(slashPos + 1);
+                if (denStr.Length > 0 && (denStr[0] == '+' || denStr[0] == '-'))
+                    throw MakeReaderError($"Ratio denominator must not carry a sign: {token}");
                 var num = ParseIntegerRadix(numStr, radix);
                 var den = ParseIntegerRadix(denStr, radix);
                 if (den == 0)
@@ -1959,15 +2037,36 @@ public class Reader
         int start = 0;
         if (token.Length > 0 && token[0] == '-') { negative = true; start = 1; }
         else if (token.Length > 0 && token[0] == '+') { start = 1; }
+        if (start >= token.Length)
+            throw new FormatException("No digits in integer token");
 
+        // Digits accumulate in a long while they fit; a long decimal number is then handed to
+        // BigInteger.Parse in one piece, any other base goes on digit by digit.
+        long small = 0;
         BigInteger result = 0;
+        bool big = false;
         for (int i = start; i < token.Length; i++)
         {
             int digit = DigitValue(token[i]);
             if (digit < 0 || digit >= radix)
                 throw new FormatException($"Invalid digit '{token[i]}' for base {radix}");
-            result = result * radix + digit;
+            if (!big)
+            {
+                if (small <= (long.MaxValue - digit) / radix) { small = small * radix + digit; continue; }
+                big = true;
+                if (radix == 10)
+                {
+                    for (int k = i; k < token.Length; k++)
+                        if (token[k] < '0' || token[k] > '9')
+                            throw new FormatException($"Invalid digit '{token[k]}' for base {radix}");
+                    result = BigInteger.Parse(token.Substring(start), System.Globalization.CultureInfo.InvariantCulture);
+                    return negative ? -result : result;
+                }
+                result = new BigInteger(small) * radix + digit;
+            }
+            else result = result * radix + digit;
         }
+        if (!big) result = small;
 
         return negative ? -result : result;
     }
@@ -2083,8 +2182,27 @@ public class Reader
         result = null!;
         if (token.Length == 0) return false;
 
-        var upper = token.ToUpperInvariant();
         int readBase = GetReadBase();
+        // The commonest token: an optional sign and up to 18 decimal digits, in base 10.
+        if (readBase == 10 && token.Length <= 19)
+        {
+            int n = token.Length, i = 0;
+            bool neg = false;
+            if (token[0] == '-' || token[0] == '+') { neg = token[0] == '-'; i = 1; }
+            if (i < n && n - i <= 18)
+            {
+                long v = 0;
+                int j = i;
+                for (; j < n; j++)
+                {
+                    int d = token[j] - '0';
+                    if ((uint)d > 9) break;
+                    v = v * 10 + d;
+                }
+                if (j == n) { result = Fixnum.Make(neg ? -v : v); return true; }
+            }
+        }
+        var upper = token.ToUpperInvariant();
 
         // Trailing dot means integer in CL (e.g., "10." = 10)
         // Per CLHS, trailing dot forces base 10 interpretation
@@ -2103,7 +2221,9 @@ public class Reader
         {
             var numPart = upper[..slashPos];
             var denPart = upper[(slashPos + 1)..];
-            if (IsAllDigitsInBase(numPart, readBase) && IsAllDigitsInBase(denPart, readBase))
+            // [sign] digits+ / digits+ : only the numerator takes a sign (CLHS 2.3.1.1)
+            if (IsAllDigitsInBase(numPart, readBase) && IsAllDigitsInBase(denPart, readBase)
+                && denPart[0] != '+' && denPart[0] != '-')
             {
                 BigInteger num = 0, den = 0;
                 bool parsed = false;
@@ -2184,15 +2304,15 @@ public class Reader
     {
         var readBaseSym = Startup.Sym("*READ-BASE*");
         LispObject val;
-        if (DynamicBindings.TryGet(readBaseSym, out val))
-        {
-            if (val is Fixnum f) return (int)f.Value;
-        }
-        else if (readBaseSym.IsBound && readBaseSym.Value is Fixnum f2)
-        {
-            return (int)f2.Value;
-        }
-        return 10;
+        LispObject? value = null;
+        if (DynamicBindings.TryGet(readBaseSym, out val)) value = val;
+        else if (readBaseSym.IsBound) value = readBaseSym.Value;
+        if (value == null) return 10;
+        // CLHS 2.2: the value of *READ-BASE* is an integer from 2 to 36.
+        if (value is Fixnum f && f.Value >= 2 && f.Value <= 36) return (int)f.Value;
+        throw new LispErrorException(new LispTypeError(
+            "*READ-BASE* is not an integer between 2 and 36", value,
+            Runtime.List(Startup.Sym("INTEGER"), Fixnum.Make(2), Fixnum.Make(36))));
     }
 
     private static bool HasExponentMarker(string token)
@@ -2351,7 +2471,13 @@ public class Reader
             {
                 if (_readSuppress)
                     return new Symbol(symName); // dummy uninterned symbol
-                throw MakeReaderError($"Package \"{pkgName}\" not found");
+            {
+                var perr = new LispError($"Package \"{pkgName}\" not found");
+                perr.ConditionTypeName = "READER-PACKAGE-ERROR";
+                perr.PackageRef = new LispString(pkgName);
+                if (LispStreamRef != null) perr.StreamErrorStreamRef = LispStreamRef;
+                throw new LispErrorException(perr);
+            }
             }
 
             if (_readSuppress)
@@ -2380,7 +2506,11 @@ public class Reader
                     return Runtime.CanonicalizeSymbol(sym);
                 // Not external: signal error per spec (B7)
                 if (_readSuppress) return new Symbol(symName);
-                throw MakeReaderError($"Symbol \"{symName}\" is not external in package \"{pkgName}\"");
+                var xerr = new LispError($"Symbol \"{symName}\" is not external in package \"{pkgName}\"");
+                xerr.ConditionTypeName = "READER-PACKAGE-ERROR";
+                xerr.PackageRef = new LispString(pkg.Name);
+                if (LispStreamRef != null) xerr.StreamErrorStreamRef = LispStreamRef;
+                throw new LispErrorException(xerr);
             }
         }
 
@@ -2476,9 +2606,11 @@ public class Reader
         var st = rt.GetSyntaxType((char)ch);
         if (_readSuppress && st != SyntaxType.Whitespace && st != SyntaxType.TerminatingMacro)
         {
-            // In suppress mode, undefined but valid sub-characters: consume next token/object and return NIL
-            if (!TryRead(out _)) return null;
-            return Nil.Instance;
+            // In suppress mode an undefined sub-character reads as nothing (SBCL's
+            // dispatch-char-error returns no values), so the characters after it are
+            // read by whatever comes next: `#+nil (def x (:a #f) (:b #t))` skips the
+            // list instead of taking the closing parenthesis for the #f's argument.
+            return null;
         }
         throw MakeReaderError($"Unknown {dispChar} dispatch character: {(char)ch}");
     }

@@ -22,8 +22,8 @@
 (defnote :no-floating-point-underflow-by-default
   "dotcl flushes FP underflow to 0.0 by default (SBCL/CCL/ECL behavior)." t)
 
-;;; Four LOOP.1.40-43: what an arithmetic loop's variable holds once FINALLY
-;;; runs. CLHS 6.1.2.1.1 leaves it open, ansi-test tags the four as a spec
+;;; Five LOOP.1.39-43: what an arithmetic loop's variable holds once FINALLY
+;;; runs. CLHS 6.1.2.1.1 leaves it open, ansi-test tags the five as a spec
 ;;; problem itself, and dotcl, SBCL and ABCL all answer the same way (the
 ;;; stepped-past value) against the suite's expectation. Disabling this narrow
 ;;; note rather than :ansi-spec-problem keeps unrelated tests running.

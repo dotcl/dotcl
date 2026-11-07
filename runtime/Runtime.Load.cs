@@ -30,6 +30,7 @@ public static partial class Runtime
         LispObject? verboseArg = null;
         LispObject? printArg = null;
         LispObject? ifDoesNotExistArg = null;
+        LispObject? externalFormatArg = null;
         bool allowOtherKeys = false;
 
         // First pass: check for :allow-other-keys
@@ -59,7 +60,7 @@ public static partial class Runtime
                 case "VERBOSE": verboseArg ??= args[i + 1]; break;
                 case "PRINT": printArg ??= args[i + 1]; break;
                 case "IF-DOES-NOT-EXIST": ifDoesNotExistArg ??= args[i + 1]; break;
-                case "EXTERNAL-FORMAT": break; // accepted but ignored
+                case "EXTERNAL-FORMAT": externalFormatArg ??= args[i + 1]; break;
                 case "ALLOW-OTHER-KEYS": break; // already handled
                 default:
                     if (!allowOtherKeys)
@@ -103,25 +104,41 @@ public static partial class Runtime
             try
             {
                 LispObject result = Nil.Instance;
-                while (reader.TryRead(out var form))
+                // Set by the command line for a program read from standard input, so
+                // an error in it is reported at "<stdin>:LINE:" as one in a file is.
+                string? streamName = ScriptStreamName;
+                ScriptStreamName = null;
+                ScriptStreamLoading = streamName != null;
+                try
                 {
-                    foreach (var subForm in FlattenTopLevel(form))
+                    while (reader.TryRead(out var form))
                     {
-                        var instrList = CompileTopLevel(subForm);
-                        result = DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
-                    }
+                        if (streamName != null) { t_loadingFile = streamName; t_loadingLine = reader.LastFormLine; }
+                        foreach (var subForm in FlattenTopLevel(form))
+                        {
+                            var instrList = CompileTopLevel(subForm);
+                            result = DotCL.Emitter.CilAssembler.AssembleAndRun(instrList);
+                        }
 
-                    if (isPrint)
-                    {
-                        var w = GetStandardOutputWriter();
-                        w.WriteLine(FormatTop(result, true));
-                        w.Flush();
+                        if (isPrint)
+                        {
+                            var w = GetStandardOutputWriter();
+                            w.WriteLine(FormatTop(result, true));
+                            w.Flush();
+                        }
                     }
+                }
+                catch (Exception ex) when (streamName != null && ex is not LispSourceException
+                                           && !IsLispControlFlowException(ex)
+                                           && UnmatchedThrowError(ex) == null)
+                {
+                    throw new LispSourceException(streamName, reader.LastFormLine, ex);
                 }
                 return T.Instance;
             }
             finally
             {
+                if (ScriptStreamLoading) { t_loadingFile = null; ScriptStreamLoading = false; }
                 DynamicBindings.TruncateTo(streamBindDepth);
             }
         }
@@ -138,6 +155,14 @@ public static partial class Runtime
                 if (File.Exists(merged))
                     filePath = merged;
             }
+        }
+
+        // A name with no type that names no file: try NAME.fasl, then NAME.lisp, as SBCL's LOAD
+        // does, so that (load "foo") finds foo.lisp.
+        if (!File.Exists(filePath) && string.IsNullOrEmpty(Path.GetExtension(filePath)))
+        {
+            foreach (var type in new[] { ".fasl", ".lisp" })
+                if (File.Exists(filePath + type)) { filePath += type; break; }
         }
 
         if (!File.Exists(filePath))
@@ -179,7 +204,7 @@ public static partial class Runtime
             throw FaslFileError(
                 $"LOAD: not a dotcl fasl (foreign Lisp fasl?): {filePath}", filespec);
 
-        var source = File.ReadAllText(filePath);
+        var source = ReadSourceText(filePath, externalFormatArg, "LOAD");
         var loadStringReader = new StringReader(source);
         // Position-tracking, like CompileFile below. Without it FILE-POSITION on
         // the stream LOAD hands to a reader macro answers NIL, and a reader macro
@@ -220,7 +245,7 @@ public static partial class Runtime
             var mergedLoadPath = MergePathnames(loadInputPath, dpdForLoad is LispPathname ? dpdForLoad : LispPathname.FromString(""));
             int loadBindDepth = DynamicBindings.Depth;
             DynamicBindings.Push(loadPathSym, mergedLoadPath);
-            DynamicBindings.Push(loadTrueSym, LispPathname.FromString(Path.GetFullPath(filePath)));
+            DynamicBindings.Push(loadTrueSym, LispPathname.FromString(Compat.ResolveSymlinks(Path.GetFullPath(filePath))));
             DynamicBindings.Push(packageSym, oldPackage);
             DynamicBindings.Push(readtableSym, oldReadtable);
             PushPolicyBindings();
@@ -228,6 +253,8 @@ public static partial class Runtime
             var savedSourceLines = SourceLineTable;
             var savedSourcePositions = SourcePositionTable;
             BeginCompilerUnit(filePath);
+            var savedLoadFile = t_loadingFile;
+            var savedLoadLine = t_loadingLine;
             try
             {
                 LispObject result = Nil.Instance;
@@ -236,13 +263,15 @@ public static partial class Runtime
                     || source.StartsWith(";; -*- dotcl-compiled -*-");
                 if (!isCompiled)
                 {
-                    SourceLineTable = new Dictionary<object, (int, int, int, int)>(ReferenceEqualityComparer.Instance);
-                    SourcePositionTable = new Dictionary<object, (int, int)>(ReferenceEqualityComparer.Instance);
+                    SourceLineTable = new Dictionary<object, SourceSpan>(ReferenceEqualityComparer.Instance);
+                    SourcePositionTable = new Dictionary<object, SourceRange>(ReferenceEqualityComparer.Instance);
                 }
 
-                while (reader2.TryRead(out var form))
+                while (TryReadTopLevelForm(reader2, filePath, out var form))
                 {
                     int formLine = reader2.LastFormLine;
+                    t_loadingFile = filePath;
+                    t_loadingLine = formLine;
                     SetCompilerTopLevel(form, formLine);
                     if (!isCompiled) RecordDefinitionSources(form, filePath, formLine, useSourceLines: true);
                     try
@@ -265,7 +294,16 @@ public static partial class Runtime
                             foreach (var subForm in FlattenTopLevel(form, null, formLine))
                             {
 #if DOTCL_EMIT
-                                var instrList = CompileTopLevel(subForm, TopLevelFormXrefName(filePath, formLine, form));
+                                // The file's definitions are loaded as this compiles, so a
+                                // LOAD-TIME-VALUE form is evaluated now, as EVAL and COMPILE do, not
+                                // at the first call of the function that holds it. The tree-walk
+                                // evaluator keeps its own first-use evaluation.
+                                var ltvNow = Startup.Sym("*LTV-EVAL-NOW*");
+                                bool pushLtv = !UseInterpreter();
+                                if (pushLtv) DynamicBindings.Push(ltvNow, T.Instance);
+                                LispObject instrList;
+                                try { instrList = CompileTopLevel(subForm, TopLevelFormXrefName(filePath, formLine, form)); }
+                                finally { if (pushLtv) DynamicBindings.Pop(ltvNow); }
                                 s_runningTopLevelForm = true;
                                 try { result = DotCL.Emitter.CilAssembler.AssembleAndRun(instrList); }
                                 finally { s_runningTopLevelForm = false; }
@@ -324,11 +362,50 @@ public static partial class Runtime
             finally
             {
                 EndCompilerUnit();
+                t_loadingFile = savedLoadFile;
+                t_loadingLine = savedLoadLine;
                 SourceLineTable = savedSourceLines;
                 SourcePositionTable = savedSourcePositions;
                 WhitelistLoadedDefinitionsForCompileFile();
                 DynamicBindings.TruncateTo(loadBindDepth);
             }
+        }
+    }
+
+    /// <summary>When set, LOAD of a stream reports errors at this name and the line of the form.</summary>
+    public static string? ScriptStreamName;
+    [ThreadStatic] private static bool ScriptStreamLoading;
+
+    /// <summary>The file and the line of the top-level form LOAD is running on this thread.</summary>
+    [ThreadStatic] private static string? t_loadingFile;
+    [ThreadStatic] private static int t_loadingLine;
+
+    /// <summary>"file:line" for the form being loaded, with the line moved to the definition of the
+    /// innermost Lisp function when that is known for sure; null outside a load.</summary>
+    internal static string? LoadingPlace()
+    {
+        if (t_loadingFile == null) return null;
+        string file = t_loadingFile;
+        int line = t_loadingLine;
+        var fn = LispFunction.InnermostFrameName();
+        if (fn != null)
+        {
+            var found = DefinitionSourcesForFrame(fn);
+            if (found.Count == 1) { file = found[0].File; line = found[0].Line; }
+        }
+        return $"{file}:{line}";
+    }
+
+    /// <summary>Reads the next top-level form of a file being loaded. An error in the text
+    /// itself (an unbalanced paren, an unknown package or character name) is reported at the
+    /// line the form started on, as an error in running a form is, instead of with no position.</summary>
+    private static bool TryReadTopLevelForm(Reader reader, string filePath, out LispObject form)
+    {
+        try { return reader.TryRead(out form); }
+        catch (Exception ex)
+        {
+            if (Runtime.IsLispControlFlowException(ex) || ex is LispSourceException) throw;
+            throw new LispSourceException(filePath, reader.LastFormLine, ex);
         }
     }
 
@@ -405,6 +482,9 @@ public static partial class Runtime
     /// reported as a FILE-ERROR naming the file rather than as a bare
     /// reflection failure.
     /// </summary>
+    private static Dictionary<string, Guid>? _lz_s_faslModuleMvids;
+    private static Dictionary<string, Guid> s_faslModuleMvids => System.Threading.Volatile.Read(ref _lz_s_faslModuleMvids) ?? System.Threading.Interlocked.CompareExchange(ref _lz_s_faslModuleMvids, new(), null) ?? _lz_s_faslModuleMvids!;
+
     private static void RunFaslModuleInit(System.Reflection.Assembly asm,
         string filePath, LispObject filespec)
     {
@@ -423,6 +503,21 @@ public static partial class Runtime
             ?? throw FaslFileError(
                 $"LOAD: not a dotcl fasl (CompiledModule has no ModuleInit method): {filePath}",
                 filespec);
+        // A different fasl under a module name already loaded must not read the earlier fasl's
+        // make-load-form literals back by key; the same fasl loaded again keeps its objects.
+        if (asm.GetName().Name is { } faslModuleName)
+        {
+            var mvid = asm.ManifestModule.ModuleVersionId;
+            bool changed;
+            lock (s_faslModuleMvids)
+                changed = s_faslModuleMvids.TryGetValue(faslModuleName, out var prior) && prior != mvid;
+            lock (s_faslModuleMvids) s_faslModuleMvids[faslModuleName] = mvid;
+            if (changed)
+            {
+                LispInstance.EvictInternedModule(faslModuleName);
+                LispStruct.EvictInternedModule(faslModuleName);
+            }
+        }
         try
         {
             var result = (LispObject?)initMethod.Invoke(null, null) ?? Nil.Instance;
@@ -451,7 +546,7 @@ public static partial class Runtime
     /// The cost is that the parts load from bytes, so they have no file Location.
     /// </summary>
     private static bool LoadFaslBundleParts(System.Reflection.Assembly asm,
-        string filePath, LispObject filespec, bool warnOnly)
+        string filePath, LispObject filespec, bool warnOnly, bool collectible = false)
     {
         var names = new List<string>();
         foreach (var n in asm.GetManifestResourceNames())
@@ -482,7 +577,7 @@ public static partial class Runtime
             System.Reflection.Assembly part;
             try
             {
-                part = RuntimeLoadContext.LoadBytes(bytes);
+                part = RuntimeLoadContext.LoadBytes(bytes, collectible: collectible);
             }
             catch (BadImageFormatException)
             {
@@ -642,6 +737,9 @@ public static partial class Runtime
     /// </summary>
     public static long R2rFaslsLoaded;
     public static long FaslsLoaded;
+    /// <summary>How many fasls were loaded again (their path had been loaded before)
+    /// and went into a collectible load context.</summary>
+    public static long FaslsReloaded;
 
     /// <summary>os-arch (linux-x64, osx-arm64, win-x64, ...): the name of the
     /// R2R siblings. Never the distro-specific RuntimeIdentifier.</summary>
@@ -828,40 +926,51 @@ public static partial class Runtime
     }
 
 #if !NETSTANDARD2_0
-    /// <summary>Fasl paths this process has loaded by path.</summary>
+    /// <summary>Fasl paths this process has loaded, by whatever route.</summary>
     private static readonly HashSet<string> s_faslPathsLoaded = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Load a fasl by path, the first time this process loads that path.
+    /// <summary>True the first time this process loads FASLFULL; false for every load
+    /// of that path after it, which is a reload.
     ///
-    /// By path because loading from a byte array costs a second antivirus scan on
-    /// Windows (AMSI inspects every image handed over in memory, on top of the
-    /// scan of the file when it is opened), and because a file-backed module is
-    /// what debuggers and coverage collectors see: they find the .pdb next to it.
+    /// The first load of a path goes in by path, and may use native (ReadyToRun) code:
+    /// by path because loading from a byte array costs a second antivirus scan on
+    /// Windows (AMSI inspects every image handed over in memory, on top of the scan of
+    /// the file when it is opened), and because a file-backed module is what debuggers
+    /// and coverage collectors see: they find the .pdb next to it. But the runtime keeps
+    /// the image it opened for a path and hands it back to the next load of the same
+    /// path, in any load context, even after the file was replaced, so a second load
+    /// by path would run the old module. And such an assembly can never be unloaded.
     ///
-    /// Only the first time: the runtime keeps the image it opened for a path and
-    /// hands it back to the next load of the same path, in any load context, even
-    /// after the file was replaced. So LOADing a fasl again after recompiling it
-    /// would run the old module. A path loaded before is read into memory and
-    /// loaded from the bytes, as every fasl used to be.
-    ///
-    /// A context of its own for each, as Assembly.Load(byte[]) gives each array:
-    /// the default context refuses a second assembly of the same name.</summary>
+    /// A reload is therefore a different route: the bytes are read and go into a
+    /// collectible load context (ReloadFaslFromBytes), and never back into a native
+    /// code image, so a development loop of loading the same system again does not pile
+    /// up assemblies.</summary>
+    private static bool FirstLoadOfFaslPath(string faslFull)
+    {
+        lock (s_faslPathsLoaded) return s_faslPathsLoaded.Add(faslFull);
+    }
+
+    /// <summary>The fasl at FASLFULL, which this process has loaded before, as a new
+    /// module in a collectible load context of its own: the default context refuses a
+    /// second assembly of the same name, and a context of its own is what the runtime
+    /// can unload once the old definitions are no longer referenced.</summary>
+    private static System.Reflection.Assembly ReloadFaslFromBytes(string faslFull)
+    {
+        var bytes = File.ReadAllBytes(faslFull);
+        var pdbPath = Path.ChangeExtension(faslFull, ".pdb");
+        if (File.Exists(pdbPath))
+        {
+            try { return RuntimeLoadContext.LoadBytes(bytes, File.ReadAllBytes(pdbPath), collectible: true); }
+            catch (BadImageFormatException) { throw; }
+            catch { } // mismatched or unreadable pdb: load without it
+        }
+        return RuntimeLoadContext.LoadBytes(bytes, collectible: true);
+    }
+
+    /// <summary>Load a fasl by path, the first time this process loads that path. A
+    /// context of its own for each, as Assembly.Load(byte[]) gives each array.</summary>
     private static System.Reflection.Assembly LoadFaslFromPath(string faslFull)
     {
-        bool first;
-        lock (s_faslPathsLoaded) first = s_faslPathsLoaded.Add(faslFull);
-        if (!first)
-        {
-            var bytes = File.ReadAllBytes(faslFull);
-            var pdbPath = Path.ChangeExtension(faslFull, ".pdb");
-            if (File.Exists(pdbPath))
-            {
-                try { return RuntimeLoadContext.LoadBytes(bytes, File.ReadAllBytes(pdbPath)); }
-                catch (BadImageFormatException) { throw; }
-                catch { } // mismatched or unreadable pdb: load without it
-            }
-            return RuntimeLoadContext.LoadBytes(bytes);
-        }
         var context = RuntimeLoadContext.NewContext("fasl " + Path.GetFileName(faslFull));
         return context.LoadFromAssemblyPath(faslFull);
     }
@@ -961,7 +1070,7 @@ public static partial class Runtime
             dpdForLoad is LispPathname ? dpdForLoad : LispPathname.FromString(""));
         int faslBindDepth = DynamicBindings.Depth;
         DynamicBindings.Push(loadPathSym, mergedLoadPath);
-        DynamicBindings.Push(loadTrueSym, LispPathname.FromString(Path.GetFullPath(filePath)));
+        DynamicBindings.Push(loadTrueSym, LispPathname.FromString(Compat.ResolveSymlinks(Path.GetFullPath(filePath))));
         DynamicBindings.Push(packageSym, oldPackage);
         DynamicBindings.Push(readtableSym, oldReadtable);
         PushPolicyBindings();
@@ -970,6 +1079,7 @@ public static partial class Runtime
         {
             var faslFull = Path.GetFullPath(filePath);
             System.Reflection.Assembly asm;
+            bool reload = false;
             try
             {
                 // An ahead-of-time sibling, <name>.fasl.r2r-<rid>, holds the same
@@ -985,12 +1095,25 @@ public static partial class Runtime
                 // whole filename, not into the stem: a sibling must not match a
                 // *.fasl glob, or every caller that walks fasls has to remember to
                 // exclude it (the Makefile and two csprojs each used to).
-                var r2rPath = compiled == null ? TryFindR2rSibling(faslFull) : null;
+#if !NETSTANDARD2_0
+                // A path loaded before is a reload: IL in a collectible context, never a
+                // native-code image (see FirstLoadOfFaslPath). The module COMPILE-FILE
+                // emitted in memory counts as the load of its path.
+                reload = !FirstLoadOfFaslPath(faslFull) && compiled == null;
+#endif
+                var r2rPath = compiled == null && !reload ? TryFindR2rSibling(faslFull) : null;
                 if (compiled != null)
                 {
                     asm = compiled;
                     FaslsLoadedInMemory++;
                 }
+#if !NETSTANDARD2_0
+                else if (reload)
+                {
+                    asm = ReloadFaslFromBytes(faslFull);
+                    FaslsReloaded++;
+                }
+#endif
                 else if (r2rPath != null)
                 {
                     asm = RuntimeLoadContext.LoadFrom(r2rPath);
@@ -1047,7 +1170,7 @@ public static partial class Runtime
             // A bundle (uiop bundle-op / dotcl:combine-fasls) is an assembly with
             // no code whose parts ride along as resources. Run each part in the
             // order they were bundled; a later part may depend on an earlier one.
-            if (LoadFaslBundleParts(asm, filePath, filespec, warnOnly)) return T.Instance;
+            if (LoadFaslBundleParts(asm, filePath, filespec, warnOnly, collectible: reload)) return T.Instance;
 
             // A PE file that is not a dotcl fasl: a plain .NET library, or another
             // implementation's fasl that happens to be an assembly. Report it as a

@@ -195,7 +195,8 @@ public static class MultipleValues
     ///
     /// B is still passed so the two entries read the same at the call site and a
     /// caller cannot accidentally pair the wrong secondary with the primary.</summary>
-    public static LispObject Values2Primary(LispObject a, LispObject b) => Primary(a);
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static LispObject Values2Primary(LispObject a, LispObject b) => PrimaryAlone(a);
 
     /// <summary>VALUES2 for a call whose values are read out of the thread state by
     /// the very next instruction (CAPTUREFORBIND, NTHVALUEOF): those readers take a

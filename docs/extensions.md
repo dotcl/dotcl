@@ -229,6 +229,7 @@ Scripts and the process:
 
 - `dotcl:script-arguments`: the arguments a script was given. [Writing scripts](scripting.md#arguments)
 - `dotcl:command-line-arguments`: the command line, in the shape UIOP expects. [Writing scripts](scripting.md#arguments)
+- `dotcl:exit`: `sb-ext:exit` for scripts written against SBCL: `(dotcl:exit :code 1 :abort nil)`. The same exit as `dotcl:quit`; `:timeout` is accepted and ignored. A bare `(exit)` in a script or REPL reaches it.
 - `dotcl:quit`: exit the process with a code. [Writing scripts](scripting.md#exit-code)
 - `dotcl:*exit-hooks*`: functions of no arguments called, in order, when the process exits through `dotcl:quit`, at the end of the program, or on SIGTERM / SIGHUP (Unix; status 143 / 129, no unwinding), as `sb-ext:*exit-hooks*`. An error in one is printed and the rest still run.
 - `dotcl:getenv`, `dotcl:setenv`, `dotcl:unsetenv`: environment variables.
@@ -273,7 +274,7 @@ Memory:
 - `dotcl:make-weak-pointer`, `dotcl:weak-pointer-value`, `dotcl:weak-pointer-p`: weak pointers.
 - `make-hash-table :weakness` and `dotcl:hash-table-weakness`: weak hash tables (`:key`, `:value`, `:key-and-value`, `:key-or-value`).
 - `dotcl:finalize`, `dotcl:cancel-finalization`, `dotcl:run-finalizers`: run a function after an object is collected.
-- `dotcl:make-pinned-vector`, `dotcl:pinned-vector-address`, `dotcl:unpin-vector`: a vector the collector does not move, so native code can use its address.
+- `dotcl:make-pinned-vector`, `dotcl:pinned-vector-address`, `dotcl:unpin-vector`: a vector the collector does not move, so native code can use its address. `(dotcl:make-pinned-vector length element-type &key alignment)` puts element 0 at a multiple of `alignment` bytes (a power of two up to 65536); it is still an ordinary simple vector, not a displaced one. `adjust-array` gives it unpinned storage, as without `:alignment`.
 - `dotcl:pinned-vector-p`: true for a pinned vector whose storage has not been replaced (by `adjust-array`); never signals.
 
 Packages:
@@ -286,10 +287,12 @@ Introspection and debugging:
 
 - `dotcl:function-lambda-list`: the lambda list of a function or macro. [Using libraries](libraries.md#what-ships-with-dotcl)
 - `dotcl:function-source-location`: the file and line where a name was last defined.
+- `dotcl:*evaluator-mode*`: `:compile` (the default) sends `eval` of a compound form through the CIL compiler; `:interpret` sends it through the tree-walk interpreter, which needs no code generation. A build without code generation always interprets, whatever this says. Test whether a build can generate code with `(member :dotcl-emit *features*)`; the variable answers `:compile` on both.
 - `dotcl:watch-fdefinition`: call a function after each change to a symbol's global function definition (a debugger re-wrapping a redefined function).
 - `dotcl:definition-sources`: every recorded definition of a name (function, macro, compiler macro, generic function and each method, variable, class, type, method combination, ...; a package's `defpackage` given its name), each with its kind, file and line.
 - `dotcl:definition-source`: the file and line where a function, macro function, generic function, method, class or package object was defined.
 - `dotcl:record-definition-sources`: attribute the definitions in a form to a file and line, for a tool that compiles one form at a time.
+- `dotcl:*source-path-map*`, `dotcl:register-source-root`: where a fasl's source is. `compile-file` writes the source path of each definition into the fasl. A build that must give the same bytes wherever the checkout is sets `dotcl:*source-path-map*` to a list of `(from . to)` strings (or the environment variable `DOTCL_SOURCE_PATH_MAP`, `"from=to;from=to"`, when the variable is NIL); a leading `from` directory in a recorded path is replaced by `to`, the longest `from` winning. A package's fasls use `/dotcl-src/NAME/...` for the library NAME. `(dotcl:register-source-root "NAME" "/real/directory")` says where that library's source is on this machine, so `dotcl:function-source-location` and `dotcl:definition-sources` answer with real files. `(require "NAME")` of a contrib module registers the directory its fasl was found in, and a system ASDF has loaded is found through `asdf:system-source-directory`.
 - `dotcl:compiler-condition-source`, `dotcl:*compiler-context*`: where a condition signalled during compilation came from. Inside a handler for a warning or error from `compile-file` or `compile` (or a warning during `load` of source), `(dotcl:compiler-condition-source)` and `dotcl:*compiler-context*` describe the current top-level form and the subform being compiled, as a plist: `:file`, `:line` and `:position` (the top-level form's 1-based line and 0-based character offset), `:subform-line` and `:subform-position` (the innermost source form the compiler knows, when it does), `:form` and `:top-level-form`. `(dotcl:compiler-condition-source condition)` returns the position saved when that condition was signalled, so it can be read after the handler has returned. The undefined-function and undefined-variable warnings that `compile-file` reports at the end of a compilation unit carry the position of the first use. NIL outside compilation.
 - `dotcl:who-calls`, `dotcl:who-is-called-by`: cross references between functions.
   `dotcl:who-references`, `dotcl:who-sets`, `dotcl:who-binds`: the definitions that read, assign
@@ -300,7 +303,10 @@ Introspection and debugging:
   (`print`, `car`, `when`, ...) are recorded too. Recorded when code is compiled;
   `dotcl:*record-xref*` NIL turns the recording off, `dotcl:*record-xref-standard*` NIL only
   that of the standard functions and macros the compiler lowers itself.
+  The fasls that ship with dotcl (asdf, the contrib libraries) are built with it off, so these
+  answer for code you compile or load from source, not for those.
 - `dotcl:typexpand-1`, `dotcl:typexpand`: expand a `deftype`.
+- `dotcl:valid-type-specifier-p`: true if the object is a well-formed type specifier, else false; never signals. It checks the arguments of a compound specifier (the bounds of `integer`, the dimensions of `array`, the lambda list of `function`) and expands `deftype`s (a failing or self-referential expander gives false). As `sb-ext:valid-type-specifier-p`.
 - `dotcl:symbol-global-value`: the global value of a symbol, ignoring dynamic bindings; a place.
 - `dotcl:charpos`: the column an output stream is at.
 - `dotcl:pretty-stream-p`: true for the stream of a logical block being pretty printed, including the stream a `print-object` method or a condition report is handed inside one; as `sb-pretty:pretty-stream-p`.

@@ -36,6 +36,24 @@ public class NamedType : CType
     public static readonly NamedType NIL_TYPE = Get("NIL");
 }
 
+/// <summary>A compound FUNCTION or VALUES type specifier, (FUNCTION arg-types result-type):
+/// kept with its specifier so SUBTYPEP can tell two signatures apart (it used to flatten
+/// every one of them to the atom FUNCTION / VALUES, so (function (integer) integer) was a
+/// subtype of (function (string) string)). ARGS and RESULT are the parts as written
+/// (NULL: not given, or *); for VALUES, ARGS holds the value types.</summary>
+public class FunctionType : CType
+{
+    public string HeadName { get; }
+    public LispObject? Args { get; }
+    public LispObject? Result { get; }
+    public FunctionType(string head, LispObject? args, LispObject? result)
+    { HeadName = head; Args = args; Result = result; }
+    public override string ToSpecifier()
+        => HeadName == "VALUES"
+            ? $"(VALUES {Args})"
+            : $"(FUNCTION {(Args == null ? "*" : Args.ToString())} {(Result == null ? "*" : Result.ToString())})";
+}
+
 /// <summary>Numeric type with optional interval bounds: (INTEGER 0 10), (FLOAT * 1.0), etc.</summary>
 public class NumericType : CType
 {
@@ -361,9 +379,19 @@ public static class TypeParser
                      : new ComplexType(mask);
             }
 
-            // Function / Values: stub for now
-            case "FUNCTION" or "VALUES":
-                return NamedType.Get(headName);
+            // Function / Values: a bare or all-* form is the atom; a signature is kept.
+            case "VALUES":
+                return cons.Cdr is Cons ? new FunctionType("VALUES", cons.Cdr, null) : NamedType.Get(headName);
+            case "FUNCTION":
+            {
+                if (cons.Cdr is not Cons fc) return NamedType.Get(headName);
+                var argSpec = fc.Car;
+                var resSpec = fc.Cdr is Cons rc ? rc.Car : null;
+                bool argStar = argSpec is Symbol { Name: "*" };
+                bool resStar = resSpec == null || resSpec is Symbol { Name: "*" };
+                if (argStar && resStar) return NamedType.Get(headName);
+                return new FunctionType("FUNCTION", argStar ? null : argSpec, resStar ? null : resSpec);
+            }
 
             default:
                 // Might be a compound deftype: (my-type arg1 arg2)
@@ -436,6 +464,10 @@ public static class TypeParser
         LispObject? low = null, high = null;
         bool lowExcl = false, highExcl = false;
 
+        // At most a low and a high bound: (integer 1 2 3) is not a type specifier.
+        if (args is Cons c1x && c1x.Cdr is Cons c2x && c2x.Cdr is not Nil)
+            throw new LispErrorException(new LispError(
+                "invalid type specifier: " + Runtime.FormatObject(new Cons(Startup.Sym(numClass), args), true)));
         if (args is Cons c1)
         {
             ParseBound(c1.Car, out low, out lowExcl);
@@ -633,11 +665,126 @@ public static class TypeParser
 
 public static class CTypeOps
 {
+    /// <summary>True when CT holds no object by its shape alone: NIL, the negation of a universal
+    /// type, an intersection with an empty member, a union of empty types.</summary>
+    internal static bool ProvablyEmpty(CType ct, int depth = 0)
+    {
+        if (depth > 32) return false;
+        switch (ct)
+        {
+            case NamedType { Name: "NIL" }: return true;
+            case NegationType n: return ProvablyUniversal(n.Inner, depth + 1);
+            case IntersectionType i:
+                foreach (var m in i.Types) if (ProvablyEmpty(m, depth + 1)) return true;
+                return false;
+            case UnionType u:
+                foreach (var m in u.Types) if (!ProvablyEmpty(m, depth + 1)) return false;
+                return u.Types.Length > 0;
+            default: return false;
+        }
+    }
+
+    /// <summary>True when some object we can name is of type CT: one of the objects the type itself lists
+    /// (MEMBER / EQL) or one of the built-in witnesses, asked of the same TYPEP the algebra agrees with.</summary>
+    private static bool HasWitnessObject(CType ct)
+    {
+        if (ContainsSatisfies(ct) || ContainsUnknownName(ct) || !WitnessSafe(ct)) return false;
+        var objs = new List<LispObject>();
+        CollectMembers(ct, objs);
+        CollectNumericCandidates(ct, objs);
+        foreach (var o in objs)
+            if (IsTypep(o, ct)) return true;
+        foreach (var o in s_witnesses.Value)
+            if (IsTypep(o, ct)) return true;
+        return false;
+    }
+
+    /// <summary>Numbers near the bounds of the numeric ranges in CT (the bounds, one step inside them, the
+    /// middle), of the representation the bounds are in, as candidates for a witness.</summary>
+    private static void CollectNumericCandidates(CType ct, List<LispObject> into)
+    {
+        switch (ct)
+        {
+            case NumericType n:
+                try
+                {
+                    var one = n.Low is Fixnum || n.High is Fixnum || (n.Low == null && n.High == null && n.NumClass is "INTEGER" or "RATIONAL" or "REAL")
+                        ? (LispObject)Fixnum.Make(1)
+                        : (n.Low ?? n.High) is DoubleFloat ? new DoubleFloat(1.0) : new SingleFloat(1.0f);
+                    if (n.Low != null) { into.Add(n.Low); into.Add(Runtime.Add(n.Low, one)); }
+                    if (n.High != null) { into.Add(n.High); into.Add(Runtime.Subtract(n.High, one)); }
+                    if (n.Low != null && n.High != null)
+                    {
+                        var two = Runtime.Add(one, one);
+                        var mid = Runtime.Divide(Runtime.Add(n.Low, n.High), two);
+                        into.Add(mid);
+                        if (n.Low is Fixnum && mid is Ratio) into.Add(Runtime.Add(n.Low, one));
+                    }
+                }
+                catch { }
+                break;
+            case NegationType neg: CollectNumericCandidates(neg.Inner, into); break;
+            case UnionType u: foreach (var t in u.Types) CollectNumericCandidates(t, into); break;
+            case IntersectionType i: foreach (var t in i.Types) CollectNumericCandidates(t, into); break;
+        }
+    }
+
+    /// <summary>True when CT certainly holds some object: a plain named type other than NIL, a
+    /// non-empty numeric range, a MEMBER with members, a union with such a member.</summary>
+    internal static bool ProvablyNonEmpty(CType ct, int depth = 0)
+    {
+        if (depth > 32) return false;
+        switch (ct)
+        {
+            case NamedType nt: return nt.Name != "NIL";
+            case NumericType num: return !NumericRangeIsEmpty(num);
+            case MemberType m: return m.Members.Length > 0;
+            case UnionType u:
+                foreach (var t in u.Types) if (ProvablyNonEmpty(t, depth + 1)) return true;
+                return false;
+            // (NOT X) holds something unless X is every object; a plain type other than T is not.
+            case NegationType { Inner: NamedType or NumericType or MemberType or ComplexType or ConsType or ArrayType or ClassCType } neg:
+                return !ProvablyUniversal(neg.Inner, depth + 1);
+            default: return HasWitnessObject(ct);
+        }
+    }
+
+    /// <summary>True when CT holds every object by its shape alone: T, the negation of an empty
+    /// type, a union with a universal member, an intersection of universal types.</summary>
+    private static bool ProvablyUniversal(CType ct, int depth = 0)
+    {
+        if (depth > 32) return false;
+        switch (ct)
+        {
+            case NamedType { Name: "T" }: return true;
+            case NegationType n: return ProvablyEmpty(n.Inner, depth + 1);
+            case UnionType u:
+                foreach (var m in u.Types) if (ProvablyUniversal(m, depth + 1)) return true;
+                return false;
+            case IntersectionType i:
+                foreach (var m in i.Types) if (!ProvablyUniversal(m, depth + 1)) return false;
+                return i.Types.Length > 0;
+            default: return false;
+        }
+    }
+
     /// <summary>
     /// Determine if ct1 is a subtype of ct2.
     /// Returns (result, certain) where certain=true means the answer is definitive.
     /// </summary>
     public static (bool result, bool certain) Subtypep(CType ct1, CType ct2)
+    {
+        var (r, k) = SubtypepCore(ct1, ct2);
+        // "Not a subtype, for certain" needs an object of ct1 outside ct2. For a type made of AND / OR / NOT
+        // the rules below can find no such object because ct1 holds none at all -- (AND (NOT A) (NOT B)) with
+        // (OR A B) the universe is empty, and an empty type is below everything -- so the answer is only
+        // certain when ct1 is shown to hold something.
+        if (!r && k && (ct1 is IntersectionType or NegationType or UnionType) && !ProvablyNonEmpty(ct1))
+            return (false, false);
+        return (r, k);
+    }
+
+    private static (bool result, bool certain) SubtypepCore(CType ct1, CType ct2)
     {
         // === Normalize ClassCType to NamedType for built-in classes ===
         if (ct1 is ClassCType cls1n && Runtime.IsBuiltinTypeName(cls1n.Class.Name.Name))
@@ -647,6 +794,23 @@ public static class CTypeOps
 
         // === Identity ===
         if (ReferenceEquals(ct1, ct2) || StructurallyEqual(ct1, ct2)) return (true, true);
+
+        // A type that is plainly empty is a subtype of every type, and every type is a subtype of
+        // one that is plainly the universe, whatever the shapes: (NOT (OR INTEGER T)) is NIL.
+        if (ProvablyEmpty(ct1) || ProvablyUniversal(ct2)) return (true, true);
+
+        // === FUNCTION / VALUES signatures ===
+        if (ct1 is FunctionType || ct2 is FunctionType)
+        {
+            var fr = SubtypepSignature(ct1, ct2);
+            if (fr != null) return fr.Value;
+            // A signature is a FUNCTION (or VALUES) as far as the other rules can tell.
+            if (ct1 is FunctionType f1a) ct1 = NamedType.Get(f1a.HeadName);
+        }
+
+        // A numeric range with no member, (INTEGER 256 10) or (REAL (1) 1), is empty:
+        // a subtype of every type.
+        if (ct1 is NumericType emptyRange && NumericRangeIsEmpty(emptyRange)) return (true, true);
 
         // === Universal / Empty ===
         if (ct2 is NamedType nt2)
@@ -849,11 +1013,97 @@ public static class CTypeOps
     /// True when the two CTypes were parsed from equivalent specifiers. Only a
     /// sufficient test for type equality; false means "not shown equal".
     /// </summary>
+    /// <summary>SUBTYPEP where a FUNCTION / VALUES signature is involved, or null to let the
+    /// general rules go on. Two signatures: arguments contravariant, result covariant, when
+    /// both are plain lists of types of the same shape; otherwise not shown. The atom FUNCTION
+    /// is not a subtype of a signature; a signature is a subtype of the atom.</summary>
+    private static (bool, bool)? SubtypepSignature(CType ct1, CType ct2)
+    {
+        if (ct1 is FunctionType a && ct2 is FunctionType b)
+        {
+            if (a.HeadName != b.HeadName) return (false, true);
+            if (a.HeadName == "VALUES")
+                return SubtypepTypeLists(a.Args, b.Args) ?? (false, false);
+            // The argument list *: matches any; a given list against * : not shown the other way.
+            if (b.Args != null)
+            {
+                if (a.Args == null) return (false, false);
+                // contravariant: B's arguments <: A's arguments
+                var args = SubtypepTypeLists(b.Args, a.Args);
+                if (args == null || !args.Value.Item1) return args ?? (false, false);
+            }
+            if (b.Result != null)
+            {
+                if (a.Result == null) return (false, false);
+                var res = SubtypepValuesSpec(a.Result, b.Result);
+                if (res == null || !res.Value.Item1) return res ?? (false, false);
+            }
+            return (true, true);
+        }
+        if (ct2 is FunctionType)
+        {
+            // FUNCTION, COMPILED-FUNCTION ... against a signature: not every function has it.
+            if (ct1 is NamedType n1 && n1.Name is "T" or "FUNCTION" or "COMPILED-FUNCTION"
+                or "GENERIC-FUNCTION" or "STANDARD-GENERIC-FUNCTION")
+                return (false, true);
+            return null;
+        }
+        return null;   // ct1 is a signature against another shape: handled as the atom
+    }
+
+    private static (bool, bool)? SubtypepTypeLists(LispObject? xs, LispObject? ys)
+    {
+        // Same-length lists of plain types: pairwise. Lambda-list keywords, a different
+        // length or anything else: not shown.
+        var a = TypeListOf(xs); var b = TypeListOf(ys);
+        if (a == null || b == null || a.Count != b.Count) return (false, false);
+        for (int i = 0; i < a.Count; i++)
+        {
+            var (r, certain) = Subtypep(TypeParser.Parse(a[i]), TypeParser.Parse(b[i]));
+            if (!r) return (false, certain);
+        }
+        return (true, true);
+    }
+
+    private static (bool, bool)? SubtypepValuesSpec(LispObject x, LispObject y)
+    {
+        // A result is a type or (VALUES type ...): compare the first value, or pairwise.
+        var xv = x is Cons { Car: Symbol { Name: "VALUES" } } xc ? xc.Cdr : new Cons(x, Nil.Instance);
+        var yv = y is Cons { Car: Symbol { Name: "VALUES" } } yc ? yc.Cdr : new Cons(y, Nil.Instance);
+        var a = TypeListOf(xv); var b = TypeListOf(yv);
+        if (a == null || b == null) return (false, false);
+        // The result of the first is at least as specific: each of B's values has a
+        // matching one in A (a missing value is NIL-able only for &optional: not shown).
+        if (a.Count < b.Count) return (false, false);
+        for (int i = 0; i < b.Count; i++)
+        {
+            var (r, certain) = Subtypep(TypeParser.Parse(a[i]), TypeParser.Parse(b[i]));
+            if (!r) return (false, certain);
+        }
+        return (true, true);
+    }
+
+    private static List<LispObject>? TypeListOf(LispObject? spec)
+    {
+        var list = new List<LispObject>();
+        for (var cur = spec; cur is Cons c; cur = c.Cdr)
+        {
+            if (c.Car is Symbol { Name: "&OPTIONAL" or "&REST" or "&KEY" or "&ALLOW-OTHER-KEYS" or "&AUX" })
+                return null;
+            list.Add(c.Car);
+        }
+        return list;
+    }
+
     private static bool StructurallyEqual(CType a, CType b)
     {
         if (ReferenceEquals(a, b)) return true;
         switch (a)
         {
+            case FunctionType fa:
+                return b is FunctionType fb && fa.HeadName == fb.HeadName
+                    && Runtime.IsTrueEqual(fa.Args ?? Nil.Instance, fb.Args ?? Nil.Instance)
+                    && Runtime.IsTrueEqual(fa.Result ?? Nil.Instance, fb.Result ?? Nil.Instance);
             case NamedType na:
                 return b is NamedType nb && na.Name == nb.Name;
             case ClassCType ca:
@@ -905,9 +1155,29 @@ public static class CTypeOps
         {
             return Subtypep(neg2.Inner, neg1.Inner);
         }
+        // ct1 <: (NOT (OR a b ...)) iff ct1 <: (NOT a), (NOT b), ... each: exact.
+        if (neg2.Inner is UnionType unionInner && unionInner.Types.Length > 0)
+        {
+            bool allTrue = true, anyFalseCertain = false;
+            foreach (var member in unionInner.Types)
+            {
+                var (r, k) = SubtypepNot(ct1, new NegationType(member));
+                if (!(r && k)) allTrue = false;
+                if (!r && k) anyFalseCertain = true;
+            }
+            if (allTrue) return (true, true);
+            if (anyFalseCertain) return (false, true);
+            // otherwise the whole union is tried below
+        }
         // ct1 <: (NOT inner) iff ct1 and inner are disjoint
         var (isSub, cert) = Subtypep(ct1, neg2.Inner);
-        if (isSub) return (false, true);  // ct1 subset-of inner -> ct1 not-subset-of (NOT inner)
+        if (isSub)
+        {
+            // ct1 <: inner: ct1 <: (NOT inner) only when ct1 holds nothing at all. An empty
+            // ct1 (say (AND (NOT A) (NOT B)) where (OR A B) is every object) is below everything.
+            if (ProvablyEmpty(ct1)) return (true, true);
+            return ProvablyNonEmpty(ct1) ? (false, true) : (false, false);
+        }
         if (cert && AreDisjoint(ct1, neg2.Inner))
             return (true, true);  // definitely disjoint -> ct1 subset-of (NOT inner)
         return (false, false);
@@ -1584,6 +1854,24 @@ public static class CTypeOps
     /// Check if an intersection type is provably empty.
     /// Detects (AND X (NOT X)) and (AND X (NOT Y)) where X subset-of Y patterns.
     /// </summary>
+    private static bool NumericRangeIsEmpty(NumericType n)
+    {
+        if (n.Low is not Number lo || n.High is not Number hi) return false;
+        int c;
+        try { c = Arithmetic.Compare(lo, hi); }
+        catch (Exception) { return false; }
+        if (c > 0) return true;
+        if (c == 0 && (n.LowExclusiveP || n.HighExclusiveP)) return true;
+        // Over the integers, an open range with no integer inside: (INTEGER (5) (6)).
+        if (n.NumClass == "INTEGER" && lo is Fixnum l && hi is Fixnum h)
+        {
+            long low = n.LowExclusiveP ? l.Value + 1 : l.Value;
+            long high = n.HighExclusiveP ? h.Value - 1 : h.Value;
+            return low > high;
+        }
+        return false;
+    }
+
     private static bool IsEmptyIntersection(IntersectionType inter)
     {
         var types = inter.Types;
@@ -1896,9 +2184,16 @@ public static class CTypeOps
         // Special: rank 0 matches NIL (empty dimension list)
         if (d1 is Fixnum rank1)
         {
+            // A rank says nothing about the lengths, so it is inside a dimension
+            // list only when that list leaves every length open:
+            // (ARRAY * 1) is not inside (VECTOR * 3).
             int len = 0;
             var cur = d2;
-            while (cur is Cons cc) { len++; cur = cc.Cdr; }
+            while (cur is Cons cc)
+            {
+                if (!(cc.Car is Symbol ws && ws.Name == "*")) return false;
+                len++; cur = cc.Cdr;
+            }
             return rank1.Value == len;
         }
         if (d2 is Fixnum rank2)

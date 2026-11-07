@@ -401,7 +401,8 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("SET-METHOD-COMBINATION: not a generic function", gfObj));
         if (mcName is not Symbol mcSym)
             throw new LispErrorException(new LispTypeError("SET-METHOD-COMBINATION: not a symbol", mcName));
-        gf.MethodCombination = mcSym;
+        // The standard combination is the absence of a built-in one.
+        gf.MethodCombination = mcSym.Name == "STANDARD" ? null : mcSym;
         return gfObj;
     }
 
@@ -411,6 +412,8 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("SET-METHOD-COMBINATION-ORDER: not a generic function", gfObj));
         if (order is Symbol sym && sym.Name == "MOST-SPECIFIC-LAST")
             gf.MostSpecificFirst = false;
+        else
+            gf.MostSpecificFirst = true;
         return gfObj;
     }
 
@@ -509,6 +512,40 @@ public static partial class Runtime
         return new LispMethod(specs.ToArray(), quals.ToArray(), func);
     }
 
+    internal static GenericFunction? AddMethodGf;
+    internal static LispMethod? AddMethodDefault;
+
+    /// <summary>What DEFMETHOD calls to add its method. AMOP has DEFMETHOD go through the
+    /// generic function ADD-METHOD, so a method of the program on it (specialised on the
+    /// generic function's class) runs. Until there is one, and for a generic function it
+    /// does not apply to, the method is added directly.</summary>
+    public static LispObject AddMethodProtocol(LispObject gfObj, LispObject methodObj)
+    {
+        var amGf = AddMethodGf;
+        if (amGf != null && amGf.Methods.Count > 1 && gfObj is GenericFunction gf
+            && AddMethodOverridden(amGf, gf))
+            return amGf.Invoke(new[] { gfObj, methodObj });
+        return AddMethod(gfObj, methodObj);
+    }
+
+    private static bool AddMethodOverridden(GenericFunction amGf, GenericFunction gf)
+    {
+        var cls = ClassOf(gf) as LispClass;
+        if (cls == null) return false;
+        foreach (var m in amGf.Methods)
+        {
+            if (ReferenceEquals(m, AddMethodDefault) || m.Specializers.Length == 0) continue;
+            var spec = m.Specializers[0];
+            if (spec is LispClass sc)
+            {
+                if (!IsSystemClass(sc, "T") && Array.IndexOf(cls.ClassPrecedenceList, sc) >= 0) return true;
+            }
+            else if (spec is EqlSpecializer es && ReferenceEquals(es.Object, gf))
+                return true;
+        }
+        return false;
+    }
+
     public static LispObject AddMethod(LispObject gfObj, LispObject methodObj)
     {
         if (gfObj is not GenericFunction gf)
@@ -530,6 +567,7 @@ public static partial class Runtime
         // Raised before the method becomes visible and the method epoch moves,
         // so no class can cache "no protocol" against the new epoch.
         NoteSlotProtocolMethod(gf, method);
+        NotePrintObjectMethod(gf, method);
 
         // Copy-on-write under MethodsLock so a concurrent dispatch always sees a
         // consistent method array. Replace an existing method with matching
@@ -601,6 +639,20 @@ public static partial class Runtime
     private static void InvalidateSlotAccessShortcuts(GenericFunction gf)
     {
         if (SlotProtocolGFs.Contains(gf)) InvalidateAllDispatchCaches();
+    }
+
+    /// <summary>After a DEFCLASS redefinition has made its accessors: remove the accessor
+    /// methods of the previous definition that the new one did not make again (CLHS
+    /// 4.3.6: a reader or writer the new definition leaves out is removed).</summary>
+    public static LispObject PruneStaleAccessors(LispObject clsObj)
+    {
+        if (clsObj is LispClass cls && cls.StaleAccessorMethods is { } stale)
+        {
+            cls.StaleAccessorMethods = null;
+            foreach (var (gf, m) in stale)
+                RemoveMethod(gf, m);
+        }
+        return Nil.Instance;
     }
 
     public static LispObject RemoveMethod(LispObject gfObj, LispObject methodObj)
@@ -849,7 +901,7 @@ public static partial class Runtime
                 {
                     int at = Array.IndexOf(m.Specializers, cls);
                     if (m.Qualifiers.Length == 0 && at >= 0)
-                    { m.AccessorSlot = slotd; classPosition = at; break; }
+                    { m.AccessorSlot = slotd; classPosition = at; cls.AccessorMethods.Add((gf, m)); break; }
                 }
             // The AccessorSlot tag is what RecomputeAccessorFlags keys on; the method
             // was already added (with AccessorSlot null then), so recompute now.
@@ -873,8 +925,13 @@ public static partial class Runtime
             // method should be. dotcl picks the class itself (above), so the answer is
             // not used to build anything -- what the protocol buys here is the call.
             // A writer generic function is named (SETF name).
-            if (slotd != null && classPosition >= 0)
-                AccessorMethodClassHook?.Invoke(cls, slotd, classPosition == 0);
+            if (slotd != null && classPosition >= 0
+                && AccessorMethodClassHook?.Invoke(cls, slotd, classPosition == 0) is { } chosen)
+            {
+                // The class the protocol named is the class of the accessor method.
+                foreach (var m in gf.Methods)
+                    if (ReferenceEquals(m.AccessorSlot, slotd)) { m.MetaClass = chosen; break; }
+            }
         }
         return Nil.Instance;
     }

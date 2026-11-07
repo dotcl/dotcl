@@ -2,6 +2,11 @@ namespace DotCL;
 
 public static partial class Runtime
 {
+    /// <summary>Rejects the objects that can never be called (numbers, characters, strings, NIL)
+    /// where a reader macro function is expected; anything else is left to FUNCALL.</summary>
+    private static bool IsFunctionDesignatorForReader(LispObject o) =>
+        !(o is Number || o is LispChar || o is LispString || o is Nil);
+
     /// <summary>A character argument. Bare casts to LispChar raise
     /// InvalidCastException, which the CLR-exception mapping reports as
     /// PROGRAM-ERROR carrying no datum; the spec wants a TYPE-ERROR naming the
@@ -93,13 +98,21 @@ public static partial class Runtime
         throw new LispErrorException(new LispTypeError("NREVERSE: not a sequence", list));
     }
 
+    /// <summary>A non-negative integer index as a long: a bignum counts as the largest long, since the
+    /// list is walked only as far as it goes. Anything else is a TYPE-ERROR.</summary>
+    private static long IndexLimit(string who, LispObject n)
+    {
+        if (n is Fixnum f && f.Value >= 0) return f.Value;
+        if (n is Bignum b && b.Value.Sign > 0) return long.MaxValue;
+        throw new LispErrorException(new LispTypeError($"{who}: index must be a non-negative integer", n, Startup.Sym("UNSIGNED-BYTE")));
+    }
+
     public static LispObject Nth(LispObject n, LispObject list)
     {
-        if (n is not Fixnum f || f.Value < 0)
-            throw new LispErrorException(new LispTypeError("NTH: index must be a non-negative integer", n, Startup.Sym("UNSIGNED-BYTE")));
-        int idx = (int)f.Value;
+        // Any non-negative integer: past the end of the list the answer is NIL, however large.
+        long idx = IndexLimit("NTH", n);
         LispObject current = list;
-        for (int i = 0; i < idx; i++)
+        for (long i = 0; i < idx; i++)
         {
             if (current is Cons c) { current = c.Cdr; continue; }
             // Running out of list is NIL; running into a non-list is an error.
@@ -119,11 +132,9 @@ public static partial class Runtime
 
     public static LispObject Nthcdr(LispObject n, LispObject list)
     {
-        if (n is not Fixnum f || f.Value < 0)
-            throw new LispErrorException(new LispTypeError("NTHCDR: index must be a non-negative integer", n, Startup.Sym("UNSIGNED-BYTE")));
-        int idx = (int)f.Value;
+        long idx = IndexLimit("NTHCDR", n);
         LispObject current = list;
-        for (int i = 0; i < idx; i++)
+        for (long i = 0; i < idx; i++)
         {
             if (current is Cons c) current = c.Cdr;
             else if (current is Nil) return Nil.Instance;
@@ -322,13 +333,13 @@ public static partial class Runtime
         while (cur is Cons c1)
         {
             if (c1.Cdr is not Cons c2)
-                throw new LispErrorException(new LispTypeError("GETF: not a proper plist", c1.Cdr, Startup.Sym("LIST")));
+                throw new LispErrorException(new LispTypeError($"GETF: not a proper plist {FormatObject(plist, true)}, bad tail", c1.Cdr, Startup.Sym("LIST")));
             if (IsTrueEq(c1.Car, indicator))
                 return c2.Car;
             cur = c2.Cdr;
         }
         if (cur is not Nil)
-            throw new LispErrorException(new LispTypeError("GETF: not a proper plist", cur, Startup.Sym("LIST")));
+            throw new LispErrorException(new LispTypeError($"GETF: not a proper plist {FormatObject(plist, true)}, bad tail", cur, Startup.Sym("LIST")));
         return defaultVal;
     }
 
@@ -362,6 +373,17 @@ public static partial class Runtime
         return null; // C# null = not found (distinct from Nil.Instance)
     }
 
+    /// <summary>FindKeyArg for a keyword symbol the caller has in hand: keywords are interned,
+    /// so the match is by identity, which is a reference compare per argument pair rather
+    /// than a string compare.</summary>
+    public static LispObject? FindKeyArgSym(LispObject[] args, int startIndex, LispObject keyword)
+    {
+        for (int i = startIndex; i < args.Length - 1; i += 2)
+            if (ReferenceEquals(args[i], keyword))
+                return args[i + 1];
+        return null;
+    }
+
     /// <summary>Find keyword arg by exact symbol identity (name + package) for explicit keyword specs like ((foo bar) default).</summary>
     public static LispObject? FindKeyArgByName(LispObject[] args, int startIndex, string keyName, string packageName)
     {
@@ -382,8 +404,10 @@ public static partial class Runtime
     //   2. Legacy (global): FASLs compiled without module context (old FASLs, eval, compile).
     // ConcurrentDictionary: parallel load of load-time-value-bearing FASLs writes
     // these slot tables concurrently; a plain Dictionary corrupts under that.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, LispObject> _ltvSlots = new();
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, System.Collections.Concurrent.ConcurrentDictionary<int, LispObject>> _ltvSlotsPerModule = new();
+    private static System.Collections.Concurrent.ConcurrentDictionary<int, LispObject>? _lz__ltvSlots;
+    private static System.Collections.Concurrent.ConcurrentDictionary<int, LispObject> _ltvSlots => System.Threading.Volatile.Read(ref _lz__ltvSlots) ?? System.Threading.Interlocked.CompareExchange(ref _lz__ltvSlots, new(), null) ?? _lz__ltvSlots!;
+    private static System.Collections.Concurrent.ConcurrentDictionary<string, System.Collections.Concurrent.ConcurrentDictionary<int, LispObject>>? _lz__ltvSlotsPerModule;
+    private static System.Collections.Concurrent.ConcurrentDictionary<string, System.Collections.Concurrent.ConcurrentDictionary<int, LispObject>> _ltvSlotsPerModule => System.Threading.Volatile.Read(ref _lz__ltvSlotsPerModule) ?? System.Threading.Interlocked.CompareExchange(ref _lz__ltvSlotsPerModule, new(), null) ?? _lz__ltvSlotsPerModule!;
     private static int _ltvNextId;
 
     public static int AllocateLtvSlot() => Interlocked.Increment(ref _ltvNextId);
@@ -564,6 +588,52 @@ public static partial class Runtime
     /// <summary>APPLY, APPLYSPREAD1 and APPLYSPREAD2 with the caller's value mode
     /// (MultipleValues.TakeMode), handed to the callee when it gets at most four
     /// arguments.</summary>
+    /// <summary>(APPLY F A... REST) where REST is the &amp;REST variable of the calling function
+    /// that this function would have built a list for: the arguments are taken from the
+    /// calling function's own argument array from START on, so no list is made and no
+    /// list is walked. FIXED is the array of the leading arguments, or null.</summary>
+    public static LispObject ApplyArgs(LispObject func, LispObject[]? fixedArgs, LispObject[] rest, int start)
+    {
+        var fn = CoerceToFunction(func);
+        int nf = fixedArgs == null ? 0 : fixedArgs.Length;
+        int nr = rest.Length > start ? rest.Length - start : 0;
+        if (nf == 0)
+        {
+            switch (nr)
+            {
+                case 0: return fn.Invoke0();
+                case 1: return fn.Invoke1(rest[start]);
+                case 2: return fn.Invoke2(rest[start], rest[start + 1]);
+                case 3: return fn.Invoke3(rest[start], rest[start + 1], rest[start + 2]);
+                case 4: return fn.Invoke4(rest[start], rest[start + 1], rest[start + 2], rest[start + 3]);
+            }
+        }
+        var all = new LispObject[nf + nr];
+        if (nf > 0) Array.Copy(fixedArgs!, all, nf);
+        if (nr > 0) Array.Copy(rest, start, all, nf, nr);
+        return fn.Invoke(all);
+    }
+
+    /// <summary>ApplyArgs for a call site that takes the callee's value mode.</summary>
+    public static LispObject ApplyArgsM(LispObject func, LispObject[]? fixedArgs, LispObject[] rest, int start, int mode)
+    {
+        var fn = CoerceToFunction(func);
+        int nf = fixedArgs == null ? 0 : fixedArgs.Length;
+        int nr = rest.Length > start ? rest.Length - start : 0;
+        if (nf == 0)
+        {
+            switch (nr)
+            {
+                case 0: return fn.Invoke0M(mode);
+                case 1: return fn.Invoke1M(rest[start], mode);
+                case 2: return fn.Invoke2M(rest[start], rest[start + 1], mode);
+                case 3: return fn.Invoke3M(rest[start], rest[start + 1], rest[start + 2], mode);
+                case 4: return fn.Invoke4M(rest[start], rest[start + 1], rest[start + 2], rest[start + 3], mode);
+            }
+        }
+        return ApplyArgs(fn, fixedArgs, rest, start);
+    }
+
     public static LispObject ApplyM(LispObject func, LispObject argList, int mode)
     {
         var fn = CoerceToFunction(func);
@@ -721,8 +791,7 @@ public static partial class Runtime
         if (_macroFunctions.TryGetValue(sym, out var mfn)) return mfn;
         // Special operators are fbound: return a stub rather than erroring
         if (IsSpecialOperator(sym))
-            return new LispFunction(_ => throw new LispErrorException(
-                new LispError($"Cannot call special operator {sym.Name} as a function")), sym.Name);
+            return SpecialOperatorFunction(sym);
         return UndefinedFunctionError(sym);
     }
 
@@ -736,11 +805,15 @@ public static partial class Runtime
         var sym = GetSymbol(name, "SYMBOL-FUNCTION");
         if (sym.Function is LispFunction fn) return fn;
         if (_macroFunctions.TryGetValue(sym, out var mfn)) return mfn;
-        if (IsSpecialOperator(sym))
-            return new LispFunction(_ => throw new LispErrorException(
-                new LispError($"Cannot call special operator {sym.Name} as a function")), sym.Name);
+        if (IsSpecialOperator(sym)) return SpecialOperatorFunction(sym);
         return UndefinedFunctionError(sym);
     }
+
+    // Apart from SymbolFunction: the lambda captures SYM, and a capture in the method
+    // that holds it allocates the closure object on every call.
+    private static LispObject SpecialOperatorFunction(Symbol sym)
+        => new LispFunction(_ => throw new LispErrorException(
+            new LispError($"Cannot call special operator {sym.Name} as a function")), sym.Name);
 
     public static LispObject SpecialOperatorP(LispObject name)
     {
@@ -1056,7 +1129,9 @@ public static partial class Runtime
             // Not a type arrays are specialized on (a class name, say), so the
             // storage is general and the element type upgrades to T (CLHS
             // 15.1.2.1). Keeping the name instead made ARRAY-ELEMENT-TYPE report
-            // it and SIMPLE-VECTOR-P reject the array.
+            // it and SIMPLE-VECTOR-P reject the array. A symbol that names no
+            // type at all (a misspelling) is an error, not a general array.
+            if (IsUnknownTypeSymbol(ets)) throw UnknownTypeSpecifier(typeSpec);
             return "T";
         }
         if (typeSpec is Cons etCons && etCons.Car is Symbol etHead)
@@ -1451,7 +1526,7 @@ public static partial class Runtime
         // heap-exhausted-error). Storage-conditions are not ERRORs, so
         // handler-case (error ...) deliberately does not catch this.
         if (ex is OutOfMemoryException)
-            return new LispStorageCondition(ex.Message)
+            return new LispStorageCondition("Heap exhausted: the allocation could not be satisfied")
             { ClrExceptionType = ex.GetType(), ClrException = ex };
         // A subscript outside the array. The helper paths raise this as a
         // TYPE-ERROR themselves, and so must the paths that index a concrete
@@ -1471,7 +1546,7 @@ public static partial class Runtime
         if (ex is InvalidCastException)
         {
             var (datum, expected) = CastFailureTypes(ex.Message);
-            return new LispTypeError(ex.Message, datum, expected)
+            return new LispTypeError(LispCastMessage(ex.Message), datum, expected)
             { ClrExceptionType = ex.GetType(), ClrException = ex };
         }
         if (ex is IndexOutOfRangeException)
@@ -1489,6 +1564,31 @@ public static partial class Runtime
     /// The datum is known only when the source type is NIL's; the expected type
     /// is known for the runtime types that stand for one Lisp type, else T.
     /// </summary>
+    /// <summary>The Lisp name for a runtime class in a CLR cast message, or null.</summary>
+    private static string? LispNameOfClr(string clr) => clr switch
+    {
+        "DotCL.Fixnum" => "FIXNUM", "DotCL.Bignum" => "BIGNUM", "DotCL.Ratio" => "RATIO",
+        "DotCL.SingleFloat" => "SINGLE-FLOAT", "DotCL.DoubleFloat" => "DOUBLE-FLOAT", "DotCL.LispComplex" => "COMPLEX",
+        "DotCL.LispChar" => "CHARACTER", "DotCL.LispString" => "STRING", "DotCL.LispVector" => "VECTOR",
+        "DotCL.Cons" => "CONS", "DotCL.Nil" => "NULL", "DotCL.T" => "T", "DotCL.Symbol" => "SYMBOL",
+        "DotCL.Package" => "PACKAGE", "DotCL.LispClass" => "CLASS", "DotCL.LispFunction" => "FUNCTION",
+        "DotCL.LispHashTable" => "HASH-TABLE", "DotCL.LispPathname" => "PATHNAME", "DotCL.LispFileStream" => "STREAM",
+        "DotCL.Number" => "NUMBER", "System.IConvertible" => "NUMBER",
+        _ => null
+    };
+
+    /// <summary>"Unable to cast object of type 'A' to type 'B'." as a Lisp message when both classes
+    /// have a Lisp name: "The value is not of type B (it is a A)". Otherwise the CLR text.</summary>
+    private static string LispCastMessage(string clrMessage)
+    {
+        var m = System.Text.RegularExpressions.Regex.Match(clrMessage ?? "", @"type '([^']+)' to type '([^']+)'");
+        if (!m.Success) return clrMessage ?? "";
+        var from = LispNameOfClr(m.Groups[1].Value);
+        var to = LispNameOfClr(m.Groups[2].Value);
+        if (to == null) return clrMessage ?? "";
+        return $"The value is not of type {to}" + (from != null ? $" (it is a {from})" : "");
+    }
+
     private static (LispObject datum, LispObject expected) CastFailureTypes(string message)
     {
         LispObject expected = T.Instance;
@@ -1544,10 +1644,26 @@ public static partial class Runtime
     /// successful body). SBCL behaves the same way: thread termination is a
     /// control transfer, not a condition handlers can intercept.
     /// </summary>
+    /// <summary>The managed thread that runs a script and will catch
+    /// <see cref="ScriptExitException"/> at the top, or -1 when nothing will (a REPL,
+    /// an embedded host). Exiting from any other thread ends the process at once.</summary>
+    public static int ScriptExitThreadId = -1;
+
+    /// <summary>End the process with CODE. On the thread that runs a script the stack is
+    /// unwound first, so UNWIND-PROTECT cleanup forms run (as SBCL's EXIT does);
+    /// anywhere else, or when ABORT, the process ends at once.</summary>
+    public static void ExitProcess(int code, bool abort = false)
+    {
+        if (InExitHook) throw new ExitHookAbort(code);
+        if (!abort && ScriptExitThreadId == Environment.CurrentManagedThreadId)
+            throw new ScriptExitException(code);
+        Environment.Exit(code);
+    }
+
     public static bool IsLispControlFlowException(Exception ex)
         => ex is BlockReturnException || ex is CatchThrowException ||
            ex is GoException || ex is RestartInvocationException ||
-           ex is HandlerCaseInvocationException ||
+           ex is HandlerCaseInvocationException || ex is ScriptExitException ||
            ex is System.Threading.ThreadInterruptedException;
 
     /// <summary>
@@ -2241,6 +2357,8 @@ public static partial class Runtime
         }
         Startup.RegisterUnary("FUNCTION-LAMBDA-EXPRESSION", obj =>
         {
+            if (obj is not LispFunction)
+                throw new LispErrorException(new LispTypeError("FUNCTION-LAMBDA-EXPRESSION: not a function", obj, Startup.Sym("FUNCTION")));
             var closureP = (obj is LispFunction lf && lf.Environment != null)
                 ? T.Instance : (LispObject)Nil.Instance;
             // A generic function answers the name GENERIC-FUNCTION-NAME answers:
@@ -2385,6 +2503,8 @@ public static partial class Runtime
         {
             var fn = new LispFunction(args => {
                 if (args.Length == 0) throw new LispErrorException(new LispProgramError($"{opName}: requires at least 1 argument"));
+                if (args.Length == 1 && args[0] is not LispChar)
+                    throw new LispErrorException(new LispTypeError($"{opName}: not a character", args[0], Startup.Sym("CHARACTER")));
                 for (int i = 1; i < args.Length; i++)
                     if (!Runtime.IsTruthy(cmp(args[i-1], args[i]))) return Nil.Instance;
                 return T.Instance;
@@ -2403,6 +2523,8 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("CHAR>=", NaryCharChain("CHAR>=", Runtime.CharGe));
         var charNeFn = new LispFunction(args => {
             if (args.Length == 0) throw new LispErrorException(new LispProgramError("CHAR/=: requires at least 1 argument"));
+            if (args.Length == 1 && args[0] is not LispChar)
+                throw new LispErrorException(new LispTypeError("CHAR/=: not a character", args[0], Startup.Sym("CHARACTER")));
             for (int i = 0; i < args.Length; i++)
                 for (int j = i + 1; j < args.Length; j++)
                     if (Runtime.IsTruthy(Runtime.CharEqual(args[i], args[j]))) return Nil.Instance;
@@ -2606,8 +2728,12 @@ public static partial class Runtime
         }));
         Emitter.CilAssembler.RegisterFunction("SET-MACRO-CHARACTER", new LispFunction(args => {
             if (args.Length < 2) throw new System.Exception("SET-MACRO-CHARACTER: requires char and function");
-            char ch = ((LispChar)args[0]).Value;
+            if (args[0] is not LispChar macroLc)
+                throw new LispErrorException(new LispTypeError("SET-MACRO-CHARACTER: not a character", args[0], Startup.Sym("CHARACTER")));
+            char ch = macroLc.Value;
             var lispFn = args[1];
+            if (!IsFunctionDesignatorForReader(lispFn))
+                throw new LispErrorException(new LispTypeError("SET-MACRO-CHARACTER: not a function designator", lispFn, Startup.Sym("FUNCTION")));
             bool nonTerm = args.Length >= 3 && Runtime.IsTruthy(args[2]);
             var rt = args.Length >= 4 && args[3] is LispReadtable rt1 ? rt1
                 : (LispReadtable)DynamicBindings.Get(Startup.Sym("*READTABLE*"));
@@ -2637,9 +2763,19 @@ public static partial class Runtime
         }));
         Emitter.CilAssembler.RegisterFunction("SET-DISPATCH-MACRO-CHARACTER", new LispFunction(args => {
             if (args.Length < 3) throw new System.Exception("SET-DISPATCH-MACRO-CHARACTER: requires 3+ arguments");
-            char dispChar = ((LispChar)args[0]).Value;
-            char subChar = ((LispChar)args[1]).Value;
+            if (args[0] is not LispChar dispLc)
+                throw new LispErrorException(new LispTypeError("SET-DISPATCH-MACRO-CHARACTER: not a character", args[0], Startup.Sym("CHARACTER")));
+            if (args[1] is not LispChar subLc)
+                throw new LispErrorException(new LispTypeError("SET-DISPATCH-MACRO-CHARACTER: not a character", args[1], Startup.Sym("CHARACTER")));
+            char dispChar = dispLc.Value;
+            char subChar = subLc.Value;
+            // A digit after the dispatch character is the numeric argument, never a sub-character.
+            if (Compat.IsAsciiDigit(subChar))
+                throw new LispErrorException(new LispError(
+                    $"SET-DISPATCH-MACRO-CHARACTER: {subChar} is a digit, which cannot be a dispatch sub-character"));
             var lispFn = args[2];
+            if (!IsFunctionDesignatorForReader(lispFn))
+                throw new LispErrorException(new LispTypeError("SET-DISPATCH-MACRO-CHARACTER: not a function designator", lispFn, Startup.Sym("FUNCTION")));
             var rt = args.Length >= 4 && args[3] is LispReadtable rt1 ? rt1
                 : (LispReadtable)DynamicBindings.Get(Startup.Sym("*READTABLE*"));
             rt.SetDispatchMacroCharacter(dispChar, subChar, (reader, c, n) => {

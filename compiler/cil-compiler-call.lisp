@@ -25,21 +25,35 @@
       ((= n 0) (compile-static-program-error
                  (format nil "~A: wrong number of arguments: 0 (expected >= 1)" op)))
       ((= n 1)
-       ;; (< a) evaluates arg for side effects, returns T
-       `(,@(compile-expr (car args)) (:pop) ,@(emit-t)))
+       ;; (< a) checks its argument (a number, a real for the orderings) and returns T
+       `(,@(compile-expr (car args))
+         (:call ,(if (eq op '=) "Runtime.CheckNumber1" "Runtime.CheckReal1"))
+         (:pop) ,@(emit-t)))
       ((and (= n 2)
             (or (and (fixnum-typed-p (first args)) (fixnum-typed-p (second args)))
-                (and (float-typed-p (first args)) (float-typed-p (second args)))))
+                (and (float-typed-p (first args)) (float-typed-p (second args)))
+                (and (member op '(< > <= >= = /=)) (%sum-cmp-plan op args))))
        ;; The test position compares raw values; the value position used to
        ;; box them again for the generic entry.
        (compile-expr `(if (,op ,@args) t nil)))
       ((= n 2) (compile-binary-call args method))
       (t
        ;; Expand (op a b c ...) -> (let* ((t0 a) (t1 b) (t2 c) ...) (and (op t0 t1) (op t1 t2) ...))
+       ;; An integer literal is its own operand (no temporary), and a temporary
+       ;; holding a value that is statically a fixnum is declared one, so the
+       ;; comparisons between them are raw int64 compares.
        (let* ((tmps (loop for i below n collect (intern (format nil "%%NARGT~A" i))))
-              (bindings (loop for tmp in tmps for arg in args collect `(,tmp ,arg)))
-              (pairs (loop for (t1 t2) on tmps while t2 collect `(,op ,t1 ,t2))))
-         (compile-expr `(let* ,bindings (and ,@pairs))))))))
+              (operands (loop for tmp in tmps for arg in args
+                              collect (if (typep arg 'fixnum) arg tmp)))
+              (bindings (loop for tmp in tmps for arg in args
+                              unless (typep arg 'fixnum) collect `(,tmp ,arg)))
+              (decls (loop for tmp in tmps for arg in args
+                           when (and (not (typep arg 'fixnum)) (fixnum-exact-p arg))
+                             collect tmp))
+              (pairs (loop for (t1 t2) on operands while t2 collect `(,op ,t1 ,t2))))
+         (compile-expr `(let* ,bindings
+                          ,@(when decls `((declare (type fixnum ,@decls))))
+                          (and ,@pairs))))))))
 
 (defun simple-expr-p (expr)
   "Return T if EXPR compiles to simple stack ops without try blocks.
@@ -551,7 +565,15 @@
   (let* ((entries (remove-if (lambda (e) (or (and (backing-entry-dims e)
                                                   (not (eq (sixth e) :maybe)))
                                              (%backing-never-declines-p e)
-                                             (eq (tenth e) :never-null)))
+                                             (eq (tenth e) :never-null)
+                                             ;; An alias of a buffer an enclosing
+                                             ;; unswitch tested: in its fast copy the
+                                             ;; buffer is present, and in its slow copy
+                                             ;; the accesses already use the helper.
+                                             ;; Testing it again would emit this body
+                                             ;; twice for a copy that cannot be used.
+                                             (member (third e) *array-backing-outer*
+                                                     :test #'eq)))
                              entries))
          (arrays (and entries
                       (some (lambda (e)
@@ -563,9 +585,14 @@
                             entries)))
          (structs (and struct-entries (%backing-duplicable-p body))))
     (if (or (not (or arrays structs))
-            (not (%backing-duplicable-p body)))
+            (not (%backing-duplicable-p body))
+            ;; Each unswitch compiles its body two or three times, and the body of a loop
+            ;; that is itself inside an unswitched loop holds the next one: compile time
+            ;; grew as 3^depth. From the third level on the test stays at the access.
+            (>= *unswitch-depth* +unswitch-depth-limit+))
         (funcall thunk)
-        (let* ((slow (gen-label "ABUSLOW"))
+        (let* ((*unswitch-depth* (1+ *unswitch-depth*))
+               (slow (gen-label "ABUSLOW"))
                (done (gen-label "ABUDONE"))
                (tests `(,@(when arrays
                             (loop for e in entries
@@ -579,7 +606,10 @@
                                                (:conv-i4)
                                                (:ldc-i4 ,(%struct-backing-length e))
                                                (:blt ,slow)))))))
+               (outer (if arrays (append (mapcar #'third entries) *array-backing-outer*)
+                          *array-backing-outer*))
                (fast (let ((*backing-arm* (if arrays :fast *backing-arm*))
+                           (*array-backing-outer* outer)
                            (*array-backing-tested*
                              (if arrays
                                  (append (mapcar #'third entries)
@@ -591,6 +621,7 @@
                                                            *struct-backing-known*)))
                        (funcall thunk)))
                (slow-copy (let ((*backing-arm* (if arrays :helper *backing-arm*))
+                                (*array-backing-outer* outer)
                                 (*array-backing-tested* (if arrays '() *array-backing-tested*)))
                             (funcall thunk)))
                (plain (and (> (length fast) *unswitch-body-limit*)
@@ -651,7 +682,10 @@
                                 for d = (nth k dims)
                                 collect `(:ldc-i4 ,(if (integerp d) d -1)))
                         (:ldc-i4 ,(if (or (eq (sixth e) :checked) (ninth e)) (or (fifth e) 0) 0))
-                        (:ldc-i4 ,(if (compiling-at-safety-0-p) 0 1))
+                        ;; The element type is checked against the declared one
+                        ;; unless the array is the one this binding's MAKE-ARRAY
+                        ;; made (:MADE), whose element type is known.
+                        (:ldc-i4 ,(if (or (eq (sixth e) :made) (compiling-at-safety-0-p)) 0 1))
                         (:call ,(ecase kind
                                   (1 "Runtime.BackingNDU8") (2 "Runtime.BackingNDU16")
                                   (3 "Runtime.BackingNDI32") (4 "Runtime.BackingNDI64")
@@ -1011,6 +1045,9 @@
 (defun compile-values-call (args)
   (cond
     ;; (values): a shared marker, no array and no wrapper to build.
+    ;; In a single-value position it is NIL: no marker to build and unwrap.
+    ((and (null args) (null *in-mv-context*) (null *in-tail-position*))
+     (emit-nil))
     ((null args) '((:call "MultipleValues.Values0")))
     ;; (values x) where only the primary value is taken, nothing reads what is published.
     ((and (null (cdr args)) (null *in-mv-context*) (null *in-tail-position*))
@@ -1049,7 +1086,8 @@
     (cond
       ((or (< nargs 2) (> nargs 3))
        ;; Wrong number of args -> PROGRAM-ERROR
-       (compile-expr '(error 'program-error)))
+       (compile-static-program-error
+        (format nil "SUBSEQ: wrong number of arguments: ~D (expected 2-3)" nargs)))
       (t
        ;; Single-valued arguments wherever the SUBSEQ form is (see GETHASH).
        `(,@(compile-value-args (list (first args) (second args) (third args)))
@@ -1058,7 +1096,7 @@
 (defun compile-concatenate (args)
   "Compile (concatenate result-type seq1 seq2 ...)."
   (if (null args)
-      (compile-expr '(error 'program-error))
+      (compile-static-program-error "CONCATENATE: wrong number of arguments: 0 (expected at least 1)")
       (let ((rt-tmp (gen-local "RTTYP"))
             (arr-tmp (gen-local "CATARR")))
         `((:declare-local ,rt-tmp "LispObject")

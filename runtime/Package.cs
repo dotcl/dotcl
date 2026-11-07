@@ -417,8 +417,11 @@ public class Package : LispObject
             var (sym, status) = FindSymbol(name);
             if (status != SymbolStatus.None)
                 return (sym, false);
-            sym = new Symbol(name, this);
+            // Keyword names are interned strings, so a compiled function's table of valid
+            // keys (string literals) can be matched against them by reference.
+            sym = new Symbol(ReferenceEquals(this, Startup.KeywordPkg) || Name == "KEYWORD" ? string.Intern(name) : name, this);
             _internalSymbols[name] = sym;
+            TouchSymbols();
             // KEYWORD package: auto-export and make self-evaluating
             if (Name == "KEYWORD")
             {
@@ -448,6 +451,28 @@ public class Package : LispObject
             {
                 // Already external - no effect
                 return;
+            }
+
+            // CLHS 11.1.1.2.5: exporting a symbol whose name is already taken in this
+            // package by another symbol (its own, or an inherited one) is a name
+            // conflict; without a resolution the package's own symbol was silently
+            // lost. DOTCL_EXPORT_CONFLICT=warn only reports it and replaces, as it did.
+            if (!ReferenceEquals(found, sym) && !BridgeConflictIsSilent(found, sym))
+            {
+                if (Environment.GetEnvironmentVariable("DOTCL_EXPORT_CONFLICT") == "warn")
+                {
+                    Console.Error.WriteLine(
+                        $";; EXPORT-CONFLICT: {sym.HomePackage?.Name}:{sym.Name} replaces {found.HomePackage?.Name}:{found.Name} ({status}) in package {Name}");
+                }
+                else
+                {
+                    var res = Runtime.SignalNameConflict(
+                        this, "EXPORT", sym, found, new[] { sym, found },
+                        keepOld: true, takeNew: true, importChoices: false,
+                        resolve: false, continueRestart: true);
+                    if (res.Choice == Runtime.NameConflictChoice.KeepOld) return;
+                    // TakeNew / Continue: the exported symbol replaces the other one.
+                }
             }
 
             // Check for name conflicts in packages that use this package
@@ -505,10 +530,13 @@ public class Package : LispObject
             {
                 // Import first, then export
                 _internalSymbols[sym.Name] = sym;
+                TouchSymbols();
             }
 
             _internalSymbols.TryRemove(sym.Name, out _);
+            TouchSymbols();
             _externalSymbols[sym.Name] = sym;
+            TouchSymbols();
         }
     }
 
@@ -527,6 +555,7 @@ public class Package : LispObject
                     if (status == SymbolStatus.Inherited)
                     {
                         _internalSymbols[sym.Name] = sym;
+                        TouchSymbols();
                     }
                     return;
                 }
@@ -540,6 +569,7 @@ public class Package : LispObject
 
             // No existing symbol - import it
             _internalSymbols[sym.Name] = sym;
+            TouchSymbols();
 
             // If the symbol has no home package, set it to this package
             if (sym.HomePackage == null)
@@ -553,6 +583,7 @@ public class Package : LispObject
         lock (_pkgLock)
         {
             _internalSymbols[sym.Name] = sym;
+            TouchSymbols();
             if (sym.HomePackage == null)
                 sym.HomePackage = this;
         }
@@ -638,6 +669,7 @@ public class Package : LispObject
             {
                 var sym = new Symbol(name, this);
                 _internalSymbols[name] = sym;
+                TouchSymbols();
                 BumpMappingEpoch();
             }
             _shadowingSymbols.Add(name);
@@ -664,7 +696,9 @@ public class Package : LispObject
             if (status == SymbolStatus.External)
             {
                 _externalSymbols.TryRemove(sym.Name, out _);
+                TouchSymbols();
                 _internalSymbols[sym.Name] = sym;
+                TouchSymbols();
             }
             // If internal or inherited, unexport has no effect (not an error)
         }
@@ -695,6 +729,73 @@ public class Package : LispObject
                 _nicknames.Add(Register(nickname));
         }
     }
+
+    private int _symVersion;
+    private sealed class SymSnapshot
+    {
+        public int Version;
+        public Symbol[] External = Array.Empty<Symbol>();
+        public Symbol[] Internal = Array.Empty<Symbol>();
+    }
+    private SymSnapshot? _symSnap;
+
+    private void TouchSymbols() => System.Threading.Interlocked.Increment(ref _symVersion);
+
+    /// <summary>Arrays of this package's own symbols, rebuilt only after a table mutation.</summary>
+    private SymSnapshot Snapshot()
+    {
+        var snap = _symSnap;
+        int v = System.Threading.Volatile.Read(ref _symVersion);
+        if (snap != null && snap.Version == v) return snap;
+        snap = new SymSnapshot { Version = v, External = _externalSymbols.Values.ToArray(), Internal = _internalSymbols.Values.ToArray() };
+        _symSnap = snap;
+        return snap;
+    }
+
+    /// <summary>Prepend each external symbol onto RESULT (canonicalized NIL / T), skipping the ones
+    /// whose name is present in SKIPPRESENTIN when that is given. Walks the table in place, where
+    /// ExternalSymbols copies it first.</summary>
+    internal LispObject ConsExternalOnto(LispObject result, Package? skipPresentIn)
+    {
+        foreach (var sym in Snapshot().External)
+        {
+            if (skipPresentIn != null && skipPresentIn.IsPresent(sym.Name)) continue;
+            result = new Cons(Runtime.CanonicalizeSymbol(sym), result);
+        }
+        return result;
+    }
+
+    /// <summary>Prepend the external symbols of USED that are inherited here: those whose names are not
+    /// present in this package. When this package has fewer symbols of its own than USED exports, the
+    /// names that clash are found by looking up this package's names in USED (usually none), instead of
+    /// looking up every exported name here.</summary>
+    internal LispObject ConsInheritedOnto(LispObject result, Package used)
+    {
+        if (_externalSymbols.Count + _internalSymbols.Count >= used._externalSymbols.Count)
+            return used.ConsExternalOnto(result, this);
+        HashSet<string>? blocked = null;
+        foreach (var kv in _externalSymbols)
+            if (used._externalSymbols.ContainsKey(kv.Key)) (blocked ??= new()).Add(kv.Key);
+        foreach (var kv in _internalSymbols)
+            if (used._externalSymbols.ContainsKey(kv.Key)) (blocked ??= new()).Add(kv.Key);
+        foreach (var sym in used.Snapshot().External)
+        {
+            if (blocked != null && blocked.Contains(sym.Name)) continue;
+            result = new Cons(Runtime.CanonicalizeSymbol(sym), result);
+        }
+        return result;
+    }
+
+    internal LispObject ConsInternalOnto(LispObject result)
+    {
+        foreach (var sym in Snapshot().Internal)
+            result = new Cons(Runtime.CanonicalizeSymbol(sym), result);
+        return result;
+    }
+
+    /// <summary>Is NAME the name of a symbol present (external or internal) in this package?</summary>
+    internal bool IsPresent(string name)
+        => _externalSymbols.ContainsKey(name) || _internalSymbols.ContainsKey(name);
 
     public IEnumerable<Symbol> ExternalSymbols => _externalSymbols.Values;
     public IEnumerable<Symbol> InternalSymbols => _internalSymbols.Values;
@@ -844,6 +945,7 @@ public class Package : LispObject
             _externalSymbols.TryRemove(name, out _);
         else
             _internalSymbols.TryRemove(name, out _);
+        TouchSymbols();
         _shadowingSymbols.Remove(name);
         if (ReferenceEquals(sym.HomePackage, this)) sym.HomePackage = null;
         BumpMappingEpoch();
@@ -872,9 +974,10 @@ public class Package : LispObject
     {
         lock (_pkgLock)
         {
-            // Preserve external status: if the replaced symbol was external, keep new one external
             bool wasExternal = _externalSymbols.TryRemove(sym.Name, out var oldExt);
+            TouchSymbols();
             _internalSymbols.TryRemove(sym.Name, out var oldInt);
+            TouchSymbols();
             // The symbol it replaces is uninterned (CLHS SHADOWING-IMPORT), so it
             // loses this package as its home, as UNINTERN does.
             var old = oldExt ?? oldInt;
@@ -883,11 +986,13 @@ public class Package : LispObject
                 if (old.HomePackage == this) old.HomePackage = null;
                 BumpMappingEpoch();
             }
-            // Import the symbol and mark it as shadowing
-            if (wasExternal)
+            // A different symbol is inserted as an internal symbol (CLHS SHADOWING-IMPORT);
+            // a symbol that is already present keeps the status it has.
+            if (wasExternal && ReferenceEquals(old, sym))
                 _externalSymbols[sym.Name] = sym;
             else
                 _internalSymbols[sym.Name] = sym;
+            TouchSymbols();
             _shadowingSymbols.Add(sym.Name);
         }
     }
@@ -962,7 +1067,9 @@ public class Package : LispObject
                     sym.HomePackage = null;
             }
             _internalSymbols.Clear();
+            TouchSymbols();
             _externalSymbols.Clear();
+            TouchSymbols();
             _shadowingSymbols.Clear();
 
             // Remove from global package list

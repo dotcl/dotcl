@@ -73,6 +73,6 @@
          <DotCLRuntimeVersion> to pin a different runtime.
          NOTE: kept in sync with the SDK package version at pack time; the literal
          below is the fallback for a locally built SDK. -->
-    <DotCLRuntimeVersion Condition="'$(DotCLRuntimeVersion)' == ''">0.1.36</DotCLRuntimeVersion>
+    <DotCLRuntimeVersion Condition="'$(DotCLRuntimeVersion)' == ''">0.1.37</DotCLRuntimeVersion>
   </PropertyGroup>
 </Project>

@@ -156,6 +156,12 @@ public static partial class Runtime
         // the entry package at read time (it doesn't exist yet).
         LispObject? toplevelDesignator = toplevelArg is Nil ? null : toplevelArg;
 
+        // A Windows executable needs the .exe extension to be started by name.
+        if (isExecutable && (targetRid ?? Compat.RuntimeIdentifier) is { } exeRid
+            && exeRid.StartsWith("win", StringComparison.OrdinalIgnoreCase)
+            && Path.GetExtension(outputPath).Length == 0)
+            outputPath += ".exe";
+
         // Core mode: write the .fasl directly to outputPath.
         // Exec mode: write the .fasl to a temp path, then invoke `dotnet publish`
         // to produce a self-contained single-file exe with the .fasl embedded.
@@ -206,12 +212,19 @@ public static partial class Runtime
 
         var packageSym = Startup.Sym("*PACKAGE*");
         var oldPackage = DynamicBindings.Get(packageSym);
+        var readtableSym = Startup.Sym("*READTABLE*");
+        var oldReadtable = DynamicBindings.Get(readtableSym);
 
         try
         {
             // Prepend (require "asdf") so UIOP is available when sources
-            // compiled with ASDF deps load in a standalone exe context.
-            if (sources.Count > 0)
+            // compiled with ASDF deps load in a standalone exe context. Skipped when
+            // nothing could refer to it: no ASDF closure, and no ASDF / UIOP package
+            // in this session for the sources to have been read against. Loading
+            // asdf.fasl costs about a second of every start of the application.
+            bool needsAsdf = (asdfSystems != null && asdfSystems.Count > 0)
+                || Package.FindPackage("ASDF") != null || Package.FindPackage("UIOP") != null;
+            if (sources.Count > 0 && needsAsdf)
             {
                 var requireForm = new Cons(Startup.Sym("REQUIRE"),
                     new Cons(new LispString("asdf"), Nil.Instance));
@@ -241,6 +254,14 @@ public static partial class Runtime
                 var registerSym = ResolveSymbolName("ASDF:REGISTER-PRELOADED-SYSTEM");
                 foreach (var (name, version) in asdfSystems)
                 {
+                    if (version == RequireModuleMarker)
+                    {
+                        // A module of the image, not a system with files: the deployed
+                        // image loads it with REQUIRE before the sources that use it.
+                        faslAsm.AddTopLevelForm(CompileTopLevel(new Cons(Startup.Sym("REQUIRE"),
+                            new Cons(new LispString(name), Nil.Instance))));
+                        continue;
+                    }
                     LispObject args = new Cons(new LispString(name), Nil.Instance);
                     if (!string.IsNullOrEmpty(version))
                         ((Cons)args).Cdr = new Cons(Startup.SymInPkg("VERSION", "KEYWORD"),
@@ -257,6 +278,11 @@ public static partial class Runtime
             {
                 progress.WriteLine($"; [{i + 1}/{sources.Count}] {sources[i]}");
                 progress.Flush();
+                // Each source starts with the package and readtable the build began
+                // with, as COMPILE-FILE binds them: an IN-PACKAGE does not carry over
+                // into the next file (the :load file after an ASDF closure).
+                DynamicBindings.Set(packageSym, oldPackage);
+                DynamicBindings.Set(readtableSym, oldReadtable);
                 CompileSourceInto(sources[i], faslAsm);
             }
 
@@ -309,6 +335,7 @@ public static partial class Runtime
         {
             DynamicBindings.Set(compileFileModeSym, oldCompileFileMode);
             DynamicBindings.Set(packageSym, oldPackage);
+            DynamicBindings.Set(readtableSym, oldReadtable);
         }
     }
 
@@ -612,6 +639,8 @@ public static partial class Runtime
     /// the building image still has a real ASDF registry, so the deployed image can
     /// answer for itself. See the register-preloaded-system emission in
     /// BuildFaslFromSources.</summary>
+    private const string RequireModuleMarker = "\u0001require";
+
     private static List<string> CollectAsdfSystemSources(
         LispObject systemDesignator, out List<(string Name, string Version)> systems)
     {
@@ -783,9 +812,15 @@ public static partial class Runtime
                              (list (nreverse files)
                                    (mapcar (lambda (sys)
                                              (list (asdf:component-name sys)
-                                                   (let ((v (ignore-errors
-                                                              (asdf:component-version sys))))
-                                                     (if (stringp v) v """"))))
+                                                   ;; A system that is a module of the image
+                                                   ;; (dotcl-bsd-sockets, found through REQUIRE)
+                                                   ;; has no files in the walk: it is marked,
+                                                   ;; and the deployed image requires it.
+                                                   (if (typep sys 'asdf::require-system)
+                                                       (concatenate 'string (string (code-char 1)) ""require"")
+                                                       (let ((v (ignore-errors
+                                                                  (asdf:component-version sys))))
+                                                         (if (stringp v) v """")))))
                                            ordered)))))";
 
         LispObject result;

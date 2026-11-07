@@ -70,6 +70,7 @@ public class LispCondition : LispObject
 public class LispError : LispCondition
 {
     public LispError(string message) : base(message) { ConditionTypeName = "ERROR"; }
+    public LispError(System.Func<string> messageThunk) : base(messageThunk) { ConditionTypeName = "ERROR"; }
 }
 
 public class LispTypeError : LispError
@@ -77,14 +78,146 @@ public class LispTypeError : LispError
     // Settable so MOP slot-access (setf slot-value / slot-makunbound) can reach
     // the DATUM / EXPECTED-TYPE slots of a native (runtime-signaled) type-error.
     public LispObject Datum { get; set; }
-    public LispObject ExpectedType { get; set; }
+    private LispObject? _expectedType;
+    private readonly string _message;
+    /// <summary>The type the datum was expected to be. When the runtime did not say
+    /// (most of the several hundred places that signal a type error name the
+    /// expectation only in the message, "GETHASH: not a hash-table"), it is read
+    /// from the message; NIL, the empty type, only when nothing can be told.</summary>
+    public LispObject ExpectedType
+    {
+        // A datum that is a cons is a list the runtime found to be dotted or otherwise not
+        // proper: it is a LIST, so naming LIST (or SEQUENCE) as the expected type would say
+        // the datum is of the expected type. Nothing is inferred for it.
+        get => _expectedType ??= (Datum is Cons ? null : InferExpectedType(_message)) ?? Nil.Instance;
+        set => _expectedType = value;
+    }
 
     public LispTypeError(string message, LispObject? datum = null, LispObject? expectedType = null)
-        : base(message)
+        : base(datum != null && NamesNoValue(message)
+                   ? () => WithDatum(message, datum)
+                   : (System.Func<string>)(() => message))
     {
         ConditionTypeName = "TYPE-ERROR";
         Datum = datum ?? Nil.Instance;
-        ExpectedType = expectedType ?? Nil.Instance;
+        _message = message;
+        _expectedType = expectedType;
+    }
+
+    private static LispObject? InferExpectedType(string message)
+    {
+        int colon = message.IndexOf(": ", System.StringComparison.Ordinal);
+        string rest = colon >= 0 ? message.Substring(colon + 2) : message;
+        // Only the expectation, not the value some messages append after it.
+        int next = rest.IndexOf(": ", System.StringComparison.Ordinal);
+        if (next >= 0) rest = rest.Substring(0, next);
+        rest = rest.Trim();
+        static LispObject Sym(string n) => Startup.Sym(n);
+        static LispObject Or(params string[] n)
+        {
+            LispObject l = Nil.Instance;
+            for (int i = n.Length - 1; i >= 0; i--) l = new Cons(Sym(n[i]), l);
+            return new Cons(Sym("OR"), l);
+        }
+        switch (rest)
+        {
+            case "not a list": case "not a proper list": case "not a proper plist":
+            case "argument is not a list": return Sym("LIST");
+            case "not a sequence": case "not a proper sequence": return Sym("SEQUENCE");
+            case "not an array": return Sym("ARRAY");
+            case "not a vector": return Sym("VECTOR");
+            case "not a hash-table": case "not a hash table": return Sym("HASH-TABLE");
+            case "not a function designator": return Or("FUNCTION", "SYMBOL");
+            case "not a string designator": return Or("STRING", "SYMBOL", "CHARACTER");
+            case "not a pathname designator": case "not a string or pathname":
+                return Or("STRING", "PATHNAME", "SYNONYM-STREAM", "FILE-STREAM");
+            case "not a symbol": return Sym("SYMBOL");
+            case "not an integer": return Sym("INTEGER");
+            case "not a number": return Sym("NUMBER");
+            case "not a character": return Sym("CHARACTER");
+            case "not a string": return Sym("STRING");
+            case "not a cons": return Sym("CONS");
+            case "not a method": return Sym("METHOD");
+            case "not a stream": return Sym("STREAM");
+            case "not a package": return Sym("PACKAGE");
+            case "not a pathname": return Sym("PATHNAME");
+            case "not a structure": return Sym("STRUCTURE-OBJECT");
+            case "not a generic function": return Sym("GENERIC-FUNCTION");
+            case "not a CLOS instance": return Sym("STANDARD-OBJECT");
+            case "not a class": return Sym("CLASS");
+            case "not a restart": return Sym("RESTART");
+            case "not rational": return Sym("RATIONAL");
+            case "not real": return Sym("REAL");
+            case "not characters": return Sym("CHARACTER");
+            case "not a bit-array":
+                return new Cons(Sym("ARRAY"), new Cons(Sym("BIT"), Nil.Instance));
+            case "argument must be a string designator":
+                return Or("STRING", "SYMBOL", "CHARACTER");
+            case "not a character designator": return Or("CHARACTER", "STRING");
+            case "not a vector with fill-pointer": case "not a vector with fill pointer":
+                return new Cons(Sym("AND"), new Cons(Sym("VECTOR"), new Cons(
+                    new Cons(Sym("SATISFIES"), new Cons(Sym("ARRAY-HAS-FILL-POINTER-P"), Nil.Instance)), Nil.Instance)));
+            case "index must be integer": return Sym("INTEGER");
+            case "argument must be a symbol": return Sym("SYMBOL");
+            case "predicate must be a function": return Or("FUNCTION", "SYMBOL");
+            case "prefix must be a string": return Sym("STRING");
+            case "not a non-negative integer": return Sym("UNSIGNED-BYTE");
+            case "count not an integer": return Sym("INTEGER");
+            case "invalid class specifier": return Or("CLASS", "SYMBOL");
+            case "invalid package designator": return Or("STRING", "SYMBOL", "CHARACTER", "PACKAGE");
+        }
+        if (rest.EndsWith(" must be integer", System.StringComparison.Ordinal)) return Sym("INTEGER");
+        var outOfRange = System.Text.RegularExpressions.Regex.Match(rest,
+            @"^index -?\d+ out of range for (?:string|vector|array|list)[^\d]*(\d+)$");
+        if (outOfRange.Success)
+        {
+            long n = long.Parse(outOfRange.Groups[1].Value);
+            return n > 0
+                ? new Cons(Sym("INTEGER"), new Cons(Fixnum.Make(0), new Cons(Fixnum.Make(n - 1), Nil.Instance)))
+                : Sym("INTEGER");
+        }
+        var bounds = System.Text.RegularExpressions.Regex.Match(rest, @"is not in \[0, (\d+)\]$");
+        if (bounds.Success)
+            return new Cons(Sym("INTEGER"), new Cons(Fixnum.Make(0),
+                new Cons(Fixnum.Make(long.Parse(bounds.Groups[1].Value)), Nil.Instance)));
+        if (rest.StartsWith("condition is not of type WARNING")) return Sym("WARNING");
+        const string coerceTo = "cannot coerce to ";
+        if (rest.StartsWith(coerceTo) && rest.Length > coerceTo.Length
+            && rest.IndexOf(' ', coerceTo.Length) < 0)
+            return Sym(rest.Substring(coerceTo.Length).ToUpperInvariant());
+        if (rest == "cannot convert to pathname") return Sym("PATHNAME");
+        if (message.StartsWith("Not a pathname designator"))
+            return Or("STRING", "PATHNAME", "SYNONYM-STREAM", "FILE-STREAM");
+        return null;
+    }
+
+    /// <summary>True for a message of the form "OP: not a THING" that says what was
+    /// expected but not what was given, so the value is added when it is reported.</summary>
+    private static bool NamesNoValue(string message)
+    {
+        int colon = message.IndexOf(": ", System.StringComparison.Ordinal);
+        if (colon <= 0 || message.IndexOf(": ", colon + 2, System.StringComparison.Ordinal) >= 0) return false;
+        var rest = message.AsSpan(colon + 2);
+        return rest.StartsWith("not a ") || rest.StartsWith("not an ")
+               || rest.StartsWith("cannot coerce to ");
+    }
+
+    private static string WithDatum(string message, LispObject datum)
+    {
+        const string coerce = ": cannot coerce to ";
+        int at = message.IndexOf(coerce, System.StringComparison.Ordinal);
+        if (at > 0)
+            return message.Substring(0, at) + ": cannot coerce " + DatumText(datum) + " to "
+                   + message.Substring(at + coerce.Length);
+        return message + ": " + DatumText(datum);
+    }
+
+    private static string DatumText(LispObject datum)
+    {
+        string text;
+        try { text = Runtime.FormatObject(datum, true); }
+        catch (System.Exception) { text = datum.ToString() ?? "?"; }
+        return text.Length > 80 ? text.Substring(0, 77) + "..." : text;
     }
 }
 
@@ -118,7 +251,7 @@ public class LispCellError : LispError
 public class LispUndefinedFunction : LispCellError
 {
     public LispUndefinedFunction(LispObject name)
-        : base($"Undefined function: {name}", name) { ConditionTypeName = "UNDEFINED-FUNCTION"; }
+        : base($"Undefined function: {name}{Runtime.NotAFunctionNote(name)}", name) { ConditionTypeName = "UNDEFINED-FUNCTION"; }
     public override string ToString() => $"#<UNDEFINED-FUNCTION: {Name}>";
 }
 
@@ -165,13 +298,45 @@ public class LispInteractiveInterrupt : LispCondition
         : base("Interactive interrupt") { ConditionTypeName = "INTERACTIVE-INTERRUPT"; }
 }
 
+/// <summary>Where a LispErrorException was raised, recorded while the Lisp frames that
+/// raised it were still on the stack: the innermost frame's function and, when a
+/// backtrace was asked for (DOTCL_BACKTRACE=1), the frames. A script run reports the
+/// error after the stack is gone, and uses this to say which function failed.</summary>
+public sealed class ErrorOrigin
+{
+    /// <summary>Set for a script run, which reports an unhandled error from the top.</summary>
+    public static volatile bool Enabled;
+    /// <summary>Whether to keep the frames too: DOTCL_BACKTRACE=1.</summary>
+    public static volatile bool Backtrace;
+
+    public static bool HasLispFrames => LispFunction.InnermostFrameName() != null;
+
+    public string? Function { get; private init; }
+    public string[]? Frames { get; private init; }
+
+    public static ErrorOrigin? Capture()
+    {
+        var name = LispFunction.InnermostFrameName();
+        if (name == null) return null;
+        return new ErrorOrigin { Function = name, Frames = Backtrace ? LispFunction.GetCallStackForms() : null };
+    }
+}
+
 public class LispErrorException : Exception
 {
     public LispCondition Condition { get; }
+    public ErrorOrigin? Origin { get; private set; }
+    /// <summary>Above zero while the interop tries the overloads of a call in turn.</summary>
+    [ThreadStatic] public static int QuietDepth;
     public LispErrorException(LispCondition condition)
         : base(condition.Message)
     {
         Condition = condition;
+        // An overload being tried (QuietDepth > 0) is not an error yet: the caller
+        // catches the failure and goes on to the next candidate, so no handler or
+        // debugger hears of it.
+        if (QuietDepth > 0) return;
+        if (ErrorOrigin.Enabled) Origin = ErrorOrigin.Capture();
         // Per CL spec: error signals the condition through handler-bind before throwing.
         // If a handler does a non-local exit, this constructor never returns.
         HandlerClusterStack.Signal(condition);
@@ -388,6 +553,9 @@ public static class HandlerClusterStack
     /// Per CL spec: when calling a handler, that handler's cluster and above are removed
     /// to prevent infinite recursion.
     /// </summary>
+    /// <summary>0 normally; while a binding's type is being tested, the index of its cluster + 1.</summary>
+    [ThreadStatic] private static int _typepLimit;
+
     public static void Signal(LispCondition condition)
     {
         var exit = SignalForExit(condition);
@@ -401,12 +569,21 @@ public static class HandlerClusterStack
         Runtime.CaptureCompilerSource(condition);
         var clusters = _clusters;
         if (clusters == null) return null;
-        for (int i = clusters.Count - 1; i >= 0; i--)
+        int top = _typepLimit > 0 && _typepLimit - 1 < clusters.Count ? _typepLimit - 1 : clusters.Count;
+        for (int i = top - 1; i >= 0; i--)
         {
             var cluster = clusters[i];
             foreach (var binding in cluster)
             {
-                if (!Runtime.IsTruthy(Runtime.Typep(condition, binding.TypeSpec))) continue;
+                // An error raised while testing the binding's type (an unknown type
+                // specifier) is signalled to the handlers outside this cluster, not to
+                // this one, which would test the same type again without end.
+                int savedLimit = _typepLimit;
+                _typepLimit = i + 1;
+                bool matches;
+                try { matches = Runtime.IsTruthy(Runtime.Typep(condition, binding.TypeSpec)); }
+                finally { _typepLimit = savedLimit; }
+                if (!matches) continue;
                 // HCTAG is set only by a binding an older fasl built; that fasl's
                 // filter compares against that object.
                 if (binding.IsHandlerCaseClause)
@@ -698,7 +875,8 @@ public static class ConditionSystem
         {
             if (t_unhandledErrorsEnterDebugger) return true;
             var invSym = s_invokeDebuggerHookSym ??= Startup.SymInPkg("*INVOKE-DEBUGGER-HOOK*", "DOTCL");
-            if (DynamicBindings.TryGet(invSym, out var invHook) && invHook is not Nil) return true;
+            if (DynamicBindings.TryGet(invSym, out var invHook) && invHook is not Nil
+                && !s_reportingHooks.TryGetValue(invHook, out _)) return true;
             var sym = s_debuggerHookSym ??= Startup.Sym("*DEBUGGER-HOOK*");
             return DynamicBindings.TryGet(sym, out var hook)
                 && hook is not Nil

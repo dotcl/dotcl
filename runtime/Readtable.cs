@@ -28,25 +28,25 @@ public enum ReadtableCase
 public class LispReadtable : LispObject
 {
     // Syntax type for each character. Characters not in this map are Constituent by default.
-    private readonly Dictionary<char, SyntaxType> _syntaxTypes = new();
+    private readonly CharSyntaxMap _syntaxTypes = new();
 
     // Reader macro functions: char -> C# delegate (stream, char) -> LispObject?
     // null return means "no value produced" (re-enter step 1)
-    private readonly Dictionary<char, Func<Reader, char, LispObject?>> _macroFunctions = new();
+    private readonly CharMap<Func<Reader, char, LispObject?>> _macroFunctions = new();
 
     // Which macro characters are non-terminating
-    private readonly HashSet<char> _nonTerminating = new();
+    private readonly CharBitSet _nonTerminating = new();
 
     // Original Lisp function objects for user-set macro characters
     // Used by GET-MACRO-CHARACTER to return the function the user passed to SET-MACRO-CHARACTER
-    private readonly Dictionary<char, LispObject> _lispMacroFunctions = new();
+    private readonly CharMap<LispObject> _lispMacroFunctions = new();
 
     // Dispatch tables: dispatching-char -> (sub-char -> dispatch function(stream, sub-char, numarg))
-    private readonly Dictionary<char, Dictionary<char, Func<Reader, char, int, LispObject?>>> _dispatchTables = new();
+    private readonly CharMap<CharMap<Func<Reader, char, int, LispObject?>>> _dispatchTables = new();
 
     // Original Lisp function objects for user-set dispatch macro sub-characters
     // Used by GET-DISPATCH-MACRO-CHARACTER to return the function the user passed to SET-DISPATCH-MACRO-CHARACTER
-    private readonly Dictionary<char, Dictionary<char, LispObject>> _lispDispatchFunctions = new();
+    private readonly CharMap<CharMap<LispObject>> _lispDispatchFunctions = new();
 
     // The reader macro function of every dispatching macro character, in every
     // readtable. One object rather than one per readtable: the dispatcher is the
@@ -74,7 +74,7 @@ public class LispReadtable : LispObject
     /// <summary>Set the syntax type of a character.</summary>
     public void SetSyntaxType(char ch, SyntaxType type)
     {
-        _syntaxTypes[ch] = type;
+        _syntaxTypes.Set(ch, type);
     }
 
     /// <summary>Check if a character is a macro character (terminating or non-terminating).</summary>
@@ -120,13 +120,13 @@ public class LispReadtable : LispObject
         SetSyntaxType(ch, nonTerminating ? SyntaxType.NonTerminatingMacro : SyntaxType.TerminatingMacro);
         if (nonTerminating) _nonTerminating.Add(ch); else _nonTerminating.Remove(ch);
         if (!_dispatchTables.ContainsKey(ch))
-            _dispatchTables[ch] = new Dictionary<char, Func<Reader, char, int, LispObject?>>();
+            _dispatchTables[ch] = new CharMap<Func<Reader, char, int, LispObject?>>();
         // The shared dispatcher, not a closure over this readtable.
         _macroFunctions[ch] = _dispatchMacroFunction;
     }
 
     /// <summary>Get the dispatch table for a dispatching macro character.</summary>
-    public Dictionary<char, Func<Reader, char, int, LispObject?>>? GetDispatchTable(char ch)
+    internal CharMap<Func<Reader, char, int, LispObject?>>? GetDispatchTable(char ch)
     {
         return _dispatchTables.TryGetValue(ch, out var table) ? table : null;
     }
@@ -147,7 +147,7 @@ public class LispReadtable : LispObject
         {
             if (!_lispDispatchFunctions.TryGetValue(dispChar, out var lispTable))
             {
-                lispTable = new Dictionary<char, LispObject>();
+                lispTable = new CharMap<LispObject>();
                 _lispDispatchFunctions[dispChar] = lispTable;
             }
             lispTable[upper] = lispFn;
@@ -205,7 +205,8 @@ public class LispReadtable : LispObject
         // Copy dispatch table if dispatching macro character
         if (fromReadtable._dispatchTables.TryGetValue(fromChar, out var srcTable))
         {
-            var newTable = new Dictionary<char, Func<Reader, char, int, LispObject?>>(srcTable);
+            var newTable = new CharMap<Func<Reader, char, int, LispObject?>>();
+            newTable.CopyFrom(srcTable);
             _dispatchTables[toChar] = newTable;
             _macroFunctions[toChar] = _dispatchMacroFunction;
         }
@@ -219,20 +220,26 @@ public class LispReadtable : LispObject
     public void CopyFrom(LispReadtable source)
     {
         Case = source.Case;
-        _syntaxTypes.Clear();
-        foreach (var kv in source._syntaxTypes) _syntaxTypes[kv.Key] = kv.Value;
+        _syntaxTypes.CopyFrom(source._syntaxTypes);
         _macroFunctions.Clear();
-        foreach (var kv in source._macroFunctions) _macroFunctions[kv.Key] = kv.Value;
+        _macroFunctions.CopyFrom(source._macroFunctions);
         _lispMacroFunctions.Clear();
-        foreach (var kv in source._lispMacroFunctions) _lispMacroFunctions[kv.Key] = kv.Value;
-        _nonTerminating.Clear();
-        foreach (var ch in source._nonTerminating) _nonTerminating.Add(ch);
+        _lispMacroFunctions.CopyFrom(source._lispMacroFunctions);
+        _nonTerminating.CopyFrom(source._nonTerminating);
         _dispatchTables.Clear();
-        foreach (var kv in source._dispatchTables)
-            _dispatchTables[kv.Key] = new Dictionary<char, Func<Reader, char, int, LispObject?>>(kv.Value);
+        source._dispatchTables.ForEach((k, v) =>
+        {
+            var t = new CharMap<Func<Reader, char, int, LispObject?>>();
+            t.CopyFrom(v);
+            _dispatchTables[k] = t;
+        });
         _lispDispatchFunctions.Clear();
-        foreach (var kv in source._lispDispatchFunctions)
-            _lispDispatchFunctions[kv.Key] = new Dictionary<char, LispObject>(kv.Value);
+        source._lispDispatchFunctions.ForEach((k, v) =>
+        {
+            var t = new CharMap<LispObject>();
+            t.CopyFrom(v);
+            _lispDispatchFunctions[k] = t;
+        });
         // The dispatcher is shared, so a copied entry already points at it; the
         // dispatch tables above are what had to be copied.
     }
@@ -242,14 +249,22 @@ public class LispReadtable : LispObject
     {
         var copy = new LispReadtable();
         copy.Case = Case;
-        foreach (var kv in _syntaxTypes) copy._syntaxTypes[kv.Key] = kv.Value;
-        foreach (var kv in _macroFunctions) copy._macroFunctions[kv.Key] = kv.Value;
-        foreach (var kv in _lispMacroFunctions) copy._lispMacroFunctions[kv.Key] = kv.Value;
-        foreach (var ch in _nonTerminating) copy._nonTerminating.Add(ch);
-        foreach (var kv in _dispatchTables)
-            copy._dispatchTables[kv.Key] = new Dictionary<char, Func<Reader, char, int, LispObject?>>(kv.Value);
-        foreach (var kv in _lispDispatchFunctions)
-            copy._lispDispatchFunctions[kv.Key] = new Dictionary<char, LispObject>(kv.Value);
+        copy._syntaxTypes.CopyFrom(_syntaxTypes);
+        copy._macroFunctions.CopyFrom(_macroFunctions);
+        copy._lispMacroFunctions.CopyFrom(_lispMacroFunctions);
+        copy._nonTerminating.CopyFrom(_nonTerminating);
+        _dispatchTables.ForEach((k, v) =>
+        {
+            var t = new CharMap<Func<Reader, char, int, LispObject?>>();
+            t.CopyFrom(v);
+            copy._dispatchTables[k] = t;
+        });
+        _lispDispatchFunctions.ForEach((k, v) =>
+        {
+            var t = new CharMap<LispObject>();
+            t.CopyFrom(v);
+            copy._lispDispatchFunctions[k] = t;
+        });
         // The dispatcher is shared, so the copied entries already point at it;
         // the dispatch tables above are what had to be copied.
         return copy;

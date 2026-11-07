@@ -443,6 +443,103 @@
             `(,@doc ,@decls (block ,bname ,@rest))))
         fn-body)))
 
+;;; --- Local functions that return from an outer block without an exception ---
+;;;
+;;; A LABELS / FLET function that does (RETURN-FROM B ...) for a block B outside
+;;; itself, and is only ever called by name, hands the caller a BLOCK-EXIT-TOKEN
+;;; instead of throwing: the function ends as if the RETURN-FROM were a return of
+;;; the token, and every call of such a function (entry element 7: (GS . BLOCKS))
+;;; looks at the result (see %EXIT-TOKEN-CHECK-INSTRS). GS names the block that
+;;; stands for the function's own body, marked by the PFN-EXIT property.
+
+(defun %pfn-fn-facts (params fn-body)
+  "(values EXIT-BLOCKS CALLED) for a local function: the names of the blocks
+   outside it that its body returns from, and the mangled names of the local
+   functions it calls (or names). Read off the free variables, which the
+   expansion of macros has been through."
+  (let ((exits '()) (calls '()))
+    (dolist (sym (find-free-vars-with-defaults params fn-body))
+      (let ((n (var-name sym)))
+        (when (and (> (length n) 6) (string= n "%BTAG-" :end1 6))
+          (dolist (e (cstate-block-tags))
+            (when (and (car e) (symbolp (car e))
+                       (not (get (car e) 'pfn-exit))
+                       (string= (block-tag-var-name (car e)) n))
+              (pushnew (car e) exits))))
+        (when (and (> (length n) 10) (string= n "__LABELFN_" :end1 10))
+          (pushnew (subseq n 10) calls :test #'string=))))
+    (values exits calls)))
+
+(defun %pfn-candidate-p (fdef scope-forms)
+  "Can the local function FDEF be called only by name, with required parameters?"
+  (let ((name (car fdef)))
+    (and (symbolp name) name
+         (labels-required-only-params-p (cadr fdef))
+         (%symbol-only-in-operator-position-p name scope-forms))))
+
+(defun %visible-pfn-entries (called)
+  "The exit info (GS . BLOCKS) of the entries among CALLED (mangled names) that
+   have one."
+  (loop for e in (cstate-local-functions)
+        when (and (eighth e) (member (first e) called :test #'string=))
+          collect (eighth e)))
+
+(defun %labels-pfn-plan (fn-defs body)
+  "For a LABELS group: an alist (NAME . (GS . BLOCKS)) for the functions that take
+   the exit protocol, or NIL."
+  (let* ((cands '()) (facts '())
+         ;; The names are in scope in the definitions, as they are when those are
+         ;; compiled: the free variables of a body name the functions it calls.
+         (fake (mapcar (lambda (f) (list (mangle-name (car f)) (gen-local "PFNPLAN") t nil nil nil (car f)))
+                       fn-defs))
+         (*cstate* (cstate-with *cstate*
+                     +cs-local-functions+ (append fake (cstate-local-functions))
+                     +cs-locals+ (append (compile-labels-build-new-locals fake) (cstate-locals))
+                     +cs-boxed-vars+ (append (mapcar #'car (compile-labels-build-new-locals fake))
+                                             (cstate-boxed-vars)))))
+    (dolist (f fn-defs)
+      (when (%pfn-candidate-p f (append (loop for g in fn-defs append (cddr g)) body))
+        (multiple-value-bind (exits calls) (%pfn-fn-facts (cadr f) (cddr f))
+          (push f cands)
+          (push (list (car f) exits calls) facts))))
+    (let ((exiting (loop for fa in facts when (second fa) collect (first fa))))
+      (when exiting
+        ;; A function that calls an exiting one hands its token on.
+        (loop
+          (let ((more (loop for fa in facts
+                            when (and (not (member (first fa) exiting))
+                                      (intersection (third fa)
+                                                    (mapcar #'mangle-name exiting)
+                                                    :test #'string=))
+                              collect (first fa))))
+            (if more (setf exiting (append more exiting)) (return))))
+        (let ((blocks (remove-duplicates
+                       (loop for fa in facts append (second fa)))))
+          (loop for n in exiting
+                collect (cons n (cons (let ((gs (make-symbol "PFN-EXIT")))
+                                        (setf (get gs 'pfn-exit) t)
+                                        gs)
+                                      blocks))))))))
+
+(defun %flet-pfn-info (fdef plan inl-plan body)
+  "The exit info (GS . BLOCKS) when the FLET function FDEF takes the exit
+   protocol, else NIL."
+  (when (and (not plan) (not inl-plan) (%pfn-candidate-p fdef body))
+    (multiple-value-bind (exits calls) (%pfn-fn-facts (cadr fdef) (cddr fdef))
+      (let ((via (%visible-pfn-entries calls)))
+        (when (or exits via)
+          (let ((gs (make-symbol "PFN-EXIT")))
+            (setf (get gs 'pfn-exit) t)
+            (cons gs (remove-duplicates
+                      (append exits (loop for v in via append (cdr v)))))))))))
+
+(defun %pfn-wrap-body (name fn-body gs)
+  "FN-BODY of the local function NAME with its forms inside the block GS."
+  (let* ((b (%local-fn-block-body name fn-body))
+         (doc (and (stringp (car b)) (cdr b) (list (car b)))))
+    (multiple-value-bind (decls rest) (%split-leading-declares (if doc (cdr b) b))
+      `(,@doc ,@decls (block ,gs ,@rest)))))
+
 (defun compile-flet (fn-defs body)
   "Compile (flet ((name (params) body...) ...) body...).
    Tries the capture-lifting path first (see %LIFT-CAPTURES); a call site that
@@ -487,13 +584,16 @@
              ;; the SOURCE lambda list and body, not the lifted ones: capture
              ;; lifting is about the closure this may end up not needing.
              (inl-plan (and (member name inline-names :test #'eq)
-                            (make-local-inline-plan name (cadr fdef) (cddr fdef)))))
+                            (make-local-inline-plan name (cadr fdef) (cddr fdef))))
+             (pfn (%flet-pfn-info fdef plan inl-plan body)))
         ;; Compile the lambda (in current scope, not extended)
         ;; CL spec: flet creates an implicit block named after the function
         ;; ((setf sym) names: block sym).
         (flet ((compile-the-lambda ()
                  (let ((*lift-block-tags* (if plan (cstate-block-tags) nil)))
-                   (compile-lambda params (%local-fn-block-body name fn-body)))))
+                   (compile-lambda params (if pfn
+                                              (%pfn-wrap-body name fn-body (car pfn))
+                                              (%local-fn-block-body name fn-body))))))
           ;; A definition that may be inlined away is compiled LATER, and only if
           ;; the body turns out to still reach the binding. Not merely dropped
           ;; after the fact: compiling a closure that contains a RETURN-FROM out
@@ -507,7 +607,7 @@
                                     ,@(compile-the-lambda)
                                     (:stloc ,key))))
                 fn-instrs)
-          (push (list name-str key nil (and plan caps) (and plan tag) inl-plan name)
+          (push (list name-str key nil (and plan caps) (and plan tag) inl-plan name pfn)
                 new-local-fns)
           ;; Track in *locals* so closures can capture flet functions, under
           ;; the __LABELFN_ prefix only, as LABELS does: CL is a Lisp-2, and an
@@ -942,10 +1042,13 @@
   (let ((outer-cstate *cstate*)
         (box-instrs '())
         (new-local-fns '())
-        (fn-compile-list '()))
+        (fn-compile-list '())
+        (pfn-plan (and (not (eq fn-defs *labels-once-inner*))
+                       (%labels-pfn-plan fn-defs body))))
     ;; Phase 1: Allocate boxes for all function names
     (dolist (fdef fn-defs)
       (let* ((name (car fdef))
+             (pfn (cdr (assoc name pfn-plan :test #'eq)))
              (name-str (mangle-name name))
              (key (gen-local name-str)))
         (setf box-instrs
@@ -953,8 +1056,8 @@
                       `((:declare-local ,key "LispObject[]")
                         (:ldc-i4 1) (:newarr "LispObject")
                         (:stloc ,key))))
-        (push (list name-str key t nil nil nil name) new-local-fns)
-        (push (list name (cadr fdef) (cddr fdef) key) fn-compile-list)))
+        (push (list name-str key t nil nil nil name pfn) new-local-fns)
+        (push (list name (cadr fdef) (cddr fdef) key pfn) fn-compile-list)))
     (setf new-local-fns (nreverse new-local-fns))
     (setf fn-compile-list (nreverse fn-compile-list))
     ;; Phase 2: Compile each function body in scope of ALL labels names
@@ -1014,7 +1117,11 @@
                      (let ((*cstate* (cstate-with *cstate*
                                        +cs-tco-local-fn-key+ key
                                        +cs-tco-self-symbol+ (if (symbolp name) name nil))))
-                       (compile-lambda params (%local-fn-block-body name fn-body) name-str))))
+                       (compile-lambda params
+                                       (if (fifth entry)
+                                           (%pfn-wrap-body name fn-body (car (fifth entry)))
+                                           (%local-fn-block-body name fn-body))
+                                       name-str))))
                  ;; Speculative direct+TCO: try compiling this labels fn
                  ;; through the direct path so a single self-tail-recursion is
                  ;; TCO'd instead of overflowing. Accept only when the generated

@@ -32,7 +32,7 @@
 (defun nvm-record-text (core platform)
   (with-standard-io-syntax
     (prin1-to-string
-     `(:dotcl-version "0.0.1-test" :core ,core
+     `(:dotcl-version "99.0.0-test" :core ,core
        ,@(unless (eq platform :none) (list :platform platform))
        :fasls (("src/x.lisp.fasl" . "src/x.lisp"))))))
 
@@ -65,7 +65,7 @@ PLATFORM (:NONE leaves the platform out, as dotcl before it was recorded did)."
             (nuget::%place-fasls dir)))
       (list n seen
             (dotnet:static "System.IO.File" "ReadAllText" (nvm-target dir))
-            (and (search "was compiled by dotcl 0.0.1-test" out) t)
+            (and (search "was compiled by dotcl 99.0.0-test" out) t)
             (count #\Newline (string-right-trim '(#\Newline) out)))))
   (1 (nuget:fasl-version-mismatch) "pretend fasl" t 0))
 
@@ -208,9 +208,9 @@ what was written to *ERROR-OUTPUT*."
 ;;; (a) Another dotcl: the shipped fasl is loaded, after one warning line.
 (deftest-emitting-only nuget-fasl.load-other-dotcl
   (let ((dir (nvm-layout "nvm-a")))
-    (nvm-edit-record dir :core "0123456789abcdef" :dotcl-version "0.0.1-test")
+    (nvm-edit-record dir :core "0123456789abcdef" :dotcl-version "99.0.0-test")
     (multiple-value-bind (which out) (nvm-load "nvm-a" dir)
-      (list which (and (search "was compiled by dotcl 0.0.1-test" out) t))))
+      (list which (and (search "was compiled by dotcl 99.0.0-test" out) t))))
   (:fasl t))
 
 ;;; (b) The handler picks COMPILE-FROM-SOURCE: the source is compiled and loaded.
@@ -267,3 +267,91 @@ many references were changed (one, or the test is not testing anything)."
                                        '(:windows :win32 :x86)))
     (values (nvm-load "nvm-d" dir)))
   :source)
+
+;;; --- The version rule: a dotcl reads what an older one (0.1.34 and later) wrote ----------------
+
+(defun nvm-versioned-tree (version &key (platform (nuget::%platform-features)) host-independent)
+  (let ((dir (nvm-dir "versioned")))
+    (nvm-write dir "src/x.lisp" "(defun nvm-x () 1)")
+    (nvm-write dir "src/x.lisp.fasl" "pretend fasl")
+    (nvm-write dir "dotcl-build.sexp"
+               (with-standard-io-syntax
+                 (prin1-to-string
+                  `(:dotcl-version ,version :core "not-this-core" :platform ,platform
+                    ,@(and host-independent '(:host-independent t))
+                    :fasls (("src/x.lisp.fasl" . "src/x.lisp"))))))
+    dir))
+
+(defun nvm-place-versioned (version &rest keys &key (reading "0.1.40") &allow-other-keys)
+  "(values placed-count warned text-written-to-error-output) for a tree built by VERSION, read
+by a dotcl of version READING (default 0.1.40; the running version is whatever the checkout was
+built as, and a build without git tags says 0.0.0)."
+  (let* ((dir (apply #'nvm-versioned-tree version (loop for (k v) on keys by #'cddr unless (eq k :reading) append (list k v))))
+         (nuget::*reading-version* reading)
+         (warned nil))
+    (multiple-value-bind (n out)
+        (nvm-capturing-errors
+          (handler-bind ((warning (lambda (c) c (setf warned t))))
+            (nuget::%place-fasls dir)))
+      (values n warned out))))
+
+(deftest nuget-fasl.version-numbers
+  (list (nuget::%version-numbers "0.1.36+327.g429aec7.dirty")
+        (nuget::%version-numbers "0.1.34")
+        (nuget::%version-numbers "99.0.0-test")
+        (nuget::%version-numbers "garbage")
+        (nuget::%version-numbers nil)
+        (nuget::%version< '(0 1 33) '(0 1 34))
+        (nuget::%version< '(0 1 34) '(0 1 34))
+        (nuget::%version< '(0 2) '(0 1 99))
+        (nuget::%version< '(0 1) '(0 1 0 1)))
+  ((0 1 36) (0 1 34) (99 0 0) nil nil t nil nil t))
+
+;;; Older than this dotcl but 0.1.34 or later: the fasls are used as they are, silently.
+(deftest nuget-fasl.older-dotcl-fasls-load-silently
+  (multiple-value-bind (n warned out) (nvm-place-versioned "0.1.34")
+    (list n warned out))
+  (1 nil ""))
+
+;;; Newer than this dotcl: the same warning as for any other dotcl, then the fasls (the loader
+;;; refuses one that needs a newer runtime, as before).
+(deftest nuget-fasl.newer-dotcl-still-warns
+  (multiple-value-bind (n warned out) (nvm-place-versioned "99.0.0")
+    (list n warned (and (search "was compiled by dotcl 99.0.0" out) t)))
+  (1 t t))
+
+;;; Below 0.1.34, or a version that cannot be read: the sources, without an error or a warning.
+(deftest nuget-fasl.too-old-dotcl-compiles-sources
+  (let ((r '()))
+    (dolist (v '("0.1.33" "0.0.1-test" "garbage"))
+      (multiple-value-bind (n warned out) (nvm-place-versioned v)
+        (push (list n warned (and (search "so its sources are compiled instead" out) t)) r)))
+    (nreverse r))
+  ((nil nil t) (nil nil t) (nil nil t)))
+
+;;; A package that declares itself host independent is used on another platform.
+(deftest nuget-fasl.host-independent-ignores-platform
+  (let ((other (if (member :windows *features*) '(:linux :unix :x86-64) '(:windows :win32 :x86))))
+    (list (nvm-place-versioned "0.1.34" :platform other :host-independent t)
+          (nvm-place-versioned "0.1.34" :platform other)))
+  (1 nil))
+
+;;; The packer writes the declaration into the build record, and the record reads back.
+(deftest nuget-fasl.build-record-host-independent
+  (let ((with (read-from-string (asdf-nuget::%build-record '(("a.fasl" . "a.lisp")) t)))
+        (without (read-from-string (asdf-nuget::%build-record '(("a.fasl" . "a.lisp"))))))
+    (list (getf with :host-independent) (getf without :host-independent :absent)
+          (getf with :fasls) (and (getf with :platform) t)))
+  (t :absent (("a.fasl" . "a.lisp")) t))
+
+;;; A dotcl built from a source without git tags (a bundle clone, git archive) says 0.0.0, and
+;;; one whose version is not a number at all is "unknown": either way every recorded version
+;;; looks the same or newer, so the shipped fasls are used after the usual warning -- neither
+;;; silently nor from source.
+(deftest nuget-fasl.reader-without-a-version-warns
+  (let ((r '()))
+    (dolist (reading '("0.0.0" "unknown"))
+      (multiple-value-bind (n warned) (nvm-place-versioned "0.1.34" :reading reading)
+        (push (list n warned) r)))
+    (nreverse r))
+  ((1 t) (1 t)))

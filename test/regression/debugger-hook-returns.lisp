@@ -124,12 +124,13 @@ HANDLER-BIND around it was given, oldest first."
 ;;; run through the tree-walk interpreter under :INTERPRET, where LOAD would
 ;;; compile the rest of this file.
 ;;;
-;;; *DEBUGGER-HOOK* is bound to NIL so the debugger itself is what runs: a
-;;; script started with --core has a hook that prints and exits the process.
+;;; *DEBUGGER-HOOK* and dotcl:*INVOKE-DEBUGGER-HOOK* are bound to NIL so the debugger itself
+;;; is what runs: a script started with --core has a hook that prints and exits the process
+;;; (in dotcl:*invoke-debugger-hook*, which runs before *debugger-hook*).
 
 (defun rdh-ignore-errors-invoke-debugger ()
   (let ((r (multiple-value-list
-            (let ((*debugger-hook* nil))
+            (let ((*debugger-hook* nil) (dotcl:*invoke-debugger-hook* nil))
               (ignore-errors (invoke-debugger (make-condition 'warning)))))))
     (list (first r) (typep (second r) 'error))))
 
@@ -139,7 +140,7 @@ HANDLER-BIND around it was given, oldest first."
 
 (deftest rdh-non-error-invoke-debugger-ignore-errors-eval
   (eval '(let ((r (multiple-value-list
-                   (let ((*debugger-hook* nil))
+                   (let ((*debugger-hook* nil) (dotcl:*invoke-debugger-hook* nil))
                      (ignore-errors (invoke-debugger (make-condition 'warning)))))))
           (list (first r) (typep (second r) 'error))))
   (nil t))
@@ -147,7 +148,7 @@ HANDLER-BIND around it was given, oldest first."
 ;;; The first clause whose type matches takes it, and a clause that does not
 ;;; match lets it go on to the next HANDLER-CASE out.
 (deftest rdh-unsignalled-error-clause-order-eval
-  (eval '(let ((*debugger-hook* nil))
+  (eval '(let ((*debugger-hook* nil) (dotcl:*invoke-debugger-hook* nil))
           (handler-case
               (handler-case (invoke-debugger (make-condition 'warning))
                 (warning () :warning)
@@ -161,7 +162,7 @@ HANDLER-BIND around it was given, oldest first."
 ;;; The clause runs after the unwind: a cleanup in the body comes first, as it
 ;;; does when the error is signalled to the clause.
 (deftest rdh-unsignalled-error-cleanup-first-eval
-  (eval '(let ((log '()) (*debugger-hook* nil))
+  (eval '(let ((log '()) (*debugger-hook* nil) (dotcl:*invoke-debugger-hook* nil))
           (handler-case (unwind-protect (invoke-debugger (make-condition 'warning))
                           (push :cleanup log))
             (error () (push :clause log)))

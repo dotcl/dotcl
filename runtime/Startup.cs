@@ -347,7 +347,7 @@ public static class Startup
     // the machine or of this particular image is decided in Initialize().
     private static readonly HashSet<string> _features = new()
     {
-        "DOTCL", "COMMON-LISP", "NET", "UNICODE", "PACKAGE-LOCAL-NICKNAMES"
+        "DOTCL", "COMMON-LISP", "ANSI-CL", "IEEE-FLOATING-POINT", "NET", "UNICODE", "PACKAGE-LOCAL-NICKNAMES"
     };
 
     private static bool _initialized;
@@ -645,7 +645,7 @@ public static class Startup
         starStderr.Value = ErrorOutput;
 
         // Bidirectional I/O streams
-        var termIO = new LispBidirectionalStream(hostStdin, hostStdout);
+        var termIO = new LispBidirectionalStream(hostStdin, hostStdout) { LineStateOwner = StandardOutput };
         foreach (var name in new[] { "*DEBUG-IO*", "*QUERY-IO*", "*TERMINAL-IO*" })
         {
             var sym = InternExport(name);
@@ -1390,14 +1390,40 @@ public static class Startup
     /// as T.Instance / Nil.Instance, not their package-table entries.</summary>
     internal static LispObject SymValue(string name) => Runtime.CanonicalizeSymbol(Sym(name));
 
+    // A small direct-mapped cache in front of _symCache, keyed by the identity of the name string:
+    // the callers pass string literals (Sym("*PACKAGE*") and the like), the same object every time,
+    // so a hit costs an identity hash and a reference compare instead of hashing the characters
+    // in a ConcurrentDictionary. A slot holds a name and its symbol together, replaced as a whole;
+    // only resolutions that _symCache pins are stored, so a hit answers what Sym would.
+    private sealed class SymFrontSlot
+    {
+        public readonly string Name;
+        public readonly Symbol Sym;
+        public SymFrontSlot(string name, Symbol sym) { Name = name; Sym = sym; }
+    }
+    private static readonly SymFrontSlot?[] _symFront = new SymFrontSlot?[4096];
+
     public static Symbol Sym(string name)
     {
-        if (_symCache.TryGetValue(name, out var cached)) return cached;
+        var slot = _symFront[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(name) & 4095];
+        if (slot != null && ReferenceEquals(slot.Name, name)) return slot.Sym;
+        return SymSlow(name);
+    }
+
+    private static Symbol Pinned(string name, Symbol sym)
+    {
+        _symFront[System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(name) & 4095] = new SymFrontSlot(name, sym);
+        return sym;
+    }
+
+    private static Symbol SymSlow(string name)
+    {
+        if (_symCache.TryGetValue(name, out var cached)) return Pinned(name, cached);
         var (sym, status) = CL.FindSymbol(name);
-        if (status != SymbolStatus.None) { _symCache[name] = sym; return sym; }
+        if (status != SymbolStatus.None) { _symCache[name] = sym; return Pinned(name, sym); }
         // Symbols not in CL go to DOTCL-INTERNAL.
         var (sym2, status2) = Internal.FindSymbol(name);
-        if (status2 != SymbolStatus.None) { _symCache[name] = sym2; return sym2; }
+        if (status2 != SymbolStatus.None) { _symCache[name] = sym2; return Pinned(name, sym2); }
         // Cross-package bridge (replaces the old flat _functions table), limited
         // to dotcl's own namespace: see Package.IsBridgeSource.
         foreach (var pkg in Package.AllPackages)
@@ -1409,7 +1435,7 @@ public static class Startup
                 if (TraceBridge)
                     Console.Error.WriteLine($"[Sym bridge] {name} -> {existingSym.HomePackage?.Name ?? pkg.Name}::{name}");
                 _symCache[name] = existingSym;
-                return existingSym;
+                return Pinned(name, existingSym);
             }
         }
         // Intern a fresh placeholder in DOTCL-INTERNAL, but DO NOT cache.
@@ -1599,18 +1625,32 @@ public static class Startup
     // mapping to the cached symbol (a SHADOWING-IMPORT swapping it for another
     // package's symbol, say) must be looked up again, or fasl code that first
     // runs after the swap gets the symbol the package no longer has.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<(string, string), (Symbol Sym, int Epoch)> _symInPkgCache = new();
+    // Package name -> symbol name -> entry, with reference types throughout: a
+    // framework generic over a value tuple is not precompiled in a ReadyToRun image.
+    private sealed class SymCacheEntry
+    {
+        public readonly Symbol Sym;
+        public readonly int Epoch;
+        public SymCacheEntry(Symbol sym, int epoch) { Sym = sym; Epoch = epoch; }
+    }
+    private static System.Collections.Concurrent.ConcurrentDictionary<string, System.Collections.Concurrent.ConcurrentDictionary<string, SymCacheEntry>>? _lz__symInPkgCache;
+    private static System.Collections.Concurrent.ConcurrentDictionary<string, System.Collections.Concurrent.ConcurrentDictionary<string, SymCacheEntry>> _symInPkgCache => System.Threading.Volatile.Read(ref _lz__symInPkgCache) ?? System.Threading.Interlocked.CompareExchange(ref _lz__symInPkgCache, new(), null) ?? _lz__symInPkgCache!;
+
+    private static void CacheSymInPkg(string name, string pkgName, Symbol sym, int epoch)
+    {
+        var table = _symInPkgCache.GetOrAdd(pkgName, static _ => new());
+        table[name] = new SymCacheEntry(sym, epoch);
+    }
 
     public static Symbol SymInPkg(string name, string pkgName)
     {
-        var key = (name, pkgName);
         int epoch = Package.MappingEpoch;
-        if (_symInPkgCache.TryGetValue(key, out var cached) && cached.Epoch == epoch) return cached.Sym;
+        if (_symInPkgCache.TryGetValue(pkgName, out var byName) && byName.TryGetValue(name, out var cached) && cached.Epoch == epoch) return cached.Sym;
         var pkg = Package.FindPackagePhysical(pkgName);
         if (pkg != null)
         {
             var (sym, status) = pkg.FindSymbol(name);
-            if (status != SymbolStatus.None) { _symInPkgCache[key] = (sym, epoch); return sym; }
+            if (status != SymbolStatus.None) { CacheSymInPkg(name, pkgName, sym, epoch); return sym; }
             var (newSym, _) = pkg.Intern(name);
             // No cross-package Function copy here: interning PKG::NAME must not
             // give the fresh symbol another package's function. Unqualified
@@ -1620,7 +1660,7 @@ public static class Startup
             // Copying grafted e.g. ASDF/FOOTER::EMPTYP onto a user package's
             // freshly interned EMPTYP, making DEFGENERIC see a bogus ordinary
             // function (and any funcall of that symbol reach the wrong one).
-            _symInPkgCache[key] = (newSym, epoch);
+            CacheSymInPkg(name, pkgName, newSym, epoch);
             return newSym;
         }
         // Fallback to CL: package doesn't exist yet
@@ -1636,6 +1676,33 @@ public static class Startup
             sym.Value = sym; // keywords are self-evaluating
         }
         return sym;
+    }
+
+    /// <summary>The C3 linearization of CLS with direct superclasses SUPERS (each already linearized),
+    /// or null when the superclass orders cannot be merged.</summary>
+    private static LispClass[]? C3Linearization(LispClass cls, LispClass[] supers)
+    {
+        var lists = new List<List<LispClass>>();
+        foreach (var s in supers) lists.Add(new List<LispClass>(s.ClassPrecedenceList));
+        lists.Add(new List<LispClass>(supers));
+        var result = new List<LispClass> { cls };
+        while (true)
+        {
+            lists.RemoveAll(l => l.Count == 0);
+            if (lists.Count == 0) return result.ToArray();
+            LispClass? next = null;
+            foreach (var l in lists)
+            {
+                var cand = l[0];
+                bool inTail = false;
+                foreach (var m in lists)
+                    if (m.IndexOf(cand) > 0) { inTail = true; break; }
+                if (!inTail) { next = cand; break; }
+            }
+            if (next == null) return null;
+            result.Add(next);
+            foreach (var l in lists) if (l[0] == next) l.RemoveAt(0);
+        }
     }
 
     private static void InitializeBuiltinClasses()
@@ -1666,7 +1733,7 @@ public static class Startup
             var cpl = new List<LispClass>();
             for (int i = rawCpl.Count - 1; i >= 0; i--)
                 if (seen.Add(rawCpl[i])) cpl.Insert(0, rawCpl[i]);
-            cls.ClassPrecedenceList = cpl.ToArray();
+            cls.ClassPrecedenceList = C3Linearization(cls, supers) ?? cpl.ToArray();
             // Inherit effective slots from superclasses
             var inheritedSlots = new List<SlotDefinition>();
             var seenSlotNames = new HashSet<string>();
@@ -1733,7 +1800,7 @@ public static class Startup
         var cellError = MakeCondClassWithSlots("CELL-ERROR", error, "NAME");
         MakeCondClass("UNBOUND-VARIABLE", cellError);
         MakeCondClass("UNDEFINED-FUNCTION", cellError);
-        MakeCondClassWithSlots("PACKAGE-ERROR", error, "PACKAGE");
+        var packageError = MakeCondClassWithSlots("PACKAGE-ERROR", error, "PACKAGE");
         var arithmeticError = MakeCondClassWithSlots("ARITHMETIC-ERROR", error, "OPERATION", "OPERANDS");
         MakeCondClass("DIVISION-BY-ZERO", arithmeticError);
         MakeCondClass("CONTROL-ERROR", error);
@@ -1754,7 +1821,9 @@ public static class Startup
         MakeCondClass("SIMPLE-ERROR", simpleCondition, error);       // [SIMPLE-ERROR, SIMPLE-CONDITION, ERROR, ...]
         MakeCondClass("SIMPLE-WARNING", simpleCondition, warning);   // [SIMPLE-WARNING, SIMPLE-CONDITION, WARNING, ...]
         MakeCondClass("SIMPLE-TYPE-ERROR", simpleCondition, typeError); // [SIMPLE-TYPE-ERROR, SIMPLE-CONDITION, TYPE-ERROR, ...]
-        MakeCondClass("READER-ERROR", parseError, streamError);      // [READER-ERROR, PARSE-ERROR, STREAM-ERROR, ...]
+        var readerError = MakeCondClass("READER-ERROR", parseError, streamError);      // [READER-ERROR, PARSE-ERROR, STREAM-ERROR, ...]
+        // A package named in a token that does not exist: both a READER-ERROR and a PACKAGE-ERROR.
+        MakeCondClass("READER-PACKAGE-ERROR", readerError, packageError);
 
         // Built-in type classes (for defmethod specializers like (function function))
         var function_ = MakeClass("FUNCTION", tClass);
@@ -2044,6 +2113,9 @@ public static class Startup
             var fslFn = new LispFunction(Runtime.FunctionSourceLocation, "DOTCL:FUNCTION-SOURCE-LOCATION", -1).WithArgCount(1, 1);
             RegisterDotcl("FUNCTION-SOURCE-LOCATION", fslFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:FUNCTION-SOURCE-LOCATION", fslFn);
+            var rsrFn = new LispFunction(Runtime.RegisterSourceRoot, "DOTCL:REGISTER-SOURCE-ROOT", -1).WithArgCount(2, 2);
+            RegisterDotcl("REGISTER-SOURCE-ROOT", rsrFn);
+            Emitter.CilAssembler.RegisterFunction("DOTCL:REGISTER-SOURCE-ROOT", rsrFn);
             var dssFn = new LispFunction(Runtime.DefinitionSources, "DOTCL:DEFINITION-SOURCES", -1).WithArgCount(1, 1);
             RegisterDotcl("DEFINITION-SOURCES", dssFn);
             Emitter.CilAssembler.RegisterFunction("DOTCL:DEFINITION-SOURCES", dssFn);
@@ -2231,7 +2303,7 @@ public static class Startup
 
         // Pinned vectors: a specialized vector whose storage the GC does not move,
         // so foreign code can use its address (the static-vectors backend).
-        RegisterDotcl("MAKE-PINNED-VECTOR", new LispFunction(Runtime.MakePinnedVector, "DOTCL:MAKE-PINNED-VECTOR", 2));
+        RegisterDotcl("MAKE-PINNED-VECTOR", new LispFunction(Runtime.MakePinnedVector, "DOTCL:MAKE-PINNED-VECTOR", 2).WithKeyArgs(2, 2, false, "ALIGNMENT"));
         RegisterDotcl("PINNED-VECTOR-ADDRESS", new LispFunction(Runtime.PinnedVectorAddress, "DOTCL:PINNED-VECTOR-ADDRESS", 1));
         RegisterDotcl("PINNED-VECTOR-P", new LispFunction(Runtime.PinnedVectorP, "DOTCL:PINNED-VECTOR-P", 1));
         RegisterDotcl("UNPIN-VECTOR", new LispFunction(Runtime.UnpinVector, "DOTCL:UNPIN-VECTOR", 1));
@@ -2427,6 +2499,16 @@ public static class Startup
         hostIgnoreSym.IsSpecial = true;
         hostIgnoreSym.Value = Nil.Instance;
 
+        // dotcl:*source-path-map*: ((FROM . TO) ...) strings; COMPILE-FILE writes the source path
+        // of each definition into the fasl with a leading FROM replaced by TO (the longest FROM
+        // wins). NIL: the absolute path as it is. Also read from DOTCL_SOURCE_PATH_MAP,
+        // "from=to;from=to", when the variable is NIL. For builds that must not depend on where
+        // the checkout is.
+        var sourcePathMapSym = SymInPkg("*SOURCE-PATH-MAP*", "DOTCL");
+        DotclPkg.Export(sourcePathMapSym);
+        sourcePathMapSym.IsSpecial = true;
+        sourcePathMapSym.Value = Nil.Instance;
+
         RegisterDotcl("FASL-HOST-FEATURES", new LispFunction(args => {
             if (args.Length != 1)
                 throw new LispErrorException(new LispProgramError(
@@ -2619,12 +2701,48 @@ public static class Startup
         if (exitHooks.Value == null) exitHooks.Value = Nil.Instance;
         Runtime.InstallExitHooks(exitHooks);
 
-        // dotcl:quit: exit the process (like sb-ext:exit on SBCL)
+        // dotcl:quit: exit the process (like sb-ext:exit on SBCL). (quit [code] [:abort t]):
+        // a script's thread unwinds first, so cleanup forms of UNWIND-PROTECT run; with
+        // :abort true the process ends at once without running them.
         RegisterDotcl("QUIT", new LispFunction(args => {
+            // The exit code is an integer (NIL: none, 0); anything else is a TYPE-ERROR, not exit 0.
+            if (args.Length > 0 && args[0] is not (Fixnum or Nil) && !(args[0] is Symbol { Name: "ABORT" }))
+                throw new LispErrorException(new LispTypeError("QUIT: the exit code must be an integer", args[0], Startup.Sym("INTEGER")));
             int code = args.Length > 0 && args[0] is Fixnum n ? (int)n.Value : 0;
-            System.Environment.Exit(code);
+            bool abort = false;
+            for (int i = 1; i + 1 < args.Length; i += 2)
+                if (args[i] is Symbol k && k.Name == "ABORT") abort = args[i + 1] is not Nil;
+            Runtime.ExitProcess(code, abort);
             return Nil.Instance; // unreachable
-        }).WithArgCount(0, 1));
+        }).WithKeyArgs(0, 1, false, "ABORT"));
+
+        // dotcl:exit: SBCL's (exit &key code abort timeout), for scripts written against
+        // sb-ext:exit. The same exit as QUIT; TIMEOUT is accepted and ignored.
+        RegisterDotcl("EXIT", new LispFunction(args => {
+            int code = 0;
+            bool abort = false;
+            if (args.Length % 2 != 0)
+                throw new LispErrorException(new LispProgramError("EXIT: odd number of keyword arguments"));
+            for (int i = 0; i + 1 < args.Length; i += 2)
+            {
+                if (args[i] is not Symbol k)
+                    throw new LispErrorException(new LispProgramError("EXIT: keyword argument must be a symbol"));
+                switch (k.Name)
+                {
+                    case "CODE":
+                        if (args[i + 1] is Fixnum n) code = (int)n.Value;
+                        else if (args[i + 1] is not Nil)
+                            throw new LispErrorException(new LispTypeError("EXIT: the exit code must be an integer", args[i + 1], Startup.Sym("INTEGER")));
+                        break;
+                    case "ABORT": abort = args[i + 1] is not Nil; break;
+                    case "TIMEOUT": case "ALLOW-OTHER-KEYS": break;
+                    default:
+                        throw new LispErrorException(new LispProgramError($"EXIT: unrecognized keyword argument :{k.Name}"));
+                }
+            }
+            Runtime.ExitProcess(code, abort);
+            return Nil.Instance; // unreachable
+        }, "EXIT", -1));
 
         // dotcl:script-arguments: what a script was given, and nothing else.
         //
@@ -2638,6 +2756,13 @@ public static class Startup
             if (sa != null)
                 for (int i = sa.Count - 1; i >= 0; i--)
                     result = new Cons(new LispString(sa[i]), result);
+            else if (Runtime.HostIsApplication)
+            {
+                // An application executable: everything after argv[0] is the program's.
+                var argv = System.Environment.GetCommandLineArgs();
+                for (int i = argv.Length - 1; i >= 1; i--)
+                    result = new Cons(new LispString(argv[i]), result);
+            }
             return result;
         }, "SCRIPT-ARGUMENTS", 0).WithArgCount(0, 0));
 
@@ -2723,7 +2848,7 @@ public static class Startup
             var moduleName = (args.Length >= 3 && args[2] is LispString mn && mn.Value.Length > 0)
                 ? mn.Value
                 : System.IO.Path.GetFileNameWithoutExtension(outPath)
-                    + "_" + System.Guid.NewGuid().ToString("N").Substring(0, 8);
+                    + "_" + Runtime.ModuleNameSuffix(inPath, outPath);
             var corlib = (args.Length >= 4 && args[3] is LispString cl && cl.Value.Length > 0)
                 ? cl.Value
                 : null;
@@ -3173,6 +3298,8 @@ public static class Startup
             new LispFunction(Runtime.DestroyThread, "DESTROY-THREAD", 1));
         RegisterDotcl("INTERRUPT-THREAD",
             new LispFunction(Runtime.InterruptThread, "INTERRUPT-THREAD", 2));
+        RegisterDotcl("VALID-TYPE-SPECIFIER-P",
+            new LispFunction(Runtime.ValidTypeSpecifierP, "VALID-TYPE-SPECIFIER-P", 1).WithArgCount(1, 1));
         RegisterDotcl("KNOWN-TYPE-NAME-P",
             new LispFunction(Runtime.KnownTypeNameP, "KNOWN-TYPE-NAME-P", 1).WithArgCount(1, 1));
         // DEFTYPE expansion, the MACROEXPAND-1 / MACROEXPAND of type specifiers:
@@ -3565,12 +3692,12 @@ public static class Startup
         }, "DOTNET:HINT-TYPE", 1),
             "(dotnet:hint-type obj) => type-or-nil\nFor a dotnet:box value, return its hint type (the user-supplied static type used\nto choose overloads) as a System.Type; NIL if OBJ carries no hint. See\ndotnet:object-type for the actual runtime type.");
         RegisterDotNet(DotNetPkg, "TYPE-NAMES", new LispFunction(Runtime.DotNetTypeNames, "DOTNET:TYPE-NAMES", -1).WithKeyArgs(1, 1, false, "LIMIT"),
-            "(dotnet:type-names prefix &key limit) => list of plists\nThe type names starting with PREFIX, as (:name :kind). KIND is :class for a type and\n:namespace for a name that only leads to more names, so \"System.Te\" answers with the\nnamespace \"System.Text.\" as well as the types directly under it. LIMIT caps the\nresult (default 200). Indexed once per change to the loaded assemblies, so a package\npulled in with nuget:require shows up without restarting.");
+            "(dotnet:type-names prefix &key limit) => list of plists\nThe type names starting with PREFIX, as (:name :kind). KIND is :class for a type and\n:namespace for a name that only leads to more names, so \"System.Te\" answers with the\nnamespace \"System.Text.\" as well as the types directly under it. LIMIT caps the\nwhole result, namespaces first (default 200). Indexed once per change to the loaded assemblies, so a package\npulled in with nuget:require shows up without restarting.");
         RegisterDotNet(DotNetPkg, "DOCUMENTATION", new LispFunction(Runtime.DotNetDocumentation, "DOTNET:DOCUMENTATION", -1),
             "(dotnet:documentation type-or-object &optional member-name) => plist-or-nil\nThe prose .NET ships for a type, or for one of its members: (:summary :parameters\n:returns :exceptions), where :parameters and :exceptions are alists. Read from the XML\nfile beside the assembly, or from the reference pack for the shared framework (which\nships none). NIL when nothing documents it. A property accessor is answered under the\nproperty (get_Length as Length), and an inherited member under the type that declares\nit. e.g. (dotnet:documentation \"System.Text.StringBuilder\" \"AppendLine\").");
         RegisterDotNet(DotNetPkg, "MEMBERS", new LispFunction(Runtime.DotNetMembers, "DOTNET:MEMBERS", -1)
             .WithKeyArgs(1, 1, false, "KIND", "PREFIX", "STATIC", "INHERITED", "EXTENSIONS", "DOCUMENTATION"),
-            "(dotnet:members type-or-object &key kind prefix static inherited extensions documentation) => list of plists\nList what can be called on a type, or on the runtime type of an object: each entry is a plist\n(:name :kind :static :signature :declaring-type). KIND keeps one of :method :property :field\n:event :constructor; PREFIX keeps names starting with a string (case-insensitive); STATIC is\n:both (default), :static or :instance; INHERITED defaults to T; EXTENSIONS defaults to T and\nadds the extension methods that apply to the type. DOCUMENTATION adds :documentation, the\nsentence .NET ships for the member, to the entries that have one. Property accessors are listed under the\nnames dotnet:invoke takes (get_Item, set_Width).");
+            "(dotnet:members type-or-object &key kind prefix static inherited extensions documentation) => list of plists\nList what can be called on a type, or on the runtime type of an object: each entry is a plist\n(:name :kind :static :signature :declaring-type). KIND keeps one of :method :property :field\n:event :constructor; PREFIX keeps names starting with a string (case-insensitive); STATIC is\n:both (default), :static or :instance; INHERITED defaults to T; EXTENSIONS defaults to T and\nadds the extension methods that apply to the type. DOCUMENTATION adds :documentation, the\nsentence .NET ships for the member, to the entries that have one: T uses the files already read\nand never waits (the first call may carry none), :WAIT reads the file first. Property accessors are listed under the\nnames dotnet:invoke takes (get_Item, set_Width).");
         RegisterDotNet(DotNetPkg, "OBJECT-TYPE", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError($"DOTNET:OBJECT-TYPE: requires 1 argument, got {args.Length}"));
             return Runtime.DotNetObjectType(args[0]);
@@ -3620,7 +3747,8 @@ public static class Startup
 
     // Docstrings for DOTNET: built-ins, applied into the Lisp *documentation-table* after
     // the stdlib (which defines DOCUMENTATION) loads, via %DOTNET-DOC-ALIST (#25).
-    private static readonly List<(Symbol Sym, string Doc)> _dotnetDocs = new();
+    private static List<(Symbol Sym, string Doc)>? _lz__dotnetDocs;
+    private static List<(Symbol Sym, string Doc)> _dotnetDocs => System.Threading.Volatile.Read(ref _lz__dotnetDocs) ?? System.Threading.Interlocked.CompareExchange(ref _lz__dotnetDocs, new(), null) ?? _lz__dotnetDocs!;
 
     private static void RegisterDotNet(Package pkg, string name, LispFunction fn, string? doc = null)
     {

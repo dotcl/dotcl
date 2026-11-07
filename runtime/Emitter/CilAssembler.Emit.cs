@@ -286,7 +286,8 @@ public partial class CilAssembler
     internal static LispObject? ClosureSiteLambdaList(Delegate del)
         => _closureLambdaLists.TryGetValue(del, out var ll) ? ll : null;
 
-    private static readonly ConstructorInfo _lambdaListAttrCtor =
+    private static ConstructorInfo? _lazy__lambdaListAttrCtor;
+    private static ConstructorInfo _lambdaListAttrCtor => _lazy__lambdaListAttrCtor ??=
         typeof(LispLambdaListAttribute).GetConstructor(new[] { typeof(string), typeof(string) })!;
 
     /// <summary>Put an anonymous function's lambda list on the FASL method its
@@ -1475,6 +1476,8 @@ public partial class CilAssembler
     private static Type ResolveType(string name)
     {
         if (_typeCache.TryGetValue(name, out var t)) return t;
+        if (name.StartsWith("V128.", StringComparison.Ordinal) && Tables.TrySimdType(name, out t))
+            return t!;
         throw new Exception($"Unknown type: {name}");
     }
 

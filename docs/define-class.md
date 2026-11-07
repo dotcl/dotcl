@@ -325,6 +325,7 @@ dotcl build-library --system word-stats.asd --search-path ../text-util \
 ```
 
 ```lisp
+;; word-stats.asd, ../text-util/ and Contracts.dll are your own project's files
 (dotcl:build-library :system "word-stats.asd" :search-paths '("../text-util/")
                      :references '("Contracts.dll") :output "out/WordStatsPlugin.dll")
 ```

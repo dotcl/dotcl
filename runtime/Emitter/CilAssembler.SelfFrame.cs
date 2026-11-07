@@ -16,26 +16,36 @@ public partial class CilAssembler
     private LocalBuilder? _selfFrameLocal;
     private LocalBuilder? _ehMarker;
 
-    private static readonly MethodInfo[] s_enterN =
+    private static MethodInfo[]? _lazy_s_enterN;
+    private static MethodInfo[] s_enterN => _lazy_s_enterN ??= new MethodInfo[]
     {
         typeof(LispFunction).GetMethod("Enter0")!, typeof(LispFunction).GetMethod("Enter1")!,
         typeof(LispFunction).GetMethod("Enter2")!, typeof(LispFunction).GetMethod("Enter3")!,
         typeof(LispFunction).GetMethod("Enter4")!,
     };
-    private static readonly MethodInfo[] s_enterNU =
+    private static MethodInfo[]? _lazy_s_enterNU;
+    private static MethodInfo[] s_enterNU => _lazy_s_enterNU ??= new MethodInfo[]
     {
         typeof(LispFunction).GetMethod("Enter0U")!, typeof(LispFunction).GetMethod("Enter1U")!,
         typeof(LispFunction).GetMethod("Enter2U")!, typeof(LispFunction).GetMethod("Enter3U")!,
         typeof(LispFunction).GetMethod("Enter4U")!,
     };
-    private static readonly MethodInfo s_enterUnit = typeof(LispFunction).GetMethod("EnterUnit")!;
-    private static readonly MethodInfo s_leaveFrame = typeof(LispFunction).GetMethod("Leave")!;
-    private static readonly MethodInfo s_resumeFrame = typeof(LispFunction).GetMethod("Resume")!;
-    private static readonly MethodInfo s_resumeBelow = typeof(LispFunction).GetMethod("ResumeBelow")!;
-    private static readonly MethodInfo s_unlinkIfTop = typeof(LispFunction).GetMethod("UnlinkIfTop")!;
-    private static readonly MethodInfo s_selfTailEntry = typeof(LispFunction).GetMethod("SelfTailEntry")!;
-    private static readonly MethodInfo s_selfTailPrepare = typeof(LispFunction).GetMethod("SelfTailPrepare")!;
-    private static readonly FieldInfo s_tailLendMarker = typeof(LispFunction).GetField("TailLendMarker")!;
+    private static MethodInfo? _lazy_s_enterUnit;
+    private static MethodInfo s_enterUnit => _lazy_s_enterUnit ??= typeof(LispFunction).GetMethod("EnterUnit")!;
+    private static MethodInfo? _lazy_s_leaveFrame;
+    private static MethodInfo s_leaveFrame => _lazy_s_leaveFrame ??= typeof(LispFunction).GetMethod("Leave")!;
+    private static MethodInfo? _lazy_s_resumeFrame;
+    private static MethodInfo s_resumeFrame => _lazy_s_resumeFrame ??= typeof(LispFunction).GetMethod("Resume")!;
+    private static MethodInfo? _lazy_s_resumeBelow;
+    private static MethodInfo s_resumeBelow => _lazy_s_resumeBelow ??= typeof(LispFunction).GetMethod("ResumeBelow")!;
+    private static MethodInfo? _lazy_s_unlinkIfTop;
+    private static MethodInfo s_unlinkIfTop => _lazy_s_unlinkIfTop ??= typeof(LispFunction).GetMethod("UnlinkIfTop")!;
+    private static MethodInfo? _lazy_s_selfTailEntry;
+    private static MethodInfo s_selfTailEntry => _lazy_s_selfTailEntry ??= typeof(LispFunction).GetMethod("SelfTailEntry")!;
+    private static MethodInfo? _lazy_s_selfTailPrepare;
+    private static MethodInfo s_selfTailPrepare => _lazy_s_selfTailPrepare ??= typeof(LispFunction).GetMethod("SelfTailPrepare")!;
+    private static FieldInfo? _lazy_s_tailLendMarker;
+    private static FieldInfo s_tailLendMarker => _lazy_s_tailLendMarker ??= typeof(LispFunction).GetField("TailLendMarker")!;
 
     internal static bool CanSelfFrame(string name, int paramCount, bool noFrame) =>
         paramCount <= 4 && CanTypedFrame(name, paramCount, noFrame);
@@ -46,7 +56,8 @@ public partial class CilAssembler
         && !name.StartsWith("%MINI-", StringComparison.Ordinal)
         && !name.StartsWith("%CALL-WITH-", StringComparison.Ordinal);
 
-    private static readonly MethodInfo? s_dmDescriptor =
+    private static MethodInfo? _lazy_s_dmDescriptor;
+    private static MethodInfo? s_dmDescriptor => _lazy_s_dmDescriptor ??=
         typeof(DynamicMethod).GetMethod("GetMethodDescriptor", BindingFlags.NonPublic | BindingFlags.Instance);
 
     /// <summary>Zero when the runtime gives out no address: InvokeN only.</summary>
@@ -273,11 +284,15 @@ public partial class CilAssembler
         _il.Emit(OpCodes.Ldc_I4_0);
     }
 
-    private static readonly MethodInfo s_isSameFileFunction = typeof(CilAssembler).GetMethod("IsSameFileFunction")!;
+    private static MethodInfo? _lazy_s_isSameFileFunction;
+    private static MethodInfo s_isSameFileFunction => _lazy_s_isSameFileFunction ??= typeof(CilAssembler).GetMethod("IsSameFileFunction")!;
 
-    private static readonly MethodInfo s_passMode = typeof(MultipleValues).GetMethod("PassMode")!;
-    private static readonly MethodInfo s_sameFileTail = typeof(LispFunction).GetMethod("SameFileTail")!;
-    private static readonly MethodInfo s_sameFileTailFrom = typeof(LispFunction).GetMethod("SameFileTailFrom")!;
+    private static MethodInfo? _lazy_s_passMode;
+    private static MethodInfo s_passMode => _lazy_s_passMode ??= typeof(MultipleValues).GetMethod("PassMode")!;
+    private static MethodInfo? _lazy_s_sameFileTail;
+    private static MethodInfo s_sameFileTail => _lazy_s_sameFileTail ??= typeof(LispFunction).GetMethod("SameFileTail")!;
+    private static MethodInfo? _lazy_s_sameFileTailFrom;
+    private static MethodInfo s_sameFileTailFrom => _lazy_s_sameFileTailFrom ??= typeof(LispFunction).GetMethod("SameFileTailFrom")!;
 
     /// <summary>A :CALL-SAME-FILE in tail position: the frame this body owns is
     /// handed to the callee, as for a tail call through its entry.</summary>

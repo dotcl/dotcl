@@ -594,15 +594,117 @@ public static partial class Runtime
         return instArg; // return original instance (possibly wrapped)
     }
 
+    private static Symbol? _makeInstanceSym;
+
+    /// <summary>MAKE-INSTANCE with a class designator that is not a literal symbol (a
+    /// variable holding a symbol or a class object). With no method of the program on
+    /// MAKE-INSTANCE the generic function would only reach its default method, so that is
+    /// called directly; any other method, a redefinition of the function, or a customised
+    /// invocation protocol sends the call through the generic function as before.</summary>
+    public static LispObject MakeInstanceDyn(LispObject classSpec, LispObject[] initargs)
+    {
+        var gf = MakeInstanceGf;
+        var sym = _makeInstanceSym ??= Startup.Sym("MAKE-INSTANCE");
+        if (gf != null && gf.Methods.Count == 1 && ReferenceEquals(gf.Methods[0], MakeInstanceDefaultMethod)
+            && gf.DispatchFunction == null && ReferenceEquals(sym.Function, gf)
+            && !(AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf)))
+            return MakeInstanceWithInitargs(classSpec, initargs);
+        var all = new LispObject[initargs.Length + 1];
+        all[0] = classSpec;
+        Array.Copy(initargs, 0, all, 1, initargs.Length);
+        if (sym.Function is LispFunction lf) return lf.Invoke(all);
+        throw new LispErrorException(new LispError("MAKE-INSTANCE is not a function"));
+    }
+
     [System.Runtime.CompilerServices.MethodImpl((System.Runtime.CompilerServices.MethodImplOptions)512)] // AggressiveOptimization (not in netstandard2.0)
     public static LispObject MakeInstanceWithInitargs(LispObject classSpec, params LispObject[] initargs)
     {
+        if (classSpec is LispClass lcls && (initargs.Length & 1) == 0
+            && LivePlan(lcls) is { } cplan && MakeFromPlan(cplan, initargs) is { } cmade)
+            return MultipleValues.Alone(cmade);
         if (classSpec is Symbol sym && (initargs.Length & 1) == 0
             && (sym.ClassMemo is { } memo && memo.Epoch == ClassRegistry.Epoch
                     ? memo.AsClass : FindClassOrNil(sym) as LispClass) is { } cls
             && LivePlan(cls) is { } plan && MakeFromPlan(plan, initargs) is { } made)
             return MultipleValues.Alone(made);
+        // A MAKE-INSTANCE method of the program applies to this class (its metaclass
+        // is specialised on): the class name goes through the generic function, as
+        // AMOP's method on SYMBOL does by calling MAKE-INSTANCE on the class.
+        if (classSpec is Symbol csym && MakeInstanceGf != null && MakeInstanceGf.Methods.Count > 1
+            && FindClassOrNil(csym) is LispClass ocls && MakeInstanceOverridden(ocls))
+        {
+            var viaGf = new LispObject[initargs.Length + 1];
+            viaGf[0] = ocls;
+            Array.Copy(initargs, 0, viaGf, 1, initargs.Length);
+            return MakeInstanceGf.Invoke(viaGf);
+        }
         return MultipleValues.Alone(MakeInstanceOf(classSpec, initargs));
+    }
+
+    // MAKE-INSTANCE of a literal class name with one to three literal keywords: the
+    // initargs arrive as arguments. The plan builds the instance from them; anything the
+    // plan does not take (no plan yet, :DEFAULT-INITARGS, :AFTER methods, a keyword not
+    // seen before, a program method on MAKE-INSTANCE) goes the array way, as before.
+    public static LispObject MakeInstanceKV1(LispObject classSpec, LispObject k0, LispObject v0)
+        => MakeKV(classSpec, 1, k0, v0, null, null, null, null);
+
+    public static LispObject MakeInstanceKV2(LispObject classSpec, LispObject k0, LispObject v0,
+                                             LispObject k1, LispObject v1)
+        => MakeKV(classSpec, 2, k0, v0, k1, v1, null, null);
+
+    public static LispObject MakeInstanceKV3(LispObject classSpec, LispObject k0, LispObject v0,
+                                             LispObject k1, LispObject v1, LispObject k2, LispObject v2)
+        => MakeKV(classSpec, 3, k0, v0, k1, v1, k2, v2);
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static LispObject MakeKV(LispObject classSpec, int n, LispObject k0, LispObject v0,
+                                     LispObject? k1, LispObject? v1, LispObject? k2, LispObject? v2)
+    {
+        if (classSpec is Symbol sym
+            && (sym.ClassMemo is { } memo && memo.Epoch == ClassRegistry.Epoch
+                    ? memo.AsClass : FindClassOrNil(sym) as LispClass) is { } cls
+            && LivePlan(cls) is { } plan && plan.TryMakeKV(n, k0, v0, k1, v1, k2, v2) is { } made)
+            return MultipleValues.Alone(made);
+        return MakeKVSlow(classSpec, n, k0, v0, k1, v1, k2, v2);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispObject MakeKVSlow(LispObject classSpec, int n, LispObject k0, LispObject v0,
+                                         LispObject? k1, LispObject? v1, LispObject? k2, LispObject? v2)
+    {
+        var args = new LispObject[n * 2];
+        args[0] = k0; args[1] = v0;
+        if (n > 1) { args[2] = k1!; args[3] = v1!; }
+        if (n > 2) { args[4] = k2!; args[5] = v2!; }
+        return MakeInstanceWithInitargs(classSpec, args);
+    }
+
+    /// <summary>The MAKE-INSTANCE generic function and its default method, set when
+    /// they are made (Runtime.CLOS.Builtins).</summary>
+    internal static GenericFunction? MakeInstanceGf;
+    internal static LispMethod? MakeInstanceDefaultMethod;
+
+    /// <summary>True when a method of the program on MAKE-INSTANCE applies to the class
+    /// object CLS: one specialised on a class of its metaclass, or EQL to it. Only
+    /// asked once such a method exists.</summary>
+    internal static bool MakeInstanceOverridden(LispClass cls)
+    {
+        var gf = MakeInstanceGf;
+        if (gf == null || gf.Methods.Count <= 1) return false;
+        var meta = ClassOf(cls) as LispClass;
+        if (meta == null) return false;
+        foreach (var m in gf.Methods)
+        {
+            if (ReferenceEquals(m, MakeInstanceDefaultMethod) || m.Specializers.Length == 0) continue;
+            var spec = m.Specializers[0];
+            if (spec is LispClass sc)
+            {
+                if (!IsSystemClass(sc, "T") && Array.IndexOf(meta.ClassPrecedenceList, sc) >= 0) return true;
+            }
+            else if (spec is EqlSpecializer es && ReferenceEquals(es.Object, cls))
+                return true;
+        }
+        return false;
     }
 
     // Method changes and class finalization move MethodEpoch; :DEFAULT-INITARGS set
@@ -1053,6 +1155,8 @@ public static partial class Runtime
         if (plan == null || plan.Epoch != epoch)
         {
             if (GenericFunction.MethodEpoch != epoch) return;
+            // A MAKE-INSTANCE method of the program applies to the class: no fast plan.
+            if (MakeInstanceOverridden(cls)) return;
             cls.Ctor = plan = new CtorPlan(cls, epoch, afters);
         }
         var map = cls.InitargToSlotIndex;
@@ -1315,6 +1419,14 @@ public static partial class Runtime
         {
             if (!_classRegistry.TryGetValue(sym, out newClass!))
                 throw new LispErrorException(new LispError($"CHANGE-CLASS: no class named {sym.Name}"));
+            // CLHS change-class: the method for a symbol calls CHANGE-CLASS again with the
+            // class named, so a method on the class (a :before, say) runs too.
+            if (Startup.Sym("CHANGE-CLASS").Function is GenericFunction ccGf)
+            {
+                var again = (LispObject[])args.Clone();
+                again[1] = newClass;
+                return ccGf.Invoke(again);
+            }
         }
         else
             throw new LispErrorException(new LispTypeError("CHANGE-CLASS: invalid class specifier", newClassSpec));

@@ -92,13 +92,25 @@ public class GrayStreamTextWriter : TextWriter
         Runtime.CallForPrimary(GetWriteCharFn(), _stream, LispChar.Make(value));
     }
 
+    /// <summary>WRITE-STRING / WRITE-LINE with :START and :END: the method gets the whole
+    /// string and the bounds, as SBCL does (the output is the same text).</summary>
+    public void WriteRange(string value, int start, int end)
+    {
+        var fn = GetWriteStringFn();
+        if (fn != null)
+            Runtime.CallForPrimary(fn, _stream, new LispString(value), Fixnum.Make(start), Fixnum.Make(end));
+        else
+            for (int i = start; i < end; i++) Write(value[i]);
+    }
+
     public override void Write(string? value)
     {
         if (value == null) return;
         var fn = GetWriteStringFn();
         if (fn != null)
         {
-            Runtime.CallForPrimary(fn, _stream, new LispString(value));
+            // CLHS 21.1.2: START and END are given; the whole string is 0 to its length.
+            Runtime.CallForPrimary(fn, _stream, new LispString(value), Fixnum.Make(0), Fixnum.Make(value.Length));
         }
         else
         {

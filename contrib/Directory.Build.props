@@ -1,0 +1,12 @@
+<Project>
+  <!-- Reproducible builds for the contrib projects, as in runtime/Directory.Build.props (which
+       does not reach this directory): on CI, or with -p:ContinuousIntegrationBuild=true (make
+       pack does), the checkout root is mapped to /_/ in the paths the compiler writes, so
+       the DLL (its PDB path) is the same wherever the checkout is. -->
+  <PropertyGroup>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(ContinuousIntegrationBuild)' == '' And '$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <DotclRepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../'))</DotclRepoRoot>
+    <PathMap Condition="'$(ContinuousIntegrationBuild)' == 'true'">$(DotclRepoRoot)=/_/</PathMap>
+  </PropertyGroup>
+</Project>

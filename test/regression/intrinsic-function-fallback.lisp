@@ -23,6 +23,7 @@
     "%DOTIMES-1+"
     ;; %MINI-EVAL delegates it to the MAKE-INSTANCE generic function.
     "%MAKE-INSTANCE-WITH-INITARGS"
+    "%MAKE-INSTANCE-DYN"
     ;; Third argument is a literal list of parameter type names; evaluating the
     ;; arguments the ordinary way would try to call it. %MINI-EVAL has a case.
     "%DOTNET-CALL-DIRECT"

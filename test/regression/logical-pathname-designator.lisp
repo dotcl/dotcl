@@ -94,10 +94,12 @@
           (pathname-directory p) (pathname-name p)))
   (nil "C" (:absolute "foo") "bar"))
 
+;; "C:foo" is a drive-relative name on Windows; elsewhere it is a name holding a colon.
 (deftest logical-pathname-designator.drive-relative-is-a-device
   (let ((p (pathname "C:foo")))
     (list (typep p 'logical-pathname) (pathname-device p) (pathname-name p)))
-  (nil "C" "foo"))
+  #+windows (nil "C" "foo")
+  #-windows (nil nil "C:foo"))
 
 ;;; The same through MERGE-PATHNAMES, which is where the confusion would bite.
 (deftest logical-pathname-designator.merged-drive-is-a-device

@@ -300,13 +300,20 @@ public partial class CilAssembler
     }
 
 #if NET9_0_OR_GREATER
-    private static readonly MethodInfo s_abiTailPrep = typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.TailPrep))!;
-    private static readonly MethodInfo s_abiTailDirect = typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.TailDirect))!;
-    private static readonly MethodInfo s_abiTailClosure = typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.TailClosure))!;
-    private static readonly MethodInfo s_abiEnvironment = typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.Environment))!;
-    private static readonly MethodInfo s_abiSelfTailEntry = typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.SelfTailEntry))!;
-    private static readonly MethodInfo s_abiSelfTailPrepare = typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.SelfTailPrepare))!;
-    private static readonly MethodInfo s_abiLend = typeof(LibraryAbi).GetProperty(nameof(LibraryAbi.Lend))!.GetGetMethod()!;
+    private static MethodInfo? _lazy_s_abiTailPrep;
+    private static MethodInfo s_abiTailPrep => _lazy_s_abiTailPrep ??= typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.TailPrep))!;
+    private static MethodInfo? _lazy_s_abiTailDirect;
+    private static MethodInfo s_abiTailDirect => _lazy_s_abiTailDirect ??= typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.TailDirect))!;
+    private static MethodInfo? _lazy_s_abiTailClosure;
+    private static MethodInfo s_abiTailClosure => _lazy_s_abiTailClosure ??= typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.TailClosure))!;
+    private static MethodInfo? _lazy_s_abiEnvironment;
+    private static MethodInfo s_abiEnvironment => _lazy_s_abiEnvironment ??= typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.Environment))!;
+    private static MethodInfo? _lazy_s_abiSelfTailEntry;
+    private static MethodInfo s_abiSelfTailEntry => _lazy_s_abiSelfTailEntry ??= typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.SelfTailEntry))!;
+    private static MethodInfo? _lazy_s_abiSelfTailPrepare;
+    private static MethodInfo s_abiSelfTailPrepare => _lazy_s_abiSelfTailPrepare ??= typeof(LibraryAbi).GetMethod(nameof(LibraryAbi.SelfTailPrepare))!;
+    private static MethodInfo? _lazy_s_abiLend;
+    private static MethodInfo s_abiLend => _lazy_s_abiLend ??= typeof(LibraryAbi).GetProperty(nameof(LibraryAbi.Lend))!.GetGetMethod()!;
 
     /// <summary>EmitTailInvoke in a library: the same tail call, made through LibraryAbi.</summary>
     private void EmitLibraryTailInvoke(LispObject instr)

@@ -155,7 +155,7 @@
 ;; The body is compiled once for the fasl backend: the shared body carries it,
 ;; and the array entry and both typed entries are calls to it. The one other
 ;; copy is the required-only shape's body for the in-memory backend, which
-;; cannot inline the call and so keeps a copy of its own (the fasl ignores it).
+;; cannot inline the call and so keeps a copy of its own (the fasl ignores it). The two-keyword-pair entry is a call too.
 (defun %ksb-sink (x) x)
 
 (deftest-emitting-only key-shared-body.body-compiled-once
@@ -167,7 +167,8 @@
     (list (and (search ":SHARED" s) t)
           (%ksb-count "CALL-KEY-SHARED" s)
           (%ksb-count "MARKER-FOR-COUNT" s)))
-  (t 3 2))
+  ;; the array entry, the required-only entry, and the entries of one to three pairs (one required argument)
+  (t 5 2))
 
 ;; A small body keeps its own copy in the required-only entry: the JIT of a
 ;; copy is cheap, and the copy folds a constant default. The other two entries
@@ -178,4 +179,5 @@
               (list :marker-for-count a b)))))
     (list (%ksb-count "CALL-KEY-SHARED" s)
           (%ksb-count "MARKER-FOR-COUNT" s)))
-  (2 2))
+  ;; the array entry and the entries of one to three pairs (one required argument) call it; the copy does not
+  (4 2))

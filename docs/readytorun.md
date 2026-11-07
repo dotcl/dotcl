@@ -46,8 +46,9 @@ Off by default. Set `dotcl:*compile-r2r*` to a true value and ASDF writes a
 sibling for each FASL it compiles:
 
 ```lisp
+(require "asdf")
 (setf dotcl:*compile-r2r* t)
-(asdf:load-system "my-app")
+(asdf:load-system "my-app")             ; your own system
 ```
 
 It is a special variable rather than a build setting because whether the trade
@@ -104,3 +105,14 @@ ignored, or the sibling is for another platform.
 Set `dotcl:*load-r2r*` to `nil` and `load` ignores siblings entirely, which is
 the way to compare a run with and without them. `DOTCL_NO_R2R_FASL=1` in the
 environment sets the initial value.
+
+## Loading the same fasl again
+
+The sibling and a ReadyToRun fasl are used by the first load of a path only. A
+path this process has loaded before is read as plain IL into a collectible load
+context: it is JIT-compiled, as any image loaded from a byte array is, and the
+runtime can unload the assembly once the definitions it made have been replaced
+and nothing refers to them. That is what keeps a loop of `clear-system` and
+`load-system` (or editing and loading a file again) from growing the process.
+`(dotcl:r2r-stats)` does not count a reload. A path that has been loaded again
+does not go back to native code for the rest of the process.

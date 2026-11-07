@@ -914,6 +914,7 @@
              ;; An explicit NIL supplied-p is a binding; an absent one is not.
              (when (cddr p) (check-binding-name (caddr p) "lambda list")))
             (t (check-binding-name p "lambda list")))))
+  (%check-lambda-list-shape params)
   params)
 
 (defun %mini-make-closure (lambda-form env &optional name plumbing)
@@ -1017,6 +1018,11 @@
     ;; without calling it: everything %MINI-BIND-PARAMS-CALL takes.
     (when (fboundp '%set-fn-interp-info)
       (%set-fn-interp-info fn info))
+    ;; The docstring of (lambda (...) "doc" form...) belongs to the function made.
+    (when (and (not plumbing) (fboundp '%set-function-arity))
+      (let ((b (%doc-first body)))
+        (when (and (consp b) (stringp (car b)) (cdr b))
+          (funcall (fdefinition '(setf documentation)) (car b) fn t))))
     fn))
 
 (defun %mini-call (fn args tailp env)
@@ -1200,6 +1206,31 @@
         (%call-with-handler-cluster handlers thunk)
         (%call-with-handler-case handlers thunk))))
 
+(defun %mini-form-shape-problem (form env)
+  "The shape problem of the special form or standard macro call FORM, or NIL.
+   A macro call is only checked when no lexical function or macro of that name hides it."
+  (or (%special-form-shape-problem form)
+      (and (%macro-form-shape-problem form)
+           (not (%mini-fdefn (car form) env))
+           (not (%mini-macro-fn-in (car form) (cdr (assoc '%mini-macros env))))
+           (%macro-form-shape-problem form))
+      (%mini-dotted-call-problem form env)))
+
+(defun %mini-dotted-call-problem (form env)
+  "A message when FORM, a call whose operator is a symbol, has a dotted argument
+   list and the operator is a function (not a special operator or a macro). Macro
+   and special form calls with a dotted tail are for their own expanders and
+   shape checks."
+  (let ((tail (cdr form)))
+    (loop while (consp tail) do (setq tail (cdr tail)))
+    (when (and tail
+               (not (special-operator-name-p (car form)))
+               (not (%mini-macro-fn-in (car form) (cdr (assoc '%mini-macros env))))
+               (not (%mini-fdefn (car form) env))
+               (not (macro-function (car form))))
+      (let ((*print-length* 6) (*print-level* 3))
+        (format nil "~S: malformed function call (not a proper list): ~S" (car form) form)))))
+
 (defun %mini-eval (form env &optional tailp gop)
   "Interpret FORM in ENV (alist of (sym . val)). No Reflection.Emit needed.
 
@@ -1252,6 +1283,9 @@
                    (if (eq exp form)
                        (symbol-value form)
                        (%mini-eval exp env))))))))
+    ((and (consp form) (symbolp (car form)) (%mini-form-shape-problem form env))
+     (error 'program-error :format-control "~A"
+                           :format-arguments (list (%mini-form-shape-problem form env))))
     ((consp form)
      ;; A lexical FLET/LABELS binding shadows a GLOBAL MACRO of the same name
      ;; (CLHS 3.1.2.1.2.4). MACROEXPAND-1 cannot see ENV, so expanding first
@@ -1582,8 +1616,19 @@
                       (list* *%mini-go-marker* (cdr b)
                              (multiple-value-list
                               (when (cddr form) (%mini-eval (caddr form) env))))
-                      (throw (if b (%mini-block-catch-tag (cdr b)) (cadr form))
-                             (when (cddr form) (%mini-eval (caddr form) env))))))
+                      ;; A block that is nowhere: no catch takes the throw, and that is a
+                      ;; PROGRAM-ERROR here (CLHS 5.2), as the compiler makes it.
+                      (let ((vals (when (cddr form)
+                                    (multiple-value-list (%mini-eval (caddr form) env)))))
+                        (handler-case
+                            (throw (if b (%mini-block-catch-tag (cdr b)) (cadr form))
+                              (values-list vals))
+                          (control-error (c)
+                            (if b
+                                (error c)
+                                (error 'program-error
+                                       :format-control "return-from: no block named ~s"
+                                       :format-arguments (list (cadr form))))))))))
                (the
                 ;; (THE FIXNUM ...) is a range license on the compiled path: the
                 ;; arithmetic under it is lowered to native int64 and, above
@@ -1777,7 +1822,9 @@
                 ;; by one. Entry is (tag tb-id . index).
                 (let* ((tag (cadr form))
                        (b (assoc tag (cdr (assoc '%mini-go-tags env)))))
-                  (cond ((null b) (error "%mini-eval: go tag ~S not found" tag))
+                  (cond ((null b) (error 'program-error
+                                         :format-control "go: no tagbody tag named ~s"
+                                         :format-arguments (list tag)))
                         ;; (cdr b) is (tb-id . index), which is what the marker
                         ;; carries and what the CATCH would have thrown.
                         (gop (cons *%mini-go-marker* (cdr b)))
@@ -1832,7 +1879,7 @@
                 ;; A docstring needs a body after it; "foo" alone IS the body.
                 (let* ((name (progn (%check-defun-name (cadr form)) (cadr form)))
                        (params (caddr form))
-                       (fbody (cdddr form))
+                       (fbody (%doc-first (cdddr form)))
                        (bname (if (consp name) (cadr name) name))
                        (doc (when (and (stringp (car fbody)) (cdr fbody))
                               (car fbody)))
@@ -1846,6 +1893,8 @@
                   ;; a call means, so the call-site construction is dropped.
                   (when (symbolp name)
                     (remhash name *struct-keyword-ctors*)
+                    (remhash name *typed-struct-keyword-ctors*)
+                    (remhash name *struct-predicates*)
                     (remhash name *typed-vector-struct-accessors*))
                   (when doc (funcall #'(setf documentation) doc name 'function))
                   name))
@@ -1901,7 +1950,7 @@
                 ;; destructuring-bind. No compilation.
                 (let* ((name (cadr form))
                        (ll0 (caddr form))
-                       (mbody (cdddr form))
+                       (mbody (%doc-first (cdddr form)))
                        (whole-var (when (and (consp ll0) (eq (car ll0) '&whole))
                                     (cadr ll0)))
                        (rest-ll (if whole-var (cddr ll0) ll0))
@@ -1975,8 +2024,8 @@
                  (%mini-make-closure (list* 'lambda '() (cddr form)) env nil t)))
                (multiple-value-list
                 (multiple-value-list (%mini-eval (cadr form) env)))
-               (%make-instance-with-initargs
-                ;; Compiler intrinsic for (make-instance 'class ...): delegate to GF.
+               ((%make-instance-with-initargs %make-instance-dyn)
+                ;; Compiler intrinsic for (make-instance class ...): delegate to GF.
                 (apply (symbol-function 'make-instance)
                        (%mini-eval-args (cdr form) env)))
                (t

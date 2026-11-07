@@ -40,7 +40,14 @@ public static partial class Runtime
         static LispObject? ToComponent(LispObject val)
         {
             if (val is Nil) return null;
-            if (val is LispVector v && v.IsCharVector && v.Rank == 1) return new LispString(v.ToCharString());
+            if (val is LispVector v && v.IsCharVector && v.Rank == 1) return new LispString(LispPathname.QuoteLiteral(v.ToCharString()));
+            // A string given to make-pathname is literal: * ? [ in it are quoted, so
+            // (make-pathname :name "a*b") names a file called a*b and is not wild (use :wild).
+            if (val is LispString lsv)
+            {
+                var quoted = LispPathname.QuoteLiteral(lsv.Value);
+                return quoted == lsv.Value ? lsv : new LispString(quoted);
+            }
             return val;
         }
 
@@ -59,9 +66,26 @@ public static partial class Runtime
             return Runtime.List(items.ToArray());
         }
 
+        // A component is a string, :WILD, :UNSPECIFIC, NIL or a pattern; a number or a
+        // character is none of those (the version alone may be an integer).
+        static void CheckComponent(string what, LispObject val, bool integerOk = false)
+        {
+            if (val is LispChar || (val is Number && !(integerOk && val is Fixnum or Bignum)))
+                throw new LispErrorException(new LispTypeError(
+                    $"MAKE-PATHNAME: invalid {what}: {val}", val, Startup.Sym("STRING")));
+        }
         for (int j = 0; j < args.Length - 1; j += 2)
         {
             string key = args[j] switch { Symbol s => s.Name, _ => args[j].ToString() };
+            switch (key)
+            {
+                case "HOST": case "DEVICE": case "NAME": case "TYPE": case "DIRECTORY":
+                    CheckComponent(key.ToLowerInvariant(), args[j + 1]);
+                    break;
+                case "VERSION":
+                    CheckComponent("version", args[j + 1], integerOk: true);
+                    break;
+            }
             switch (key)
             {
                 case "HOST":
@@ -221,6 +245,60 @@ public static partial class Runtime
         return T.Instance;
     }
 
+    // How pathname pieces compare. Windows file names do not differ by case, so
+    // there they are compared without regard to it; on Unix-like systems the case
+    // is significant, as in SBCL and ECL.
+    private static readonly StringComparison PathCase =
+        Compat.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    private static bool HasGlob(string s) => LispPathname.HasWildChar(s);
+
+    /// <summary>Whether the pattern, which may hold * (any run of characters) and
+    /// ? (one character), matches the whole of the text. The text each * matched is
+    /// added to stars, in order.</summary>
+    private static bool GlobMatch(string pat, string text, List<string>? stars = null)
+    {
+        var found = new List<string>();
+        bool Rec(int pi, int ti, int mark)
+        {
+            while (pi < pat.Length)
+            {
+                char c = pat[pi];
+                // A quoted * ? [ is the character itself.
+                if (c == '\\' && !Compat.IsWindows() && pi + 1 < pat.Length && LispPathname.IsQuotable(pat[pi + 1]))
+                {
+                    if (ti >= text.Length || string.Compare(pat, pi + 1, text, ti, 1, PathCase) != 0) return false;
+                    pi += 2; ti++;
+                    continue;
+                }
+                if (c == '*')
+                {
+                    for (int end = text.Length; end >= ti; end--)
+                    {
+                        found.Add(text.Substring(ti, end - ti));
+                        if (Rec(pi + 1, end, found.Count)) return true;
+                        found.RemoveRange(found.Count - 1, 1);
+                    }
+                    return false;
+                }
+                if (ti >= text.Length) return false;
+                if (c != '?' && string.Compare(pat, pi, text, ti, 1, PathCase) != 0) return false;
+                pi++; ti++;
+            }
+            return ti >= text.Length;
+        }
+        if (!Rec(0, 0, 0)) return false;
+        stars?.AddRange(found);
+        return true;
+    }
+
+    /// <summary>A pathname piece against a pattern piece: a plain string must be the
+    /// same, a string with * or ? is a pattern.</summary>
+    private static bool PieceMatches(string pattern, string value, List<string>? stars = null)
+        => HasGlob(pattern) ? GlobMatch(pattern, value, stars)
+                            : string.Equals(LispPathname.UnquoteForFileSystem(value),
+                                            LispPathname.UnquoteForFileSystem(pattern), PathCase);
+
     private static bool ComponentMatchP(LispObject? value, LispObject? pattern)
     {
         if (pattern == null) return true; // nil pattern matches anything
@@ -228,7 +306,7 @@ public static partial class Runtime
         if (pattern is LispString pstr && pstr.Value == "*") return true; // "*" matches anything
         if (value == null) return pattern == null;
         if (value is LispString vs && pattern is LispString pts)
-            return string.Equals(vs.Value, pts.Value, StringComparison.OrdinalIgnoreCase);
+            return PieceMatches(pts.Value, vs.Value);
         return false;
     }
 
@@ -263,22 +341,22 @@ public static partial class Runtime
         if (pList[0] is Symbol ps && wList[0] is Symbol ws && ps.Name != ws.Name)
             return false;
 
-        int pi = 1, wi = 1;
+        return DirectoryListMatch(pList, 1, wList, 1);
+    }
+
+    /// <summary>The directory components P[PI..] against the pattern W[WI..], where :WILD-INFERIORS
+    /// (**) matches any number of components, including none, and there may be several of them.</summary>
+    private static bool DirectoryListMatch(List<LispObject> pList, int pi, List<LispObject> wList, int wi)
+    {
         while (wi < wList.Count)
         {
             if (wList[wi] is Symbol wsym && wsym.Name == "WILD-INFERIORS")
             {
-                // :wild-inferiors matches zero or more directory components
                 wi++;
-                if (wi >= wList.Count) return true; // rest of path matches
-                // Find next wildcard component match
-                while (pi < pList.Count)
-                {
-                    if (DirectoryComponentMatch(pList, pi, wList, wi))
-                        return true;
-                    pi++;
-                }
-                return pi >= pList.Count && wi >= wList.Count;
+                if (wi >= wList.Count) return true;
+                for (int k = pi; k <= pList.Count; k++)
+                    if (DirectoryListMatch(pList, k, wList, wi)) return true;
+                return false;
             }
             if (pi >= pList.Count) return false;
             if (wList[wi] is Symbol wsym2 && wsym2.Name == "WILD")
@@ -287,8 +365,13 @@ public static partial class Runtime
             }
             if (pList[pi] is LispString ps2 && wList[wi] is LispString ws2)
             {
-                if (!string.Equals(ps2.Value, ws2.Value, StringComparison.OrdinalIgnoreCase))
+                if (!PieceMatches(ws2.Value, ps2.Value))
                     return false;
+                pi++; wi++; continue;
+            }
+            // :UP and :BACK (the .. component) match themselves.
+            if (pList[pi] is Symbol pup && wList[wi] is Symbol wup && pup.Name == wup.Name)
+            {
                 pi++; wi++; continue;
             }
             return false;
@@ -303,7 +386,7 @@ public static partial class Runtime
             if (wList[wi] is Symbol ws && ws.Name == "WILD") { pi++; wi++; continue; }
             if (pList[pi] is LispString ps && wList[wi] is LispString ws2)
             {
-                if (!string.Equals(ps.Value, ws2.Value, StringComparison.OrdinalIgnoreCase))
+                if (!PieceMatches(ws2.Value, ps.Value))
                     return false;
                 pi++; wi++; continue;
             }
@@ -372,7 +455,29 @@ public static partial class Runtime
         if (to == null) return src; // nil in dest -> use source
         if (to is Symbol ts && ts.Name == "WILD") return src; // :wild in dest -> use source
         if (to is LispString tstr && tstr.Value == "*") return src; // "*" in dest -> use source
+        if (to is LispString pat && pat.Value.IndexOf('*') >= 0 && src is LispString srcStr)
+        {
+            // Each * of the to-piece takes what the next wild part of the from-piece matched.
+            var pieces = new List<string>();
+            if (from is Symbol fw && fw.Name == "WILD") pieces.Add(srcStr.Value);
+            else if (from is LispString fpat && HasGlob(fpat.Value)) GlobMatch(fpat.Value, srcStr.Value, pieces);
+            return new LispString(FillStars(pat.Value, pieces));
+        }
         return to;
+    }
+
+    /// <summary>The pattern with each * replaced by the next of pieces; a * with no
+    /// piece left stays.</summary>
+    private static string FillStars(string pattern, List<string> pieces)
+    {
+        var sb = new System.Text.StringBuilder();
+        int next = 0;
+        foreach (char c in pattern)
+        {
+            if (c == '*' && next < pieces.Count) sb.Append(pieces[next++]);
+            else sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     private static LispObject? LowercaseDirectoryStrings(LispObject? dir)
@@ -402,43 +507,34 @@ public static partial class Runtime
         cur = toDir;
         while (cur is Cons c) { tList.Add(c.Car); cur = c.Cdr; }
 
-        // Find the parts of srcDir that are "captured" by :wild-inferiors in fromDir
-        var captured = new List<LispObject>();
-        int si = 1; // skip :absolute/:relative
-        int fi = 1;
-        while (fi < fList.Count && si < sList.Count)
-        {
-            if (fList[fi] is Symbol fs && fs.Name == "WILD-INFERIORS")
-            {
-                // Capture everything until we match the next from component
-                fi++;
-                if (fi >= fList.Count)
-                {
-                    // Rest of source is captured
-                    while (si < sList.Count) { captured.Add(sList[si++]); }
-                }
-                else
-                {
-                    while (si < sList.Count)
-                    {
-                        if (fList[fi] is LispString fstr && sList[si] is LispString sstr
-                            && string.Equals(fstr.Value, sstr.Value, StringComparison.OrdinalIgnoreCase))
-                            break;
-                        captured.Add(sList[si++]);
-                    }
-                }
-                continue;
-            }
-            si++; fi++;
-        }
+        // What the wild pieces of the from-directory matched in the source: a name
+        // for each :wild, and a list of names for each :wild-inferiors, in order.
+        var wildPieces = new List<LispObject>();
+        var inferiorPieces = new List<List<LispObject>>();
+        if (sList.Count > 0 && fList.Count > 0)
+            CaptureDirectory(fList, 1, sList, 1, wildPieces, inferiorPieces);
 
-        // Build result: to-directory with :wild-inferiors replaced by captured
+        // Build result: each wild piece of the to-directory takes the next piece the
+        // from-directory captured, as a :wild or :wild-inferiors of the from does.
         var result = new List<LispObject>();
+        int nextWild = 0, nextInferior = 0;
         for (int ti = 0; ti < tList.Count; ti++)
         {
             if (tList[ti] is Symbol ts && ts.Name == "WILD-INFERIORS")
             {
-                result.AddRange(captured);
+                if (nextInferior < inferiorPieces.Count)
+                    result.AddRange(inferiorPieces[nextInferior++]);
+            }
+            else if (tList[ti] is Symbol tw && tw.Name == "WILD" && nextWild < wildPieces.Count)
+            {
+                result.Add(wildPieces[nextWild++]);
+            }
+            else if (tList[ti] is LispString tstr && tstr.Value.IndexOf('*') >= 0)
+            {
+                var pieces = new List<string>();
+                while (nextWild < wildPieces.Count && pieces.Count < tstr.Value.Count(ch => ch == '*'))
+                    pieces.Add(wildPieces[nextWild++] is LispString w ? w.Value : "");
+                result.Add(new LispString(FillStars(tstr.Value, pieces)));
             }
             else
             {
@@ -447,6 +543,47 @@ public static partial class Runtime
         }
 
         return result.Count > 0 ? List(result.ToArray()) : null;
+    }
+
+    /// <summary>Align the from-directory with the source directory from the given
+    /// positions and record what each wild piece matched. :wild-inferiors takes the
+    /// shortest run that lets the rest match. False when they do not align.</summary>
+    private static bool CaptureDirectory(List<LispObject> f, int fi, List<LispObject> s, int si,
+        List<LispObject> wild, List<List<LispObject>> inferiors)
+    {
+        int wildMark = wild.Count, infMark = inferiors.Count;
+        while (fi < f.Count)
+        {
+            if (f[fi] is Symbol fs && fs.Name == "WILD-INFERIORS")
+            {
+                for (int take = 0; si + take <= s.Count; take++)
+                {
+                    inferiors.Add(s.GetRange(si, take));
+                    if (CaptureDirectory(f, fi + 1, s, si + take, wild, inferiors)) return true;
+                    inferiors.RemoveRange(inferiors.Count - 1, 1);
+                    // The recursive call restored the lists it added to.
+                }
+                wild.RemoveRange(wildMark, wild.Count - wildMark);
+                inferiors.RemoveRange(infMark, inferiors.Count - infMark);
+                return false;
+            }
+            if (si >= s.Count) break;
+            if (f[fi] is Symbol fw && fw.Name == "WILD")
+                wild.Add(s[si]);
+            else if (f[fi] is LispString fstr && s[si] is LispString sstr)
+            {
+                var stars = new List<string>();
+                if (!PieceMatches(fstr.Value, sstr.Value, stars)) break;
+                foreach (var star in stars) wild.Add(new LispString(star));
+            }
+            else
+                break;
+            fi++; si++;
+        }
+        if (fi >= f.Count && si >= s.Count) return true;
+        wild.RemoveRange(wildMark, wild.Count - wildMark);
+        inferiors.RemoveRange(infMark, inferiors.Count - infMark);
+        return false;
     }
 
     public static LispObject CompileFilePathname(LispObject[] args)
@@ -464,7 +601,13 @@ public static partial class Runtime
         {
             if (args[i] is Symbol ks && ks.Name == "OUTPUT-FILE" && !(args[i + 1] is Nil))
             {
-                return Pathname(args[i + 1]);
+                // A name with no type gets the fasl type (SBCL merges the default type in).
+                var outp = Pathname(args[i + 1]);
+                if (outp is LispPathname op && op.NameComponent != null && op.TypeComponent == null)
+                    return op is LispLogicalPathname
+                        ? new LispLogicalPathname(op.Host, op.Device, op.DirectoryComponent, op.NameComponent, new LispString("fasl"), op.Version)
+                        : new LispPathname(op.Host, op.Device, op.DirectoryComponent, op.NameComponent, new LispString("fasl"), op.Version);
+                return outp;
             }
         }
         // Default: always .fasl (content may be PE assembly or text SIL depending on :fasl flag).
@@ -531,14 +674,37 @@ public static partial class Runtime
         throw new LispErrorException(new LispTypeError("NAMESTRING: not a pathname", path));
     }
 
+    /// <summary>A pathname piece as PATHNAME-NAME and friends answer it: the text without the
+    /// quoting backslashes ("a\\*b" is the name a*b; the pathname holds the quoted form).</summary>
+    private static LispObject UnquotedPiece(LispObject? piece)
+        => piece switch
+        {
+            null => Nil.Instance,
+            LispString ls when ls.Value.IndexOf('\\') >= 0 =>
+                LispPathname.UnquoteForFileSystem(ls.Value) is var u && u != ls.Value ? new LispString(u) : ls,
+            _ => piece
+        };
+
     public static LispObject PathnameDirectory(LispObject path)
-        => ToPathnameDesignator(path, "PATHNAME-DIRECTORY").DirectoryComponent ?? (LispObject)Nil.Instance;
+    {
+        var dir = ToPathnameDesignator(path, "PATHNAME-DIRECTORY").DirectoryComponent;
+        if (dir is not Cons) return dir ?? (LispObject)Nil.Instance;
+        var parts = new List<LispObject>();
+        bool changed = false;
+        for (var cur = dir; cur is Cons c; cur = c.Cdr)
+        {
+            var piece = UnquotedPiece(c.Car);
+            if (!ReferenceEquals(piece, c.Car)) changed = true;
+            parts.Add(piece);
+        }
+        return changed ? List(parts.ToArray()) : dir;
+    }
 
     public static LispObject PathnameName(LispObject path)
-        => ToPathnameDesignator(path, "PATHNAME-NAME").NameComponent ?? (LispObject)Nil.Instance;
+        => UnquotedPiece(ToPathnameDesignator(path, "PATHNAME-NAME").NameComponent);
 
     public static LispObject PathnameType(LispObject path)
-        => ToPathnameDesignator(path, "PATHNAME-TYPE").TypeComponent ?? (LispObject)Nil.Instance;
+        => UnquotedPiece(ToPathnameDesignator(path, "PATHNAME-TYPE").TypeComponent);
 
     public static LispObject PathnameHost(LispObject path)
         => ToPathnameDesignator(path, "PATHNAME-HOST").Host ?? (LispObject)Nil.Instance;
@@ -768,7 +934,7 @@ public static partial class Runtime
 
             bool IsWild(LispObject? component) {
                 if (component is Symbol s && s.Name == "WILD") return true;
-                if (component is LispString lstr && lstr.Value.Contains('*')) return true;
+                if (component is LispString lstr && LispPathname.HasWildChar(lstr.Value)) return true;
                 return false;
             }
 
@@ -778,7 +944,7 @@ public static partial class Runtime
                     var cur = dir;
                     while (cur is Cons c) {
                         if (c.Car is Symbol s && (s.Name == "WILD-INFERIORS" || s.Name == "WILD")) return true;
-                        if (c.Car is LispString lstr && lstr.Value.Contains('*')) return true;
+                        if (c.Car is LispString lstr && LispPathname.HasWildChar(lstr.Value)) return true;
                         cur = c.Cdr;
                     }
                 }
@@ -818,9 +984,9 @@ public static partial class Runtime
                     if (args[i] is Symbol kw)
                     {
                         if (!startSeen && kw.Name == "START" && args[i + 1] is Fixnum sf)
-                        { start = (int)sf.Value; startSeen = true; }
+                        { start = Runtime.ClampIndex(sf.Value); startSeen = true; }
                         else if (!endSeen && kw.Name == "END" && args[i + 1] is Fixnum ef)
-                        { end = (int)ef.Value; endSeen = true; }
+                        { end = Runtime.ClampIndex(ef.Value); endSeen = true; }
                         else if (!endSeen && kw.Name == "END" && args[i + 1] is Nil)
                         { end = null; endSeen = true; }
                         else if (!junkSeen && kw.Name == "JUNK-ALLOWED")

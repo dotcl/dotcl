@@ -392,6 +392,10 @@
   (and key (null optional) (null rest-param) (null aux)
        (<= (length required) 8)))
 
+(defun %anonymous-fn-label (fn-name)
+  "FN-NAME for an error message: \"lambda\" for a function without a name."
+  (if (equal fn-name "") "lambda" fn-name))
+
 (defun %key-binding-forms (key kw-var val-var)
   "LET* bindings for the key params. When KW-VAR is NIL none are supplied and
    each takes its default; otherwise the one keyword KW-VAR names takes VAL-VAR
@@ -422,7 +426,7 @@
                       ,@(when allow-other-keys-p '(t)))
             (error 'program-error
                    :format-control "~a: unrecognized keyword argument ~s"
-                   :format-arguments (list ,fn-name ,kw-var)))
+                   :format-arguments (list ,(%anonymous-fn-label fn-name) ,kw-var)))
           (let* ,bindings ,@wrapped-body))
         `((let* ,bindings ,@wrapped-body)))))
 
@@ -667,7 +671,8 @@
                           required (%build-key-direct-body required key wrapped-body nil nil)
                           fn-name fn-pkg fn-symbol)
                        (unless copy-self-p instrs))))
-          (list
+          (append
+           (list
            (list :shared (+ n (length key)) shared-instrs)
            (if (and copy (<= (length copy) *key-entry-copy-max-instrs*))
                ;; Small: the copy is the entry. Its JIT is cheap, and a call to
@@ -691,11 +696,44 @@
                                 ,@(when allow-other-keys-p '(t)))
                       (error 'program-error
                              :format-control "~a: unrecognized keyword argument ~s"
-                             :format-arguments (list ,fn-name ,kw-var)))
+                             :format-arguments (list ,(%anonymous-fn-label fn-name) ,kw-var)))
                     (%call-key-shared
                      ,@rs
                      ,@(loop for kw in kws
-                             collect `(if (eq ,kw-var ',kw) ,val-var (%absent-key)))))))))))))
+                             collect `(if (eq ,kw-var ',kw) ,val-var (%absent-key))))))))
+           ;; Two to four keyword pairs, as far as the 8-argument ceiling allows. The
+           ;; first :ALLOW-OTHER-KEYS decides whether an unknown keyword is an error,
+           ;; as in the array entry (CheckNoUnknownKeys); a key given twice takes its
+           ;; first value.
+           (loop for pairs from 2 to 4
+                 when (<= (+ n (* 2 pairs)) 8)
+                   collect
+                   (let* ((kvs (loop repeat (1- pairs)
+                                     collect (cons (gensym "KWX") (gensym "KVALX"))))
+                          (all (cons (cons kw-var val-var) kvs)))
+                     (list (+ n (* 2 pairs)) nil
+                           (compile-function-body-direct
+                            (append rs (loop for (k . v) in all append (list k v)))
+                            `((unless (or ,@(when allow-other-keys-p '(t))
+                                          (cond ,@(loop for (k . v) in all
+                                                        collect `((eq ,k :allow-other-keys) ,v))))
+                                ,@(loop for (k . nil) in all
+                                        collect `(unless (or ,@(loop for kw in kws
+                                                                     collect `(eq ,k ',kw))
+                                                             (eq ,k :allow-other-keys))
+                                                   (error 'program-error
+                                                          :format-control "~a: unrecognized keyword argument ~s"
+                                                          :format-arguments (list ,(%anonymous-fn-label fn-name) ,k)))))
+                              (%call-key-shared
+                               ,@rs
+                               ,@(loop for kw in kws
+                                       collect (labels ((pick (l)
+                                                          (if (null l)
+                                                              '(%absent-key)
+                                                              `(if (eq ,(caar l) ',kw)
+                                                                   ,(cdar l)
+                                                                   ,(pick (cdr l))))))
+                                                 (pick all)))))))))))))))
 
 (defun %build-key-direct-specs (required key wrapped-body fn-name fn-pkg fn-symbol
                                 allow-other-keys-p implicit-keys-p
@@ -1910,7 +1948,9 @@
 (defun %ftype-arg-declarations (name params body)
   "BODY with (TYPE spec param) declarations for the required parameters NAME's
    declaimed FTYPE gives a type."
-  (if (or *cross-compiling* (not (symbolp name)))
+  (if (or *cross-compiling* (not (symbolp name))
+          ;; Code under (safety 0) does not check argument types.
+          (eql (body-safety body) 0))
       body
       (multiple-value-bind (args found) (gethash name *function-arg-types*)
         (if (not (and found (listp args)))
@@ -2229,13 +2269,15 @@
   ;; never clears the entry the same expansion is about to make.
   (when (symbolp (cadr expr))
     (remhash (cadr expr) *struct-keyword-ctors*)
+    (remhash (cadr expr) *typed-struct-keyword-ctors*)
+    (remhash (cadr expr) *struct-predicates*)
     (remhash (cadr expr) *typed-vector-struct-accessors*))
   ;; CLHS 3.4.11: extract docstring (first form if string AND more forms follow).
   ;; Skip during cross-compile because cil-stdlib's own defuns may precede
   ;; (setf documentation) GF definition; runtime user defuns are fine.
   (let* ((name (cadr expr))
          (params (caddr expr))
-         (body (cdddr expr))
+         (body (%doc-first (cdddr expr)))
          ;; A (SETF FOO) name carries its docstring too; the form's value is
          ;; then the quoted name, as COMPILE-DEFUN leaves it.
          (has-docstring (and (not *cross-compiling*)
@@ -2255,6 +2297,17 @@
                 (compile-sym-lookup name)
                 (compile-quoted name)))
         defun-instrs)))
+
+(defun %doc-first (body)
+  "BODY with a docstring that follows leading declarations moved in front of them:
+   (declare ...)* \"doc\" form... becomes \"doc\" (declare ...)* form... (CLHS 3.4.11 lets the
+   docstring and the declarations come in either order). Anything else is returned as is."
+  (let ((decls '()) (rest body))
+    (loop while (and (consp rest) (consp (car rest)) (eq (caar rest) 'declare))
+          do (push (pop rest) decls))
+    (if (and decls (consp rest) (stringp (car rest)) (cdr rest))
+        (cons (car rest) (append (nreverse decls) (cdr rest)))
+        body)))
 
 (defun compile-defmacro (name lambda-list body)
   "Compile (defmacro name lambda-list body...).
@@ -2504,7 +2557,7 @@
              (unless (and (consp form)
                           (symbolp (car form))
                           (member (symbol-name (car form))
-                                  '("%REGISTER-STRUCT-CLASS" "%REGISTER-STRUCT-READER")
+                                  '("%REGISTER-STRUCT-CLASS" "%REGISTER-STRUCT-READER" "%SET-STRUCT-SLOT-INITFORMS")
                                   :test #'string=))
                (eval form)))))
         (*compile-file-mode*
@@ -2987,7 +3040,7 @@
               (key-default (third key-spec))
               (sp-var (fourth key-spec))
               (explicit-key-pkg (fifth key-spec))
-              (find-key-fn (if explicit-key-pkg "Runtime.FindKeyArgByName" "Runtime.FindKeyArg"))
+              (find-key-fn (if explicit-key-pkg "Runtime.FindKeyArgByName" "Runtime.FindKeyArgSym"))
               (key (cdr (assoc var-name locals-alist)))
               (found-label (gen-label "KEYFOUND"))
               (done-label (gen-label "KEYDONE")))
@@ -3005,7 +3058,7 @@
                              (let ((tmp (gen-local "KEYTMP")))
                                `((:declare-local ,tmp "LispObject")
                                  ,@args-array-instrs (:ldc-i4 ,key-start)
-                                 (:ldstr ,key-name)
+                                 ,(if explicit-key-pkg `(:ldstr ,key-name) `(:load-sym-keyword ,key-name))
                                  ,@(when explicit-key-pkg `((:ldstr ,explicit-key-pkg)))
                                  (:call ,find-key-fn)
                                  (:dup) (:brtrue ,found-label)
@@ -3018,7 +3071,7 @@
                                  ,@(emit-box-create key (list (list :ldloc tmp)) var-name)))
                              `((:declare-local ,key "LispObject")
                                ,@args-array-instrs (:ldc-i4 ,key-start)
-                               (:ldstr ,key-name)
+                               ,(if explicit-key-pkg `(:ldstr ,key-name) `(:load-sym-keyword ,key-name))
                                ,@(when explicit-key-pkg `((:ldstr ,explicit-key-pkg)))
                                (:call ,find-key-fn)
                                (:dup) (:brtrue ,found-label)
@@ -3039,7 +3092,7 @@
                            (%bind-supplied-p-instrs
                             sp-var sp-key
                             `(,@args-array-instrs (:ldc-i4 ,key-start)
-                              (:ldstr ,key-name)
+                              ,(if explicit-key-pkg `(:ldstr ,key-name) `(:load-sym-keyword ,key-name))
                               ,@(when explicit-key-pkg `((:ldstr ,explicit-key-pkg)))
                               (:call ,find-key-fn)
                               (:brtrue ,sp-found-label)
@@ -3926,6 +3979,12 @@
                   (*mv-mode-local* nil)
                   (*mv-expect-args* nil)
                   (*self-single-value* nil)
+                  (*rest-forward*
+                    (and rest-param (not *cross-compiling*)
+                         (not (member rest-param special-param-syms))
+                         (not (boxed-var-p rest-param))
+                         (null (find-mutated-and-captured-vars body (list (var-name rest-param))))
+                         (list rest-param (cdr (assoc rest-param local-keys)) args-arg-idx key-start)))
                   (body-instrs (compile-progn body)))
              (merge-disjoint-locals
               (if special-param-syms

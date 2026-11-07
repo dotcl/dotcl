@@ -569,6 +569,20 @@
                      ,@(compile-as-long arg) (:stloc ,tb)
                      (:ldloc ,ta) (:ldloc ,tb) (:call ,entry)))))))
 
+(defun %never-returns-form-p (form)
+  "True for a call of ERROR: it leaves by a non-local exit, so an IF whose other arm
+   has a type has that type."
+  (and (consp form) (eq (car form) 'error)
+       (not (local-function-entry 'error))))
+
+(defun %plain-block-body (expr)
+  "The single body form of (BLOCK NAME FORM) when nothing returns from NAME, else NIL."
+  (and (consp expr) (eq (car expr) 'block)
+       (consp (cdr expr)) (cadr expr) (symbolp (cadr expr))
+       (consp (cddr expr)) (null (cdddr expr))
+       (not (%block-returns-to-p (cadr expr) (cddr expr)))
+       (caddr expr)))
+
 (defun fixnum-typed-p (expr)
   "Return T if EXPR is statically known to produce a Fixnum value; see
    %FIXNUM-TYPED-P."
@@ -623,6 +637,12 @@
           (fixnum-typed-p (caddr expr))
           (fixnum-typed-p (cadddr expr)))
      t)
+    ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4)
+          (%never-returns-form-p (cadddr expr))
+          (fixnum-typed-p (caddr expr)))
+     t)
+    ((let ((b (%plain-block-body expr))) (and b (fixnum-typed-p b)))
+     t)
     ((and (consp expr) (eq (car expr) 'the)
           (let ((ty (cadr expr)))
             (or (eq ty 'fixnum)
@@ -660,6 +680,20 @@
           (eq (car expr) '-)
           (fixnum-typed-p (cadr expr))
           (or *fixnum-wrap-licensed* (expr-int-range expr)))
+     t)
+    ;; (abs X) is exact when its range fits; (isqrt X) of a non-negative fixnum is
+    ;; always a fixnum.
+    ((and (consp expr) (= (length expr) 2)
+          (eq (car expr) 'abs)
+          (not (local-function-entry 'abs))
+          (fixnum-typed-p (cadr expr))
+          (or *fixnum-wrap-licensed* (expr-int-range expr)))
+     t)
+    ((and (consp expr) (= (length expr) 2)
+          (eq (car expr) 'isqrt)
+          (not (local-function-entry 'isqrt))
+          (fixnum-exact-p (cadr expr))
+          (let ((r (expr-int-range (cadr expr)))) (and r (>= (car r) 0))))
      t)
     ;; %dotimes-1+: dotimes-emitted increment whose result is asserted to fit
     ;; int64 (counter < limit at the increment site), fixnum-typed like 1+.
@@ -1746,22 +1780,28 @@
                        (:add "Runtime.Add") (:sub "Runtime.Subtract")
                        (:mul "Runtime.Multiply")))))))
 
-(defun try-compile-spec-arith (expr)
+(defun try-compile-spec-arith (expr &optional want-long divisor)
   "EXPR, a +, - or * with another of them among its operands, computed on int64
-   when its operands are fixnums (see above), leaving the boxed value; or NIL."
+   when its operands are fixnums (see above), leaving the boxed value; or NIL.
+   WANT-LONG: the caller wants the raw int64 (it would unbox the result), so the fast
+   path leaves the int64 itself instead of boxing it and only the slow path boxes.
+   DIVISOR, (OP B) with OP MOD or REM and B a fixnum-typed expression: the result is
+   (OP EXPR B), a fixnum bounded by B, taken on the int64 when EXPR's does not overflow and
+   on the generic MOD / REM (which may see a bignum EXPR) when it does; implies WANT-LONG."
   (let* ((*spec-leaves* nil)
          (op (%spec-op expr))
          (plan (and op
-                    (or (%spec-op (second op)) (%spec-op (third op)))
+                    (or divisor (%spec-op (second op)) (%spec-op (third op)))
                     (let ((*int-type-memo* (or *int-type-memo* (make-hash-table :test 'eq))))
                       (%spec-plan expr nil t)))))
     (when (and plan (eq (car plan) :node)
-               (or (eq (car (third plan)) :node) (eq (car (fourth plan)) :node))
+               (or divisor (eq (car (third plan)) :node) (eq (car (fourth plan)) :node))
                (<= (length *spec-leaves*) 8)
                (not (fixnum-typed-p expr)))
       (let ((leaves (reverse *spec-leaves*))
             (slow (gen-label "SPSLOW"))
-            (done (gen-label "SPDONE")))
+            (done (gen-label "SPDONE"))
+            (divl (and divisor (gen-local "SPD"))))
         `(,@(loop for (l kind x) in leaves
                   append `((:declare-local ,l ,(if (eq kind :long) "Int64" "LispObject"))
                            ,@(if (eq kind :long)
@@ -1772,11 +1812,33 @@
           ,@(loop for (l kind) in leaves
                   unless (eq kind :long)
                     append `((:ldloc ,l) (:call "Runtime.IsFixnumObject") (:brfalse ,slow)))
-          ,@(%spec-fast plan slow t)
+          ,@(when divisor
+              `((:declare-local ,divl "Int64") ,@(compile-as-long (second divisor)) (:stloc ,divl)))
+          ,@(cond (divisor
+                   (multiple-value-bind (code load) (%spec-fast plan slow nil)
+                     `(,@code ,@load (:ldloc ,divl)
+                       (:call ,(if (eq (first divisor) 'mod) "Runtime.ModFixnumL" "Runtime.RemFixnumL")))))
+                  (want-long
+                   (multiple-value-bind (code load) (%spec-fast plan slow nil)
+                     `(,@code ,@load)))
+                  (t (%spec-fast plan slow t)))
           (:br ,done)
           (:label ,slow)
           ,@(%spec-generic plan)
+          ,@(when divisor
+              `((:ldloc ,divl) (:call "Fixnum.Make")
+                (:call ,(if (eq (first divisor) 'mod) "Runtime.Mod" "Runtime.Rem"))))
+          ,@(when (or want-long divisor) '((:unbox-fixnum)))
           (:label ,done))))))
+
+(defun try-compile-spec-mod-long (expr)
+  "EXPR = (MOD|REM A B) with A a nested +, - or * that is not provably a fixnum and B fixnum-typed:
+   the raw int64 result (see TRY-COMPILE-SPEC-ARITH), or NIL."
+  (when (and (consp expr) (member (car expr) '(mod rem)) (= (length expr) 3)
+             (not (local-function-entry (car expr)))
+             (not (macrolet-shadowed-p (car expr)))
+             (fixnum-typed-p (caddr expr)))
+    (try-compile-spec-arith (cadr expr) t (list (car expr) (caddr expr)))))
 
 (defun compile-guarded-long-bitop (fn a b)
   (let ((op (ecase fn (logand :and) (logior :or) (logxor :xor)))
@@ -1988,6 +2050,23 @@
     ;; ordinary IF uses, so fused comparisons and and/or/not chains behave
     ;; identically here. The arms are not asked FIXNUM-TYPED-P again: the caller
     ;; asked it of the IF, possibly under *FIXNUM-WRAP-LICENSED*.
+    ((let ((b (%plain-block-body expr))) b)
+     (compile-as-long (%plain-block-body expr)))
+    ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4)
+          (%never-returns-form-p (cadddr expr)))
+     ;; The else arm leaves by a non-local exit; the stack still gets a long there.
+     (let ((else-label (gen-label "LONGELSE"))
+           (end-label (gen-label "LONGEND")))
+       `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+             (compile-boolean-branch (cadr expr) else-label nil))
+         ,@(compile-as-long (caddr expr))
+         (:br ,end-label)
+         (:label ,else-label)
+         ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+             (compile-expr (cadddr expr)))
+         (:pop)
+         (:ldc-i8 0)
+         (:label ,end-label))))
     ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4))
      (let ((else-label (gen-label "LONGELSE"))
            (end-label (gen-label "LONGEND")))
@@ -2033,6 +2112,12 @@
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '-))
      `(,@(compile-as-long (cadr expr))
        (:neg)))
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) 'abs))
+     `(,@(compile-as-long (cadr expr))
+       (:call "Runtime.AbsFixnumL")))
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) 'isqrt))
+     `(,@(compile-as-long (cadr expr))
+       (:call "Runtime.IsqrtFixnumL")))
     ;; %dotimes-1+: raw add: the emitting macro asserts the result fits int64
     ;; (the increment site is only reached while counter < limit <= int64-max).
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '%dotimes-1+))
@@ -2220,6 +2305,14 @@
   (cond
     ((fixnum-arith-unboxed-safe-p expr) (compile-as-long expr))
     ((checked-long-arith-p expr) (compile-checked-long-arith expr))
+    ;; A nested +, - or * whose operands are fixnums but whose result is only known to be an
+    ;; integer, (setq s (+ s (* i i))): int64 with an overflow check, the raw value kept for the
+    ;; slot instead of boxed and unboxed (a 22-byte Fixnum per iteration).
+    ((try-compile-spec-arith expr t))
+    ((try-compile-spec-mod-long expr))
+    ;; A binding form or an inline call: its last form is left raw instead of
+    ;; boxed for the unbox below.
+    ((compile-as-long-structured expr))
     (t `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
              (compile-expr expr))
          (:unbox-fixnum)))))
@@ -2291,6 +2384,9 @@
   (let ((x (first args))
         (n (second args)))
     (when (and (fixnum-exact-p x) (integerp n))
+      (if (eql n 0)
+          ;; A shift by nothing: the value itself.
+          `(,@(compile-as-long x) (:call "Fixnum.Make"))
       (if (>= n 0)
           ;; Left shift can overflow int64 (and raw CIL shl masks count mod 64),
           ;; so route through Runtime.AshLeftLong which promotes to Bignum.
@@ -2304,7 +2400,7 @@
           `(,@(compile-as-long x)
             (:ldc-i4 ,(min 63 (- n)))
             (:shr)
-            (:call "Fixnum.Make"))))))
+            (:call "Fixnum.Make")))))))
 
 (defun char-code-operand (expr)
   "Instructions leaving EXPR's character code on the stack as a raw int64, or
@@ -2363,6 +2459,57 @@
     `(,@(char-code-operand (first args))
       ,@(char-code-operand (second args))
       ,@body)))
+
+;;; Comparing a raw (unsigned-byte 64) local with an integer that fits in the
+;;; same machine word needs no boxing. The u64 slot holds the bits, so a value at
+;;; or above 2^63 reads as negative in an Int64: the comparison is unsigned.
+
+(defun %u64-cmp-simple-int (expr)
+  "EXPR as one of: (:const N) for an integer constant 0..2^63-1, (:u64 KEY) for a
+   raw u64 local, (:fix) for a fixnum-typed variable (a plain slot read, so
+   evaluating it twice is harmless), else NIL."
+  (setf expr (fold-typed-operand expr))
+  (cond ((integerp expr) (and (<= 0 expr #x7FFFFFFFFFFFFFFF) (list :const expr)))
+        ((and (symbolp expr) expr (u64-native-local-p expr))
+         (list :u64 (u64-native-local-p expr)))
+        ((and (symbolp expr) expr (fixnum-typed-p expr)) (list :fix expr))
+        (t nil)))
+
+(defun u64-cmp-operands (op args)
+  "When ARGS is a comparison of a raw u64 local with a simple integer (see
+   %U64-CMP-SIMPLE-INT), the normalized (OP X-INFO N-INFO): X is the u64 local,
+   OP is :lt :le :gt :ge :eq :ne read as X OP N. NIL otherwise."
+  (let ((a (%u64-cmp-simple-int (first args)))
+        (b (%u64-cmp-simple-int (second args))))
+    (flet ((mirror (o) (ecase o (:lt :gt) (:gt :lt) (:le :ge) (:ge :le) (:eq :eq) (:ne :ne))))
+      (cond ((and a b (eq (car a) :u64)) (list op a b))
+            ((and a b (eq (car b) :u64)) (list (mirror op) b a))
+            (t nil)))))
+
+(defun compile-u64-cmp (args op)
+  "Emit the unsigned comparison u64-cmp-operands found, leaving an i4 (0 or 1)."
+  (destructuring-bind (op x n) (u64-cmp-operands op args)
+    (let ((ldx `((:ldloc ,(second x))))
+          (ldn (ecase (car n)
+                 (:const `((:ldc-i8 ,(second n))))
+                 (:u64 `((:ldloc ,(second n))))
+                 (:fix (compile-as-long (second n)))))
+          (cmp (ecase op
+                 (:lt '((:clt-un)))
+                 (:gt '((:cgt-un)))
+                 (:eq '((:ceq)))
+                 (:le '((:cgt-un) (:ldc-i4 0) (:ceq)))
+                 (:ge '((:clt-un) (:ldc-i4 0) (:ceq)))
+                 (:ne '((:ceq) (:ldc-i4 0) (:ceq))))))
+      (if (not (eq (car n) :fix))
+          `(,@ldx ,@ldn ,@cmp)
+          ;; A negative fixnum is below every u64: x < n, x <= n, x = n are false
+          ;; and x > n, x >= n, x /= n are true, whatever the bits of x are.
+          (let ((neg `(,@ldn (:ldc-i8 0) (:clt)))
+                (nonneg `(,@ldn (:ldc-i8 0) (:clt) (:ldc-i4 0) (:ceq))))
+            (ecase op
+              ((:lt :le :eq) `(,@nonneg ,@ldx ,@ldn ,@cmp (:and)))
+              ((:gt :ge :ne) `(,@neg ,@ldx ,@ldn ,@cmp (:or)))))))))
 
 (defun compile-fixnum-cmp (args op)
   "Emit native int64 comparison. OP is :lt :le :gt :ge :eq :ne.

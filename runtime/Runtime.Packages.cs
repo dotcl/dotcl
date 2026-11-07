@@ -29,30 +29,17 @@ public static partial class Runtime
     }
 
     public static LispObject PackageExternalSymbolsList(LispObject pkg)
-    {
-        var p = ResolvePackage(pkg, "DO-EXTERNAL-SYMBOLS");
-        LispObject result = Nil.Instance;
-        foreach (var s in p.ExternalSymbols)
-            result = new Cons(CanonicalizeSymbol(s), result);
-        return result;
-    }
+        => ResolvePackage(pkg, "DO-EXTERNAL-SYMBOLS").ConsExternalOnto(Nil.Instance, null);
 
     public static LispObject PackageAllSymbolsList(LispObject pkg)
     {
         var p = ResolvePackage(pkg, "DO-SYMBOLS");
         LispObject result = Nil.Instance;
-        foreach (var s in p.ExternalSymbols)
-            result = new Cons(CanonicalizeSymbol(s), result);
-        foreach (var s in p.InternalSymbols)
-            result = new Cons(CanonicalizeSymbol(s), result);
+        result = p.ConsExternalOnto(result, null);
+        result = p.ConsInternalOnto(result);
         foreach (var used in p.UseList)
-            foreach (var s in used.ExternalSymbols)
-            {
-                // Only include if not shadowed by a directly present symbol
-                var (_, status) = p.FindSymbol(s.Name);
-                if (status == SymbolStatus.Inherited)
-                    result = new Cons(CanonicalizeSymbol(s), result);
-            }
+            // Inherited only if no symbol of that name is present in P itself.
+            result = p.ConsInheritedOnto(result, used);
         return result;
     }
 
@@ -186,7 +173,12 @@ public static partial class Runtime
         else if (pkg is Symbol s) name = s.Name;
         else if (pkg is LispChar lc) name = lc.Value.ToString();
         else if (pkg is LispVector v && v.IsCharVector) name = v.ToCharString();
-        else name = pkg.ToString()!;
+        else if (pkg is Nil) name = "NIL";
+        else if (pkg is T) name = "T";
+        else throw new LispErrorException(new LispTypeError(
+            context + ": not a package designator", pkg,
+            List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("SYMBOL"),
+                 Startup.Sym("CHARACTER"), Startup.Sym("PACKAGE"))));
         var found = FindPackageNamed(name);
         if (found != null) return found;
         var err = new LispError($"{context}: no package named {name}");
@@ -412,9 +404,14 @@ public static partial class Runtime
         string pkgName;
         if (name is LispString ls) pkgName = ls.Value;
         else if (name is Symbol s) pkgName = s.Name;
+        else if (name is Nil) pkgName = "NIL";
+        else if (name is T) pkgName = "T";
         else if (name is LispChar lc) pkgName = lc.Value.ToString();
         else if (name is LispVector v && v.IsCharVector) pkgName = v.ToCharString();
-        else pkgName = name.ToString()!;
+        else throw new LispErrorException(new LispTypeError(
+            "FIND-PACKAGE: not a package designator", name,
+            List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("SYMBOL"),
+                 Startup.Sym("CHARACTER"), Startup.Sym("PACKAGE"))));
         // Check local nicknames of *package* first (SBCL compat: find-package resolves local nicknames)
         return FindPackageNamed(pkgName) ?? (LispObject)Nil.Instance;
     }
@@ -644,6 +641,9 @@ public static partial class Runtime
     {
         if (args.Length < 1 || args.Length > 2) throw MakeProgramError("INTERN", 1, 2, args.Length);
         var pkg = args.Length > 1 ? args[1] : DynamicBindings.Get(Startup.Sym("*PACKAGE*"));
+        if (!(args[0] is LispString || args[0] is LispVector { IsCharVector: true }))
+            throw new LispErrorException(new LispTypeError(
+                "INTERN: not a string", args[0], Startup.Sym("STRING")));
         return InternSymbol(args[0], pkg);
     }
 
@@ -659,12 +659,12 @@ public static partial class Runtime
         };
         Package p;
         if (pkg is Package pp) p = pp;
-        else if (pkg is LispString ps) p = FindPackageNamed(ps.Value) ?? throw new LispErrorException(new LispError($"Package not found: {ps.Value}"));
-        else if (pkg is Symbol psym) p = FindPackageNamed(psym.Name) ?? throw new LispErrorException(new LispError($"Package not found: {psym.Name}"));
-        else if (pkg is LispChar pc) { var pn = pc.Value.ToString(); p = FindPackageNamed(pn) ?? throw new LispErrorException(new LispError($"Package not found: {pn}")); }
-        else if (pkg is LispVector pv && pv.IsCharVector) { var pn = pv.ToCharString(); p = FindPackageNamed(pn) ?? throw new LispErrorException(new LispError($"Package not found: {pn}")); }
+        else if (pkg is LispString || pkg is Symbol && pkg is not Nil || pkg is LispChar || (pkg is LispVector pv && pv.IsCharVector))
+            p = ResolvePackage(pkg, "INTERN");
         else if (pkg is Nil) p = CurrentPackage("INTERN");
-        else throw new LispErrorException(new LispTypeError("INTERN: invalid package designator", pkg));
+        else throw new LispErrorException(new LispTypeError("INTERN: not a package designator", pkg,
+            List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("SYMBOL"),
+                 Startup.Sym("CHARACTER"), Startup.Sym("PACKAGE"))));
 
         var (resultSym, isNew) = p.Intern(symName);
         var canonical = CanonicalizeSymbol(resultSym);
@@ -996,6 +996,9 @@ public static partial class Runtime
     private static LispObject FindSymbolIn(LispObject nameArg, LispObject? pkgArg)
     {
         // (find-symbol name &optional package) -> symbol, status
+        if (!(nameArg is LispString || nameArg is LispChar || nameArg is LispVector { IsCharVector: true }))
+            throw new LispErrorException(new LispTypeError(
+                "FIND-SYMBOL: not a string", nameArg, Startup.Sym("STRING")));
         var pkg = pkgArg != null ? ResolvePackage(pkgArg, "FIND-SYMBOL") : CurrentPackage("FIND-SYMBOL");
         string symName = nameArg switch
         {

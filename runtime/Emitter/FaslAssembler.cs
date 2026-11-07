@@ -236,8 +236,10 @@ public class FaslAssembler
         if (runnable)
         {
             _ab = null!;
+            // Collectible: this is the module a LOAD of the file just written runs, and a
+            // reload of the same fasl must be able to drop it like any other.
             _runAb = AssemblyBuilder.DefineDynamicAssembly(
-                new AssemblyName(moduleName), RuntimeLoadContext.RunAccess);
+                new AssemblyName(moduleName), AssemblyBuilderAccess.RunAndCollect);
             _mb = _runAb.DefineDynamicModule(moduleName);
         }
         else
@@ -1168,6 +1170,8 @@ public class FaslAssembler
         var shellMethod = tb.DefineMethod(SanitizeName(name) + "_shell_" + id,
             MethodAttributes.Public | MethodAttributes.Static, typeof(LispObject), shellTypes);
         bool selfFramed = CilAssembler.CanSelfFrame(name, paramCount, f.NoFrame);
+        // (debug 0): no frame, but still entered by calli, as an untyped DEFUN is.
+        bool plainEntry = f.NoFrame && CilAssembler.CanSelfFrame(name, paramCount, false);
         bool leaf = selfFramed && onBodyMethod == null && f.Generic == null && CilAssembler.IsLeafSig(f.Sig)
             && CilAssembler.IsTypedLeaf(f.Body, structMap.UninternedTypeBuilder != null);
         MethodBuilder? genericMethod = null;
@@ -1214,7 +1218,8 @@ public class FaslAssembler
             CilAssembler.EmitTypedShell(framedShell.GetILGenerator().ForLibrary(), f, typedMethod, selfFramed);
             CilAssembler.EmitLeafShell(shellMethod.GetILGenerator().ForLibrary(), f, framedEntry!, framedShell);
         }
-        else CilAssembler.EmitTypedShell(shellMethod.GetILGenerator().ForLibrary(), f, typedMethod, selfFramed, generic: genericMethod);
+        else CilAssembler.EmitTypedShell(shellMethod.GetILGenerator().ForLibrary(), f, typedMethod, selfFramed, generic: genericMethod,
+                                         entryCheck: plainEntry ? ClosureEntryCheckMI : null);
 
         // 3. Array wrapper: static LispObject Name_N(LispObject[] args). As for a
         // native function, self is resolved through the symbol on this slow path.
@@ -1246,7 +1251,7 @@ public class FaslAssembler
             directBodyMethod: shellMethod, selfBound: true, noFrame: f.NoFrame, selfFramed: selfFramed,
             lambdaList: f.LambdaList != null ? CilAssembler.FaslLambdaListText(f.LambdaList, f.Pkg) : null,
             typedEntry: (typedEntryMethod, f.Sig), typedFramedEntry: framedEntry,
-            typedArgRanges: CilAssembler.TypedArgRanges(f), leafEntry: leaf);
+            typedArgRanges: CilAssembler.TypedArgRanges(f), leafEntry: leaf, plainEntry: plainEntry);
     }
 
     /// <summary>One typed arity of an &amp;optional / &amp;key / &amp;rest function:
@@ -1625,6 +1630,7 @@ public class FaslAssembler
         if (retargetCorlib != null)
             FaslCorlibRetarget.RetargetCorlib(image, retargetCorlib);
         ImageHook?.Invoke(image);
+        FaslDeterministic.Stamp(image);
         // Replaced, never rewritten in place: the old fasl may be loaded (LOAD
         // reads fasls by path) and still mapped by this process.
         Compat.WriteAllBytesReplacing(outputPath, image);

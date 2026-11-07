@@ -256,7 +256,8 @@ Point the build at it, in `hello.csproj`:
 </ItemGroup>
 ```
 
-Use it in `app.lisp`:
+Use it in `app.lisp` (it needs the `alexandria` clone and the search path set
+up above):
 
 ```lisp
 (defpackage :app (:use :cl) (:export #:app-main))

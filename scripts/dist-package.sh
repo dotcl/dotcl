@@ -2,7 +2,7 @@
 # Build the prebuilt package of one dist release for this dotcl and platform,
 # and the line for the dist's dotcl-packages.txt that offers it.
 #
-# Usage: scripts/dist-package.sh [--dist <distinfo-url>]... [--version <v>] <system> <out-dir>
+# Usage: scripts/dist-package.sh [--dist <distinfo-url>]... [--version <v>] [--allow-unreleased] <system> <out-dir>
 #
 #   --dist     A versioned distinfo URL (the dist version to build from). Give
 #              them in rising preference: the last one wins a system that more
@@ -22,6 +22,10 @@
 # (lisp-implementation-version) of the dotcl that built it, and only that dotcl
 # uses it.
 #
+# Only a released dotcl builds a package: its version is a plain X.Y.Z. A
+# development build (X.Y.Z+N.gHASH) or an untagged one (0.0.0) is refused,
+# unless --allow-unreleased is given (the end-to-end test builds with the tree).
+#
 # The sources come from a fresh Quicklisp home in a temporary directory; nothing
 # outside it is written but <out-dir>.
 set -eu
@@ -29,10 +33,12 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DISTS=""
 VERSION=""
+ALLOW_UNRELEASED=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dist) DISTS="$DISTS $2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
+    --allow-unreleased) ALLOW_UNRELEASED=1; shift ;;
     -*) echo "unknown option $1" >&2; exit 2 ;;
     *) break ;;
   esac
@@ -92,6 +98,16 @@ EOF
 echo "=== fetching the sources of $SYSTEM ==="
 $DOTCL "$WORK/fetch.lisp" < /dev/null
 read -r PROJECT PREFIX DOTCL_VERSION RID < "$WORK/release.txt"
+
+if printf '%s' "$DOTCL_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' && [ "$DOTCL_VERSION" != 0.0.0 ]; then
+  unreleased=""
+else
+  unreleased=1
+fi
+if [ -n "$unreleased" ] && [ -z "$ALLOW_UNRELEASED" ]; then
+  echo "dist-package: refusing to build a package with dotcl $DOTCL_VERSION: only a released dotcl (a plain X.Y.Z) builds one (--allow-unreleased overrides)" >&2
+  exit 3
+fi
 
 if [ -z "$VERSION" ]; then
   suffix="$(printf '%s' "${PREFIX#"$PROJECT"-}" | tr -c 'A-Za-z0-9' '.' | tr -s '.' | sed 's/^\.//; s/\.$//')"

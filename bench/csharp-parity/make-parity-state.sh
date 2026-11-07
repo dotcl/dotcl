@@ -48,7 +48,7 @@ done
 # floor in every process.
 #
 # The per-process values are also checked for falling into two groups
-# (bench/gate/modes.awk). That happens without any noise at all: the same binary
+# (bench/gate/modes.lisp). That happens without any noise at all: the same binary
 # can land a hot loop on either side of an alignment boundary depending on the
 # process, and then every process is either fast or slow. The minimum is then
 # the fast group's floor only if at least one process drew the fast group, so
@@ -60,29 +60,22 @@ done
 #
 # Output, one line per name: name<TAB>min<TAB>processes<TAB>split-json
 read_pairs() {
-    awk -F'\t' "$(cat "$modes_awk")"'
-        NF >= 2 && $2 + 0 == $2 {
-            if (!($1 in cnt)) o[++nk] = $1
-            cnt[$1]++
-            val[$1, cnt[$1]] = $2 + 0
-        }
-        END {
-            for (i = 1; i <= nk; i++) {
-                k = o[i]
-                n = cnt[k]
-                for (j = 1; j <= n; j++) v[j] = val[k, j]
-                split_modes(v, n)
-                if (M_split)
-                    s = sprintf("{\"fast_n\": %d, \"fast_ms\": %.3f, \"slow_n\": %d, \"slow_ms\": %.3f}", \
-                                M_fast_n, M_fast_med, M_slow_n, M_slow_med)
-                else
-                    s = "null"
-                printf "%s\t%.3f\t%d\t%s\n", k, M_min, n, s
-            }
-        }' "$1"
+    "${DOTCL_RUNTIME[@]}" "$gate_dir/pairs.lisp" "$1" < /dev/null
 }
 
-modes_awk="$(cd "$(dirname "$0")/../gate" && pwd)/modes.awk"
+# The dotcl command that runs the bench scripts (a Lisp file each). BENCH_RUNTIME is the
+# runtime the Makefile builds for the benchmarks; without it, the built runtime of this tree.
+gate_dir="$(cd "$(dirname "$0")/../gate" && pwd)"
+root="$(cd "$gate_dir/../.." && pwd)"
+if [ -n "${BENCH_RUNTIME:-}" ]; then
+    DOTCL_RUNTIME=("$BENCH_RUNTIME" --core "$root/compiler/dotcl.core")
+else
+    DOTCL_RUNTIME=(dotnet "$root/runtime/bin/Debug/net10.0/runtime.dll" --core "$root/compiler/dotcl.core")
+fi
+if [ ! -f "$root/compiler/dotcl.core" ]; then
+    echo "$0: no compiler/dotcl.core (make compile-core-fasl)" >&2
+    exit 1
+fi
 
 csharp_pairs=$(read_pairs "$csharp_file")
 dotcl_pairs=$(read_pairs "$dotcl_file")

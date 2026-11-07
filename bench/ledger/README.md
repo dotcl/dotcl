@@ -56,6 +56,28 @@ the environment:
 In the table `!` marks a row whose cold ratio is over 10x or whose steady ratio
 is over 2x; `!!` marks a row whose steady ratio is over 3x.
 
+## Startup
+
+`startup/empty` and `startup/hello` measure how long a fresh process takes to
+start and run a script: an empty file, or a file that prints one line. One
+measurement is the median wall time of `LEDGER_STARTUP_COUNT` (10) fresh
+processes after one unmeasured process, taken by `startup-time.lisp` (a dotcl script); dotcl runs
+with `--no-init`, SBCL with `--non-interactive --no-userinit`. The rounds
+alternate the two sides as for every row and the fastest median is kept.
+
+Startup has no steady state, so the steady columns show `-` and the row is never
+marked. The cold ratio is kept and takes part in the comparison with the previous
+run. SBCL is started directly, not through `ros` (which would add its own launch time):
+`run.sh` looks for the newest `sbcl-bin/<version>/bin/sbcl` under `$LEDGER_ROSWELL_HOME`
+(default `~/.roswell`) for the version `SBCL_CMD` reports, with its `sbcl.core`, then for `sbcl` on PATH.
+If neither is found, the SBCL side of the startup rows is left empty (`-`) and only dotcl is recorded.
+
+The ledger runs a non-ReadyToRun build, so startup here is larger than in the
+shipped tool (about 200 ms shipped; 655 ms for dotcl on the Apple-silicon mac the
+row was added on, against 14.5 ms for SBCL, fastest median of 3 rounds). The ratio
+to SBCL is therefore large and is never marked. Only the trend between runs on the same
+machine matters.
+
 ## Method
 
 - Each row of `items.tsv` is its own process per side. dotcl and SBCL alternate

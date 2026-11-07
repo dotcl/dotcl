@@ -33,7 +33,8 @@ public static partial class Runtime
     private static Symbol? _initializeInstanceSym;
     private static Symbol? _sharedInitializeSym;
     /// <summary>Custom method combination registry: name -> (operator name, identity-with-one-argument)</summary>
-    private static readonly ConcurrentDictionary<string, (string Operator, bool IdentityWithOneArg)> _methodCombinationRegistry = new();
+    private static ConcurrentDictionary<string, (string Operator, bool IdentityWithOneArg)>? _lz__methodCombinationRegistry;
+    private static ConcurrentDictionary<string, (string Operator, bool IdentityWithOneArg)> _methodCombinationRegistry => System.Threading.Volatile.Read(ref _lz__methodCombinationRegistry) ?? System.Threading.Interlocked.CompareExchange(ref _lz__methodCombinationRegistry, new(), null) ?? _lz__methodCombinationRegistry!;
 
     /// <summary>Short-form combination name -> the operator symbol itself, for an
     /// operator that is not one of the built-in names (a user function or macro).
@@ -331,6 +332,8 @@ public static partial class Runtime
             && !existing.NameCleared && ReferenceEquals(existing.Name, lc.Name))
         {
             NotifyDirectSubclasses(existing.DirectSuperclasses, lc.DirectSuperclasses, existing);
+            existing.StaleAccessorMethods = existing.AccessorMethods;
+            existing.AccessorMethods = new();
             existing.DirectSlots = lc.DirectSlots;
             existing.DirectSuperclasses = lc.DirectSuperclasses;
             existing.DirectDefaultInitargs = lc.DirectDefaultInitargs;
@@ -926,6 +929,13 @@ public static partial class Runtime
         if (!AnyInvocationProtocolCustomized || InvocationProtocolGfs is not { } protocols)
             return false;
         if (gf.UsesInvocationProtocol is bool known) return known;
+        if (gf.KeepsOrdinaryDispatch) { gf.UsesInvocationProtocol = false; return false; }
+        // Every protocol generic function keeps the ordinary path, whichever protocol
+        // method applies to it: a method on STANDARD-GENERIC-FUNCTION applies to all of
+        // them, and dispatching one through the protocol would call the others, which
+        // dispatch through it in turn.
+        foreach (var (protocolGf, _) in protocols)
+            if (ReferenceEquals(gf, protocolGf)) { gf.UsesInvocationProtocol = false; return false; }
         bool customized = false;
         foreach (var (protocolGf, defaultMethod) in protocols)
         {
@@ -1061,7 +1071,7 @@ public static partial class Runtime
     /// <summary>Called when DEFCLASS creates an accessor method, so AMOP's
     /// READER-METHOD-CLASS / WRITER-METHOD-CLASS run. Installed by Mop.Init; null
     /// until then. The bool says whether the accessor reads.</summary>
-    public static Action<LispClass, SlotDefinition, bool>? AccessorMethodClassHook;
+    public static Func<LispClass, SlotDefinition, bool, LispClass?>? AccessorMethodClassHook;
 
     /// <summary>Called while a class is being finalized, so AMOP's
     /// COMPUTE-DEFAULT-INITARGS runs. Installed by Mop.Init; null until then.</summary>
@@ -1072,6 +1082,11 @@ public static partial class Runtime
     /// leave the class's own answer alone, which is what happens until a metaclass
     /// specialises the protocol. Installed by Mop.Init.</summary>
     public static Func<LispClass, SlotDefinition[]?>? ComputeSlotsHook;
+
+    /// <summary>Called while a class is being finalized, so AMOP's
+    /// COMPUTE-CLASS-PRECEDENCE-LIST runs and its answer becomes the class's
+    /// precedence list. Returns null to use the standard order. Installed by Mop.Init.</summary>
+    public static Func<LispClass, LispClass[]?>? ComputeCplHook;
 
     /// <summary>Called when a generic function.s methods or initialization change,
     /// so AMOP.s COMPUTE-DISCRIMINATING-FUNCTION runs and its answer is installed.
@@ -1180,7 +1195,11 @@ public static partial class Runtime
     }
 
     public static LispObject MakeClass(LispObject name, LispObject supersList, LispObject slotDefsList)
-        => MakeClassCore(name, supersList, slotDefsList, null);
+        // A plain DEFCLASS goes through ENSURE-CLASS-USING-CLASS once the program has a
+        // method on it: an :AROUND method specialised on nothing in particular may
+        // choose the metaclass.
+        => MakeClassCore(name, supersList, slotDefsList, null,
+                         defining: EnsureClassGf is { } ecg && ecg.Methods.Count > 1);
 
     // --- Macro function registry ---
 
@@ -1218,6 +1237,16 @@ public static partial class Runtime
         System.Threading.Interlocked.Increment(ref MacroEpoch);
     }
 
+    /// <summary>For the message of an undefined function: the name is a macro or a special
+    /// operator, which a function call (funcall, mapcar, #') cannot use.</summary>
+    internal static string NotAFunctionNote(LispObject name)
+    {
+        if (name is not Symbol sym) return "";
+        if (_macroFunctions.ContainsKey(sym)) return " (it is a macro, not a function)";
+        if (IsSpecialOperator(sym)) return " (it is a special operator, not a function)";
+        return "";
+    }
+
     public static LispObject MacroFunction(LispObject name)
     {
         // Guard against stack overflow from recursive macro expansion
@@ -1240,12 +1269,17 @@ public static partial class Runtime
         if (result != Nil.Instance) return result;
         var sym = GetSymbol(name, "MACRO-FUNCTION");
         var compilerFn = Startup.LookupCompilerMacroAsMacro(sym);
-        if (compilerFn != null)
-            return new LispFunction(wrapArgs =>
-                compilerFn.Invoke(new LispObject[] { wrapArgs[0] }),
-                $"MACRO-EXPANDER-{sym.Name}", 2);
+        if (compilerFn != null) return CompilerMacroExpander(sym, compilerFn);
         return Nil.Instance;
     }
+
+    // Apart from MacroFunction1, which the compiler asks for every form: a lambda that
+    // captures a local of the method makes C# allocate its closure on entry, whether or
+    // not this branch is taken.
+    private static LispObject CompilerMacroExpander(Symbol sym, LispFunction compilerFn)
+        => new LispFunction(wrapArgs =>
+            compilerFn.Invoke(new LispObject[] { wrapArgs[0] }),
+            $"MACRO-EXPANDER-{sym.Name}", 2);
 
 
     // --- Global symbol-macro registry (DEFINE-SYMBOL-MACRO) ---

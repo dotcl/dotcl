@@ -23,10 +23,10 @@
 (deftest sealed-types.class-of-names
   (mapcar (lambda (x) (class-name (class-of x)))
           (list (cons 1 2) 1 1.5d0 'sym "s" #\a nil t #(1) (make-hash-table)))
-  ;; The names are dotcl's current CLASS-OF granularity (SYMBOL for T, VECTOR
-  ;; for a simple vector) -- pinned here because the
+  ;; The names are dotcl's current CLASS-OF granularity (SYMBOL for T,
+  ;; SIMPLE-VECTOR for a simple vector, as SBCL) -- pinned here because the
   ;; point is that sealing changed nothing, not that these are the finest names.
-  (cons fixnum double-float symbol string character null symbol vector hash-table))
+  (cons fixnum double-float symbol string character null symbol simple-vector hash-table))
 
 (defstruct sealed-s a)
 (defclass sealed-c () ((a :initarg :a)))

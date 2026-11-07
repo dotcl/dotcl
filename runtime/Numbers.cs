@@ -204,7 +204,7 @@ public sealed class SingleFloat : Number
         if (float.IsPositiveInfinity(Value)) return Runtime.NonFiniteFloatFormSafe("SINGLE-FLOAT-POSITIVE-INFINITY");
         if (float.IsNegativeInfinity(Value)) return Runtime.NonFiniteFloatFormSafe("SINGLE-FLOAT-NEGATIVE-INFINITY");
         if (float.IsNaN(Value)) return Runtime.NonFiniteFloatFormSafe("SINGLE-FLOAT-NAN");
-        var s = Value.ToString("R");
+        var s = FloatText.R(Value);
         if (s.Contains('E') || s.Contains('e'))
             return s;
         if (!s.Contains('.'))
@@ -246,7 +246,7 @@ public sealed class DoubleFloat : Number
         if (double.IsPositiveInfinity(Value)) return Runtime.NonFiniteFloatFormSafe("DOUBLE-FLOAT-POSITIVE-INFINITY");
         if (double.IsNegativeInfinity(Value)) return Runtime.NonFiniteFloatFormSafe("DOUBLE-FLOAT-NEGATIVE-INFINITY");
         if (double.IsNaN(Value)) return Runtime.NonFiniteFloatFormSafe("DOUBLE-FLOAT-NAN");
-        var s = Value.ToString("R");
+        var s = FloatText.R(Value);
         if (s.Contains('E') || s.Contains('e'))
             return s.Replace("E", "d").Replace("e", "d");
         if (!s.Contains('.'))
@@ -325,4 +325,59 @@ public sealed class BoxedComplex : LispComplex
 
     public override Number Real => _real;
     public override Number Imaginary => _imaginary;
+}
+
+/// <summary>The shortest decimal text that reads back as the same float, which is what PRIN1 owes
+/// (CLHS 22.1.3.1.3). .NET's "R" is right nearly always; for a few values at a power of two
+/// (2^-25 as a double) it drops a digit the reader needs, because the interval below such a value
+/// is half as wide as the one above it. Then the text is checked by reading it back, and the
+/// 17- (9- for single) digit form replaces it.</summary>
+internal static class FloatText
+{
+    public static string R(double v)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        var s = v.ToString("R", inv);
+        if (double.IsNaN(v) || double.IsInfinity(v)) return s;
+        if (double.Parse(s, inv) != v)
+        {
+            for (int digits = 16; digits <= 17; digits++)
+            {
+                var t = v.ToString("E" + (digits - 1), inv);
+                if (double.Parse(t, inv) == v) return Shorten(t, s);
+            }
+            return v.ToString("G17", inv);
+        }
+        return s;
+    }
+
+    public static string R(float v)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        var s = v.ToString("R", inv);
+        if (float.IsNaN(v) || float.IsInfinity(v)) return s;
+        if (float.Parse(s, inv) != v)
+        {
+            for (int digits = 8; digits <= 9; digits++)
+            {
+                var t = v.ToString("E" + (digits - 1), inv);
+                if (float.Parse(t, inv) == v) return Shorten(t, s);
+            }
+            return v.ToString("G9", inv);
+        }
+        return s;
+    }
+
+    // "E16" gives d.dddddddddddddddE-008; return it in the same shape "R" would have used
+    // (digits, optional fraction, E and a signed exponent) so the callers' parsing of RAW still works.
+    private static string Shorten(string e, string like)
+    {
+        // The caller of "R" gets either fixed ("0.001") or scientific ("1E-05") text; scientific is
+        // always acceptable to them, so hand back the E form without leading zeros in the exponent.
+        int ei = e.IndexOf('E');
+        var mant = e.Substring(0, ei).TrimEnd('0');
+        if (mant.EndsWith(".")) mant = mant.Substring(0, mant.Length - 1);
+        int exp = int.Parse(e.Substring(ei + 1), System.Globalization.CultureInfo.InvariantCulture);
+        return mant + "E" + (exp < 0 ? "-" : "+") + Math.Abs(exp).ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
 }

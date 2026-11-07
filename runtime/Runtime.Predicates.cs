@@ -104,6 +104,23 @@ public static partial class Runtime
         => v == null || (v is Symbol s && s.Name == "NEWEST" && s.HomePackage?.Name == "KEYWORD")
             ? Nil.Instance : v;
 
+    /// <summary>A nested structure is walked by recursion on the CAR (or the slots, or the
+    /// elements), and a deep enough one used to take the process down with a native stack
+    /// overflow. Every 128th call asks whether the stack is nearly used up, and signals the
+    /// same STORAGE-CONDITION an over-deep Lisp function call does.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal static void StackGuard(string who)
+    {
+        if ((++CallTls.StackCheck & 127) == 0) StackGuardSlow(who);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void StackGuardSlow(string who)
+    {
+        if (!Compat.TryEnsureSufficientExecutionStackWithMargin())
+            throw new LispErrorException(new LispStorageCondition($"Stack overflow in function {who}"));
+    }
+
     public static LispObject Equal(LispObject a, LispObject b)
     {
         a = Primary(a); b = Primary(b);
@@ -114,6 +131,28 @@ public static partial class Runtime
         // the final "return NIL", so this terminates.
         while (true)
         {
+            // Two conses first: the common case of a list or a tree, which would otherwise run through
+            // the string, pathname and bit-vector tests before reaching the cons branch below. The
+            // elements are compared here when they are the same object or both fixnums.
+            if (a is Cons ca0 && b is Cons cb0)
+            {
+                if (ReferenceEquals(ca0, cb0)) return T.Instance;
+                var x = ca0.Car; var y = cb0.Car;
+                if (!ReferenceEquals(x, y))
+                {
+                    if (x is Fixnum fx && y is Fixnum fy)
+                    {
+                        if (fx.Value != fy.Value) return Nil.Instance;
+                    }
+                    else
+                    {
+                        StackGuard("EQUAL");
+                        if (!IsTruthy(Equal(x, y))) return Nil.Instance;
+                    }
+                }
+                a = ca0.Cdr; b = cb0.Cdr;
+                continue;
+            }
             if (IsTrueEql(a, b)) return T.Instance;
             // Two strings: compare the characters where they are, without
             // building a System.String of a char-array backed one.
@@ -153,6 +192,7 @@ public static partial class Runtime
             // compared with the same full EQUAL logic on the next iteration).
             if (a is Cons ca && b is Cons cb)
             {
+                StackGuard("EQUAL");
                 if (!IsTruthy(Equal(ca.Car, cb.Car))) return Nil.Instance;
                 a = ca.Cdr; b = cb.Cdr;
                 continue;
@@ -270,6 +310,42 @@ public static partial class Runtime
         Primary(obj) is LispVector sbv && sbv.IsBitVector && sbv.Rank == 1 && sbv.IsSimple ? T.Instance : Nil.Instance;
     public static LispObject Arrayp(LispObject obj)
     { obj = Primary(obj); return obj is LispVector || obj is LispString ? T.Instance : Nil.Instance; }
+    public static bool IsTrueHashTable(LispObject obj) => obj is LispHashTable;
+    /// <summary>Compare the sum or difference of two int64 values with a third as
+    /// the integers they are, however far the sum is out of int64: CODE is the
+    /// comparison (0 &lt; 1 &lt;= 2 &gt; 3 &gt;= 4 = 5 /=) plus 8 when the second
+    /// operand is subtracted. (&lt; (1+ i) end) with I the largest fixnum is false,
+    /// not a wrapped true.</summary>
+    public static bool CmpSum(long a, long b, long c, int code)
+    {
+        long s;
+        bool overflow;
+        if ((code & 8) == 0) { s = unchecked(a + b); overflow = ((a ^ s) & (b ^ s)) < 0; }
+        else { s = unchecked(a - b); overflow = ((a ^ b) & (a ^ s)) < 0; }
+        int op = code & 7;
+        if (overflow)
+        {
+            // The true value is beyond int64 on the side opposite to the sign of s.
+            bool tooBig = s < 0;
+            switch (op)
+            {
+                case 0: case 1: return !tooBig;
+                case 2: case 3: return tooBig;
+                case 4: return false;
+                default: return true;
+            }
+        }
+        switch (op)
+        {
+            case 0: return s < c;
+            case 1: return s <= c;
+            case 2: return s > c;
+            case 3: return s >= c;
+            case 4: return s == c;
+            default: return s != c;
+        }
+    }
+
     public static LispObject Hash_table_p(LispObject obj) => Primary(obj) is LispHashTable ? T.Instance : Nil.Instance;
     public static LispObject Keywordp(LispObject obj) =>
         Primary(obj) is Symbol sym && sym.HomePackage != null && sym.HomePackage.Name == "KEYWORD"
@@ -432,8 +508,11 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("DIGIT-CHAR", new LispFunction(args => {
             Runtime.CheckArityMin("DIGIT-CHAR", args, 1);
             Runtime.CheckArityMax("DIGIT-CHAR", args, 2);
-            if (args[0] is not Fixnum wf) return Nil.Instance;
-            int weight = (int)wf.Value;
+            // CLHS: the weight is a non-negative integer (a weight past the radix gives NIL).
+            if (args[0] is not Fixnum { Value: >= 0 } wf)
+                throw new LispErrorException(new LispTypeError("DIGIT-CHAR: the weight is not a non-negative integer", args[0],
+                    Startup.Sym("UNSIGNED-BYTE")));
+            int weight = (int)Math.Min(wf.Value, int.MaxValue);
             int radix = args.Length >= 2 && args[1] is Fixnum rf ? (int)rf.Value : 10;
             if (radix < 2 || radix > 36) throw new LispErrorException(new LispTypeError("DIGIT-CHAR: radix out of range", args.Length >= 2 ? args[1] : Nil.Instance));
             if (weight < 0 || weight >= radix) return Nil.Instance;

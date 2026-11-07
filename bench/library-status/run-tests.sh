@@ -396,6 +396,41 @@ write_json() {
 }
 
 
+# Lisp run after TEST-SYSTEM for a library whose tests are plain functions that
+# TEST-OP does not call. The suite is loaded from the library's source (md5
+# compiles its tests only with :md5-testing; yacc keeps them in a file the
+# system does not list) and its result is printed as a LIBTEST-LAST-RESULT line.
+# An error stops the run through the debugger hook, as in TEST-SYSTEM.
+extra_tests() {
+  case "$1" in
+    md5) cat <<'XEOF'
+(libstatus-with-debugger-hook #'libtest-error-hook
+  (let ((*features* (cons :md5-testing *features*)))
+    (load (merge-pathnames "md5.lisp" (asdf:system-source-directory "md5"))))
+  (let ((pass 0) (fail 0))
+    (dolist (spec '(("TEST-RFC1321" . "*RFC1321-TESTSUITE*")
+                    ("TEST-OTHER" . "*OTHER-TESTSUITE*")))
+      (let ((n (length (symbol-value (find-symbol (cdr spec) "MD5")))))
+        (if (funcall (find-symbol (car spec) "MD5"))
+            (incf pass n)
+            (incf fail n))))
+    (format t "~%LIBTEST-LAST-RESULT md5 ~d ~d~%" pass fail)))
+XEOF
+    ;;
+    yacc) cat <<'XEOF'
+(libstatus-with-debugger-hook #'libtest-error-hook
+  (load (merge-pathnames "yacc-tests.lisp" (asdf:system-source-directory "yacc")))
+  (let ((pass 0) (fail 0))
+    (dolist (name '("TESTS-LOW" "TESTS-HI"))
+      (if (funcall (find-symbol name "YACC-TESTS"))
+          (incf pass)
+          (incf fail)))
+    (format t "~%LIBTEST-LAST-RESULT yacc ~d ~d~%" pass fail)))
+XEOF
+    ;;
+  esac
+}
+
 n=0
 ran=0
 skipped=0
@@ -599,6 +634,7 @@ remember it to load after LIBTEST-BEGIN."
     (unless names (libtest-die "LIBTEST-ERROR" "nested OPERATE with :FORCE" 2))
     (libstatus-with-debugger-hook #'libtest-error-hook
       (dolist (name names) (asdf:test-system name)))))
+$(extra_tests "$sys")
 ;; stefil keeps the result of the last suite run in *LAST-TEST-RESULT*. A test
 ;; op that does not print it leaves only progress characters, so print it here.
 (dolist (p '("HU.DWIM.STEFIL" "STEFIL"))

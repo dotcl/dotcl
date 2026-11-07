@@ -443,11 +443,64 @@ public static partial class Runtime
         int col = ProcessXpBlock(content, tokens, sectionEnds, 0, tokens.Count, _pprintBufferStart, margin, result,
                                   tokens[0].suffixLen);
 
+        if (GetPrintLinesLimit() is int maxLines)
+            ApplyPrintLines(result, content, tokens, _pprintBufferStart, maxLines);
+
         // Replace content in StringWriter
         sb.Length = _pprintBufferStart;
         sb.Append(result);
 
         _pprintColumn = col;
+    }
+
+    /// <summary>*PRINT-LINES* as a positive limit, or null when unlimited (or readably printing).</summary>
+    private static int? GetPrintLinesLimit()
+    {
+        if (GetPrintReadably()) return null;
+        var sym = Startup.Sym("*PRINT-LINES*");
+        var val = DynamicBindings.TryGet(sym, out var v) ? v : sym.Value;
+        return val is Fixnum f && f.Value >= 1 && f.Value < int.MaxValue ? (int)f.Value : null;
+    }
+
+    /// <summary>When the laid-out block RESULT has more than MAXLINES lines, cut it after line
+    /// MAXLINES, add " .." and the closing text of every block still open at the cut. Layout only
+    /// changes white space, so the cut is located in CONTENT by matching non-blank characters.</summary>
+    private static void ApplyPrintLines(System.Text.StringBuilder result, string content,
+        List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)> tokens,
+        int bufStart, int maxLines)
+    {
+        int lines = 1, cut = -1;
+        for (int i = 0; i < result.Length; i++)
+        {
+            if (result[i] != '\n') continue;
+            if (++lines == maxLines + 1) { cut = i; break; }
+        }
+        if (cut < 0) return;
+        int end = cut;
+        while (end > 0 && result[end - 1] == ' ') end--;
+        int ci = 0;
+        for (int ri = 0; ri < end; ri++)
+        {
+            char rc = result[ri];
+            if (char.IsWhiteSpace(rc)) continue;
+            int j = ci;
+            while (j < content.Length && char.IsWhiteSpace(content[j])) j++;
+            if (j < content.Length && content[j] == rc) ci = j + 1;
+        }
+        var closers = new System.Text.StringBuilder();
+        var open = new Stack<int>();
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            if (tokens[i].kind == "BLOCK_START") { open.Push(i); continue; }
+            if (tokens[i].kind != "BLOCK_END" || open.Count == 0) continue;
+            int s = open.Pop();
+            int startPos = tokens[s].pos - bufStart, endPos = tokens[i].pos - bufStart;
+            if (startPos > ci || endPos < ci) continue;
+            int len = System.Math.Min(tokens[s].suffixLen, content.Length - endPos);
+            if (len > 0) closers.Append(content, endPos, len);
+        }
+        result.Length = end;
+        result.Append(" ..").Append(closers);
     }
 
     /// <summary>Remove the spaces kept before buffered mandatory newlines when buffering stops.</summary>
@@ -523,7 +576,45 @@ public static partial class Runtime
     /// <param name="margin">Right margin</param>
     /// <param name="result">Output StringBuilder</param>
     /// <returns>Column position after output</returns>
+    [ThreadStatic] private static List<(int shift, int ownLen)>? _xpOwnersStore;
+    private static List<(int shift, int ownLen)> _xpOwners => _xpOwnersStore ??= new();
+
     private static int ProcessXpBlock(string content, List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)> tokens,
+        int[] sectionEnds, int tokenStart, int tokenEnd, int bufStart, int margin, System.Text.StringBuilder result,
+        int rootSuffixLen, int colOverride = -1)
+    {
+        // Track how far each block was moved and how long a per-line prefix of its
+        // own it adds, for the mandatory newlines of the blocks inside it.
+        int shift = 0, ownLen = 0;
+        if (tokenStart < tokenEnd && tokens[tokenStart].kind == "BLOCK_START")
+        {
+            var st = tokens[tokenStart];
+            if (colOverride >= 0) shift = colOverride - st.blockCol;
+            string? parentPlp = null;
+            bool found = false;
+            int depth = 0;
+            for (int pi = tokenStart - 1; pi >= 0 && !found; pi--)
+            {
+                if (tokens[pi].kind == "BLOCK_END") depth++;
+                else if (tokens[pi].kind == "BLOCK_START")
+                {
+                    if (depth == 0) { parentPlp = tokens[pi].plp; found = true; }
+                    else depth--;
+                }
+            }
+            if (st.plp != null && !string.Equals(st.plp, parentPlp, StringComparison.Ordinal))
+                ownLen = st.plp.Length > (parentPlp?.Length ?? 0)
+                    ? st.plp[(parentPlp?.Length ?? 0)..].TrimStart(' ').Length : 0;
+        }
+        _xpOwners.Add((shift, ownLen));
+        try
+        {
+            return ProcessXpBlockCore(content, tokens, sectionEnds, tokenStart, tokenEnd, bufStart, margin, result, rootSuffixLen, colOverride);
+        }
+        finally { _xpOwners.RemoveAt(_xpOwners.Count - 1); }
+    }
+
+    private static int ProcessXpBlockCore(string content, List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)> tokens,
         int[] sectionEnds, int tokenStart, int tokenEnd, int bufStart, int margin, System.Text.StringBuilder result,
         int rootSuffixLen, int colOverride = -1)
     {
@@ -537,7 +628,6 @@ public static partial class Runtime
         // When colOverride shifts the block, compute offset to adjust token indents
         int colShift = colOverride >= 0 ? colOverride - startToken.blockCol : 0;
         string? plp = startToken.plp;
-
         // Collect this block's own tokens (skip inner blocks)
         // Own tokens are those at nesting level 0 relative to this block
         // (unused, replaced by ownTokens2 below)
@@ -753,6 +843,29 @@ public static partial class Runtime
                     int spaces = nl;
                     while (spaces > 0 && segment[spaces - 1] == ' ') spaces--;
                     if (spaces < nl) segment = segment[..spaces] + segment[nl..];
+                    // The prefix and indentation after the newline were written for the
+                    // column the blocks had when they were buffered; blocks moved right
+                    // (by a tab before them) keep their lines under their new start.
+                    if (colShift > 0 || _xpOwners.Count > 0)
+                    {
+                        int ownerShift = 0, ownLen = 0;
+                        for (int oi = _xpOwners.Count - 1; oi >= 0; oi--)
+                            if (_xpOwners[oi].ownLen > 0) { ownerShift = _xpOwners[oi].shift; ownLen = _xpOwners[oi].ownLen; break; }
+                        if (tokPlp == null) ownerShift = 0;
+                        int plpLen = tokPlp?.Length ?? 0;
+                        if (ownerShift > 0 && ownLen > 0 && plpLen >= ownLen
+                            && nl + 1 + plpLen <= segment.Length
+                            && string.CompareOrdinal(segment, nl + 1, tokPlp!, 0, plpLen) == 0)
+                        {
+                            int at = nl + 1 + plpLen - ownLen;
+                            segment = segment[..at] + new string(' ', ownerShift) + segment[at..];
+                        }
+                        int more = colShift - ownerShift;
+                        if (more > 0) segment += new string(' ', more);
+                        else if (more < 0)
+                            for (int k = -more; k > 0 && segment.Length > nl + 1 && segment[^1] == ' '; k--)
+                                segment = segment[..^1];
+                    }
                 }
                 result.Append(segment);
                 col = CountColumnAfter(segment, col);
@@ -1419,10 +1532,10 @@ public static partial class Runtime
     private static (int start, int end) OctetsBounds(LispObject? startArg, LispObject? endArg,
                                                      int length, string who)
     {
-        int start = startArg is Fixnum sf ? (int)sf.Value
+        int start = startArg is Fixnum sf ? Runtime.ClampIndex(sf.Value)
             : startArg == null || startArg is Nil ? 0
             : throw new LispErrorException(new LispTypeError($"{who}: :START is not an index", startArg, Startup.Sym("FIXNUM")));
-        int end = endArg is Fixnum ef ? (int)ef.Value
+        int end = endArg is Fixnum ef ? Runtime.ClampIndex(ef.Value)
             : endArg == null || endArg is Nil ? length
             : throw new LispErrorException(new LispTypeError($"{who}: :END is not an index", endArg, Startup.Sym("FIXNUM")));
         if (start < 0 || end > length || start > end)
@@ -1484,6 +1597,16 @@ public static partial class Runtime
             bytes[i - start] = (byte)f.Value;
         }
         return new LispString(enc.GetString(bytes));
+    }
+
+    /// <summary>The text of a Lisp source file for LOAD / COMPILE-FILE, read as the given
+    /// :EXTERNAL-FORMAT (the default, UTF-8 with a byte order mark honoured, when none is
+    /// given). An unsupported format is an error, as for OPEN.</summary>
+    internal static string ReadSourceText(string path, LispObject? externalFormat, string who)
+    {
+        if (externalFormat == null || externalFormat is Nil) return File.ReadAllText(path);
+        var enc = ParseExternalFormat(externalFormat, who);
+        return enc == null ? File.ReadAllText(path) : File.ReadAllText(path, enc);
     }
 
     internal static System.Text.Encoding? ParseExternalFormat(LispObject spec, string who = "OPEN")
@@ -1549,7 +1672,8 @@ public static partial class Runtime
             case "ASCII": case "US-ASCII": return System.Text.Encoding.ASCII;
             case "UTF-16": case "UTF16": case "UCS-2": case "UCS2":
                 return System.Text.Encoding.Unicode;
-            case "UTF-16BE": case "UTF16BE": return System.Text.Encoding.BigEndianUnicode;
+            case "UTF-16BE": case "UTF16BE":
+                return new System.Text.UnicodeEncoding(bigEndian: true, byteOrderMark: false);
             case "UTF-16LE": case "UTF16LE":
                 return new System.Text.UnicodeEncoding(bigEndian: false, byteOrderMark: false);
             case "UTF-32": case "UTF32": case "UCS-4": case "UCS4":
@@ -1683,7 +1807,9 @@ public static partial class Runtime
             return new ByteTrackingReader(s, enc ?? new System.Text.UTF8Encoding(false),
                                           skipPreamble: false);
         var r = enc == null ? new ByteTrackingReader(s, SniffEncoding(s), skipPreamble: true)
-                            : new ByteTrackingReader(s, enc, skipPreamble: false);
+                            // An encoding that writes a byte order mark (:UTF-16, :UTF-32 without an
+                            // endianness) has it consumed on reading too; the others have none to skip.
+                            : new ByteTrackingReader(s, enc, skipPreamble: enc.GetPreamble().Length > 0);
         r.Newline = newline;
         return r;
     }
@@ -1729,6 +1855,20 @@ public static partial class Runtime
         return w;
     }
 
+    private static readonly string[] s_ifExistsValues =
+        { "NIL", "ERROR", "NEW-VERSION", "RENAME", "RENAME-AND-DELETE", "OVERWRITE", "APPEND", "SUPERSEDE", "DEFAULT" };
+    private static readonly string[] s_ifDoesNotExistValues = { "NIL", "ERROR", "CREATE", "DEFAULT" };
+
+    /// <summary>OPEN accepts only the values CLHS lists for :IF-EXISTS and :IF-DOES-NOT-EXIST.</summary>
+    private static void CheckOpenOption(string name, LispObject value, string[] allowed)
+    {
+        if (Array.IndexOf(allowed, name) >= 0) return;
+        var members = new List<LispObject> { Startup.Sym("MEMBER") };
+        foreach (var a in allowed)
+            if (a != "DEFAULT") members.Add(a == "NIL" ? Nil.Instance : Startup.Keyword(a));
+        throw new LispErrorException(new LispTypeError("OPEN: invalid option value", value, List(members.ToArray())));
+    }
+
     /// <summary>The byte stream under an :IF-EXISTS :APPEND output stream. Where
     /// the OS offers it, every write lands at the then-current end of file even
     /// with other appenders (see AppendFileStream). Elsewhere, seek to the end
@@ -1749,19 +1889,33 @@ public static partial class Runtime
         {
             return OpenFileCore(path, options);
         }
-        catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException
+                                   or ArgumentException or NotSupportedException)
         {
             // The file system refused (missing directory, permission, too many
-            // open files ...): OPEN signals FILE-ERROR for these, not a generic
-            // error, so that handlers for FILE-ERROR see them.
-            var err = new LispError($"OPEN: {ex.Message}");
-            err.ConditionTypeName = "FILE-ERROR";
-            err.FileErrorPathnameRef = path is LispPathname ? path
+            // open files, a name the host cannot hold ...): OPEN signals
+            // FILE-ERROR for these, not a generic error, so that handlers for
+            // FILE-ERROR see them.
+            var failedPath = path is LispPathname ? path
                 : path is LispFileStream pfs ? LispPathname.FromString(pfs.FilePath)
                 : LispPathname.FromString(ResolvePhysicalPath(path));
+            var err = new LispError($"OPEN: unable to open {FormatObject(failedPath, true)}: {FsFailureReason(ex)}");
+            err.ConditionTypeName = "FILE-ERROR";
+            err.FileErrorPathnameRef = failedPath;
             throw new LispErrorException(err);
         }
     }
+
+    // A short Lisp-side reason for a refused file system call, instead of the
+    // host library's message text.
+    internal static string FsFailureReason(Exception ex) => ex switch
+    {
+        FileNotFoundException or DirectoryNotFoundException => "no such file or directory",
+        UnauthorizedAccessException => "permission denied",
+        PathTooLongException => "file name too long",
+        ArgumentException or NotSupportedException => "invalid file name",
+        _ => ex.Message,
+    };
 
     private static readonly string[] OpenKeys =
         { "DIRECTION", "ELEMENT-TYPE", "IF-EXISTS", "IF-DOES-NOT-EXIST", "EXTERNAL-FORMAT" };
@@ -1771,6 +1925,18 @@ public static partial class Runtime
         // Checked here, not on the function object: compiled calls to OPEN come
         // straight to OpenFile.
         CheckNoUnknownKeys("OPEN", options, 0, OpenKeys);
+        // A wild pathname names no single file: FILE-ERROR (the quoted spelling,
+        // "star\\*name", is the literal file).
+        if (path is LispPathname wildPn ? HasWildComponent(wildPn)
+            : path is LispString wildStr && !IsLogicalPathnameString(wildStr.Value)
+              && HasWildComponent(LispPathname.FromString(wildStr.Value)))
+        {
+            var wildPath = path as LispPathname ?? LispPathname.FromString(((LispString)path).Value);
+            var wildErr = new LispError($"OPEN: wild pathname not allowed: {wildPath.ToNamestring()}");
+            wildErr.ConditionTypeName = "FILE-ERROR";
+            wildErr.FileErrorPathnameRef = wildPath;
+            throw new LispErrorException(wildErr);
+        }
         string filePath = ResolvePhysicalPath(path);
 
         // Resolve the original pathname object for storing on the stream
@@ -1783,6 +1949,7 @@ public static partial class Runtime
             originalPathname = pfs.OriginalPathname ?? LispPathname.FromString(pfs.FilePath);
 
         string direction = "INPUT";
+        bool bivalent = false;   // :element-type :default: bytes and characters
         string ifExists = "DEFAULT";
         string ifDoesNotExist = "DEFAULT";
         LispObject? elementType = null; // null means CHARACTER
@@ -1804,9 +1971,12 @@ public static partial class Runtime
                 var etVal = options[j + 1];
                 // :element-type DEFAULT means CHARACTER per CLHS
                 if (etVal is Symbol etSym && etSym.Name == "DEFAULT")
-                    elementType = null;
+                { elementType = null; bivalent = true; }
                 else
+                {
+                    if (etVal is Symbol etUnknown && IsUnknownTypeSymbol(etUnknown)) throw UnknownTypeSpecifier(etVal);
                     elementType = etVal;
+                }
                 continue;
             }
             if (key == "EXTERNAL-FORMAT")
@@ -1827,8 +1997,12 @@ public static partial class Runtime
             switch (key)
             {
                 case "DIRECTION": direction = val; break;
-                case "IF-EXISTS": ifExists = val; break;
-                case "IF-DOES-NOT-EXIST": ifDoesNotExist = val; break;
+                case "IF-EXISTS":
+                    CheckOpenOption(val, options[j + 1], s_ifExistsValues);
+                    ifExists = val; break;
+                case "IF-DOES-NOT-EXIST":
+                    CheckOpenOption(val, options[j + 1], s_ifDoesNotExistValues);
+                    ifDoesNotExist = val; break;
             }
         }
 
@@ -1867,7 +2041,9 @@ public static partial class Runtime
                 if (!File.Exists(filePath) && ifDoesNotExist != "CREATE")
                 {
                     if (ifDoesNotExist == "NIL") return Nil.Instance;
-                    var err = new LispError($"File not found: {filePath}");
+                    var err = new LispError(Directory.Exists(filePath)
+                        ? $"Cannot open a directory for input: {filePath}"
+                        : $"File not found: {filePath}");
                     err.ConditionTypeName = "FILE-ERROR";
                     err.FileErrorPathnameRef = path is LispPathname ? path : (LispObject)LispPathname.FromString(filePath);
                     throw new LispErrorException(err);
@@ -1878,7 +2054,7 @@ public static partial class Runtime
                 var netFsIn = new FileStream(filePath, inMode, FileAccess.Read, FileShare.ReadWrite);
                 var reader = MakeReader(netFsIn, encoding, binaryElement, newline);
                 var fs = new LispFileStream(reader, filePath);
-                fs.ElementType = elementType;
+                fs.ElementType = elementType; fs.Bivalent = bivalent;
                 fs.ExternalFormat = externalFormat;
                 fs.OriginalPathname = originalPathname;
                 return fs;
@@ -1912,7 +2088,7 @@ public static partial class Runtime
                             var netFs = new FileStream(filePath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
                             var writer = MakeWriter(netFs, encoding, newline);
                             var ofs = new LispFileStream(writer, filePath);
-                            ofs.ElementType = elementType;
+                            ofs.ElementType = elementType; ofs.Bivalent = bivalent;
                             ofs.ExternalFormat = externalFormat;
                             ofs.OriginalPathname = originalPathname;
                             return ofs;
@@ -1921,7 +2097,7 @@ public static partial class Runtime
                         {
                             var writer = MakeWriter(OpenForAppend(filePath, create: false), encoding, newline);
                             var ofs = new LispFileStream(writer, filePath);
-                            ofs.ElementType = elementType;
+                            ofs.ElementType = elementType; ofs.Bivalent = bivalent;
                             ofs.ExternalFormat = externalFormat;
                             ofs.OriginalPathname = originalPathname;
                             return ofs;
@@ -1958,7 +2134,7 @@ public static partial class Runtime
                         : CreateForOutput(filePath);
                     var writer = MakeWriter(netFsOut, encoding, newline);
                     var fs = new LispFileStream(writer, filePath);
-                    fs.ElementType = elementType;
+                    fs.ElementType = elementType; fs.Bivalent = bivalent;
                     fs.ExternalFormat = externalFormat;
                     fs.OriginalPathname = originalPathname;
                     fs.AbortDeletePath = abortDeletePath ?? (fileExisted ? null : filePath);
@@ -2006,7 +2182,7 @@ public static partial class Runtime
                             var readerTrunc = MakeReader(netFsTrunc, encoding, binaryElement, newline);
                             var writerTrunc = MakeWriter(netFsTrunc, encoding, newline); writerTrunc.AutoFlush = true;
                             var fsTrunc = new LispFileStream(readerTrunc, writerTrunc, filePath);
-                            fsTrunc.ElementType = elementType;
+                            fsTrunc.ElementType = elementType; fsTrunc.Bivalent = bivalent;
                             fsTrunc.ExternalFormat = externalFormat;
                             fsTrunc.OriginalPathname = originalPathname;
                             fsTrunc.AbortDeletePath = abortDeletePath;
@@ -2024,7 +2200,7 @@ public static partial class Runtime
                             var reader = MakeReader(netFs, encoding, binaryElement, newline);
                             var writer = MakeWriter(netFs, encoding, newline); writer.AutoFlush = true;
                             var afs = new LispFileStream(reader, writer, filePath);
-                            afs.ElementType = elementType;
+                            afs.ElementType = elementType; afs.Bivalent = bivalent;
                             afs.ExternalFormat = externalFormat;
                             afs.OriginalPathname = originalPathname;
                             return afs;
@@ -2052,7 +2228,7 @@ public static partial class Runtime
                     var reader = MakeReader(netFs, encoding, binaryElement, newline);
                     var writer = MakeWriter(netFs, encoding, newline); writer.AutoFlush = true;
                     var fs = new LispFileStream(reader, writer, filePath);
-                    fs.ElementType = elementType;
+                    fs.ElementType = elementType; fs.Bivalent = bivalent;
                     fs.ExternalFormat = externalFormat;
                     fs.OriginalPathname = originalPathname;
                     fs.AbortDeletePath = fileExists ? null : filePath;
@@ -2084,7 +2260,7 @@ public static partial class Runtime
                 }
                 var probeStream = new LispFileStream(filePath);
                 probeStream.IsClosed = true;
-                probeStream.ElementType = elementType;
+                probeStream.ElementType = elementType; probeStream.Bivalent = bivalent;
                 probeStream.OriginalPathname = originalPathname;
                 return probeStream;
             }
@@ -2197,6 +2373,8 @@ public static partial class Runtime
     /// would wait for the user or the writer end of a pipe, true when a character
     /// or the end of input is available, null when it cannot tell.</summary>
     public static Func<bool?>? StdinDataReady;
+    /// <summary>READ-BYTE on the process's standard input, installed by the CLI (null elsewhere).</summary>
+    public static Func<int>? StdinReadByte;
 
     private static bool StdinNotReady(TextReader reader)
     {
@@ -2359,7 +2537,7 @@ public static partial class Runtime
         LispBinaryStream => true,
         // A bivalent stream (BivalentStreamWriter) accepts both write-char and write-byte.
         LispBidirectionalStream bv => bv.Writer is BivalentStreamWriter,
-        LispFileStream fs => fs.IsOutput && IsIntegerElementType(fs.ElementType),
+        LispFileStream fs => fs.IsOutput && (fs.Bivalent || IsIntegerElementType(fs.ElementType)),
         LispBroadcastStream bs => bs.Streams.Length > 0 && IsBinaryOutputStream(bs.Streams[^1]),
         LispTwoWayStream tw => IsBinaryOutputStream(tw.OutputStream),
         LispEchoStream es => IsBinaryOutputStream(es.OutputStream),
@@ -2398,10 +2576,18 @@ public static partial class Runtime
         if (args.Length < 1)
             throw new LispErrorException(new LispProgramError("READ-BYTE: requires at least 1 argument"));
         if (args.Length > 3) throw new LispErrorException(new LispProgramError($"READ-BYTE: wrong number of arguments: {args.Length} (expected 1-3)"));
-        var stream = args[0];
-        bool eofErrorP = args.Length < 2 || IsTruthy(args[1]);
-        var eofValue = args.Length >= 3 ? args[2] : Nil.Instance;
+        return ReadByteCore(args[0], args.Length < 2 || IsTruthy(args[1]),
+                            args.Length >= 3 ? args[2] : Nil.Instance);
+    }
 
+    /// <summary>(READ-BYTE stream eof-error-p eof-value) for a call the compiler sees with
+    /// its three arguments (the missing ones filled in): no argument array.</summary>
+    public static LispObject ReadByteDirect(LispObject stream, LispObject eofErrorP, LispObject eofValue)
+        => GuardStreamIO(stream, stream, eofErrorP, eofValue,
+                         static (st, ee, ev) => ReadByteCore(st, IsTruthy(ee), ev));
+
+    private static LispObject ReadByteCore(LispObject stream, bool eofErrorP, LispObject eofValue)
+    {
         // Gray binary input stream: dispatch to the stream-read-byte generic.
         if (stream is LispInstance gbi && IsGrayStream(gbi))
         {
@@ -2422,6 +2608,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError(
                 $"READ-BYTE: {ls} is not an input stream", stream, Startup.Sym("STREAM")));
 
+        CheckBinaryInput(stream);
         int byteWidth = GetBinaryFormat(stream, out bool signedElems);
         var elem = ReadBinaryElement(stream, byteWidth, signedElems);
         if (elem == null)
@@ -2477,6 +2664,37 @@ public static partial class Runtime
             : args[0];
     }
 
+    private static Symbol? s_readtableSym;
+    private static Symbol ReadtableSym => s_readtableSym ??= Startup.Sym("*READTABLE*");
+
+    /// <summary>IsBinaryStream for a stream that is not a composite: the answer
+    /// that function gives for a LispStream.</summary>
+    private static bool IsBinaryPlain(LispStream ls)
+    {
+        var et = ls.ElementType;
+        if (et == null) return false;
+        if (et is Symbol sym)
+            return sym.Name is not ("CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR");
+        return true;
+    }
+
+    /// <summary>The stream itself when it is a file or string input stream of exactly
+    /// the usual classes, open for input and with a character element type: nothing to
+    /// look through, no echo to feed, no Gray dispatch. Else null, and the caller takes
+    /// the general path. An exact-type test costs one compare; the general path's
+    /// chain of class tests is most of what a PEEK-CHAR or READ-CHAR spent.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static LispStream? PlainCharInput(LispObject o)
+    {
+        var t = o.GetType();
+        if (t == typeof(LispStringInputStream) || t == typeof(LispFileStream) || t == typeof(LispInputStream))
+        {
+            var ls = System.Runtime.CompilerServices.Unsafe.As<LispStream>(o);
+            if ((ls.IsInput || !ls.IsOutput) && !IsBinaryPlain(ls)) return ls;
+        }
+        return null;
+    }
+
     /// <summary>Check if a stream has binary element type (not character).</summary>
     private static bool IsBinaryStream(LispObject stream)
     {
@@ -2515,6 +2733,8 @@ public static partial class Runtime
         }
         if (stream is LispBinaryStream bs)
             return bs.BaseStream.ReadByte();
+        if (StdinReadByte is { } readStdinByte && ReferenceEquals(stream, Startup.StandardInput))
+            return readStdinByte();
         // Bivalent stream: read-byte draws from the same byte source as read-char.
         if (stream is LispBidirectionalStream bvi && bvi.Reader is BivalentStreamReader bsr)
             return bsr.ReadRawByte();
@@ -2567,7 +2787,12 @@ public static partial class Runtime
         // No Flush per byte: the FileStream buffers like the character side
         // does, and FINISH-OUTPUT / FORCE-OUTPUT / CLOSE / FILE-LENGTH flush it.
         if (stream is LispFileStream fs && fs.OutputWriter is StreamWriter sw)
+        {
+            // Characters written before are still in the encoder's buffer: send them first so a
+            // stream that takes both (:element-type :default) keeps them in order.
+            if (fs.Bivalent) sw.Flush();
             sw.BaseStream.WriteByte((byte)b);
+        }
         else if (stream is LispBroadcastStream bs)
         {
             foreach (var s in bs.Streams) WriteStreamByte(s, b);
@@ -2686,6 +2911,7 @@ public static partial class Runtime
             throw new LispErrorException(new LispProgramError($"{funcName}: odd number of keyword arguments"));
         bool allowOtherKeys = false;
         bool hasUnknownKeys = false;
+        string? unknownKeyShown = null;
         // First pass: check for :allow-other-keys (first occurrence wins)
         for (int i = kwStart; i < args.Length; i += 2)
         {
@@ -2708,7 +2934,7 @@ public static partial class Runtime
                     var val = args[i + 1];
                     if (val is not Fixnum fi || fi.Value < 0)
                         throw new LispErrorException(new LispTypeError($"{funcName}: invalid :START value", val, Startup.Sym("UNSIGNED-BYTE")));
-                    start = (int)fi.Value;
+                    start = Runtime.ClampIndex(fi.Value);
                     startSeen = true;
                 }
             }
@@ -2718,20 +2944,35 @@ public static partial class Runtime
                 {
                     var val = args[i + 1];
                     if (val is Nil) { /* nil is ok, keep end = -1 */ }
-                    else if (val is Fixnum fi && fi.Value >= 0) end = (int)fi.Value;
+                    else if (val is Fixnum fi && fi.Value >= 0) end = Runtime.ClampIndex(fi.Value);
                     else throw new LispErrorException(new LispTypeError($"{funcName}: invalid :END value", val, Startup.Sym("UNSIGNED-BYTE")));
                     endSeen = true;
                 }
             }
             else if (key == "ALLOW-OTHER-KEYS") { /* already handled */ }
-            else hasUnknownKeys = true;
+            else { hasUnknownKeys = true; unknownKeyShown ??= FormatTop(args[i], true); }
         }
         if (hasUnknownKeys && !allowOtherKeys)
-            throw new LispErrorException(new LispProgramError($"{funcName}: unrecognized keyword argument"));
+            throw new LispErrorException(new LispProgramError($"{funcName}: unrecognized keyword argument {unknownKeyShown}"));
     }
 
     // Length of a sequence for resolving a defaulted :end when dispatching
     // read-sequence / write-sequence to a Gray stream's bulk generic.
+    /// <summary>START and END (-1: the end) must be bounding indices of SEQ: 0 &lt;= START &lt;= END &lt;= length.</summary>
+    private static void CheckSequenceBounds(string funcName, LispObject seq, int start, int end)
+    {
+        if (seq is not (LispString or LispVector or Cons or Nil)) return;
+        int len = GraySeqLength(seq);
+        if (start > len)
+            throw new LispErrorException(new LispTypeError(
+                $"{funcName}: :START {start} is past the end of the sequence (length {len})", Fixnum.Make(start),
+                Runtime.List(Startup.Sym("INTEGER"), Fixnum.Make(0), Fixnum.Make(len))));
+        if (end >= 0 && (end > len || end < start))
+            throw new LispErrorException(new LispTypeError(
+                $"{funcName}: :END {end} is not between :START {start} and the length {len}", Fixnum.Make(end),
+                Runtime.List(Startup.Sym("INTEGER"), Fixnum.Make(start), Fixnum.Make(len))));
+    }
+
     private static int GraySeqLength(LispObject seq)
     {
         switch (seq)
@@ -2742,6 +2983,16 @@ public static partial class Runtime
             case Cons: { int n = 0; LispObject t = seq; while (t is Cons c) { n++; t = c.Cdr; } return n; }
             default: return 0;
         }
+    }
+
+    /// <summary>The character UNREAD-CHAR left pending on STREAM, or -1. Bulk readers that read the
+    /// text reader directly have to take it first, or the character is skipped.</summary>
+    private static int TakePendingUnread(LispObject stream)
+    {
+        var resolved = ResolveLispStream(stream);
+        int ch = resolved.UnreadCharValue;
+        if (ch != -1) resolved.UnreadCharValue = -1;
+        return ch;
     }
 
     public static LispObject ReadSequence(LispObject[] args)
@@ -2768,6 +3019,7 @@ public static partial class Runtime
         int end = -1;
         // Validate keyword args
         ValidateSequenceKeywords("READ-SEQUENCE", args, 2, ref start, ref end);
+        CheckSequenceBounds("READ-SEQUENCE", seq, start, end);
 
         // Gray stream (Gray protocol): dispatch to the stream-read-sequence
         // generic so a subclass can bulk-fill the sequence (e.g. flexi-streams
@@ -2798,9 +3050,30 @@ public static partial class Runtime
             if (end < 0) end = ls.Length;
             TextReader reader = GetTextReader(stream);
             int pos = start;
+            int pend = pos < end ? TakePendingUnread(stream) : -1;
+            if (echoWriter == null)
+            {
+                // Without an echo, read a block at a time into the string's own array. A
+                // reader may return fewer characters than asked for before the end, so
+                // loop until the block is full or it returns 0 (end of input).
+                if (pos < end)
+                {
+                    var target = ls.RawChars;
+                    // A character UNREAD-CHAR left pending comes first.
+                    if (pend != -1) { target[pos++] = (char)pend; pend = -1; }
+                    while (pos < end)
+                    {
+                        int got = reader.Read(target, pos, end - pos);
+                        if (got <= 0) break;
+                        pos += got;
+                    }
+                }
+                return Fixnum.Make(pos);
+            }
             while (pos < end)
             {
-                int ch = reader.Read();
+                int ch = pend != -1 ? pend : reader.Read();
+                pend = -1;
                 if (ch == -1) break;
                 ls[pos++] = (char)ch;
                 echoWriter?.Write((char)ch);
@@ -2824,9 +3097,11 @@ public static partial class Runtime
             else
             {
                 TextReader reader = GetTextReader(stream);
+                int pend = pos < end ? TakePendingUnread(stream) : -1;
                 while (pos < end)
                 {
-                    int ch = reader.Read();
+                    int ch = pend != -1 ? pend : reader.Read();
+                    pend = -1;
                     if (ch == -1) break;
                     vec.SetElement(pos++, LispChar.Make((char)ch));
                     echoWriter?.Write((char)ch);
@@ -2863,9 +3138,11 @@ public static partial class Runtime
             else
             {
                 TextReader consReader = GetTextReader(stream);
+                int pend = pos < end && cell is Cons ? TakePendingUnread(stream) : -1;
                 while (pos < end && cell is Cons cc)
                 {
-                    int ch = consReader.Read();
+                    int ch = pend != -1 ? pend : consReader.Read();
+                    pend = -1;
                     if (ch == -1) break;
                     cc.Car = LispChar.Make((char)ch);
                     echoWriter?.Write((char)ch);
@@ -2886,6 +3163,7 @@ public static partial class Runtime
         int end = -1;
         // Validate keyword args
         ValidateSequenceKeywords("WRITE-SEQUENCE", args, 2, ref start, ref end);
+        CheckSequenceBounds("WRITE-SEQUENCE", args[0], start, end);
         return WriteSequenceCore(args[0], args[1], start, end);
     }
 
@@ -2909,6 +3187,9 @@ public static partial class Runtime
                 throw new LispErrorException(new LispTypeError("WRITE-SEQUENCE: not a proper sequence", seq, Startup.Sym("VECTOR")));
         }
 
+        // NIL and T name the current *STANDARD-OUTPUT* / *TERMINAL-IO*, like every other output function.
+        if (stream is Nil) return WriteSequenceCore(seq, DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*")), start, end);
+        if (stream is T) return WriteSequenceCore(seq, DynamicBindings.Get(Startup.Sym("*TERMINAL-IO*")), start, end);
         // Resolve composite streams
         if (stream is LispTwoWayStream tws) return WriteSequenceCore(seq, tws.OutputStream, start, end);
         if (stream is LispSynonymStream syn) return WriteSequenceCore(seq, DynamicBindings.Get(syn.Symbol), start, end);
@@ -2975,12 +3256,16 @@ public static partial class Runtime
         if (stream is LispOutputStream outs) writer = outs.Writer;
         else if (stream is LispFileStream fs && fs.IsOutput) writer = fs.OutputWriter!;
         else if (stream is LispBidirectionalStream bidi) writer = bidi.Writer;
-        else writer = Console.Out;
+        else writer = GetTextWriter(stream);
 
+        // The last character written decides whether the stream is at the start of a line (~& and FRESH-LINE).
+        int lastWritten = -1;
         if (seq is LispString ls)
         {
             if (end < 0) end = ls.Value.Length;
-            writer.Write(ls.Value.Substring(start, end - start));
+            var piece = ls.Value.Substring(start, end - start);
+            writer.Write(piece);
+            if (piece.Length > 0) lastWritten = piece[piece.Length - 1];
         }
         else if (seq is LispVector vecCh)
         {
@@ -2988,7 +3273,7 @@ public static partial class Runtime
             for (int i = start; i < end; i++)
             {
                 var elem = vecCh.GetElement(i);
-                if (elem is LispChar lc) writer.Write(lc.Value);
+                if (elem is LispChar lc) { writer.Write(lc.Value); lastWritten = lc.Value; }
                 else throw new LispErrorException(new LispTypeError(
                     $"WRITE-SEQUENCE: {elem} can not be written to a character stream",
                     elem, Startup.Sym("CHARACTER")));
@@ -3006,13 +3291,14 @@ public static partial class Runtime
             for (int i = 0; i < start && cell is Cons c; i++) cell = c.Cdr;
             for (int i = start; i < end && cell is Cons cc; i++)
             {
-                if (cc.Car is LispChar lc) writer.Write(lc.Value);
+                if (cc.Car is LispChar lc) { writer.Write(lc.Value); lastWritten = lc.Value; }
                 else throw new LispErrorException(new LispTypeError(
                     $"WRITE-SEQUENCE: {cc.Car} can not be written to a character stream",
                     cc.Car, Startup.Sym("CHARACTER")));
                 cell = cc.Cdr;
             }
         }
+        if (lastWritten >= 0) UpdateAtLineStart(stream, (char)lastWritten);
         return seq;
     }
 
@@ -3107,17 +3393,32 @@ public static partial class Runtime
             MultipleValues.SetPair(line, missing ? T.Instance : Nil.Instance);
             return line;
         }
+        CheckCharacterInput(stream);
         var echoStream = FindEchoStream(stream);
         TextWriter? echoWriter = echoStream != null ? GetTextWriter(echoStream.OutputStream) : null;
+
+        // A character file whose line is wholly in the buffer and ASCII: the line comes out
+        // of the byte buffer as one string.
+        if (echoStream == null && stream is LispFileStream plainFile && plainFile.IsInput
+            && !plainFile.IsClosed && plainFile.UnreadCharValue == -1
+            && plainFile.InputReader is ByteTrackingReader bytesIn
+            && bytesIn.TryReadLineAscii(out var fastLine, out var fastNl))
+        {
+            var fastResult = new LispString(fastLine);
+            MultipleValues.SetPair(fastResult, fastNl ? Nil.Instance : T.Instance);
+            return fastResult;
+        }
 
         // Read character by character to handle concatenated streams crossing boundaries
         var sb = new System.Text.StringBuilder();
         bool foundNewline = false;
         bool gotAny = false;
+        int pendingChar = TakePendingUnread(stream);
         while (true)
         {
             TextReader reader = GetTextReader(stream); // Re-resolve each iteration for concatenated streams
-            int ch = reader.Read();
+            int ch = pendingChar != -1 ? pendingChar : reader.Read();
+            pendingChar = -1;
             if (ch == -1)
             {
                 // For concatenated streams, advance to next component
@@ -3183,6 +3484,9 @@ public static partial class Runtime
                     if (es.InputStream is LispStream) { streamObj = es.InputStream; continue; }
                     return es.ResolvedInputCache ??= new LispInputStream(new GrayStreamTextReader((LispInstance)es.InputStream));
                 case LispStream ls:
+                    if (!ls.IsInput && ls.IsOutput)
+                        throw new LispErrorException(new LispTypeError(
+                            $"{ls} is not an input stream", ls, Startup.Sym("STREAM")));
                     return ls;
                 case T:
                     streamObj = DynamicBindings.Get(Startup.Sym("*TERMINAL-IO*"));
@@ -3201,6 +3505,32 @@ public static partial class Runtime
 
     // TYPE-ERROR for an object that is not an input stream designator (a stream,
     // T or NIL), as SBCL signals for (read-char "abc").
+    /// <summary>READ-BYTE takes a binary input stream (CLHS: "should signal an error of
+    /// type error if stream is not a binary input stream"; SBCL a type-error). A file
+    /// stream opened for characters and a string input stream are not; a stream
+    /// opened with :ELEMENT-TYPE :DEFAULT is bivalent, and the console, socket and
+    /// Gray streams decide for themselves.</summary>
+    private static void CheckBinaryInput(LispObject streamObj)
+    {
+        var leaf = streamObj;
+        for (int guard = 0; guard < 32; guard++)
+        {
+            if (leaf is LispTwoWayStream tw) leaf = tw.InputStream;
+            else if (leaf is LispEchoStream es) leaf = es.InputStream;
+            else if (leaf is LispSynonymStream ss && ss.Symbol.Value is { } sv) leaf = sv;
+            else if (leaf is LispConcatenatedStream cs && cs.CurrentIndex < cs.Streams.Length) leaf = cs.Streams[cs.CurrentIndex];
+            else break;
+        }
+        bool characterOnly = leaf is LispStringInputStream
+            || (leaf is LispFileStream fs && fs.IsInput && !fs.Bivalent
+                && (fs.ElementType == null
+                    || (fs.ElementType is Symbol sym && sym.Name is "CHARACTER" or "BASE-CHAR" or "STANDARD-CHAR")));
+        if (characterOnly)
+            throw new LispErrorException(new LispTypeError(
+                "READ-BYTE: not a binary input stream: the stream's element type is a character type",
+                streamObj, Startup.Sym("STREAM")));
+    }
+
     internal static LispTypeError NotInputStreamDesignator(LispObject obj)
         => new LispTypeError($"{obj} is not an input stream designator", obj,
             Runtime.List(Startup.Sym("OR"), Startup.Sym("STREAM"),
@@ -3217,12 +3547,48 @@ public static partial class Runtime
     // The compiler emits direct (:call "Runtime.ReadChar") etc. for the common
     // stream builtins, bypassing the registered LispFunction wrappers; so the
     // stream-error guard must live on the methods themselves.
+    /// <summary>READ-CHAR, PEEK-CHAR and READ-LINE take a character input stream
+    /// (CLHS); an (unsigned-byte 8) stream is a type-error, as in SBCL and ECL.
+    /// A Gray stream decides for itself, and a bivalent stream is a character
+    /// stream.</summary>
+    private static void CheckCharacterInput(LispObject streamObj)
+    {
+        // Look through the composite streams to the stream that is read; a Gray
+        // stream decides for itself.
+        var leaf = streamObj;
+        for (int guard = 0; guard < 32; guard++)
+        {
+            if (leaf is LispTwoWayStream tw) leaf = tw.InputStream;
+            else if (leaf is LispEchoStream es) leaf = es.InputStream;
+            else if (leaf is LispSynonymStream ss && ss.Symbol.Value is { } sv) leaf = sv;
+            else if (leaf is LispConcatenatedStream cs && cs.CurrentIndex < cs.Streams.Length) leaf = cs.Streams[cs.CurrentIndex];
+            else break;
+        }
+        if (leaf is LispInstance) return;
+        if (IsBinaryStream(leaf))
+            throw new LispErrorException(new LispTypeError(
+                "Not a character input stream: the stream's element type is not a character type",
+                streamObj, Startup.Sym("STREAM")));
+    }
+
     public static LispObject ReadChar(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
         => GuardStreamIO(streamObj, streamObj, eofErrorP, eofValue,
                          static (st, ee, ev) => ReadCharUnguarded(st, ee, ev));
 
     private static LispObject ReadCharUnguarded(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
     {
+        var plainIn = PlainCharInput(streamObj);
+        if (plainIn != null && plainIn.UnreadCharValue == -1)
+        {
+            int pc0 = GetTextReader(streamObj).Read();
+            if (pc0 == -1)
+            {
+                if (IsTruthy(eofErrorP))
+                    throw new LispErrorException(MakeEndOfFileError(streamObj));
+                return eofValue;
+            }
+            return LispChar.Make((char)pc0);
+        }
         // Gray input stream: dispatch to the stream-read-char generic.
         // ResolveLispStream would otherwise drop the CLOS instance to
         // *standard-input* (its default: branch), so read-char read stdin.
@@ -3240,6 +3606,21 @@ public static partial class Runtime
                 return eofValue;
             }
         }
+        // A file or string input stream itself (not a composite or a synonym): nothing to
+        // look through, no echo to feed, and the stream is its own resolved stream.
+        if ((streamObj is LispFileStream || streamObj is LispInputStream)
+            && ((LispStream)streamObj).UnreadCharValue == -1 && !IsBinaryStream(streamObj))
+        {
+            int pc = GetTextReader(streamObj).Read();
+            if (pc == -1)
+            {
+                if (IsTruthy(eofErrorP))
+                    throw new LispErrorException(MakeEndOfFileError(streamObj));
+                return eofValue;
+            }
+            return LispChar.Make((char)pc);
+        }
+        CheckCharacterInput(streamObj);
         // Check if this is an echo stream BEFORE resolving
         var echoStream = FindEchoStream(streamObj);
         var stream = ResolveLispStream(streamObj);
@@ -3319,7 +3700,7 @@ public static partial class Runtime
         }
         if (peekType is T)
         {
-            var rtObj = DynamicBindings.Get(Startup.Sym("*READTABLE*"));
+            var rtObj = DynamicBindings.Get(ReadtableSym);
             var readtable = rtObj is LispReadtable lrt ? lrt : Startup.StandardReadtable;
             while (true)
             {
@@ -3344,11 +3725,23 @@ public static partial class Runtime
         // stream-read-char generics (ResolveLispStream would drop the instance
         // to *standard-input*, and the LispStream path below assumes a
         // resolvable stream with an UnreadCharValue slot).
-        if (streamObj is LispInstance grIn && IsGrayStream(grIn))
-            return PeekCharGray(peekType, grIn, eofErrorP, eofValue);
+        LispEchoStream? echoStream;
+        LispStream stream;
+        var plainIn = PlainCharInput(streamObj);
+        if (plainIn != null)
+        {
+            echoStream = null;
+            stream = plainIn;
+        }
+        else
+        {
+            if (streamObj is LispInstance grIn && IsGrayStream(grIn))
+                return PeekCharGray(peekType, grIn, eofErrorP, eofValue);
 
-        var echoStream = FindEchoStream(streamObj);
-        var stream = ResolveLispStream(streamObj);
+            CheckCharacterInput(streamObj);
+            echoStream = FindEchoStream(streamObj);
+            stream = ResolveLispStream(streamObj);
+        }
         TextWriter? echoWriter = echoStream != null ? GetTextWriter(echoStream.OutputStream) : null;
 
         if (peekType is LispChar targetChar)
@@ -3380,7 +3773,7 @@ public static partial class Runtime
         else if (peekType is T)
         {
             // Skip characters with whitespace[2] syntax type in the current readtable
-            var rtObj = DynamicBindings.Get(Startup.Sym("*READTABLE*"));
+            var rtObj = DynamicBindings.Get(ReadtableSym);
             var readtable = rtObj is LispReadtable lrt ? lrt : Startup.StandardReadtable;
             // Check unread char first
             if (stream.UnreadCharValue != -1)
@@ -3453,6 +3846,20 @@ public static partial class Runtime
         // stream too, and matching that keeps portable code working.
         if (args[0] is LispStream closed && closed.IsClosed)
             throw new LispErrorException(MakeStreamError(args[0], "FILE-POSITION"));
+        // CLHS: the position is :START, :END or a non-negative integer.
+        if (args.Length == 2)
+        {
+            bool valid = args[1] is Fixnum pf ? pf.Value >= 0
+                       : args[1] is Bignum pb ? pb.Value.Sign >= 0
+                       : args[1] is Symbol ps && ps.HomePackage?.Name == "KEYWORD"
+                         && (ps.Name == "START" || ps.Name == "END");
+            if (!valid)
+                throw new LispErrorException(new LispTypeError(
+                    "FILE-POSITION: position must be :START, :END or a non-negative integer", args[1],
+                    List(Startup.Sym("OR"),
+                         List(Startup.Sym("MEMBER"), Startup.Keyword("START"), Startup.Keyword("END")),
+                         List(Startup.Sym("INTEGER"), Fixnum.Make(0), Startup.Sym("*")))));
+        }
         // Broadcast stream: return file-position of last component, or 0 if empty
         if (args[0] is LispBroadcastStream bs)
         {
@@ -3694,7 +4101,20 @@ public static partial class Runtime
     {
         if (ch is not LispChar lc)
             throw new LispErrorException(new LispTypeError("WRITE-CHAR: not a character", ch));
+        // A file opened for bytes (not :element-type :default, which takes both) is not a
+        // character stream.
+        if (stream is LispFileStream bfs && bfs.IsOutput && !bfs.Bivalent && IsIntegerElementType(bfs.ElementType))
+            throw new LispErrorException(new LispTypeError("WRITE-CHAR: not a character output stream", stream, Startup.Sym("STREAM")));
 
+        // A file or string output stream itself, with no pretty-printer block open: the
+        // writer is the stream's own, there is no pending break or block to track, and
+        // the stream's line-start flag is the only state to keep.
+        if (!_pprintActive && (stream is LispFileStream || stream is LispOutputStream))
+        {
+            GetTextWriter(stream).Write(lc.Value);
+            ((LispStream)stream).AtLineStart = lc.Value == '\n';
+            return ch;
+        }
         var writer = ResolveOutputStreamDesignator(stream);
         if (PprintUnrelatedWriter(writer))
         {
@@ -3709,6 +4129,17 @@ public static partial class Runtime
         if (lc.Value == '\n')
             PprintAfterNewline(writer);
         return ch;
+    }
+
+    private static LispErrorException NotAString(string fn, LispObject obj)
+        => new LispErrorException(new LispTypeError($"{fn}: not a string: {FormatObject(obj, true)}", obj, Startup.Sym("STRING")));
+
+    private static void CheckStringBounds(string fn, string s, int start, int end)
+    {
+        if (end > s.Length || start > end)
+            throw new LispErrorException(new LispTypeError(
+                $"{fn}: bounding indices {start} and {end} are invalid for a string of length {s.Length}",
+                Fixnum.Make(start > end ? start : end), Startup.Sym("INTEGER")));
     }
 
     public static LispObject WriteString(LispObject[] args)
@@ -3755,8 +4186,23 @@ public static partial class Runtime
         {
             LispString ls => ls.Value,
             LispVector vec when vec.IsCharVector || vec.ElementTypeName == "NIL" => vec.ToCharString(),
-            _ => str.ToString() ?? ""
+            _ => throw NotAString(newline ? "WRITE-LINE" : "WRITE-STRING", str)
         };
+        // A file or string output stream itself, with no pretty-printer block open: the
+        // text goes to the stream's own writer and only the line-start flag is kept.
+        if (!_pprintActive && (stream is LispFileStream || stream is LispOutputStream))
+        {
+            var plainWriter = GetTextWriter(stream);
+            plainWriter.Write(s);
+            if (newline)
+            {
+                plainWriter.Write('\n');
+                ((LispStream)stream).AtLineStart = true;
+            }
+            else if (s.Length > 0)
+                ((LispStream)stream).AtLineStart = s[s.Length - 1] == '\n';
+            return str;
+        }
         var writer = ResolveOutputStreamDesignator(stream);
         if (newline)
         {
@@ -3788,7 +4234,7 @@ public static partial class Runtime
         {
             LispString ls => ls.Value,
             LispVector vec when vec.IsCharVector || vec.ElementTypeName == "NIL" => vec.ToCharString(),
-            _ => str.ToString()
+            _ => throw NotAString("WRITE-STRING", str)
         };
         var stream = args.Length > 1 ? args[1] : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
 
@@ -3818,7 +4264,7 @@ public static partial class Runtime
                 {
                     if (args[i + 1] is not Fixnum fx || fx.Value < 0)
                         throw new LispErrorException(new LispTypeError("WRITE-STRING: invalid :START value", args[i + 1]));
-                    start = (int)fx.Value;
+                    start = Runtime.ClampIndex(fx.Value);
                     startSeen = true;
                 }
             }
@@ -3830,7 +4276,7 @@ public static partial class Runtime
                     {
                         if (args[i + 1] is not Fixnum fx2 || fx2.Value < 0)
                             throw new LispErrorException(new LispTypeError("WRITE-STRING: invalid :END value", args[i + 1]));
-                        end = (int)fx2.Value;
+                        end = Runtime.ClampIndex(fx2.Value);
                     }
                     endSeen = true;
                 }
@@ -3839,12 +4285,19 @@ public static partial class Runtime
                 throw new LispErrorException(new LispProgramError($"WRITE-STRING: unknown keyword argument :{key}"));
         }
 
+        CheckStringBounds("WRITE-STRING", s, start, end);
         var writer = ResolveOutputStreamDesignator(stream);
         bool unrelated = PprintUnrelatedWriter(writer);
         if (!unrelated) PprintFlushPendingBreak(writer);
         // The whole-string case is the common one (no :start/:end), and copying
         // it out only to hand it straight to the writer costs one string per
         // WRITE-STRING call.
+        if (writer is GrayStreamTextWriter grayWriter && (start != 0 || end != s.Length) && (!_pprintActive || unrelated))
+        {
+            grayWriter.WriteRange(s, start, end);
+            if (end > start) UpdateAtLineStart(stream, s[end - 1]);
+            return str;
+        }
         var substr = (start == 0 && end == s.Length) ? s : s.Substring(start, end - start);
         if (!unrelated) substr = PprintPrefixLiteralNewlines(substr);
         writer.Write(substr);
@@ -3866,7 +4319,7 @@ public static partial class Runtime
         {
             LispString ls => ls.Value,
             LispVector vec when vec.IsCharVector || vec.ElementTypeName == "NIL" => vec.ToCharString(),
-            _ => str.ToString()
+            _ => throw NotAString("WRITE-LINE", str)
         };
         var stream = args.Length > 1 ? args[1] : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
 
@@ -3896,7 +4349,7 @@ public static partial class Runtime
                 {
                     if (args[i + 1] is not Fixnum fx || fx.Value < 0)
                         throw new LispErrorException(new LispTypeError("WRITE-LINE: invalid :START value", args[i + 1]));
-                    start = (int)fx.Value;
+                    start = Runtime.ClampIndex(fx.Value);
                     startSeen = true;
                 }
             }
@@ -3908,7 +4361,7 @@ public static partial class Runtime
                     {
                         if (args[i + 1] is not Fixnum fx2 || fx2.Value < 0)
                             throw new LispErrorException(new LispTypeError("WRITE-LINE: invalid :END value", args[i + 1]));
-                        end = (int)fx2.Value;
+                        end = Runtime.ClampIndex(fx2.Value);
                     }
                     endSeen = true;
                 }
@@ -3917,7 +4370,16 @@ public static partial class Runtime
                 throw new LispErrorException(new LispProgramError($"WRITE-LINE: unknown keyword argument :{key}"));
         }
 
+        CheckStringBounds("WRITE-LINE", s, start, end);
         var writer = ResolveOutputStreamDesignator(stream);
+        if (writer is GrayStreamTextWriter grayWriter && (start != 0 || end != s.Length)
+            && (!_pprintActive || PprintUnrelatedWriter(writer)))
+        {
+            grayWriter.WriteRange(s, start, end);
+            writer.Write('\n');
+            UpdateAtLineStart(stream, '\n');
+            return str;
+        }
         WriteLineText(writer, s.Substring(start, end - start));
         UpdateAtLineStart(stream, '\n');
         return str;
@@ -3988,17 +4450,32 @@ public static partial class Runtime
 
     private static bool WildMatch(string pattern, string value, bool ignoreCase)
     {
+        // A quoted * ? [ is the character itself: tokenize so each pattern position knows.
+        bool[] literal = new bool[pattern.Length];
+        if (pattern.IndexOf('\\') >= 0 && !Compat.IsWindows())
+        {
+            var sb = new System.Text.StringBuilder();
+            var lit = new List<bool>();
+            for (int i = 0; i < pattern.Length; i++)
+            {
+                if (pattern[i] == '\\' && i + 1 < pattern.Length && LispPathname.IsQuotable(pattern[i + 1]))
+                { i++; sb.Append(pattern[i]); lit.Add(true); }
+                else { sb.Append(pattern[i]); lit.Add(false); }
+            }
+            pattern = sb.ToString();
+            literal = lit.ToArray();
+        }
         int p = 0, v = 0, star = -1, mark = 0;
         while (v < value.Length)
         {
-            if (p < pattern.Length && (pattern[p] == '?'
+            if (p < pattern.Length && ((pattern[p] == '?' && !literal[p])
                 || (ignoreCase ? char.ToUpperInvariant(pattern[p]) == char.ToUpperInvariant(value[v])
                                : pattern[p] == value[v])))
             {
                 p++;
                 v++;
             }
-            else if (p < pattern.Length && pattern[p] == '*')
+            else if (p < pattern.Length && pattern[p] == '*' && !literal[p])
             {
                 star = p++;
                 mark = v;
@@ -4013,7 +4490,7 @@ public static partial class Runtime
                 return false;
             }
         }
-        while (p < pattern.Length && pattern[p] == '*') p++;
+        while (p < pattern.Length && pattern[p] == '*' && !literal[p]) p++;
         return p == pattern.Length;
     }
 
@@ -4023,7 +4500,7 @@ public static partial class Runtime
         if (pattern == null || pattern is Nil) return value == null || value is Nil;
         if (IsWildComponent(pattern)) return true;
         if (pattern is not LispString ps || value is not LispString vs) return false;
-        if (ps.Value.Contains('*') || ps.Value.Contains('?'))
+        if (LispPathname.HasWildChar(ps.Value))
             return WildMatch(ps.Value, vs.Value, ignoreCase);
         return string.Equals(ps.Value, vs.Value,
             ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
@@ -4054,7 +4531,7 @@ public static partial class Runtime
         int firstWild = -1;
         for (int i = 0; i < segments.Length; i++)
         {
-            if (segments[i].Contains('*') || segments[i].Contains('?'))
+            if (LispPathname.HasWildChar(segments[i]))
             {
                 firstWild = i;
                 break;
@@ -4121,7 +4598,7 @@ public static partial class Runtime
         int firstWild = -1;
         for (int i = 0; i < segments.Length; i++)
         {
-            if (segments[i].Contains('*') || segments[i].Contains('?'))
+            if (LispPathname.HasWildChar(segments[i]))
             {
                 firstWild = i;
                 break;
@@ -4170,6 +4647,8 @@ public static partial class Runtime
             pn = LispLogicalPathname.FromLogicalString(str);
         else if (path is LispPathname pp)
             pn = pp;
+        else if (StringValueOrNull(path) is string plainStr)
+            pn = LispPathname.FromString(plainStr);   // a string with an unquoted * or ? is wild
 
         if (pn != null && HasWildComponent(pn))
         {
@@ -4192,7 +4671,7 @@ public static partial class Runtime
         // Both answers are the TRUENAME (CLHS 20.1.3): links along the path are
         // resolved, as TRUENAME does.
         if (File.Exists(filePath))
-            return LispPathname.FromString(Path.GetFullPath(Compat.ResolveSymlinks(filePath)));
+            return LispPathname.FromString(LispPathname.QuoteLiteral(Path.GetFullPath(Compat.ResolveSymlinks(filePath)), wildOnly: true));
         if (Directory.Exists(filePath))
         {
             // CLHS 21.4: probe-file answers the TRUENAME. A directory's truename
@@ -4205,7 +4684,7 @@ public static partial class Runtime
             // the slash, and uiop:file-exists-p said yes.
             var full = Path.GetFullPath(Compat.ResolveSymlinks(filePath));
             if (!full.EndsWith('/')) full += "/";
-            return LispPathname.FromString(full);
+            return LispPathname.FromString(LispPathname.QuoteLiteral(full, wildOnly: true));
         }
         return Nil.Instance;
     }
@@ -4226,6 +4705,8 @@ public static partial class Runtime
             pn = LispLogicalPathname.FromLogicalString(str);
         else if (path is LispPathname pp)
             pn = pp;
+        else if (StringValueOrNull(path) is string plainStr)
+            pn = LispPathname.FromString(plainStr);   // a string with an unquoted * or ? is wild
 
         if (pn != null && HasWildComponent(pn))
         {
@@ -4254,7 +4735,7 @@ public static partial class Runtime
             // For directories, ensure trailing / so last component is in directory, not name
             if (Directory.Exists(fullPath) && !fullPath.EndsWith('/'))
                 fullPath += "/";
-            return LispPathname.FromString(fullPath);
+            return LispPathname.FromString(LispPathname.QuoteLiteral(fullPath, wildOnly: true));
         }
         var fileErr = new LispError($"TRUENAME: file not found: {filePath}");
         fileErr.ConditionTypeName = "FILE-ERROR";
@@ -4298,13 +4779,14 @@ public static partial class Runtime
 
     private static bool HasWildComponent(LispPathname pn)
     {
-        if (IsWildSymbol(pn.NameComponent) || IsWildSymbol(pn.TypeComponent) || IsWildSymbol(pn.Version))
+        static bool WildPiece(LispObject? o) => IsWildSymbol(o) || (o is LispString ls && LispPathname.HasWildChar(ls.Value));
+        if (WildPiece(pn.NameComponent) || WildPiece(pn.TypeComponent) || IsWildSymbol(pn.Version))
             return true;
         if (pn.DirectoryComponent is Cons dir)
         {
             for (var c = dir; c != null; c = c.Cdr as Cons)
             {
-                if (IsWildSymbol(c.Car)) return true;
+                if (WildPiece(c.Car)) return true;
             }
         }
         return false;
@@ -4315,6 +4797,9 @@ public static partial class Runtime
     /// Translates logical pathnames to physical paths.
     /// </summary>
     public static string ResolvePhysicalPath(LispObject pathSpec)
+        => LispPathname.UnquoteForFileSystem(ResolvePhysicalPathQuoted(pathSpec));
+
+    private static string ResolvePhysicalPathQuoted(LispObject pathSpec)
     {
         // If it's a logical pathname, translate first
         if (pathSpec is LispLogicalPathname lp)
@@ -4383,8 +4868,8 @@ public static partial class Runtime
         if (args.Length < 1) throw new LispErrorException(new LispProgramError("ENSURE-DIRECTORIES-EXIST: wrong number of arguments: 0 (expected at least 1)"));
         var pathSpec = args[0];
         string filePath = ResolvePhysicalPath(pathSpec);
-        // Check for wild pathnames: signal file-error
-        var pn = pathSpec is LispPathname ? (LispPathname)pathSpec : LispPathname.FromString(filePath);
+        // Check for wild pathnames: signal file-error (the quoted spelling keeps a literal * apart)
+        var pn = pathSpec is LispPathname ? (LispPathname)pathSpec : LispPathname.FromString(ResolvePhysicalPathQuoted(pathSpec));
         if (HasWildComponent(pn))
         {
             var err = new LispError($"ENSURE-DIRECTORIES-EXIST: wild pathname: {filePath}") { ConditionTypeName = "FILE-ERROR" };
@@ -4395,7 +4880,17 @@ public static partial class Runtime
         var dir = Path.GetDirectoryName(filePath);
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
         {
-            Directory.CreateDirectory(dir);
+            // A directory could not be made (a part of the path is a file, or the
+            // permissions say no): a FILE-ERROR (CLHS), which a FILE-ERROR handler sees.
+            try { Directory.CreateDirectory(dir); }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException
+                                       || ex is NotSupportedException || ex is ArgumentException)
+            {
+                var err = new LispError($"ENSURE-DIRECTORIES-EXIST: could not create {dir}: {ex.Message}")
+                    { ConditionTypeName = "FILE-ERROR" };
+                err.FileErrorPathnameRef = pn;
+                throw new LispErrorException(err);
+            }
             return MultipleValues.Values2(pathSpec, T.Instance);
         }
         return MultipleValues.Values2(pathSpec, Nil.Instance);
@@ -4439,11 +4934,29 @@ public static partial class Runtime
         return LispPathname.FromString(dirPath + Path.DirectorySeparatorChar);
     }
 
-    /// <summary>Refuse to replace a file the file system marks read-only.</summary>
+    /// <summary>Refuse to replace a file the file system will not let this process
+    /// write. On Windows the read-only attribute is exactly that. On Unix the
+    /// attribute is derived from the mode bits and this process's own ids and
+    /// knows nothing of privilege (root may write a mode 0644 file another user
+    /// owns), so the answer there is the system's: open the file for writing,
+    /// without truncating it, and let the refusal be the error.</summary>
     private static void CheckNotReadOnly(string filePath)
     {
-        if ((File.GetAttributes(filePath) & FileAttributes.ReadOnly) != 0)
+        if (Compat.IsWindows())
+        {
+            if ((File.GetAttributes(filePath) & FileAttributes.ReadOnly) != 0)
+                throw new IOException($"file is read-only: {filePath}");
+            return;
+        }
+        try
+        {
+            using var probe = new FileStream(filePath, FileMode.Open, FileAccess.Write,
+                                             FileShare.ReadWrite | FileShare.Delete);
+        }
+        catch (UnauthorizedAccessException)
+        {
             throw new IOException($"file is read-only: {filePath}");
+        }
     }
 
     /// <summary>The name SBCL gives a file preserved by :IF-EXISTS :RENAME.</summary>
@@ -4567,7 +5080,10 @@ public static partial class Runtime
             catch (IOException) { /* non-empty or in use -> fall through to file-error */ }
         }
         // CLHS says: If delete-file fails, an error of type file-error is signaled
-        var err = new LispError($"DELETE-FILE: could not delete {filePath}");
+        var why = Directory.Exists(filePath) ? (directoryForm ? "directory not empty or in use" : "is a directory")
+                : !File.Exists(filePath) ? "no such file or directory" : null;
+        var err = new LispError(why == null ? $"DELETE-FILE: could not delete {filePath}"
+                                            : $"DELETE-FILE: could not delete {filePath}: {why}");
         err.ConditionTypeName = "FILE-ERROR";
         err.FileErrorPathnameRef = path is LispPathname ? path : (LispObject)LispPathname.FromString(filePath);
         throw new LispErrorException(err);
@@ -4650,6 +5166,14 @@ public static partial class Runtime
     public static LispObject RenameFile(LispObject filespec, LispObject newName)
     {
         string oldFile = ResolvePhysicalPath(filespec);
+        if (oldFile.Contains('\0'))
+        {
+            // A NUL ends a host path, so such a file cannot exist.
+            var nulErr = new LispError($"RENAME-FILE: no such file or directory: {FormatObject(Pathname(filespec), true)}")
+                { ConditionTypeName = "FILE-ERROR" };
+            nulErr.FileErrorPathnameRef = Pathname(filespec);
+            throw new LispErrorException(nulErr);
+        }
 
         // Resolve relative old path
         if (!Path.IsPathRooted(oldFile))
@@ -4667,6 +5191,16 @@ public static partial class Runtime
         var newPn = (LispPathname)Pathname(newName);
         var oldPn = (LispPathname)Pathname(filespec);
         var defaultedNewName = newPn.MergeWith(oldPn);
+        // The new name is a file, not a pattern: a wild component is a FILE-ERROR (it used
+        // to make a file literally named "*.lisp").
+        if (HasWildComponent(defaultedNewName)
+            || defaultedNewName.ToNamestring().IndexOfAny(new[] { '*', '?' }) >= 0)
+        {
+            var wildErr = new LispError($"RENAME-FILE: the new name is a wild pathname: {defaultedNewName.ToNamestring()}")
+                { ConditionTypeName = "FILE-ERROR" };
+            wildErr.FileErrorPathnameRef = defaultedNewName;
+            throw new LispErrorException(wildErr);
+        }
 
         // Translate to physical for actual file operation
         string targetFile = ResolvePhysicalPath(defaultedNewName);
@@ -4696,9 +5230,9 @@ public static partial class Runtime
                 Compat.MoveFile(oldFile, targetFile, overwrite: true);
             }
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         {
-            var err = new LispError($"RENAME-FILE: {e.Message}");
+            var err = new LispError($"RENAME-FILE: {FsFailureReason(e)}");
             err.ConditionTypeName = "FILE-ERROR";
             // The offending file is the missing source, otherwise the target.
             bool sourceMissing = !File.Exists(oldFile) && !Directory.Exists(oldFile);
@@ -4771,7 +5305,9 @@ public static partial class Runtime
             && full[full.Length - 1] != Path.DirectorySeparatorChar
             && full[full.Length - 1] != Path.AltDirectorySeparatorChar)
             full += Path.DirectorySeparatorChar;
-        return LispPathname.FromString(full);
+        // The file's own spelling: a * or ? in it is a literal character, quoted
+        // so that the pathname is not wild and its namestring reads back as itself.
+        return LispPathname.FromString(LispPathname.QuoteLiteral(full, wildOnly: true));
     }
 
     /// <summary>Kept only so FASLs compiled before the two DIRECTORY
@@ -4820,8 +5356,11 @@ public static partial class Runtime
                 break;
             }
         // Get pathname from first arg: translate logical pathnames
-        string namestring = ResolvePhysicalPath(args[0]);
+        // The pattern keeps its quoting (\* is a literal *) while it is matched.
+        string namestring = ResolvePhysicalPathQuoted(args[0]);
         if (string.IsNullOrEmpty(namestring)) namestring = ".";
+        // A NUL ends a host path, so nothing can match.
+        if (namestring.Contains('\0')) return Nil.Instance;
         var patternPn = args[0] as LispPathname ?? LispPathname.FromString(namestring);
 
         // Detect directory-only search: pathname has no name/type component.
@@ -4834,12 +5373,12 @@ public static partial class Runtime
             wantsDirs = namestring.EndsWith("/") || namestring.EndsWith("\\");
 
         // Check if pattern contains wildcards
-        bool hasWild = namestring.Contains('*') || namestring.Contains('?');
+        bool hasWild = LispPathname.HasWildChar(namestring);
 
         if (!hasWild)
         {
             // Non-wild: check if file/directory exists
-            string fullPath = Path.GetFullPath(namestring);
+            string fullPath = Path.GetFullPath(LispPathname.UnquoteForFileSystem(namestring));
             if (File.Exists(fullPath) || Directory.Exists(fullPath))
                 return new Cons(EntryPathname(fullPath, resolve), Nil.Instance);
             return Nil.Instance;
@@ -4865,7 +5404,7 @@ public static partial class Runtime
                 // A wildcard may sit in the directory part rather than the last
                 // segment, "dists/*/", so expand the whole path, not just the
                 // final component.
-                if (searchDir.Contains('*') || searchDir.Contains('?'))
+                if (LispPathname.HasWildChar(searchDir))
                 {
                     foreach (var dir in ExpandWildDirectories(dirWildPath))
                         entries.Add(EntryPathname(dir, resolve));
@@ -4873,6 +5412,13 @@ public static partial class Runtime
                 }
 
                 if (!Directory.Exists(searchDir)) return Nil.Instance;
+                // "sub/**/" is sub itself and every directory below it.
+                if (dirWild == "**")
+                {
+                    foreach (var dir in WildInferiorsOf(searchDir))
+                        entries.Add(EntryPathname(dir, resolve));
+                    return SortedDirectoryEntries(entries);
+                }
                 foreach (var dir in Directory.EnumerateDirectories(searchDir, dirWild))
                 {
                     // Return as directory-designating pathname (trailing separator)
@@ -4889,7 +5435,7 @@ public static partial class Runtime
             // what the second DIRECTORY implementation did and this one did not,
             // which is why compiled callers and #'DIRECTORY callers each worked
             // for their own cases and neither noticed the other's gap.
-            if (dirPath.Contains('*') || dirPath.Contains('?'))
+            if (LispPathname.HasWildChar(dirPath))
             {
                 foreach (var file in ExpandWildDirectory(dirPath, patternPn))
                     entries.Add(EntryPathname(file, resolve));
@@ -4981,13 +5527,22 @@ public static partial class Runtime
         }
         else
             throw new LispErrorException(new LispTypeError("MAKE-STRING-INPUT-STREAM: not a string", args[0]));
+        // CLHS: START is a non-negative integer, END an integer or NIL, START <= END <= length.
         int start = 0, end = val.Length;
-        if (args.Length > 1 && args[1] is Fixnum startFx)
-            start = (int)startFx.Value;
+        var indexType = List(Startup.Sym("INTEGER"), Fixnum.Make(0), Fixnum.Make(val.Length));
+        if (args.Length > 1)
+        {
+            if (args[1] is not Fixnum startFx || startFx.Value < 0 || startFx.Value > val.Length)
+                throw new LispErrorException(new LispTypeError(
+                    "MAKE-STRING-INPUT-STREAM: :START is not a valid index", args[1], indexType));
+            start = Runtime.ClampIndex(startFx.Value);
+        }
         if (args.Length > 2 && args[2] is not Nil)
         {
-            if (args[2] is Fixnum endFx)
-                end = (int)endFx.Value;
+            if (args[2] is not Fixnum endFx || endFx.Value < start || endFx.Value > val.Length)
+                throw new LispErrorException(new LispTypeError(
+                    "MAKE-STRING-INPUT-STREAM: :END is not a valid index", args[2], indexType));
+            end = Runtime.ClampIndex(endFx.Value);
         }
         var sliced = val.Substring(start, end - start);
         var sr = new StringReader(sliced);
@@ -5117,6 +5672,8 @@ public static partial class Runtime
                     items.Add(obj);
             }
             } finally { lispReader.ExitRecursiveRead(); }
+            // Under *READ-SUPPRESS* the elements were read and thrown away: the result is NIL.
+            if (DynamicBindings.Get(Startup.Sym("*READ-SUPPRESS*")) is not Nil) return Nil.Instance;
             // Build list from items
             LispObject result = Nil.Instance;
             for (int i = items.Count - 1; i >= 0; i--)
@@ -5148,10 +5705,18 @@ public static partial class Runtime
             if (obj is LispInstance) return Nil.Instance; // CLOS/gray stream: not interactive (cf. OUTPUT-STREAM-P)
             if (obj is not LispStream) throw new LispErrorException(new LispTypeError("INTERACTIVE-STREAM-P: not a stream", obj, Startup.Sym("STREAM")));
             if (obj is LispSynonymStream syn) obj = DynamicBindings.Get(syn.Symbol);
-            if (obj is LispInputStream li && li.Reader == Console.In) return T.Instance;
-            if (obj is LispOutputStream lo
-                && (lo.Writer is ColumnTrackingWriter ctw ? ctw.Inner : lo.Writer) == Console.Out) return T.Instance;
-            if (obj is LispBidirectionalStream bi && bi.Reader == Console.In) return T.Instance;
+            // The console is interactive only while it is a terminal: redirected to a
+            // file or a pipe it is not (SBCL: isatty), and libraries branch on it.
+            if (obj is LispInputStream li && li.Reader == Console.In)
+                return Console.IsInputRedirected ? Nil.Instance : T.Instance;
+            if (obj is LispOutputStream lo)
+            {
+                var w = lo.Writer is ColumnTrackingWriter ctw ? ctw.Inner : lo.Writer;
+                if (w == Console.Out) return Console.IsOutputRedirected ? Nil.Instance : T.Instance;
+                if (w == Console.Error) return Console.IsErrorRedirected ? Nil.Instance : T.Instance;
+            }
+            if (obj is LispBidirectionalStream bi && bi.Reader == Console.In)
+                return Console.IsInputRedirected || Console.IsOutputRedirected ? Nil.Instance : T.Instance;
             return Nil.Instance;
         });
         Startup.RegisterUnary("STREAM-ELEMENT-TYPE", obj => {
@@ -5167,6 +5732,12 @@ public static partial class Runtime
                     ? inType
                     : Runtime.List(Startup.Sym("AND"), inType, outType);
             }
+            // CLHS: a broadcast stream's element type is that of its last component
+            // stream, and T when it has none.
+            if (obj is LispBroadcastStream bcs && bcs.ElementType == null)
+                return bcs.Streams.Length == 0
+                    ? T.Instance
+                    : Runtime.Funcall(Startup.Sym("STREAM-ELEMENT-TYPE").Function!, bcs.Streams[^1]);
             if (obj is LispStream ls) return ls.ElementType ?? Startup.Sym("CHARACTER");
             // Gray streams: no stream-element-type generic, so report the protocol
             // default: CHARACTER for character streams, (unsigned-byte 8) for binary.
@@ -5323,7 +5894,7 @@ public static partial class Runtime
                     {
                         var key = args[i] is Symbol ks ? ks.Name : "";
                         if (key != "ELEMENT-TYPE" && key != "ALLOW-OTHER-KEYS")
-                            throw new LispErrorException(new LispProgramError($"MAKE-STRING-OUTPUT-STREAM: unknown keyword argument :{key}"));
+                            throw new LispErrorException(new LispProgramError($"MAKE-STRING-OUTPUT-STREAM: unknown keyword argument {FormatTop(args[i], true)}"));
                     }
                 }
                 // Extract :element-type if provided
@@ -5365,8 +5936,6 @@ public static partial class Runtime
                 var stream = args.Length > 0 ? args[0] : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
                 var eofErrorP = args.Length > 1 ? args[1] : T.Instance;
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
-                var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
-                if (recursiveP is not Nil) eofErrorP = T.Instance;
                 return Runtime.ReadCharNoHang(stream, eofErrorP, eofValue);
             }));
         Emitter.CilAssembler.RegisterFunction("READ-CHAR",
@@ -5458,8 +6027,6 @@ public static partial class Runtime
                 var stream = args.Length > 0 ? args[0] : DynamicBindings.Get(Startup.Sym("*STANDARD-INPUT*"));
                 var eofErrorP = args.Length > 1 ? args[1] : T.Instance;
                 var eofValue = args.Length > 2 ? args[2] : Nil.Instance;
-                var recursiveP = args.Length > 3 ? args[3] : Nil.Instance;
-                if (recursiveP is not Nil) eofErrorP = T.Instance;
                 return Runtime.ReadLineMv(stream, eofErrorP, eofValue);
             }, "READ-LINE", -1));
 
@@ -5468,7 +6035,7 @@ public static partial class Runtime
             new LispFunction(args => {
                 for (int i = 0; i < args.Length; i++)
                 {
-                    if (args[i] is not LispStream s || !s.IsOutput)
+                    if (!Runtime.IsOutputStreamArg(args[i]))
                     {
                         // Expected type: (AND STREAM (SATISFIES OUTPUT-STREAM-P)) when arg is a stream but not output
                         var expectedType = args[i] is LispStream
@@ -5477,7 +6044,7 @@ public static partial class Runtime
                         throw new LispErrorException(new LispTypeError("MAKE-BROADCAST-STREAM: argument is not an output stream", args[i], expectedType));
                     }
                 }
-                var streams = args.OfType<LispStream>().ToArray();
+                var streams = (LispObject[])args.Clone();
                 return new LispBroadcastStream(streams);
             }, "MAKE-BROADCAST-STREAM", -1));
         Emitter.CilAssembler.RegisterFunction("MAKE-CONCATENATED-STREAM",
@@ -5533,38 +6100,46 @@ public static partial class Runtime
                 new LispFunction(args => {
                     if (args.Length > 1)
                         throw new LispErrorException(new LispProgramError($"{fn}: wrong number of arguments: {args.Length} (expected 0 or 1)"));
-                    // Gray output stream: trampoline to the corresponding generic
-                    // (stream-force-output / stream-finish-output / stream-clear-output)
-                    // so streamp=T instances are accepted. Binary gray streams count
-                    // too: flexi-streams' classes are binary output streams, and
-                    // testing only the character predicate rejected the very objects
-                    // write-char and streamp had already accepted.
-                    //
-                    // With no argument the stream is *STANDARD-OUTPUT*, which is as
-                    // likely to be a gray stream (a REPL or editor server binds it to
-                    // one) and gets the same trampoline.
-                    var target = args.Length > 0 && args[0] is not Nil
-                        ? args[0]
-                        : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
-                    // Also the output side of a two-way, echo or synonym stream:
-                    // CLEAR-OUTPUT there has to reach STREAM-CLEAR-OUTPUT, not
-                    // become a flush.
-                    if (target is not T && GrayComponent(target, false) is LispInstance gi)
-                    {
-                        var gfn = GrayStreamLookup.GrayOrCl("STREAM-" + fn);
-                        CallForPrimary(gfn, gi);
-                        return Nil.Instance;
-                    }
-                    if (args.Length > 0 && args[0] is not (LispStream or Nil or T))
-                        throw new LispErrorException(new LispTypeError($"{fn}: not a stream designator", args[0], Startup.Sym("STREAM")));
-                    var stream = args.Length > 0 && args[0] is not Nil
-                        ? args[0]
-                        : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
-                    return Runtime.GuardStreamIO(stream, stream,
-                                                 static st => { FlushStream(st); return Nil.Instance; });
+                    return FlushOutputTo(fn, args.Length > 0 ? args[0] : Nil.Instance);
                 }));
         }
     }
+
+    /// <summary>FINISH-OUTPUT / FORCE-OUTPUT / CLEAR-OUTPUT on STREAMARG (NIL = *STANDARD-OUTPUT*).</summary>
+    internal static LispObject FlushOutputTo(string fn, LispObject streamArg)
+    {
+        // Gray output stream: trampoline to the corresponding generic
+        // (stream-force-output / stream-finish-output / stream-clear-output)
+        // so streamp=T instances are accepted. Binary gray streams count
+        // too: flexi-streams' classes are binary output streams, and
+        // testing only the character predicate rejected the very objects
+        // write-char and streamp had already accepted.
+        //
+        // With no argument the stream is *STANDARD-OUTPUT*, which is as
+        // likely to be a gray stream (a REPL or editor server binds it to
+        // one) and gets the same trampoline.
+        var target = streamArg is not Nil
+            ? streamArg
+            : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
+        // Also the output side of a two-way, echo or synonym stream:
+        // CLEAR-OUTPUT there has to reach STREAM-CLEAR-OUTPUT, not
+        // become a flush.
+        if (target is not T && GrayComponent(target, false) is LispInstance gi)
+        {
+            var gfn = GrayStreamLookup.GrayOrCl("STREAM-" + fn);
+            CallForPrimary(gfn, gi);
+            return Nil.Instance;
+        }
+        if (streamArg is not (LispStream or Nil or T))
+            throw new LispErrorException(new LispTypeError($"{fn}: not a stream designator", streamArg, Startup.Sym("STREAM")));
+        return Runtime.GuardStreamIO(target, target,
+                                     static st => { FlushStream(st); return Nil.Instance; });
+    }
+
+    public static LispObject FinishOutput0() => FlushOutputTo("FINISH-OUTPUT", Nil.Instance);
+    public static LispObject FinishOutput1(LispObject stream) => FlushOutputTo("FINISH-OUTPUT", stream);
+    public static LispObject ForceOutput0() => FlushOutputTo("FORCE-OUTPUT", Nil.Instance);
+    public static LispObject ForceOutput1(LispObject stream) => FlushOutputTo("FORCE-OUTPUT", stream);
 
     internal static void FlushStream(LispObject stream)
     {

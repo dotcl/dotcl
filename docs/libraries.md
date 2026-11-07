@@ -76,7 +76,7 @@ ASDF is bundled, so a system on disk loads with no setup:
 ```lisp
 (require "asdf")
 (push #p"/path/to/my-systems/" asdf:*central-registry*)
-(asdf:load-system "my-system")
+(asdf:load-system "my-system")       ; "my-system" and the path are your own
 ```
 
 Quicklisp ships with dotcl:

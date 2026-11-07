@@ -288,8 +288,13 @@ public sealed class LispProcess : LispObject
     /// <summary>A file redirection target: a namestring or a pathname. UIOP's
     /// %normalize-io-specifier turns string specs into pathnames, so both arrive here.
     /// Returns null for non-file specs (:stream, nil, t, a stream).</summary>
+    // A file named for the child's input or output is made absolute against
+    // *DEFAULT-PATHNAME-DEFAULTS* (CLHS 19.2.3), so the parent that opens it and the child's shell
+    // redirection (which starts in the process's own directory) name the same file.
     private static string? FilePath(LispObject spec) =>
-        spec is LispPathname p ? p.ToNamestring() : Runtime.StringValueOrNull(spec);
+        spec is LispPathname || Runtime.StringValueOrNull(spec) is not null
+            ? Runtime.ResolvePhysicalPath(spec)
+            : null;
 
     private static System.Threading.Thread Spawn(string name, System.Action body)
     {

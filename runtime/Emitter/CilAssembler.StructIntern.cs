@@ -301,7 +301,8 @@ public partial class CilAssembler
         internal System.Reflection.Emit.ILGenerator? SymFnSiteInitIl;
 #pragma warning restore CS0649
         private readonly Dictionary<string, System.Reflection.Emit.FieldBuilder> _symFnSiteFields = new();
-        private static readonly System.Reflection.ConstructorInfo _symFnSiteCtor =
+        private static System.Reflection.ConstructorInfo? _lazy__symFnSiteCtor;
+        private static System.Reflection.ConstructorInfo _symFnSiteCtor => _lazy__symFnSiteCtor ??=
             typeof(Startup.SymFnSite).GetConstructor(new[] { typeof(string), typeof(string) })!;
         private int _symFnSiteCounter;
 
@@ -334,7 +335,8 @@ public partial class CilAssembler
         // type initializer like the SymFnSite cells above.
         private readonly Dictionary<string, System.Reflection.Emit.FieldBuilder> _symSiteFields =
             new(StringComparer.Ordinal);
-        private static readonly System.Reflection.ConstructorInfo _symSiteCtor =
+        private static System.Reflection.ConstructorInfo? _lazy__symSiteCtor;
+        private static System.Reflection.ConstructorInfo _symSiteCtor => _lazy__symSiteCtor ??=
             typeof(Startup.SymSite).GetConstructor(new[] { typeof(string) })!;
         private int _symSiteCounter;
 
@@ -354,7 +356,8 @@ public partial class CilAssembler
 
         private readonly Dictionary<string, System.Reflection.Emit.FieldBuilder> _keywordFields =
             new(StringComparer.Ordinal);
-        private static readonly System.Reflection.MethodInfo _keywordMethod =
+        private static System.Reflection.MethodInfo? _lazy__keywordMethod;
+        private static System.Reflection.MethodInfo _keywordMethod => _lazy__keywordMethod ??=
             typeof(Startup).GetMethod("Keyword")!;
         private int _keywordCounter;
 
@@ -425,7 +428,8 @@ public partial class CilAssembler
 
         private readonly Dictionary<string, System.Reflection.Emit.FieldBuilder> _stringFields =
             new(StringComparer.Ordinal);
-        private static readonly System.Reflection.ConstructorInfo _lispStringCtor =
+        private static System.Reflection.ConstructorInfo? _lazy__lispStringCtor;
+        private static System.Reflection.ConstructorInfo _lispStringCtor => _lazy__lispStringCtor ??=
             typeof(LispString).GetConstructor(new[] { typeof(string) })!;
         private int _stringCounter;
 

@@ -115,7 +115,7 @@ and in the program, around the region of interest:
 
 ```lisp
 (dotcl:alloc-reset)
-(run-the-thing)
+(run-the-thing)        ; your own workload
 (dotcl:alloc-report)   ; prints a per-type count table
 ```
 
@@ -200,7 +200,7 @@ bigger than twice the CV is real" cannot see anything.
 
 So `make bench-parity` runs each half in `PARITY_PASSES` processes (5 by
 default) and checks every kernel's per-process values for a split, with the
-rule in `bench/gate/modes.awk`: sort them, take the widest gap between neighbours
+rule in `bench/gate/modes.lisp`: sort them, take the widest gap between neighbours
 that leaves at least two values above it, and call the values split when that
 gap is at least 10% of the fast group's median and at least 3 times the wider
 group's own range. One slow process alone is not a group: interference only
@@ -217,7 +217,7 @@ or a larger `PARITY_PASSES`, before it is believed. When recording a baseline
 for such a kernel, take it from a run that shows the split, so the recorded
 number is the fast group's.
 
-`bench/gate/test-modes.sh` holds the rule to the values it was written against
+`bench/gate/test-modes.lisp` holds the rule to the values it was written against
 (three split cases and three noisy one-group cases from that machine) and runs
 first in `make bench-parity`.
 
@@ -265,7 +265,7 @@ Then look at each side's per-process values before comparing anything.
 Concatenate each side's outputs into one file (one `name<TAB>ms` line per
 kernel per process, as `kernels.lisp` and the C# half print them) and run
 
-    bench/gate/process-modes.sh base=base.txt variant=variant.txt
+    dotcl bench/gate/process-modes.lisp base=base.txt variant=variant.txt
 
 It prints each side's count, minimum, median and whether it is split. For a
 kernel that is one group on both sides it sets the medians and minimums side
