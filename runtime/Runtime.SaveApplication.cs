@@ -8,7 +8,7 @@ public static partial class Runtime
 {
     // --- save-application (MVP) ---
 
-    /// <lispdoc>(dotcl:save-application output-path &amp;key load prelude system toplevel executable r2r no-self-contained target runtime-csproj) -- Bundle Lisp sources into a .fasl or self-contained exe. :system collects ASDF transitive deps; :prelude compiles sources ahead of them, for a shim the bundled libraries need in place before they load; :r2r t enables ReadyToRun ahead-of-time compilation; :no-self-contained t omits the .NET runtime (smaller binary, requires .NET on target); :target :linux-arm64 etc. for cross-platform publish; :runtime-csproj or DOTCL_RUNTIME_CSPROJ env var for installed-tool use.</lispdoc>
+    /// <lispdoc>(dotcl:save-application output-path &amp;key load prelude system toplevel executable r2r no-self-contained target runtime-csproj) -- Bundle Lisp sources into a .fasl or self-contained exe. :system collects ASDF transitive deps; :prelude compiles sources ahead of them, for a shim the bundled libraries need in place before they load; :r2r nil publishes without ReadyToRun (the default is ReadyToRun, as :r2r t); :no-self-contained t omits the .NET runtime (smaller binary, requires .NET on target); :target :linux-arm64 etc. for cross-platform publish; :runtime-csproj or DOTCL_RUNTIME_CSPROJ env var for installed-tool use.</lispdoc>
     /// <summary>
     /// <c>(dotcl:save-application output-path &amp;key load system toplevel executable target runtime-csproj)</c>
     ///
@@ -69,7 +69,7 @@ public static partial class Runtime
         LispObject? preludeArg = null;
         LispObject? toplevelArg = null;
         bool isExecutable = false;
-        bool isR2r = false;
+        bool? isR2r = null;   // null: the runtime project's default (ReadyToRun)
         bool noSelfContained = false;
         string? targetRid = null;
         string? runtimeCsprojOverride = null;
@@ -194,6 +194,32 @@ public static partial class Runtime
 
 #if DOTCL_EMIT
     /// <summary>
+    /// The suffix of the module name of a fasl built from SOURCES: eight hex digits of a hash of
+    /// the output's file name, the names (no directories) and contents of the sources in order,
+    /// the entry designator, and the runtime version. The same input gives the same name, wherever
+    /// the checkout is and whenever it is built, so the fasl is a function of its input; two
+    /// different inputs give different names, which is what keeps the load-time-value slot
+    /// namespaces of independently built fasls apart.
+    /// </summary>
+    internal static string BundleModuleSuffix(string faslPath, IReadOnlyList<string> sources, string? entry)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        void Add(byte[] b) { sha.TransformBlock(b, 0, b.Length, null, 0); }
+        void AddText(string t) { Add(System.Text.Encoding.UTF8.GetBytes(t)); Add(new byte[] { 0 }); }
+        AddText(Path.GetFileName(faslPath));
+        AddText(entry ?? "");
+        AddText(typeof(Runtime).Assembly.GetName().Version?.ToString() ?? "");
+        foreach (var src in sources)
+        {
+            AddText(Path.GetFileName(src));
+            Add(File.ReadAllBytes(src));
+            Add(new byte[] { 0 });
+        }
+        sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+        return BitConverter.ToString(sha.Hash!, 0, 4).Replace("-", "").ToLowerInvariant();
+    }
+
+    /// <summary>
     /// Compile :load sources into the FASL at `faslPath`, append an entry call form
     /// if a toplevel designator was given, save. Shared between save-application's
     /// :executable nil and :executable t paths.
@@ -203,7 +229,7 @@ public static partial class Runtime
         List<(string Name, string Version)>? asdfSystems = null)
     {
         var moduleName = Path.GetFileNameWithoutExtension(faslPath)
-            + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            + "_" + BundleModuleSuffix(faslPath, sources, toplevelDesignator?.ToString());
         var faslAsm = new DotCL.Emitter.FaslAssembler(moduleName);
 
         var compileFileModeSym = Startup.Sym("*COMPILE-FILE-MODE*");
@@ -349,7 +375,7 @@ public static partial class Runtime
     private static void BuildExecutableFromFasl(
         string userFaslPath, string outputExe,
         string? targetRid = null, string? runtimeCsprojOverride = null,
-        bool readyToRun = false, bool noSelfContained = false)
+        bool? readyToRun = null, bool noSelfContained = false)
     {
         var runtimeCsproj = runtimeCsprojOverride
             ?? FindRuntimeCsproj()
@@ -401,8 +427,9 @@ public static partial class Runtime
                 psi.ArgumentList.Add("-p:EnableCompressionInSingleFile=true");
             psi.ArgumentList.Add("-p:PackAsTool=false");
             psi.ArgumentList.Add($"-p:DotclUserFasl={userFaslPath}");
-            if (readyToRun)
-                psi.ArgumentList.Add("-p:PublishReadyToRun=true");
+            // The runtime project publishes ReadyToRun by default; :r2r nil turns it off.
+            if (readyToRun is bool r2r)
+                psi.ArgumentList.Add(r2r ? "-p:PublishReadyToRun=true" : "-p:PublishReadyToRun=false");
             psi.ArgumentList.Add("-o"); psi.ArgumentList.Add(publishOut);
 
             using var proc = System.Diagnostics.Process.Start(psi)
@@ -533,7 +560,7 @@ public static partial class Runtime
     {
 #if DOTCL_EMIT
         var moduleName = Path.GetFileNameWithoutExtension(faslPath)
-            + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            + "_" + BundleModuleSuffix(faslPath, sources, null);
         var faslAsm = new DotCL.Emitter.FaslAssembler(moduleName);
 
         var compileFileModeSym = Startup.Sym("*COMPILE-FILE-MODE*");

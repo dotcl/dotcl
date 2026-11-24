@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; `dotcl pack` without --toplevel calls the system's :entry-point.
 ;;;
 ;;; A system built as a program already says what to call: ASDF's :entry-point,

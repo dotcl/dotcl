@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; AREF on an array-typed parameter reads the element unboxed.
 ;;;
 ;;; A LispVector whose element type upgrades to a fixed-width backing stores

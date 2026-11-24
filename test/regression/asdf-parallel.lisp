@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; contrib/asdf-parallel: a small system whose files form a dependency graph
 ;;; (two to three of them can compile at once) is built once serially and once
 ;;; with four workers, each copy under its own package, and the two give the

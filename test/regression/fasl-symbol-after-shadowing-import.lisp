@@ -18,8 +18,8 @@
 (defpackage :fsasi-b (:use :cl) (:export #:body))
 
 (deftest-compiled-only fasl-symbol-after-shadowing-import.flet-template
-  (let ((src "fsasi-tmp.lisp")
-        (fasl "fsasi-tmp.fasl"))
+  (let ((src (regression-temp-file "fsasi-tmp.lisp"))
+        (fasl (regression-temp-file "fsasi-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)

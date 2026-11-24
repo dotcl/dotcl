@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; An interpreted DEFCONSTANT must mark the symbol constant.
 ;;;
 ;;; COMPILE-DEFVAR emits Runtime.SetSymbolConstant for the defconstant case; the

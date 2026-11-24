@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Omitting a trailing optional parameter.
 ;;;
 ;;; C# writes `JsonDocument.Parse(text)` for a method declared

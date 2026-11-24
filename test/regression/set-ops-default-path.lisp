@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The set functions and TREE-EQUAL stopped paying per element to pass their
 ;;; keyword arguments along.
 ;;;

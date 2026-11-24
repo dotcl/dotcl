@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; An ASDF system shipped as a NuGet package, and consumed by naming it in a
 ;;; (:nuget ...) component.
 ;;;

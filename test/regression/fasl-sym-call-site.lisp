@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression tests for the per-call-site function-symbol cache in FASL code.
 ;;;
 ;;; The JIT path got one call-site cell per :load-sym-fn site, rooted in the

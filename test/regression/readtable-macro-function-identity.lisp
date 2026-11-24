@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; What GET-MACRO-CHARACTER hands back has to be the same object every time.
 ;;;
 ;;; A library that builds a readtable out of others has to decide whether two

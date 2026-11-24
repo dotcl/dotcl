@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A MACROLET lambda list with both &WHOLE and &ENVIRONMENT binds both
 ;;; variables (CLHS 3.4.4). The expander builder handled &ENVIRONMENT only when
 ;;; &WHOLE was absent; with &WHOLE the environment variable was never bound, so

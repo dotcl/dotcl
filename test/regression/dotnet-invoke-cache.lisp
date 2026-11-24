@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression tests for the dotnet:invoke / dotnet:static MethodInfo cache.
 ;;; The cache must never change overload resolution or results: it keys on the arg
 ;;; runtime types, falls back to InvokeMember for anything it does not cache, and

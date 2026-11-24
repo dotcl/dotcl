@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A hash table must find a key its own test function considers the same.
 ;;; EQL and EQUAL compare numbers by value, so every number has to hash by
 ;;; value; bignums, ratios and complexes used to fall through to an identity

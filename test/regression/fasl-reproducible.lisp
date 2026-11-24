@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A .fasl is a function of its source (and of the path it was compiled from, which it records
 ;;; for the definition-source lookup): compiling the same file to the same name twice gives the
 ;;; same bytes (the module version id, the PE time stamp and the module-name suffix come from a hash of

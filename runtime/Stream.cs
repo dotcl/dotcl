@@ -33,6 +33,69 @@ public class PositionTrackingReader : TextReader
 }
 
 
+/// <summary>A PositionTrackingReader that reads a string directly: the string stream's reader
+/// without a StringReader behind it (one object less per stream, one virtual call less per
+/// character).</summary>
+public sealed class StringPositionReader : PositionTrackingReader
+{
+    private readonly string _s;
+    private int _i;
+    private bool _disposed;
+
+    public StringPositionReader(string s) : base(TextReader.Null) { _s = s; }
+
+    // As StringReader: a closed stream's reader is an error to read, not an empty string.
+    protected override void Dispose(bool disposing) { _disposed = true; base.Dispose(disposing); }
+    private void CheckOpen() { if (_disposed) throw new ObjectDisposedException(null, "Cannot read from a closed TextReader."); }
+
+    public override int Read()
+    {
+        CheckOpen();
+        if (_i >= _s.Length) return -1;
+        Position++;
+        return _s[_i++];
+    }
+
+    public override int Peek() { CheckOpen(); return _i < _s.Length ? _s[_i] : -1; }
+
+    public override int Read(char[] buffer, int index, int count)
+    {
+        CheckOpen();
+        int n = Math.Min(count, _s.Length - _i);
+        if (n <= 0) return 0;
+        _s.CopyTo(_i, buffer, index, n);
+        _i += n;
+        Position += n;
+        return n;
+    }
+
+    public override string? ReadLine()
+    {
+        CheckOpen();
+        if (_i >= _s.Length) return null;
+        int j = _i;
+        while (j < _s.Length && _s[j] != '\r' && _s[j] != '\n') j++;
+        var line = _s.Substring(_i, j - _i);
+        _i = j;
+        if (_i < _s.Length)
+        {
+            char c = _s[_i++];
+            if (c == '\r' && _i < _s.Length && _s[_i] == '\n') _i++;
+        }
+        Position += line.Length + 1; // as PositionTrackingReader counts a line: +1 for the newline
+        return line;
+    }
+
+    public override string ReadToEnd()
+    {
+        CheckOpen();
+        var rest = _s.Substring(_i);
+        Position += rest.Length;
+        _i = _s.Length;
+        return rest;
+    }
+}
+
 /// <summary>What #\Newline is in a character file: the external format's line
 /// end. Lf is the single LF byte, unchanged, and the default on every OS. Crlf
 /// writes CR LF and reads CR LF as #\Newline (a CR or LF on its own is read as
@@ -62,6 +125,7 @@ public sealed class ByteTrackingReader : TextReader
     private readonly System.IO.Stream _stream;
     private readonly System.Text.Decoder _decoder;
     private readonly bool _utf8;
+    private bool _midSequence;            // the decoder holds the start of a multi-byte sequence
     private readonly byte[] _bytes = new byte[4096];
     private int _byteLen;                 // bytes in _bytes
     private int _bytePos;                 // consumed within _bytes
@@ -157,6 +221,7 @@ public sealed class ByteTrackingReader : TextReader
     public void ResetTo(long bytePosition)
     {
         _decoder.Reset();
+        _midSequence = false;
         _byteLen = _bytePos = 0;
         _pendingLen = _pendingPos = 0;
         _pendingBytes = 0;
@@ -244,7 +309,7 @@ public sealed class ByteTrackingReader : TextReader
             // very nearly all such bytes, and taking them without going through the
             // decoder is what keeps this reader close to a StreamReader: the
             // per-byte Convert call cost about 40% on READ-LINE without it.
-            if (_utf8 && _bytes[_bytePos] < 0x80)
+            if (_utf8 && !_midSequence && _bytes[_bytePos] < 0x80)
             {
                 _pending[0] = (char)_bytes[_bytePos];
                 _bytePos++;
@@ -260,6 +325,7 @@ public sealed class ByteTrackingReader : TextReader
                              out _);
             _bytePos += bytesUsed;
             _pendingBytes += bytesUsed;
+            _midSequence = charsUsed == 0;
             if (charsUsed > 0)
             {
                 _pendingLen = charsUsed;
@@ -387,6 +453,27 @@ public interface IColumnWriter
     int Column { get; }
 }
 
+/// <summary>A writer that can take back the spaces and tabs it was last given, which the pretty
+/// printer does before a line break it emits. The writers of console and file streams hold such
+/// blanks back until the next character, a flush or the close; a writer on a string simply
+/// shortens its string.</summary>
+public interface IBlankTrimmingWriter
+{
+    /// <summary>Drop the blanks at the end of what was written; returns how many.</summary>
+    int TrimTrailingBlanks();
+}
+
+internal static class BlankSplit
+{
+    /// <summary>Number of space and tab characters at the end of TEXT.</summary>
+    public static int Trailing(ReadOnlySpan<char> text)
+    {
+        int n = 0;
+        while (n < text.Length && (text[text.Length - 1 - n] == ' ' || text[text.Length - 1 - n] == '\t')) n++;
+        return n;
+    }
+}
+
 /// <summary>Column bookkeeping shared by the column-tracking writers.</summary>
 internal static class ColumnCount
 {
@@ -400,13 +487,15 @@ internal static class ColumnCount
 /// <summary>StreamWriter of an output file stream that counts its column.
 /// A subclass, so the code that flushes or repositions a file stream through
 /// its StreamWriter keeps working.</summary>
-public sealed class ColumnStreamWriter : StreamWriter, IColumnWriter
+public sealed class ColumnStreamWriter : StreamWriter, IColumnWriter, IBlankTrimmingWriter
 {
     private int _col;
     public int Column => _col;
     // What #\Newline is written as; null while the line end is LF, so the
     // default path does no more than test it.
     private string? _eol;
+    // Spaces and tabs written last and not yet passed on (see IBlankTrimmingWriter).
+    private string? _held;
 
     /// <summary>The reader of an :IO file stream, which is told before each write (see
     /// ByteTrackingReader.PrepareForWrite).</summary>
@@ -429,62 +518,96 @@ public sealed class ColumnStreamWriter : StreamWriter, IColumnWriter
     private string Translate(string text) =>
         text.IndexOf('\n') < 0 ? text : text.Replace("\n", _eol!);
 
-    public override void Write(char value)
+    private void Emit(ReadOnlySpan<char> text)
     {
+        if (text.Length == 0) return;
         SharedReader?.PrepareForWrite();
-        if (value == '\n' && _eol != null) base.Write(_eol);
-        else base.Write(value);
-        _col = value == '\n' ? 0 : _col + 1;
+        if (!Runtime.PprintHoldsBlanks)
+        {
+            Release();
+            base.Write(_eol != null ? Translate(text.ToString()) : text.ToString());
+            _col = ColumnCount.After(_col, text);
+            return;
+        }
+        int blanks = BlankSplit.Trailing(text);
+        if (blanks == text.Length)
+        {
+            _held = _held == null ? text.ToString() : _held + text.ToString();
+        }
+        else
+        {
+            Release();
+            var body = blanks == 0 ? text : text.Slice(0, text.Length - blanks);
+            base.Write(_eol != null ? Translate(body.ToString()) : body.ToString());
+            if (blanks > 0) _held = text.Slice(text.Length - blanks).ToString();
+        }
+        _col = ColumnCount.After(_col, text);
     }
-    public override void Write(string? value)
+
+    private void Release()
     {
-        SharedReader?.PrepareForWrite();
-        base.Write(_eol != null && value != null ? Translate(value) : value);
-        if (value != null) _col = ColumnCount.After(_col, value.AsSpan());
+        if (_held != null) { base.Write(_held); _held = null; }
     }
-    public override void Write(char[] buffer, int index, int count)
+
+    public int TrimTrailingBlanks()
     {
-        SharedReader?.PrepareForWrite();
-        if (_eol != null) base.Write(Translate(new string(buffer, index, count)));
-        else base.Write(buffer, index, count);
-        _col = ColumnCount.After(_col, new ReadOnlySpan<char>(buffer, index, count));
+        int n = _held?.Length ?? 0;
+        _held = null;
+        _col = Math.Max(0, _col - n);
+        return n;
     }
+
+    public override void Write(char value) => Emit(stackalloc char[] { value });
+    public override void Write(string? value) { if (value != null) Emit(value.AsSpan()); }
+    public override void Write(char[] buffer, int index, int count) => Emit(new ReadOnlySpan<char>(buffer, index, count));
     public override void Write(char[]? buffer)
     {
         if (buffer == null) return;
         Write(buffer, 0, buffer.Length);
     }
 #if !NETSTANDARD2_0
-    public override void Write(ReadOnlySpan<char> buffer)
-    {
-        SharedReader?.PrepareForWrite();
-        if (_eol != null) base.Write(Translate(new string(buffer)));
-        else base.Write(buffer);
-        _col = ColumnCount.After(_col, buffer);
-    }
+    public override void Write(ReadOnlySpan<char> buffer) => Emit(buffer);
     public override void WriteLine(ReadOnlySpan<char> buffer)
     {
         SharedReader?.PrepareForWrite();
-        if (_eol != null) { Write(buffer); Write('\n'); }
-        else { base.WriteLine(buffer); _col = 0; }
+        Release();
+        if (_eol != null) { base.Write(Translate(new string(buffer))); base.Write(_eol); }
+        else { base.WriteLine(buffer); }
+        _col = 0;
     }
 #endif
     // NewLine is the line end when one is set, and the base writes it as is.
     public override void WriteLine(string? value)
     {
         SharedReader?.PrepareForWrite();
-        if (_eol != null) { Write(value); Write('\n'); }
-        else { base.WriteLine(value); _col = 0; }
+        Release();
+        if (_eol != null) { base.Write(value == null ? "" : Translate(value)); base.Write(_eol); }
+        else base.WriteLine(value);
+        _col = 0;
     }
-    public override void WriteLine() { SharedReader?.PrepareForWrite(); if (_eol != null) Write('\n'); else { base.WriteLine(); _col = 0; } }
+    public override void WriteLine()
+    {
+        SharedReader?.PrepareForWrite();
+        Release();
+        if (_eol != null) base.Write(_eol); else base.WriteLine();
+        _col = 0;
+    }
+    public override void Flush() { Release(); base.Flush(); }
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) Release();
+        base.Dispose(disposing);
+    }
 }
 
 /// <summary>Writer in front of the console (or any host writer) that counts its
 /// column, for *STANDARD-OUTPUT* / *TERMINAL-IO* / *ERROR-OUTPUT*.</summary>
-public sealed class ColumnTrackingWriter : TextWriter, IColumnWriter
+public sealed class ColumnTrackingWriter : TextWriter, IColumnWriter, IBlankTrimmingWriter
 {
     private readonly TextWriter _inner;
     private int _col;
+    // Spaces and tabs written last and not yet passed on (see IBlankTrimmingWriter).
+    private string? _held;
     public int Column => _col;
     public TextWriter Inner => _inner;
 
@@ -495,40 +618,62 @@ public sealed class ColumnTrackingWriter : TextWriter, IColumnWriter
     }
 
     public override System.Text.Encoding Encoding => _inner.Encoding;
-    public override void Write(char value)
+
+    private void Emit(ReadOnlySpan<char> text)
     {
-        _inner.Write(value);
-        _col = value == '\n' ? 0 : _col + 1;
+        if (text.Length == 0) return;
+        if (!Runtime.PprintHoldsBlanks)
+        {
+            Release();
+            _inner.Write(text.ToString());
+            _col = ColumnCount.After(_col, text);
+            return;
+        }
+        int blanks = BlankSplit.Trailing(text);
+        if (blanks == text.Length)
+        {
+            _held = _held == null ? text.ToString() : _held + text.ToString();
+        }
+        else
+        {
+            if (_held != null) { _inner.Write(_held); _held = null; }
+            if (blanks == 0) _inner.Write(text.ToString());
+            else
+            {
+                _inner.Write(text.Slice(0, text.Length - blanks).ToString());
+                _held = text.Slice(text.Length - blanks).ToString();
+            }
+        }
+        _col = ColumnCount.After(_col, text);
     }
-    public override void Write(string? value)
+
+    private void Release()
     {
-        _inner.Write(value);
-        if (value != null) _col = ColumnCount.After(_col, value.AsSpan());
+        if (_held != null) { _inner.Write(_held); _held = null; }
     }
-    public override void Write(char[] buffer, int index, int count)
+
+    public int TrimTrailingBlanks()
     {
-        _inner.Write(buffer, index, count);
-        _col = ColumnCount.After(_col, new ReadOnlySpan<char>(buffer, index, count));
+        int n = _held?.Length ?? 0;
+        _held = null;
+        _col = Math.Max(0, _col - n);
+        return n;
     }
-    public override void Write(char[]? buffer)
-    {
-        _inner.Write(buffer);
-        if (buffer != null) _col = ColumnCount.After(_col, buffer.AsSpan());
-    }
+
+    public override void Write(char value) => Emit(stackalloc char[] { value });
+    public override void Write(string? value) { if (value != null) Emit(value.AsSpan()); }
+    public override void Write(char[] buffer, int index, int count) => Emit(new ReadOnlySpan<char>(buffer, index, count));
+    public override void Write(char[]? buffer) { if (buffer != null) Emit(buffer.AsSpan()); }
 #if !NETSTANDARD2_0
-    public override void Write(ReadOnlySpan<char> buffer)
-    {
-        _inner.Write(buffer);
-        _col = ColumnCount.After(_col, buffer);
-    }
-    public override void WriteLine(ReadOnlySpan<char> buffer) { _inner.WriteLine(buffer); _col = 0; }
+    public override void Write(ReadOnlySpan<char> buffer) => Emit(buffer);
+    public override void WriteLine(ReadOnlySpan<char> buffer) { Release(); _inner.WriteLine(buffer); _col = 0; }
 #endif
-    public override void WriteLine(string? value) { _inner.WriteLine(value); _col = 0; }
-    public override void WriteLine() { _inner.WriteLine(); _col = 0; }
-    public override void Flush() => _inner.Flush();
+    public override void WriteLine(string? value) { Release(); _inner.WriteLine(value); _col = 0; }
+    public override void WriteLine() { Release(); _inner.WriteLine(); _col = 0; }
+    public override void Flush() { Release(); _inner.Flush(); }
     protected override void Dispose(bool disposing)
     {
-        if (disposing) _inner.Dispose();
+        if (disposing) { Release(); _inner.Dispose(); }
         base.Dispose(disposing);
     }
 }
@@ -621,6 +766,8 @@ public class LispFileStream : LispStream
     public LispPathname? OriginalPathname { get; set; }
     /// <summary>Output file to delete if this stream is closed abortively.</summary>
     internal string? AbortDeletePath { get; set; }
+    /// <summary>For an append stream on an existing file: the length to cut back to on an abortive close.</summary>
+    internal long AbortTruncateLength { get; set; } = -1;
     /// <summary>Original file moved aside while this stream writes.</summary>
     internal string? BackupPath { get; set; }
     /// <summary>Keep BackupPath on normal close (:if-exists :rename).</summary>
@@ -713,14 +860,27 @@ public class LispStringOutputStream : LispOutputStream
     public bool EndsAtLineStart()
     {
         var sb = _sw.GetStringBuilder();
-        return sb.Length == 0 || sb[sb.Length - 1] == '\n';
+        // Empty: at the start of a line unless the text stands for text written after a column.
+        return sb.Length == 0 ? _startColumn == 0 : sb[sb.Length - 1] == '\n';
     }
 
     /// <summary>The column the text of this stream starts at on its first line.
     /// Zero for a stream of its own; the column of the destination for the
     /// buffer a PRINT-OBJECT method is handed while the printer builds the text
     /// it writes there.</summary>
-    public int StartColumn { get; set; }
+    public int StartColumn
+    {
+        get => _startColumn;
+        set
+        {
+            _startColumn = value;
+            // A buffer that stands for text written after a column (a ~/fn/ function's stream, the
+            // stream PRINT-OBJECT is handed) is not at the start of a line while it is empty and the
+            // destination was not: FRESH-LINE and ~& on it ask the destination's line, as in SBCL.
+            if (_sw.GetStringBuilder().Length == 0) AtLineStart = value == 0;
+        }
+    }
+    private int _startColumn;
 
     /// <summary>Get the string and reset the stream (for GET-OUTPUT-STREAM-STRING).</summary>
     public string GetStringAndReset()
@@ -730,6 +890,7 @@ public class LispStringOutputStream : LispOutputStream
         // The stream is empty again, so it is at the start of a line (FRESH-LINE already
         // reads the column from the now empty buffer; ~& reads this flag).
         AtLineStart = true;
+        _startColumn = 0;
         return result;
     }
 
@@ -855,6 +1016,9 @@ public class LispStringInputStream : LispInputStream
         _fullString = fullString;
         _endOffset = endOffset;
     }
+
+    /// <summary>The exclusive end of the readable text in the original string.</summary>
+    public int EndOffset => _endOffset;
 
     /// <summary>Current position in the original string.</summary>
     public int Position => StartOffset + (TrackingReader?.Position ?? 0);
@@ -996,6 +1160,27 @@ public class LispBroadcastStream : LispStream
 
     public LispBroadcastStream(LispObject[] streams) => Streams = streams;
 
+    // The line state belongs to the components: a write to a component directly is
+    // seen by FRESH-LINE on the broadcast stream, and a write through the broadcast
+    // stream is seen by FRESH-LINE on a component. The first component answers, as in SBCL.
+    public override bool AtLineStart
+    {
+        get
+        {
+            if (Streams.Length == 0) return base.AtLineStart;
+            var last = Streams[0];
+            if (last is LispStringOutputStream sout) return sout.EndsAtLineStart();
+            if (last is LispStream ls) return ls.AtLineStart;
+            return base.AtLineStart;
+        }
+        set
+        {
+            base.AtLineStart = value;
+            foreach (var c in Streams)
+                if (c is LispStream ls && c is not LispStringOutputStream) ls.AtLineStart = value;
+        }
+    }
+
     public override string ToString() => "#<BROADCAST-STREAM>";
 }
 
@@ -1023,6 +1208,9 @@ public class LispEchoStream : LispStream
     public LispObject OutputStream { get; }
     // See LispTwoWayStream.ResolvedInputCache.
     internal LispStream? ResolvedInputCache;
+    // The echoing reader made for the last call, reused while the input stream hands out
+    // the same reader (a plain string or file stream does; a concatenated one does not).
+    internal EchoingTextReader? EchoReader;
     public override bool IsInput => true;
     public override bool IsOutput => true;
     public override string? StreamTypeName => "ECHO-STREAM";
@@ -1420,9 +1608,23 @@ public sealed class InterruptibleSocketStream : System.IO.Stream
     private const int SliceMicroseconds = 100_000;
     private readonly System.Net.Sockets.NetworkStream _s;
 
+    // Bytes received but not yet read. A byte-at-a-time reader (a request line or header read
+    // with READ-BYTE) would otherwise cost a poll and a receive call for every byte; this takes
+    // what the socket has in one receive, as SBCL's socket streams do with their buffer.
+    private readonly byte[] _rb = new byte[16384];
+    private int _rpos, _rlen;
+
     public InterruptibleSocketStream(System.Net.Sockets.NetworkStream s) => _s = s;
     public System.Net.Sockets.Socket Socket => _s.Socket;
-    public bool DataAvailable => _s.DataAvailable;
+    public bool DataAvailable => _rpos < _rlen || _s.DataAvailable;
+
+    private bool Fill()
+    {
+        WaitReadable();
+        _rpos = 0;
+        _rlen = _s.Read(_rb, 0, _rb.Length);
+        return _rlen > 0;
+    }
 
     public override bool CanRead => _s.CanRead;
     public override bool CanWrite => _s.CanWrite;
@@ -1460,23 +1662,30 @@ public sealed class InterruptibleSocketStream : System.IO.Stream
     }
 
     public override int Read(byte[] buffer, int offset, int count)
-    {
-        if (count == 0) return 0;
-        WaitReadable();
-        return _s.Read(buffer, offset, count);
-    }
+        => Read(new System.Span<byte>(buffer, offset, count));
 
     public override int Read(System.Span<byte> buffer)
     {
         if (buffer.Length == 0) return 0;
-        WaitReadable();
-        return _s.Read(buffer);
+        if (_rpos >= _rlen)
+        {
+            if (buffer.Length >= _rb.Length)
+            {
+                WaitReadable();
+                return _s.Read(buffer);
+            }
+            if (!Fill()) return 0;
+        }
+        int n = System.Math.Min(buffer.Length, _rlen - _rpos);
+        new System.ReadOnlySpan<byte>(_rb, _rpos, n).CopyTo(buffer);
+        _rpos += n;
+        return n;
     }
 
     public override int ReadByte()
     {
-        WaitReadable();
-        return _s.ReadByte();
+        if (_rpos >= _rlen && !Fill()) return -1;
+        return _rb[_rpos++];
     }
 
     public override void Write(byte[] buffer, int offset, int count) => _s.Write(buffer, offset, count);

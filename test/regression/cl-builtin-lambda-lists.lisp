@@ -185,3 +185,10 @@
 (deftest cl-ll-user-function-unchanged
   (cl-ll-names (first (cl-ll-of 'cl-ll-user-fn)))
   ("ALPHA" "&KEY" "BETA"))
+
+;;; CAR, CDR and the CxxR family take LIST, as the dictionary entries write them
+;;; (they were X, which DESCRIBE showed).
+(deftest cl-ll-car-family-takes-list
+  (list (first (cl-ll-of 'car)) (first (cl-ll-of 'cdr)) (first (cl-ll-of 'cadr))
+        (first (cl-ll-of 'cddddr)))
+  ((list) (list) (list) (list)))

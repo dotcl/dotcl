@@ -10,8 +10,22 @@
 (defun handler-op-name ()
   (if *handler-op* (symbol-name *handler-op*) ""))
 
+(defun %report-compile-error (msg)
+  "Tell the user that the form being compiled is in error, as SBCL's \"caught ERROR:\" does:
+   under COMPILE-FILE as a STYLE-WARNING (the text is SBCL's; it is not a full WARNING so that a
+   library holding a form that is wrong only under dotcl's features -- a #+sbcl-only binding, say --
+   still loads, as it did before the report existed), otherwise on *ERROR-OUTPUT*. The compiled
+   code signals the error when it runs."
+  ;; A call with the wrong number of arguments is already reported, with the function's
+  ;; name and the count it wants, by the argument-count check of the analysis pass.
+  (unless (or *cross-compiling* (search "wrong number of arguments" msg))
+    (if *compile-file-mode*
+        (warn 'style-warning :format-control "caught ERROR:~%  ~A" :format-arguments (list msg))
+        (ignore-errors (format *error-output* "~&; caught ERROR:~%;   ~A~%" msg)))))
+
 (defun compile-static-program-error (msg)
   "Emit CIL that unconditionally signals PROGRAM-ERROR with MSG."
+  (%report-compile-error msg)
   `((:ldstr ,msg)
     (:newobj "LispProgramError")
     (:newobj "LispErrorException")
@@ -51,9 +65,17 @@
                            when (and (not (typep arg 'fixnum)) (fixnum-exact-p arg))
                              collect tmp))
               (pairs (loop for (t1 t2) on operands while t2 collect `(,op ,t1 ,t2))))
-         (compile-expr `(let* ,bindings
-                          ,@(when decls `((declare (type fixnum ,@decls))))
-                          (and ,@pairs))))))))
+         ;; The chain stops at the first false pair; when it does, every operand is
+         ;; still checked (CLHS 12.2: each argument must be a number, a real for the
+         ;; orderings). Operands proven fixnum need no check.
+         (let ((checks (loop for tmp in tmps for arg in args
+                             unless (or (typep arg 'fixnum) (fixnum-exact-p arg))
+                               collect `(,op ,tmp 0))))
+           (compile-expr `(let* ,bindings
+                            ,@(when decls `((declare (type fixnum ,@decls))))
+                            ,(if checks
+                                 `(if (and ,@pairs) t (progn ,@checks nil))
+                                 `(and ,@pairs))))))))))
 
 (defun simple-expr-p (expr)
   "Return T if EXPR compiles to simple stack ops without try blocks.
@@ -79,6 +101,30 @@
         ((and (consp expr) (eq (car expr) 'quote)) t)
         (t nil)))
 
+(defun %native-long-var-p (x)
+  "True when X is a variable held in a native int64 slot."
+  (and (symbolp x) x (boundp '*cstate*) (native-slot-p x (cstate-long-locals)) t))
+
+(defun %mixed-long-compare-method (args method)
+  "For the two ARGS of a numeric comparison METHOD (Runtime.IsTrueLt and the like): (:LONG-FIRST . M) or
+   (:LONG-LAST . M) when one operand is a variable in a native int64 slot and the other a variable that
+   is not, with M the Runtime entry that takes the int64 raw; else NIL."
+  (let* ((entry (assoc method '(("Runtime.IsTrueLt" "Runtime.IsTrueLtLO" "Runtime.IsTrueLtOL")
+                                ("Runtime.IsTrueGt" "Runtime.IsTrueGtLO" "Runtime.IsTrueGtOL")
+                                ("Runtime.IsTrueLe" "Runtime.IsTrueLeLO" "Runtime.IsTrueLeOL")
+                                ("Runtime.IsTrueGe" "Runtime.IsTrueGeLO" "Runtime.IsTrueGeOL")
+                                ("Runtime.IsTrueNumEq" "Runtime.IsTrueNumEqLO" "Runtime.IsTrueNumEqOL"))
+                       :test #'equal))
+         (a (first args)) (b (second args)))
+    (and entry (= (length args) 2) (symbolp a) (symbolp b) a b
+         (not *cross-compiling*)
+         (cond ((and (%native-long-var-p a) (not (%native-long-var-p b)) (lookup-local b)
+                     (not (boxed-var-p b)))
+                (cons :long-first (second entry)))
+               ((and (%native-long-var-p b) (not (%native-long-var-p a)) (lookup-local a)
+                     (not (boxed-var-p a)))
+                (cons :long-last (third entry)))))))
+
 (defun compile-binary-call (args method &optional (fn-name (handler-op-name)))
   ;; Pre-evaluate both args to temps so the stack is empty
   ;; when each is compiled (CIL requires empty stack at try-block entry).
@@ -87,6 +133,15 @@
     (return-from compile-binary-call
       (compile-static-program-error
        (format nil "~a: wrong number of arguments: ~a (expected 2)" fn-name (length args)))))
+  ;; A numeric comparison of an int64 local against a generic operand: the int64 goes in raw, so it
+  ;; is not boxed (a fresh Fixnum above the small-integer caches) for every comparison.
+  (let ((mixed (%mixed-long-compare-method args method)))
+    (when mixed
+      (return-from compile-binary-call
+        (let ((*in-tail-position* nil) (*in-mv-context* nil))
+          (if (eq (car mixed) :long-first)
+              `(,@(compile-as-long (first args)) ,@(compile-expr (second args)) (:call ,(cdr mixed)))
+              `(,@(compile-expr (first args)) ,@(compile-as-long (second args)) (:call ,(cdr mixed))))))))
   ;; Fast path: if both args are simple, push directly without temp locals
   (if (and (simple-expr-p (first args)) (simple-expr-p (second args)))
       `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
@@ -198,10 +253,10 @@
     ((null args) (emit-nil))
     ((null (cdr args)) (compile-for-single-value (car args)))
     ((null (cddr args)) (compile-binary-call args "Runtime.Append"))
-    (t ;; 3+ args: fold left into nested binary appends
-       (let ((acc (car args)))
-         (dolist (a (cdr args))
-           (setq acc (list 'append acc a)))
+    (t ;; 3+ args: fold right so each list is copied once
+       (let ((acc (car (last args))))
+         (dolist (a (reverse (butlast args)))
+           (setq acc (list 'append a acc)))
          (compile-form acc)))))
 
 (defun compile-aref-native-index-call (arr idx-exprs method &optional (val nil val-p))
@@ -354,6 +409,45 @@
           (:ldloc ,idx-tmp)
           (:call "Runtime.CharAtL")))))
 
+(defun compile-char-set-long (args)
+  "(%CHAR-SET STR IDX VALUE) with IDX statically a fixnum: the subscript goes in
+   as a raw int64 (Runtime.CharSetL). The three arguments are evaluated in order,
+   each once, through temporaries when any is not simple."
+  (destructuring-bind (str idx val) args
+    (when (and (consp val) (eq (car val) 'code-char) (= (length val) 2)
+               (not (local-function-entry 'code-char))
+               (fixnum-typed-p (second val)))
+      (return-from compile-char-set-long
+        (let ((t1 (gen-local "CSS")) (t2 (gen-local "CSI")) (t3 (gen-local "CSC")))
+          `((:declare-local ,t1 "LispObject")
+            (:declare-local ,t2 "Int64")
+            (:declare-local ,t3 "Int64")
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr str))
+            (:stloc ,t1)
+            ,@(compile-expr-to-long idx)
+            (:stloc ,t2)
+            ,@(compile-expr-to-long (second val))
+            (:stloc ,t3)
+            (:ldloc ,t1) (:ldloc ,t2) (:ldloc ,t3)
+            (:call "Runtime.CharSetCodeL")))))
+    (if (every #'simple-expr-p args)
+        `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr str))
+          ,@(compile-expr-to-long idx)
+          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr val))
+          (:call "Runtime.CharSetL"))
+        (let ((t1 (gen-local "CSS")) (t2 (gen-local "CSI")) (t3 (gen-local "CSV")))
+          `((:declare-local ,t1 "LispObject")
+            (:declare-local ,t2 "Int64")
+            (:declare-local ,t3 "LispObject")
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr str))
+            (:stloc ,t1)
+            ,@(compile-expr-to-long idx)
+            (:stloc ,t2)
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr val))
+            (:stloc ,t3)
+            (:ldloc ,t1) (:ldloc ,t2) (:ldloc ,t3)
+            (:call "Runtime.CharSetL"))))))
+
 (defun %backing-index-code (entry idxs)
   "Two values: instructions run before the buffer is loaded (non-simple
    subscripts, in order), and instructions that then leave the row-major index
@@ -393,7 +487,15 @@
                                                                 (:stloc ,tk))))
                                             `((:ldloc ,tk)))))))
                            (if check
-                               `(,@code ,@(dim-code d) (:ldc-i4 ,k) (:call "Runtime.AxisIndexL"))
+                               ;; The check is inline IL, not a call of the AggressiveInlining
+                               ;; helper AxisIndexL: in a very large method the JIT runs out of
+                               ;; inlining budget and the call stays a call at every subscript.
+                               ;; Out of range goes to the same error helper, so the message is
+                               ;; the one the helper always gave.
+                               (let ((ok (gen-label "AXOK")))
+                                 `(,@code (:dup) ,@(dim-code d) (:blt-un ,ok)
+                                          ,@(dim-code d) (:ldc-i4 ,k) (:call "Runtime.AxisIndexError")
+                                          (:label ,ok)))
                                code)))))))
         (values
          pre
@@ -754,22 +856,24 @@
    against it with the per-element helper as the other arm: the buffer slot is
    NIL whenever the fetch declined, and declining has to cost speed rather than
    correctness. Everything else compiles to the helper alone."
-  (let ((helper (%numeric-aref-helper-as-long arr idxs rank))
-        (back (array-backing-entry-for-read (list* 'aref arr idxs))))
+  (let* ((back (array-backing-entry-for-read (list* 'aref arr idxs)))
+         ;; Beside a hoisted buffer the helper is the arm that runs only when
+         ;; there is no buffer: a call the JIT is told not to inline.
+         (helper (%numeric-aref-helper-as-long arr idxs rank (and back t))))
     (if back
         (compile-backing-aref-as-long back idxs helper)
         helper)))
 
-(defun %numeric-aref-helper-as-long (arr idxs rank)
+(defun %numeric-aref-helper-as-long (arr idxs rank &optional cold)
   "Emit (aref ARR IDX...) on a proven numeric-backed array as a raw int64 on
-   the stack (Runtime.ArefNum*L). ARR is a plain lexical local or a structure
+   the stack (Runtime.ArefNum*L; the NoInlining Runtime.ArefNum*LCold when COLD). ARR is a plain lexical local or a structure
    accessor call (numeric-array-aref-info); non-simple indices are evaluated to
    Int64 temps first so the stack is empty whenever a non-simple subexpression
    compiles, and ARR goes into a temp ahead of them when it is not a local."
   (let ((method (ecase rank
-                  (1 "Runtime.ArefNumL")
-                  (2 "Runtime.ArefNum2DL")
-                  (3 "Runtime.ArefNum3DL"))))
+                  (1 (if cold "Runtime.ArefNumLCold" "Runtime.ArefNumL"))
+                  (2 (if cold "Runtime.ArefNum2DLCold" "Runtime.ArefNum2DL"))
+                  (3 (if cold "Runtime.ArefNum3DLCold" "Runtime.ArefNum3DL")))))
     (if (every #'simple-expr-p idxs)
         `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
               (compile-expr arr))
@@ -791,23 +895,48 @@
 (defun compile-numeric-aref-set (arr idxs val rank)
   "Emit (setf (aref ARR IDX...) VAL) on a numeric-backed array, boxed value on
    the stack. Hoisted buffer with a helper arm, exactly as the read is."
-  (let ((helper (%numeric-aref-helper-set arr idxs val rank))
-        (back (array-backing-entry (list* 'aref arr idxs))))
+  (let* ((back (array-backing-entry (list* 'aref arr idxs)))
+         (helper (%numeric-aref-helper-set arr idxs val rank (and back t))))
     `(,@(if back
             (compile-backing-aref-set back idxs val helper)
             helper)
       (:call "Fixnum.Make"))))
 
-(defun %numeric-aref-helper-set (arr idxs val rank)
+(defun %aref-set-numeric-parts (expr)
+  "(values ARR IDXS VAL RANK) when EXPR is (%AREF-SET ARR IDX... VAL) on an array whose
+   elements are stored as int64 and VAL can be lowered to a raw int64, as the
+   %AREF-SET handler stores it; else NIL."
+  (when (and (consp expr) (eq (car expr) '%aref-set)
+             (not (local-function-entry '%aref-set))
+             (<= 3 (length (cdr expr)) 5)
+             (not (%aref-set-let-sunk expr)))
+    (let* ((args (cdr expr))
+           (idxs (butlast (cdr args)))
+           (val (fold-constant-symbol (car (last args))))
+           (info (and (fixnum-long-lowerable-p val)
+                      (every #'fixnum-long-lowerable-p idxs)
+                      (numeric-array-aref-info `(aref ,(first args) ,@idxs)))))
+      (when (and info (integerp (cadr info)))
+        (values (first args) idxs val (car info))))))
+
+(defun compile-numeric-aref-set-long (arr idxs val rank)
+  "COMPILE-NUMERIC-AREF-SET without the box: the stored value as a raw int64."
+  (let* ((back (array-backing-entry (list* 'aref arr idxs)))
+         (helper (%numeric-aref-helper-set arr idxs val rank (and back t))))
+    (if back
+        (compile-backing-aref-set back idxs val helper)
+        helper)))
+
+(defun %numeric-aref-helper-set (arr idxs val rank &optional cold)
   "Emit (setf (aref ARR IDX...) VAL) on a numeric-backed array with the value
    lowered to a raw int64 (Runtime.ArefSetNum*L; range-checked store, returns
    the stored long). Leaves that RAW long on the stack; COMPILE-NUMERIC-AREF-SET
    boxes it for the general setf contract, and in statement position the
    peephole (P5 family) deletes the box."
   (let ((method (ecase rank
-                  (1 "Runtime.ArefSetNumL")
-                  (2 "Runtime.ArefSetNum2DL")
-                  (3 "Runtime.ArefSetNum3DL"))))
+                  (1 (if cold "Runtime.ArefSetNumLCold" "Runtime.ArefSetNumL"))
+                  (2 (if cold "Runtime.ArefSetNum2DLCold" "Runtime.ArefSetNum2DL"))
+                  (3 (if cold "Runtime.ArefSetNum3DLCold" "Runtime.ArefSetNum3DL")))))
     (if (and (every #'simple-expr-p idxs) (simple-expr-p val))
         `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
               (compile-expr arr))
@@ -991,9 +1120,17 @@
          (:call "Runtime.List")
          (:call "MultipleValues.Primary")))))
 
+(defun compile-vector-call (args)
+  "(VECTOR a1 ... an): the simple-vector the VECTOR function builds from its
+   &rest list, made here without the call. The arguments are evaluated left to
+   right, one value each (COMPILE-ARGS-ARRAY), the same array the call would
+   have taken."
+  `(,@(compile-args-array args)
+    (:newobj "LispVector")))
+
 (defun compile-list-star-call (args)
   (cond
-    ((null args) (error "LIST* requires at least one argument"))
+    ((null args) (compile-static-program-error "LIST*: wrong number of arguments: 0 (expected at least 1)"))
     ;; (LIST* x) is x. Compiling it as such removes a call, and there is no cons
     ;; to build.
     ((null (cdr args)) (compile-for-single-value (car args)))
@@ -1012,29 +1149,58 @@
        ;; table from a function that returns more than one value is its
        ;; primary value, also when the GETHASH is in tail position or inside
        ;; MULTIPLE-VALUE-BIND.
-       `(,@(compile-value-args (list (first args) (second args)
-                                     (if (= nargs 3) (third args) '(:code (:ldnull)))))
-         (:call "Runtime.Gethash"))))))
+       (let* ((key (first args))
+              (table (second args))
+              (default (if (= nargs 3) (third args) '(:code (:ldnull))))
+              (fixnum-key (fixnum-typed-p key))
+              (op-key (and (not fixnum-key) (gethash-fixnum-op key))))
+         (cond
+           (fixnum-key
+            (let ((key-code (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                              (compile-as-long key))))
+              `(,@(compile-value-args (list (cons :code-long key-code) table default))
+                (:call "Runtime.GethashFixnum"))))
+           (op-key
+            (destructuring-bind (op a b) op-key
+              (let ((a-code (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                              (compile-as-long a)))
+                    (b-code (let ((*in-tail-position* nil) (*in-mv-context* nil))
+                              (compile-as-long b))))
+                `(,@(compile-value-args
+                     (list (cons :code-long `((:ldc-i8 ,op)))
+                           (cons :code-long a-code)
+                           (cons :code-long b-code)
+                           table default))
+                  (:call "Runtime.GethashFixnumOp")))))
+           (t
+            `(,@(compile-value-args (list key table default))
+              (:call "Runtime.Gethash")))))))))
 
 (defun compile-value-args (items)
   "Push the single value of each of ITEMS, left to right, for a known-function
-   intrinsic call. An item is a form, or (:CODE . instructions) pushed as is.
+   intrinsic call. An item is a form, (:CODE . instructions) pushed as is, or
+   (:CODE-LONG . instructions) for a raw int64.
    Code that leaves a protected region or opens one (CATCH, HANDLER-CASE,
    UNWIND-PROTECT, a loop exited with LEAVE) needs an empty evaluation stack,
    and the values of the items before it would be on it, so when any item after
    the first has such code every value is taken into a temp first."
   (let ((codes (let ((*in-tail-position* nil) (*in-mv-context* nil))
                  (mapcar (lambda (it)
-                           (if (and (consp it) (eq (car it) :code))
+                           (if (and (consp it) (member (car it) '(:code :code-long)))
                                (cdr it)
                                (compile-expr it)))
-                         items))))
+                         items)))
+        (types (mapcar (lambda (it)
+                         (if (and (consp it) (eq (car it) :code-long))
+                             "Int64" "LispObject"))
+                       items)))
     (if (notany #'%instrs-need-empty-stack-p (cdr codes))
         (apply #'append codes)
         (let ((temps (loop repeat (length codes) collect (gen-local "VA"))))
           (append (loop for code in codes
                         for tmp in temps
-                        append `((:declare-local ,tmp "LispObject") ,@code (:stloc ,tmp)))
+                        for ty in types
+                        append `((:declare-local ,tmp ,ty) ,@code (:stloc ,tmp)))
                   (loop for tmp in temps collect `(:ldloc ,tmp)))))))
 
 (defun compile-puthash (args)
@@ -1052,6 +1218,10 @@
     ;; (values x) where only the primary value is taken, nothing reads what is published.
     ((and (null (cdr args)) (null *in-mv-context*) (null *in-tail-position*))
      (compile-for-single-value (car args)))
+    ;; (values a b ...) where only the primary value is taken: the others are evaluated for
+    ;; effect, and no MvReturn is made for a value nobody reads.
+    ((and (cdr args) (null *in-mv-context*) (null *in-tail-position*))
+     (compile-for-single-value `(prog1 ,@args)))
     ;; (values x) is "the primary value of x as the only value": the channel's
     ;; "nobody published" state, which every reader takes as one value, the
     ;; returned one.
@@ -1095,19 +1265,60 @@
 
 (defun compile-concatenate (args)
   "Compile (concatenate result-type seq1 seq2 ...)."
-  (if (null args)
-      (compile-static-program-error "CONCATENATE: wrong number of arguments: 0 (expected at least 1)")
-      (let ((rt-tmp (gen-local "RTTYP"))
-            (arr-tmp (gen-local "CATARR")))
-        `((:declare-local ,rt-tmp "LispObject")
-          (:declare-local ,arr-tmp "LispObject[]")
-          ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
-          (:stloc ,rt-tmp)
-          ,@(compile-args-array (cdr args))
-          (:stloc ,arr-tmp)
-          (:ldloc ,rt-tmp)
-          (:ldloc ,arr-tmp)
-          (:call "Runtime.Concatenate")))))
+  (cond
+    ((null args)
+     (compile-static-program-error "CONCATENATE: wrong number of arguments: 0 (expected at least 1)"))
+    ((= (length args) 3)
+     (let ((rt-tmp (gen-local "RTTYP"))
+           (a-tmp (gen-local "CATA"))
+           (b-tmp (gen-local "CATB")))
+       `((:declare-local ,rt-tmp "LispObject")
+         (:declare-local ,a-tmp "LispObject")
+         (:declare-local ,b-tmp "LispObject")
+         ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
+         (:stloc ,rt-tmp)
+         ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (second args)))
+         (:stloc ,a-tmp)
+         ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (third args)))
+         (:stloc ,b-tmp)
+         (:ldloc ,rt-tmp)
+         (:ldloc ,a-tmp)
+         (:ldloc ,b-tmp)
+         (:call "Runtime.Concatenate2"))))
+    ((= (length args) 4)
+     (let ((rt-tmp (gen-local "RTTYP"))
+           (a-tmp (gen-local "CATA"))
+           (b-tmp (gen-local "CATB"))
+           (c-tmp (gen-local "CATC")))
+       `((:declare-local ,rt-tmp "LispObject")
+         (:declare-local ,a-tmp "LispObject")
+         (:declare-local ,b-tmp "LispObject")
+         (:declare-local ,c-tmp "LispObject")
+         ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
+         (:stloc ,rt-tmp)
+         ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (second args)))
+         (:stloc ,a-tmp)
+         ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (third args)))
+         (:stloc ,b-tmp)
+         ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (fourth args)))
+         (:stloc ,c-tmp)
+         (:ldloc ,rt-tmp)
+         (:ldloc ,a-tmp)
+         (:ldloc ,b-tmp)
+         (:ldloc ,c-tmp)
+         (:call "Runtime.Concatenate3"))))
+    (t
+     (let ((rt-tmp (gen-local "RTTYP"))
+           (arr-tmp (gen-local "CATARR")))
+       `((:declare-local ,rt-tmp "LispObject")
+         (:declare-local ,arr-tmp "LispObject[]")
+         ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
+         (:stloc ,rt-tmp)
+         ,@(compile-args-array (cdr args))
+         (:stloc ,arr-tmp)
+         (:ldloc ,rt-tmp)
+         (:ldloc ,arr-tmp)
+         (:call "Runtime.Concatenate"))))))
 
 (defun compile-args-array (args)
   "Compile arguments into a LispObject[] array on the stack.

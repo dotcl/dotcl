@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A (SETF accessor) generic function is named by the list (SETF accessor)
 ;;; wherever its name is visible: GENERIC-FUNCTION-NAME and the third value of
 ;;; FUNCTION-LAMBDA-EXPRESSION. The name round-trips through FDEFINITION.

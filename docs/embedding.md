@@ -201,7 +201,7 @@ dependencies, to FASLs in the output directory, plus a manifest listing them:
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="DotCL.Runtime" Version="0.1.30" />
+  <PackageReference Include="DotCL.Runtime" Version="<version>" />
 </ItemGroup>
 <PropertyGroup>
   <DotclProjectAsd>$(MSBuildProjectDirectory)/app.asd</DotclProjectAsd>

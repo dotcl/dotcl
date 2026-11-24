@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; ~^ with nothing around it to terminate ends the FORMAT operation.
 ;;;
 ;;; CLHS 22.3.9.2: ~^ terminates the innermost ~{...~} or ~<...~>, and when there

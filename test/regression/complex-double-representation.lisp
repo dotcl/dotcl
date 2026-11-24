@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A complex of two doubles keeps them unboxed.
 ;;;
 ;;; The parts used to be two separate number objects, so every complex operation

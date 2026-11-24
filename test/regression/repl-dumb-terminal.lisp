@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; A terminal that takes no escape sequences (TERM=dumb: Emacs's shell and
 ;;; comint buffers) gets plain line input, not the line editor: the editor draws
 ;;; with escape sequences, which such a terminal shows as text. The decision is

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; REMOVE on a vector or string costs the result and nothing else.
 ;;;
 ;;; The indexed path grew a List of every surviving element and copied it out,

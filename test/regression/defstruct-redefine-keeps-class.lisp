@@ -25,7 +25,7 @@
   t)
 
 (deftest-compiled-only defstruct-redefine-keeps-class.compile-file
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "dskc-c.lisp" dir))
          (fasl (merge-pathnames "dskc-c.fasl" dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)

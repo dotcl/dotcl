@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; WRITE-BYTE / WRITE-SEQUENCE to a binary stream signal a TYPE-ERROR for an
 ;;; integer the stream's element cannot hold.
 ;;;

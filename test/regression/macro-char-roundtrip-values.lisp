@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A reader macro that produces a value must say it produced one.
 ;;;
 ;;; GET-MACRO-CHARACTER hands back a Lisp function wrapping the built-in reader

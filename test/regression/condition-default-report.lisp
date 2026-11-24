@@ -28,3 +28,15 @@
 (deftest condition-default-report.handler-case-message
   (handler-case (error 'cdr-plain) (error (c) (princ-to-string c)))
   "Condition COMMON-LISP-USER::CDR-PLAIN was signalled.")
+
+;; The standard condition types are symbols of COMMON-LISP: the report writes them bare, as SBCL
+;; does (its default report prints with COMMON-LISP as the current package).
+(deftest condition-default-report.standard-types-are-bare
+  (list (princ-to-string (make-condition 'error))
+        (princ-to-string (make-condition 'warning))
+        (princ-to-string (make-condition 'simple-error))
+        (handler-case (error 'program-error) (error (c) (princ-to-string c))))
+  ("Condition ERROR was signalled."
+   "Condition WARNING was signalled."
+   "Condition SIMPLE-ERROR was signalled."
+   "Condition PROGRAM-ERROR was signalled."))

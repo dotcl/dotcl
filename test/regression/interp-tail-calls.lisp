@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The tree-walk evaluator must not spend a .NET frame per tail-recursive
 ;;; iteration. Without this, a tail-recursive loop, the ordinary CL idiom, could
 ;;; not be written at all on a build with no compiler (netstandard2.0 / WASM /

@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; `dotcl build <asd>` compiles the files inside the system's :module
 ;;; components, not just the system's direct children.
 ;;;

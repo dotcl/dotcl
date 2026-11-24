@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; INVOKE-RESTART on a restart object looked the object up again with a NIL
 ;;; condition, so the restart's test function ran with NIL and hid restarts
 ;;; meant for a condition. An active object is invokable whatever its test says;

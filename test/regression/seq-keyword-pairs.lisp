@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Sequence and list functions called with one or two keyword pairs take a
 ;;; direct entry that parses the pairs from its parameters.  The tests pin
 ;;; that those calls allocate nothing, and that the keyword rules are the same

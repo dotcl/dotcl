@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Building a method through the AMOP (MAKE-INSTANCE 'STANDARD-METHOD) and
 ;;; attaching it with ADD-METHOD.
 ;;;

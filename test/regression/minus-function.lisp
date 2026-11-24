@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; #'- with zero arguments, and the unary case (the DEFUN in cil-stdlib.lisp).
 ;;;
 ;;; The definition read:

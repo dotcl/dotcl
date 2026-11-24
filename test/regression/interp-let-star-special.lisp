@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; LET* is sequential: each binding is in effect while the REMAINING init forms
 ;;; are evaluated (CLHS 3.1.2.1.1.2). The interpreter collected the special
 ;;; bindings and PROGV'd them all at the end, which got that backwards; a later

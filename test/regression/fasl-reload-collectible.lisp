@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Loading the same fasl again. The first load of a path goes in by path (and may use
 ;;; native code); every load of that path after it goes into a collectible load context
 ;;; as IL, so reloading a system while developing does not pile up assemblies. The

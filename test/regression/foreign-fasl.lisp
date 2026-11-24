@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; .fasl is a shared extension: SBCL, CCL and ECL all write files with that
 ;;; name, and they turn up next to sources in quicklisp dists and in bundle
 ;;; directories. dotcl fasls are .NET assemblies, so such a file cannot be

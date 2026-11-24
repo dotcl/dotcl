@@ -196,6 +196,19 @@
   "T when compiling via compile-file. Controls eval-when behavior per CLHS 3.2.3.1:
    :compile-toplevel -> eval at compile time, :load-toplevel -> emit CIL for load.")
 
+(defvar *defun-arities* (make-hash-table :test #'eq :synchronized t)
+  "Function name -> (min . max) arguments of the DEFUN last compiled for it (max NIL when the lambda
+   list has &REST, &BODY or &KEY). A call compiled later is checked against it, as SBCL checks a
+   call to a function it knows.")
+
+(defvar *same-file-called* nil
+  "While COMPILE-FILE compiles one file: the names called as functions before being defined
+   (a table made by COMPILE-FILE). DEFMACRO consults it for \"previously assumed to be a function\".")
+
+(defvar *same-file-defun-bodies* nil
+  "While COMPILE-FILE compiles one file: function name -> the body of the DEFUN last compiled for it,
+   to tell a second DEFUN of the name from the same DEFUN compiled twice (EVAL-WHEN).")
+
 (defvar *same-file-functions* nil
   "While COMPILE-FILE compiles one file: the DEFUNs compiled so far from it
    whose body a call can enter directly while the name still holds the function
@@ -353,6 +366,124 @@
         (push (cons name fresh-value) *closure-fresh-state*)))
   name)
 
+(defvar *macro-takes-environment* (make-hash-table :test #'eq :synchronized t)
+  "Global macro names whose lambda list has an &ENVIRONMENT parameter.")
+
+(defvar *macro-expander-takes-environment*
+  (make-hash-table :test #'eq :weakness :key :synchronized t)
+  "Lexical MACROLET expanders, mapped to whether they take &ENVIRONMENT.")
+
+(defun %macro-lambda-list-takes-environment-p (params)
+  "True when macro lambda list PARAMS has an &ENVIRONMENT parameter."
+  (loop for p on params
+        thereis (and (consp p) (eq (car p) '&environment))))
+
+(defun %macro-body-asks-declarations-p (body)
+  "True when the macro body BODY names something that asks the environment about
+   declarations (the CLtL2 queries, an environment's lexical info): such a macro
+   may expand differently where its form is compiled than in an analysis walk."
+  (let ((seen (make-hash-table :test #'eq)))
+    (labels ((walk (x)
+               (cond ((symbolp x)
+                      (and x (symbol-package x)
+                           (let ((n (symbol-name x)))
+                             (or (search "INFORMATION" n) (search "CLTL2" n)
+                                 (search "LEXENV" n) (search "LEXINFO" n)
+                                 (search "AUGMENT-ENVIRONMENT" n)))))
+                     ((consp x)
+                      (unless (gethash x seen)
+                        (setf (gethash x seen) t)
+                        (loop for c = x then (cdr c)
+                              while (consp c)
+                              thereis (walk (car c))
+                              finally (return (and c (walk c))))))
+                     (t nil))))
+      (and (walk body) t))))
+
+(defun %body-walkable-p (body)
+  "True when the analysis walks may expand a macro with this BODY (see %NOTE-MACRO-TAKES-ENVIRONMENT)."
+  (not (%macro-body-asks-declarations-p body)))
+
+(defun %note-macro-takes-environment (name takes-p &optional walkable)
+  "Record that global macro NAME does or does not take &ENVIRONMENT. WALKABLE: the
+   body does not ask about declarations, so the analysis walks may expand it."
+  (when (symbolp name)
+    (if takes-p
+        (setf (gethash name *macro-takes-environment*) (if walkable :walkable t))
+        (remhash name *macro-takes-environment*)))
+  name)
+
+(defun %note-macro-expander-takes-environment (expander takes-p)
+  "Record that macro EXPANDER, a lexical MACROLET binding, does or does not take
+   &ENVIRONMENT. A false entry also shadows a global macro of the same name."
+  (when expander
+    (setf (gethash expander *macro-expander-takes-environment*)
+          (cond ((eq takes-p :contained) :contained) (takes-p t) (t nil))))
+  expander)
+
+(defun %macro-expander-takes-environment-p (name expander)
+  "True when EXPANDER, the macro expander of NAME, has an &ENVIRONMENT parameter."
+  (multiple-value-bind (value found)
+      (gethash expander *macro-expander-takes-environment*)
+    (if found value (and name (gethash name *macro-takes-environment*)))))
+
+(defun %global-macro-takes-environment-p (name expander)
+  "True when the analysis walks must leave the macro EXPANDER of NAME to code
+   generation: it takes &ENVIRONMENT and does more with it than macroexpand. The
+   walks keep no block or tag names and only part of the variable and function
+   frames, so an expansion made there would be asked about an environment that
+   is not the one code generation reads, and its side effects would run twice (a
+   code walker called from the expander, say). A global macro answers by its
+   recorded flag; a MACROLET macro by what %MACROLET-ENV-CLASS found in its body
+   (:CONTAINED, the environment goes only to MACROEXPAND, is expanded in the
+   walks as before)."
+  (multiple-value-bind (value found)
+      (gethash expander *macro-expander-takes-environment*)
+    (if found
+        (eq value t)
+        (and name (gethash name *macro-takes-environment*) t))))
+
+(defun %macrolet-env-contained-p (params mbody)
+  "True when the &ENVIRONMENT parameter of the MACROLET macro (PARAMS MBODY) is
+   used only as the environment argument of MACROEXPAND, MACROEXPAND-1 or
+   MACRO-FUNCTION, or of a helper whose name contains MACROEXPAND (or named in
+   a DECLARE), and the body asks nothing else of it:
+   whatever the walks give it, such a macro expands the same where its form is
+   compiled, apart from symbol macros the walk already treats as unknown."
+  (let ((env (cadr (member '&environment params))))
+    (and env (symbolp env)
+         (not (%macro-body-asks-declarations-p mbody))
+         (labels ((ok (x)
+                    (cond ((eq x env) nil)
+                          ((atom x) t)
+                          ((eq (car x) 'quote) t)
+                          ((eq (car x) 'declare) t)
+                          ((and (member (car x) '(macroexpand macroexpand-1 macro-function))
+                                (consp (cdr x)) (consp (cddr x))
+                                (eq (third x) env))
+                           (and (ok (second x)) (ok (cdddr x))))
+                          ;; A helper named after macro expansion (a
+                          ;; TRIVIAL-MACROEXPAND-ALL style wrapper) that takes the
+                          ;; environment as an argument only expands with it.
+                          ((and (symbolp (car x))
+                                (search "MACROEXPAND" (symbol-name (car x)))
+                                (member env (cdr x) :test #'eq)
+                                (null (cdr (last x))))
+                           (loop for a in (cdr x)
+                                 always (or (eq a env) (ok a))))
+                          (t (loop for c = x then (cdr c)
+                                   while (consp c)
+                                   always (ok (car c))
+                                   finally (return (or (null c) (ok c))))))))
+           (ok mbody)))))
+
+(defun %macrolet-env-class (params mbody)
+  "NIL when the MACROLET macro (PARAMS MBODY) takes no &ENVIRONMENT, :CONTAINED
+   when it uses it only as %MACROLET-ENV-CONTAINED-P allows, else T."
+  (cond ((not (%macro-lambda-list-takes-environment-p params)) nil)
+        ((%macrolet-env-contained-p params mbody) :contained)
+        (t t)))
+
 (defmacro define-compile-state (name init &key (fresh-init nil fresh-init-p) doc)
   "Declare a per-compilation special variable that automatically participates
    in the closure-boundary reset: compile-closure-body rebinds it to
@@ -464,6 +595,11 @@
 ;; (SYMBOL still resolving to KEY) takes its arguments from the argument array
 ;; instead of the list. See %REST-FORWARD-APPLY.
 (defvar *rest-forward* nil)
+
+;; name -> (UNIT . TYPE): a DEFUN whose every result is a global proclaimed to hold the same
+;; simple array type (%INFER-ARRAY-RETURN-TYPE). Answers only inside UNIT, as the numeric
+;; inferred return types do.
+(defvar *inferred-array-return-types* (make-hash-table :test #'eq :synchronized t))
 
 (defvar *inferred-return-type-names* (make-hash-table :test #'eq :synchronized t)
   "symbol -> the compilation unit (see %RETURN-TYPE-UNIT) in which its
@@ -688,7 +824,16 @@
          (%xref-walk-all (cdr f) seen))
         ((eq op 'cond)
          (xref-record-use :macroexpands op f)
-         (loop for c in (cdr f) when (consp c) do (%xref-walk-all c seen)))
+         ;; A clause chain is compiled as COND of its tail inside COND of its tail, each a fresh
+         ;; cons sharing the clause conses of the original. The cells of the clause list are
+         ;; marked as they are walked, so the COND of a tail that was walked already costs
+         ;; nothing (otherwise a COND of n clauses walked n(n+1)/2 clause cells).
+         (loop for cell on (cdr f)
+               while (consp cell)
+               do (when (%lazy-table-get seen cell) (return))
+                  (%lazy-table-put seen cell t)
+                  (let ((c (car cell)))
+                    (when (consp c) (%xref-walk-all c seen)))))
         ((or (special-operator-name-p op) (eq op 'declare)))
         ((macro-function op) (xref-record-use :macroexpands op f))
         ((fboundp op)
@@ -924,12 +1069,17 @@
          (declared (make-hash-table :test #'eq))
          (loads (make-hash-table :test #'eq))
          (stores (make-hash-table :test #'eq))
-         (spoiled (make-hash-table :test #'eq)))
+         (spoiled (make-hash-table :test #'eq))
+         (seen (make-hash-table :test #'eq)))
     (loop for i across ins
           when (and (consp i) (eq (car i) :declare-local))
             do (setf (gethash (cadr i) declared) t))
     (labels ((spoil (x)
-               (cond ((consp x) (spoil (car x)) (spoil (cdr x)))
+               (cond ((consp x)
+                      ;; An operand can be user data with a cycle in it.
+                      (unless (gethash x seen)
+                        (setf (gethash x seen) t)
+                        (spoil (car x)) (spoil (cdr x))))
                      ((and x (symbolp x) (gethash x declared))
                       (setf (gethash x spoiled) t)))))
       (dotimes (k n)
@@ -1024,6 +1174,12 @@
    (%SET-LTV-SLOT-IN module id form) for the LOAD-TIME-VALUE forms in it, so
    their forms run when the fasl is loaded, before the top level form, instead
    of when the code first reaches them. NIL everywhere else.")
+
+(defvar *ltv-sites* nil
+  "While one top level form is compiled: an EQ table from a LOAD-TIME-VALUE form
+   to the slot id it was given (or, under *LTV-EVAL-NOW*, to the cell holding its
+   value). A function whose body is compiled for several entries compiles the
+   same form once per entry; the table makes them share one evaluation.")
 
 (defvar *ltv-eval-now* nil
   "True while compiling LOAD-TIME-VALUE forms to run now, as COMPILE does.")
@@ -1227,6 +1383,10 @@
                       multiple-value-call multiple-value-prog1 progv))
        t))
 
+(defvar *cond-continuation* nil
+  "The form (COND clause...) COMPILE-COND made for the clauses after the first one, while that
+   form is being compiled. Its clauses were checked with the COND it was cut from.")
+
 (defun %form-arg-count (expr)
   "The number of arguments of EXPR, or NIL when EXPR is a dotted or circular list."
   (let ((c (cdr expr)) (k 0))
@@ -1279,6 +1439,39 @@
   (or (symbolp x)
       (and (consp x) (symbolp (car x)) (string= (symbol-name (car x)) "SETF")
            (consp (cdr x)) (symbolp (cadr x)) (null (cddr x)))))
+
+(defun %lambda-list-variable-problem (op ll)
+  "A message when an ordinary lambda list LL names something that is not a symbol where a
+   variable belongs (a required parameter, or the variable of an &OPTIONAL / &KEY / &AUX entry), else NIL."
+  (let ((state :required))
+    (dolist (p ll nil)
+      (cond
+        ((and (symbolp p) p (member p lambda-list-keywords))
+         (setf state (case p (&optional :optional) (&key :key) (&aux :aux) ((&rest &body) :rest) (t state))))
+        ((eq state :rest)
+         (unless (symbolp p) (return (format nil "~S: the &REST variable ~S is not a symbol" op p))))
+        ((member state '(:optional :key :aux))
+         (let ((var (cond ((symbolp p) p)
+                          ((not (consp p)) nil)
+                          ((and (eq state :key) (consp (car p))) (and (consp (cdar p)) (cadar p)))
+                          (t (car p)))))
+           (unless (and var (symbolp var))
+             (let ((*print-length* 6) (*print-level* 3))
+               (return (format nil "~S: ~S is not a valid lambda list entry" op p))))))
+        ((not (symbolp p))
+         (let ((*print-length* 6) (*print-level* 3))
+           (return (format nil "~S: ~S is not a symbol in the lambda list" op p))))))))
+
+(defun %lambda-list-problem (op ll)
+  "A message when the ordinary lambda list LL of OP (LAMBDA, DEFUN, FLET, LABELS) is malformed, else NIL.
+   The rules are the ones the compiler applies anyway (%CHECK-LAMBDA-LIST-SHAPE), so a lambda list that
+   compiles today is never refused here; the point is that the error becomes a run-time one."
+  (let ((*print-length* 6) (*print-level* 3))
+    (cond ((not (listp ll)) (format nil "~S: the lambda list must be a list: ~S" op ll))
+          ((not (%proper-list-p ll)) (format nil "~S: the lambda list is not a proper list: ~S" op ll))
+          (t (or (handler-case (progn (%check-lambda-list-shape ll) nil)
+                   (program-error (c) (format nil "~S: ~A" op c)))
+                 (%lambda-list-variable-problem op ll))))))
 
 (defun %declare-syntax-problem (op decl)
   "A message when a declaration specifier of the (DECLARE ...) form DECL is malformed, else NIL.
@@ -1361,7 +1554,8 @@
           ((oddp n) (let ((*print-length* 6) (*print-level* 3))
                       (format nil "SETQ: odd number of arguments: ~S" expr)))
           (t (do ((c (cdr expr) (cddr c))) ((null c) nil)
-               (unless (and (symbolp (car c)) (not (%constant-symbol-p (car c))))
+               (unless (and (symbolp (car c)) (not (%constant-symbol-p (car c)))
+                            (or *cross-compiling* (not (constantp (car c)))))
                  (return (let ((*print-length* 6) (*print-level* 3))
                            (format nil "SETQ: ~S is not a variable: ~S" (car c) expr)))))))))
 
@@ -1393,6 +1587,12 @@
                                     :test #'string=))
                  (return (format nil "EVAL-WHEN: invalid situation ~S" x))))))))
 
+(defun %shape-check-message (checker expr)
+  "The message of the PROGRAM-ERROR that CHECKER signals for the form EXPR, or NIL when it is well formed."
+  (handler-case (progn (funcall checker expr) nil)
+    (program-error (c) (let ((*print-pretty* nil) (*print-length* 6) (*print-level* 3))
+                         (princ-to-string c)))))
+
 (defun %macro-form-shape-problem (expr)
   "A message when the call EXPR of a standard macro has the wrong number of arguments, else NIL.
    Not for use when a local function or macro of that name is in scope."
@@ -1417,7 +1617,12 @@
                                          (%constant-symbol-p (car ts))))))))
              (return (let ((*print-length* 6) (*print-level* 3))
                        (format nil "~S: malformed clause ~S" (car expr) clause)))))))
-    ((and or cond prog1 prog2) (%arity-problem expr 0 nil))
+    ((and or prog1 prog2) (%arity-problem expr 0 nil))
+    (cond (or (%arity-problem expr 0 nil)
+              (dolist (clause (cdr expr) nil)
+                ;; a clause that is not a list is a TYPE-ERROR, as in SBCL
+                (unless (and (consp clause) (%proper-list-p clause))
+                  (return (list :type-error clause 'cons))))))
     (handler-case
      (or (%arity-problem expr 1 nil)
          (dolist (clause (cddr expr) nil)
@@ -1435,7 +1640,8 @@
            (unless (and (consp clause) (%proper-list-p clause) (cdr clause)
                         (listp (cadr clause)))
              (return (let ((*print-pretty* nil) (*print-length* 6) (*print-level* 3))
-                       (format nil "RESTART-CASE: malformed clause ~S" clause)))))))
+                       (format nil "RESTART-CASE: malformed clause ~S" clause)))))
+         (%shape-check-message #'%check-restart-case-shape expr)))
     (handler-bind
      (or (%arity-problem expr 1 nil)
          (and (listp (cadr expr)) (%proper-list-p (cadr expr))
@@ -1450,7 +1656,8 @@
               (dolist (b (cadr expr) nil)
                 (unless (and (consp b) (%proper-list-p b) (cdr b) (evenp (length (cddr b))))
                   (return (let ((*print-pretty* nil) (*print-length* 6) (*print-level* 3))
-                            (format nil "RESTART-BIND: malformed binding ~S" b))))))))
+                            (format nil "RESTART-BIND: malformed binding ~S" b))))))
+         (%shape-check-message #'%check-restart-bind-shape expr)))
     (with-simple-restart
      (or (%arity-problem expr 1 nil)
          (let ((spec (cadr expr)))
@@ -1484,6 +1691,7 @@
     (lambda (or (%arity-problem expr 1 nil)
                 (and (not (listp (cadr expr)))
                      (format nil "LAMBDA: the lambda list must be a list: ~S" (cadr expr)))
+                (%lambda-list-problem 'lambda (cadr expr))
                 (%body-declare-problem 'lambda (cddr expr) t t)))
     ((dolist dotimes do do*)
      (and (consp (cdr expr)) (%proper-list-p (cddr expr))
@@ -1496,12 +1704,23 @@
     (multiple-value-list (%arity-problem expr 1 1))
     (multiple-value-setq (%arity-problem expr 2 2))
     (nth-value (%arity-problem expr 2 2))
-    (defvar (or (%arity-problem expr 1 3) (%name-problem expr (cadr expr) "variable name")))
-    ((defparameter defconstant) (or (%arity-problem expr 2 3) (%name-problem expr (cadr expr) "variable name")))
+    (defvar (or (%arity-problem expr 1 3) (%name-problem expr (cadr expr) "variable name")
+                (%doc-string-problem expr 3)))
+    ((defparameter defconstant) (or (%arity-problem expr 2 3) (%name-problem expr (cadr expr) "variable name")
+                                    (%doc-string-problem expr 3)))
     ((defun deftype) (or (%arity-problem expr 2 nil) (%name-problem-fn expr)
+                         (and (eq (car expr) 'defun) (%lambda-list-problem 'defun (caddr expr)))
                          (and (eq (car expr) 'defun) (%proper-list-p (cdddr expr))
                               (%body-declare-problem 'defun (cdddr expr) t t))))
     (t nil)))
+
+(defun %doc-string-problem (expr index)
+  "A message when the element INDEX of EXPR (the documentation of a DEFVAR, DEFPARAMETER
+   or DEFCONSTANT) is present and not a string."
+  (let ((tail (nthcdr index expr)))
+    (when (and (consp tail) (car tail) (not (stringp (car tail))))
+      (let ((*print-length* 6) (*print-level* 3))
+        (format nil "~S: the documentation must be a string: ~S" (car expr) (car tail))))))
 
 (defun %name-problem-fn (expr)
   (let ((name (cadr expr)))
@@ -1518,7 +1737,10 @@
     (quote (%arity-problem expr 1 1))
     (if (%arity-problem expr 2 3))
     (the (%arity-problem expr 2 2))
-    (function (%arity-problem expr 1 1))
+    (function (or (%arity-problem expr 1 1)
+                  (let ((f (cadr expr)))
+                    (and (consp f) (eq (car f) 'lambda) (consp (cdr f))
+                         (%lambda-list-problem 'lambda (cadr f))))))
     (block (or (%arity-problem expr 1 nil)
                (%name-problem expr (cadr expr) "block name")))
     (return-from (or (%arity-problem expr 1 2)
@@ -1546,11 +1768,22 @@
                 (cond ((not (and (consp def) (consp (cdr def)) (listp (cadr def))))
                        (return (let ((*print-pretty* nil) (*print-length* 6) (*print-level* 3))
                                  (format nil "~S: malformed function definition ~S" (car expr) def))))
-                      (t (let ((p (or (%lambda-list-key-problem (car expr) (cadr def))
+                      (t (let ((p (or (%lambda-list-problem (car expr) (cadr def))
+                                      (%lambda-list-key-problem (car expr) (cadr def))
                                       (%body-declare-problem (car expr) (cddr def) t))))
                            (when p (return p)))))))
          (and (consp (cdr expr)) (%proper-list-p (cddr expr))
               (%body-declare-problem (car expr) (cddr expr) nil t))
+         ;; An FTYPE declaration names functions; a MACROLET macro is not one.
+         (and (eq (car expr) 'macrolet) (listp (cadr expr)) (%proper-list-p (cadr expr))
+              (%proper-list-p (cddr expr))
+              (let ((name (loop for form in (cddr expr)
+                                while (and (consp form) (eq (car form) 'declare))
+                                thereis (loop for spec in (cdr form)
+                                              thereis (and (consp spec) (eq (car spec) 'ftype)
+                                                           (consp (cdr spec)) (%proper-list-p (cddr spec))
+                                                           (find-if (lambda (n) (assoc n (cadr expr))) (cddr spec)))))))
+                (and name (format nil "MACROLET: ~S is a macro, so it cannot be named in an FTYPE declaration" name))))
          (and (not (listp (cadr expr)))
               (let ((*print-length* 6) (*print-level* 3))
                 (format nil "~S: the binding list must be a list: ~S" (car expr) (cadr expr))))
@@ -1723,6 +1956,44 @@
       (or (svref s index)
           (setf (svref s index) (make-hash-table :test 'eq))))))
 
+(defun %expand-through-hook (expander form)
+  "FORM expanded by EXPANDER, through *MACROEXPAND-HOOK* when the program set
+   one, as MACROEXPAND-1 does."
+  (let ((hook *macroexpand-hook*))
+    (if (or (null hook) (eq hook 'funcall) (eq hook #'funcall))
+        (funcall expander form)
+        (funcall hook
+                 (lambda (fm env) (declare (ignore env)) (funcall expander fm))
+                 form
+                 nil))))
+
+(defun %notify-macroexpand-hook (op form)
+  "Tell a program's *MACROEXPAND-HOOK* about FORM, a call of the standard macro
+   OP that the compiler lowers itself (DEFUN, WHEN, ...), as SBCL does when it
+   expands the macro. The hook gets a function that returns FORM unchanged."
+  (let ((hook *macroexpand-hook*))
+    (unless (or (null hook) (eq hook 'funcall) (eq hook #'funcall))
+      (when (and (symbolp op) (macro-function op))
+        (funcall hook (lambda (fm env) (declare (ignore env)) fm) form nil)))))
+
+(defun %unshare-ltv-forms (x)
+  "X with every (LOAD-TIME-VALUE ...) form outside QUOTE copied, so that two
+   expansions of a macro that returns one literal LOAD-TIME-VALUE list are two
+   sites in *LTV-SITES*. X itself when it holds none."
+  (cond ((atom x) x)
+        ((eq (car x) 'quote) x)
+        ((eq (car x) 'load-time-value) (copy-list x))
+        (t (let ((changed nil) (items '()) (tail x))
+             (loop while (consp tail)
+                   do (let ((a (%unshare-ltv-forms (car tail))))
+                        (unless (eq a (car tail)) (setf changed t))
+                        (push a items))
+                      (setf tail (cdr tail)))
+             (if changed
+                 (let ((r tail))
+                   (dolist (i items r) (setf r (cons i r))))
+                 x)))))
+
 (defun cached-macroexpand (form expander)
   "Expand FORM using EXPANDER, memoizing the result per (FORM, *macroexpand-scope*)
    in *macroexpand-cache*.  If the cache is NIL (outside a compile-toplevel) falls
@@ -1767,7 +2038,9 @@
                    (setf result (handler-bind ((error (lambda (c) (setf failure c))))
                                   (if earlier
                                       (error earlier)
-                                      (with-phase "macroexpand" (funcall expander form))))
+                                      (with-phase "macroexpand"
+                                        (%unshare-ltv-forms
+                                         (%expand-through-hook expander form)))))
                          done t)
                    (setf uncacheable *expansion-uncacheable*
                          unreusable *expansion-unreusable*
@@ -1936,7 +2209,12 @@
         ex)))
 
 (defun %mv-tail-function-p (name)
-  (and (symbolp name) (gethash name *mv-tail-functions*)))
+  ;; VALUES-LIST's entry takes a value mode; no other COMMON-LISP name does.
+  (and (symbolp name)
+       (or (eq name 'values-list)
+           (and (gethash name *mv-tail-functions*)
+                (not (eq (symbol-package name)
+                         (load-time-value (find-package "COMMON-LISP"))))))))
 
 (defun %note-mv-tail-function (name)
   (when (symbolp name)
@@ -2977,11 +3255,30 @@ through to compile-sym-lookup."
       (local-function-entry name)))
 
 
+(defun %boxed-entry-matches-p (x sym)
+  "True when the *CSTATE* boxed-vars entry X stands for the variable SYM. A symbol entry
+   is that variable itself, or one of the same name from a compatible package (the rule
+   of LOCAL-ENTRY): a variable of another package that merely has the same name is a
+   different variable (CL scoping is by symbol identity). A string entry is a bare name
+   (the analysis keeps only names), which can only be matched by name."
+  (cond ((eq x sym) t)
+        ((symbolp x)
+         (and (string= (var-name x) (var-name sym))
+              (same-var-package-p x (symbol-package sym))
+              t))
+        (t (string= x (var-name sym)))))
+
 (defun boxed-var-p (sym)
-  "Check if a variable needs boxing (by effective name, cross-package safe)."
-  (member (var-name sym) (cstate-boxed-vars)
-          :key (lambda (x) (if (symbolp x) (var-name x) x))
-          :test #'string=))
+  "Check if a variable needs boxing (by effective name; a same-named variable of another
+   package is a different variable)."
+  (member sym (cstate-boxed-vars) :test (lambda (s x) (%boxed-entry-matches-p x s))))
+
+(defun %long-box-var-p (sym)
+  "True when SYM is a captured, assigned variable declared FIXNUM whose cell is a LongBox
+   (a raw long), not a LispObject[1]: the cell's local key carries the LONG-BOX property."
+  (and (symbolp sym) sym (boundp '*cstate*)
+       (let ((key (lookup-local sym)))
+         (and key (symbolp key) (get key 'long-box) (boxed-var-p sym) t))))
 
 (defun labels-cell-var-p (name-or-sym)
   "True if NAME-OR-SYM names a labels function cell; a boxed LispObject[1]
@@ -3018,6 +3315,15 @@ through to compile-sym-lookup."
                                      (prin1-to-string s)))
                      (cdr symbol))))
     (t (symbol-name symbol))))
+
+(defun mangle-defun-name (name)
+  "The name a DEFUN registers its function under. Like MANGLE-NAME, except that an
+   uninterned symbol (a gensym, a #:name) must not register under its bare name: that is
+   the name of the interned symbol in the current package (or in COMMON-LISP), whose
+   function the registration would replace. \"#:NAME\" names no interned symbol."
+  (if (and name (symbolp name) (null (symbol-package name)))
+      (concatenate 'string "#:" (symbol-name name))
+      (mangle-name name)))
 
 (defun constant-binding-name-p (name)
   "True when NAME may not be bound as a variable. CLHS 3.1.2.1.1.3: naming a
@@ -3162,6 +3468,57 @@ through to compile-sym-lookup."
          (setf rest-param (check-binding-name p "lambda list"))
          (setf state :done))))
     (values (nreverse required) (nreverse optional) (nreverse key) rest-param (nreverse aux) allow-other-keys-p has-key-p)))
+
+(defun %lambda-call-as-let (lam args)
+  "(LAMBDA (a b) body...) applied to ARGS, as (LET ((a x) (b y)) body...), or NIL: only a lambda
+   list of plain required parameters of the same length as ARGS, no docstring. The closure the
+   application would otherwise make, and call, is not needed: the arguments are evaluated first
+   and bound at once, as LET does."
+  (when (and (not *cross-compiling*)
+             (consp lam) (eq (car lam) 'lambda) (consp (cdr lam))
+             (not (local-function-entry 'lambda))
+             (not (macrolet-shadowed-p 'lambda))
+             (listp (cadr lam)) (null (cdr (last (cadr lam))))
+             (<= (length (cadr lam)) 8)
+             (= (length (cadr lam)) (length args))
+             (every (lambda (p) (and (symbolp p) p (not (keywordp p)) (not (eq p t))
+                                     (not (lambda-list-keyword-p p))))
+                    (cadr lam))
+             (= (length (remove-duplicates (cadr lam))) (length (cadr lam)))
+             (not (and (stringp (caddr lam)) (cdddr lam)))
+             ;; Only declarations a LET treats as a lambda does: IGNORE, IGNORABLE and types. A
+             ;; NOTINLINE, INLINE, OPTIMIZE, SPECIAL, FTYPE ... one belongs to the lambda's own
+             ;; body (a compiler macro it suppresses, the safety its stores are compiled at).
+             (loop for form in (cddr lam)
+                   while (and (consp form) (eq (car form) 'declare))
+                   always (every (lambda (spec)
+                                   (and (consp spec) (symbolp (car spec))
+                                        (or (%plain-optimize-spec-p spec)
+                                        (member (symbol-name (car spec))
+                                                '("IGNORE" "IGNORABLE" "TYPE" "FIXNUM" "INTEGER" "DOUBLE-FLOAT"
+                                                  "SINGLE-FLOAT" "FLOAT" "REAL" "NUMBER" "CHARACTER" "STRING"
+                                                  "SIMPLE-STRING" "SYMBOL" "LIST" "CONS" "FUNCTION" "BIT"
+                                                  "SIMPLE-VECTOR" "VECTOR" "ARRAY" "HASH-TABLE" "KEYWORD")
+                                                :test #'string=))))
+                                 (cdr form))))
+    ;; The declared types of the parameters are checked on entry, as a call checks them.
+    (let ((form `(let ,(mapcar #'list (cadr lam) args)
+                   ,@(insert-simple-decl-checks (cddr lam) (cadr lam))))
+          (safety (body-declared-safety (cddr lam))))
+      ;; The safety the lambda declares is the policy of its body, which a LET does not carry.
+      (if safety `(%with-safety ,safety ,form) form))))
+
+(defun %plain-optimize-spec-p (spec)
+  "(OPTIMIZE q...) with each quality a bare name or (name integer) of SPEED SAFETY DEBUG SPACE
+   COMPILATION-SPEED."
+  (and (consp spec) (symbolp (car spec)) (string= (symbol-name (car spec)) "OPTIMIZE")
+       (every (lambda (q)
+                (let ((name (if (consp q) (car q) q)))
+                  (and (symbolp name)
+                       (member (symbol-name name) '("SPEED" "SAFETY" "DEBUG" "SPACE" "COMPILATION-SPEED")
+                               :test #'string=)
+                       (or (symbolp q) (and (consp (cdr q)) (integerp (cadr q)) (null (cddr q)))))))
+              (cdr spec))))
 
 (defun %check-lambda-call-keywords (op args)
   "When OP is a (LAMBDA lambda-list ...) with &KEY and no &ALLOW-OTHER-KEYS, warn
@@ -3450,10 +3807,13 @@ the literal and the next compilation inherits it."
     (if key
         (if (boxed-var-p sym)
             ;; Boxed read: LispObject[1] cell (normal, and labels function cells
-            ;; even under debug) or LispBox.Value (debug data variable).
-            (if (and *emit-source-lines* (not (labels-cell-var-p sym)))
-                `((:ldloc ,key) (:ldfld "LispBox.Value"))
-                `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref)))
+            ;; even under debug) or LispBox.Value (debug data variable), or the raw
+            ;; long of a LongBox (a captured, assigned FIXNUM variable), boxed here.
+            (cond ((%long-box-var-p sym)
+                   `((:ldloc ,key) (:ldfld "LongBox.Value") (:call "Fixnum.Make")))
+                  ((and *emit-source-lines* (not (labels-cell-var-p sym)))
+                   `((:ldloc ,key) (:ldfld "LispBox.Value")))
+                  (t `((:ldloc ,key) (:ldc-i4 0) (:ldelem-ref))))
             (if (and (boundp '*cstate*)
                      (native-slot-p sym (cstate-long-locals)))
                 `((:ldloc ,key) (:call "Fixnum.Make"))
@@ -3558,11 +3918,19 @@ the literal and the next compilation inherits it."
 (defun %xref-pack (caller edges uses)
   "CALLER, EDGES and USES printed into one string, which loading only queues;
    the first query reads it back."
-  (let ((pkg *package*))
+  (let* ((pkg *package*)
+         ;; Printed inside a package unit, the names mean that unit's packages: the
+         ;; unit's name goes in front of the package name, with the unit separator.
+         (unit-fn (and (find-package "DOTCL")
+                       (find-symbol "%CURRENT-PACKAGE-UNIT-NAME" "DOTCL")))
+         (unit (and unit-fn (fboundp unit-fn) (funcall unit-fn)))
+         (pname (if unit
+                    (concatenate 'string unit "!" (package-name pkg))
+                    (package-name pkg))))
     (with-standard-io-syntax
       (let ((*package* pkg) (*print-readably* nil) (*print-pretty* nil)
             (*print-circle* nil))
-        (format nil "~S ~S" (package-name pkg) (list* caller edges uses))))))
+        (format nil "~S ~S" pname (list* caller edges uses))))))
 
 (defun compile-expr-raw (expr)
   "Compile expression without MvReturn unwrapping."
@@ -3666,7 +4034,11 @@ the literal and the next compilation inherits it."
         (let ((*form-prefixed* expr)) (append prefix (compile-for-single-value expr))))))
   (if (single-value-form-p expr)
       (compile-expr-raw expr)
-      (let ((code (let ((*mv-expect-args* (if (consp expr) (cons (cdr expr) :primary) nil)))
+      (let ((code (let ((*mv-expect-args* (if (consp expr) (cons (cdr expr) :primary) nil))
+                        ;; Only the primary value is taken: the forms inside (a BLOCK from an
+                        ;; inlined call, its RETURN-FROMs, VALUES) need not build the others.
+                        (*in-mv-context* nil)
+                        (*in-tail-position* nil))
                     (compile-expr-raw expr))))
         (if (or (struct-slot-read-emitted-p expr code)
                 (code-ends-unwrapped-p code))
@@ -3954,7 +4326,16 @@ the literal and the next compilation inherits it."
            (let ((mf (macro-function sym)))
              (and mf (lambda (form) (funcall mf form nil)))))))
 
-(defun %macrolet-expander-form (params mbody)
+(defun %body-in-block (name body)
+  "BODY with its leading declarations and doc string kept in front and the forms
+   after them wrapped in (BLOCK NAME ...)."
+  (let ((head '()))
+    (loop while (or (and (stringp (car body)) (cdr body))
+                    (and (consp (car body)) (eq (caar body) 'declare)))
+          do (push (pop body) head))
+    `(,@(nreverse head) (block ,name ,@body))))
+
+(defun %macrolet-expander-form (params mbody &optional name)
   "Build the (lambda (form) ...) expander body for a MACROLET-defined macro with
    lambda list PARAMS and macro body MBODY, handling &whole and &environment per
    CL macro lambda-list rules. Shared by every macrolet registration site;
@@ -3980,7 +4361,8 @@ the literal and the next compilation inherits it."
     ;; Built inside out: the lambda list proper, then &whole around it, then
     ;; &environment around that, so &environment is bound whether or not &whole
     ;; is present.
-    (let ((body `(destructuring-bind ,clean-params (cdr form) ,@mbody)))
+    (let ((body `(destructuring-bind ,clean-params (cdr form)
+                     ,@(if name (%body-in-block name mbody) mbody))))
       (cond ((and whole-var (consp whole-var))
              ;; &whole (pattern): destructure the whole form against the pattern
              (setq body `(destructuring-bind ,whole-var form ,body)))
@@ -4004,7 +4386,7 @@ the literal and the next compilation inherits it."
              (declare (ignore ,env-arg))
              ,body)))))
 
-(defun %eval-macrolet-expander (params mbody)
+(defun %eval-macrolet-expander (params mbody &optional name)
   "The expander function for a MACROLET binding of lambda list PARAMS and body
    MBODY, as the analysis walkers register it. Made with the tree-walk evaluator
    (%MINI-EVAL), the same one COMPILE-MACROLET uses for code generation, not with
@@ -4024,9 +4406,11 @@ the literal and the next compilation inherits it."
    names an enclosing FLET function or lexical variable came back as a different
    symbol and missed the binding."
   (if *cross-compiling*
-      (let ((*cross-compiling* nil))
-        (eval (%macrolet-expander-form params mbody)))
-      (%macrolet-expander params mbody nil)))
+      (%note-macro-expander-takes-environment
+       (let ((*cross-compiling* nil))
+         (eval (%macrolet-expander-form params mbody name)))
+       (%macrolet-env-class params mbody))
+      (%macrolet-expander params mbody nil name)))
 
 (defun %mini-env-same-p (a b)
   "True when the %COMPILE-SCOPE-MINI-ENV results A and B bind the same names to
@@ -4043,7 +4427,7 @@ the literal and the next compilation inherits it."
                      (every #'same-item (cdr x) (cdr y)))
           (return nil))))))
 
-(defun %macrolet-expander (params mbody flet-defs)
+(defun %macrolet-expander (params mbody flet-defs &optional name)
   "The expander for a MACROLET binding of lambda list PARAMS and body MBODY, made
    in the current scope and wrapped in the FLET definitions FLET-DEFS. Within one
    COMPILE-TOPLEVEL the same binding, FLET-DEFS and scope give the same function."
@@ -4057,8 +4441,10 @@ the literal and the next compilation inherits it."
         (destructuring-bind (p f en . fn) e
           (when (and (eq p params) (eq f flet-defs)
                      (%mini-env-same-p en env))
-            (return-from %macrolet-expander fn)))))
-    (let* ((expander-form (%macrolet-expander-form params mbody))
+            (return-from %macrolet-expander
+              (%note-macro-expander-takes-environment
+               fn (%macrolet-env-class params mbody)))))))
+    (let* ((expander-form (%macrolet-expander-form params mbody name))
            (fn (%expander-with-caller-env
                 (%mini-eval (if flet-defs
                                 `(flet ,flet-defs ,expander-form)
@@ -4067,7 +4453,8 @@ the literal and the next compilation inherits it."
                 params)))
       (when table
         (push (list* params flet-defs env fn) (gethash mbody table)))
-      fn)))
+      (%note-macro-expander-takes-environment
+       fn (%macrolet-env-class params mbody)))))
 
 (defun %expander-with-caller-env (fn params)
   "FN, an expander %MINI-EVAL made from %MACROLET-EXPANDER-FORM, called with the
@@ -4078,7 +4465,7 @@ the literal and the next compilation inherits it."
    SYMBOL-MACROLET bindings around the macro call: (MACROEXPAND X ENV) of a
    symbol macro X bound there gave X back. Building the environment here, outside
    the closure, takes it from the compiler's scope at the call."
-  (if (loop for p on params thereis (and (consp p) (eq (car p) '&environment)))
+  (if (%macro-lambda-list-takes-environment-p params)
       (lambda (form &optional env)
         (funcall fn form (or env (%lexical-macro-environment))))
       fn))
@@ -4502,6 +4889,100 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
     (eval `(macrolet ,macros
              (symbol-macrolet ,symbol-macros
                (function ,lambda-expression))))))
+
+;;; Enumerating what an environment binds. An environment from the compiler holds
+;;; the frames of the forms around the macro call (see *LEXICAL-DECL-FRAMES*);
+;;; the names come from those, and what is known about each from the queries
+;;; above, so that the answers agree. An environment without frames -- NIL, or
+;;; one a macro was given by an early analysis walk -- binds nothing.
+
+(defun %env-frames (env)
+  "The frames ENV carries. Asking marks the expansion unreusable, as the queries do:
+   the answer depends on where the macro is expanded; see *EXPANSION-UNREUSABLE*."
+  (let ((lexinfo (%env-lexinfo env)))
+    (when lexinfo (setf *expansion-unreusable* t))
+    (car lexinfo)))
+
+(defun %frame-scope-order (frame names)
+  "NAMES of FRAME in the order SBCL's lexical environment lists them: a LET,
+   LET*, FLET or LABELS frame newest first (the last bound first); the other
+   frames (a lambda list, whose names the frame already holds last to first,
+   SYMBOL-MACROLET, MACROLET) as they are."
+  (if (member (car frame) '(:let :flet)) (reverse names) names))
+
+(defun %cltl2-map-variables (function env)
+  "Call FUNCTION with (NAME KIND DECLARATIONS EXPANSION) for each variable ENV
+   binds, innermost binding first (inside a LET / LET* frame the last bound first, as
+   SBCL's lexical environment lists them), each name once: KIND is :LEXICAL, :SPECIAL or
+   :SYMBOL-MACRO (EXPANSION is then the expansion), DECLARATIONS the alist
+   VARIABLE-INFORMATION gives. A special variable is listed when ENV binds or
+   declares it, although VARIABLE-INFORMATION calls it not local."
+  (let ((seen '()) (names '()))
+    (dolist (frame (%env-frames env))
+      (dolist (name (%frame-scope-order frame (%frame-variables frame)))
+        (when (and (symbolp name) name (not (member name seen)))
+          (push name seen)
+          (push name names))))
+    (dolist (name (nreverse names))
+      (multiple-value-bind (kind local decls)
+          (funcall (symbol-function (find-symbol "VARIABLE-INFORMATION" "DOTCL-CLTL2")) name env)
+        (when (or local (eq kind :special))
+          (funcall function name kind decls
+                   (when (eq kind :symbol-macro) (values (macroexpand-1 name env)))))))
+    nil))
+
+(defun %cltl2-map-functions (function env)
+  "Call FUNCTION with (NAME KIND DECLARATIONS MACRO-FUNCTION) for each local
+   function or macro ENV binds, innermost first (inside a FLET / LABELS frame the
+   last defined first, as SBCL's lexical environment lists them), each name once: KIND is :FUNCTION
+   or :MACRO, and MACRO-FUNCTION the macro function of a macro."
+  (let ((seen '()) (names '()))
+    (dolist (frame (%env-frames env))
+      (dolist (name (%frame-scope-order frame (%frame-functions frame)))
+        (when (and name (not (member name seen :test #'equal)))
+          (push name seen)
+          (push name names))))
+    (dolist (name (nreverse names))
+      (multiple-value-bind (kind local decls)
+          (funcall (symbol-function (find-symbol "FUNCTION-INFORMATION" "DOTCL-CLTL2")) name env)
+        (when local
+          (funcall function name kind decls
+                   (when (and (eq kind :macro) (symbolp name)) (macro-function name env))))))
+    nil))
+
+(defun %cltl2-map-scope-names (function env frame-kind kind test)
+  "Call FUNCTION with (NAME KIND NIL) for the names the FRAME-KIND frames of ENV
+   list, innermost first, each name once (compared with TEST). An ENV without
+   lexical state lists nothing."
+  (let ((lexinfo (%env-lexinfo env)) (seen '()))
+    (when lexinfo (setf *expansion-unreusable* t))
+    (dolist (frame (car lexinfo))
+      (when (eq (car frame) frame-kind)
+        (dolist (name (cadr frame))
+          ;; Not the compiler's own exit block of a local function (see %PFN-WRAP-BODY).
+          (unless (or (member name seen :test test)
+                      (and (symbolp name) name (get name 'pfn-exit)))
+            (push name seen)
+            (funcall function name kind nil)))))
+    nil))
+
+(defun %cltl2-map-blocks (function env)
+  "Call FUNCTION with (NAME KIND DECLARATIONS) for each block ENV is inside,
+   innermost first, each name once (NAME may be NIL, the block of LOOP and DO):
+   KIND is :BLOCK and DECLARATIONS NIL. The names are the :BLOCK frames the
+   compiler pushes at each block, also at one nothing returns from (compiled
+   without a block) and inside the body of a local function, which may
+   RETURN-FROM an outer block. The analysis walks keep no such frames, so an
+   expansion they make asks in vain: it is marked unreusable and made again
+   where the form is compiled, with the full environment."
+  (%cltl2-map-scope-names function env :block :block #'eq))
+
+(defun %cltl2-map-tags (function env)
+  "Call FUNCTION with (NAME KIND DECLARATIONS) for each TAGBODY tag ENV is
+   inside, innermost first, each name once: KIND is :TAG and DECLARATIONS NIL.
+   As for blocks, an expansion made by an analysis walk is made again at code
+   generation."
+  (%cltl2-map-scope-names function env :tagbody :tag #'eql))
 
 (defun %proclaim-compiler-info (spec)
   "Record the compiler side of the proclamation SPEC. Called by PROCLAIM for
@@ -5086,6 +5567,24 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
   "How many conses %LOCAL-INLINE-SNAPSHOT walks, macro expansions included,
    before it gives up on the definition (no plan, ordinary calls).")
 
+;; The variables a form binds for its own body: a symbol the body binds itself with one of these
+;; forms means, inside that scope, the body's own binding wherever the copy is substituted, so
+;; only its uses outside the scope name something the call site can see differently.
+(defun %inline-simple-var-p (v)
+  (and v (symbolp v) (not (member v lambda-list-keywords))))
+
+(defun %inline-binding-vars (bindings)
+  "The variables of a LET / LET* binding list, or :UNKNOWN when it is not a plain list of
+   VAR or (VAR [INIT]) entries."
+  (if (and (listp bindings) (null (cdr (last bindings))))
+      (let ((vars '()))
+        (dolist (b bindings (nreverse vars))
+          (cond ((%inline-simple-var-p b) (push b vars))
+                ((and (consp b) (%inline-simple-var-p (car b)) (listp (cdr b)) (null (cddr b)))
+                 (push (car b) vars))
+                (t (return :unknown)))))
+      :unknown))
+
 (defun %local-inline-snapshot (body params)
   "For every symbol BODY mentions other than PARAMS, what it resolves to here,
    or :REFUSE when that cannot be worked out. PARAMS are excluded because the
@@ -5095,11 +5594,18 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
    The text of BODY is not all it names. A macro form names whatever its
    expansion does: (GETX) expanding to a variable X reads the X bound where it
    is compiled. So the expansion of every macro form outside COMMON-LISP is
-   walked as well (an expander that signals refuses the definition). The CL
+   walked (an expander that signals refuses the definition), and it is the
+   expansion that is walked, since that is what is compiled. The CL
    macros are not expanded: what they introduce is CL operators and fresh
    names, except the block RETURN leaves, so a RETURN, like a
    (RETURN-FROM NIL ...), records NIL's binding. NIL is otherwise skipped, as
-   every list ends in it."
+   every list ends in it.
+
+   A variable BODY binds itself with LET, LET*, MULTIPLE-VALUE-BIND, a LAMBDA parameter or the
+   variable of DOLIST / DOTIMES is not recorded for the uses inside that scope as a variable
+   (the copy binds it again); an operator, a block name, a go tag or a function name is
+   recorded whatever is bound, and any form not listed here records every symbol it mentions,
+   as before."
   (let ((seen '())
         (result '())
         (budget *local-inline-snapshot-limit*))
@@ -5108,6 +5614,9 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
                            (member x seen :test #'eq))
                  (push x seen)
                  (push (cons x (%local-inline-bindings x)) result)))
+             (tick ()
+               (when (minusp (decf budget))
+                 (throw '%local-inline-refuse :refuse)))
              (expansion (x)
                (let ((op (car x)))
                  (when (and (symbolp op)
@@ -5118,33 +5627,82 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
                                 (%lexical-macro-p op)))
                    (let ((expander (find-macro-expander op)))
                      (when expander
-                       (list (handler-case (funcall expander x)
-                               (error ()
-                                 (throw '%local-inline-refuse :refuse)))))))))
-             (walk (x)
-               (when (minusp (decf budget))
-                 (throw '%local-inline-refuse :refuse))
-               (cond ((and x (symbolp x)) (note x))
-                     ((consp x)
-                      (unless (eq (car x) 'quote)
-                        (when (or (eq (car x) 'return)
-                                  (and (eq (car x) 'return-from)
-                                       (consp (cdr x))
-                                       (null (cadr x))))
-                          (note nil))
-                        (let ((exp (expansion x)))
-                          (when exp (walk (car exp))))
-                        (walk-elements x)))))
-             ;; Element by element: a tail of a form is not a form, and taken
-             ;; for one, (LIST M) would expand a macro M at (M).
-             (walk-elements (l)
-               (do ((r l (cdr r)))
-                   ((atom r) (when (and r (symbolp r)) (note r)))
-                 (when (minusp (decf budget))
-                   (throw '%local-inline-refuse :refuse))
-                 (walk (car r)))))
+                       (if (%macro-expander-takes-environment-p op expander)
+                           (throw '%local-inline-refuse :refuse)
+                           (list (handler-case (cached-macroexpand x expander)
+                                   (error ()
+                                     (throw '%local-inline-refuse :refuse))))))))))
+             ;; A symbol in a variable position.
+             (walk (x bound)
+               (tick)
+               (cond ((and x (symbolp x))
+                      (unless (member x bound :test #'eq) (note x)))
+                     ((consp x) (walk-form x bound))))
+             (walk-body (forms bound)
+               (do ((r forms (cdr r)))
+                   ((atom r) (when (and r (symbolp r) (not (member r bound :test #'eq))) (note r)))
+                 (tick)
+                 (walk (car r) bound)))
+             (walk-form (x bound)
+               (let ((head (car x)))
+                 (cond
+                   ((eq head 'quote) nil)
+                   ((and (member head '(let let*)) (consp (cdr x))
+                         (not (eq (%inline-binding-vars (cadr x)) :unknown)))
+                    (note head)
+                    (let ((inner bound))
+                      (dolist (b (cadr x))
+                        (when (consp b) (walk-body (cdr b) (if (eq head 'let*) inner bound)))
+                        (let ((v (if (consp b) (car b) b)))
+                          (if (eq head 'let*)
+                              (push v inner)
+                              nil)))
+                      (when (eq head 'let)
+                        (setf inner (append (%inline-binding-vars (cadr x)) bound)))
+                      (walk-body (cddr x) inner)))
+                   ((and (eq head 'multiple-value-bind) (consp (cdr x)) (consp (cddr x))
+                         (listp (cadr x)) (every #'%inline-simple-var-p (cadr x)))
+                    (note head)
+                    (walk (caddr x) bound)
+                    (walk-body (cdddr x) (append (cadr x) bound)))
+                   ((and (member head '(dolist dotimes)) (consp (cdr x)) (consp (cadr x))
+                         (%inline-simple-var-p (car (cadr x))) (listp (cdr (cadr x)))
+                         (null (cdr (last (cadr x)))))
+                    (note head)
+                    (let ((v (car (cadr x))))
+                      (walk (cadr (cadr x)) bound)
+                      (walk-body (cddr (cadr x)) (cons v bound))
+                      (walk-body (cddr x) (cons v bound))))
+                   ((and (eq head 'lambda) (consp (cdr x)) (listp (cadr x))
+                         (null (cdr (last (cadr x))))
+                         (every #'%inline-simple-var-p (cadr x)))
+                    (note head)
+                    (walk-body (cddr x) (append (cadr x) bound)))
+                   ((and (member head '(block return-from go)) (consp (cdr x)) (symbolp (cadr x)))
+                    (note head)
+                    (when (and (eq head 'return-from) (null (cadr x))) (note nil))
+                    (when (cadr x) (note (cadr x)))
+                    (walk-body (cddr x) bound))
+                   ((and (eq head 'function) (consp (cdr x)) (symbolp (cadr x)))
+                    (note head)
+                    (when (cadr x) (note (cadr x))))
+                   ((eq head 'tagbody)
+                    (note head)
+                    (dolist (e (cdr x))
+                      (tick)
+                      (if (and e (symbolp e)) (note e) (walk e bound))))
+                   (t
+                    (when (eq head 'return) (note nil))
+                    (let ((exp (expansion x)))
+                      (cond (exp
+                             ;; The operator names the macro; the expansion is what runs.
+                             (when (and head (symbolp head)) (note head))
+                             (walk (car exp) bound))
+                            (t
+                             (when (and head (symbolp head)) (note head))
+                             (walk-body (if (and head (symbolp head)) (cdr x) x) bound)))))))))
       (catch '%local-inline-refuse
-        (walk-elements body)
+        (walk-body body '())
         result))))
 
 (defun %local-inline-env-matches-p (snapshot)
@@ -5191,11 +5749,17 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
     (when (and plan
                (not (member op *inlining-stack*))
                (not (member op *notinline-functions*)))
-      (destructuring-bind (name params decls body blockp snapshot count) plan
+      (destructuring-bind (name params decls body blockp snapshot count &optional rest-var) plan
         (let* ((args (cdr expr))
-               (ok (and (= (length args) (length params))
+               (ok (and (if rest-var
+                            (>= (length args) (length params))
+                            (= (length args) (length params)))
+                        ;; The cap only refuses where the ordinary call can still reach the
+                        ;; local function: inside a closure that did not capture it, a refused
+                        ;; call would be a call of a global function of that name.
                         (or (not *local-inline-capped*)
-                            (< (car count) *local-inline-call-limit*))
+                            (< (car count) *local-inline-call-limit*)
+                            (not (lookup-local (%labelfn-local-sym (mangle-name name)))))
                         (%local-inline-env-matches-p snapshot))))
           (when (and ok (not *local-inline-probe*)) (incf (car count)))
           (%local-inline-note op ok snapshot)
@@ -5213,11 +5777,98 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
                    ;; The substituted LET checks the parameters' declared types, as
                    ;; the out-of-line entry does.
                    (seq (insert-simple-decl-checks (append decls forms) params)))
-              `(let ,(loop for p in params
-                           for a in args
-                           unless (assoc p consts :test #'eq)
-                             collect (list p a))
-                 ,@seq))))))))
+              (let* ((extra (and rest-var (nthcdr (length params) args)))
+                     (temps (loop for a in extra collect (gensym "RESTARG")))
+                     (folded (and rest-var (<= (length extra) 3)
+                                  (%local-inline-fold-rest rest-var seq temps))))
+                (if folded
+                    ;; The extra arguments stay values in temporaries: no list is built.
+                    `(let (,@(loop for p in params
+                                   for a in args
+                                   unless (assoc p consts :test #'eq)
+                                     collect (list p a))
+                           ,@(loop for tmp in temps for a in extra collect (list tmp a)))
+                       ,@(car folded))
+                    `(let (,@(loop for p in params
+                                   for a in args
+                                   unless (assoc p consts :test #'eq)
+                                     collect (list p a))
+                           ,@(when rest-var
+                               `((,rest-var (list ,@extra)))))
+                       ,@seq))))))))))
+
+(defun %local-inline-fold-rest (var forms temps)
+  "The forms FORMS of a substituted local function with VAR, its &REST variable, as a list of
+   the values of TEMPS (known: no list is built), returned as (NEW-FORMS), when VAR occurs only
+   as the test of an IF / WHEN / UNLESS or as the list of a DOLIST (unrolled once per value);
+   NIL when it occurs anywhere else. A declaration naming VAR is dropped when it is DYNAMIC-EXTENT
+   and refuses the fold otherwise."
+  (let ((n (length temps)))
+    (labels ((mentions (x)
+               (cond ((eq x var) t)
+                     ((atom x) nil)
+                     ((eq (car x) 'quote) nil)
+                     (t (or (mentions (car x)) (mentions (cdr x))))))
+             (walk (x)
+               ;; X with VAR folded away, or :FAIL.
+               (cond ((eq x var) :fail)
+                     ((atom x) x)
+                     ((eq (car x) 'quote) x)
+                     ((not (mentions x)) x)
+                     ((and (member (car x) '(if when unless)) (consp (cdr x)) (eq (cadr x) var)
+                           (not (macrolet-shadowed-p (car x))))
+                      (let ((rest (mapcar #'walk (cddr x))))
+                        (if (member :fail rest)
+                            :fail
+                            (ecase (car x)
+                              (if (if (> n 0) (car rest) (if (cdr rest) (cadr rest) nil)))
+                              (when (if (> n 0) `(progn ,@rest) nil))
+                              (unless (if (> n 0) nil `(progn ,@rest)))))))
+                     ;; (apply f a... VAR): the call with the values of TEMPS spread.
+                     ((and (eq (car x) 'apply) (consp (cdr x)) (consp (cddr x))
+                           (null (cdr (last x))) (eq (car (last x)) var)
+                           (not (macrolet-shadowed-p 'apply))
+                           (notany #'mentions (butlast (cdr x))))
+                      `(funcall ,@(butlast (cdr x)) ,@temps))
+                     ((and (eq (car x) 'dolist) (consp (cdr x)) (consp (cadr x))
+                           (eq (car (cadr x)) 'identity-never))
+                      :fail)
+                     ((and (eq (car x) 'dolist) (consp (cdr x)) (consp (cadr x))
+                           (symbolp (car (cadr x))) (car (cadr x))
+                           (consp (cdr (cadr x))) (eq (cadr (cadr x)) var)
+                           (not (macrolet-shadowed-p 'dolist))
+                           (not (mentions (cddr (cadr x))))
+                           (not (global-special-p (car (cadr x)))))
+                      (let* ((v (car (cadr x)))
+                             (result (caddr (cadr x)))
+                             (body (mapcar #'walk (cddr x))))
+                        (if (member :fail body)
+                            :fail
+                            `(block nil
+                               ,@(loop for tmp in temps collect `(let ((,v ,tmp)) ,@body))
+                               (let ((,v nil)) (declare (ignorable ,v)) ,result)))))
+                     (t (let ((out '()))
+                          (loop for tail = x then (cdr tail)
+                                while (consp tail)
+                                do (let ((e (if (and (eq tail x) (atom (car tail))) (car tail) (walk (car tail)))))
+                                     (when (eq e :fail) (return-from walk :fail))
+                                     (push e out))
+                                finally (when tail (return-from walk :fail)))
+                          (nreverse out))))))
+      ;; Declarations in FORMS naming VAR.
+      (let ((new '()))
+        (dolist (f forms)
+          (if (and (consp f) (eq (car f) 'declare))
+              (let ((specs (loop for d in (cdr f)
+                                 unless (and (consp d) (eq (car d) 'dynamic-extent) (mentions d)
+                                             (every (lambda (v) (or (eq v var) (not (symbolp v)))) (cdr d)))
+                                   collect d)))
+                (when (some #'mentions specs) (return-from %local-inline-fold-rest nil))
+                (when specs (push `(declare ,@specs) new)))
+              (let ((w (walk f)))
+                (when (eq w :fail) (return-from %local-inline-fold-rest nil))
+                (push w new))))
+        (list (nreverse new))))))
 
 (defun %local-inline-constant-params (params args decls body snapshot)
   "(PARAM . NUMBER) for the parameters of a local function substituted at a
@@ -5352,7 +6003,12 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
                          "IMPORT" "SHADOW" "SHADOWING-IMPORT")
                        :test #'string=))
       (try-eval expr))
-    (let ((problem (and (symbolp op)
+    (let ((problem (or (and (consp op) (eq (car op) 'lambda) (consp (cdr op))
+                            (%lambda-list-problem 'lambda (cadr op)))
+                       (and (symbolp op)
+                        ;; The rest of a COND chain, made by COMPILE-COND from clauses that
+                        ;; the first COND of the chain has checked: not looked at again.
+                        (not (eq expr *cond-continuation*))
                         (or (%special-form-shape-problem expr)
                             (and (not (macrolet-shadowed-p op))
                                  (not (local-function-entry op))
@@ -5363,9 +6019,14 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
                                  (not (macro-function op))
                                  (let ((*print-length* 6) (*print-level* 3))
                                    (format nil "~S: malformed function call (not a proper list): ~S"
-                                           op expr)))))))
+                                           op expr))))))))
       (when problem
-        (return-from compile-form (compile-static-program-error problem))))
+        (return-from compile-form
+          (if (consp problem)
+              ;; (:TYPE-ERROR datum expected-type): the form signals that at run time
+              (compile-expr `(error 'type-error :datum ',(second problem)
+                                                :expected-type ',(third problem)))
+              (compile-static-program-error problem)))))
     ;; quote fast path
     (when *labels-demoted* (%labels-demoted-check op))
     (if (eq op 'quote)
@@ -5396,7 +6057,9 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
                             (not (macrolet-shadowed-p op))
                             (gethash op *compile-form-handlers*))))
           (if handler
-              (let ((*handler-op* op)) (funcall handler expr))
+              (progn
+                (%notify-macroexpand-hook op expr)
+                (let ((*handler-op* op)) (funcall handler expr)))
             ;; Fallback: cons-op cases, string=-based ops, macro expansion, named-call
             (cond
               ;; Direct dispatch for a known-typed dotnet:invoke (typed direct callvirt).
@@ -5452,6 +6115,8 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
               ;; Store the function to a local before evaluating args so the stack is
               ;; empty during arg evaluation. CIL requires empty stack at try-block entry;
               ;; loop/return in args would fail if the function is on the stack.
+              ((and (consp op) (eq (car op) 'lambda) (%lambda-call-as-let op (cdr expr)))
+               (compile-expr (%lambda-call-as-let op (cdr expr))))
               ((and (consp op) (eq (car op) 'lambda))
                (%check-lambda-call-keywords op (cdr expr))
                (let ((fn-tmp (gen-local "FN")) (arr-tmp (gen-local "FNARR")))
@@ -5510,6 +6175,10 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
               ;; producing unverifiable IL (e.g. (setf (svref s j) (block nil ...))).
               ((string= (symbol-name op) "%SET-CHAR")
                (or (%compile-set-char-code (cdr expr))
+                   ;; A subscript known to be a fixnum goes in raw, as (SETF CHAR) does: no
+                   ;; Fixnum is built for an index above the cache.
+                   (and (= (length (cdr expr)) 3) (fixnum-typed-p (third expr))
+                        (compile-char-set-long (cdr expr)))
                    (compile-ternary-call (cdr expr) "Runtime.SetChar")))
               ((string= (symbol-name op) "%SET-ELT")
                (compile-ternary-call (cdr expr) "Runtime.SetElt"))
@@ -5533,8 +6202,13 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
               ((string= (symbol-name op) "%PACKAGE-ALL-SYMBOLS")
                (compile-unary-call (cdr expr) "Runtime.PackageAllSymbolsList"))
               ((string= (symbol-name op) "INTERN")
-               `(,@(compile-args-array (cdr expr))
-                 (:call "Runtime.InternMv")))
+               (case (length (cdr expr))
+                 (1 `(,@(compile-value-arg (cadr expr))
+                      (:call "Runtime.Intern1")))
+                 (2 `(,@(compile-value-args (cdr expr))
+                      (:call "Runtime.Intern2")))
+                 (t `(,@(compile-args-array (cdr expr))
+                      (:call "Runtime.InternMv")))))
               ;; defmacro: string= match to catch cross-package variants (e.g. SB-XC:DEFMACRO),
               ;; but only when the variant has no macro definition of its own.
               ;; SBCL's host build defines SB-XC:DEFMACRO as a REAL host macro
@@ -5551,6 +6225,7 @@ DECLAIM handled at compile time and a runtime PROCLAIM both come through here."
                         (not (find-macro-expander op))))
                ;; CLHS 3.4.11: extract docstring (first form if string AND more forms follow).
                ;; Skip during cross-compile (bootstrap concern, see compile-defun handler).
+               (%notify-macroexpand-hook op expr)
                (let* ((name (cadr expr))
                       (lambda-list (caddr expr))
                       (body (%doc-first (cdddr expr)))

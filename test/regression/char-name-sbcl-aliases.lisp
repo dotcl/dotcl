@@ -10,4 +10,4 @@
 
 (deftest char-name-sbcl-aliases-not-printed
   (list (char-name #\/) (char-name #\\) (char-name #\.))
-  ("Solidus" "Reverse_solidus" "Full_stop"))
+  ("SOLIDUS" "REVERSE_SOLIDUS" "FULL_STOP"))

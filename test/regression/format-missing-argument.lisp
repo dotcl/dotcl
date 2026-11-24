@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A FORMAT directive that needs an argument and has none is an error.
 ;;;
 ;;; CLHS 22.3 makes FORMAT an error when the arguments run out. dotcl printed

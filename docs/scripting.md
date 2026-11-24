@@ -74,7 +74,9 @@ that does nothing about failure still reports it to the shell.
 The report is one line. An error the runtime raises (a type error from `+`, an undefined
 function, a reader error) is `file:line: message`; when it was raised inside a
 function you defined, the line is where that function is defined. A condition your own code
-signals with `error` is reported as `TYPE: message`, without a position. To see the Lisp
+signals with `error` is reported as `file:line: TYPE: message`, with the line of the
+top-level form being loaded (or the function's definition, as above). A program read
+from standard input is reported as `<stdin>:line:`. To see the Lisp
 call stack too, run the script with `DOTCL_BACKTRACE=1` in the environment: the
 frames (function names and arguments, innermost first) are printed under the
 line. Frames of the .NET runtime are not shown, and a call in tail position

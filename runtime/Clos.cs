@@ -111,6 +111,10 @@ internal sealed class ReinitMethodKeys
 /// </summary>
 public class LispClass : LispObject
 {
+    /// <summary>True once the registry has given this class's name to another class, or dropped it:
+    /// an instance of it is no longer an instance of what FIND-CLASS of its name answers.</summary>
+    internal volatile bool Superseded;
+
     public Symbol Name { get; set; }
     /// <summary>A fixed, well-spread number for this class, which the generic
     /// function dispatch tables hash class vectors by. Assigned once, so it does not
@@ -128,8 +132,39 @@ public class LispClass : LispObject
     /// <summary>The accessor methods DEFCLASS made for this class's slot options, and the
     /// ones of its previous definition until the redefinition has made its own: those
     /// not made again are removed (CLHS 4.3.6).</summary>
+    // Threads that load the same fasl together redefine this class and add its accessors at once:
+    // every use of the two lists below happens under AccessorLock.
+    internal readonly object AccessorLock = new();
     internal List<(GenericFunction Gf, LispMethod Method)> AccessorMethods = new();
     internal List<(GenericFunction Gf, LispMethod Method)>? StaleAccessorMethods;
+
+    /// <summary>A redefinition starts a new list of accessor methods; the methods of the previous
+    /// definition wait to be pruned (any still waiting from an earlier redefinition stay).</summary>
+    internal void SwapInStaleAccessors()
+    {
+        lock (AccessorLock)
+        {
+            if (StaleAccessorMethods == null) StaleAccessorMethods = AccessorMethods;
+            else StaleAccessorMethods.AddRange(AccessorMethods);
+            AccessorMethods = new();
+        }
+    }
+
+    internal void AddAccessorMethod(GenericFunction gf, LispMethod m)
+    {
+        lock (AccessorLock) AccessorMethods.Add((gf, m));
+    }
+
+    /// <summary>The stale accessor methods, taken: the list is empty afterwards.</summary>
+    internal (GenericFunction Gf, LispMethod Method)[] TakeStaleAccessors()
+    {
+        lock (AccessorLock)
+        {
+            var stale = StaleAccessorMethods;
+            StaleAccessorMethods = null;
+            return stale == null ? System.Array.Empty<(GenericFunction, LispMethod)>() : stale.ToArray();
+        }
+    }
     /// <summary>The metaclass of this class. Null means STANDARD-CLASS (default).</summary>
     public LispClass? Metaclass { get; set; }
     /// <summary>Cache for Runtime.UsesSlotProtocol: (method epoch &lt;&lt; 2) | valid | answer.</summary>
@@ -376,6 +411,10 @@ public class LispClass : LispObject
     /// <summary>Make-instance plan for the custom-method-free path; null until the first
     /// such make-instance, stale once the method epoch moves.</summary>
     internal CtorPlan? Ctor;
+    /// <summary>The MethodEpoch at which MAKE-INSTANCE found that no constructor plan can serve this
+    /// class (an :AROUND, a primary or other method on INITIALIZE-INSTANCE / SHARED-INITIALIZE), so
+    /// it does not scan both generic functions' methods again on every call; -1 when not known.</summary>
+    internal int CtorPlanNoneEpoch = -1;
     /// <summary>MAKE-INSTANCE plan for a structure class, built on first use.</summary>
     internal StructCtorPlan? StructCtor;
     /// <summary>Cached result of HasCustomInitMethods check. Null = not yet computed.</summary>
@@ -887,7 +926,7 @@ public class LispClass : LispObject
     /// be decided yet (a class not defined at finalization time) counts as no.</summary>
     private static bool SubtypeCertain(LispObject sub, LispObject super)
     {
-        try { return Runtime.IsTruthy(Runtime.Subtypep(sub, super)); }
+        try { return Runtime.SubtypepClean(sub, super) is not Nil; }
         catch (LispErrorException) { return false; }
     }
 
@@ -1017,14 +1056,37 @@ internal sealed class CtorPlan
     public readonly LispObject?[] InitformValues;
     /// <summary>The :AFTER methods of INITIALIZE-INSTANCE to run, least specific first.</summary>
     public readonly LispMethod[] Afters;
+    /// <summary>The :AFTER methods of SHARED-INITIALIZE to run before the INITIALIZE-INSTANCE
+    /// ones, least specific first.</summary>
+    public readonly LispMethod[] SharedAfters;
+    /// <summary>The :BEFORE methods of INITIALIZE-INSTANCE, most specific first, then those of
+    /// SHARED-INITIALIZE: they run on the allocated instance, before its slots are filled.</summary>
+    public readonly LispMethod[] Befores;
+    public readonly LispMethod[] SharedBefores;
+    public bool HasBefores => Befores.Length != 0 || SharedBefores.Length != 0;
+    /// <summary>The :AROUND methods of INITIALIZE-INSTANCE, most specific first; with them, the
+    /// chain they run in, ending in a method that runs the rest of the plan. Null when none.</summary>
+    public LispMethod[] Arounds = Array.Empty<LispMethod>();
+    public List<LispMethod>? AroundChain;
+    /// <summary>The :AROUND methods of SHARED-INITIALIZE, most specific first, and the chain they run
+    /// in (ending in a method that runs the :BEFORE methods, the slot filling and the :AFTER
+    /// methods of SHARED-INITIALIZE).</summary>
+    public LispMethod[] SharedArounds = Array.Empty<LispMethod>();
+    public List<LispMethod>? SharedAroundChain;
+    /// <summary>Any method the plan runs besides filling the slots.</summary>
+    public bool HasAfters => Afters.Length != 0 || SharedAfters.Length != 0 || HasBefores || Arounds.Length != 0 || SharedArounds.Length != 0;
     public volatile (Symbol Key, int Slot)[] Keys = Array.Empty<(Symbol, int)>();
     public readonly (Symbol Key, int Slot, LispFunction Thunk)[] Defaults;
     public readonly object SourceDefaults;
 
-    public CtorPlan(LispClass cls, int epoch, LispMethod[] afters)
+    public CtorPlan(LispClass cls, int epoch, LispMethod[] afters, LispMethod[]? sharedAfters = null,
+                    LispMethod[]? befores = null, LispMethod[]? sharedBefores = null)
     {
         Epoch = epoch;
         Afters = afters;
+        SharedAfters = sharedAfters ?? Array.Empty<LispMethod>();
+        Befores = befores ?? Array.Empty<LispMethod>();
+        SharedBefores = sharedBefores ?? Array.Empty<LispMethod>();
         Class = cls;
         Layout = cls.Layout;
         var slots = new List<int>();
@@ -1057,6 +1119,86 @@ internal sealed class CtorPlan
         Array.Copy(keys, grown, keys.Length);
         grown[keys.Length] = (key, slot);
         Keys = grown;
+    }
+
+    /// <summary>True when every initarg key has been seen (so its slot is known).</summary>
+    public bool KeysKnown(LispObject[] initargs)
+    {
+        var keys = Keys;
+        for (int i = 0; i < initargs.Length; i += 2)
+        {
+            bool found = false;
+            foreach (var k in keys)
+                if (ReferenceEquals(k.Key, initargs[i])) { found = true; break; }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    /// <summary>INITARGS followed by the defaulted initargs (:DEFAULT-INITARGS) whose key the
+    /// caller did not supply, each default form run once. INITARGS itself when none is added.
+    /// The initargs INITIALIZE-INSTANCE receives (CLHS 7.1.2).</summary>
+    public LispObject[] EffectiveInitargs(LispObject[] initargs)
+    {
+        var defs = Defaults;
+        if (defs.Length == 0) return initargs;
+        LispObject[]? extra = null;
+        int n = 0;
+        for (int j = 0; j < defs.Length; j++)
+        {
+            var key = defs[j].Key;
+            bool supplied = false;
+            for (int i = 0; i < initargs.Length; i += 2)
+                if (initargs[i] is Symbol s && (ReferenceEquals(s, key) || s.Name == key.Name)) { supplied = true; break; }
+            if (supplied) continue;
+            extra ??= new LispObject[defs.Length * 2];
+            extra[n++] = key;
+            extra[n++] = Runtime.UnwrapMv(defs[j].Thunk.Invoke(Array.Empty<LispObject>()));
+        }
+        if (n == 0) return initargs;
+        var eff = new LispObject[initargs.Length + n];
+        Array.Copy(initargs, eff, initargs.Length);
+        Array.Copy(extra!, 0, eff, initargs.Length, n);
+        return eff;
+    }
+
+    private int SlotOfPair(LispObject[] effective, int i, int nSupplied)
+    {
+        if (i < nSupplied)
+        {
+            int s = KeySlot(effective[i]);
+            if (s != -2) return s;
+            // A key no earlier call carried (an :AROUND added it): the class's own table.
+            var map = Class.InitargToSlotIndex;
+            return effective[i] is Symbol ks && map != null && map.TryGetValue(ks.Name, out int idx) ? idx : -1;
+        }
+        foreach (var d in Defaults)
+            if (ReferenceEquals(d.Key, effective[i]) || (effective[i] is Symbol s && s.Name == d.Key.Name))
+                return d.Slot;
+        return -1;
+    }
+
+    /// <summary>SHARED-INITIALIZE's slot filling for an instance the :BEFORE methods have already
+    /// seen: an initarg always sets its slot (the first of two for one slot wins), and a slot
+    /// still unbound takes its initform.</summary>
+    public void FillSlots(LispInstance inst, LispObject[] effective, int nSupplied)
+    {
+        var slotv = inst.Slots;
+        for (int i = 0; i < effective.Length; i += 2)
+        {
+            int slot = SlotOfPair(effective, i, nSupplied);
+            if (slot < 0) continue;
+            bool earlier = false;
+            for (int j = 0; j < i; j += 2)
+                if (SlotOfPair(effective, j, nSupplied) == slot) { earlier = true; break; }
+            if (!earlier) Store(slotv, slot, effective[i + 1]);
+        }
+        var forms = Initforms;
+        for (int j = 0; j < forms.Length; j++)
+        {
+            int s = InitformSlots[j];
+            if (slotv[s] == null) Store(slotv, s, InitformValues[j] ?? LispFunction.Call0(forms[j]));
+        }
     }
 
     /// <summary>The new instance, or null when an initarg has not been seen yet.</summary>
@@ -1109,7 +1251,7 @@ internal sealed class CtorPlan
     public LispInstance? TryMakeKV(int n, LispObject k0, LispObject v0,
                                    LispObject? k1, LispObject? v1, LispObject? k2, LispObject? v2)
     {
-        if (Defaults.Length != 0 || Afters.Length != 0) return null;
+        if (Defaults.Length != 0 || HasAfters) return null;
         int s0 = KeySlot(k0);
         if (s0 == -2) return null;
         int s1 = -1, s2 = -1;
@@ -1146,7 +1288,7 @@ internal sealed class CtorPlan
             var v = Runtime.UnwrapMv(defs[j].Thunk.Invoke(Array.Empty<LispObject>()));
             int slot = defs[j].Slot;
             if (slot >= 0 && slotv[slot] == null) Store(slotv, slot, v);
-            if (Afters.Length != 0)
+            if (HasAfters)
             {
                 extra ??= new LispObject[defs.Length * 2];
                 extra[n++] = key; extra[n++] = v;
@@ -1281,6 +1423,7 @@ public sealed class LispInstance : LispObject
         var fn = Emitter.CilAssembler.GetFunctionBySymbol(Startup.Sym("ALLOCATE-INSTANCE"));
         MultipleValues.Reset();
         var obj = Runtime.UnwrapMv(fn.Invoke1(cls));
+        if (obj == null) throw NullLiteralError(key, "ALLOCATE-INSTANCE gave a CLR null");
         // Whatever ALLOCATE-INSTANCE made is the literal: a structure (its
         // MAKE-LOAD-FORM-SAVING-SLOTS form has this shape too) has to be found
         // by its key afterwards just as an instance is.
@@ -1303,11 +1446,19 @@ public sealed class LispInstance : LispObject
     /// has been interned under KEY.</summary>
     public static bool IsInterned(string key) => _internCache.ContainsKey(key);
 
+    public static void CopySlot(string targetKey, LispObject targetSlot,
+        string ownerKey, LispObject ownerSlot)
+    {
+        if (TryGetInterned(targetKey) is not LispInstance target) return;
+        if (TryGetInterned(ownerKey) is not LispInstance owner) return;
+        Runtime.SetSlotValue(target, targetSlot, Runtime.SlotValue(owner, ownerSlot));
+    }
+
     /// <summary>FASL load-time: evaluate make-load-form creation form once and cache by key.</summary>
     public static LispObject InternViaEval(string key, LispObject creationForm)
     {
         if (_internCache.TryGetValue(key, out var existing))
-            return existing;
+            return existing ?? throw NullLiteralError(key, "interned as null");
         // Nil means "just look up": the creation form ran in its own top-level method
         // earlier in this same fasl, so a miss is not a legitimate state. Reporting it
         // beats the old silent Nil.Instance, which turned a lost literal into a wrong
@@ -1317,9 +1468,15 @@ public sealed class LispInstance : LispObject
                 $"FASL: load-form literal {key} was not created before it was referenced"));
         var obj = Runtime.TryCallConstantForm(creationForm, out var called)
             ? Runtime.UnwrapMv(called) : Runtime.Eval(creationForm);
+        if (obj == null) throw NullLiteralError(key, "its creation form gave a CLR null");
         _internCache[key] = obj;
         return obj;
     }
+
+    /// <summary>A make-load-form literal that is a CLR null (not NIL) would be built into a cons or a
+    /// slot and surface far away as a NullReferenceException; say which literal it was instead.</summary>
+    private static LispErrorException NullLiteralError(string key, string why) =>
+        new LispErrorException(new LispError($"FASL: load-form literal {key}: {why}"));
 }
 
 /// <summary>An EQL specializer metaobject. AMOP makes these objects with identity:
@@ -1462,6 +1619,10 @@ internal class CachedDispatch
     /// consulted on a cache miss rather than on every call.</summary>
     public LispFunction? EffectiveMethodFunction;
     public List<LispMethod> Around = null!;
+    /// <summary>What CALL-NEXT-METHOD out of the last :around method runs: the before/primary/after
+    /// combination of this entry, as a function. Built on the first :around call, so an :around
+    /// dispatch allocates no delegate of its own.</summary>
+    public Func<LispObject[], LispObject>? AroundFallback;
     public List<LispMethod> Before = null!;
     public List<LispMethod> Primary = null!;
     public List<LispMethod> After = null!;
@@ -1486,6 +1647,13 @@ internal class CachedDispatch
     /// <summary>Precomputed effective primary chain for EqlMethods[i]:
     /// [EqlMethods[i], ..non-EQL primaries..]: avoids a per-hit list allocation.</summary>
     public List<LispMethod>[]? EqlChains;
+
+    /// <summary>For an entry of <see cref="GenericFunction.EqlSigCache"/>: the argument
+    /// positions that carry an EQL specializer in some method, the distinct EQL values
+    /// seen at each, and which of them the cached call held (-1: none).</summary>
+    public int[]? EqlSigPositions;
+    public LispObject[][]? EqlSigValues;
+    public int[]? EqlSig;
 
     /// <summary>Specialized standard slot READER. When >= 0, the single
     /// applicable method is an accessor reader for the instance-allocated slot at this
@@ -1799,6 +1967,12 @@ public class GenericFunction : LispFunction
     /// where the old single-entry monomorphic cache missed on every alternation.</summary>
     internal volatile CachedDispatch[]? DispatchCache;
 
+    /// <summary>Entries for the calls of a generic function with EQL specializers and
+    /// two or more required arguments, which <see cref="DispatchCache"/> cannot hold:
+    /// each is keyed on the classes of the required arguments and on which EQL value
+    /// (if any) each EQL-specialized position holds. Cleared with the rest.</summary>
+    internal volatile CachedDispatch[]? EqlSigCache;
+
     /// <summary>In front of both: entries that are one call of the first method's
     /// function, keyed on the classes of the first one or two arguments.</summary>
     internal volatile LooseSlot?[]? LooseCache;
@@ -2108,7 +2282,7 @@ public class GenericFunction : LispFunction
     /// <summary>Invalidate dispatch cache when methods are added/removed.</summary>
     internal void InvalidateCache()
     {
-        DispatchCache = null; DispatchByClasses = null; LooseCache = null; LooseFront = null; BumpMethodEpoch();
+        DispatchCache = null; EqlSigCache = null; DispatchByClasses = null; LooseCache = null; LooseFront = null; BumpMethodEpoch();
     }
 
     /// <summary>Global method-system epoch. Bumped on any method add/remove (via

@@ -94,10 +94,74 @@
 #-sbcl
 (defun preprocess-sbcl-quasiquotes (form) form)
 
+(defparameter *generated-name-prefixes* '("WHOLE" "ENV")
+  "Prefixes of the gensyms that reach a lambda list as a bare NAME<counter>.")
+
+(defun counter-underscore-name-p (name)
+  "True for BASE<counter>_<n> (MAPFN1065_64): a gensym's name with the compiler's own suffix."
+  (let* ((d (position-if #'digit-char-p name))
+         (u (and d (position #\_ name :start d))))
+    (and d u (> d 0) (> u d) (< (1+ u) (length name))
+         (every #'digit-char-p (subseq name d u))
+         (every #'digit-char-p (subseq name (1+ u))))))
+
+(defun generated-name-p (name)
+  (or (search "#:" name)
+      (counter-underscore-name-p name)
+      (some (lambda (p)
+              (let ((n (length p)))
+                (and (> (length name) n)
+                     (string= p name :end2 n)
+                     (every #'digit-char-p (subseq name n)))))
+            *generated-name-prefixes*)))
+
+(defun canonical-uninterned-names (instrs)
+  "INSTRS with the names of its generated uninterned symbols made independent of the process
+   that compiled them. A generated name is one with a gensym inside it: the compiler builds a
+   local from a gensym's printed name, which has the form BASE<counter>#:<n>_<m> (PKG879#:1_1,
+   KEY16848#:13475_45). So is a plain gensym of the macro lambda lists (WHOLE746, ENV747: the prefixes in
+   *generated-name-prefixes*). Any other name without \"#:\" is written by hand in the sources
+   (LIST2, X1, ARG0-OFFSET) and stays as it is: it shows in a lambda list, where renaming it would also
+   leave :PARAMS and the keyword names of a &key parameter out of step. The counters are global to the compiling process, so the same
+   sources gave a different file when the process had consumed a different number of gensyms
+   before it started (a Linux startup took 85 more than a Mac one, and the two copies of the
+   tree compared in the reproducibility check differed in every such name). SIL consumers key a
+   local by its name, never by the symbol object, so one new name per old name (numbered in the
+   order the names first appear) keeps every identity and difference, and the text no longer
+   depends on the counters."
+  (let ((renamed (make-hash-table :test #'equal))
+        (next 0))
+    (labels ((rename (sym)
+               (let ((name (symbol-name sym)))
+                 (if (not (generated-name-p name))
+                     sym
+                     (or (gethash name renamed)
+                         (setf (gethash name renamed)
+                               (let* ((cut (position-if #'digit-char-p name))
+                                      (base (subseq name 0 (or cut (length name)))))
+                                 (make-symbol (format nil "~A#~D" base (incf next)))))))))
+             (walk (x)
+               (cond ((consp x)
+                      ;; The CDR chain is walked by the loop, so a long list does not nest.
+                      (let* ((head (cons (walk (car x)) nil))
+                             (tail head)
+                             (rest (cdr x)))
+                        (loop while (consp rest)
+                              do (let ((cell (cons (walk (car rest)) nil)))
+                                   (setf (cdr tail) cell
+                                         tail cell
+                                         rest (cdr rest))))
+                        (when rest (setf (cdr tail) (walk rest)))
+                        head))
+                     ((and (symbolp x) x (null (symbol-package x))) (rename x))
+                     ((simple-vector-p x) (map 'simple-vector #'walk x))
+                     (t x))))
+      (walk instrs))))
+
 (defun write-instrs (instrs stream)
   (let ((*print-pretty* t)
         (*print-right-margin* 200))
-    (prin1 instrs stream)
+    (prin1 (canonical-uninterned-names instrs) stream)
     (terpri stream)))
 
 (defun read-all-forms (filename)
@@ -195,6 +259,15 @@
                                          (intern "LOCK-PACKAGE" (find-package "DOTCL")))
                                        "COMMON-LISP"))))))
     (setf *cross-compiling* t)
+    ;; The core's own LOAD-TIME-VALUE slots live in a namespace of their own, so
+    ;; that the ids the compiler gives a later program (counted from 1 in every
+    ;; process) never meet them. The ids stay a function of the sources alone:
+    ;; the output does not depend on which core produced it.
+    #-dotcl (setf dotcl.cil-compiler::*current-module-id* "dotcl-core")
+    #+dotcl
+    (let* ((pkg (find-package "DOTCL-INTERNAL"))
+           (sym (and pkg (find-symbol "*CURRENT-MODULE-ID*" pkg))))
+      (when sym (setf (symbol-value sym) "dotcl-core")))
     ;; Self-host: the compiler that does the work is the one already in the
     ;; image (package DOTCL-INTERNAL), not the sources this driver's package
     ;; names. Setting only our own flag leaves the real compiler in run-time

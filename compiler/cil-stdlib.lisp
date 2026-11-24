@@ -74,8 +74,10 @@
 (defun rename-package (pkg new-name &optional new-nicknames) (rename-package pkg new-name new-nicknames))
 (defun find-symbol (name &optional (pkg *package*))
   (multiple-value-bind (s status) (find-symbol name pkg) (values s status)))
-(defun intern (name &optional (pkg *package*))
-  (multiple-value-bind (s status) (intern name pkg) (values s status)))
+(defun intern (name &optional (pkg nil pkg-p))
+  ;; An omitted package is left to the runtime, which checks *PACKAGE*; an explicit
+  ;; NIL names the package "NIL".
+  (multiple-value-bind (s status) (if pkg-p (intern name pkg) (intern name)) (values s status)))
 (defun unintern (sym &optional (pkg *package*)) (unintern sym pkg))
 (defun export (symbols &optional (pkg *package*))
   (if (listp symbols)
@@ -240,8 +242,18 @@
         ((not (consp lead)) lag)
       (setq lead (cdr lead)))))
 
+(defun %circular-list-p (list)
+  "True when LIST (which may be dotted) is a circular list."
+  (let ((slow list) (fast list))
+    (loop
+      (unless (and (consp fast) (consp (cdr fast))) (return nil))
+      (setq slow (cdr slow) fast (cddr fast))
+      (when (eq slow fast) (return t)))))
+
 (defun butlast (list &optional (n 1))
   (unless (listp list)
+    (error 'type-error :datum list :expected-type 'list))
+  (when (%circular-list-p list)
     (error 'type-error :datum list :expected-type 'list))
   (%check-index n "BUTLAST")
   (if (zerop n)
@@ -265,6 +277,8 @@
 (defun nbutlast (list &optional (n 1))
   (unless (listp list)
     (error 'type-error :datum list :expected-type 'list))
+  (when (%circular-list-p list)
+    (error 'type-error :datum list :expected-type 'list))
   (%check-index n "NBUTLAST")
   (when (zerop n) (return-from nbutlast list))
   (let ((lead list))
@@ -281,32 +295,84 @@
 (defun list-length (list)
   ;; Signal type-error for non-list
   (unless (listp list)
-    (error 'type-error :datum list :expected-type 'list))
+    (error 'simple-type-error :datum list :expected-type 'list
+           :format-control "LIST-LENGTH: not a list: ~S" :format-arguments (list list)))
   ;; Tortoise-and-hare: returns NIL for circular lists per CL spec
   ;; For dotted lists, CDR-on-atom naturally signals type-error
   (do ((n 0 (+ n 2))
        (fast list (cddr fast))
        (slow list (cdr slow)))
       (nil)
-    (when (endp fast) (return n))
-    (when (endp (cdr fast)) (return (+ n 1)))
+    (when (null fast) (return n))
+    (unless (listp fast)
+      (error 'simple-type-error :datum fast :expected-type 'list
+             :format-control "LIST-LENGTH: not a proper list: the list ~S ends in ~S"
+             :format-arguments (list list fast)))
+    (unless (listp (cdr fast))
+      (error 'simple-type-error :datum (cdr fast) :expected-type 'list
+             :format-control "LIST-LENGTH: not a proper list: the list ~S ends in ~S"
+             :format-arguments (list list (cdr fast))))
+    (when (null (cdr fast)) (return (+ n 1)))
     (when (and (> n 0) (eq fast slow)) (return nil))))
 (defun nconc (&rest lists)
-  (let ((result nil))
-    (dolist (l lists result)
-      (if (null result)
-          (setq result l)
-          (let ((last (last result)))
-            (rplacd last l)
-            (setq result result))))))
+  ;; The end of an argument is looked for only when another argument follows it:
+  ;; (NCONC H R R) links R to itself, and finding the end of the last R would walk
+  ;; the circle that was just made (SBCL answers that circular list; series builds
+  ;; its templates that way).
+  (let ((head nil) (tail nil) (atom-seen nil))
+    (do ((rest lists (cdr rest)))
+        ((null rest) head)
+      (let ((l (car rest)))
+        (when atom-seen (error 'type-error :datum atom-seen :expected-type 'list))
+        (when l
+          (if head (rplacd tail l) (setq head l))
+          (if (consp l)
+              (when (cdr rest) (setq tail (last l)))
+              (setq atom-seen l)))))))
+;;; The CDR chain is walked by the loop; only the CAR recurses.
+(defun %copy-tree-rest (rest)
+  (let* ((head (cons (copy-tree (car rest)) nil))
+         (tail head))
+    (setq rest (cdr rest))
+    (loop
+      (if (consp rest)
+          (let ((cell (cons (copy-tree (car rest)) nil)))
+            (rplacd tail cell)
+            (setq tail cell)
+            (setq rest (cdr rest)))
+          (progn
+            (rplacd tail (copy-tree rest))
+            (return head))))))
+
+;;; The old recursive walks are faster on a small tree; a tree of more than
+;;; 4000 conses goes to the loop forms, which do not nest one frame per element.
+(defun %tree-small-p (tree)
+  (>= (%tree-budget tree 4000) 0))
+
+(defun %tree-budget (tree n)
+  (declare (type fixnum n))
+  (loop
+    (if (consp tree)
+        (progn
+          (setq n (%tree-budget (car tree) (- n 1)))
+          (when (< n 0) (return n))
+          (setq tree (cdr tree)))
+        (return n))))
+
 (defun copy-tree (tree)
   (if (consp tree)
-      (cons (copy-tree (car tree)) (copy-tree (cdr tree)))
+      (cons (copy-tree (car tree))
+            (if (consp (cdr tree))
+                (%copy-tree-rest (cdr tree))
+                (copy-tree (cdr tree))))
       tree))
+
 (defun string (x) (string x))
 (defun gethash (key ht &optional default) (gethash key ht default))
-(defun intern (name &optional (pkg *package*))
-  (multiple-value-bind (s status) (intern name pkg) (values s status)))
+(defun intern (name &optional (pkg nil pkg-p))
+  ;; An omitted package is left to the runtime, which checks *PACKAGE*; an explicit
+  ;; NIL names the package "NIL".
+  (multiple-value-bind (s status) (if pkg-p (intern name pkg) (intern name)) (values s status)))
 (defun gensym (&optional (prefix "G")) (gensym prefix))
 
 ;; Arithmetic wrappers (body uses 2-arg inline ops, not self-recursive)
@@ -337,21 +403,31 @@
 (defun = (number &rest more)
   ;; (= x) checks that X is a number; the one-argument call is lowered inline, not a self-call.
   (when (null more) (= number))
+  ;; Every argument is checked, also those after the point the answer is known.
+  (dolist (x more) (= x x))
   (dolist (x more t) (unless (= number x) (return nil))))
 (defun < (number &rest more)
   (when (null more) (< number))
+  ;; Every argument is checked, also those after the point the answer is known.
+  (dolist (x more) (< x 0))
   (let ((prev number))
     (dolist (x more t) (if (< prev x) (setq prev x) (return nil)))))
 (defun > (number &rest more)
   (when (null more) (> number))
+  ;; Every argument is checked, also those after the point the answer is known.
+  (dolist (x more) (> x 0))
   (let ((prev number))
     (dolist (x more t) (if (> prev x) (setq prev x) (return nil)))))
 (defun <= (number &rest more)
   (when (null more) (<= number))
+  ;; Every argument is checked, also those after the point the answer is known.
+  (dolist (x more) (<= x 0))
   (let ((prev number))
     (dolist (x more t) (if (<= prev x) (setq prev x) (return nil)))))
 (defun >= (number &rest more)
   (when (null more) (>= number))
+  ;; Every argument is checked, also those after the point the answer is known.
+  (dolist (x more) (>= x 0))
   (let ((prev number))
     (dolist (x more t) (if (>= prev x) (setq prev x) (return nil)))))
 
@@ -407,16 +483,48 @@
         (push tail args)
         (rplaca cs (cdr tail))))))
 
+(defun %check-function-designator (name what value)
+  "VALUE is a function or a symbol: a bad :test, :key or function argument of NAME is a type-error that says so."
+  (unless (or (functionp value) (symbolp value))
+    (error 'simple-type-error :datum value :expected-type '(or function symbol)
+           :format-control "~A: ~A is not a function designator: ~S"
+           :format-arguments (list name what value)))
+  value)
+
+(defun %check-set-keys (name test test-not key)
+  (when (and test test-not)
+    (error "~A: both :TEST and :TEST-NOT were supplied" name))
+  (%check-function-designator name ":test" test)
+  (%check-function-designator name ":test-not" test-not)
+  (%check-function-designator name ":key" key))
+
 (defun mapc (function list &rest more-lists)
-  (if (null more-lists)
-      (dolist (x list list)
-        (funcall function x))
-      (let ((tails (cons list more-lists)))
-        (do ((args (%map-multi tails) (%map-multi tails)))
-            ((null args) list)
-          (apply function (nreverse args))))))
+  (%check-function-designator "MAPC" "the function" function)
+  (cond
+    ((null more-lists)
+     (dolist (x list list)
+       (funcall function x)))
+    ((null (cdr more-lists))
+     (let ((a list) (b (car more-lists)))
+       (loop
+         (when (or (null a) (null b)) (return list))
+         (funcall function (car a) (car b))
+         (setq a (cdr a) b (cdr b)))))
+    (t
+     (let ((tails (cons list more-lists)))
+       (do ((args (%map-multi tails) (%map-multi tails)))
+           ((null args) list)
+         (apply function (nreverse args)))))))
 
 (defun mapcan (function list &rest more-lists)
+  (%check-function-designator "MAPCAN" "the function" function)
+  (when (and more-lists (null (cdr more-lists)))
+    (return-from mapcan
+      (let ((a list) (b (car more-lists)) (result nil))
+        (loop
+          (when (or (null a) (null b)) (return result))
+          (setq result (nconc result (funcall function (car a) (car b))))
+          (setq a (cdr a) b (cdr b))))))
   (if (null more-lists)
       ;; Single list: keep a pointer to the tail instead of NCONCing the whole
       ;; result again per element, and call FUNCTION directly instead of
@@ -445,6 +553,14 @@
           (setq result (nconc result (apply function (nreverse args))))))))
 
 (defun maplist (function list &rest more-lists)
+  (%check-function-designator "MAPLIST" "the function" function)
+  (when (and more-lists (null (cdr more-lists)))
+    (return-from maplist
+      (let ((a list) (b (car more-lists)) (result nil))
+        (loop
+          (when (or (null a) (null b)) (return (nreverse result)))
+          (push (funcall function a b) result)
+          (setq a (cdr a) b (cdr b))))))
   (if (null more-lists)
       (let ((result nil))
         (do ((tail list (cdr tail)))
@@ -457,6 +573,14 @@
           (push (apply function (nreverse args)) result)))))
 
 (defun mapl (function list &rest more-lists)
+  (%check-function-designator "MAPL" "the function" function)
+  (when (and more-lists (null (cdr more-lists)))
+    (return-from mapl
+      (let ((a list) (b (car more-lists)))
+        (loop
+          (when (or (null a) (null b)) (return list))
+          (funcall function a b)
+          (setq a (cdr a) b (cdr b))))))
   (if (null more-lists)
       (do ((tail list (cdr tail)))
           ((null tail) list)
@@ -467,6 +591,14 @@
           (apply function (nreverse args))))))
 
 (defun mapcon (function list &rest more-lists)
+  (%check-function-designator "MAPCON" "the function" function)
+  (when (and more-lists (null (cdr more-lists)))
+    (return-from mapcon
+      (let ((a list) (b (car more-lists)) (result nil))
+        (loop
+          (when (or (null a) (null b)) (return result))
+          (setq result (nconc result (funcall function a b)))
+          (setq a (cdr a) b (cdr b))))))
   (if (null more-lists)
       (let ((result nil))
         (do ((tail list (cdr tail)))
@@ -490,6 +622,8 @@
 
 (defun tailp (object list)
   ;; Returns T if object is EQL to any tail (sublist) of list, including NIL
+  (unless (listp list)
+    (error 'type-error :datum list :expected-type 'list))
   (do ((tail list (cdr tail)))
       ((atom tail) (eql tail object))
     (when (eq tail object) (return t))))
@@ -617,10 +751,25 @@
 ;;; default, or given as #'eql / 'eql and so on) and there is no :TEST-NOT: membership
 ;;; is then a lookup instead of a walk of LIST2 per element of LIST1 (quadratic). The
 ;;; answers are the same, and so is the order of the results, which comes from LIST1.
+(defun %set-list-longer-p (list)
+  ;; More than 16 conses in a proper list; a dotted or circular list is false.
+  (do ((slow list) (fast list) (n 0))
+      (nil)
+    (when (null fast) (return (> n 16)))
+    (unless (consp fast) (return nil))
+    (setq fast (cdr fast))
+    (incf n)
+    (when (eq fast slow) (return nil))
+    (when (null fast) (return (> n 16)))
+    (unless (consp fast) (return nil))
+    (setq fast (cdr fast))
+    (setq slow (cdr slow))
+    (incf n)
+    (when (eq fast slow) (return nil))))
+
 (defun %set-index (list2 test test-not key)
   ;; A dotted or circular LIST2 is left to the walk, which only errors when it gets that far.
-  (when (and (null test-not) (consp list2)
-             (let ((n (ignore-errors (list-length list2)))) (and n (> n 16))))
+  (when (and (null test-not) (consp list2) (%set-list-longer-p list2))
     (let ((kind (cond ((or (eq test #'eql) (eq test 'eql)) 'eql)
                       ((or (eq test #'equal) (eq test 'equal)) 'equal)
                       ((or (eq test #'equalp) (eq test 'equalp)) 'equalp))))
@@ -632,7 +781,16 @@
 (defun %set-has (index item)
   (values (gethash item index)))
 
+(defun %check-set-list (list2)
+  "The second list of a set operation is a list even when the first is empty and the
+   operation never looks at it."
+  (unless (listp list2)
+    (error 'type-error :datum list2 :expected-type 'list))
+  list2)
+
 (defun union (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (%check-set-keys "UNION" test test-not key)
+  (%check-set-list list2)
   (let ((result (copy-list list2)))
     (if (or test-p test-not key-p)
         (let* ((test (if test-p test #'eql))
@@ -649,11 +807,24 @@
               (push x result)))))))
 
 (defun nunion (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (%check-set-keys "NUNION" test test-not key)
   (if (or test-p test-not key-p)
-      (union list1 list2 :test (if test-p test #'eql) :test-not test-not :key key)
+      (progn
+        (%check-set-list list2)
+        (let* ((test (if test-p test #'eql))
+               (key (or key #'identity))
+               (result (copy-list list2))
+               (index (%set-index list2 test test-not key)))
+          (dolist (x list1 result)
+            (unless (if index
+                        (%set-has index (funcall key x))
+                        (%set-member (funcall key x) list2 test test-not key))
+              (push x result)))))
       (union list1 list2)))
 
 (defun intersection (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (%check-set-keys "INTERSECTION" test test-not key)
+  (%check-set-list list2)
   (let ((result nil))
     (if (or test-p test-not key-p)
         (let* ((test (if test-p test #'eql))
@@ -670,11 +841,24 @@
               (push x result)))))))
 
 (defun nintersection (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (%check-set-keys "NINTERSECTION" test test-not key)
   (if (or test-p test-not key-p)
-      (intersection list1 list2 :test (if test-p test #'eql) :test-not test-not :key key)
+      (progn
+        (%check-set-list list2)
+        (let* ((test (if test-p test #'eql))
+               (key (or key #'identity))
+               (result nil)
+               (index (%set-index list2 test test-not key)))
+          (dolist (x list1 (nreverse result))
+            (when (if index
+                      (%set-has index (funcall key x))
+                      (%set-member (funcall key x) list2 test test-not key))
+              (push x result)))))
       (intersection list1 list2)))
 
 (defun set-difference (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (%check-set-keys "SET-DIFFERENCE" test test-not key)
+  (%check-set-list list2)
   (let ((result nil))
     (if (or test-p test-not key-p)
         (let* ((test (if test-p test #'eql))
@@ -691,14 +875,25 @@
               (push x result)))))))
 
 (defun nset-difference (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (%check-set-keys "NSET-DIFFERENCE" test test-not key)
   (if (or test-p test-not key-p)
-      (set-difference list1 list2 :test (if test-p test #'eql) :test-not test-not :key key)
+      (progn
+        (%check-set-list list2)
+        (let* ((test (if test-p test #'eql))
+               (key (or key #'identity))
+               (result nil)
+               (index (%set-index list2 test test-not key)))
+          (dolist (x list1 (nreverse result))
+            (unless (if index
+                        (%set-has index (funcall key x))
+                        (%set-member (funcall key x) list2 test test-not key))
+              (push x result)))))
       (set-difference list1 list2)))
 
 (defun set-exclusive-or (list1 list2 &key (test nil test-p) test-not (key nil key-p))
-  ;; Elements in list1 not in list2: test called as (test (key e1) (key e2))
-  ;; Elements in list2 not in list1: test also called as (test (key e1) (key e2))
-  ;; so for second pass we use %set-member-rev to keep list1-key as first arg
+  (%check-set-keys "SET-EXCLUSIVE-OR" test test-not key)
+  (%check-set-list list2)
+  ;; The second pass keeps list1's key as the first test argument.
   (let ((result nil))
     (if (or test-p test-not key-p)
         (let* ((test (if test-p test #'eql))
@@ -724,11 +919,31 @@
     result))
 
 (defun nset-exclusive-or (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (%check-set-keys "NSET-EXCLUSIVE-OR" test test-not key)
   (if (or test-p test-not key-p)
-      (set-exclusive-or list1 list2 :test (if test-p test #'eql) :test-not test-not :key key)
+      (progn
+        (%check-set-list list2)
+        (let* ((test (if test-p test #'eql))
+               (key (or key #'identity))
+               (result nil)
+               (index2 (%set-index list2 test test-not key))
+               (index1 (%set-index list1 test test-not key)))
+          (dolist (x list1)
+            (unless (if index2
+                        (%set-has index2 (funcall key x))
+                        (%set-member (funcall key x) list2 test test-not key))
+              (push x result)))
+          (dolist (x list2)
+            (unless (if index1
+                        (%set-has index1 (funcall key x))
+                        (%set-member-rev (funcall key x) list1 test test-not key))
+              (push x result)))
+          result))
       (set-exclusive-or list1 list2)))
 
 (defun subsetp (list1 list2 &key (test nil test-p) test-not (key nil key-p))
+  (%check-set-keys "SUBSETP" test test-not key)
+  (%check-set-list list2)
   (if (or test-p test-not key-p)
       (let* ((test (if test-p test #'eql))
              (key (or key #'identity))
@@ -747,33 +962,131 @@
 ;;; Tree operations
 ;;; ============================================================
 
-;;; The recursion used to pass :TEST and :TEST-NOT down at every node, so each
-;;; cons in the tree cost a keyword argument list on the way in. They do not
-;;; change, so they are carried positionally instead. A LABELS closure would
-;;; have read them from the enclosing frame, but that closure is allocated on
-;;; every call to TREE-EQUAL, including the ones that answer from an atom
-;;; without recursing at all -- a named helper with four parameters costs
-;;; nothing (a call frame records its first four arguments in inline slots).
+;;; The CDR chain is walked by the loop; only the CAR recurses.
 (defun %tree-equal-1 (a b test test-not)
-  (if (consp a)
-      (and (consp b)
-           (%tree-equal-1 (car a) (car b) test test-not)
-           (%tree-equal-1 (cdr a) (cdr b) test test-not))
-      (and (not (consp b))
-           (if test-not
-               (not (funcall test-not a b))
-               (if (funcall test a b) t nil)))))
+  (loop
+    (cond ((consp a)
+           (unless (consp b) (return nil))
+           (unless (%tree-equal-1 (car a) (car b) test test-not) (return nil))
+           (setq a (cdr a) b (cdr b)))
+          (t
+           (return (and (not (consp b))
+                        (if test-not
+                            (not (funcall test-not a b))
+                            (if (funcall test a b) t nil))))))))
 
-(defun tree-equal (tree1 tree2 &key (test #'eql) test-not)
+(defun tree-equal (tree1 tree2 &key (test #'eql test-p) test-not)
+  (when (and test-p test test-not) (error "TREE-EQUAL: both :TEST and :TEST-NOT were supplied"))
   (%tree-equal-1 tree1 tree2 (or test #'eql) test-not))
 
-(defun subst (new old tree &key (test #'eql) test-not (key #'identity))
+;;; PROBE answers (values replacement t) or (values nil nil); only the CAR recurses.
+(defun %subst-walk (tree probe)
+  (labels ((walk (base)
+             (let ((cur base) (head nil) (tail nil) (cut nil) (started nil))
+               (labels ((extend (value)
+                          (let ((cell (cons value nil)))
+                            (if tail (rplacd tail cell) (setq head cell))
+                            (setq tail cell)
+                            cell))
+                        (prefix (up-to)
+                          (do ((c base (cdr c)))
+                              ((eq c up-to))
+                            (extend (car c)))))
+                 (loop
+                   (multiple-value-bind (r hit) (funcall probe cur)
+                     (when hit
+                       (unless started
+                         (prefix cur)
+                         (setq started t))
+                       (if tail (rplacd tail r) (setq head r))
+                       (return-from walk (or head r))))
+                   (if (consp cur)
+                       (let* ((new-car (walk (car cur)))
+                              (changed (not (eq new-car (car cur)))))
+                         (unless started
+                           (when changed
+                             (prefix cur)
+                             (setq started t)))
+                         (when started
+                           (let ((cell (extend new-car)))
+                             (when changed
+                               (setq cut (cons cell cur)))))
+                         (setq cur (cdr cur)))
+                       (if started
+                           (progn
+                             (rplacd tail cur)
+                             (when cut
+                               (rplacd (car cut) (cdr (cdr cut))))
+                             (return-from walk head))
+                           (return-from walk base))))))))
+    (walk tree)))
+
+(defun %nsubst-walk (tree probe)
+  (labels ((walk (node)
+             (let ((cur node) (prev nil))
+               (loop
+                 (multiple-value-bind (r hit) (funcall probe cur)
+                   (when hit
+                     (if prev
+                         (progn (rplacd prev r) (return-from walk node))
+                         (return-from walk r))))
+                 (if (consp cur)
+                     (let ((new-car (walk (car cur))))
+                       (unless (eq new-car (car cur))
+                         (rplaca cur new-car))
+                       (setq prev cur)
+                       (setq cur (cdr cur)))
+                     (return-from walk node))))))
+    (walk tree)))
+
+(defun subst (new old tree &key (test #'eql test-p) test-not (key #'identity))
+  (when (and test-p test test-not) (error "SUBST: both :TEST and :TEST-NOT were supplied"))
   (let ((key (or key #'identity)))
-    (labels ((s (node)
-               (let ((k (funcall key node)))
-                 (if (if test-not
-                         (not (funcall test-not old k))
-                         (funcall test old k))
+    (if (%tree-small-p tree)
+      (labels ((s (node)
+                 (let ((k (funcall key node)))
+                   (if (if test-not
+                           (not (funcall test-not old k))
+                           (funcall test old k))
+                       new
+                       (if (consp node)
+                           (let ((new-car (s (car node)))
+                                 (new-cdr (s (cdr node))))
+                             (if (and (eq new-car (car node))
+                                      (eq new-cdr (cdr node)))
+                                 node
+                                 (cons new-car new-cdr)))
+                           node)))))
+        (s tree))
+        (%subst-walk
+         tree
+         (lambda (node)
+           (let ((k (funcall key node)))
+             (if (if test-not
+                     (not (funcall test-not old k))
+                     (funcall test old k))
+                 (values new t)
+                 (values nil nil))))))))
+
+(defun nsubst (new old tree &key (test #'eql test-p) test-not (key #'identity))
+  (when (and test-p test test-not) (error "NSUBST: both :TEST and :TEST-NOT were supplied"))
+  ;; Destructive: the tree is mutated in place.
+  (let ((key (or key #'identity)))
+    (%nsubst-walk
+     tree
+     (lambda (node)
+       (let ((k (funcall key node)))
+         (if (if test-not
+                 (not (funcall test-not old k))
+                 (funcall test old k))
+             (values new t)
+             (values nil nil)))))))
+
+(defun subst-if (new predicate tree &key (key #'identity))
+  (let ((key (or key #'identity)))
+    (if (%tree-small-p tree)
+      (labels ((s (node)
+                 (if (funcall predicate (funcall key node))
                      new
                      (if (consp node)
                          (let ((new-car (s (car node)))
@@ -782,97 +1095,30 @@
                                     (eq new-cdr (cdr node)))
                                node
                                (cons new-car new-cdr)))
-                         node)))))
-      (s tree))))
-
-(defun nsubst (new old tree &key (test #'eql) test-not (key #'identity))
-  ;; Genuinely destructive: callers rely on the tree being mutated in place
-  ;; and may discard the return value. SBCL's PROPAGATE-LVAR-ANNOTATIONS does
-  ;; (nsubst new old (annotation-deps dep)) to redirect dependency lists when
-  ;; lvars are substituted; the previous subst-alias left the deps pointing at
-  ;; dead lvars (type NIL) and every funarg call-type check warned.
-  (let ((key (or key #'identity)))
-    (labels ((match-p (node)
-               (let ((k (funcall key node)))
-                 (if test-not
-                     (not (funcall test-not old k))
-                     (funcall test old k))))
-             (s (node)
-               (cond ((match-p node) new)
-                     ((consp node)
-                      (let ((a (s (car node)))
-                            (d (s (cdr node))))
-                        (unless (eq a (car node)) (rplaca node a))
-                        (unless (eq d (cdr node)) (rplacd node d)))
-                      node)
-                     (t node))))
-      (s tree))))
-
-(defun subst-if (new predicate tree &key (key #'identity))
-  (let ((key (or key #'identity)))
-    (labels ((s (node)
-               (if (funcall predicate (funcall key node))
-                   new
-                   (if (consp node)
-                       (let ((new-car (s (car node)))
-                             (new-cdr (s (cdr node))))
-                         (if (and (eq new-car (car node))
-                                  (eq new-cdr (cdr node)))
-                             node
-                             (cons new-car new-cdr)))
-                       node))))
-      (s tree))))
+                         node))))
+        (s tree))
+        (%subst-walk
+         tree
+         (lambda (node)
+           (if (funcall predicate (funcall key node))
+               (values new t)
+               (values nil nil)))))))
 
 (defun nsubst-if (new predicate tree &key (key #'identity))
   (let ((key (or key #'identity)))
-    (labels ((s (node)
-               (cond ((funcall predicate (funcall key node)) new)
-                     ((consp node)
-                      (let ((a (s (car node)))
-                            (d (s (cdr node))))
-                        (unless (eq a (car node)) (rplaca node a))
-                        (unless (eq d (cdr node)) (rplacd node d)))
-                      node)
-                     (t node))))
-      (s tree))))
+    (%nsubst-walk
+     tree
+     (lambda (node)
+       (if (funcall predicate (funcall key node))
+           (values new t)
+           (values nil nil))))))
 
 (defun subst-if-not (new predicate tree &key (key #'identity))
   (let ((key (or key #'identity)))
-    (labels ((s (node)
-               (if (not (funcall predicate (funcall key node)))
-                   new
-                   (if (consp node)
-                       (let ((new-car (s (car node)))
-                             (new-cdr (s (cdr node))))
-                         (if (and (eq new-car (car node))
-                                  (eq new-cdr (cdr node)))
-                             node
-                             (cons new-car new-cdr)))
-                       node))))
-      (s tree))))
-
-(defun nsubst-if-not (new predicate tree &key (key #'identity))
-  (let ((key (or key #'identity)))
-    (labels ((s (node)
-               (cond ((not (funcall predicate (funcall key node))) new)
-                     ((consp node)
-                      (let ((a (s (car node)))
-                            (d (s (cdr node))))
-                        (unless (eq a (car node)) (rplaca node a))
-                        (unless (eq d (cdr node)) (rplacd node d)))
-                      node)
-                     (t node))))
-      (s tree))))
-
-(defun sublis (alist tree &key (test #'eql) test-not (key #'identity))
-  (let ((key (or key #'identity)))
-    (labels ((s (node)
-               (let* ((k (funcall key node))
-                      (pair (if test-not
-                                (assoc k alist :test-not test-not)
-                                (assoc k alist :test test))))
-                 (if pair
-                     (cdr pair)
+    (if (%tree-small-p tree)
+      (labels ((s (node)
+                 (if (not (funcall predicate (funcall key node)))
+                     new
                      (if (consp node)
                          (let ((new-car (s (car node)))
                                (new-cdr (s (cdr node))))
@@ -880,37 +1126,65 @@
                                     (eq new-cdr (cdr node)))
                                node
                                (cons new-car new-cdr)))
-                         node)))))
-      (s tree))))
+                         node))))
+        (s tree))
+        (%subst-walk
+         tree
+         (lambda (node)
+           (if (funcall predicate (funcall key node))
+               (values nil nil)
+               (values new t)))))))
 
-(defun nsublis (alist tree &key (test #'eql) test-not (key #'identity))
-  ;; Destructive, as SUBLIS's N-variant is allowed to be and as callers expect:
-  ;; series renames labels in a code fragment with NSUBLIS and discards the
-  ;; value, so a copying NSUBLIS left the old labels in place. The CAR of every
-  ;; cons is replaced in place; the CDR chain is walked iteratively so a long
-  ;; list does not nest one frame per element.
+(defun nsubst-if-not (new predicate tree &key (key #'identity))
   (let ((key (or key #'identity)))
-    (labels ((hit (node)
-               (let ((k (funcall key node)))
-                 (if test-not
-                     (assoc k alist :test-not test-not)
-                     (assoc k alist :test test))))
-             (s (node)
-               (let ((pair (hit node)))
-                 (cond (pair (cdr pair))
-                       ((atom node) node)
-                       (t (do ((last nil sub)
-                               (sub node (cdr sub)))
-                              ((atom sub)
-                               (let ((p (hit sub)))
-                                 (when p (rplacd last (cdr p)))))
-                            (let ((p (and last (hit sub))))
-                              (when p
-                                (rplacd last (cdr p))
-                                (return)))
-                            (rplaca sub (s (car sub))))
-                          node)))))
-      (s tree))))
+    (%nsubst-walk
+     tree
+     (lambda (node)
+       (if (funcall predicate (funcall key node))
+           (values nil nil)
+           (values new t))))))
+
+(defun sublis (alist tree &key (test #'eql test-p) test-not (key #'identity))
+  (when (and test-p test test-not) (error "SUBLIS: both :TEST and :TEST-NOT were supplied"))
+  (let ((key (or key #'identity)))
+    (if (%tree-small-p tree)
+      (labels ((s (node)
+                 (let* ((k (funcall key node))
+                        (pair (if test-not
+                                  (assoc k alist :test-not test-not)
+                                  (assoc k alist :test test))))
+                   (if pair
+                       (cdr pair)
+                       (if (consp node)
+                           (let ((new-car (s (car node)))
+                                 (new-cdr (s (cdr node))))
+                             (if (and (eq new-car (car node))
+                                      (eq new-cdr (cdr node)))
+                                 node
+                                 (cons new-car new-cdr)))
+                           node)))))
+        (s tree))
+        (%subst-walk
+         tree
+         (lambda (node)
+           (let* ((k (funcall key node))
+                  (pair (if test-not
+                            (assoc k alist :test-not test-not)
+                            (assoc k alist :test test))))
+             (if pair (values (cdr pair) t) (values nil nil))))))))
+
+(defun nsublis (alist tree &key (test #'eql test-p) test-not (key #'identity))
+  (when (and test-p test test-not) (error "NSUBLIS: both :TEST and :TEST-NOT were supplied"))
+  ;; Destructive: callers may discard the value.
+  (let ((key (or key #'identity)))
+    (%nsubst-walk
+     tree
+     (lambda (node)
+       (let* ((k (funcall key node))
+              (pair (if test-not
+                        (assoc k alist :test-not test-not)
+                        (assoc k alist :test test))))
+         (if pair (values (cdr pair) t) (values nil nil)))))))
 
 ;;; ============================================================
 ;;; Miscellaneous
@@ -982,7 +1256,13 @@
       (when (and required-length (/= (length result) required-length))
         (error 'type-error :datum result :expected-type result-type)))))
 
+(defun %map-cursor-ended (cur)
+  (cond ((consp cur) nil)
+        ((null cur) t)
+        (t (error 'type-error :datum cur :expected-type 'list))))
+
 (defun map (result-type function &rest sequences)
+  (%check-function-designator "MAP" "the function" function)
   (when (null sequences)
     (error 'program-error :format-control "MAP: wrong number of arguments: 2 (expected at least 3)"))
   ;; One list, vector or string, a function object, and a NIL / LIST / VECTOR result: built in the runtime.
@@ -1009,7 +1289,7 @@
        (let ((a (%seq-to-list (first sequences)))
              (b (%seq-to-list (second sequences))))
          (loop
-           (when (or (null a) (null b)) (return))
+           (when (or (%map-cursor-ended a) (%map-cursor-ended b)) (return))
            (push (funcall function (car a) (car b)) result)
            (setq a (cdr a))
            (setq b (cdr b)))))
@@ -1022,7 +1302,7 @@
            (loop
              (let ((args nil))
                (do ((c seq-lists (cdr c))) ((null c))
-                 (when (null (car c)) (return-from outer)))
+                 (when (%map-cursor-ended (car c)) (return-from outer)))
                (do ((c seq-lists (cdr c))) ((null c))
                  (push (caar c) args))
                (push (apply function (nreverse args)) result)
@@ -1089,7 +1369,7 @@
                                                 :expected-type 'sequence))))))))
                            (coerce result 'vector))
                           (t (error 'type-error :datum result-type
-                                    :expected-type '(or list vector))))))
+                                    :expected-type 'sequence)))))
                (unless (typep res result-type)
                  (error 'type-error :datum res :expected-type result-type))
                res))))))))
@@ -1165,6 +1445,10 @@
       (setf (fill-pointer result) n))
     result))
 
+;; Direct entries for MAP and MAP-INTO: the one- and two-sequence walks happen
+;; before their &rest list is built. Defined after both functions.
+(%attach-map-fast-paths #'map #'map-into #'mapc)
+
 ;;; ============================================================
 ;;; MERGE
 ;;; ============================================================
@@ -1219,7 +1503,7 @@
                             ((and ok2 sub-string) (coerce result 'string))
                             ((and ok3 sub-vector) (coerce result 'vector))
                             (t (error 'type-error :datum result-type
-                                      :expected-type '(or list vector))))))
+                                      :expected-type 'sequence)))))
                  (unless (typep res result-type)
                    (error 'type-error :datum res :expected-type result-type))
                  res)))))))))
@@ -1270,7 +1554,23 @@ Also expands element types within compound type specifiers like (VECTOR etype si
             (setq type (list* (car type) expanded-etype (cddr type))))))))
   type)
 
-(defun make-sequence (type length &key (initial-element nil))
+(defun %make-sequence-default-element (etype)
+  "An element of ETYPE to fill a vector with when MAKE-SEQUENCE is given no :INITIAL-ELEMENT."
+  (let ((candidates (list 0 0.0 0d0 (code-char 0) #\Space (complex 0d0 0d0) (complex 0.0 0.0) nil t)))
+    (or (find-if (lambda (x) (typep x etype)) candidates)
+        (and (consp etype) (member (car etype) '(integer mod unsigned-byte signed-byte))
+             (cond ((eq (car etype) 'integer)
+                    (let ((lo (if (consp (cdr etype)) (cadr etype) '*)))
+                      (cond ((integerp lo) lo) ((and (consp lo) (integerp (car lo))) (1+ (car lo))) (t 0))))
+                   (t 0)))
+        (and (consp etype) (member (car etype) '(member eql)) (if (eq (car etype) 'eql) (cadr etype) (cadr etype)))
+        (and (consp etype) (member (car etype) '(double-float float real single-float short-float long-float rational))
+             (let ((lo (and (consp (cdr etype)) (cadr etype))))
+               (cond ((realp lo) (if (eq (car etype) 'double-float) (coerce lo 'double-float) (if (rationalp lo) lo (coerce lo 'single-float))))
+                     (t 0))))
+        nil)))
+
+(defun make-sequence (type length &key (initial-element nil ie-p))
   (let* ((type (%typexpand-full type))
          (base-type (if (consp type) (car type) type))
          (base-name (when (symbolp base-type) (symbol-name base-type))))
@@ -1292,7 +1592,9 @@ Also expands element types within compound type specifiers like (VECTOR etype si
        ;; Check size constraint: (string n)
        (when (and (consp type) (consp (cdr type)) (integerp (cadr type)) (/= length (cadr type)))
          (error 'type-error :datum length :expected-type type))
-       (make-string length :initial-element (or initial-element #\Space)
+       (when (and ie-p (not (characterp initial-element)))
+         (error 'type-error :datum initial-element :expected-type 'character))
+       (make-string length :initial-element (if ie-p initial-element #\Space)
                            :element-type (if (member base-name '("BASE-STRING" "SIMPLE-BASE-STRING")
                                                      :test #'string=)
                                              'base-char
@@ -1302,7 +1604,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
        ;; Check size constraint: (bit-vector n)
        (when (and (consp type) (consp (cdr type)) (integerp (cadr type)) (/= length (cadr type)))
          (error 'type-error :datum length :expected-type type))
-       (make-array length :element-type 'bit :initial-element (or initial-element 0)))
+       (make-array length :element-type 'bit :initial-element (if ie-p initial-element 0)))
       ;; Vector types (possibly with element type)
       ((member base-name '("VECTOR" "SIMPLE-VECTOR" "ARRAY" "SIMPLE-ARRAY") :test #'string=)
        ;; Size constraint: (vector etype n) and (simple-vector n) give a length.
@@ -1329,7 +1631,8 @@ Also expands element types within compound type specifiers like (VECTOR etype si
                         t)))
          (if (or (eq etype t) (eq etype '*) (and (symbolp etype) (string= (symbol-name etype) "*")))
              (make-array length :initial-element initial-element)
-             (make-array length :element-type etype :initial-element (or initial-element 0)))))
+             (make-array length :element-type etype
+                         :initial-element (if (or ie-p initial-element) initial-element (%make-sequence-default-element etype))))))
       ;; Sequence is abstract
       ((string= base-name "SEQUENCE")
        (error 'type-error :datum type :expected-type 'sequence))
@@ -1346,7 +1649,12 @@ Also expands element types within compound type specifiers like (VECTOR etype si
                      (let ((h (car type)))
                        (and (symbolp h) (string= (symbol-name h) "OR"))))
             (error 'type-error :datum length :expected-type type))
-          (make-array length :initial-element initial-element))
+          ;; A type specifier such as (AND VECTOR (NOT SIMPLE-ARRAY)) that the vector built here is not
+          ;; of has no sequence to make. A class (CLASS-OF of a vector) names the vectors in general.
+          (let ((vector (make-array length :initial-element initial-element)))
+            (unless (or (not (consp type)) (typep vector type))
+              (error 'type-error :datum type :expected-type 'sequence))
+            vector))
          (t (error 'type-error :datum type :expected-type 'sequence)))))))
 
 ;;; ============================================================
@@ -1378,7 +1686,12 @@ Also expands element types within compound type specifiers like (VECTOR etype si
 ;;; Byte operations (BYTE, LDB, DPB, MASK-FIELD, DEPOSIT-FIELD)
 ;;; ============================================================
 
-(defun byte (size position) (cons size position))
+(defun byte (size position)
+  (unless (typep size '(integer 0 *))
+    (error 'type-error :datum size :expected-type '(integer 0 *)))
+  (unless (typep position '(integer 0 *))
+    (error 'type-error :datum position :expected-type '(integer 0 *)))
+  (cons size position))
 (defun byte-size (bytespec) (car bytespec))
 (defun byte-position (bytespec) (cdr bytespec))
 
@@ -1645,7 +1958,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
     ((rationalp n) (cond ((plusp n) 1) ((minusp n) -1) (t 0)))
     ((typep n 'single-float) (cond ((plusp n) 1.0) ((minusp n) -1.0) (t n)))
     ((typep n 'double-float) (cond ((plusp n) 1.0d0) ((minusp n) -1.0d0) (t n)))
-    (t (error "SIGNUM: not a number: ~S" n))))
+    (t (error 'type-error :datum n :expected-type 'number))))
 
 ;; SCALE-FLOAT is registered in the runtime (Runtime.Arithmetic.cs): it needs
 ;; scaleB so that the power of two is never built as a float of its own.
@@ -1710,6 +2023,7 @@ Also expands element types within compound type specifiers like (VECTOR etype si
     (t (rational x))))
 
 (defun conjugate (z)
+  (unless (numberp z) (error 'type-error :datum z :expected-type 'number))
   (if (complexp z)
       (complex (realpart z) (- (imagpart z)))
       z))
@@ -3154,11 +3468,27 @@ and symbol-macro scope is used as the starting point."
    when it no longer reads (its package is gone)."
   (ignore-errors
     (multiple-value-bind (pname pos) (read-from-string packed)
-      (let ((pkg (find-package pname)))
-        (when pkg
-          (with-standard-io-syntax
-            (let ((*package* pkg) (*read-eval* nil))
-              (values (read-from-string packed t nil :start pos)))))))))
+      ;; A registration made inside a package unit starts with "UNIT!PACKAGE": it is
+      ;; read in that unit, or the symbols of the unit's packages would be interned in
+      ;; the global package of the same name.
+      (let* ((bang (position #\! pname))
+             (unit (and bang (> bang 0) (subseq pname 0 bang)))
+             (unit-call (and unit (find-symbol "%CALL-IN-PACKAGE-UNIT-NAMED" "DOTCL")))
+             (reader
+               (lambda (name)
+                 (let ((pkg (find-package name)))
+                   (when pkg
+                     (with-standard-io-syntax
+                       (let ((*package* pkg) (*read-eval* nil))
+                         (values (read-from-string packed t nil :start pos)))))))))
+        (let ((r (if (and unit-call (fboundp unit-call))
+                     (funcall unit-call unit
+                              (lambda () (or (funcall reader (subseq pname (1+ bang))) :none)))
+                     :not-found)))
+          (case r
+            (:not-found (funcall reader pname))
+            (:none nil)
+            (t r)))))))
 
 (defun %xref-index-1 (caller callees uses)
   (when (stringp caller)
@@ -3170,8 +3500,11 @@ and symbol-macro scope is used as the starting point."
     (setf (gethash old *xref-caller-table*)
           (remove caller (gethash old *xref-caller-table*) :test #'equal)))
   (setf (gethash caller *xref-callee-table*) callees)
-  (dolist (callee callees)
-    (pushnew caller (gethash callee *xref-caller-table*) :test #'equal))
+  ;; The old edges are gone, so CALLER is in none of these lists: a plain PUSH
+  ;; (PUSHNEW walked the whole list, which for a name every function mentions
+  ;; is every function loaded so far).
+  (dolist (callee (remove-duplicates callees :test #'equal))
+    (push caller (gethash callee *xref-caller-table*)))
   (loop for (kind names) on (gethash caller *xref-caller-uses*) by #'cddr
         for table = (%xref-use-table kind)
         when table
@@ -3184,8 +3517,8 @@ and symbol-macro scope is used as the starting point."
   (loop for (kind names) on uses by #'cddr
         for table = (%xref-use-table kind)
         when table
-          do (dolist (name names)
-               (pushnew caller (gethash name table) :test #'equal))))
+          do (dolist (name (remove-duplicates names :test #'equal))
+               (push caller (gethash name table)))))
 
 (defun %xref-flush ()
   "Index the queued registrations, oldest first. Call with *XREF-LOCK* held."
@@ -3560,3 +3893,168 @@ The fasl is loaded anyway. Bind DOTCL:*WARN-HOST-DEPENDENT-FASL* to NIL to silen
            (setq *standard-input* in)
            (close file))))
   nil)
+
+;;; The SETF functions of the standard accessors (CLHS 5.1.2.9 leaves their existence to the
+;;; implementation; SBCL and the others have them, and #'(setf car) and (fdefinition '(setf nth))
+;;; are used by code that passes an accessor's setter around). Each is the SETF of the place.
+(defun (setf car) (new-value list)
+  (setf (car list) new-value))
+
+(defun (setf cdr) (new-value list)
+  (setf (cdr list) new-value))
+
+(defun (setf caar) (new-value list)
+  (setf (caar list) new-value))
+
+(defun (setf cadr) (new-value list)
+  (setf (cadr list) new-value))
+
+(defun (setf cdar) (new-value list)
+  (setf (cdar list) new-value))
+
+(defun (setf cddr) (new-value list)
+  (setf (cddr list) new-value))
+
+(defun (setf caaar) (new-value list)
+  (setf (caaar list) new-value))
+
+(defun (setf caadr) (new-value list)
+  (setf (caadr list) new-value))
+
+(defun (setf cadar) (new-value list)
+  (setf (cadar list) new-value))
+
+(defun (setf caddr) (new-value list)
+  (setf (caddr list) new-value))
+
+(defun (setf cdaar) (new-value list)
+  (setf (cdaar list) new-value))
+
+(defun (setf cdadr) (new-value list)
+  (setf (cdadr list) new-value))
+
+(defun (setf cddar) (new-value list)
+  (setf (cddar list) new-value))
+
+(defun (setf cdddr) (new-value list)
+  (setf (cdddr list) new-value))
+
+(defun (setf caaaar) (new-value list)
+  (setf (caaaar list) new-value))
+
+(defun (setf caaadr) (new-value list)
+  (setf (caaadr list) new-value))
+
+(defun (setf caadar) (new-value list)
+  (setf (caadar list) new-value))
+
+(defun (setf caaddr) (new-value list)
+  (setf (caaddr list) new-value))
+
+(defun (setf cadaar) (new-value list)
+  (setf (cadaar list) new-value))
+
+(defun (setf cadadr) (new-value list)
+  (setf (cadadr list) new-value))
+
+(defun (setf caddar) (new-value list)
+  (setf (caddar list) new-value))
+
+(defun (setf cadddr) (new-value list)
+  (setf (cadddr list) new-value))
+
+(defun (setf cdaaar) (new-value list)
+  (setf (cdaaar list) new-value))
+
+(defun (setf cdaadr) (new-value list)
+  (setf (cdaadr list) new-value))
+
+(defun (setf cdadar) (new-value list)
+  (setf (cdadar list) new-value))
+
+(defun (setf cdaddr) (new-value list)
+  (setf (cdaddr list) new-value))
+
+(defun (setf cddaar) (new-value list)
+  (setf (cddaar list) new-value))
+
+(defun (setf cddadr) (new-value list)
+  (setf (cddadr list) new-value))
+
+(defun (setf cdddar) (new-value list)
+  (setf (cdddar list) new-value))
+
+(defun (setf cddddr) (new-value list)
+  (setf (cddddr list) new-value))
+
+(defun (setf first) (new-value list)
+  (setf (first list) new-value))
+
+(defun (setf second) (new-value list)
+  (setf (second list) new-value))
+
+(defun (setf third) (new-value list)
+  (setf (third list) new-value))
+
+(defun (setf fourth) (new-value list)
+  (setf (fourth list) new-value))
+
+(defun (setf fifth) (new-value list)
+  (setf (fifth list) new-value))
+
+(defun (setf sixth) (new-value list)
+  (setf (sixth list) new-value))
+
+(defun (setf seventh) (new-value list)
+  (setf (seventh list) new-value))
+
+(defun (setf eighth) (new-value list)
+  (setf (eighth list) new-value))
+
+(defun (setf ninth) (new-value list)
+  (setf (ninth list) new-value))
+
+(defun (setf tenth) (new-value list)
+  (setf (tenth list) new-value))
+
+(defun (setf rest) (new-value list)
+  (setf (rest list) new-value))
+
+(defun (setf nth) (new-value n list)
+  (setf (nth n list) new-value))
+
+(defun (setf elt) (new-value sequence index)
+  (setf (elt sequence index) new-value))
+
+(defun (setf char) (new-value string index)
+  (setf (char string index) new-value))
+
+(defun (setf schar) (new-value string index)
+  (setf (schar string index) new-value))
+
+(defun (setf gethash) (new-value key hash-table &optional default)
+  (declare (ignore default))
+  (setf (gethash key hash-table) new-value))
+
+(defun (setf fill-pointer) (new-value vector)
+  (setf (fill-pointer vector) new-value))
+
+(defun (setf subseq) (new-value sequence start &optional end)
+  (setf (subseq sequence start end) new-value))
+
+(defun (setf row-major-aref) (new-value array index)
+  (setf (row-major-aref array index) new-value))
+
+(defun (setf macro-function) (new-value name &optional environment)
+  (declare (ignore environment))
+  (setf (macro-function name) new-value))
+
+(defun (setf compiler-macro-function) (new-value name &optional environment)
+  (declare (ignore environment))
+  (setf (compiler-macro-function name) new-value))
+
+(defun (setf readtable-case) (new-value readtable)
+  (setf (readtable-case readtable) new-value))
+
+(defun (setf logical-pathname-translations) (new-value host)
+  (setf (logical-pathname-translations host) new-value))

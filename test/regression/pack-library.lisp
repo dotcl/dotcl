@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; `dotcl pack --library`: an ASDF system as a NuGet package that another system
 ;;; names in a (:nuget ...) component.
 ;;;

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A structure's raw slot array is fetched once per binding, not per access.
 ;;;
 ;;; Slots whose declared type fits an int64 or a double live in a long[] beside

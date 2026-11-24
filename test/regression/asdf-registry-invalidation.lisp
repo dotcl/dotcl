@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; compile-file finally-block ASDF registry invalidation.
 ;;;
 ;;; The compile-file finally strip nulls Function slots of symbols newly

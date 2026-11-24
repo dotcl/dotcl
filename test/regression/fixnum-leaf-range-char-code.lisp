@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; (CHAR-CODE (SCHAR S I)) carries its range into EXPR-INT-RANGE, not only
 ;;; into FIXNUM-TYPED-P.
 ;;;

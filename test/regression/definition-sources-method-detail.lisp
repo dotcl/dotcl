@@ -2,7 +2,7 @@
 ;;; the method object, and reading them back interns nothing.
 
 (defun %dsd-source ()
-  (let ((src (merge-pathnames "dsd-fixture.lisp" (regression-temp-dir))))
+  (let ((src (merge-pathnames "dsd-fixture.lisp" (regression-temp-dir/))))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (dolist (l '("(defpackage \"DS-DETAIL\" (:use \"CL\"))"     ; 1
                    "(in-package \"DS-DETAIL\")"                  ; 2

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; RUN-PROGRAM with a file or null output returns when the child exits, even
 ;;; if the child left a background process that still holds that output.
 ;;;

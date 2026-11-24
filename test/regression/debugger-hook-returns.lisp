@@ -1,3 +1,4 @@
+;;; regression: full-tier-only
 ;;; When *DEBUGGER-HOOK* (or INVOKE-DEBUGGER itself) returns instead of
 ;;; transferring control, the error still has to unwind. What unwinds must not
 ;;; run the handlers again: they have seen the condition once already.

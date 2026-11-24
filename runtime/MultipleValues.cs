@@ -77,7 +77,7 @@ public sealed class MvReturn : LispObject
 public struct MvHeld
 {
     internal int N;
-    internal LispObject? V0, V1, V2, V3;
+    internal LispObject? V0, V1, V2, V3, V4, V5, V6, V7;
     internal LispObject[]? Rest;
 }
 
@@ -636,7 +636,7 @@ public static class MultipleValues
         if (mode == ModePrimary) return PrimaryOnly(a);
         if (mode != ModeCapture) return Values(a, b, c, d, e);
         var s = SnapFor(5);
-        s[0] = a; s[1] = b; s[2] = c; s[3] = d; s[4] = e;
+        SnapSet(s, 0, a); SnapSet(s, 1, b); SnapSet(s, 2, c); SnapSet(s, 3, d); SnapSet(s, 4, e);
         return CaptureN(5, a);
     }
 
@@ -646,7 +646,7 @@ public static class MultipleValues
         if (mode == ModePrimary) return PrimaryOnly(a);
         if (mode != ModeCapture) return Values(a, b, c, d, e, f);
         var s = SnapFor(6);
-        s[0] = a; s[1] = b; s[2] = c; s[3] = d; s[4] = e; s[5] = f;
+        SnapSet(s, 0, a); SnapSet(s, 1, b); SnapSet(s, 2, c); SnapSet(s, 3, d); SnapSet(s, 4, e); SnapSet(s, 5, f);
         return CaptureN(6, a);
     }
 
@@ -656,7 +656,7 @@ public static class MultipleValues
         if (mode == ModePrimary) return PrimaryOnly(a);
         if (mode != ModeCapture) return Values(a, b, c, d, e, f, g);
         var s = SnapFor(7);
-        s[0] = a; s[1] = b; s[2] = c; s[3] = d; s[4] = e; s[5] = f; s[6] = g;
+        SnapSet(s, 0, a); SnapSet(s, 1, b); SnapSet(s, 2, c); SnapSet(s, 3, d); SnapSet(s, 4, e); SnapSet(s, 5, f); SnapSet(s, 6, g);
         return CaptureN(7, a);
     }
 
@@ -666,7 +666,7 @@ public static class MultipleValues
         if (mode == ModePrimary) return PrimaryOnly(a);
         if (mode != ModeCapture) return Values(a, b, c, d, e, f, g, h);
         var s = SnapFor(8);
-        s[0] = a; s[1] = b; s[2] = c; s[3] = d; s[4] = e; s[5] = f; s[6] = g; s[7] = h;
+        SnapSet(s, 0, a); SnapSet(s, 1, b); SnapSet(s, 2, c); SnapSet(s, 3, d); SnapSet(s, 4, e); SnapSet(s, 5, f); SnapSet(s, 6, g); SnapSet(s, 7, h);
         return CaptureN(8, a);
     }
 
@@ -709,14 +709,17 @@ public static class MultipleValues
         var s = _bindSnap;
         int n = _bindCount;
         LispObject a = Nil.Instance, b = Nil.Instance, c = Nil.Instance, d = Nil.Instance;
+        LispObject e = Nil.Instance, g = Nil.Instance;
         LispObject[]? args = null;
-        if (n > 4) { args = new LispObject[n]; Array.Copy(s!, args, n); }
+        if (n > 6) { args = new LispObject[n]; Array.Copy(s!, args, n); }
         else
         {
             if (n > 0) a = s![0];
             if (n > 1) b = s![1];
             if (n > 2) c = s![2];
             if (n > 3) d = s![3];
+            if (n > 4) e = s![4];
+            if (n > 5) g = s![5];
         }
         var f = Runtime.CoerceToFunction(fn);
         return n switch
@@ -726,6 +729,8 @@ public static class MultipleValues
             2 => f.Invoke2M(a, b, mode),
             3 => f.Invoke3M(a, b, c, mode),
             4 => f.Invoke4M(a, b, c, d, mode),
+            5 => f.Invoke5M(a, b, c, d, e, mode),
+            6 => f.Invoke6M(a, b, c, d, e, g, mode),
             _ => f.Invoke(args!),
         };
     }
@@ -827,7 +832,7 @@ public static class MultipleValues
         }
         if (c > vals.Length || !ReferenceEquals(vals[0], primary)) { h.N = -1; return h; }
         h.N = c;
-        if (c > 4)
+        if (c > 8)
         {
             // A snapshot or a longer buffer is reused; a published array of exactly C is not.
             if (vals.Length == c && _count != CountSnap) h.Rest = vals;
@@ -838,6 +843,10 @@ public static class MultipleValues
         if (c > 1) h.V1 = vals[1];
         if (c > 2) h.V2 = vals[2];
         if (c > 3) h.V3 = vals[3];
+        if (c > 4) h.V4 = vals[4];
+        if (c > 5) h.V5 = vals[5];
+        if (c > 6) h.V6 = vals[6];
+        if (c > 7) h.V7 = vals[7];
         return h;
     }
 
@@ -863,10 +872,14 @@ public static class MultipleValues
             case 0: _values = Array.Empty<LispObject>(); _count = 0; break;
             case 1: SetOne(h.V0!); break;
             case 2: SetPair(h.V0!, h.V1!); break;
-            case 3: case 4:
+            case 3: case 4: case 5: case 6: case 7: case 8:
                 var snap = SnapFor(n);
                 snap[0] = h.V0!; snap[1] = h.V1!; snap[2] = h.V2!;
-                if (n == 4) snap[3] = h.V3!;
+                if (n > 3) snap[3] = h.V3!;
+                if (n > 4) snap[4] = h.V4!;
+                if (n > 5) snap[5] = h.V5!;
+                if (n > 6) snap[6] = h.V6!;
+                if (n > 7) snap[7] = h.V7!;
                 _bindCount = n;
                 _count = CountSnap;
                 break;
@@ -879,6 +892,10 @@ public static class MultipleValues
             2 => Values2(h.V0!, h.V1!),
             3 => Values(h.V0!, h.V1!, h.V2!),
             4 => Values(h.V0!, h.V1!, h.V2!, h.V3!),
+            5 => Values(h.V0!, h.V1!, h.V2!, h.V3!, h.V4!),
+            6 => Values(h.V0!, h.V1!, h.V2!, h.V3!, h.V4!, h.V5!),
+            7 => Values(h.V0!, h.V1!, h.V2!, h.V3!, h.V4!, h.V5!, h.V6!),
+            8 => Values(h.V0!, h.V1!, h.V2!, h.V3!, h.V4!, h.V5!, h.V6!, h.V7!),
             _ => Values(h.Rest!),
         };
     }

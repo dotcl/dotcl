@@ -80,6 +80,12 @@
 (defvar *lsp-test-text*
   (format nil "(car '(1))~C~C;; ~A BAD~C(cdr '(2))" #\Return #\Newline *lsp-test-wide* #\Return))
 
+;;; Defined here so that a definition request for it has somewhere to go.
+(defun lsp-test-fn (a b &optional c) (list a b c))
+
+(defun %lsp-request-at (stream method uri line character)
+  (dotcl-jsonrpc:jget (%lsp-request stream method (%lsp-position uri line character)) "result"))
+
 (defun %lsp-scenario ()
   ;; Set globally, not bound: the server answers on a thread of its own.
   (push '%lsp-test-bad-tokens dotcl-lsp:*diagnostic-functions*)
@@ -116,6 +122,55 @@
              (note :hover-nothing
                    (result (%lsp-request stream "textDocument/hover"
                                          (%lsp-position "file:///plain.lisp" 0 12))))
+             ;; Completion, signature help and definition on a document that is
+             ;; only a few forms.
+             (%lsp-send stream "textDocument/didOpen"
+                        (%lsp-doc "file:///edit.lisp"
+                                  (format nil "(string-upc)~%(lsp-test-fn 1 )~%(lsp-test-fn 1 2 3)~%(car 1)~%x")))
+             (%lsp-diagnostics stream "file:///edit.lisp")
+             (note :complete
+                   (let* ((r (%lsp-request-at stream "textDocument/completion"
+                                              "file:///edit.lisp" 0 11))
+                          (items (coerce (dotcl-jsonrpc:jget r "items") 'list))
+                          (item (find "string-upcase" items
+                                      :key (lambda (i) (dotcl-jsonrpc:jget i "label"))
+                                      :test #'string-equal)))
+                     (list (and item t)
+                           (and item (dotcl-jsonrpc:jget item "kind"))
+                           (and item (let ((range (dotcl-jsonrpc:jget
+                                                   (dotcl-jsonrpc:jget item "textEdit") "range")))
+                                       (list (dotcl-jsonrpc:jget (dotcl-jsonrpc:jget range "start") "character")
+                                             (dotcl-jsonrpc:jget (dotcl-jsonrpc:jget range "end") "character")))))))
+             (note :complete-nothing
+                   (%lsp-request-at stream "textDocument/completion" "file:///edit.lisp" 4 0))
+             (note :signature
+                   (flet ((sig (line character)
+                            (let ((r (%lsp-request-at stream "textDocument/signatureHelp"
+                                                      "file:///edit.lisp" line character)))
+                              (and r (list (dotcl-jsonrpc:jget
+                                            (aref (dotcl-jsonrpc:jget r "signatures") 0) "label")
+                                           (dotcl-jsonrpc:jget r "activeParameter"))))))
+                     (list (sig 1 15)         ; after (lsp-test-fn 1 
+                           (sig 1 12)         ; at the end of the operator
+                           (sig 2 14)         ; on the first argument of a complete call
+                           (sig 2 17)         ; past the last argument
+                           (sig 4 0))))       ; outside any form
+             (note :definition
+                   (let* ((r (%lsp-request-at stream "textDocument/definition"
+                                              "file:///edit.lisp" 2 3))
+                          (found (list (dotcl:function-source-location 'lsp-test-fn))))
+                     (list (length r)
+                           (and (plusp (length r))
+                                (= (dotcl-jsonrpc:jget
+                                    (dotcl-jsonrpc:jget (dotcl-jsonrpc:jget (aref r 0) "range") "start")
+                                    "line")
+                                   (1- (getf (first found) :line))))
+                           (and (plusp (length r))
+                                (search "dotcl-lsp.lisp" (dotcl-jsonrpc:jget (aref r 0) "uri"))
+                                t))))
+             (note :definition-standard
+                   (length (%lsp-request-at stream "textDocument/definition"
+                                            "file:///edit.lisp" 3 2)))
              ;; The stand-in checker: the range is in UTF-16 units.
              (%lsp-send stream "textDocument/didOpen"
                         (%lsp-doc "file:///test-lsp.lisp" *lsp-test-text*))
@@ -186,6 +241,19 @@
 (deftest dotcl-lsp.diagnostic-range-utf16
   (%lsp-get :wide)
   ("textDocument/publishDiagnostics" 1 1 ((1 7) (1 10)) 2 "bad token"))
+
+(deftest dotcl-lsp.completion
+  (list (%lsp-get :complete) (%lsp-get :complete-nothing))
+  ((t 3 (1 11)) nil))
+
+(deftest dotcl-lsp.signature-help
+  (%lsp-get :signature)
+  (("(lsp-test-fn a b &optional c)" 1) nil ("(lsp-test-fn a b &optional c)" 0)
+   ("(lsp-test-fn a b &optional c)" 2) nil))
+
+(deftest dotcl-lsp.definition
+  (list (%lsp-get :definition) (%lsp-get :definition-standard))
+  ((1 t t) 0))
 
 (deftest dotcl-lsp.incremental-change
   (%lsp-get :changed)

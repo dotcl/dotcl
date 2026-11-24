@@ -1,7 +1,9 @@
 #!/bin/bash
 # Re-measure every dotcl-versus-SBCL ruler in items.tsv and write one table.
 #
-#   bench/ledger/run.sh [setup|measure|render|all]      (default: all)
+#   bench/ledger/run.sh [setup|check|measure|render|all]      (default: all)
+#   (setup and check refuse a tree whose core or fasls are not those of its runtime source,
+#    and a dotcl dist older than bench/ledger/dotcl-dist-min.txt)
 #
 # For each row of items.tsv, in its own process per side, dotcl and SBCL are run
 # alternately ROUNDS times (default 3); the table keeps the fastest value of each
@@ -43,7 +45,7 @@
 #   LEDGER_STEADY_TOLERANCE  consecutive-run spread considered stable (default 0.05)
 #   LEDGER_STEADY_WINDOW     consecutive stable runs required (default 3)
 #   LEDGER_STEADY_MIN_RUNS   runs before a stable window is accepted (default 10)
-#   LEDGER_STEADY_MIN_SECONDS  seconds before a stable window may start (default 3)
+#   LEDGER_STEADY_MIN_SECONDS  seconds before a stable window may start (default 8)
 #   LEDGER_STEADY_MAX_RUNS   runs after the minimum time before stopping (default 20)
 #   LEDGER_STEADY_MAX_SECONDS  cap on steady seconds per benchmark (default 120)
 set -u
@@ -60,7 +62,7 @@ STEADY_STRONG=${LEDGER_STEADY_STRONG:-3}
 STEADY_TOLERANCE=${LEDGER_STEADY_TOLERANCE:-0.05}
 STEADY_WINDOW=${LEDGER_STEADY_WINDOW:-3}
 STEADY_MIN_RUNS=${LEDGER_STEADY_MIN_RUNS:-10}
-STEADY_MIN_SECONDS=${LEDGER_STEADY_MIN_SECONDS:-3}
+STEADY_MIN_SECONDS=${LEDGER_STEADY_MIN_SECONDS:-8}
 STEADY_MAX_RUNS=${LEDGER_STEADY_MAX_RUNS:-20}
 STEADY_MAX_SECONDS=${LEDGER_STEADY_MAX_SECONDS:-120}
 ITEMS=${LEDGER_ITEMS:-$here/items.tsv}
@@ -123,16 +125,63 @@ setup_ironclad() {
   done
 }
 
+# A clone over the network is tried up to three times, ten seconds apart.
+clone_retry() {
+  local try
+  for try in 1 2 3; do
+    git clone -q "$@" && return 0
+    log "clone failed (attempt $try of 3)"
+    [ "$try" -lt 3 ] && sleep 10
+  done
+  return 1
+}
+
+# The dotcl dist the overlay registry reads must be new enough, and must load what the
+# coalton rows need. Fails with the version found and the version required.
+check_dist() {
+  local distinfo=$QLH/dists/dotcl/distinfo.txt have need out
+  if [ ! -f "$distinfo" ]; then
+    log "no dotcl dist at $QLH/dists/dotcl (distinfo.txt missing); install the dotcl dist, version $(dist_min) or newer"
+    return 1
+  fi
+  have=$(sed -n 's/^version: *//p' "$distinfo" | head -1 | tr -d '\r ')
+  need=$(dist_min)
+  if [ -z "$have" ]; then log "cannot read the version of the dotcl dist in $distinfo"; return 1; fi
+  if [ "$have" \< "$need" ]; then
+    log "the dotcl dist is $have, the ledger needs $need or newer (update it, or set LEDGER_DOTCL_DIST_MIN to override)"
+    return 1
+  fi
+  [ "${LEDGER_DIST_SMOKE:-1}" = 1 ] || { log "dotcl dist $have (needs $need); smoke load skipped"; return 0; }
+  mkdir -p "$WORK/xdg-smoke"
+  out=$(env XDG_CACHE_HOME="$WORK/xdg-smoke" CL_SOURCE_REGISTRY="$(registry_dotcl)" \
+        timeout 900 "$RUNTIME" --core "$CORE" --eval '(progn (require "quicklisp") (funcall (intern "QUICKLOAD" "QL") :float-features :silent t) (format t "~%DIST-SMOKE-OK~%"))' < /dev/null 2>&1) || true
+  case $out in
+    *DIST-SMOKE-OK*) log "dotcl dist $have (needs $need); float-features loads";;
+    *) log "the dotcl dist $have cannot load float-features, which the coalton rows need; update the dist (the ledger needs $need or newer) or fix its float-features release"
+       echo "$out" | tail -5 >&2
+       return 1;;
+  esac
+}
+
+# the version the dist must have: LEDGER_DOTCL_DIST_MIN, else the first line of
+# dotcl-dist-min.txt that is not a comment
+dist_min() {
+  if [ -n "${LEDGER_DOTCL_DIST_MIN:-}" ]; then echo "$LEDGER_DOTCL_DIST_MIN"; return; fi
+  sed -n '/^[0-9]/{p;q;}' "$here/dotcl-dist-min.txt" 2>/dev/null
+}
+
 setup() {
-  [ -x "$RUNTIME" ] && [ -f "$CORE" ] || { log "no Release runtime / dotcl.core in $TREE (build first)"; return 1; }
+  [ -x "$RUNTIME" ] && [ -f "$CORE" ] || { log "no Release runtime / dotcl.core in $TREE (run bench/ledger/build.sh)"; return 1; }
+  "$here/build.sh" check "$TREE" || return 1
   if [ ! -d "$WORK/cl-bench" ]; then
-    git clone -q https://github.com/benkard/cl-bench.git "$WORK/cl-bench" || return 1
+    clone_retry https://github.com/benkard/cl-bench.git "$WORK/cl-bench" || return 1
   fi
   if [ ! -d "$COALTON_DIR" ]; then
-    git clone -q https://github.com/coalton-lang/coalton.git "$COALTON_DIR" || return 1
+    clone_retry https://github.com/coalton-lang/coalton.git "$COALTON_DIR" || return 1
     git -C "$COALTON_DIR" checkout -q "$COALTON_REV" || return 1
   fi
   setup_ironclad || return 1
+  check_dist || return 1
   log "setup done"
 }
 
@@ -140,14 +189,14 @@ setup() {
 # overlay release of each project, then dotcl's stock dist, then Roswell's
 registry_dotcl() {
   local ov=$QLH/dists/dotcl/software out d p src
-  declare -A seen
-  seen[coalton]=1
+  local seen=" coalton "
+
   out="(:source-registry (:tree \"$COALTON_DIR/\")"
   for src in "$ov" "$QLH/dists/quicklisp/software" "$ROSQL"; do
     for d in $(ls "$src" 2>/dev/null | sort -r -V); do
       p=$(echo "$d" | sed -E 's/-(v?[0-9][0-9.]*|release|git|darcs).*$//')
-      [ -n "${seen[$p]:-}" ] && continue
-      seen[$p]=1
+      case "$seen" in *" $p "*) continue ;; esac
+      seen="$seen$p "
       out="$out (:tree \"$src/$d/\")"
     done
   done
@@ -414,6 +463,8 @@ measure() {
       so=$OUT/steady-$side.out; se=$OUT/steady-$side.err
       log "$id $side steady"
       run_one "$kind" "$arg" "$side" "$to" "$so" "$se" steady
+      # every run's time, in order, so a warm-up plateau can be read off afterwards
+      grep -h '^TIMES ' "$so" 2>/dev/null | sed "s/^TIMES /$side\t/" >> "$OUT/steady-times.tsv" || true
       parse "$kind" "$arg" "$id" "$so" "$se" steady > "$OUT/last.parsed"
       n=$(wc -l < "$OUT/last.parsed" | tr -d ' ')
       awk -F'\t' -v m=steady -v s="$side" -v r=- \
@@ -582,7 +633,7 @@ render() {
     echo "- machine: $(hostname), $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | sed 's/.*: //')"
     echo "- host: $(nproc 2>/dev/null || sysctl -n hw.logicalcpu) logical CPUs, $(uname -sm), .NET $(dotnet --list-runtimes 2>/dev/null | awk '$1 == "Microsoft.NETCore.App" { v = $2 } END { print v }')"
     echo "- cold: the row's existing fresh-process measurement; dotcl and SBCL alternate $ROUNDS times and the fastest value of each side is shown"
-    echo "- steady: repeated in one process until $STEADY_WINDOW consecutive runs are within ${tol}% of each other, after at least $STEADY_MIN_RUNS runs and $STEADY_MIN_SECONDS s (at most $STEADY_MAX_RUNS runs after those seconds or $STEADY_MAX_SECONDS s)"
+    echo "- steady: the warm-up-free plateau; repeated in one process until $STEADY_WINDOW consecutive runs are within ${tol}% of each other, after at least $STEADY_MIN_RUNS runs and $STEADY_MIN_SECONDS s (at most $STEADY_MAX_RUNS runs after those seconds or $STEADY_MAX_SECONDS s)"
     echo "- mark: ! means cold is over ${COLD_MAX}x or steady is over ${STEADY_MAX}x; !! means steady is over ${STEADY_STRONG}x"
     echo "- runs = steady runs to stability (dotcl/SBCL when they differ); ratio = dotcl / SBCL; times in ms (imago in ns per pixel)"
     echo "- date: $(date +%Y-%m-%d), wall time of the run $((elapsed / 60)) min (lock waits included)"
@@ -623,9 +674,10 @@ publish() {
 
 case ${1:-all} in
   setup) setup;;
+  check) "$here/build.sh" check "$TREE" && check_dist;;
   measure) measure;;
   render) render;;
   publish) publish;;
   all) setup && measure && render && { [ "${LEDGER_PUBLISH:-0}" != 1 ] || publish; };;
-  *) echo "usage: $0 [setup|measure|render|publish|all]" >&2; exit 2;;
+  *) echo "usage: $0 [setup|check|measure|render|publish|all]" >&2; exit 2;;
 esac

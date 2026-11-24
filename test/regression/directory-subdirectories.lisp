@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; DIRECTORY reports subdirectories, and reports them as directory pathnames.
 ;;;
 ;;; DIRECTORY used to have two implementations. Compiled calls reached one of

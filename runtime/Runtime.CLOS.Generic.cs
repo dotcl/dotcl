@@ -75,6 +75,23 @@ public static partial class Runtime
         return NewDispatchingGF(sym, ar);
     }
 
+    /// <summary>Whether the built-in function a generic function replaced is one of its methods for ARGS.
+    /// In SBCL CLOSE and its kin are generic functions whose built-in method is specialized on STREAM, so a
+    /// method on a class that is not a stream (iolib's datagram socket) has no next method; the fallback
+    /// here is T-specialized, which made NEXT-METHOD-P true and CALL-NEXT-METHOD fail with "not a stream".</summary>
+    private static bool FallbackAppliesTo(GenericFunction gf, LispObject[] args)
+    {
+        if (args.Length == 0) return true;
+        switch (gf.Name.Name)
+        {
+            case "CLOSE": case "STREAM-ELEMENT-TYPE": case "INPUT-STREAM-P": case "OUTPUT-STREAM-P":
+            case "INTERACTIVE-STREAM-P": case "OPEN-STREAM-P":
+                return Typep(args[0], Startup.Sym("STREAM")) is not Nil;
+            default:
+                return true;
+        }
+    }
+
     private static LispMethod FallbackMethodOf(GenericFunction gf, int requiredCount)
     {
         var fb = gf.FallbackFunction!;
@@ -402,7 +419,12 @@ public static partial class Runtime
         if (mcName is not Symbol mcSym)
             throw new LispErrorException(new LispTypeError("SET-METHOD-COMBINATION: not a symbol", mcName));
         // The standard combination is the absence of a built-in one.
-        gf.MethodCombination = mcSym.Name == "STANDARD" ? null : mcSym;
+        var now = mcSym.Name == "STANDARD" ? null : mcSym;
+        if (!ReferenceEquals(gf.MethodCombination, now))
+        {
+            gf.MethodCombination = now;
+            gf.InvalidateCache();
+        }
         return gfObj;
     }
 
@@ -646,11 +668,10 @@ public static partial class Runtime
     /// 4.3.6: a reader or writer the new definition leaves out is removed).</summary>
     public static LispObject PruneStaleAccessors(LispObject clsObj)
     {
-        if (clsObj is LispClass cls && cls.StaleAccessorMethods is { } stale)
+        if (clsObj is LispClass cls)
         {
-            cls.StaleAccessorMethods = null;
-            foreach (var (gf, m) in stale)
-                RemoveMethod(gf, m);
+            foreach (var (gf, m) in cls.TakeStaleAccessors())
+                if (gf != null && m != null) RemoveMethod(gf, m);
         }
         return Nil.Instance;
     }
@@ -885,6 +906,50 @@ public static partial class Runtime
     /// specialized on CLS with the effective slot-definition named SLOTNAME, so
     /// DOTCL-MOP:ACCESSOR-METHOD-SLOT-DEFINITION can recover it. No-op if the pieces
     /// can't be resolved (keeps DEFCLASS robust).</summary>
+    // Methods a metaclass's class initialization put on an accessor's generic function, set aside
+    // while DEFCLASS defines its own accessor on the same specializer and put back afterwards.
+    // In SBCL class initialization defines the accessors first, so a method added after that (mito's
+    // INITIALIZE-INSTANCE :AROUND adds relational readers) wins; in dotcl DEFCLASS defines them once
+    // the class exists. The DEFMETHOD forms stay at top level, between the save and the restore, so
+    // their definition sources are recorded as before.
+    [ThreadStatic] private static Dictionary<(GenericFunction, LispClass), LispMethod>? s_savedHookMethods;
+
+    private static (GenericFunction, LispClass)? HookKey(LispObject fnName, LispObject className, LispObject setfP)
+    {
+        if (fnName is not Symbol fn || className is not Symbol cn) return null;
+        if (FindClassOrNil(cn) is not LispClass cls || cls.Metaclass == null) return null;
+        var f = setfP is Nil ? fn.Function : fn.SetfFunction;
+        return f is GenericFunction gf ? (gf, cls) : null;
+    }
+
+    /// <summary>Set aside the unqualified method of the generic function named FN (or (SETF FN)
+    /// when SETFP is true) that is specialized on the class NAME names and is not an accessor
+    /// method, when that class has a metaclass of its own.</summary>
+    public static LispObject ClassHookSave(LispObject fnName, LispObject className, LispObject setfP)
+    {
+        if (HookKey(fnName, className, setfP) is not { } key) return Nil.Instance;
+        foreach (var m in key.Item1.Methods)
+            if (m.Qualifiers.Length == 0 && m.AccessorSlot == null
+                && Array.IndexOf(m.Specializers, key.Item2) >= 0)
+            {
+                (s_savedHookMethods ??= new())[key] = m;
+                return T.Instance;
+            }
+        return Nil.Instance;
+    }
+
+    /// <summary>Put back the method ClassHookSave set aside, replacing the accessor method DEFCLASS
+    /// defined on the same specializer.</summary>
+    public static LispObject ClassHookRestore(LispObject fnName, LispObject className, LispObject setfP)
+    {
+        if (HookKey(fnName, className, setfP) is not { } key) return Nil.Instance;
+        if (s_savedHookMethods == null || !s_savedHookMethods.TryGetValue(key, out var m)) return Nil.Instance;
+        s_savedHookMethods.Remove(key);
+        AddMethodProtocol(key.Item1, m);
+        key.Item1.RecomputeAccessorFlags();
+        return T.Instance;
+    }
+
     public static LispObject RegisterAccessorMethod(LispObject gfObj, LispObject clsObj, LispObject slotNameObj)
     {
         if (gfObj is GenericFunction gf && clsObj is LispClass cls && slotNameObj is Symbol slotName)
@@ -901,7 +966,7 @@ public static partial class Runtime
                 {
                     int at = Array.IndexOf(m.Specializers, cls);
                     if (m.Qualifiers.Length == 0 && at >= 0)
-                    { m.AccessorSlot = slotd; classPosition = at; cls.AccessorMethods.Add((gf, m)); break; }
+                    { m.AccessorSlot = slotd; classPosition = at; cls.AddAccessorMethod(gf, m); break; }
                 }
             // The AccessorSlot tag is what RecomputeAccessorFlags keys on; the method
             // was already added (with AccessorSlot null then), so recompute now.
@@ -1410,20 +1475,41 @@ public static partial class Runtime
     /// hard to place.</summary>
     private static LispObject InvokeAroundCombination(
         GenericFunction gf, CachedDispatch cached, List<LispMethod> primary, LispObject[] args)
-        => InvokeAroundCombination(gf, cached.Around, cached.Before, primary, cached.After, args);
+    {
+        var fallback = cached.AroundFallback;
+        if (fallback == null || !ReferenceEquals(primary, cached.Primary))
+        {
+            var made = new StandardCombinationFallback(gf, cached.Before, primary, cached.After).Run;
+            // Only the entry's own primary list is remembered; a per-call chain (EQL) is not.
+            if (!ReferenceEquals(primary, cached.Primary)) fallback = made;
+            else fallback = cached.AroundFallback = made;
+        }
+        return InvokeAroundCombination(gf, cached.Around, cached.Before, primary, cached.After, args, fallback);
+    }
+
+    private sealed class StandardCombinationFallback
+    {
+        private readonly GenericFunction _gf;
+        private readonly List<LispMethod> _before, _primary, _after;
+        public StandardCombinationFallback(GenericFunction gf, List<LispMethod> before,
+                                           List<LispMethod> primary, List<LispMethod> after)
+        { _gf = gf; _before = before; _primary = primary; _after = after; }
+        public LispObject Run(LispObject[] a) => InvokeStandardCombination(_gf, _before, _primary, _after, a);
+    }
 
     /// <summary>As above, for the cache-miss path, which holds the four method lists
     /// in locals rather than in a cache entry.</summary>
     private static LispObject InvokeAroundCombination(
         GenericFunction gf, List<LispMethod> around, List<LispMethod> before,
-        List<LispMethod> primary, List<LispMethod> after, LispObject[] args)
+        List<LispMethod> primary, List<LispMethod> after, LispObject[] args,
+        Func<LispObject[], LispObject>? fallback = null)
     {
         var savedGf = _currentGF;
         _currentGF = gf;
         try
         {
             return InvokeWithNextMethods(around, 0, args,
-                       a => InvokeStandardCombination(gf, before, primary, after, a));
+                       fallback ?? new StandardCombinationFallback(gf, before, primary, after).Run);
         }
         finally
         {

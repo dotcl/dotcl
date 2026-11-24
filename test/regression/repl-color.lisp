@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; Colour in the REPL: the prompt, the value a form returned, warnings and
 ;;; errors, each painted with its own escape sequence, and none of it when the
 ;;; output is not a terminal or when NO_COLOR or TERM=dumb says not to.

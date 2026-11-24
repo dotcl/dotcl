@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The element buffer of a declared SIMPLE-ARRAY is fetched once per binding.
 ;;;
 ;;; AREF on a local declared (simple-array <integer type> (*)) used to call
@@ -303,14 +304,9 @@
 ;;; binding lives, which is sound only while that buffer object cannot be
 ;;; swapped. CLHS says a simple array is neither adjustable nor fill-pointered,
 ;;; so it could not be. The declarations below are false (TYPEP answers NIL
-;;; for an adjustable or fill-pointered vector), but dotcl's TYPEP used to call
-;;; the adjustable one simple, so code written against that must keep reading
-;;; and writing the right elements rather than a stale buffer.
-;;;
-;;; Both of these silently lost the write before the fetch learned to decline:
-;;; ADJUST-ARRAY and VECTOR-PUSH-EXTEND each replace the buffer object, the
-;;; write inside went to the replaced one, and a read inside disagreed with a
-;;; read outside about the same element. Neither signalled.
+;;; for an adjustable or fill-pointered vector). Code that ran with them used
+;;; to be read through a per-element helper at (safety 0); now the binding
+;;; signals a TYPE-ERROR at every safety, so a replaced buffer is never read.
 
 (defun %abh-adjust-mid-binding (v)
   (declare (type (simple-array (unsigned-byte 8) (*)) v)
@@ -320,13 +316,16 @@
     (setf (aref v 1) 42)
     (list before (aref v 1))))
 
-(deftest array-backing-hoist.adjustable-buffer-is-replaced
+;; An adjustable vector is not the declared SIMPLE-ARRAY, so even at (safety 0) the
+;; binding refuses it where it is bound. That is what keeps the buffer from being
+;; replaced under the hoisted reference: the body never runs, and the vector is
+;; left as it was.
+(deftest-emitting-only array-backing-hoist.adjustable-buffer-is-replaced
   (let ((v (make-array 4 :element-type '(unsigned-byte 8)
                          :adjustable t :initial-element 7)))
-    (let ((inside (%abh-adjust-mid-binding v)))
-      ;; The write must be visible outside: same object, same element.
-      (list inside (aref v 1) (length v))))
-  ((7 42) 42 8))
+    (list (handler-case (%abh-adjust-mid-binding v) (type-error () :type-error))
+          (aref v 1) (length v)))
+  (:type-error 7 4))
 
 (defun %abh-push-mid-binding (v)
   (declare (type (simple-array (unsigned-byte 8) (*)) v)
@@ -336,13 +335,13 @@
     (setf (aref v 0) 42)
     (list before (aref v 0))))
 
-(deftest array-backing-hoist.fill-pointer-buffer-is-replaced
+(deftest-emitting-only array-backing-hoist.fill-pointer-buffer-is-replaced
   (let ((v (make-array 2 :element-type '(unsigned-byte 8)
                          :fill-pointer 0 :adjustable t)))
     (setf (aref v 0) 7)
-    (let ((inside (%abh-push-mid-binding v)))
-      (list inside (aref v 0) (fill-pointer v))))
-  ((7 42) 42 6))
+    (list (handler-case (%abh-push-mid-binding v) (type-error () :type-error))
+          (aref v 0) (fill-pointer v)))
+  (:type-error 7 0))
 
 ;; The control: the same shape on a vector whose storage really cannot move
 ;; must be unaffected, which is what says the two tests above isolate the

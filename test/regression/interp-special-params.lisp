@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A lambda parameter whose name is globally special (DEFVAR, or a standard
 ;;; variable like *PACKAGE*) must be bound DYNAMICALLY on both evaluator paths.
 ;;;

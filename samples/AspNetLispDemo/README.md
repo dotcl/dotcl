@@ -14,7 +14,7 @@ $ bin/Debug/net10.0/AspNetLispDemo.exe
 [aspnet] running on http://localhost:5180
 
 $ curl http://localhost:5180/api/hello
-"hello from lisp"
+hello from lisp
 
 $ curl http://localhost:5180/api/async-hello
 hello from async lisp

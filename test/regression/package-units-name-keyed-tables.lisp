@@ -93,7 +93,7 @@
                     (and plist (getf plist :line))))))
 
 (deftest package-units-defpackage-source-own-unit
-  (let ((dir (regression-temp-dir)))
+  (let ((dir (regression-temp-dir/)))
     (punt-in *punt-a* (lambda () (load (punt-source dir "punt-a-pkg.lisp" 0))))
     (punt-in *punt-b* (lambda () (load (punt-source dir "punt-b-pkg.lisp" 4))))
     (let ((before (list (punt-package-line *punt-a*) (punt-package-line *punt-b*))))

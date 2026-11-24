@@ -74,8 +74,8 @@
 
 (when (emitting-mode-p)
   (deftest function-lambda-list-anonymous.from-fasl
-    (let ((src "fla-tmp.lisp")
-          (fasl "fla-tmp.fasl"))
+    (let ((src (regression-temp-file "fla-tmp.lisp"))
+          (fasl (regression-temp-file "fla-tmp.fasl")))
       (unwind-protect
            (progn
              (with-open-file (s src :direction :output :if-exists :supersede)

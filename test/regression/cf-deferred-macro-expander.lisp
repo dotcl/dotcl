@@ -7,7 +7,7 @@
 (defmacro cfdme-counted (x) (incf *cfdme-expansions*) x)
 
 (defun %cfdme-compile (name lines)
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames (format nil "~a.lisp" name) dir))
          (fasl (merge-pathnames (format nil "~a.fasl" name) dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)
@@ -39,7 +39,7 @@
 
 ;; LOAD of source: the macro works right after its definition.
 (deftest cf-deferred-macro-expander.load-source
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "cfdme-c.lisp" dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (write-line "(defmacro cfdme-c-m (a b) `(list ,b ,a))" s)

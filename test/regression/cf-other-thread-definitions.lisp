@@ -21,7 +21,7 @@
   1)
 
 (deftest-compiled-only cf-other-thread-definitions.kept
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "cfot.lisp" dir))
          (fasl (merge-pathnames "cfot.fasl" dir)))
     (setf *cfot-expanding* nil *cfot-go* nil)

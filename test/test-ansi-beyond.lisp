@@ -1,8 +1,9 @@
 ;;; The ansi-test "beyond-ansi" tests: behaviour the standard does not require
 ;;; (an error for a malformed special form, an invalid declaration or type
 ;;; specifier). gclload2.lsp does not load them, so the ANSI runs never see them.
-;;; The failure count is a measurement, not a gate: SBCL fails some of the same
-;;; tests. Usage: make test-ansi-beyond
+;;; SBCL fails some of the same tests, so the known failures are listed in
+;;; test/ansi-beyond-expected-failures.lsp; a failure outside that list is reported
+;;; and makes the run exit 1. Usage: make test-ansi-beyond
 
 (load "test/test-ansi-cat.lisp")
 
@@ -18,4 +19,9 @@
 
 (in-package :cl-test)
 (let ((*load-pathname* nil) (*load-truename* nil))
-  (rt:do-tests))
+  (let ((ok (progn (rt:do-tests :expected-failures "test/ansi-beyond-expected-failures.lsp")
+                   (null rt::*unexpected-failures*))))
+    (format t "~&beyond-ansi: ~:[UNEXPECTED FAILURES~;ok -- the failing set is the one in test/ansi-beyond-expected-failures.lsp~]~%" ok)
+    (when rt::*unexpected-successes*
+      (format t "beyond-ansi: these now pass and can leave the list: ~{~A~^ ~}~%" rt::*unexpected-successes*))
+    (unless ok (dotcl:exit :code 1))))

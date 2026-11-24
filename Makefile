@@ -7,7 +7,7 @@ DOTCL_LISP ?= ros -L sbcl-bin run
 STDBUF ?=
 SETSID ?= $(shell which setsid 2>/dev/null)
 
-.PHONY: refresh-fasls call-coverage regression-time test-random-forms test-random-nightly test-random-type-prop il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-reader-corpus test-coverage test-ansi-all test-ansi-gate library-status library-status-tests test-library-status-dists test-ansi-full test-ansi-extra test-ansi-beyond test-regression test-regression-interp test-regression-emitfree refresh-quicklisp-contrib test-ci-scripts test-pack-nuspec test-pack-library-e2e test-pack-library-previous test-dist-package-e2e test-save-class-lib test-plugin-host-demo test-samples test-project-compose test-project-core-build test-gc-stress test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check seed-macro-check cross-compile-seed loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotnet-cs contrib-dotcl-jitdisasm gen-char-names
+.PHONY: refresh-fasls call-coverage regression-time test-random-forms test-random-nightly test-random-type-prop il-parity il-parity-accept all build build-ns2 check-contrib-freshness run clean repl test-fasl-shape test-core-bytes test-host-api test-cli-exit test-reader-corpus test-coverage test-ansi-all test-ansi-gate library-status library-status-tests test-library-status-dists test-ansi-full test-ansi-extra test-ansi-beyond test-regression test-regression-interp test-regression-emitfree refresh-quicklisp-contrib test-ci-scripts test-pack-nuspec test-pack-library-e2e test-pack-library-previous test-dist-package-e2e test-save-class-lib test-plugin-host-demo test-samples test-project-compose test-project-core-build test-sigint-repl test-gc-stress test-mop ilverify update-ansi-state commit-ansi-state cross-compile selfhost-check selfhost-test seed-install seed-check seed-macro-check cross-compile-seed loc publish pack install setup-ansi-test setup-asdf setup-quicklisp setup-cl-bench bench bench-state bench-survey compile-asdf-fasl compile-asdf-fasls compile-quicklisp-fasl compile-core-fasl compile-contrib-fasls contrib-dotnet-cs contrib-dotcl-jitdisasm gen-char-names
 
 # Source files for cross-compile. Listed once; the recipe and dependency
 # tracking both reference this so adding a file is a single-edit change.
@@ -131,6 +131,7 @@ endef
 # the interpreter, so test-regression-interp needs it too.
 test-regression: build $(DOTCL_ROOT)compiler/cil-out.sil refresh-fasls
 	@echo "=== Running dotcl regression tests ==="
+	@test ! -f $(DOTCL_ROOT)ci/check-test-paths.sh || bash $(DOTCL_ROOT)ci/check-test-paths.sh
 	$(TREE_STAMP)
 	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/regression/run.lisp
 
@@ -209,6 +210,14 @@ test-ci-scripts:
 	sh $(DOTCL_ROOT)test/bench-gate/check.sh $(DOTCL_ROOT)
 	sh $(DOTCL_ROOT)test/ci/prune-nuget.sh $(DOTCL_ROOT)
 	sh $(DOTCL_ROOT)test/ci/startup-time.sh $(DOTCL_ROOT)
+	sh $(DOTCL_ROOT)test/ci/set-version.sh $(DOTCL_ROOT)
+	sh $(DOTCL_ROOT)test/ci/run-target.sh $(DOTCL_ROOT)
+	bash $(DOTCL_ROOT)test/ci/check-run-manifest.sh
+	sh $(DOTCL_ROOT)test/ci/sync-contrib-copies.sh $(DOTCL_ROOT)
+	sh $(DOTCL_ROOT)test/ci/ansi-gate-empty-category.sh $(DOTCL_ROOT)
+	sh $(DOTCL_ROOT)test/ci/check-script-refs-test.sh $(DOTCL_ROOT)
+	sh $(DOTCL_ROOT)test/ci/lane-emitfree-files-test.sh $(DOTCL_ROOT)
+	DOTCL_LISP="$(DOTCL_LISP)" sh $(DOTCL_ROOT)test/ci/cross-compile-deterministic.sh $(DOTCL_ROOT)
 
 test-pack-nuspec: build
 	@echo "=== Running pack nuspec checks ==="
@@ -225,7 +234,7 @@ test-pack-library-e2e: build $(DOTCL_ROOT)compiler/dotcl.core
 # The same, with the library packed by a released dotcl (installed from nuget.org)
 # and loaded by this one: the old fasls have to load and run here as they are.
 # Pinned like the seed; move it to the newest release when one ships.
-PREVIOUS_DOTCL_VERSION ?= 0.1.36
+PREVIOUS_DOTCL_VERSION ?= 0.1.37
 
 test-pack-library-previous: build $(DOTCL_ROOT)compiler/dotcl.core
 	@echo "=== Running library package check (packed by dotcl $(PREVIOUS_DOTCL_VERSION)) ==="
@@ -263,7 +272,11 @@ test-save-class-lib: build
 # the package layout the targets resolve against and builds a project twice: once
 # with a dependency that cannot be found (the message has to name the remedy) and
 # once with DotclAsdSearchPath set (it has to build).
-test-project-core-build: build $(DOTCL_ROOT)compiler/dotcl.core compile-contrib-fasls
+# Ctrl-C in the REPL on a real pty (Unix; contrib/dotcl-posix). Starts a second runtime.
+test-sigint-repl: build $(DOTCL_ROOT)compiler/cil-out.sil
+	$(SETSID) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $(DOTCL_ROOT)test/sigint-repl.lisp
+
+test-project-core-build: build $(DOTCL_ROOT)compiler/dotcl.core compile-contrib-fasls compile-asdf-fasl
 	@echo "=== Running project-core MSBuild task checks ==="
 	sh $(DOTCL_ROOT)test/project-core-build/check.sh $(DOTCL_ROOT)
 
@@ -487,6 +500,15 @@ test-ansi-all: build setup-ansi-test
 	: 'Drop the previous run first, so a category this run never reaches reads'; \
 	: 'as untested rather than as whatever an earlier run left there.'; \
 	for cat in $(ANSI_CATEGORIES); do rm -f $(ANSI_OUT)/ansi-$$cat.txt; done; \
+	: 'One process per category, 22 of them. Each used to be a dotnet run (MSBuild evaluation, a few'; \
+	: 'seconds) loading the 23 MB sil (about two seconds) before reading its first test; the built'; \
+	: 'runtime started from dotcl.core, as a shipped dotcl does, is ready in a fraction of a second.'; \
+	: 'The core is used when it is at least as new as the sil; otherwise the old command. (A core built against other runtime source says so on stderr when it starts.)'; \
+	runner="dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil"; \
+	if [ -f $(DOTCL_ROOT)runtime/bin/Debug/net10.0/runtime.dll ] && [ -f $(DOTCL_ROOT)compiler/dotcl.core ] \
+	   && [ ! $(DOTCL_ROOT)compiler/cil-out.sil -nt $(DOTCL_ROOT)compiler/dotcl.core ]; then \
+		runner="dotnet $(DOTCL_ROOT)runtime/bin/Debug/net10.0/runtime.dll --core $(DOTCL_ROOT)compiler/dotcl.core"; \
+	fi; \
 	total_pass=0; total_fail=0; total_tests=0; total_alloc=0; total_gen0=0; total_gen1=0; total_gen2=0; \
 	: 'A category that times out or crashes has counted nothing, and a run that'; \
 	: 'counted nothing must not end as green as one that counted everything.'; \
@@ -511,7 +533,9 @@ test-ansi-all: build setup-ansi-test
 		echo "            (- (nth 4 s1) (nth 4 s0)))))" >> $$tmp; \
 		t0=$$(date +%s); \
 		outfile=$(ANSI_OUT)/ansi-$$cat.txt; \
-		$(STDBUF) $(SETSID) timeout 360 dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil $$tmp > $$outfile 2>&1; \
+		: 'Ceiling per category. data-and-control-flow has two tests (LABELS.20, FLET.20) that compile a 1024-parameter function under safety 3: 8 s each with the core, 19 s each (9.9 GB) when the compiler is loaded from the SIL, as the full run does; with the full run on a busy runner that crossed 360 s.'; \
+		limit=$(ANSI_CATEGORY_TIMEOUT); [ "$$cat" = data-and-control-flow ] && limit=$(ANSI_DCF_TIMEOUT); \
+		$(STDBUF) $(SETSID) timeout $$limit $$runner $$tmp > $$outfile 2>&1; \
 		exitcode=$$?; \
 		t1=$$(date +%s); \
 		elapsed=$$((t1 - t0)); \
@@ -702,10 +726,24 @@ commit-ansi-state: update-ansi-state
 	git add -f $(DOTCL_ROOT)ansi-state.json
 	git commit -m "Update ansi-state.json"
 
+# The ansi-test revision every fresh clone is moved to, so that fetching it is reproducible (the
+# upstream branch moves, and ansi-state.json's totals follow the revision). To update it: check out
+# the new revision in ansi-test/, run `make test-ansi-full`, put the new hash here and refresh
+# ansi-state.json in the same commit.
+ANSI_CATEGORY_TIMEOUT ?= 360
+ANSI_DCF_TIMEOUT ?= 900
+ANSI_TEST_REV ?= ca06bd919661af162c67407c9d994e881870bdb3
+
 setup-ansi-test:
 	@if [ ! -d $(DOTCL_ROOT)ansi-test ]; then \
 		echo "Cloning ansi-test (gitlab.common-lisp.net)..."; \
-		git clone https://gitlab.common-lisp.net/ansi-test/ansi-test.git $(DOTCL_ROOT)ansi-test; \
+		for try in 1 2 3; do \
+			git clone https://gitlab.common-lisp.net/ansi-test/ansi-test.git $(DOTCL_ROOT)ansi-test && break; \
+			echo "clone failed (attempt $$try of 3)"; \
+			[ $$try -lt 3 ] && sleep 10; \
+		done; \
+		[ -d $(DOTCL_ROOT)ansi-test/.git ] || exit 1; \
+		git -C $(DOTCL_ROOT)ansi-test checkout -q $(ANSI_TEST_REV) || exit 1; \
 	else \
 		echo "ansi-test/ already exists"; \
 	fi
@@ -744,7 +782,12 @@ setup-asdf:
 	@# cloning a matching asdf.
 	@if [ ! -d $(DOTCL_ROOT)asdf ]; then \
 		echo "Cloning asdf..."; \
-		git clone --branch $(ASDF_BRANCH) https://github.com/dotcl/asdf.git $(DOTCL_ROOT)asdf; \
+		for try in 1 2 3; do \
+			git clone --branch $(ASDF_BRANCH) https://github.com/dotcl/asdf.git $(DOTCL_ROOT)asdf && break; \
+			echo "clone failed (attempt $$try of 3)"; \
+			[ $$try -lt 3 ] && sleep 10; \
+		done; \
+		[ -d $(DOTCL_ROOT)asdf/.git ] || exit 1; \
 	else \
 		cur=$$(git -C $(DOTCL_ROOT)asdf rev-parse --abbrev-ref HEAD 2>/dev/null); \
 		if [ -z "$$cur" ]; then \
@@ -795,7 +838,12 @@ setup-quicklisp:
 	@# check that the shipping branch contains the PR branch.
 	@if [ ! -d $(DOTCL_ROOT)quicklisp-client ]; then \
 		echo "Cloning quicklisp-client..."; \
-		git clone --branch $(QUICKLISP_CLIENT_BRANCH) https://github.com/dotcl/quicklisp-client.git $(DOTCL_ROOT)quicklisp-client; \
+		for try in 1 2 3; do \
+			git clone --branch $(QUICKLISP_CLIENT_BRANCH) https://github.com/dotcl/quicklisp-client.git $(DOTCL_ROOT)quicklisp-client && break; \
+			echo "clone failed (attempt $$try of 3)"; \
+			[ $$try -lt 3 ] && sleep 10; \
+		done; \
+		[ -d $(DOTCL_ROOT)quicklisp-client/.git ] || exit 1; \
 	else \
 		cur=$$(git -C $(DOTCL_ROOT)quicklisp-client rev-parse --abbrev-ref HEAD 2>/dev/null); \
 		if [ -z "$$cur" ]; then \
@@ -842,6 +890,7 @@ QUICKLISP_FASL = $(if $(wildcard $(DOTCL_ROOT)contrib/quicklisp/quicklisp.lisp),
 refresh-fasls: build $(DOTCL_ROOT)compiler/cil-out.sil
 	@sh $(DOTCL_ROOT)scripts/drop-stale-fasls.sh $(RUNTIME_SOURCE_ID) $(REFRESH_FASLS) $(QUICKLISP_FASL)
 	@$(MAKE) --no-print-directory $(REFRESH_FASLS) refresh-quicklisp-contrib $(QUICKLISP_FASL)
+	@sh $(DOTCL_ROOT)scripts/sync-contrib-copies.sh $(DOTCL_ROOT) $(CONTRIB_NAMES)
 
 # contrib/quicklisp/ is generated (setup-quicklisp, compile-quicklisp-fasl) and
 # gitignored, so a change to how it is generated -- scripts/build-quicklisp.sh, or
@@ -1018,7 +1067,15 @@ PARITY_PASSES  ?= 5
 # the floor estimate, so a real slowdown stays over the limit through all of
 # them and only a run that drew no fast process is rescued. A run that is
 # within its limits after the first passes costs nothing extra.
-PARITY_EXTRA_PASSES ?= 8
+#
+# Sixteen: on the Linux laptop string-walk and string-walk-vector ran at the
+# slow group in about 70 percent of the processes (21 of 30 in one recorded
+# series, 42 ms or 59 ms against a C# side that stays at 88 ms). The chance that
+# none of n processes draws the fast group is 0.7^n: 1.2 percent at the 13 that
+# eight extra passes give, 0.08 percent at 21. An unlucky run costs at most
+# sixteen more processes of about fifteen seconds each; a lucky one stops at the
+# first fast process.
+PARITY_EXTRA_PASSES ?= 16
 
 # The key bench/gate/check-ratios.sh looks the baselines up under. A ratio belongs to
 # one machine, not to a platform: the self-hosted CI runners and the Linux
@@ -1105,7 +1162,7 @@ regression-time regression-time-baseline: build $(DOTCL_ROOT)compiler/cil-out.si
 ILP_DIR      = $(DOTCL_ROOT)bench/il-parity
 ILP_TOOL_EXE = $(ILP_DIR)/tool/bin/Release/net10.0/$(if $(filter win-%,$(HOST_RID)),ilparity.exe,ilparity)
 ILP_REF_DLL  = $(ILP_DIR)/bin/Release/net10.0/IlParityRefs.dll
-ILP_CASES    = stack hash heap ring tokenizer vec2
+ILP_CASES    = stack hash heap ring tokenizer vec2 bits
 ILP_COUNTS   = $(BENCH_TMP)/il-parity-counts.tsv
 
 .PHONY: test-random-forms il-parity il-parity-accept
@@ -1138,7 +1195,12 @@ il-parity-accept:
 setup-cl-bench:
 	@if [ ! -d $(DOTCL_ROOT)cl-bench ]; then \
 		echo "Cloning benkard/cl-bench..."; \
-		git clone https://github.com/benkard/cl-bench.git $(DOTCL_ROOT)cl-bench; \
+		for try in 1 2 3; do \
+			git clone https://github.com/benkard/cl-bench.git $(DOTCL_ROOT)cl-bench && break; \
+			echo "clone failed (attempt $$try of 3)"; \
+			[ $$try -lt 3 ] && sleep 10; \
+		done; \
+		[ -d $(DOTCL_ROOT)cl-bench/.git ] || exit 1; \
 	else \
 		echo "cl-bench/ already exists"; \
 	fi
@@ -1399,7 +1461,16 @@ endef
 $(foreach n,$(CONTRIB_NAMES),$(eval $(call CONTRIB_ORDER_RULE,$(n))))
 
 $(DOTCL_ROOT)contrib/%.fasl: $(DOTCL_ROOT)contrib/%.lisp $(DOTCL_ROOT)compiler/cil-out.sil
-	$(call PACK_PATHMAP,contrib/$(firstword $(subst /, ,$*)),$(firstword $(subst /, ,$*))) dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil --eval '(progn $(PACK_XREF_OFF) (compile-file "$<"))'
+	@: 'About thirty contribs are compiled one process each. Starting each from the built runtime and'; \
+	: 'dotcl.core (as a shipped dotcl starts) skips the MSBuild evaluation of a dotnet run and the load'; \
+	: 'of the 23 MB sil; the core is used when it is at least as new as the sil.'; \
+	runner="dotnet run --project $(DOTCL_ROOT)runtime/runtime.csproj -- --asm $(DOTCL_ROOT)compiler/cil-out.sil"; \
+	if [ -f $(DOTCL_ROOT)runtime/bin/Debug/net10.0/runtime.dll ] && [ -f $(DOTCL_ROOT)compiler/dotcl.core ] \
+	   && [ ! $(DOTCL_ROOT)compiler/cil-out.sil -nt $(DOTCL_ROOT)compiler/dotcl.core ]; then \
+		runner="dotnet $(DOTCL_ROOT)runtime/bin/Debug/net10.0/runtime.dll --core $(DOTCL_ROOT)compiler/dotcl.core"; \
+	fi; \
+	echo "$$runner --eval compile-file $<"; \
+	$(call PACK_PATHMAP,contrib/$(firstword $(subst /, ,$*)),$(firstword $(subst /, ,$*))) $$runner --eval '(progn $(PACK_XREF_OFF) (compile-file "$<"))'
 	@n=$$(echo '$*' | cut -d/ -f1); \
 	if [ -d "$(DOTCL_ROOT)runtime/contrib/$$n" ]; then \
 	  cp "$@" "$(DOTCL_ROOT)runtime/contrib/$$n/$$n.fasl"; \

@@ -90,11 +90,11 @@
 
 (deftest simple-array-predicates.type-of-names
   (mapcar #'type-of (append (%sap-strings) (%sap-vectors t 0) (%sap-vectors 'bit 1)))
-  ;; The T and simple bit vectors carry their dimension, as in SBCL.
+  ;; Every vector type carries its dimension, as in SBCL.
   ((simple-array character (4)) (simple-array character (4))
    (vector character 4) (vector character 4) (vector character 4)
    (simple-vector 4) (vector t 4) (vector t 4) (vector t 4)
-   (simple-bit-vector 4) bit-vector bit-vector bit-vector))
+   (simple-bit-vector 4) (bit-vector 4) (bit-vector 4) (bit-vector 4)))
 
 ;; ADJUST-ARRAY of a non-adjustable array onto a displacement returns a new
 ;; array that is displaced without being adjustable: still not simple.

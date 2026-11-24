@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A READ that uses no #n= / #n# does not build the tables for them.
 ;;;
 ;;; Reader held two Dictionary fields for the share labels and initialised both

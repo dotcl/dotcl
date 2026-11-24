@@ -12,9 +12,13 @@ bench/ledger/remote.sh MACHINE          # the same on a machine from machines.ts
 LEDGER_ONLY='^coalton/' LEDGER_ROUNDS=1 bench/ledger/run.sh
 ```
 
-Needs a Release runtime and `compiler/dotcl.core` in the tree
-(`make cross-compile compile-asdf-fasl compile-quicklisp-fasl bench-build compile-core-fasl`), `ros` with `sbcl-bin`
-2.6.8, and a Quicklisp home for dotcl. `setup` clones cl-bench and Coalton into
+Needs a Release runtime and `compiler/dotcl.core` in the tree, built by `bench/ledger/build.sh`
+(it builds the runtime, then rebuilds `dotcl.core` and the asdf, quicklisp and contrib fasls that
+depend on the runtime source; `bench/ledger/build.sh check` only checks, and `run.sh` checks before
+it measures, so a core left from an earlier commit is refused instead of measured), `ros` with
+`sbcl-bin` 2.6.8, and a Quicklisp home for dotcl whose dotcl dist is at least the version in
+`dotcl-dist-min.txt` (`LEDGER_DOTCL_DIST_MIN` overrides it) and loads `float-features`; `run.sh check`
+reports the version it found. `setup` clones cl-bench and Coalton into
 the work directory and builds the two ironclad source trees.
 
 ## Cold and steady
@@ -26,25 +30,30 @@ rulers keep the one warm-up and minimum of five runs they always used. dotcl and
 SBCL alternate `LEDGER_ROUNDS` times (3) and the fastest cold value of each side
 is kept.
 
-Steady is a separate measurement in one fresh process per side. The benchmark
-is repeated in that process until a stability window is reached: the last
-`LEDGER_STEADY_WINDOW` consecutive runs (3) must all be within
-`LEDGER_STEADY_TOLERANCE` (0.05, so 5%) of the smallest of them, and at least
-`LEDGER_STEADY_MIN_RUNS` (10) runs must have been taken. The minimum run count
-matters because .NET's tiered JIT can produce three early runs that agree while
-it has not reached its final tier yet. The window must also start at least
-`LEDGER_STEADY_MIN_SECONDS` (3) seconds after the benchmark's files finished
-loading. For the first two to three seconds after loading cl-bench, the .NET
-background tiered-JIT thread keeps recompiling the compiler's own hot methods,
-so two cores are busy and the clock is lower; short benchmarks would otherwise
-reach ten stable runs on that slow plateau. The minimum is taken once per
-process, so a process that measures several benchmarks pays it only before the
-first ones. The minimum of the stable window and the total number of runs taken
-are recorded. Repeating stops early when the minimum time has passed and
-`LEDGER_STEADY_MAX_RUNS` (20) further runs have been taken, or when
-`LEDGER_STEADY_MAX_SECONDS` (120) is reached; a row that never stabilises is
-shown with a `steady: not stable` note. The same detection is used on dotcl and
-SBCL, so the ratio compares like with like.
+Steady is a separate measurement in one fresh process per side. The steady
+value is the warm-up-free plateau: the fastest run of the first window of
+`LEDGER_STEADY_WINDOW` (3) consecutive runs that are all within
+`LEDGER_STEADY_TOLERANCE` (0.05, so 5%) of the smallest of them, taken after
+`LEDGER_STEADY_MIN_RUNS` (10) runs and `LEDGER_STEADY_MIN_SECONDS` (8) seconds,
+and not still dropping.
+
+The benchmark is repeated in that process until such a window is reached.
+Three rules keep the tiered JIT's slow early plateaus out of the value. The
+minimum run count and the minimum time (measured from the end of loading the
+benchmark's files, once per process) matter because .NET's tiered JIT can
+produce several early runs that agree while it has not reached its final code
+yet: a benchmark can sit on a plateau 20 to 200 percent slower than its final
+speed for the first one to four seconds, and a shorter minimum declared that
+plateau stable. The window is also rejected while it is still dropping: when
+the last window's fastest run is more than the tolerance below the fastest run
+of the window before it, the benchmark is still climbing to a faster tier.
+Every run's time is kept (the `TIMES` line of the steady output, in order), so
+a plateau can be read off afterwards. The minimum of the stable window and the
+total number of runs taken are recorded. Repeating stops early when the
+minimum time has passed and `LEDGER_STEADY_MAX_RUNS` (20) further runs have
+been taken, or when `LEDGER_STEADY_MAX_SECONDS` (120) is reached; a row that
+never stabilises is shown with a `steady: not stable` note. The same detection
+is used on dotcl and SBCL, so the ratio compares like with like.
 
 The two thresholds are set at the top of `run.sh` and can be overridden through
 the environment:

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A fasl that is itself a ReadyToRun image (a per-RID package ships
 ;;; asdf.fasl that way, under its own name) is loaded by path, so that its
 ;;; native code is used. Read into a byte array its code was ignored and every

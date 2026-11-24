@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Output on a binary DOTNET:TO-STREAM stream is buffered, as SBCL's socket
 ;;; streams are: it used to send every WRITE-BYTE on its own, so a TLS record
 ;;; written byte by byte (cl+ssl's Lisp BIO) to a peer that had just closed

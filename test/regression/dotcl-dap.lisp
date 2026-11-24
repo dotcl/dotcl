@@ -20,10 +20,26 @@
   (eval '(defun dap-test-caller (n) (let ((m (* n 10))) (1+ (dap-test-target n m))))))
 
 (defvar *dap-test-seq* 0)
+(defvar *dap-last-request* nil)
+
+(defun %dap-connect (port)
+  "Connect to the adapter on loopback, retrying until it accepts (an upper
+bound of a minute, so a slow start is waited out and a dead server still fails)."
+  (let ((deadline (+ (get-universal-time) 60)) (last nil))
+    (loop
+      (handler-case
+          (let ((socket (dotcl-bsd-sockets:tcp-connect "127.0.0.1" port :timeout 5)))
+            (setf (dotcl-bsd-sockets:sockopt-receive-timeout socket) 90)
+            (return socket))
+        (error (e)
+          (setf last e)
+          (when (> (get-universal-time) deadline) (error last))
+          (sleep 0.2))))))
 (defvar *dap-test-events* '())
 
 (defun %dap-send (stream command &rest arguments)
   (let ((seq (incf *dap-test-seq*)))
+    (setf *dap-last-request* (format nil "~A (seq ~D)" command seq))
     (dotcl-dap::write-message
      stream (list :obj "seq" seq "type" "request" "command" command
                   "arguments" (cons :obj arguments)))
@@ -88,13 +104,18 @@ came before it. The other events read on the way are kept for %DAP-EVENT."
         (setf *dap-test-events* (append (nreverse kept) *dap-test-events*))
         (values stopped (and (member (%dap-body stopped "threadId") started) t))))))
 
+(defvar *dap-top-id* nil)
+
 (defun %dap-scenario ()
   (let* ((server (progn (setf dotcl-dap:*log-stream* *dap-log*)
                         (dotcl-dap:start-server :port 0)))
-         (socket (dotcl-bsd-sockets:tcp-connect "127.0.0.1" (dotcl-dap:server-port server)
-                                                :timeout 5))
+         (socket (%dap-connect (dotcl-dap:server-port server)))
          (stream (progn
-                   (setf (dotcl-bsd-sockets:sockopt-receive-timeout socket) 10)
+                   ;; A reply is waited for up to 90 seconds: the adapter's code runs
+                   ;; for the first time here, on a loaded machine in a Debug build,
+                   ;; and one slow runner took more than 10 seconds for a single
+                   ;; request. The bound only matters when the adapter is dead.
+                   (setf (dotcl-bsd-sockets:sockopt-receive-timeout socket) 90)
                    (dotcl-bsd-sockets:socket-make-stream
                     socket :element-type '(unsigned-byte 8))))
          (out '())
@@ -172,6 +193,7 @@ came before it. The other events read on the way are kept for %DAP-EVENT."
                       (caller (find-if (lambda (f)
                                          (search "DAP-TEST-CALLER" (dotcl-dap::jget f "name")))
                                        frames)))
+                 (setf *dap-top-id* top)
                  (note :top-frame (first names))
                  (note :caller-frame (and caller (dotcl-dap::jget caller "name")))
                  (let* ((scope (aref (%dap-body (%dap-request stream "scopes" "frameId" top)
@@ -203,6 +225,12 @@ came before it. The other events read on the way are kept for %DAP-EVENT."
                                                 "success"))
                (note :not-stopped-after-continue
                      (not (member worker (dotcl-dap:stopped-threads))))
+               (let ((r (%dap-request stream "evaluate" "expression" "(+ 1 2)"
+                                      "frameId" *dap-top-id* "context" "hover")))
+                 (note :eval-stale (list (dotcl-dap::jget r "success")
+                                         (and (search "no longer valid"
+                                                      (or (dotcl-dap::jget r "message") ""))
+                                              t))))
                (note :worker-result (dotcl-thread:thread-join worker))
                (note :stop-log (%dap-wait-log "dotcl-dap: thread"))
                (note :disconnect (dotcl-dap::jget (%dap-request stream "disconnect") "success"))
@@ -222,7 +250,23 @@ came before it. The other events read on the way are kept for %DAP-EVENT."
 ;;; is the client of, and wait there for itself.
 (defun %dap-guard (scenario)
   (handler-case (funcall scenario)
-    (error (e) (push (princ-to-string e) *dap-client-errors*) nil)))
+    (error (e)
+      ;; Name the request the error came after and the events still unread,
+      ;; so a timeout says where the conversation stopped.
+      (push (format nil "~A [after request ~A; ~D unread events~@[: ~A~]]"
+                    e *dap-last-request* (length *dap-test-events*)
+                    (and *dap-test-events*
+                         (mapcar (lambda (m) (or (dotcl-dap::jget m "event")
+                                                 (dotcl-dap::jget m "command")))
+                                 *dap-test-events*)))
+            *dap-client-errors*)
+      ;; And what the adapter was doing: its own log and the threads alive now.
+      (push (format nil "adapter log: ~{~A~^ | ~}; threads: ~{~A~^, ~}"
+                    (last (ignore-errors (%dap-log-lines)) 12)
+                    (mapcar (lambda (th) (or (ignore-errors (dotcl-thread:thread-name th)) "?"))
+                            (ignore-errors (dotcl:all-threads))))
+            *dap-client-errors*)
+      nil)))
 
 (defvar *dap-result* (%dap-guard #'%dap-scenario))
 
@@ -260,6 +304,10 @@ came before it. The other events read on the way are kept for %DAP-EVENT."
   (list (%dap-get :eval-top) (%dap-get :eval-thread)
         (%dap-get :eval-no-frame) (%dap-get :eval-error))
   ("44" "\"dap-test-worker\"" "3" :failed))
+
+(deftest dotcl-dap.evaluate-stale-frame
+  (%dap-get :eval-stale)
+  (:false t))
 
 (deftest dotcl-dap.continue
   (list (%dap-get :continue) (%dap-get :worker-result))
@@ -337,9 +385,7 @@ came before it. The other events read on the way are kept for %DAP-EVENT."
 (defun dap-missing-call () (dap-no-such-runtime-fn 7))
 
 (defun %dap-open (server)
-  (let ((socket (dotcl-bsd-sockets:tcp-connect "127.0.0.1" (dotcl-dap:server-port server)
-                                               :timeout 5)))
-    (setf (dotcl-bsd-sockets:sockopt-receive-timeout socket) 10)
+  (let ((socket (%dap-connect (dotcl-dap:server-port server))))
     (dotcl-bsd-sockets:socket-make-stream socket :element-type '(unsigned-byte 8))))
 
 (defun %dap-join (thread &optional (seconds 20))
@@ -1086,3 +1132,40 @@ output."
 (deftest dotcl-dap.client-errors
   *dap-client-errors*
   nil)
+
+;;; A second client replaces the one attached: the first connection is closed
+;;; and the second is served, with the breakpoints of the first gone.
+(defun %dap-scenario-replace ()
+  (let* ((server (dotcl-dap:start-server :port 0))
+         (first-stream (%dap-open server))
+         (out '()))
+    (flet ((note (key value) (push (cons key value) out)))
+      (unwind-protect
+           (progn
+             (%dap-request first-stream "initialize" "adapterID" "dotcl")
+             (%dap-request first-stream "attach")
+             (note :first-works
+                   (dotcl-dap::jget (%dap-request first-stream "threads") "success"))
+             (let ((second-stream (%dap-open server)))
+               (unwind-protect
+                    (progn
+                      (note :first-closed
+                            (handler-case (progn (%dap-read first-stream) :open)
+                              (error () :closed)))
+                      (%dap-request second-stream "initialize" "adapterID" "dotcl")
+                      (note :second-attach
+                            (dotcl-dap::jget (%dap-request second-stream "attach") "success"))
+                      (note :second-works
+                            (dotcl-dap::jget (%dap-request second-stream "threads") "success"))
+                      (%dap-request second-stream "disconnect"))
+                 (ignore-errors (close second-stream)))))
+        (ignore-errors (close first-stream))
+        (dotcl-dap:stop-server server)))
+    (nreverse out)))
+
+(defvar *dap-result-replace* (%dap-guard #'%dap-scenario-replace))
+
+(deftest dotcl-dap.new-client-replaces-the-attached-one
+  (mapcar (lambda (k) (cdr (assoc k *dap-result-replace*)))
+          '(:first-works :first-closed :second-attach :second-works))
+  (t :closed t t))

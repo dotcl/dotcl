@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; When :ALLOW-OTHER-KEYS appears more than once, only the first one counts.
 ;;;
 ;;; CLHS 3.4.1.4.1: when a keyword is repeated, the LEFTMOST pair is the one used,

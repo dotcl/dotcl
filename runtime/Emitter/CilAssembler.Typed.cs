@@ -621,29 +621,27 @@ public partial class CilAssembler
             return;
         }
 
-        var typedDm = new DynamicMethod(f.Name + "_typed", TypedEntrySig.ReturnType(f.Sig),
-            TypedEntrySig.BodyParamTypes(f.Sig, f.SelfFree), typeof(CilAssembler).Module, true);
+        var typedDm = NewDm(f.Name + "_typed", TypedEntrySig.ReturnType(f.Sig),
+            TypedEntrySig.BodyParamTypes(f.Sig, f.SelfFree));
         var innerAsm = new CilAssembler();
         innerAsm._il = typedDm.GetILGenerator().ForLibrary();
         innerAsm._typedSelfMethod = typedDm;
         innerAsm.AssembleTypedBody(f);
         var typedEntryDm = TypedEntryMethod(f, typedDm,
-            () => new DynamicMethod(f.Name + "_typedw", TypedEntrySig.ReturnType(f.Sig),
-                                    TypedEntrySig.ParamTypes(f.Sig), typeof(CilAssembler).Module, true),
+            () => NewDm(f.Name + "_typedw", TypedEntrySig.ReturnType(f.Sig),
+                                    TypedEntrySig.ParamTypes(f.Sig)),
             m => ((DynamicMethod)m).GetILGenerator().ForLibrary());
 
         var shellTypes = new Type[n + 1];
         shellTypes[0] = typeof(LispFunction);
         for (int i = 0; i < n; i++) shellTypes[i + 1] = typeof(LispObject);
-        var shellDm = new DynamicMethod(f.Name + "_shell", typeof(LispObject), shellTypes,
-            typeof(CilAssembler).Module, true);
+        var shellDm = NewDm(f.Name + "_shell", typeof(LispObject), shellTypes);
         bool selfFramed = CanSelfFrame(f.Name, n, f.NoFrame);
         bool leaf = selfFramed && f.Generic == null && IsLeafSig(f.Sig) && IsTypedLeaf(f.Body);
         DynamicMethod? genericDm = null;
         if (f.Generic != null)
         {
-            genericDm = new DynamicMethod(f.Name + "_generic", typeof(LispObject), GenericBodyParamTypes(n),
-                typeof(CilAssembler).Module, true);
+            genericDm = NewDm(f.Name + "_generic", typeof(LispObject), GenericBodyParamTypes(n));
             var genAsm = new CilAssembler();
             genAsm._il = genericDm.GetILGenerator().ForLibrary();
             SetupGenericBody(genAsm, f, selfFramed, unit: true);
@@ -652,15 +650,14 @@ public partial class CilAssembler
         DynamicMethod? entryDm = null;
         if (CanTypedFrame(f.Name, n, f.NoFrame))
         {
-            entryDm = new DynamicMethod(f.Name + "_tentry", TypedEntrySig.ReturnType(f.Sig),
-                TypedEntrySig.ParamTypes(f.Sig), typeof(CilAssembler).Module, true);
+            entryDm = NewDm(f.Name + "_tentry", TypedEntrySig.ReturnType(f.Sig),
+                TypedEntrySig.ParamTypes(f.Sig));
             if (leaf) EmitLeafEntry(entryDm.GetILGenerator().ForLibrary(), f);
             else EmitTypedFramedEntry(entryDm.GetILGenerator().ForLibrary(), f, typedDm, unit: true);
         }
         if (leaf)
         {
-            var framedDm = new DynamicMethod(f.Name + "_shellf", typeof(LispObject), shellTypes,
-                typeof(CilAssembler).Module, true);
+            var framedDm = NewDm(f.Name + "_shellf", typeof(LispObject), shellTypes);
             EmitTypedShell(framedDm.GetILGenerator().ForLibrary(), f, typedDm, selfFramed, unit: true);
             EmitLeafShell(shellDm.GetILGenerator().ForLibrary(), f, entryDm!, framedDm);
         }

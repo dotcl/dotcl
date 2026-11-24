@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; WRITE-SEQUENCE has a two-argument direct entry (no argument array per call)
 ;;; alongside the variadic one that parses :start/:end. Both reach the same core,
 ;;; and the core resolves composite streams by recursing on the resolved stream

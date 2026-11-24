@@ -418,9 +418,9 @@ public static partial class Runtime
         if (et == "DOUBLE-FLOAT") return 8;
         int bits = et == "FIXNUM" ? 64 : 0;
         if (et.StartsWith("UNSIGNED-BYTE-", StringComparison.Ordinal))
-            int.TryParse(et.Substring("UNSIGNED-BYTE-".Length), out bits);
+            int.TryParse(et.Substring("UNSIGNED-BYTE-".Length), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out bits);
         else if (et.StartsWith("SIGNED-BYTE-", StringComparison.Ordinal))
-            int.TryParse(et.Substring("SIGNED-BYTE-".Length), out bits);
+            int.TryParse(et.Substring("SIGNED-BYTE-".Length), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out bits);
         if (bits < 1 || bits > 64) return 0;
         return bits <= 8 ? 1 : bits <= 16 ? 2 : bits <= 32 ? 4 : 8;
     }

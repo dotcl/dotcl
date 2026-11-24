@@ -1,3 +1,4 @@
+;;; regression: full-tier-only
 ;;; The REPL's history variables: CLHS 25.1.1's * ** ***, + ++ +++, / // ///
 ;;; and -.
 ;;;

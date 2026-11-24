@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; `dotcl pack` reads the nuspec version off the system definition.
 ;;;
 ;;; The other nuspec defaults (:description, :homepage, :source-control,

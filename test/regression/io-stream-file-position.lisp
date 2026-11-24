@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; FILE-POSITION on a character :IO file stream after writing.
 ;;;
 ;;; An :IO file stream reads through a position-tracking reader and writes

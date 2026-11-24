@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; An interpreted DEFUN must keep declarations OUTSIDE the implicit block.
 ;;;
 ;;; The %MINI-EVAL DEFUN case built the closure as

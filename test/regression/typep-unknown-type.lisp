@@ -49,7 +49,7 @@
 ;; type while that file is compiled, before the class itself exists.
 (defvar *tut-compile-time-result* nil)
 (deftest-compiled-only typep-unknown-type.compile-time-class
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "tut-ctc.lisp" dir))
          (fasl (merge-pathnames "tut-ctc.fasl" dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)

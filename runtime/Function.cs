@@ -157,16 +157,32 @@ public partial class LispFunction : LispObject
     // The global CilAssembler unit map only holds the holder weakly.
     internal object? RetainUnit;
 
-    // Direct-param delegates for 0-8 arg fast path (set by assembler for simple functions)
-    internal Func<LispObject>? _func0;
-    internal Func<LispObject, LispObject>? _func1;
-    internal Func<LispObject, LispObject, LispObject>? _func2;
-    internal Func<LispObject, LispObject, LispObject, LispObject>? _func3;
-    internal Func<LispObject, LispObject, LispObject, LispObject, LispObject>? _func4;
-    internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func5;
-    internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func6;
-    internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func7;
-    internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func8;
+    // Direct-param delegates for 0-8 arg fast path (set by assembler for simple functions).
+    // They sit in a table of their own, built on the first SetDirectDelegate: a closure
+    // (the common thing to allocate at run time) never has one, and holding nine empty
+    // fields cost every closure 72 bytes. _funcN reads and writes go through the table.
+    internal sealed class DirectTable
+    {
+        internal Func<LispObject>? F0;
+        internal Func<LispObject, LispObject>? F1;
+        internal Func<LispObject, LispObject, LispObject>? F2;
+        internal Func<LispObject, LispObject, LispObject, LispObject>? F3;
+        internal Func<LispObject, LispObject, LispObject, LispObject, LispObject>? F4;
+        internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? F5;
+        internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? F6;
+        internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? F7;
+        internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? F8;
+    }
+    internal DirectTable? _dt;
+    internal Func<LispObject>? _func0 { get => _dt?.F0; set => (_dt ??= new DirectTable()).F0 = value; }
+    internal Func<LispObject, LispObject>? _func1 { get => _dt?.F1; set => (_dt ??= new DirectTable()).F1 = value; }
+    internal Func<LispObject, LispObject, LispObject>? _func2 { get => _dt?.F2; set => (_dt ??= new DirectTable()).F2 = value; }
+    internal Func<LispObject, LispObject, LispObject, LispObject>? _func3 { get => _dt?.F3; set => (_dt ??= new DirectTable()).F3 = value; }
+    internal Func<LispObject, LispObject, LispObject, LispObject, LispObject>? _func4 { get => _dt?.F4; set => (_dt ??= new DirectTable()).F4 = value; }
+    internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func5 { get => _dt?.F5; set => (_dt ??= new DirectTable()).F5 = value; }
+    internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func6 { get => _dt?.F6; set => (_dt ??= new DirectTable()).F6 = value; }
+    internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func7 { get => _dt?.F7; set => (_dt ??= new DirectTable()).F7 = value; }
+    internal Func<LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject, LispObject>? _func8 { get => _dt?.F8; set => (_dt ??= new DirectTable()).F8 = value; }
 
     // Native delegate: (self, long args) -> LispObject return.
     // Avoids boxing of ARGUMENTS (the main allocation bottleneck in fixnum recursion).
@@ -262,7 +278,8 @@ public partial class LispFunction : LispObject
     {
         _closureFunc = closureFunc;
         Environment = env;
-        _func = args => closureFunc(env, args);
+        // No args-array delegate of its own: CallDirectWithArray runs the body with
+        // the environment, so a closure costs neither a display class nor a delegate.
         Name = name;
         Arity = arity;
         DotCL.Diagnostics.AllocCounter.Inc("LispFunction+Closure");
@@ -281,6 +298,11 @@ public partial class LispFunction : LispObject
     // falls back to the wrapper). fnName is captured only by the wrapper
     // lambda; Name stays null like every closure, so PushFrame behavior and
     // per-call cost are unchanged.
+    /// <summary>MakeDirectClosure for a caller that knows the arity of DEL's type
+    /// already: no delegate type switch.</summary>
+    public static LispFunction MakeDirectClosure(Delegate del, object[] env, string fnName, int arity)
+        => new LispFunction(del, env, fnName, arity);
+
     public static LispFunction MakeDirectClosure(Delegate del, object[] env, string fnName)
     {
         // The body delegate and the environment are stored as they are; InvokeN
@@ -325,6 +347,20 @@ public partial class LispFunction : LispObject
         private int _count;
         private HashSet<object>? _many;
         internal UnitSet(object a, object b) { _items = new object[4]; _items[0] = a; _items[1] = b; _count = 2; }
+        internal bool Contains(object unit)
+        {
+            if (_many != null) return _many.Contains(unit);
+            var items = _items;
+            // The array starts with 4 slots, unused ones null (UNIT is never null), and a tail loop
+            // alternates between the same few units: compare all four without a branch per slot
+            // rather than remember which one answered last (the hint missed two calls in three).
+            if (items.Length == 4)
+                return ReferenceEquals(items[0], unit) | ReferenceEquals(items[1], unit)
+                     | ReferenceEquals(items[2], unit) | ReferenceEquals(items[3], unit);
+            for (int i = 0; i < _count; i++)
+                if (ReferenceEquals(items[i], unit)) return true;
+            return false;
+        }
         internal void Add(object unit)
         {
             if (_many != null) { _many.Add(unit); return; }
@@ -378,6 +414,12 @@ public partial class LispFunction : LispObject
         // Compilation units kept alive for tail calls made while this frame is
         // linked (see KeepUnit): null, one unit holder, or a UnitSet.
         internal object? _unit;
+
+        internal bool KeepsUnit(object unit)
+        {
+            var cur = _unit;
+            return ReferenceEquals(cur, unit) || (cur is UnitSet set && set.Contains(unit));
+        }
 
         /// <summary>Keep UNIT (a RetainUnit holder) reachable until this frame
         /// is unlinked. Only ever adds: the frame may be an outer function's,
@@ -698,6 +740,7 @@ public partial class LispFunction : LispObject
     private LispObject CallDirectWithArray(LispObject[] args)
     {
         var env = Environment!;
+        if (_closureFunc != null) return _closureFunc(env, args);
         switch (_directDel)
         {
             case Func<object[], LispObject> d0:
@@ -1373,6 +1416,26 @@ public partial class LispFunction : LispObject
     /// inline at the call site: frame names are interned (FrameNameOf) and SELF
     /// is a string literal, so owning the frame is a reference comparison.
     /// Everything else goes to TailPrepCore.</summary>
+    /// <summary>The tail-call preparation for a closure callee (a body delegate and an environment, no
+    /// frame name of its own), the way TailPrepN does it for a plain function: -1 when the case is
+    /// one TailPrepCore has to decide (no frame to lend, a unit the frame does not yet keep, a
+    /// self-framed body), else TailKindClosure.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe int TryTailPrepClosure(LispFunction callee, int arity, int mode, string? self)
+    {
+        if (callee._directDel == null || callee.Arity != arity || callee._frameName != null
+            || (callee._sfMask & (1 << arity)) != 0) return -1;
+        var top = s_top;
+        var unit = callee.RetainUnit;
+        if (unit != null && (top == null || !top->KeepsUnit(unit))) return -1;
+        bool owned = self != null && top != null
+            && (self.Length == 0 ? top->Lent : string.Equals(top->Name, self));
+        if (owned) top->Lend();
+        if (mode >= 0 && (callee._mvModeMask & (1 << arity)) != 0) MultipleValues.SetMode(mode);
+        ConditionSystem.PollInterrupt();
+        return TailKindClosure;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe int TailPrep0(LispFunction callee, int mode, string? self)
     {
@@ -1384,7 +1447,7 @@ public partial class LispFunction : LispObject
             // A callee with a compilation unit the innermost frame does not keep
             // yet goes the long way (TailPrepCore keeps it there).
             var unit = callee.RetainUnit;
-            if (unit != null && (top == null || !ReferenceEquals(top->_unit, unit)))
+            if (unit != null && (top == null || !top->KeepsUnit(unit)))
                 return callee.TailPrepCore(0, mode, self, null, null, null, null);
             if (name == null)
             {
@@ -1402,6 +1465,7 @@ public partial class LispFunction : LispObject
         }
         if ((callee._sfMask & 1) != 0 && callee._func0 != null && (self == null || self.Length == 0))
             return TailPrepSelfFramedAnon(callee, mode, self, 1);
+        { int tk = TryTailPrepClosure(callee, 0, mode, self); if (tk >= 0) return tk; }
         return callee.TailPrepCore(0, mode, self, null, null, null, null);
     }
 
@@ -1416,7 +1480,7 @@ public partial class LispFunction : LispObject
             // A callee with a compilation unit the innermost frame does not keep
             // yet goes the long way (TailPrepCore keeps it there).
             var unit = callee.RetainUnit;
-            if (unit != null && (top == null || !ReferenceEquals(top->_unit, unit)))
+            if (unit != null && (top == null || !top->KeepsUnit(unit)))
                 return callee.TailPrepCore(1, mode, self, a0, null, null, null);
             if (name == null)
             {
@@ -1434,6 +1498,7 @@ public partial class LispFunction : LispObject
         }
         if ((callee._sfMask & 2) != 0 && callee._func1 != null && (self == null || self.Length == 0))
             return TailPrepSelfFramedAnon(callee, mode, self, 2);
+        { int tk = TryTailPrepClosure(callee, 1, mode, self); if (tk >= 0) return tk; }
         return callee.TailPrepCore(1, mode, self, a0, null, null, null);
     }
 
@@ -1448,7 +1513,7 @@ public partial class LispFunction : LispObject
             // A callee with a compilation unit the innermost frame does not keep
             // yet goes the long way (TailPrepCore keeps it there).
             var unit = callee.RetainUnit;
-            if (unit != null && (top == null || !ReferenceEquals(top->_unit, unit)))
+            if (unit != null && (top == null || !top->KeepsUnit(unit)))
                 return callee.TailPrepCore(2, mode, self, a0, a1, null, null);
             if (name == null)
             {
@@ -1466,6 +1531,7 @@ public partial class LispFunction : LispObject
         }
         if ((callee._sfMask & 4) != 0 && callee._func2 != null && (self == null || self.Length == 0))
             return TailPrepSelfFramedAnon(callee, mode, self, 4);
+        { int tk = TryTailPrepClosure(callee, 2, mode, self); if (tk >= 0) return tk; }
         return callee.TailPrepCore(2, mode, self, a0, a1, null, null);
     }
 
@@ -1480,7 +1546,7 @@ public partial class LispFunction : LispObject
             // A callee with a compilation unit the innermost frame does not keep
             // yet goes the long way (TailPrepCore keeps it there).
             var unit = callee.RetainUnit;
-            if (unit != null && (top == null || !ReferenceEquals(top->_unit, unit)))
+            if (unit != null && (top == null || !top->KeepsUnit(unit)))
                 return callee.TailPrepCore(3, mode, self, a0, a1, a2, null);
             if (name == null)
             {
@@ -1498,6 +1564,7 @@ public partial class LispFunction : LispObject
         }
         if ((callee._sfMask & 8) != 0 && callee._func3 != null && (self == null || self.Length == 0))
             return TailPrepSelfFramedAnon(callee, mode, self, 8);
+        { int tk = TryTailPrepClosure(callee, 3, mode, self); if (tk >= 0) return tk; }
         return callee.TailPrepCore(3, mode, self, a0, a1, a2, null);
     }
 
@@ -1512,7 +1579,7 @@ public partial class LispFunction : LispObject
             // A callee with a compilation unit the innermost frame does not keep
             // yet goes the long way (TailPrepCore keeps it there).
             var unit = callee.RetainUnit;
-            if (unit != null && (top == null || !ReferenceEquals(top->_unit, unit)))
+            if (unit != null && (top == null || !top->KeepsUnit(unit)))
                 return callee.TailPrepCore(4, mode, self, a0, a1, a2, a3);
             if (name == null)
             {
@@ -1530,6 +1597,7 @@ public partial class LispFunction : LispObject
         }
         if ((callee._sfMask & 16) != 0 && callee._func4 != null && (self == null || self.Length == 0))
             return TailPrepSelfFramedAnon(callee, mode, self, 16);
+        { int tk = TryTailPrepClosure(callee, 4, mode, self); if (tk >= 0) return tk; }
         return callee.TailPrepCore(4, mode, self, a0, a1, a2, a3);
     }
 

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; (FUNCTION name) must find a lexical FLET / LABELS binding before the global
 ;;; definition. The tree-walk interpreter went straight to SYMBOL-FUNCTION, so
 ;;; #'f inside (flet ((f ...)) ...) missed the local function entirely; an

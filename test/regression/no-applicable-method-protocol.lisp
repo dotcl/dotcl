@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Calling a generic function with no applicable method calls
 ;;; NO-APPLICABLE-METHOD with the generic function and the arguments (CLHS
 ;;; 7.6.6), so a method on it decides the result. Dispatch used to signal an

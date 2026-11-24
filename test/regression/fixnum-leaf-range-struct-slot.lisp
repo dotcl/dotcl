@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A structure slot declared to hold a bounded integer carries its range into
 ;;; EXPR-INT-RANGE, not only into FIXNUM-TYPED-P.
 ;;;

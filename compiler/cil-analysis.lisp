@@ -111,14 +111,62 @@
               (error () nil))
             *sm-global-hits*)))
 
+(defvar *env-macro-walk-unusable* (make-hash-table :test #'eq :synchronized t)
+  "Expanders of global macros whose expansion in an analysis walk was once unusable
+   (it asked about declarations, or was uncacheable): the walk no longer runs them,
+   so such a macro runs once more at most, not once per enclosing walk.")
+
+(defun %walker-macroexpand-env (form expander bound)
+  "Like %WALKER-MACROEXPAND, for a global macro that takes &ENVIRONMENT. The
+   expander is given the walk's own macro environment (*SYMBOL-MACROS*,
+   *LEXICAL-OPERATORS*, *MACROEXPAND-SCOPE*), the one code generation reads.
+   Returns (values EXPANSION HITS), EXPANSION NIL when the expander signals or
+   when the expansion depended on more than that environment (it asked about a
+   variable's declarations, or is marked uncacheable): then the walk cannot
+   know what code generation will see and the caller keeps its conservative
+   answer. A usable expansion is memoized by CACHED-MACROEXPAND, so the form
+   is compiled from the same expansion and the macro runs once."
+  (let ((*expansion-uncacheable* nil)
+        (*expansion-unreusable* nil)
+        (cache *macroexpand-cache*))
+    ;; A form whose expansion could not be used is not expanded again by each
+    ;; enclosing walk: the macro would run once per walk and once more in code
+    ;; generation.
+    (if (or (not (eq (gethash (car form) *macro-takes-environment*) :walkable))
+            (eq (gethash expander *macro-expander-takes-environment*) t)
+            (gethash expander *env-macro-walk-unusable*)
+            (and cache (cdr cache) (gethash form (cdr cache))))
+        (values nil nil)
+        (multiple-value-bind (exp hits) (%walker-macroexpand form expander bound)
+          (cond ((or *expansion-uncacheable* *expansion-unreusable*)
+                 (setf (gethash expander *env-macro-walk-unusable*) t)
+                 (when cache
+                   (setf (gethash form (or (cdr cache)
+                                           (setf (cdr cache) (make-hash-table :test #'eq))))
+                         t))
+                 (values nil nil))
+                (t (values exp hits)))))))
+
 (defun %walk-macrolet-lexical-operators (defs)
   "*LEXICAL-OPERATORS* with the MACROLET definitions DEFS bound, for a walk."
   (%macrolet-lexical-operators
    defs
    (mapcar (lambda (d)
              (and (consp d) (symbolp (car d)) (consp (cdr d))
-                  (%eval-macrolet-expander (cadr d) (cddr d))))
+                  (%eval-macrolet-expander (cadr d) (cddr d) (car d))))
            defs)))
+
+(defvar *ffv-visible-locals-candidate* (list '#:visible-locals-candidate)
+  "Candidate meaning the form may reference every enclosing lexical variable.")
+
+(defun %ffv-note-visible-locals (bnd free-ht)
+  "Record every enclosing lexical variable as a possible free reference."
+  (dolist (entry (cstate-locals))
+    (let ((key (car entry)))
+      (when key
+        (let ((sym (if (symbolp key) key (compiler-name-sym key))))
+          (unless (or (bnd-member-p sym bnd) (%ffv-seen sym free-ht))
+            (%ffv-add sym free-ht)))))))
 
 (defun find-free-vars-expr (expr bound free-ht)
   "Walk expr finding free variable references. Results accumulated in free-ht.
@@ -232,7 +280,11 @@
                          ;; candidates for an outer lambda) local-bound-p is T, so
                          ;; this collects; otherwise it filters.
                         (dolist (sym (%lambda-free-candidates e))
-                          (cond ((not (and (consp sym) (eq (car sym) *ffv-go-candidate*)))
+                          (cond ((eq sym *ffv-visible-locals-candidate*)
+                                 (if *ffv-assume-bound*
+                                     (%ffv-add sym free-ht)
+                                     (%ffv-note-visible-locals bnd free-ht)))
+                                ((not (and (consp sym) (eq (car sym) *ffv-go-candidate*)))
                                  (when (and (not (bnd-member-p sym bnd))
                                             (not (%ffv-seen sym free-ht))
                                             (or *ffv-assume-bound* (local-bound-p sym)))
@@ -495,8 +547,8 @@
                              (dolist (form fn-body)
                                (push (cons form (cons inner-bound mdepth)) worklist)))))
                        (when (and shadows (eq head 'flet)) (enter))
-                       ;; Body sees all fn-names as bound
-                       (let ((body-bound (append fn-names fn-boxes bnd)))
+                       ;; Body sees the function boxes as bound (a function name is not a variable: a variable of the same name outside is still free)
+                       (let ((body-bound (append fn-boxes bnd)))
                          (dolist (form lbody)
                            (push (cons form (cons body-bound mdepth)) worklist))))))
                     ;; CLOS primitives: analyze sub-expressions normally
@@ -517,7 +569,8 @@
                        (push (cons sub (cons bnd mdepth)) worklist)))
                     ;; Default: try macro expansion, then generic walk
                     (t
-                     (let ((expanded nil))
+                     (let ((expanded nil)
+                           (env-unknown nil))
                        (when (and (symbolp head) head
                                   (< mdepth *macro-expand-depth-limit*)
                                   (%stack-space-available-p)
@@ -525,17 +578,28 @@
                                   (find-macro-expander head))
                          (let ((expander (find-macro-expander head)))
                            (multiple-value-bind (exp hits)
-                               (%walker-macroexpand e expander bnd)
-                             ;; An expansion EQUAL to its input is a fixed point.
-                             (setf expanded (and exp (not (equal exp e)) exp))
-                             ;; A place that is a global symbol macro may be a
-                             ;; LET-bound variable here: walk the name as a
-                             ;; reference so a binding outside this form is still
-                             ;; captured.
-                             (dolist (h hits)
-                               (push (cons h (cons bnd mdepth)) worklist)))))
+                               (if (%global-macro-takes-environment-p head expander)
+                                   (%walker-macroexpand-env e expander bnd)
+                                   (%walker-macroexpand e expander bnd))
+                             (if (and (null exp)
+                                      (%global-macro-takes-environment-p head expander))
+                               (progn
+                                 (setf env-unknown t)
+                                 (if *ffv-assume-bound*
+                                     (%ffv-add *ffv-visible-locals-candidate* free-ht)
+                                     (%ffv-note-visible-locals bnd free-ht)))
+                               (progn
+                                 ;; An expansion EQUAL to its input is a fixed point.
+                                 (setf expanded (and exp (not (equal exp e)) exp))
+                                 ;; A place that is a global symbol macro may be a
+                                 ;; LET-bound variable here: walk the name as a
+                                 ;; reference so a binding outside this form is still
+                                 ;; captured.
+                                 (dolist (h hits)
+                                   (push (cons h (cons bnd mdepth)) worklist)))))))
                        (if expanded
                            (push (cons expanded (cons bnd (1+ mdepth))) worklist)
+                           (unless env-unknown
                            (progn
                              ;; Labels function mangled name capture.
                              ;; head=NIL is admitted too: a local function may
@@ -558,8 +622,9 @@
                                        (push plan inline-plans-seen)
                                        (destructuring-bind (pname pparams pdecls pbody pblockp &rest more)
                                            plan
-                                         (declare (ignore more))
-                                         (push (cons `(let ,(mapcar (lambda (v) (list v nil)) pparams)
+                                         ;; A &REST variable is bound there too (MORE: snapshot, count, rest variable).
+                                         (push (cons `(let ,(append (mapcar (lambda (v) (list v nil)) pparams)
+                                                                    (and (third more) (list (list (third more) nil))))
                                                         ,@pdecls
                                                         ,@(if pblockp `((block ,pname ,@pbody)) pbody))
                                                      (cons nil mdepth))
@@ -594,7 +659,7 @@
                                   ;; Non-function-call form (e.g. cond clause, case clause):
                                   ;; push all sub-expressions including the car.
                                   (do-list-safe (sub e)
-                                    (push (cons sub (cons bnd mdepth)) worklist))))))))))))))))))))
+                                    (push (cons sub (cons bnd mdepth)) worklist)))))))))))))))))))))
 
 (defun %compute-free-candidates (e)
   "Free-variable CANDIDATE names of lambda form E, relative to E's OWN params.
@@ -693,8 +758,42 @@
       (:mscope (setf *macroexpand-scope* v))
       (:lexops (setf *lexical-operators* v)))))
 
+(defvar *transparent-env-macros*
+  '((("BOOLEAN-IF" "SERAPEUM/TYPES") . 0)
+    (("BOOLEAN-WHEN" "SERAPEUM/TYPES") . 0)
+    (("BOOLEAN-UNLESS" "SERAPEUM/TYPES") . 0))
+  "Alist ((NAME-STRING PACKAGE-STRING) . SKIP) of macros that take &ENVIRONMENT but only choose
+   among their own argument forms: whatever they expand to is made of the arguments after the
+   first SKIP, unchanged, plus nothing that names or assigns a variable. The mutation walk may
+   then walk those arguments in place of the expansion, without running the macro (which has to
+   run once, where the environment is real).")
+
+(defun %register-transparent-env-macro (name &optional (skip 0))
+  "Declare the global macro NAME transparent (see *TRANSPARENT-ENV-MACROS*)."
+  (let ((key (list (symbol-name name) (let ((p (symbol-package name))) (and p (package-name p))))))
+    (setf *transparent-env-macros*
+          (cons (cons key skip)
+                (remove key *transparent-env-macros* :key #'car :test #'equal))))
+  name)
+
+(defun %transparent-env-macro-skip (head)
+  "The SKIP of the transparent macro HEAD, or NIL when it is not one."
+  (and *transparent-env-macros* (symbolp head) head
+       (let ((p (symbol-package head)))
+         (cdr (assoc (list (symbol-name head) (and p (package-name p)))
+                     *transparent-env-macros* :test #'equal)))))
+
+(defun %fmc-transparent-env-form (form)
+  "A form the mutation walk can walk in place of FORM, a call of a transparent macro, or NIL."
+  (let ((skip (%transparent-env-macro-skip (car form))))
+    (and skip (consp (cdr form)) (null (cdr (last form)))
+         `(progn ,@(nthcdr (1+ skip) form)))))
+
 (defun %fmc-set-step (kind value)
   (cons *fmc-set-step* (cons kind value)))
+
+(defvar *fmc-environment-unknown* nil
+  "Set when the mutation walk leaves a macro that takes &ENVIRONMENT to code generation.")
 
 (defun %fmc-dedupe (list)
   "LIST without repeated symbols (order not kept). A short list is searched;
@@ -870,12 +969,24 @@
                ;; shadowing variable it is being assigned. Over-recording is
                ;; safe: it can only box a variable that did not need it.
                (expand (form expander in-lambda mdepth)
-                 `(multiple-value-bind (exp hits) (%walker-macroexpand ,form ,expander :none)
-                    (dolist (h hits)
-                      (unless (symbol-package h) (var-name h))
-                      (push h mut)
-                      (push (cons h (if ,in-lambda (- -1 ,mdepth) ,mdepth)) worklist))
-                    exp))
+                 `(let ((env-macro (%global-macro-takes-environment-p (car ,form) ,expander)))
+                    (multiple-value-bind (exp hits)
+                        (if env-macro
+                            (or (let ((tr (%fmc-transparent-env-form ,form)))
+                                  (and tr (values tr nil)))
+                                (%walker-macroexpand-env ,form ,expander :none))
+                            (%walker-macroexpand ,form ,expander :none))
+                      (cond
+                        ((and env-macro (null exp))
+                         (setf *fmc-environment-unknown* t
+                               *expansion-uncacheable* t)
+                         nil)
+                        (t
+                         (dolist (h hits)
+                           (unless (symbol-package h) (var-name h))
+                           (push h mut)
+                           (push (cons h (if ,in-lambda (- -1 ,mdepth) ,mdepth)) worklist))
+                         exp)))))
                ;; STEPS, in the order the walk takes them: (FORM . IN-LAMBDA)
                ;; or a set step. A kept form is summarised (and remembered)
                ;; now, a plain symbol is just a reference; without the stack
@@ -1137,16 +1248,33 @@
                                      (not (%lexical-function-p head))
                                      (setf expander (find-macro-expander head)))
                             (setf expanded (expand e expander in-lambda mdepth)))
-                          (if expanded
-                              (walk expanded in-lambda (1+ mdepth))
-                              (do-list-safe (sub e)
-                                (walk sub in-lambda mdepth)))))))))))))
+                          (cond
+                            (expanded (walk expanded in-lambda (1+ mdepth)))
+                            ;; A macro that takes &ENVIRONMENT is left to code generation,
+                            ;; and every variable counts as assigned and captured. Its
+                            ;; arguments are not forms to walk (a CASE-OF clause such as
+                            ;; (DESTRUCTURING-BIND ...) is a pattern).
+                            ((and expander (%global-macro-takes-environment-p head expander))
+                             nil)
+                            ;; The operator of a call is a function name, not a variable
+                            ;; reference: it is noted as one but never expanded as a
+                            ;; symbol-macro (a symbol-macro named like a function whose
+                            ;; expansion calls that function would otherwise be walked
+                            ;; again for every call, without end).
+                            ((and (symbolp head) head)
+                             (ref head in-lambda)
+                             (do-list-safe (sub (cdr e))
+                               (walk sub in-lambda mdepth)))
+                            (t
+                             (do-list-safe (sub e)
+                               (walk sub in-lambda mdepth))))))))))))))
       (cons (%fmc-dedupe mut) (cons (%fmc-dedupe rin) (%fmc-dedupe rout))))))
 
 (defun find-mutated-and-captured-vars (body var-names)
   "Returns (values MUTATED CAPTURED): the names in VAR-NAMES (variable-name
    strings) that BODY assigns, and those it references from inside a closure."
   (let ((*bmr-cache* (or *bmr-cache* (make-hash-table :test #'eq)))
+        (*fmc-environment-unknown* nil)
         (mutated '())
         (captured '()))
     (dolist (form body)
@@ -1161,7 +1289,13 @@
             (when (and (member n var-names :test #'string=)
                        (not (member n captured :test #'string=)))
               (push n captured))))))
-    (values mutated captured)))
+    (if *fmc-environment-unknown*
+        ;; The unexpanded macro may assign and close over anything in scope.
+        ;; Compiler-made cells (block tags, tagbody ids, labels functions) are
+        ;; only captured, never assigned: they are already shared boxes.
+        (values (remove-if #'%synthetic-capture-name-p var-names)
+                (copy-list var-names))
+        (values mutated captured))))
 
 ;;; ============================================================
 ;;; SIL local-reference enumeration (single source of truth)
@@ -1749,6 +1883,8 @@
 
 (defparameter +mv-primary-twins+
   '(("Runtime.Gethash"      . "Runtime.GethashPrimary")
+    ("Runtime.GethashFixnum" . "Runtime.GethashFixnumPrimary")
+    ("Runtime.GethashFixnumOp" . "Runtime.GethashFixnumOpPrimary")
     ("Runtime.FloorOp"      . "Runtime.FloorOpPrimary")
     ("Runtime.TruncateOp"   . "Runtime.TruncateOpPrimary")
     ("Runtime.CeilingOp"    . "Runtime.CeilingOpPrimary")
@@ -1758,8 +1894,17 @@
     ("Runtime.Values2"      . "Runtime.Values2Primary")
     ("Runtime.FindSymbolMv" . "Runtime.FindSymbolPrimary")
     ("Runtime.InternMv"     . "Runtime.InternPrimary")
+    ("Runtime.Intern1"      . "Runtime.Intern1Primary")
+    ("Runtime.Intern2"      . "Runtime.Intern2Primary")
+    ("Runtime.FindSymbol1"  . "Runtime.FindSymbol1Primary")
+    ("Runtime.FindSymbol2"  . "Runtime.FindSymbol2Primary")
     ("Runtime.ReadLineMv"   . "Runtime.ReadLinePrimary")
-    ("Runtime.SubtypepMv"   . "Runtime.SubtypepPrimary"))
+    ("Runtime.SubtypepMv"   . "Runtime.SubtypepPrimary")
+    ("Runtime.ParseIntegerStartEnd" . "Runtime.ParseIntegerStartEndPrimary")
+    ("Runtime.ParseIntegerStartEndJunk" . "Runtime.ParseIntegerStartEndJunkPrimary")
+    ("Runtime.ParseInteger1" . "Runtime.ParseInteger1Primary")
+    ("Runtime.ParseIntegerRadix" . "Runtime.ParseIntegerRadixPrimary")
+    ("Runtime.ParseIntegerJunkAllowed" . "Runtime.ParseIntegerJunkAllowedPrimary"))
   "Runtime entries that return two values, paired with an entry that returns only
    the primary. The peephole (P12) swaps in the second when the call is followed
    by Runtime.UnwrapMv, i.e. when the call site is in single-value position.
@@ -1774,15 +1919,23 @@
 
 (defparameter +mv-pair-twins+
   '(("Runtime.Gethash"      . "Runtime.GethashPair")
+    ("Runtime.GethashFixnum" . "Runtime.GethashFixnumPair")
+    ("Runtime.GethashFixnumOp" . "Runtime.GethashFixnumOpPair")
     ("Runtime.FloorOp"      . "Runtime.FloorOpPair")
     ("Runtime.TruncateOp"   . "Runtime.TruncateOpPair")
     ("Runtime.CeilingOp"    . "Runtime.CeilingOpPair")
     ("Runtime.RoundOp"      . "Runtime.RoundOpPair")
     ("Runtime.Values2"      . "Runtime.Values2Pair")
     ("Runtime.FindSymbolMv" . "Runtime.FindSymbolL")
+    ("Runtime.FindSymbol1"  . "Runtime.FindSymbol1Pair")
+    ("Runtime.FindSymbol2"  . "Runtime.FindSymbol2Pair")
     ("Runtime.InternMv"     . "Runtime.InternSymbolV")
+    ("Runtime.Intern1"      . "Runtime.Intern1Pair")
+    ("Runtime.Intern2"      . "Runtime.Intern2Pair")
     ("Runtime.ReadLineMv"   . "Runtime.ReadLine")
-    ("Runtime.SubtypepMv"   . "Runtime.SubtypepPair"))
+    ("Runtime.SubtypepMv"   . "Runtime.SubtypepPair")
+    ("Runtime.ParseIntegerStartEnd" . "Runtime.ParseIntegerStartEndPair")
+    ("Runtime.ParseIntegerStartEndJunk" . "Runtime.ParseIntegerStartEndJunkPair"))
   "The same entries as +MV-PRIMARY-TWINS+, paired with an entry that publishes
    both values in the thread state and returns the primary without an MvReturn.
    P13 swaps it in when the next instruction reads the values out of the thread
@@ -1836,6 +1989,12 @@
                                           ; into a native slot whose value came
                                           ; from a Lisp-object expression had
                                           ; this shape.
+     P14 (:ldloc X) (:pop)              -> {}          ; a local read only to be
+                                          ; discarded: loading a local has no
+                                          ; effect. A raw store's result in
+                                          ; statement position (the stored
+                                          ; variable, read for the SETF value)
+                                          ; left exactly this pair behind.
      P11 UnwrapMv UnwrapMv              -> UnwrapMv    ; the second cannot do
                                           ; anything: values never nest, so the
                                           ; first call's result is never an
@@ -1874,6 +2033,11 @@
                 (i2 (second cur))
                 (i3 (third cur)))
             (cond
+              ;; P14: a local loaded and at once discarded.
+              ((and (consp i1) (eq (car i1) :ldloc)
+                    (consp i2) (eq (car i2) :pop))
+               (setf changed t)
+               (setf cur (cddr cur)))
               ;; P1: load a local then immediately store it back to itself.
               ((and (consp i1) (eq (car i1) :ldloc)
                     (consp i2) (eq (car i2) :stloc)
@@ -1962,6 +2126,40 @@
                (setf changed t)
                (push i1 out)
                (setf cur (cddr cur)))
+              ;; P16: an int64 masked by a constant that is not negative is
+              ;; below 2^63, so boxing it as an (unsigned-byte 64) and unboxing
+              ;; it as a fixnum returns the same value.
+              ((and (consp i1) (eq (car i1) :and) (null (cdr i1))
+                    (consp i2) (eq (car i2) :call) (equal (cadr i2) "Runtime.BoxU64")
+                    (consp i3) (or (eq (car i3) :unbox-fixnum)
+                                   (equal i3 '(:call "Runtime.UnboxFixnumChecked")))
+                    (consp out) (consp (car out))
+                    (eq (car (car out)) :ldc-i8)
+                    (integerp (cadr (car out))) (>= (cadr (car out)) 0))
+               (setf changed t)
+               (push i1 out)
+               (setf cur (cdddr cur)))
+              ;; P16 after P14 has turned the mask into a zero extension.
+              ((and (consp i1) (eq (car i1) :call) (equal (cadr i1) "Runtime.BoxU64")
+                    (consp i2) (or (eq (car i2) :unbox-fixnum)
+                                   (equal i2 '(:call "Runtime.UnboxFixnumChecked")))
+                    (consp out) (equal (car out) '(:conv-u8)))
+               (setf changed t)
+               (setf cur (cddr cur)))
+              ;; P17: the value of a character store is a character, never a
+              ;; multiple-value return, so unwrapping it does nothing.
+              ((and (consp i1) (eq (car i1) :call)
+                    (member (cadr i1) '("Runtime.CharSetL" "Runtime.CharSetCodeL") :test #'equal)
+                    (consp i2) (eq (car i2) :call) (equal (cadr i2) "Runtime.UnwrapMv"))
+               (setf changed t)
+               (push i1 out)
+               (setf cur (cddr cur)))
+              ;; P18: a code-valued character store whose value is dropped.
+              ((and (consp i1) (eq (car i1) :call) (equal (cadr i1) "Runtime.CharSetCodeL")
+                    (consp i2) (eq (car i2) :pop))
+               (setf changed t)
+               (push (list :call "Runtime.CharSetCodeVoidL") out)
+               (setf cur (cddr cur)))
               ;; P15: a checked fixnum add of a constant that is not negative
               ;; needs one compare for its overflow test instead of the
               ;; sign arithmetic for an operand of either sign.
@@ -1989,7 +2187,8 @@
                     (not (and (consp i3)
                               (or (member (car i3) '(:pop :unbox-fixnum))
                                   (and (eq (car i3) :call)
-                                       (equal (cadr i3) "Runtime.UnwrapMv"))))))
+                                       (member (cadr i3) '("Runtime.UnwrapMv" "Runtime.UnboxFixnumChecked")
+                                               :test #'equal))))))
                (setf changed t)
                (push (list :load-const (cadr i1)) out)
                (setf cur (cddr cur)))
@@ -2017,7 +2216,17 @@
                         (and (eq (car i1) :newobj) (eq (car i2) :unbox-decimal)
                              (equal (cadr i1) "LispDecimal"))
                         (and (eq (car i1) :call) (eq (car i2) :unbox-fixnum)
-                             (equal (cadr i1) "Fixnum.Make"))))
+                             (equal (cadr i1) "Fixnum.Make"))
+                        ;; the same pairs read back by the checked unbox of a store into a native slot
+                        (and (eq (car i1) :call) (eq (car i2) :call)
+                             (equal (cadr i1) "Fixnum.Make")
+                             (equal (cadr i2) "Runtime.UnboxFixnumChecked"))
+                        (and (eq (car i1) :newobj) (eq (car i2) :call)
+                             (equal (cadr i1) "DoubleFloat")
+                             (equal (cadr i2) "Runtime.UnboxDoubleChecked"))
+                        (and (eq (car i1) :newobj) (eq (car i2) :call)
+                             (equal (cadr i1) "SingleFloat")
+                             (equal (cadr i2) "Runtime.UnboxSingleChecked"))))
                (setf changed t)
                (setf cur (cddr cur)))
               ;; P11: unwrap a multiple-value return twice in a row. The second
@@ -2481,11 +2690,16 @@
     :mul :div :rem :div-un :rem-un :neg :not :shl :shr :shr-un :cgt-un :clt-un
     :ldc-r4 :conv-i :conv-i4 :conv-i8 :conv-u :conv-u8 :conv-r8 :conv-r4 :conv-r-un
     :br :brtrue :brfalse :leave :beq :bne :blt :bgt :ble :bge
-    :bne-un :bge-un :bgt-un :ble-un :blt-un))
+    :bne-un :bge-un :bgt-un :ble-un :blt-un
+    :ldlen :ldelem-i8 :stelem-i8 :ldelem-r8 :stelem-r8))
 
 (defparameter +mv-quiet-calls+
   '("ConditionSystem.PollInterrupt" "MultipleValues.Reset" "MultipleValues.ResetOnExit"
     "Runtime.IsTruthy"
+    "Runtime.RawBitsToDouble" "Runtime.RawDoubleToBits" "Runtime.StructRawBacking"
+    "Runtime.StructRefD" "Runtime.StructSetD" "Runtime.ArefL" "Runtime.ArefNumD"
+    "Runtime.ArefSetNumD" "Runtime.DoubleBits" "Runtime.AtF64" "Runtime.SetAtF64"
+    "Runtime.DataF64" "Runtime.BackingF64"
     "Runtime.Car" "Runtime.Cdr" "Runtime.Primary" "Runtime.UnwrapMv"
     "Fixnum.Make" "Runtime.AddFixnumChecked" "Runtime.IsTrueEq" "Runtime.IsTrueEql"
     "Runtime.IsTrueConsp" "Runtime.IsTrueAtom" "Runtime.IsTrueListp"
@@ -2908,11 +3122,50 @@
       (let ((sym (find-symbol (first row) "COMMON-LISP")))
         (when sym (setf (gethash sym h) (cons (second row) (third row))))))))
 
+(defun %lambda-list-arity (params)
+  "(min . max) arguments an ordinary lambda list accepts, max NIL when it has &REST, &BODY or &KEY;
+   NIL when PARAMS is not a proper list."
+  (when (and (listp params) (null (cdr (last params))))
+    (let ((min 0) (max 0) (state :required))
+      (dolist (p params)
+        (cond ((eq p '&optional) (setf state :optional))
+              ((member p '(&rest &body &key)) (setf max nil) (return))
+              ((eq p '&aux) (return))
+              ((member p lambda-list-keywords))
+              ((eq state :required) (incf min) (incf max))
+              (t (incf max))))
+      (cons min max))))
+
+(defun %note-defun-arity (name params)
+  "Record the argument counts NAME's lambda list PARAMS accepts."
+  (let ((arity (and (symbolp name) name (%lambda-list-arity params))))
+    (when arity (setf (gethash name *defun-arities*) arity))))
+
+(defun %uv-note-funcall-lambda (form)
+  "Warn when (FUNCALL (LAMBDA ll ...) args...) passes a number of arguments the lambda list cannot take."
+  (let* ((fn (and (consp (cdr form)) (cadr form)))
+         (lam (cond ((and (consp fn) (eq (car fn) 'lambda)) fn)
+                    ((and (consp fn) (eq (car fn) 'function) (consp (cdr fn))
+                          (consp (cadr fn)) (eq (car (cadr fn)) 'lambda))
+                     (cadr fn))))
+         (arity (and lam (consp (cdr lam)) (%lambda-list-arity (cadr lam)))))
+    (when (and arity (%proper-list-p (cddr form)))
+      (let ((n (length (cddr form))) (min (car arity)) (max (cdr arity)))
+        (when (or (< n min) (and max (> n max)))
+          (warn 'simple-warning
+                :format-control "function called with ~D argument~:P, but wants ~A"
+                :format-arguments
+                (list n (cond ((null max) (format nil "at least ~D" min))
+                              ((= min max) (format nil "exactly ~D" min))
+                              (t (format nil "between ~D and ~D" min max))))))))))
+
 (defun %uv-note-arity (name form)
-  "Warn when FORM calls the COMMON-LISP function NAME with too few or too many arguments."
-  (let ((entry (and (symbolp name) (eq (symbol-package name) (find-package "COMMON-LISP"))
+  "Warn when FORM calls the COMMON-LISP function NAME, or a DEFUN compiled before, with too few or too many arguments."
+  (let ((entry (and (symbolp name)
                     (consp form) (listp (cdr form))
-                    (gethash name *cl-function-arities*))))
+                    (if (eq (symbol-package name) (find-package "COMMON-LISP"))
+                        (gethash name *cl-function-arities*)
+                        (gethash name *defun-arities*)))))
     (when (and entry
                (not (%lexical-function-p name))
                (not (member name *uv-local-functions* :test #'eq))
@@ -2928,10 +3181,134 @@
                             ((= min max) (format nil "exactly ~D" min))
                             (t (format nil "between ~D and ~D" min max))))))))))
 
+(defparameter *cl-function-arg-types*
+  (let ((h (make-hash-table :test #'eq)))
+    (flet ((def (names &rest types)
+             (dolist (n names)
+               (let ((sym (find-symbol (symbol-name n) "COMMON-LISP")))
+                 (when sym (setf (gethash sym h) types))))))
+      ;; Each entry: the type of the 1st, 2nd, ... argument; a final (&rest TYPE) covers the rest.
+      (def '(car cdr caar cadr cdar cddr caddr cdddr first second third fourth fifth rest list-length) 'list)
+      (def '(length reverse nreverse) 'sequence)
+      (def '(+ * max min) '(&rest number))
+      (def '(- /) 'number '(&rest number))
+      (def '(< > <= >=) 'real '(&rest real))
+      (def '(= /=) 'number '(&rest number))
+      (def '(1+ 1- abs sqrt exp sin cos tan zerop) 'number)
+      (def '(plusp minusp) 'real)
+      (def '(evenp oddp) 'integer)
+      (def '(nth nthcdr) '(integer 0) 'list)
+      (def '(symbol-name symbol-package symbol-function symbol-plist) 'symbol)
+      (def '(char-code char-upcase char-downcase upper-case-p lower-case-p) 'character)
+      (def '(gethash) 't 'hash-table)
+      (def '(elt) 'sequence '(integer 0)))
+    h)
+  "CL function -> the types of its leading arguments, for the constant-argument conflict warning.")
+
+(defun %uv-literal-arg-p (x)
+  "True when X is a self-evaluating literal or (QUOTE object); the second value is the object."
+  (cond ((or (numberp x) (stringp x) (characterp x)) (values t x))
+        ((and (symbolp x) (or (keywordp x) (eq x t) (null x))) (values t x))
+        ((and (consp x) (eq (car x) 'quote) (consp (cdr x)) (null (cddr x))) (values t (cadr x)))
+        (t (values nil nil))))
+
+(defun %uv-note-constant-args (name form)
+  "Warn when a literal argument of the COMMON-LISP function NAME cannot be of the type that
+   argument must have, as SBCL's \"Constant 5 conflicts with its asserted type LIST\"."
+  (let ((types (and (symbolp name) (eq (symbol-package name) (find-package "COMMON-LISP"))
+                    (consp form) (%proper-list-p (cdr form))
+                    (gethash name *cl-function-arg-types*))))
+    (when (and types
+               (not (%lexical-function-p name))
+               (not (member name *uv-local-functions* :test #'eq))
+               (not (find-macro-expander name))
+               (not (special-operator-name-p name)))
+      (let ((rest-type (let ((l (car (last types)))) (and (consp l) (eq (car l) '&rest) (cadr l)))))
+        (loop for arg in (cdr form)
+              for tail = types then (if (and (consp (car tail)) (eq (caar tail) '&rest)) tail (cdr tail))
+              for type = (let ((ty (car tail))) (if (and (consp ty) (eq (car ty) '&rest)) rest-type ty))
+              while type
+              do (multiple-value-bind (literal-p value) (%uv-literal-arg-p arg)
+                   (when (and literal-p (not (typep value type)))
+                     (warn 'simple-warning
+                           :format-control "Constant ~S conflicts with its asserted type ~S."
+                           :format-arguments (list value type)))))))))
+
+(defun %format-control-arg-count (control)
+  "The number of arguments the format control string CONTROL consumes, when every directive in it
+   is one that consumes a known number (no ~*, ~[, ~{, ~?, ~^, ~/, no V or # parameter); else NIL."
+  (let ((n 0) (i 0) (len (length control)))
+    (loop
+      (let ((tilde (position #\~ control :start i)))
+        (unless tilde (return n))
+        (setf i (1+ tilde))
+        ;; prefix parameters: digits, signs, commas, 'c quoting; V and # take arguments
+        (loop while (and (< i len)
+                         (let ((c (char control i)))
+                           (or (digit-char-p c) (member c '(#\, #\+ #\-))
+                               (and (char= c #\') (< (1+ i) len) (progn (incf i) t)))))
+              do (incf i))
+        (when (and (< i len) (member (char control i) '(#\v #\V #\#))) (return nil))
+        (let ((colon nil))
+          (loop while (and (< i len) (member (char control i) '(#\: #\@)))
+                do (when (char= (char control i) #\:) (setf colon t))
+                   (incf i))
+          (when (>= i len) (return nil))
+          (let ((d (char-upcase (char control i))))
+            (incf i)
+            (cond ((member d '(#\A #\S #\D #\B #\O #\X #\R #\C #\F #\E #\G #\$ #\W)) (incf n))
+                  ((char= d #\P) (unless colon (incf n)))
+                  ((member d '(#\% #\& #\~ #\| #\T #\Newline)) nil)
+                  (t (return nil)))))))))
+
+(defun %format-invalid-directive (control)
+  "The first directive character of the format control string CONTROL that FORMAT does not know, or NIL."
+  (let ((i 0) (len (length control)))
+    (loop
+      (let ((tilde (position #\~ control :start i)))
+        (unless tilde (return nil))
+        (setf i (1+ tilde))
+        (loop while (and (< i len)
+                         (let ((c (char control i)))
+                           (or (digit-char-p c) (member c '(#\, #\+ #\- #\v #\V #\#))
+                               (and (char= c #\') (< (1+ i) len) (progn (incf i) t)))))
+              do (incf i))
+        (loop while (and (< i len) (member (char control i) '(#\: #\@))) do (incf i))
+        (when (>= i len) (return nil))
+        (let ((d (char-upcase (char control i))))
+          (incf i)
+          (cond ((char= d #\/)
+                 ;; ~/package:function/ runs to the closing slash
+                 (let ((close (position #\/ control :start i)))
+                   (if close (setf i (1+ close)) (return nil))))
+                ((not (or (find d "ASDBOXRCFEG$WP%&~|T<>()[]{};^*?_I") (char= d #\Newline)))
+                 (return d))))))))
+
+(defun %uv-note-format (form)
+  "Warn when a FORMAT call with a literal control string gets fewer or more arguments than the string uses."
+  (when (and (consp (cdr form)) (consp (cddr form)) (stringp (caddr form)))
+    (let ((bad (%format-invalid-directive (caddr form))))
+      (when bad
+        (%report-compile-error (format nil "Error in FORMAT: unknown directive ~~~A in ~S" bad (caddr form))))))
+  (when (and (consp (cdr form)) (consp (cddr form)) (stringp (caddr form)) (%proper-list-p (cdddr form)))
+    (let ((needed (%format-control-arg-count (caddr form))) (given (length (cdddr form))))
+      (when needed
+        (cond ((< given needed)
+               (warn 'simple-warning
+                     :format-control "Too few arguments (~D) to FORMAT ~S: requires at least ~D."
+                     :format-arguments (list given (caddr form) needed)))
+              ((> given needed)
+               (warn 'style-warning
+                     :format-control "Too many arguments (~D) to FORMAT ~S: uses at most ~D."
+                     :format-arguments (list given (caddr form) needed))))))))
+
 (defun %uv-note-function (name form)
   "Record NAME, called in FORM, when it is not a local operator, macro or
    function. The end of the compilation unit decides whether it stayed undefined."
   (%uv-note-arity name form)
+  (when (and (eq name 'format) (not *cross-compiling*)) (%uv-note-format form))
+  (when (and (eq name 'funcall) (not *cross-compiling*) (not (%lexical-function-p name))) (%uv-note-funcall-lambda form))
+  (unless *cross-compiling* (%uv-note-constant-args name form))
   (when (and *compiler-note-undefined*
              (symbolp name) name (symbol-package name)
              (not (keywordp name))
@@ -2941,6 +3318,7 @@
              (not (gethash name *compile-form-handlers*))
              (not (find-macro-expander name))
              (not (fboundp name)))
+    (when *same-file-called* (setf (gethash name *same-file-called*) t))
     (funcall *compiler-note-undefined* :function name form)))
 
 (defun %uv-decls (body doc-p)
@@ -2971,6 +3349,12 @@
       (push (list* s :special nil) env))))
 
 (defun %uv-report (entries ignores ignorables)
+  ;; An IGNORE (or IGNORABLE) for a name this form binds nowhere, as SBCL's style warning says.
+  (dolist (sym ignores)
+    (when (and (symbolp sym) sym (symbol-package sym)
+               (not (assoc sym entries :test #'eq))
+               (not (global-special-p sym)))
+      (push (cons "IGNORE declaration for an unknown variable: ~S" sym) *uv-warnings*)))
   (dolist (e entries)
     (when (eq (cadr e) :var)
       (let* ((sym (car e))
@@ -3019,6 +3403,13 @@
             (not (assoc sym *symbol-macros* :test #'eq)))
        (funcall *compiler-note-undefined* :variable sym
                 (or *uv-current-form* sym))))))
+
+(defun %uv-assume-all-used (env)
+  "Treat every variable ENV binds as both read and assigned."
+  (dolist (e env)
+    (when (eq (cadr e) :var)
+      (setf (svref (cddr e) 0) t
+            (svref (cddr e) 1) t))))
 
 (defun %uv-walk-list (forms env)
   (loop while (consp forms)
@@ -3241,12 +3632,14 @@
                   (%uv-walk-list (cdr form) env)))))
          (t
           (let ((expander (find-macro-expander head)))
-            (let ((expanded (and expander (%walker-macroexpand form expander :none))))
-              (if (and expanded (not (equal expanded form)))
-                  (%uv-walk expanded env)
-                  (progn
-                    (%uv-note-function head form)
-                    (%uv-walk-list (cdr form) env))))))))))))
+            (if (and expander (%global-macro-takes-environment-p head expander))
+                (%uv-assume-all-used env)
+                (let ((expanded (and expander (%walker-macroexpand form expander :none))))
+                  (if (and expanded (not (equal expanded form)))
+                      (%uv-walk expanded env)
+                      (progn
+                        (%uv-note-function head form)
+                        (%uv-walk-list (cdr form) env)))))))))))))
 
 (defun %compiler-warn-undefined (kind name)
   "Signal the warning for NAME, first used in the form whose source position is
@@ -3294,6 +3687,25 @@
 ;;; ============================================================
 
 (defun compile-toplevel (expr)
+  "Compile a top-level expression. Returns instruction list. Under COMPILE-FILE a
+   PROGRAM-ERROR the compiler signals for the form (a malformed special form, a RETURN-FROM
+   to no block, a lambda list with a variable twice) is reported as SBCL's \"caught ERROR\" and
+   the form is replaced by one that signals when loaded, so one bad form does not lose the
+   whole file."
+  (if (and *compile-file-mode* (not *evaluating-at-compile-time*) (not *cross-compiling*))
+      (handler-case (%compile-toplevel-1 expr)
+        (program-error (c)
+          (let ((text (or (ignore-errors (let ((*print-length* 10) (*print-level* 4)) (prin1-to-string expr)))
+                          "#<form>"))
+                (message (or (ignore-errors (princ-to-string c)) "#<error>")))
+            (%report-compile-error message)
+            (%compile-toplevel-1
+             `(error 'compiled-program-error
+                     :format-control "Execution of a form compiled with errors.~%Form:~%  ~A~%Compile-time error:~%  ~A"
+                     :format-arguments (list ,text ,message))))))
+      (%compile-toplevel-1 expr)))
+
+(defun %compile-toplevel-1 (expr)
   "Compile a top-level expression. Returns instruction list.
 
    The peephole runs here for the same reason it runs on every function body:
@@ -3313,6 +3725,8 @@
                                     *uninterned-var-names*
                                     (list nil)))
         (*specials* '())
+        (*sm-walker-context* nil)
+        (*sm-walker-bound* :none)
         (*lexical-decl-frames* '())
         (*at-toplevel* t)
         (*toplevel-segments-p* nil)
@@ -3329,6 +3743,7 @@
         (*ffv-free-cache* (list nil))
         (*uv-warned* nil)
         (*ltv-hoisted* (and *compile-file-mode* *current-module-id* (list '())))
+        (*ltv-sites* (make-hash-table :test #'eq))
         (*xref-caller* (%xref-top-level-caller expr))
         (*xref-top-level-conses* nil)
         (*xref-walked* nil)
@@ -3402,6 +3817,8 @@
                                     *uninterned-var-names*
                                     (list nil)))
         (*specials* '())
+        (*sm-walker-context* nil)
+        (*sm-walker-bound* :none)
         (*lexical-decl-frames* '())
         (*at-toplevel* t)
         (*toplevel-segments-p* t)
@@ -3425,6 +3842,7 @@
         ;; COMPILE-FILE compiles a top level form: its LOAD-TIME-VALUE forms
         ;; belong to it, not to the fasl being written.
         (*ltv-hoisted* nil)
+        (*ltv-sites* (make-hash-table :test #'eq))
         (*ltv-eval-now* t)
         (*xref-caller* nil)
         (*xref-top-level-conses* nil)

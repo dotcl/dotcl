@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; MISMATCH checks its bounding indices.
 ;;;
 ;;; SEARCH, SUBSTITUTE, REPLACE and FILL all call CheckBoundingIndices; MISMATCH

@@ -108,7 +108,9 @@
     (lambda (i) (aref v i))))
 
 ;; A buffer fetched by a nested LET inside an unswitched loop is not one the
-;; loop tested: its accesses keep their own test.
+;; loop tested. For an octet buffer, whose fetch cannot answer null, that costs
+;; nothing: no test anywhere. For a kind whose fetch can answer null (signed 32
+;; bit) the accesses keep their own test.
 (defun %iba-nested (a vs)
   (declare (type %iba-octets a) (optimize speed (safety 0)))
   (let ((s 0))
@@ -116,6 +118,15 @@
     (dotimes (k (length a) s)
       (let ((w (svref vs k)))
         (declare (type %iba-octets w))
+        (setq s (+ s (aref a k) (aref w 0)))))))
+
+(defun %iba-nested-i32 (a vs)
+  (declare (type (simple-array (signed-byte 32) (*)) a) (optimize speed (safety 0)))
+  (let ((s 0))
+    (declare (fixnum s))
+    (dotimes (k (length a) s)
+      (let ((w (svref vs k)))
+        (declare (type (simple-array (signed-byte 32) (*)) w))
         (setq s (+ s (aref a k) (aref w 0)))))))
 
 (deftest inline-backing-alias.values
@@ -152,7 +163,8 @@
         (%iba-count "Runtime.BackingU8" #'%iba-sum16)
         (%iba-count "ABFALL" #'%iba-xor)
         (%iba-count "ABFALL" #'%iba-sum16)
-        (plusp (%iba-count "ABFALL" #'%iba-nested)))
-  (3 1 1 0 0 t))
+        (%iba-count "ABFALL" #'%iba-nested)
+        (plusp (%iba-count "ABFALL" #'%iba-nested-i32)))
+  (3 1 1 0 0 0 t))
 
 (setf dotcl:*save-sil* nil)

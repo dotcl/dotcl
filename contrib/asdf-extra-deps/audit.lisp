@@ -80,7 +80,7 @@
     (and p (find-symbol name p))))
 
 (defun mop-methods (f)
-  (let ((fn (or (find-sym "GENERIC-FUNCTION-METHODS" "SB-MOP")
+  (let ((fn (or #+sbcl (find-sym "GENERIC-FUNCTION-METHODS" "SB-MOP")
                 (find-sym "GENERIC-FUNCTION-METHODS" "DOTCL-MOP")
                 (find-sym "GENERIC-FUNCTION-METHODS" "CLOSER-MOP"))))
     (and fn (typep f 'generic-function) (length (funcall fn f)))))

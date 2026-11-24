@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Multi-line input in the bundled REPL.
 ;;;
 ;;; A form is not a line, so the editor holds the whole of one and decides for

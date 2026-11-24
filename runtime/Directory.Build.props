@@ -4,7 +4,7 @@
        library (DotCL.Runtime.csproj), inherit this <Version> via MSBuild's automatic
        Directory.Build.props import. Bump the release version HERE only. -->
   <PropertyGroup>
-    <Version>0.1.37</Version>
+    <Version>0.1.38</Version>
   </PropertyGroup>
 
   <!-- The two packed projects in this directory must not share restore output.
@@ -81,5 +81,10 @@
     <ContinuousIntegrationBuild Condition="'$(ContinuousIntegrationBuild)' == '' And '$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
     <DotclRepoRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../'))</DotclRepoRoot>
     <PathMap Condition="'$(ContinuousIntegrationBuild)' == 'true'">$(DotclRepoRoot)=/_/</PathMap>
+    <!-- A copy of the tree without .git (the samples check packs one) has no source root the
+         SDK can find, and DeterministicSourcePaths then stops projects with no package
+         references with "SourceRoot items must include at least one top-level item". PathMap
+         above already does the path mapping. -->
+    <DeterministicSourcePaths Condition="'$(ContinuousIntegrationBuild)' == 'true' And !Exists('$(DotclRepoRoot).git')">false</DeterministicSourcePaths>
   </PropertyGroup>
 </Project>

@@ -412,11 +412,20 @@ public static partial class Runtime
             if (target is not LispClass cls)
                 throw new LispErrorException(new LispTypeError(
                     "MAKE-INSTANCES-OBSOLETE: not a class", args[0]));
-            // Built-in and structure classes have no updatable instances.
+            // Built-in and structure classes have no updatable instances. The instances of
+            // the class and of every class that inherits from it become obsolete (CLHS 4.3.6).
             if (!cls.IsBuiltIn && !cls.IsStructureClass)
-                lock (cls.DefLock)
-                    cls.SupersedeLayout(cls.EffectiveSlots,
-                        LispClass.CaptureSharedValues(cls.EffectiveSlots, cls.ClassPrecedenceList));
+            {
+                foreach (var c in Runtime.AllKnownClasses())
+                {
+                    if (c.IsBuiltIn || c.IsStructureClass) continue;
+                    var cpl = c.ClassPrecedenceList;
+                    if (!ReferenceEquals(c, cls) && (cpl == null || System.Array.IndexOf(cpl, cls) < 0)) continue;
+                    lock (c.DefLock)
+                        c.SupersedeLayout(c.EffectiveSlots,
+                            LispClass.CaptureSharedValues(c.EffectiveSlots, cpl ?? new[] { c }));
+                }
+            }
             return cls;
         };
         GenericFunction mioGF = null!;
@@ -594,6 +603,8 @@ public static partial class Runtime
         RegClos("%ALLOCATE-INSTANCE", a => Runtime.MakeInstanceRaw(a[0]), 1);
         RegClos("%SLOT-EXISTS-P", a => Runtime.SlotExists(a[0], a[1]), 2);
         RegClos("%CHANGE-CLASS", Runtime.ChangeClass);
+        RegClos("%CLASS-HOOK-SAVE", a => Runtime.ClassHookSave(a[0], a[1], a[2]), 3);
+        RegClos("%CLASS-HOOK-RESTORE", a => Runtime.ClassHookRestore(a[0], a[1], a[2]), 3);
         RegClos("%REGISTER-ACCESSOR-METHOD", a => Runtime.RegisterAccessorMethod(a[0], a[1], a[2]), 3);
         RegClos("%MAKE-GF", a => Runtime.MakeGF(a[0], a[1]), 2);
         RegClos("%REGISTER-GF", a => Runtime.RegisterGF(a[0], a[1]), 2);
@@ -721,7 +732,7 @@ public static partial class Runtime
             // post.lisp aliases its classes into the FSET2 package exactly this way.
             var sym = (args[1] is Symbol orig && orig.HomePackage != null) ? orig : ToClassSymbol(args[1]);
             if (newVal is Nil) {
-                _classRegistry.TryRemove(sym, out _);
+                { if (_classRegistry.TryRemove(sym, out var removedCls) && removedCls != null) NoteOrphanClass(removedCls); }
             } else if (newVal is LispClass lc) {
                 _classRegistry[sym] = lc;
             } else {
@@ -1293,7 +1304,12 @@ public static partial class Runtime
                 new LispFunction(args => {
                     if (args.Length < 2) throw new LispErrorException(new LispProgramError("PRINT-OBJECT: requires 2 arguments"));
                     var writer = Runtime.GetOutputWriter(args[1]);
-                    var potext = Runtime.FormatTopBody(args[0], true);
+                    // A condition printed without escape is its report; this primary is
+                    // what the auxiliary methods of a report-less condition wrap.
+                    var potext = args[0] is LispInstance ci && Runtime.IsConditionInstance(ci)
+                                 && !Runtime.GetPrintEscapePublic()
+                        ? Runtime.ConditionInstanceDefaultReport(ci)
+                        : Runtime.FormatTopBody(args[0], true);
                     writer.Write(potext);
                     writer.Flush();
                     Runtime.NoteWritten(args[1], potext);
@@ -1516,6 +1532,31 @@ public static partial class Runtime
                     if (!supersSeen) { supersSpec = args[i + 1]; supersSeen = true; }
                 }
                 else { extra.Add(k); extra.Add(args[i + 1]); }
+            }
+            // ENSURE-CLASS on a class that already exists is a REINITIALIZE-INSTANCE of it
+            // (AMOP): an initarg that is not given keeps its present value. Without :DIRECT-SLOTS
+            // (or :DIRECT-DEFAULT-INITARGS) the class used to lose every slot it had, so
+            // (ensure-class 'c :direct-superclasses ...) on a class with slots left it slotless.
+            if (Runtime.FindClassOrNil(nameSym) is LispClass oldCls && !oldCls.IsForwardReferenced && !oldCls.IsBuiltIn)
+            {
+                bool slotsGiven = false, defaultsGiven = false;
+                for (int i = 0; i < extra.Count; i += 2)
+                {
+                    if (extra[i] == Startup.Keyword("DIRECT-SLOTS")) slotsGiven = true;
+                    else if (extra[i] == Startup.Keyword("DIRECT-DEFAULT-INITARGS")) defaultsGiven = true;
+                }
+                if (!slotsGiven)
+                {
+                    var plists = new List<LispObject>();
+                    foreach (var sd in oldCls.DirectSlots) plists.Add(Runtime.CanonicalSlotPlist(sd));
+                    extra.Add(Startup.Keyword("DIRECT-SLOTS")); extra.Add(Runtime.List(plists.ToArray()));
+                }
+                if (!defaultsGiven && oldCls.DirectDefaultInitargs is { Length: > 0 } ddi)
+                {
+                    var entries = new List<LispObject>();
+                    foreach (var (key, form, thunk) in ddi) entries.Add(Runtime.List(key, form, thunk));
+                    extra.Add(Startup.Keyword("DIRECT-DEFAULT-INITARGS")); extra.Add(Runtime.List(entries.ToArray()));
+                }
             }
             // Resolve the metaclass (a class object or a class name); null => STANDARD-CLASS.
             LispClass? metaclass = metaclassSpec switch

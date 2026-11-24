@@ -77,7 +77,10 @@
     (list :vars vars :var-types var-types :vals-list vals-list
           :decls1 decls1
           :decls2 decls2
-          :form form)))
+          ;; The generator splices one subform into several places; the copy makes each place its
+          ;; own form, as the text of a program has it. Shared structure would let LOAD-TIME-VALUE
+          ;; forms that are the same cons share one value here, which SBCL does not do.
+          :form (copy-tree form))))
 
 (defun rf-seed-random-state (seed)
   "A random state determined by SEED: MT19937 seeded by init_genrand, in the

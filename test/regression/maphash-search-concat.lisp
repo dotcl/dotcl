@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Three iteration/building paths stopped allocating per call:
 ;;;   MAPHASH      -- reuses a per-thread snapshot buffer and takes the Lisp
 ;;;                   function directly instead of closing over it

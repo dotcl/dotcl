@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; dotnet:invoke accepts a Lisp scalar as the receiver.
 ;;;
 ;;; .NET calls hand strings, characters and numbers back to Lisp unwrapped, so the

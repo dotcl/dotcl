@@ -114,9 +114,12 @@ the fasl is loaded, instead of loading the source.")
   (format *error-output* "  ~S: null" name)
   (finish-output *error-output*))
 
-(defun bench-emit-steady (name seconds runs stable)
+(defun bench-emit-steady (name seconds runs stable &optional all-times)
   (format t "~&STEADY ~A ~,6F ~D ~A~%"
           name seconds runs (if stable "stable" "unstable"))
+  ;; Every run, in order: the warm-up plateau is visible here.
+  (when all-times
+    (format t "TIMES ~A~{ ~,4F~}~%" name all-times))
   (finish-output))
 
 ;;; --- Timing macro ---
@@ -135,10 +138,10 @@ the fasl is loaded, instead of loading the source.")
                  (string-equal *bench-name* ,name)))
      (handler-case
        (if *bench-steady*
-           (multiple-value-bind (best runs stable)
+           (multiple-value-bind (best runs stable all-times)
                (ledger-steady:measure (lambda () (dotimes (i ,times) ,@body))
                                       :since *bench-load-finished*)
-             (bench-emit-steady ,name best runs stable))
+             (bench-emit-steady ,name best runs stable all-times))
          (if (and *bench-runs* (> *bench-runs* 0))
            (let (samples consed)
              (dotimes (run (+ *bench-warmup* *bench-runs*))

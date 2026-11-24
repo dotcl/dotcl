@@ -358,7 +358,7 @@ public static class SimdLower
             var def = typeof(SimdLower).GetMethod(op)!;
             foreach (var t in LaneTypes)
             {
-                if (t == typeof(ulong) && (op.StartsWith("Load") || op.StartsWith("Store")))
+                if (t == typeof(ulong) && (op.StartsWith("Load", System.StringComparison.Ordinal) || op.StartsWith("Store", System.StringComparison.Ordinal)))
                     yield return ("Simd." + op + "." + t.Name, typeof(SimdLower).GetMethod(op + "U64")!);
                 else
                     yield return ("Simd." + op + "." + t.Name, def.MakeGenericMethod(t));

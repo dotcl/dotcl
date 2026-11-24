@@ -58,6 +58,17 @@
         (sort (copy-list (symbol-value (find-symbol "*NOTES*" "PULOCK-COMMON"))) #'string<))
   (1 ("x 1" "x 2")))
 
+;;; The cross-reference records made while compiling inside a unit are read back in that unit
+;;; (they are read lazily): flushing them here must not intern the unit's symbols in the global
+;;; package of the same name.
+(deftest package-units-lock-xref-flush-stays-in-unit
+  (let ((flush (find-symbol "%XREF-FLUSH" "DOTCL.CIL-COMPILER")))
+    (when (and flush (fboundp flush)) (funcall flush))
+    (list (find-symbol "FAREWELL" "PULOCK-X")
+          (dotcl-lock:call-in-unit "PULOCK-X@2"
+            (lambda () (and (find-symbol "FAREWELL" "PULOCK-X") t)))))
+  (nil t))
+
 (deftest package-units-lock-packages
   (list (package-name (symbol-package (find-symbol "X-VERSION" "PULOCK-B")))
         (and (find-package "PULOCK-X@2!PULOCK-X") t)

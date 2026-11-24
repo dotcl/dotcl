@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; (SCHAR s i) and (CHAR s i) in value position.
 ;;;
 ;;; The character comparison operators already read a string element as a code

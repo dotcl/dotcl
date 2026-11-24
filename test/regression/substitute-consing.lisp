@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; SUBSTITUTE on a string or vector costs only its result.
 ;;;
 ;;; SUBSTITUTE replaces elements; it never adds or drops one, so the answer has

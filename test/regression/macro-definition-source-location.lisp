@@ -6,7 +6,7 @@
 
 (defun %mx-sl-source ()
   (or *mx-sl-src*
-      (let ((src (merge-pathnames "mx-sl-fixture.lisp" (regression-temp-dir))))
+      (let ((src (merge-pathnames "mx-sl-fixture.lisp" (regression-temp-dir/))))
         (with-open-file (s src :direction :output :if-exists :supersede)
           (dolist (l '("(defpackage \"MX-SL\" (:use \"CL\"))"                          ; 1
                        "(in-package \"MX-SL\")"                                       ; 2
@@ -39,7 +39,7 @@
   ((t 5) (t 5) (t 7) (t 7) (t 3)))
 
 (deftest-emitting-only macro-definition-source-location.load-fasl
-  (let ((fasl (merge-pathnames "mx-sl-fixture.fasl" (regression-temp-dir))))
+  (let ((fasl (merge-pathnames "mx-sl-fixture.fasl" (regression-temp-dir/))))
     (load (%mx-sl-source))
     (let ((*error-output* (make-broadcast-stream)))
       (compile-file *mx-sl-src* :output-file fasl))

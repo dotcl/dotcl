@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Line drawing in the bundled REPL.
 ;;;
 ;;; The editor used to ask the terminal where the cursor was before every

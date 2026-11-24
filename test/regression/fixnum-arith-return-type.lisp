@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; What a function whose body is (+ a b) returns.
 ;;;
 ;;; Declaring the PARAMETERS fixnum says nothing about the result: FIXNUM +

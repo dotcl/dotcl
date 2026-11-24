@@ -54,21 +54,21 @@
 ;;; the type initializer, rather than the constant pool the JIT uses), so compile
 ;;; the same shape to a file and load it back.
 (deftest-compiled-only key-check-const-array.fasl-path
-  (let ((src "kca-src-tmp.lisp"))
+  (let ((src (regression-temp-file "kca-src-tmp.lisp")))
     (unwind-protect
         (progn
           (with-open-file (s src :direction :output :if-exists :supersede)
             (write-string "(defun kca-fasl (&key a b) (if a b :no-a))" s)
             (terpri s)
             (write-string "(defun kca-fasl2 (&key a b) (if b a :no-b))" s))
-          (load (compile-file src :output-file "kca-src-tmp.fasl"))
+          (load (compile-file src :output-file (regression-temp-file "kca-src-tmp.fasl")))
           (list (funcall (symbol-function 'kca-fasl) :a 1 :b 2)
                 (funcall (symbol-function 'kca-fasl))
                 (funcall (symbol-function 'kca-fasl2) :a 3 :b 4)
                 (handler-case (progn (funcall (symbol-function 'kca-fasl) :zz 1) :no-error)
                   (error () :error))))
       (ignore-errors (delete-file src))
-      (ignore-errors (delete-file "kca-src-tmp.fasl"))
+      (ignore-errors (delete-file (regression-temp-file "kca-src-tmp.fasl")))
       (fmakunbound 'kca-fasl)
       (fmakunbound 'kca-fasl2)))
   (2 :no-a 3 :error))

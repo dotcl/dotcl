@@ -23,7 +23,8 @@
 
 ;;; The server and its one session.
 
-(defstruct server socket thread port (session nil) (owner nil))
+(defstruct server socket thread port (session nil) (owner nil)
+  (acceptor nil) (pending '()) (closed nil))
 
 (defstruct session
   stream
@@ -1199,6 +1200,10 @@ when there is exactly one."
                                     "variablesReference" (%var-ref (%children (cdr b)))))
                     bindings))))
         ((and (string= command "evaluate")
+              (jget args "frameId")
+              (not (%frame (jget args "frameId"))))
+         (fail "the frame is no longer valid (its thread has resumed)"))
+        ((and (string= command "evaluate")
               (%restart-command (jget args "expression" "")))
          (let ((cmd (%restart-command (jget args "expression")))
                (stop (%stop-for-evaluate args)))
@@ -1283,31 +1288,68 @@ when there is exactly one."
           (setf *internal-threads* (remove watcher *internal-threads*)))))
     (%log "client disconnected")))
 
+(defun %close-session (session)
+  "Make SESSION's serving loop end: a read on a closed stream fails."
+  (when session
+    (setf (session-open session) nil)
+    (ignore-errors (close (session-stream session)))))
+
+(defun %accept-loop (server)
+  "Accept connections for as long as the socket is open. A new client replaces
+the one being served: that session is closed here, and the serving thread takes
+the newest connection when the old session has finished."
+  (loop
+    (multiple-value-bind (stream address port)
+        (handler-case
+            (multiple-value-bind (s address port)
+                (dotcl-bsd-sockets:socket-accept (server-socket server))
+              (values (dotcl-bsd-sockets:socket-make-stream
+                       s :element-type '(unsigned-byte 8))
+                      address port))
+          (error () (setf (server-closed server) t) (return)))
+      (let ((old (dotcl-thread:with-lock-held (*state-lock*)
+                   (prog1 (server-pending server)
+                     (setf (server-pending server) (list (list stream address port)))))))
+        (dolist (entry old) (ignore-errors (close (first entry))))
+        (let ((session (server-session server)))
+          (when (and session (session-open session))
+            (%log "client replaced by a new connection")
+            (%close-session session)))))))
+
+(defun %next-connection (server)
+  "The newest accepted connection as (stream address port), waiting for one;
+NIL once the server is closed."
+  (loop
+    (let ((entry (dotcl-thread:with-lock-held (*state-lock*)
+                   (pop (server-pending server)))))
+      (when entry (return entry))
+      (when (server-closed server) (return nil))
+      (sleep 0.02))))
+
 (defun start-server (&key (host "127.0.0.1") (port 0))
   "Listen for a DAP client on HOST:PORT (0 picks a free port) and serve one
-session at a time in a background thread. Returns the server; SERVER-PORT
-tells the port."
+session at a time in a background thread. A client that connects while another
+is attached replaces it. Returns the server; SERVER-PORT tells the port."
   (when *server* (stop-server))
   (let* ((socket (dotcl-socket:make-server-socket host port))
          (server (make-server :socket socket :port (dotcl-socket:local-port socket))))
     (setf *start-output* *standard-output*)
     (setf (server-owner server) (dotcl:current-thread))
+    (let ((acceptor (dotcl-thread:make-thread (lambda () (%accept-loop server))
+                                              :name "dap-accept")))
+      (setf (server-acceptor server) acceptor)
+      (dotcl-thread:with-lock-held (*state-lock*) (push acceptor *internal-threads*)))
     (setf (server-thread server)
           (dotcl-thread:make-thread
            (lambda ()
              (loop
-               (multiple-value-bind (stream address port)
-                   (handler-case
-                       (multiple-value-bind (s address port)
-                           (dotcl-bsd-sockets:socket-accept socket)
-                         (values (dotcl-bsd-sockets:socket-make-stream
-                                  s :element-type '(unsigned-byte 8))
-                                 address port))
-                     (error () (return)))
-                 (let ((session (make-session :stream stream)))
-                   (setf (server-session server) session)
-                   (%log "client connected from ~A:~D" (%address-text address) port)
-                   (%serve session)))))
+               (let ((entry (%next-connection server)))
+                 (unless entry (return))
+                 (destructuring-bind (stream address port) entry
+                   (let ((session (make-session :stream stream)))
+                     (setf (server-session server) session)
+                     (%log "client connected from ~A:~D" (%address-text address) port)
+                     (%serve session))))))
            :name "dap-server"))
     (setf *server* server)))
 
@@ -1318,7 +1360,11 @@ tells the port."
         (setf (session-open session) nil)
         (ignore-errors (close (session-stream session)))))
     (%clear-breakpoints)
+    (setf (server-closed server) t)
     (dotcl-socket:socket-close (server-socket server))
+    (dolist (entry (dotcl-thread:with-lock-held (*state-lock*)
+                     (prog1 (server-pending server) (setf (server-pending server) '()))))
+      (ignore-errors (close (first entry))))
     (when (eq server *server*) (setf *server* nil))
     t))
 

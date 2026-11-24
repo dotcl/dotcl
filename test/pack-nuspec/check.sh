@@ -308,6 +308,41 @@ for pkg in "$WORK"/out/*.nupkg; do
   [ -z "$strays" ] || note "${pkg##*/} carries a JIT profile: $strays"
 done
 
+echo "=== [7] the same system packed from two directories gives the same fasl ==="
+# The fasl of a pack is a function of its sources: the module name carries a hash of
+# them, not a random suffix, and nothing of the directory it was built in is recorded.
+mkdir -p "$WORK/rep-a" "$WORK/rep-b"
+for d in rep-a rep-b; do
+  cat > "$WORK/$d/packrep.asd" <<'EOF'
+(defsystem "packrep" :version "1.0.0" :description "Reproducibility fixture" :author "A" :license "MIT"
+  :components ((:file "packrep")))
+EOF
+  cat > "$WORK/$d/packrep.lisp" <<'EOF'
+(defpackage :packrep (:use :cl) (:export #:main))
+(in-package :packrep)
+(defstruct pt x y)
+(defmacro twice (x) `(progn ,x ,x))
+(defgeneric area (o))
+(defmethod area ((o pt)) (* (pt-x o) (pt-y o)))
+(defun helper (n) (declare (type fixnum n)) (if (< n 2) n (+ (helper (- n 1)) (helper (- n 2)))))
+(defun main () (twice (format t "rep ~a ~a~%" (helper 10) (area (make-pt :x 2 :y 3)))))
+EOF
+  dotnet run --project "$RT" -- --core "$CORE" --asd-search-path "$WORK/$d" pack \
+    --system packrep --id packrep --command packrep --version 0.0.1 \
+    --dotcl-version "$ver" --from "$FROM" --rids any -o "$WORK/out-$d" >/dev/null 2>&1 \
+    || note "packing packrep from $d failed"
+  python3 -c "
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+n = [x for x in z.namelist() if x.endswith('dotcl.user.fasl')][0]
+open(sys.argv[2], 'wb').write(z.read(n))" "$WORK/out-$d/packrep.any.0.0.1.nupkg" "$WORK/$d.fasl" 2>/dev/null \
+    || note "no dotcl.user.fasl in the package packed from $d"
+done
+if [ -f "$WORK/rep-a.fasl" ] && [ -f "$WORK/rep-b.fasl" ]; then
+  cmp -s "$WORK/rep-a.fasl" "$WORK/rep-b.fasl" \
+    || note "the same sources packed from two directories gave different fasls"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "pack-nuspec: FAIL"
   exit 1

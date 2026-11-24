@@ -38,7 +38,9 @@
   "T when evaluating EXPR cannot signal: a literal, a lexical variable, or a
    conversion to a double-float of one whose value is a fixnum or a float."
   (let ((e (strip-value-wrappers expr nil)))
-    (cond ((and (consp e) (eq (car e) 'quote)) t)
+    (cond ((and (consp e) (eq (car e) 'quote))
+           ;; a malformed (QUOTE) is a run-time error, so it can signal
+           (and (consp (cdr e)) (null (cddr e))))
           ((or (null e) (eq e t) (keywordp e)) t)
           ((symbolp e)
            (and (not (global-special-p e))
@@ -106,14 +108,24 @@
    the System.Math entry that rounds a double the same way.")
 
 (defun %float-round-arg-kind (op args)
-  "When ARGS is one float of a statically known format and OP one of
-   +FLOAT-ROUND-OPS+ (either name) not locally rebound, that format: :SINGLE or
-   :DOUBLE."
-  (and (consp args) (null (cdr args))
+  "The statically known float format of ARGS for a +FLOAT-ROUND-OPS+ OP: :SINGLE or :DOUBLE."
+  (and (consp args) (null (cddr args))
        (or (assoc op +float-round-ops+) (find op +float-round-ops+ :key #'second))
+       ;; Two arguments (a divisor) only for the float-valued F functions: the integer
+       ;; FLOOR / TRUNCATE / CEILING / ROUND of two arguments return an integer, and the
+       ;; callers that lower a one-argument integer rounding do not divide.
+       (or (null (cdr args)) (assoc op +float-round-ops+))
        (not (local-function-entry op))
-       (cond ((single-float-typed-p (car args)) :single)
-             ((double-float-typed-p (car args)) :double))))
+       (let ((a (first args)) (b (second args)))
+         (flet ((operand-p (x) (or (single-float-typed-p x) (double-float-typed-p x)
+                                   (fixnum-typed-p x))))
+           (cond
+             ((or (double-float-typed-p a) (and b (double-float-typed-p b)))
+              (and (operand-p a) (or (null b) (operand-p b)) :double))
+             ((or (single-float-typed-p a) (and b (single-float-typed-p b)))
+              (and (or (single-float-typed-p a) (fixnum-typed-p a))
+                   (or (null b) (single-float-typed-p b) (fixnum-typed-p b))
+                   :single)))))))
 
 (defun %float-round-entry (op)
   (third (or (assoc op +float-round-ops+) (find op +float-round-ops+ :key #'second))))
@@ -124,6 +136,21 @@
       `(,@(compile-as-single arg) (:conv-r8) (:call ,(%float-round-entry op)) (:conv-r4))
       `(,@(compile-as-double arg) (:call ,(%float-round-entry op)))))
 
+(defun compile-float-round-raw-args (op args kind)
+  "ARGS rounded by OP, left on the stack as a raw float of format KIND."
+  (if (null (cdr args))
+      (compile-float-round-raw op (car args) kind)
+      (let ((entry (%float-round-entry op)))
+        (if (eq kind :single)
+            `(,@(compile-as-single (first args))
+              ,@(compile-as-single (second args))
+              (:call "Runtime.FloatDivS")
+              (:conv-r8) (:call ,entry) (:conv-r4))
+            `(,@(compile-as-double (first args))
+              ,@(compile-as-double (second args))
+              (:call "Runtime.FloatDivD")
+              (:call ,entry))))))
+
 (defun random-double-form-p (expr)
   "T for (RANDOM LIMIT [STATE]) with LIMIT statically a double-float."
   (and (consp expr) (eq (car expr) 'random)
@@ -131,6 +158,47 @@
        (not (macrolet-shadowed-p 'random))
        (or (= (length expr) 2) (= (length expr) 3))
        (double-float-typed-p (cadr expr))))
+
+;;; A call of a global function that is substituted at call sites (declaimed INLINE),
+;;; seen as the form it becomes: (LET ((PARAM ARG)...) DECL... FORM), the BLOCK the
+;;; substitution wraps the body in dropped when nothing returns from it. A float
+;;; result of that FORM is a float result of the call, so a LET variable bound to
+;;; the call can take a native float slot instead of boxing the result and
+;;; unboxing it at each use.
+(defun %global-inline-float-form (expr)
+  (and (consp expr) (symbolp (car expr)) (car expr)
+       (not *cross-compiling*)
+       (gethash (car expr) *inline-defs*)
+       (not (special-operator-name-p (car expr)))
+       (not (gethash (car expr) *compile-form-handlers*))
+       (not (local-function-entry (car expr)))
+       (not (macrolet-shadowed-p (car expr)))
+       (not (find-macro-expander (car expr)))
+       (not (maybe-expand-compiler-macro (car expr) expr))
+       (let ((inl (maybe-expand-inline (car expr) expr)))
+         (when (and (consp inl) (eq (car inl) 'let) (consp (cdr inl)))
+           (let* ((forms (cddr inl))
+                  (decls (loop for f in forms
+                               while (and (consp f) (eq (car f) 'declare))
+                               collect f))
+                  (rest (nthcdr (length decls) forms)))
+             (when (and (= (length rest) 1)
+                        (consp (car rest)) (eq (caar rest) 'block)
+                        (consp (cdar rest)) (consp (cddar rest)) (null (cdddar rest))
+                        (not (%block-returns-to-p (cadar rest) (cddar rest))))
+               `(let ,(cadr inl) ,@decls ,(caddar rest))))))))
+
+(defun %proven-real-var-p (x)
+  "True when X is a lexical variable the compiler has proven to hold a real number
+   (a DOTIMES count, checked by %REQUIRE-REAL), plain and not boxed."
+  (or
+   ;; The marker the let analysis writes for such a variable it has not compiled yet.
+   (and (consp x) (symbolp (car x)) (string= (symbol-name (car x)) "%AVT-REAL"))
+   (and (symbolp x) x (boundp '*cstate*)
+        (let ((key (lookup-local x)))
+          (and key
+               (not (boxed-var-p x))
+               (eq (cdr (assoc key (cstate-proven-type-locals) :test #'equal)) 'real))))))
 
 (defun double-float-typed-p (expr)
   "Return T if EXPR is statically known to produce a DoubleFloat value.
@@ -206,11 +274,21 @@
                 (b (double-float-typed-p (caddr expr))))
             (or (and a b)
                 (and a (%single-fixnum-operand-p (caddr expr)))
-                (and b (%single-fixnum-operand-p (cadr expr))))))
+                (and b (%single-fixnum-operand-p (cadr expr)))
+                (and a (single-float-typed-p (caddr expr)))
+                (and b (single-float-typed-p (cadr expr)))
+                (and a (%proven-real-var-p (caddr expr)))
+                (and b (%proven-real-var-p (cadr expr))))))
      t)
     ;; (abs x) of a double is a double -- same format, no contagion to consider.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs))
           (double-float-typed-p (cadr expr)))
+     t)
+    ;; (expt x n) of a double and an integer n is a double.
+    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'expt)
+          (not (local-function-entry 'expt))
+          (double-float-typed-p (cadr expr))
+          (or (eql (caddr expr) 2) (fixnum-typed-p (caddr expr))))
      t)
     ;; (sqrt x) of a double that cannot be negative is a double.
     ((%double-sqrt-nonneg-p expr) t)
@@ -229,6 +307,12 @@
     ((%float-if-p expr #'double-float-typed-p) t)
     ((and (consp expr) (member (car expr) '(let let*)) (consp (cdr expr)))
      (%float-let-value-p expr :double))
+    ;; A substituted call of a global INLINE function whose result form is a double.
+    ((and (consp expr) (symbolp (car expr)) (car expr)
+          (not (member (car expr) *inlining-stack* :test #'equal))
+          (let ((f (%global-inline-float-form expr)))
+            (and f (let ((*inlining-stack* (cons (car expr) *inlining-stack*)))
+                     (double-float-typed-p f))))))
     (t nil))))
 
 (defun %float-if-p (expr typed-p)
@@ -444,18 +528,18 @@
    stack, for storing into a native float slot. A float-typed EXPR lowers via
    compile-as-double/single (no box); anything else is compiled generically and
    unboxed; the slot's declaration promises a float, so a non-float value
-   surfaces as a loud InvalidCast (matching the long-locals store contract)."
+   is the declaration's TYPE-ERROR, naming the value (matching the long-locals store contract)."
   (ecase kind
     (:double (if (double-float-typed-p expr)
                  (compile-as-double expr)
                  `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                        (compile-expr expr))
-                   (:unbox-double))))
+                   (:call "Runtime.UnboxDoubleChecked"))))
     (:single (if (single-float-typed-p expr)
                  (compile-as-single expr)
                  `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                        (compile-expr expr))
-                   (:unbox-single))))))
+                   (:call "Runtime.UnboxSingleChecked"))))))
 
 (defun double-sqrt-form-p (expr)
   "T when EXPR is (SQRT X) or (LOG X) with X statically a DOUBLE-FLOAT.
@@ -508,6 +592,13 @@
             (not (local-function-entry 'abs)))
        (double-float-typed-p (cadr expr)))
       ((%double-sqrt-nonneg-p expr) t)
+      ;; (float I 1d0) / (coerce I 'double-float) of an integer whose range is
+      ;; provably non-negative: conv.r8 of a value >= 0 is >= 0.
+      ((and (consp expr) (member (car expr) '(float coerce))
+            (double-convert-form-p expr)
+            (fixnum-typed-p (cadr expr)))
+       (let ((r (expr-int-range (cadr expr))))
+         (and r (>= (car r) 0))))
       (t nil))))
 
 (defun %double-sqrt-nonneg-p (expr)
@@ -598,6 +689,13 @@
     ;; FLOAT converts it.
     ((and (not (double-float-typed-p expr)) (fixnum-typed-p expr))
      `(,@(compile-expr-to-long expr) (:conv-r8)))
+    ;; The single-float operand of a mixed double-float operation: widened
+    ;; exactly, as the contagion rule does.
+    ((and (not (double-float-typed-p expr)) (single-float-typed-p expr))
+     `(,@(compile-as-single expr) (:conv-r8)))
+    ;; A variable known to hold a real number, converted as the arithmetic converts it.
+    ((and (not (double-float-typed-p expr)) (%proven-real-var-p expr))
+     `((:ldloc ,(lookup-local expr)) (:call "Runtime.RealToDouble")))
     ;; A call from a typed body to itself whose result is a DOUBLE-FLOAT.
     ((and (typed-self-call-p expr)
           (eq (car (third (cstate-typed-self))) :double))
@@ -622,6 +720,17 @@
      (compile-as-double (%ignore-errors-inner expr)))
     ((and (%cond-as-if expr) (double-float-typed-p (%cond-as-if expr)))
      (compile-as-double (%cond-as-if expr)))
+    ;; A substituted call of a global INLINE function whose result form is a double:
+    ;; that form, in a LET of the arguments, lowered the native way.
+    ((and (consp expr) (symbolp (car expr)) (car expr)
+          (not (member (car expr) *inlining-stack* :test #'equal))
+          (let ((f (%global-inline-float-form expr)))
+            (and f
+                 (let ((*inlining-stack* (cons (car expr) *inlining-stack*)))
+                   (double-float-typed-p f))
+                 (let ((*inlining-stack* (cons (car expr) *inlining-stack*)))
+                   (return-from compile-as-double (compile-as-double f))))))
+     nil)
     ;; A structure slot declared DOUBLE-FLOAT -> raw r8 read, no box. The
     ;; integer sibling is COMPILE-STRUCT-SLOT-AS-LONG.
     ((and (consp expr) (= (length expr) 2) (symbolp (car expr))
@@ -684,6 +793,29 @@
     ;; (abs x) -> raw magnitude, no box on the way in or out.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) (quote abs)))
      `(,@(compile-as-double (cadr expr)) (:call "Math.AbsDouble")))
+    ;; (expt x 2) of a double -> one raw multiply.
+    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'expt)
+          (eql (caddr expr) 2)
+          (double-float-typed-p (cadr expr)))
+     (let ((tmp (gen-local "EXPT2")))
+       `((:declare-local ,tmp "Double")
+         ,@(compile-as-double (cadr expr))
+         (:stloc ,tmp)
+         (:ldloc ,tmp)
+         (:ldloc ,tmp)
+         (:mul))))
+    ;; (expt x n) of a double and an integer n: a raw Math.Pow.
+    ((and (consp expr) (= (length expr) 3) (eq (car expr) 'expt)
+          (double-float-typed-p (cadr expr))
+          (fixnum-typed-p (caddr expr))
+          (not (compiling-at-safety-3-p)))
+     (let ((tmp (gen-local "EXPTB")))
+       `((:declare-local ,tmp "Double")
+         ,@(compile-as-double (cadr expr))
+         (:stloc ,tmp)
+         (:ldloc ,tmp)
+         ,@(compile-expr-to-long (caddr expr))
+         (:call "Runtime.ExptDoubleL"))))
     ;; (sqrt x) of a double that cannot be negative: the raw root, no assertion.
     ((%double-sqrt-nonneg-p expr)
      `(,@(compile-as-double (cadr expr)) (:call "Math.SqrtDouble")))
@@ -701,7 +833,7 @@
      (compile-double-convert (cadr expr)))
     ((and (consp expr) (assoc (car expr) +float-round-ops+)
           (eq (%float-round-arg-kind (car expr) (cdr expr)) :double))
-     (compile-float-round-raw (car expr) (cadr expr) :double))
+     (compile-float-round-raw-args (car expr) (cdr expr) :double))
     ((random-double-form-p expr)
      (if (null (cddr expr))
          `(,@(compile-as-double (cadr expr)) (:call "Runtime.RandomDoubleRaw"))
@@ -1438,7 +1570,7 @@
        (:conv-r4)))
     ((and (consp expr) (assoc (car expr) +float-round-ops+)
           (eq (%float-round-arg-kind (car expr) (cdr expr)) :single))
-     (compile-float-round-raw (car expr) (cadr expr) :single))
+     (compile-float-round-raw-args (car expr) (cdr expr) :single))
     ((and (consp expr) (eq (car expr) 'the) (single-float-typed-p (caddr expr)))
      (compile-as-single (caddr expr)))
     ((and (consp expr) (eq (car expr) 'the))

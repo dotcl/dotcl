@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A call to a function whose FTYPE declares an integer result that fits int64
 ;;; is an integer operand for the arithmetic around it, not only when that type
 ;;; is FIXNUM. (UNSIGNED-BYTE 32) is how 32-bit modular helpers are declared

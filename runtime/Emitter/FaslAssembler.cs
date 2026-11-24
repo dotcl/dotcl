@@ -933,7 +933,7 @@ public class FaslAssembler
         // capture it). Mirrors EmitDefmethodNativeInto's wrapper.
         if (selfArg0)
         {
-            bool isSetf = name.StartsWith("(SETF ") && name.EndsWith(")");
+            bool isSetf = name.StartsWith("(SETF ", System.StringComparison.Ordinal) && name.EndsWith(")", System.StringComparison.Ordinal);
             if (isSetf)
             {
                 wil.Emit(OpCodes.Ldstr, name.Substring(6, name.Length - 7));
@@ -1081,7 +1081,7 @@ public class FaslAssembler
         // _funcN (self bound to fn) and _nativeFuncN (self passed by InvokeNativeN). Since
         // the LispFunction is built FROM this delegate, it can't capture fn; so resolve
         // self here via the symbol once per array call (cheap relative to the array path).
-        bool isSetf = name.StartsWith("(SETF ") && name.EndsWith(")");
+        bool isSetf = name.StartsWith("(SETF ", System.StringComparison.Ordinal) && name.EndsWith(")", System.StringComparison.Ordinal);
         string wrapperName = SanitizeName(name) + "_" + id;
         var wrapperMethod = tb.DefineMethod(wrapperName,
             MethodAttributes.Public | MethodAttributes.Static,
@@ -1223,7 +1223,7 @@ public class FaslAssembler
 
         // 3. Array wrapper: static LispObject Name_N(LispObject[] args). As for a
         // native function, self is resolved through the symbol on this slow path.
-        bool isSetf = name.StartsWith("(SETF ") && name.EndsWith(")");
+        bool isSetf = name.StartsWith("(SETF ", System.StringComparison.Ordinal) && name.EndsWith(")", System.StringComparison.Ordinal);
         var wrapperMethod = tb.DefineMethod(SanitizeName(name) + "_" + id,
             MethodAttributes.Public | MethodAttributes.Static,
             typeof(LispObject), new[] { typeof(LispObject[]) });
@@ -1520,7 +1520,7 @@ public class FaslAssembler
         }
 
         // Dispatch registration by name shape.
-        if (name.StartsWith("(SETF ") && name.EndsWith(")"))
+        if (name.StartsWith("(SETF ", System.StringComparison.Ordinal) && name.EndsWith(")", System.StringComparison.Ordinal))
         {
             // (SETF X): register on X's SetfFunction slot.
             var targetName = name.Substring(6, name.Length - 7);
@@ -1586,6 +1586,11 @@ public class FaslAssembler
     /// <paramref name="retargetCorlib"/> is non-null, the saved image's corlib
     /// reference is rewritten to that facade (only "netstandard" is supported) so
     /// the fasl loads on BCLs without System.Private.CoreLib (Unity IL2CPP/WebGL).</summary>
+    /// <summary>Library output: the module and data-holder types are written non-public.</summary>
+#pragma warning disable CS0649 // only the NET9+ emit path reads it
+    internal bool HideHelperTypes;
+#pragma warning restore CS0649
+
     public void Save(string outputPath, string? retargetCorlib = null)
     {
 #if !NET9_0_OR_GREATER
@@ -1629,6 +1634,7 @@ public class FaslAssembler
         FaslEhOrder.Fix(image);
         if (retargetCorlib != null)
             FaslCorlibRetarget.RetargetCorlib(image, retargetCorlib);
+        if (HideHelperTypes) FaslTypeVisibility.HideHelperTypes(image);
         ImageHook?.Invoke(image);
         FaslDeterministic.Stamp(image);
         // Replaced, never rewritten in place: the old fasl may be loaded (LOAD
@@ -1660,6 +1666,25 @@ public class FaslAssembler
     }
 
 #if NET9_0_OR_GREATER
+    private void EmitSlotPatches()
+    {
+        if (_structInternMap.SlotPatches.Count == 0) return;
+        var copy = typeof(LispInstance).GetMethod("CopySlot")!;
+        var inner = new CilAssembler
+        {
+            _il = _initIl, _faslMode = true,
+            _faslTypeBuilder = _tb, _faslStructMap = _structInternMap, _runOnce = true,
+        };
+        foreach (var p in _structInternMap.SlotPatches)
+        {
+            _initIl.Emit(OpCodes.Ldstr, _structInternMap.TrackString(p.TargetKey));
+            inner.EmitLoadConstInline(p.TargetSlot);
+            _initIl.Emit(OpCodes.Ldstr, _structInternMap.TrackString(p.OwnerKey));
+            inner.EmitLoadConstInline(p.OwnerSlot);
+            _initIl.Emit(OpCodes.Call, copy);
+        }
+    }
+
     private void Close()
     {
         CloseChunk();
@@ -1672,6 +1697,7 @@ public class FaslAssembler
         // indexed out of, built from a names blob rather than from per-symbol IL.
         _structInternMap.EmitUninternedTableInit(_cctorIl);
         _structInternMap.EmitDataPartsInit(_cctorIl);
+        EmitSlotPatches();
 
         // return Nil.Instance
         _initIl.Emit(OpCodes.Ldsfld,

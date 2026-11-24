@@ -10,6 +10,38 @@ public static partial class Runtime
     // ConcurrentDictionary so concurrent DEFCLASS / FIND-CLASS doesn't corrupt the table.
     private static readonly ClassRegistry _classRegistry = new();
 
+    // Classes taken out of the registry, held weakly. (SETF (FIND-CLASS NAME) NIL) removes a class
+    // while its instances (and its subclasses) go on existing, and a redefinition of a
+    // superclass still has to reach them (CLHS 4.3.6).
+    private static readonly List<WeakReference<LispClass>> _orphanClasses = new();
+
+    internal static void NoteOrphanClass(LispClass c)
+    {
+        lock (_orphanClasses)
+        {
+            if (_orphanClasses.Count >= 64 && (_orphanClasses.Count & (_orphanClasses.Count - 1)) == 0)
+                _orphanClasses.RemoveAll(w => !w.TryGetTarget(out _));
+            _orphanClasses.Add(new WeakReference<LispClass>(c));
+        }
+    }
+
+    /// <summary>The registered classes plus those that were taken out of the registry.</summary>
+    internal static IEnumerable<LispClass> AllKnownClasses()
+    {
+        foreach (var entry in _classRegistry) yield return entry.Value;
+        LispClass[] orphans;
+        lock (_orphanClasses)
+        {
+            if (_orphanClasses.Count == 0) yield break;
+            var l = new List<LispClass>();
+            foreach (var w in _orphanClasses)
+                if (w.TryGetTarget(out var c) && !(_classRegistry.TryGetValue(c.Name, out var r) && ReferenceEquals(r, c)))
+                    l.Add(c);
+            orphans = l.ToArray();
+        }
+        foreach (var c in orphans) yield return c;
+    }
+
     /// <summary>The class table. Every store or removal bumps Epoch, which
     /// invalidates the per-symbol FIND-CLASS answers cached on Symbol.ClassMemo.</summary>
     private sealed class ClassRegistry : ConcurrentDictionary<Symbol, LispClass>
@@ -19,11 +51,20 @@ public static partial class Runtime
         public new LispClass this[Symbol key]
         {
             get => base[key];
-            set { base[key] = value; System.Threading.Interlocked.Increment(ref Epoch); }
+            set
+            {
+                // The class this key named until now no longer answers to it (FIND-CLASS gives the
+                // new one), which the fast check of a declared class has to know.
+                if (base.TryGetValue(key, out var old) && !ReferenceEquals(old, value)) old.Superseded = true;
+                value.Superseded = false;
+                base[key] = value;
+                System.Threading.Interlocked.Increment(ref Epoch);
+            }
         }
         public new bool TryRemove(Symbol key, out LispClass value)
         {
             bool removed = base.TryRemove(key, out value!);
+            if (removed) value.Superseded = true;
             System.Threading.Interlocked.Increment(ref Epoch);
             return removed;
         }
@@ -148,6 +189,8 @@ public static partial class Runtime
 
     public static LispObject FindClass(LispObject name)
     {
+        if (name is Number or LispChar or Cons)
+            throw new LispErrorException(new LispTypeError("FIND-CLASS: the class name is not a symbol: " + FormatObject(name, true), name, Startup.Sym("SYMBOL")));
         var sym = ToClassSymbol(name);
         if (_classRegistry.TryGetValue(sym, out var cls))
             return cls;
@@ -332,8 +375,7 @@ public static partial class Runtime
             && !existing.NameCleared && ReferenceEquals(existing.Name, lc.Name))
         {
             NotifyDirectSubclasses(existing.DirectSuperclasses, lc.DirectSuperclasses, existing);
-            existing.StaleAccessorMethods = existing.AccessorMethods;
-            existing.AccessorMethods = new();
+            existing.SwapInStaleAccessors();
             existing.DirectSlots = lc.DirectSlots;
             existing.DirectSuperclasses = lc.DirectSuperclasses;
             existing.DirectDefaultInitargs = lc.DirectDefaultInitargs;
@@ -392,9 +434,8 @@ public static partial class Runtime
     /// </summary>
     private static void RefinalizeDependents(LispClass cls)
     {
-        foreach (var entry in _classRegistry)
+        foreach (var c in AllKnownClasses())
         {
-            var c = entry.Value;
             if (ReferenceEquals(c, cls)) continue;
             foreach (var super in c.DirectSuperclasses)
             {
@@ -628,7 +669,7 @@ public static partial class Runtime
             _classRegistry[simpleSym] = cls;
             // Also register under the uppercase name so unquoted Lisp symbols
             // (e.g. (ClsAnimal) read as CLSANIMAL) find the class correctly.
-            var upperSym = Startup.Sym(display.ToUpperInvariant());
+            var upperSym = Startup.Sym(CharCase.SimpleUpper(display));
             if (!ReferenceEquals(upperSym, simpleSym) && !_classRegistry.ContainsKey(upperSym))
                 _classRegistry[upperSym] = cls;
             // Always alias the class under its FullName too, so the FullName is a
@@ -669,7 +710,7 @@ public static partial class Runtime
             inst.Slots[i] = slots[i] is Nil ? null : slots[i];
         return inst;
     }
-    public static void RemoveClass(string name) => _classRegistry.TryRemove(Startup.Sym(name), out _);
+    public static void RemoveClass(string name) { if (_classRegistry.TryRemove(Startup.Sym(name), out var removed) && removed != null) NoteOrphanClass(removed); }
 
     /// <summary>Iterate all registered classes. Used by DOTCL-MOP:CLASS-DIRECT-SUBCLASSES
     /// (no back-link is maintained, so we scan).</summary>
@@ -1230,6 +1271,19 @@ public static partial class Runtime
     public static Symbol? MacroFunctionName(LispFunction fn)
         => _macroFunctionNames.TryGetValue(fn, out var sym) ? sym : null;
 
+    /// <summary>A function is being installed as the definition of SYM (DEFUN, (SETF FDEFINITION),
+    /// (SETF SYMBOL-FUNCTION)): a macro of the same name no longer is one (CLHS 5.1.2.5, a name is
+    /// a function or a macro). Without this the old expander stayed, and every call compiled
+    /// afterwards was expanded by it.</summary>
+    internal static void ForgetMacroOnFunctionDefinition(Symbol sym)
+    {
+        if (_macroFunctions.TryRemove(sym, out _))
+        {
+            System.Threading.Interlocked.Increment(ref MacroEpoch);
+            RemoveCompilerMacro(sym);
+        }
+    }
+
     public static void UnregisterMacroFunction(Symbol sym)
     {
         CheckPackageLock(sym, "FMAKUNBOUND");
@@ -1268,6 +1322,7 @@ public static partial class Runtime
         var result = MacroFunction(name);
         if (result != Nil.Instance) return result;
         var sym = GetSymbol(name, "MACRO-FUNCTION");
+        if (IsSpecialOperator(sym)) return Nil.Instance;
         var compilerFn = Startup.LookupCompilerMacroAsMacro(sym);
         if (compilerFn != null) return CompilerMacroExpander(sym, compilerFn);
         return Nil.Instance;

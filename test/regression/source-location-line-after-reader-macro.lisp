@@ -23,7 +23,7 @@
     rt))
 
 (defun %slr-fixture-path (name)
-  (merge-pathnames name (regression-temp-dir)))
+  (merge-pathnames name (regression-temp-dir/)))
 
 (defun %slr-write-fixture (path)
   (with-open-file (s path :direction :output :if-exists :supersede)

@@ -33,7 +33,7 @@
 (deftest the-multiple-values.ftruncate
   (%tmv-both '(lambda (a b) (declare (type fixnum a b))
                 (the float (ftruncate a b))) -127 65536)
-  ((0.0 -127) (0.0 -127)))
+  ((-0.0 -127) (-0.0 -127)))
 
 (deftest the-multiple-values.gethash
   (let ((h (make-hash-table)))

@@ -2,7 +2,7 @@
 ;;; external format consumes it, so the text comes back without U+FEFF and FILE-POSITION counts the mark.
 
 (defun %ebr-roundtrip (ef text)
-  (let ((path (merge-pathnames "ebr.dat" (regression-temp-dir))))
+  (let ((path (merge-pathnames "ebr.dat" (regression-temp-dir/))))
     (with-open-file (o path :direction :output :if-exists :supersede :external-format ef)
       (write-string text o))
     (with-open-file (i path :external-format ef)
@@ -18,7 +18,7 @@
   (#.(coerce (list #\a (code-char 233)) 'string) 12 12))
 
 (deftest external-format.bom-read-char-and-seek
-  (let ((path (merge-pathnames "ebr2.dat" (regression-temp-dir)))
+  (let ((path (merge-pathnames "ebr2.dat" (regression-temp-dir/)))
         (text (coerce (list #\x #\y #\z) 'string)))
     (with-open-file (o path :direction :output :if-exists :supersede :external-format :utf-16)
       (write-string text o))

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; (MOD X N) and (REM X N) with a constant divisor carry the divisor's range
 ;;; into EXPR-INT-RANGE.
 ;;;

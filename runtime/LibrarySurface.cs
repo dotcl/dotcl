@@ -170,7 +170,7 @@ public static class LibrarySurface
     {
         var hash = SHA256.HashData(Encoding.UTF8.GetBytes(string.Join("\n", entries)));
         return "sha256:" + Convert.ToHexString(hash).ToLowerInvariant()
-            + " n=" + Math.Min(entries.Count, 99999).ToString("D5");
+            + " n=" + Math.Min(entries.Count, 99999).ToString("D5", System.Globalization.CultureInfo.InvariantCulture);
     }
 
     /// <summary>Replace the placeholder surface value in IMAGE with the real one.</summary>

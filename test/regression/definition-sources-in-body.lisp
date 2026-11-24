@@ -3,7 +3,7 @@
 ;;; compiles them, so not on the emit-free build.
 
 (defun %dsb-source ()
-  (let ((src (merge-pathnames "dsb-fixture.lisp" (regression-temp-dir))))
+  (let ((src (merge-pathnames "dsb-fixture.lisp" (regression-temp-dir/))))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (dolist (l '("(defpackage \"DS-BODY\" (:use \"CL\"))"                         ; 1
                    "(in-package \"DS-BODY\")"                                      ; 2
@@ -37,7 +37,7 @@
   t)
 
 (deftest-emitting-only definition-sources-in-body.load-fasl
-  (let ((fasl (merge-pathnames "dsb-fixture.fasl" (regression-temp-dir)))
+  (let ((fasl (merge-pathnames "dsb-fixture.fasl" (regression-temp-dir/)))
         (src (%dsb-source)))
     (when (find-package "DS-BODY") (delete-package "DS-BODY"))
     (let ((*error-output* (make-broadcast-stream)))

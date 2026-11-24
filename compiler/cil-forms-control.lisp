@@ -25,23 +25,37 @@
          ;; A block in the tail of a body that took a value mode: what it
          ;; returns, by falling off its end or by RETURN-FROM, is that body's
          ;; return value, so its tail VALUES can answer the mode too.
-         (value-tail-p (and *in-tail-position* (%mv-mode-local) t))
+         ;; :BLOCK-VALUE when the block is in the tail of the function body itself
+         ;; (not of a consumer that reads the values on return), where a self call
+         ;; may loop.
+         (value-tail-p (and *in-tail-position* (%mv-mode-local)
+                            (if (member *in-tail-position* '(t :block-value))
+                                :block-value
+                                t)))
          ;; The block standing for the body of a local function that takes the
          ;; exit protocol (see %PFN-FN-FACTS) is that body: what is in its tail
          ;; is in the function's.
          (pfn-body-p (and name (symbolp name) (get name 'pfn-exit) t))
+         ;; A block whose value only the primary is taken of (a LET init, an argument):
+         ;; its forms, and the values its RETURN-FROMs return, are compiled for that.
+         (single-p (and (null *in-mv-context*) (null *in-tail-position*) (not pfn-body-p)))
          ;; Entry format: (tag-key result-key end-label local-result-key local-end-label
-         ;;                needs-catch value-tail-p)
+         ;;                needs-catch value-tail-p single-p)
+         ;; The name for the environments a macro in the body receives: a block no
+         ;; RETURN-FROM names is compiled without this function (see the TRANSPARENT-BLOCK
+         ;; sites), so the names a macro can ask for are the frames, not the compile state.
+         (*lexical-decl-frames* (%push-decl-frame :block (list name) nil))
          (*cstate* (cstate-with *cstate*
                      +cs-block-tags+
                      (acons name (list tag-key result-key end-label result-key end-label needs-catch
-                                       value-tail-p)
+                                       value-tail-p single-p)
                             (cstate-block-tags))
                      +cs-locals+ (acons tag-var-sym tag-key (cstate-locals))))
          (body-instrs (let ((*in-tail-position* (cond (pfn-body-p *in-tail-position*)
+                                                      ((eq value-tail-p :block-value) :block-value)
                                                       (value-tail-p :value)
                                                       (t nil)))
-                            (*in-mv-context* t)
+                            (*in-mv-context* (not single-p))
                             (*inlining-stack* (inline-guard-stack name)))
                         (compile-progn body))))
     (if (or (car needs-catch)
@@ -142,13 +156,33 @@
                     `((:ldloc ,tok) (:call "ControlFlowFilters.TokenException") (:throw)))))
             (:label ,ok))))))
 
+(defun %compile-unknown-block-error (name &optional (what "return for unknown block") (op "RETURN-FROM"))
+  "Code for a RETURN-FROM (or GO) to a NAME that is not there: a runtime error of
+   type COMPILED-PROGRAM-ERROR, after the same report a failed macroexpansion gets."
+  (let ((text (format nil "~A: ~A" what name)))
+    (setq *compile-errors-detected* t)
+    (if *compile-file-mode*
+        (progn
+          (incf *macroexpansion-failures*)
+          (warn "caught ERROR:~%  ~A" text))
+        (ignore-errors
+         (format *error-output* "~&; caught ERROR:~%;   ~A~%" text)))
+    (compile-expr
+     `(error 'compiled-program-error
+             :format-control "Execution of a form compiled with errors.~%Form:~%  (~A ~A)~%Compile-time error:~%  ~A"
+             :format-arguments (list ,op ',name ,text)))))
+
 (defun compile-return-from (name value-expr)
   "Compile (return-from name value).
    Local return (same compilation unit, not in finally block) uses leave.
    Non-local return (from closure or finally block) throws BlockReturnException."
   (when *transparent-blocks* (%transparent-block-check name))
   (let ((entry (assoc name (cstate-block-tags))))
-    (unless entry (error 'program-error :format-control "return-from: no block named ~s" :format-arguments (list name)))
+    ;; A RETURN-FROM to a block that is not there is reported, and the form
+    ;; becomes a runtime PROGRAM-ERROR, as SBCL does, so an enclosing
+    ;; HANDLER-CASE of the same toplevel form still sees it.
+    (unless entry
+      (return-from compile-return-from (%compile-unknown-block-error name)))
     (let ((tag-key (first (cdr entry)))
           (local-result-key (fourth (cdr entry)))
           (local-end-label (fifth (cdr entry))))
@@ -159,15 +193,18 @@
             ;; Local return: store result and leave to block end
             `(,@(%reset-before-neutral
                  (if value-expr
-                    (let ((*in-mv-context* t)
+                    (let ((*in-mv-context* (not (eighth (cdr entry))))
                           ;; The block's value is the body's return value (see
                           ;; compile-block): the returned form is in its tail,
                           ;; unless the way out runs cleanup code that could
                           ;; publish values of its own (UNWIND-PROTECT).
-                          (*in-tail-position* (if (and (seventh (cdr entry)) (%mv-mode-local)
-                                                       (not *mv-exit-cleanup*))
-                                                  :value
-                                                  *in-tail-position*))
+                          (*in-tail-position* (cond ((eighth (cdr entry)) nil)
+                                                    ((and (seventh (cdr entry)) (%mv-mode-local)
+                                                          (not *mv-exit-cleanup*))
+                                                     (if (eq (seventh (cdr entry)) :block-value)
+                                                         :block-value
+                                                         :value))
+                                                    (t *in-tail-position*)))
                           ;; Any other block's value is not this body's return
                           ;; value: no value mode applies to the returned form.
                           (*mv-mode-local* (and (seventh (cdr entry)) (not *mv-exit-cleanup*)
@@ -339,12 +376,12 @@
 
 (defun parse-tagbody-forms (forms)
   "Parse tagbody forms into segments: ((label . forms-list) ...).
-   The first segment has label nil."
+   The first segment has a fresh label, so NIL can be a tag."
   (let ((segments '())
-        (current-label nil)
+        (current-label (make-symbol "TAGBODY-START"))
         (current-forms '()))
     (dolist (form forms)
-      (if (or (and (symbolp form) (not (null form))) (integerp form))
+      (if (or (symbolp form) (integerp form))
           (progn
             (push (cons current-label (reverse current-forms)) segments)
             (setf current-label form)
@@ -556,12 +593,25 @@ leave a protected region, and balance means the GO is not inside one."
             ,@(%compile-tagbody forms nil)
             (:label ,done)))))))
 
+(defun %tagbody-duplicate-tag (tags)
+  "First tag of TAGS that appears twice (by EQL), and T when there is one."
+  (loop for rest on tags
+        when (member (car rest) (cdr rest) :test #'eql)
+          return (values (car rest) t)))
+
 (defun %compile-tagbody (forms region)
   "Compile (tagbody forms...).
    Local go (same tagbody, not in closure) uses index + leave instead of exceptions.
    Non-local go (from closures) still uses GoException throw/catch.
    REGION is (BOUND . BODY-FORMS): BOUND is pushed on *BOUNDED-INDEX* while
    those forms compile."
+  (multiple-value-bind (dup dup-p)
+      (%tagbody-duplicate-tag
+       (loop for f in forms when (or (symbolp f) (integerp f)) collect f))
+    (when dup-p
+      (return-from %compile-tagbody
+        (compile-static-program-error
+         (format nil "TAGBODY: the tag ~S appears more than once" dup)))))
   (let* ((segments (parse-tagbody-forms forms))
          (tb-id-key (gen-local "TBID"))
          (index-key (gen-local "TBIDX"))
@@ -570,14 +620,12 @@ leave a protected region, and balance means the GO is not inside one."
          (loop-label (gen-label "TBLOOP"))
          (leave-label (gen-label "TBLEAVE"))
          (ex-key (gen-local "TBEX"))
-         ;; Build tag->index map (tags start from index 0)
-         (tag-counter 0)
+         ;; Build tag->index map; segment 0 is the pre-tag prefix
          (tag-indices
            (let ((result '()))
-             (dolist (seg segments)
-               (when (car seg)
-                 (push (cons (car seg) tag-counter) result))
-               (incf tag-counter))
+             (loop for seg in (cdr segments)
+                   for index from 1
+                   do (push (cons (car seg) index) result))
              (reverse result)))
          ;; Segment labels
          (seg-labels (loop for i from 0 below (length segments)
@@ -603,6 +651,7 @@ leave a protected region, and balance means the GO is not inside one."
          ;;                    leave-label needs-catch has-go). 5th/6th enable
          ;; local go; 7th lets a captured non-local go flag this tagbody's
          ;; needs-catch; 8th records that a go exists at all.
+         (*lexical-decl-frames* (%push-decl-frame :tagbody (mapcar #'car tag-indices) nil))
          (*cstate* (cstate-with *cstate* +cs-go-tags+
                      (append
                       (mapcar (lambda (ti) (list (car ti) tb-var-name tb-id-key (cdr ti)
@@ -727,7 +776,8 @@ leave a protected region, and balance means the GO is not inside one."
    Local go (5th element in *go-tags* entry present) sets index + leave.
    Non-local go (from closures, no 5th element) uses GoException throw."
   (let ((entry (assoc tag (cstate-go-tags))))
-    (unless entry (error 'program-error :format-control "go: no tagbody tag named ~s" :format-arguments (list tag)))
+    (unless entry
+      (return-from compile-go (%compile-unknown-block-error tag "go for unknown tag" "GO")))
     ;; Format: (tag-name tb-var-name tb-id-key label-idx [index-key loop-label])
     (let ((tb-id-key (third entry))
           (label-idx (fourth entry))
@@ -926,17 +976,11 @@ leave a protected region, and balance means the GO is not inside one."
       ;; finally before the clause body executes.
       (:begin-exception-block)
       ;; Body in MV-propagating position: handler-case returns body's values (CL spec).
-      ;; Self-TCO inside handler-case: use `leave` to exit the try block and prepend
-      ;; PopCluster so each iteration has a clean handler stack.
+      ;; A self-call in the body is not a tail call: it runs under this handler, and a
+      ;; jump back to the top of the function would leave the protected region first.
       ,@(let ((*in-try-block* t)         ; protect: :ret invalid in try/catch region
               (*in-mv-context* t)
-              ;; When TCO is active, mark the try/catch context so the self-call uses
-              ;; `leave TCOLOOP` instead of `ret`. The cluster PopCluster on that leave
-              ;; is now handled by the finally block (see below), so we no longer
-              ;; prepend it to the leave-instrs (doing so would double-pop).
-              (*cstate* (cstate-with *cstate*
-                          +cs-tco-in-try-catch+
-                          (if (cstate-tco-self-name) t (cstate-tco-in-try-catch)))))
+              (*cstate* (cstate-with *cstate* +cs-tco-in-try-catch+ nil)))
           (compile-expr body-form))
       (:stloc ,result-key)
       (:leave ,inner-end-label)
@@ -1104,6 +1148,39 @@ leave a protected region, and balance means the GO is not inside one."
                                               key-start args-array)))
         `(,@arity-instrs ,@key-check-instrs ,@param-instrs
           ,@(compile-progn (wrap-aux-body aux effective-body)))))))
+
+;;; Clause shapes (CLHS RESTART-CASE, RESTART-BIND). The option keywords of a restart-case
+;;; clause are only the leading ones of its body, as the clause compiler reads them.
+(defun %check-restart-case-shape (expr)
+  (flet ((bad (control &rest args)
+           (error 'program-error :format-control (concatenate 'string "RESTART-CASE: " control)
+                                 :format-arguments args)))
+    (unless (and (consp (cdr expr)) (null (cdr (last expr)))) (bad "malformed form ~S" expr))
+    (dolist (clause (cddr expr))
+      (unless (and (consp clause) (null (cdr (last clause))) (symbolp (car clause))
+                   (consp (cdr clause)) (listp (cadr clause)) (null (cdr (last (cadr clause)))))
+        (bad "malformed clause ~S" clause))
+      (let ((rest (cddr clause)) (seen nil))
+        (loop while (and (consp rest) (member (car rest) '(:report :interactive :test)))
+              do (unless (consp (cdr rest)) (bad "the ~S option has no value in ~S" (car rest) clause))
+                 (when (member (car rest) seen) (bad "the ~S option appears twice in ~S" (car rest) clause))
+                 (push (car rest) seen)
+                 (setq rest (cddr rest)))))))
+
+(defun %check-restart-bind-shape (expr)
+  (flet ((bad (control &rest args)
+           (error 'program-error :format-control (concatenate 'string "RESTART-BIND: " control)
+                                 :format-arguments args)))
+    (unless (and (consp (cdr expr)) (listp (cadr expr)) (null (cdr (last expr)))
+                 (null (cdr (last (cadr expr)))))
+      (bad "malformed form ~S" expr))
+    (dolist (b (cadr expr))
+      (unless (and (consp b) (null (cdr (last b))) (symbolp (car b)) (consp (cdr b))
+                   (evenp (length (cddr b))))
+        (bad "malformed binding ~S" b))
+      (do ((p (cddr b) (cddr p))) ((null p))
+        (unless (member (car p) '(:test-function :report-function :interactive-function))
+          (bad "unknown keyword ~S in ~S" (car p) b))))))
 
 (defun compile-restart-case (body-form clauses)
   "Compile (restart-case body (name (params...) body...) ...).
@@ -1549,7 +1626,7 @@ leave a protected region, and balance means the GO is not inside one."
       (emit-nil)
       (let* ((clause (progn
                        ;; Every clause must be a non-empty list, also after a T clause that ends the cond.
-                       (unless shared-tmp
+                       (unless (or shared-tmp (and *cond-continuation* (eq clauses (cdr *cond-continuation*))))
                          (dolist (c clauses)
                            (unless (consp c) (error 'type-error :datum c :expected-type 'cons))))
                        (if (consp (car clauses))
@@ -1566,7 +1643,15 @@ leave a protected region, and balance means the GO is not inside one."
               (if body
                     ;; The same test lowering as IF: native comparisons, NOT,
                     ;; AND / OR chains, inlined predicates.
-                    (compile-if (list test (cons 'progn body) (cons 'cond (cdr clauses))))
+                    ;; The rest of the chain is this form's continuation, not a nested
+                    ;; subexpression: it does not count as one more level of compile depth
+                    ;; (a COND of 10000 clauses would reach the depth limit meant for
+                    ;; runaway macro expansion). The stack check in COMPILE-FORM still
+                    ;; reports a chain too long for the stack.
+                    (let* ((*compile-depth* (max 0 (1- *compile-depth*)))
+                           (rest-form (cons 'cond (cdr clauses)))
+                           (*cond-continuation* rest-form))
+                      (compile-if (list test (cons 'progn body) rest-form)))
                     ;; No body: all no-body arms share one CTMP slot
                     (let ((tmp (or shared-tmp (gen-local "CTMP"))))
                       ;; Test-only arm: the test value becomes the result, but the

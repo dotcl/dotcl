@@ -1,0 +1,406 @@
+;;; Finds redundant tests in the files named by test/regression/run.lisp.
+;;;
+;;; Run from the repository root:
+;;;   dotnet run --project runtime/runtime.csproj -- --asm compiler/cil-out.sil \
+;;;     test/tools/find-duplicate-tests.lisp
+;;;
+;;; The script only reads, it never edits a test file. It prints tab-separated
+;;; rows with the columns kind, file, test, other file, other test.
+;;; EXACT: same DEFTEST variant, form and expected values after reading.
+;;; SUBSUMED: this test's whole form also appears inside the other test's form.
+;;; NEAR: token-set Jaccard similarity at least *NEAR-DUPLICATE-THRESHOLD*.
+;;; SUBSUMED and NEAR rows are candidates for a human, never automatic deletions.
+;;;
+;;; Test files are READ, not loaded: unknown packages are created as needed,
+;;; #. forms become data, and #S forms are kept as data as well.
+
+(defparameter *near-duplicate-threshold* 0.90)
+
+(defun %token-char-p (ch)
+  (and (graphic-char-p ch)
+       (not (find ch '(#\( #\) #\" #\' #\, #\; #\` #\# #\: #\|)))
+       (not (member ch '(#\Space #\Tab #\Newline #\Return #\Page)))))
+
+(defun %source-whitespace-p (ch)
+  (member ch '(#\Space #\Tab #\Return #\Linefeed #\Page)))
+
+(defun %skip-source-space (s i n)
+  (loop
+    (cond ((>= i n) (return i))
+          ((%source-whitespace-p (char s i)) (incf i))
+          ((char= (char s i) #\;)
+           (let ((j (position #\Newline s :start i)))
+             (setq i (if j (1+ j) n))))
+          ((and (char= (char s i) #\#) (< (1+ i) n) (char= (char s (1+ i)) #\|))
+           (incf i 2)
+           (let ((depth 1))
+             (loop while (and (< i n) (> depth 0)) do
+               (cond ((and (char= (char s i) #\#) (< (1+ i) n)
+                           (char= (char s (1+ i)) #\|))
+                      (incf depth) (incf i 2))
+                     ((and (char= (char s i) #\|) (< (1+ i) n)
+                           (char= (char s (1+ i)) #\#))
+                      (decf depth) (incf i 2))
+                     (t (incf i))))))
+          ((char= (char s i) #\")
+           (incf i)
+           (loop while (< i n) do
+             (cond ((char= (char s i) #\\) (incf i 2))
+                   ((char= (char s i) #\") (incf i) (return))
+                   (t (incf i)))))
+          (t (return i)))))
+
+(defun %ensure-package (name)
+  (or (find-package name) (make-package name :use nil)))
+
+(defun %scan-package-markers (s)
+  (let ((i 0) (n (length s)))
+    (loop
+      (setq i (%skip-source-space s i n))
+      (when (>= i n) (return))
+      (cond
+        ((char= (char s i) #\#)
+         (if (and (< (1+ i) n) (char= (char s (1+ i)) #\\))
+             (incf i 3)
+             (incf i 2)))
+        ((char= (char s i) #\:)
+         (let ((j (1- i)))
+           (loop while (and (>= j 0) (%token-char-p (char s j))) do (decf j))
+           (let* ((pname (subseq s (1+ j) i))
+                  (k (if (and (< (1+ i) n) (char= (char s (1+ i)) #\:))
+                         (+ i 2)
+                         (1+ i)))
+                  (m k))
+             (loop while (and (< m n) (%token-char-p (char s m))) do (incf m))
+             (when (> (length pname) 0)
+               (let* ((pkg (%ensure-package (string-upcase pname)))
+                      (sym (string-upcase (subseq s k m))))
+                 (when (> (length sym) 0)
+                   (ignore-errors (export (intern sym pkg) pkg)))))
+             (setq i (max (1+ i) m)))))
+        (t (incf i))))))
+
+(defun %make-readtable ()
+  (let ((rt (copy-readtable nil)))
+    (set-dispatch-macro-character
+     #\# #\.
+     (lambda (stream subchar arg)
+       (declare (ignore subchar arg))
+       (list :read-eval (read stream t nil t)))
+     rt)
+    (set-dispatch-macro-character
+     #\# #\S
+     (lambda (stream subchar arg)
+       (declare (ignore subchar arg))
+       (list :struct (read stream t nil t)))
+     rt)
+    rt))
+
+(defun %read-file-forms (path rt pkg)
+  (with-open-file (in path :direction :input)
+    (let ((*readtable* rt) (*package* pkg) (*read-eval* nil))
+      (loop for form = (handler-case (read in nil :eof)
+                         (error (e)
+                           (format t "READ-ERROR ~a: ~a~%" path e)
+                           :eof))
+            until (eq form :eof)
+            collect form))))
+
+(defun %deftest-name-p (sym)
+  (and (symbolp sym)
+       (let ((name (string-upcase (symbol-name sym))))
+         (and (>= (length name) 7) (string= "DEFTEST" name :end2 7)))))
+
+(defun %definition-form-p (sym)
+  (and (symbolp sym)
+       (member (string-upcase (symbol-name sym))
+               '("DEFMACRO" "DEFUN" "DEFMETHOD" "DEFGENERIC" "DEFCLASS"
+                 "DEFSTRUCT" "DEFTYPE" "DEFINE-CONDITION" "DEFVAR"
+                 "DEFPARAMETER" "DEFCONSTANT" "DEFPACKAGE" "IN-PACKAGE")
+               :test #'string=)))
+
+(defstruct (dup (:constructor %make-dup))
+  file name variant form expected)
+
+(defun %collect-tests (form file out)
+  (cond
+    ((atom form) out)
+    ((and (symbolp (car form))
+          (member (string-upcase (symbol-name (car form))) '("QUOTE" "FUNCTION")
+                  :test #'string=))
+     out)
+    ((%deftest-name-p (car form))
+     (cons (%make-dup :file file
+                      :name (second form)
+                      :variant (string-upcase (symbol-name (car form)))
+                      :form (third form)
+                      :expected (cdddr form))
+           out))
+    ((%definition-form-p (car form)) out)
+    (t (%collect-tests (cdr form) file
+                       (%collect-tests (car form) file out)))))
+
+(defun %form-equal (a b)
+  (cond
+    ((and (stringp a) (stringp b)) (string= a b))
+    ((and (consp a) (consp b))
+     (and (%form-equal (car a) (car b)) (%form-equal (cdr a) (cdr b))))
+    ((and (arrayp a) (arrayp b))
+     (and (equal (array-dimensions a) (array-dimensions b))
+          (dotimes (i (array-total-size a) t)
+            (unless (%form-equal (row-major-aref a i) (row-major-aref b i))
+              (return nil)))))
+    ((and (pathnamep a) (pathnamep b)) (equalp a b))
+    (t (eql a b))))
+
+(defun %canonical (x &optional (seen (make-hash-table :test #'eq)) (counter (list 0)))
+  (cond
+    ((consp x)
+     (or (gethash x seen)
+         (let ((id (incf (car counter))))
+           (setf (gethash x seen) (list :ref id))
+           (cons (%canonical (car x) seen counter)
+                 (%canonical (cdr x) seen counter)))))
+    ((and (arrayp x) (not (stringp x)) (not (bit-vector-p x)))
+     (or (gethash x seen)
+         (let ((id (incf (car counter))))
+           (setf (gethash x seen) (list :ref id))
+           (cons :array
+                 (cons (array-dimensions x)
+                       (loop for i below (array-total-size x)
+                             collect (%canonical (row-major-aref x i)
+                                                 seen counter)))))))
+    ((pathnamep x) (list :pathname (namestring x)))
+    (t x)))
+
+(defun %signature (test)
+  (list (dup-variant test) (dup-form test) (dup-expected test)))
+
+(defun %run-file-names (root)
+  (let ((files '())
+        (run (merge-pathnames "test/regression/run.lisp" root))
+        (pkg (%ensure-package "DUPFIND")))
+    (with-open-file (in run)
+      (let ((*package* pkg))
+        (loop for form = (read in nil :eof)
+              until (eq form :eof)
+              do (labels ((walk (x)
+                            (when (consp x)
+                              (when (and (symbolp (car x))
+                                         (member (string-upcase (symbol-name (car x)))
+                                                 '("LOAD" "LOAD-SKIP-UNDER-INTERP"
+                                                   "LOAD-FULL-TIER-ONLY")
+                                                 :test #'string=)
+                                         (stringp (second x)))
+                                (pushnew (second x) files :test #'string=))
+                              (dolist (y x) (walk y)))))
+                   (walk form)))))
+    (reverse files)))
+
+(defun %collect-all-tests (root)
+  (let* ((rt (%make-readtable))
+         (pkg (%ensure-package "DUPFIND"))
+         (tests '()))
+    (dolist (f (%run-file-names root))
+      (let* ((path (merge-pathnames f root))
+             (text (with-open-file (in path)
+                     (let ((s (make-string (file-length in))))
+                       (read-sequence s in)
+                       s))))
+        (%scan-package-markers text)
+        (dolist (form (%read-file-forms path rt pkg))
+          (setq tests (%collect-tests form f tests)))))
+    (nreverse tests)))
+
+(defun %cyclic-p (x &optional (path (make-hash-table :test #'eq)))
+  (if (or (consp x) (arrayp x))
+      (if (gethash x path)
+          t
+          (progn
+            (setf (gethash x path) t)
+            (let ((result
+                    (if (consp x)
+                        (or (%cyclic-p (car x) path)
+                            (%cyclic-p (cdr x) path))
+                        (loop for i below (array-total-size x)
+                              thereis (%cyclic-p (row-major-aref x i) path)))))
+              (remhash x path)
+              result)))
+      nil))
+
+(defun %cyclic-test-p (test)
+  (or (%cyclic-p (dup-form test)) (%cyclic-p (dup-expected test))))
+
+(defun %name-string (x)
+  (cond ((null x) "NIL")
+        ((symbolp x) (symbol-name x))
+        ((stringp x) x)
+        (t (princ-to-string x))))
+
+(defun %exact-duplicates (tests)
+  (let ((table (make-hash-table :test #'equal))
+        (groups '()))
+    (dolist (test tests)
+      (push test (gethash (%canonical (%signature test)) table)))
+    (maphash (lambda (key members)
+               (declare (ignore key))
+               (when (> (length members) 1)
+                 (push (nreverse members) groups)))
+             table)
+    (nreverse groups)))
+
+(defun %print-exact (groups)
+  (dolist (group groups)
+    (let ((first (first group)))
+      (dolist (other (rest group))
+        (format t "EXACT~C~a~C~a~C~a~C~a~%"
+                #\Tab (dup-file first) #\Tab (%name-string (dup-name first))
+                #\Tab (dup-file other) #\Tab (%name-string (dup-name other)))))))
+
+(defun %sublists (x)
+  (let ((out '()))
+    (labels ((walk (y)
+               (when (consp y)
+                 (push y out)
+                 (walk (car y))
+                 (walk (cdr y)))))
+      (walk x))
+    out))
+
+(defun %subsumed-duplicates (tests)
+  (let ((by-form (make-hash-table :test #'equal))
+        (seen (make-hash-table :test #'equal))
+        (rows '()))
+    (dolist (test tests)
+      (when (consp (dup-form test))
+        (push test (gethash (%canonical (dup-form test)) by-form))))
+    (dolist (large tests)
+      (dolist (sub (%sublists (dup-form large)))
+        (when (consp sub)
+          (dolist (small (gethash (%canonical sub) by-form))
+            (unless (and (string= (dup-file small) (dup-file large))
+                         (equal (dup-name small) (dup-name large)))
+              (unless (%form-equal (dup-form small) (dup-form large))
+                (let ((key (list (dup-file small) (dup-name small)
+                                 (dup-file large) (dup-name large))))
+                  (unless (gethash key seen)
+                    (setf (gethash key seen) t)
+                    (push (list small large) rows)))))))))
+    (nreverse rows)))
+
+(defun %print-subsumed (rows)
+  (dolist (row rows)
+    (let ((small (first row)) (large (second row)))
+      (format t "SUBSUMED~C~a~C~a~C~a~C~a~%"
+              #\Tab (dup-file small) #\Tab (%name-string (dup-name small))
+              #\Tab (dup-file large) #\Tab (%name-string (dup-name large))))))
+
+(defun %set-add (table x)
+  (setf (gethash x table) t))
+
+(defun %tokens (x table)
+  (cond ((consp x) (%tokens (car x) table) (%tokens (cdr x) table))
+        ((null x) (%set-add table "NIL"))
+        ((symbolp x) (%set-add table (format nil "S~a" (symbol-name x))))
+        ((stringp x) (%set-add table (format nil "T~a" x)))
+        ((characterp x) (%set-add table (format nil "C~s" x)))
+        ((numberp x) (%set-add table (format nil "N~s" x)))
+        ((pathnamep x) (%set-add table (format nil "P~s" x)))
+        (t (%set-add table (format nil "O~s" x))))
+  table)
+
+(defun %test-tokens (test)
+  (let ((table (make-hash-table :test #'equal)))
+    (%tokens (dup-form test) table)
+    (%tokens (dup-expected test) table)
+    table))
+
+(defun %table-size (table)
+  (let ((n 0)) (maphash (lambda (k v) (declare (ignore k v)) (incf n)) table) n))
+
+(defun %jaccard (a b)
+  (let ((inter 0) (na (%table-size a)) (nb (%table-size b)))
+    (maphash (lambda (k v)
+               (declare (ignore v))
+               (when (gethash k b) (incf inter)))
+             a)
+    (/ (float inter) (- (+ na nb) inter))))
+
+(defun %minhash (tokens seed)
+  (let ((best most-positive-fixnum))
+    (maphash (lambda (k v)
+               (declare (ignore v))
+               (let ((h (logand (sxhash (list seed k)) most-positive-fixnum)))
+                 (when (< h best) (setq best h))))
+             tokens)
+    best))
+
+(defun %test-key (test)
+  (format nil "~a:~a" (dup-file test) (%name-string (dup-name test))))
+
+(defun %record-near (a b j seen rows)
+  (let* ((ka (%test-key a)) (kb (%test-key b))
+         (key (if (string< ka kb) (list ka kb) (list kb ka))))
+    (unless (or (string= ka kb)
+                (%form-equal (dup-form a) (dup-form b))
+                (gethash key seen))
+      (setf (gethash key seen) t)
+      (push (list a b j) rows)))
+  rows)
+
+(defun %near-duplicates (tests &optional (threshold *near-duplicate-threshold*))
+  (let* ((seeds '(0 1 2 3 4 5 6 7))
+         (infos (make-hash-table :test #'eq))
+         (buckets (make-hash-table :test #'equal))
+         (seen (make-hash-table :test #'equal))
+         (rows '()))
+    (dolist (test tests)
+      (let* ((tokens (%test-tokens test))
+             (hashes (mapcar (lambda (seed) (%minhash tokens seed)) seeds)))
+        (setf (gethash test infos) (cons tokens hashes))
+        (loop for band below 4
+              for i = (* band 2)
+              do (push test
+                       (gethash (list band (nth i hashes) (nth (1+ i) hashes))
+                                buckets)))))
+    (maphash
+     (lambda (key members)
+       (declare (ignore key))
+       (when (> (length members) 1)
+         (let ((members (nreverse members)))
+           (loop for tail on members
+                 do (dolist (b (rest tail))
+                      (let* ((a (first tail))
+                             (ia (car (gethash a infos)))
+                             (ib (car (gethash b infos))))
+                        (when (and ia ib)
+                          (let ((j (%jaccard ia ib)))
+                            (when (>= j threshold)
+                              (setq rows (%record-near a b j seen rows)))))))))))
+     buckets)
+    (nreverse rows)))
+
+(defun %print-near (rows)
+  (dolist (row rows)
+    (format t "NEAR~C~a~C~a~C~a~C~a~C~a~%"
+            #\Tab (dup-file (first row)) #\Tab (%name-string (dup-name (first row)))
+            #\Tab (dup-file (second row)) #\Tab (%name-string (dup-name (second row)))
+            #\Tab (third row))))
+
+(defun %repo-root ()
+  (merge-pathnames "../../" (directory-namestring *load-truename*)))
+
+(let* ((root (%repo-root))
+       (tests (%collect-all-tests root))
+       (core (remove-if #'%cyclic-test-p tests)))
+  (format t "~&TESTS ~d~%CYCLIC ~d~%" (length tests) (- (length tests) (length core)))
+  (finish-output)
+  (let ((exact (%exact-duplicates tests)))
+    (format t "EXACT-GROUPS ~d~%" (length exact)) (finish-output)
+    (let ((subsumed (%subsumed-duplicates core)))
+      (format t "SUBSUMED ~d~%" (length subsumed)) (finish-output)
+      (let ((near (%near-duplicates core)))
+        (format t "NEAR ~d~%" (length near)) (finish-output)
+        (%print-exact exact)
+        (%print-subsumed subsumed)
+        (%print-near near)))))

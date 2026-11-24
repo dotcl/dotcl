@@ -1,0 +1,15 @@
+(load "bench/perf/pcommon.lisp")
+(setf *bench-group* "11-flatten")
+(load-ql-system :alexandria)
+;; alexandria:flatten and friends on a tree of 1000 leaves, a long flat list, and a few small list utilities.
+;; Decision: dotcl / SBCL >= 2 on the perf machine -> look at the allocation per call first (B/op column).
+(defvar *sink* nil)
+(defun build-tree (depth)
+  (if (zerop depth) (list 1 2 3) (list (build-tree (1- depth)) (build-tree (1- depth)) 4)))
+(defvar *tree* (build-tree 7))
+(defvar *flat* (loop for i below 1000 collect i))
+(bench "flatten tree (depth 7)" 2000 (setq *sink* (alexandria:flatten *tree*)))
+(bench "flatten flat list of 1000" 2000 (setq *sink* (alexandria:flatten *flat*)))
+(bench "mappend list of 1000" 2000 (setq *sink* (alexandria:mappend (lambda (x) (list x x)) *flat*)))
+(bench "curry call" 200000 (setq *sink* (funcall (alexandria:curry #'+ 1) 2)))
+(bench "ensure-list / alist-hash-table" 20000 (setq *sink* (alexandria:alist-hash-table '((a . 1) (b . 2) (c . 3)) :test 'eq)))

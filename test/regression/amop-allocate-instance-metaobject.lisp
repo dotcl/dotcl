@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; ALLOCATE-INSTANCE on a metaobject class returns a metaobject.
 ;;;
 ;;; ALLOCATE-INSTANCE dispatches on (class-of cls), which is STANDARD-CLASS for every

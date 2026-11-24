@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Typed entries: a global function whose DECLAIM FTYPE gives every argument
 ;;; and the result a numeric type with a raw representation (an integer type
 ;;; that fits int64, or DOUBLE-FLOAT) is compiled into a body taking and

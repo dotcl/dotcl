@@ -29,7 +29,20 @@
                "(format t \"~&ARGS=~s~%\" (dotcl:script-arguments))"))
 
 (defun %csa-run (&rest args)
-  (dotcl:run-process *csa-exe* (append (list "--core" *csa-core*) args)))
+  "The exit code, standard output and standard error of a child dotcl, run with an empty
+   standard input: `dotcl script repl` reads its input after the script, and a child that
+   inherited an open pipe from the process running the suite waited for it for ever."
+  (let ((p (dotcl:launch-process *csa-exe* (append (list "--core" *csa-core*) args)
+                                 :input (make-string-input-stream "")
+                                 :output :stream :error :stream)))
+    (let* ((out (with-output-to-string (o)
+                  (loop for line = (read-line (dotcl:process-output p) nil nil)
+                        while line do (write-line line o))))
+           (err (with-output-to-string (o)
+                  (loop for line = (read-line (dotcl:process-error p) nil nil)
+                        while line do (write-line line o)))))
+      (dotcl:process-wait p)
+      (list (dotcl:process-exit-code p) out err))))
 
 (defun %csa-out (result) (second result))
 

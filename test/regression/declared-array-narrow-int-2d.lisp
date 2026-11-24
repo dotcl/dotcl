@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; AREF on parameters declared (simple-array (signed-byte 32) (* *)) and
 ;;; (simple-array (unsigned-byte 16) (* *)) takes the rank-2 backing path with
 ;;; the int32 / uint16 helpers. No other test reached either helper.

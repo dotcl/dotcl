@@ -61,7 +61,7 @@ jobs:
 
       - name: Setup Roswell
         run: |
-          curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+          curl -fL --retry 3 --retry-delay 10 --retry-all-errors https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
       # Pinned, not the Roswell default: installing another implementation flips

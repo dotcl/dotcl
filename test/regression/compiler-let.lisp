@@ -85,8 +85,8 @@
 ;; function loaded from the FASL answers what the variable was WHILE COMPILING,
 ;; and a run-time read still sees the global. SBCL: (:FROM-FASL :OUTER).
 (deftest-compiled-only compiler-let.fasl-bakes-the-expansion-time-binding
-  (let ((src "clet-tmp.lisp")
-        (fasl "clet-tmp.fasl"))
+  (let ((src (regression-temp-file "clet-tmp.lisp"))
+        (fasl (regression-temp-file "clet-tmp.fasl")))
     (unwind-protect
         (progn
           (with-open-file (s src :direction :output :if-exists :supersede)

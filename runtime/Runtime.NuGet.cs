@@ -111,7 +111,7 @@ internal static class DotNetNuGet
         foreach (var entry in zip.Entries)
         {
             // Extract lib/ and runtimes/ subtrees only
-            if (!entry.FullName.StartsWith("lib/") && !entry.FullName.StartsWith("runtimes/"))
+            if (!entry.FullName.StartsWith("lib/", System.StringComparison.Ordinal) && !entry.FullName.StartsWith("runtimes/", System.StringComparison.Ordinal))
                 continue;
             if (entry.Name == "") continue; // directory entry
 

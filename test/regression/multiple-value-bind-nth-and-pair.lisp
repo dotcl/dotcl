@@ -13,16 +13,20 @@
   (%mvbn-bind-many 1002
       (apply #'values (loop for i below 1002 collect i))
     (list mvbn0 mvbn1000 mvbn1001)))
+(defun %mvbn-two () (values 1 2))
+(declaim (notinline %mvbn-two))
 (defun %mvbn-short ()
-  (%mvbn-bind-many 1002 (values 1 2)
+  ;; The values come from a call: a literal (values 1 2) is bound as two LETs, with no capture.
+  (%mvbn-bind-many 1002 (%mvbn-two)
     (list mvbn0 mvbn1 mvbn2 mvbn1000 mvbn1001)))
 
 (defun %mvbn-build-pair ()
   (let ((old dotcl-internal::*mv-mode-elision*))
     (setq dotcl-internal::*mv-mode-elision* nil)
     (unwind-protect
+        ;; (PROGN (VALUES ...)): a bare (VALUES ...) there is bound as two LETs, with no capture
         (eval '(defun %mvbn-pair (a b)
-                 (multiple-value-bind (x y) (values a (+ b 1))
+                 (multiple-value-bind (x y) (progn (values a (+ b 1)))
                    (list x y))))
       (setq dotcl-internal::*mv-mode-elision* old))))
 (%mvbn-build-pair)

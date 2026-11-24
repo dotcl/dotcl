@@ -98,6 +98,16 @@ for dir in "$forks"/*/; do
   echo "$name $dir $head $systems" >> "$work/forks"
 done
 
+# A system that two fork directories both define (a fork and its upstream clone, say) is found
+# in whichever directory ASDF scans first, so a row can be measured against the unpatched copy
+# and look like a dotcl failure. Stop rather than measure that.
+dup=$(awk '{ for (i = 4; i <= NF; i++) { if ($i in by && by[$i] != $1) print $i " (" by[$i] ", " $1 ")"; else by[$i] = $1 } }' "$work/forks")
+if [ -n "$dup" ]; then
+  echo "run-forks: these systems are defined by more than one fork directory; leave one of each pair out of LIBRARY_STATUS_FORKS:" >&2
+  echo "$dup" | sed 's/^/  /' >&2
+  exit 1
+fi
+
 # 2. The candidates: "SYSTEM FORK,FORK..." per line, in results order.
 #    Not ok with the dists alone: a load that failed, or a test verdict that
 #    says something went wrong.

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Rational results that cannot need reducing skip the GCD.
 ;;;
 ;;; Ratio construction always reduced by a GCD. For two of the operations that

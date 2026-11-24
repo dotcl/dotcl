@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; (type-of <class object>) is the metaclass name.
 ;;;
 ;;; TYPE-OF had no branch for a class metaobject, so every class answered T.

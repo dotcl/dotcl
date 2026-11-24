@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; INITIALIZE-INSTANCE's default method calls SHARED-INITIALIZE. When nothing has
 ;;; a method of its own on SHARED-INITIALIZE for the instance, the default method is
 ;;; what the dispatch reaches, so it now runs directly on the array already in hand

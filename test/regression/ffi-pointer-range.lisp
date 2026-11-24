@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A :pointer value accepts both spellings of the same 64 bits.
 ;;;
 ;;; A pointer has no sign, so #xFFFFFFFFFFFFFFFF and -1 name the same address.

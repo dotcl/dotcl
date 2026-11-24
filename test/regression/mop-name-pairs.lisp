@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Nineteen MOP introspection names are registered twice: once in DOTCL-MOP and
 ;;; once in the CL / DOTCL-INTERNAL side. Which one a caller reaches depends on
 ;;; how it wrote the name, so the two have to answer identically.

@@ -2,7 +2,9 @@
 ;;; SIMPLE-BASE-STRING, SIMPLE-VECTOR, SIMPLE-BIT-VECTOR, bare or compound) must
 ;;; not hold an adjustable, fill-pointered or displaced array. Above (safety 0)
 ;;; that is a TYPE-ERROR where the variable is bound, as in SBCL. At (safety 0)
-;;; the declaration is trusted: no error, and the value is still read correctly.
+;;; an integer SIMPLE-ARRAY declaration is still refused where it is bound (its
+;;; buffer is fetched once, with no test left at the accesses); the others are
+;;; trusted: no error, and the value is still read correctly.
 ;;;
 ;;; Before this, the declaration-driven paths fell back to the per-element
 ;;; helper without a word, so a wrong declaration was never noticed.
@@ -182,26 +184,38 @@
 
 ;;; --- (safety 0): trusted, not checked, and still read correctly
 
+;; The octet rows: compiled code refuses the three non-simple vectors with a TYPE-ERROR
+;; (the interpreter does not, and the emit-free build compiles nothing), so each row is
+;; (compiled-result interpreted-result) with the compiled one either.
 (deftest simple-array-declaration-check.safety-0-unchecked
   (append
    (%sdc-over '(lambda (s) (declare (optimize (safety 0)) (simple-string s))
                 (let ((n 0)) (dotimes (i (length s) n) (incf n (char-code (schar s i))))))
               (cddr (%sdc-strings)))
-   (%sdc-over '(lambda (v) (declare (optimize (safety 0))
-                                    (type (simple-array (unsigned-byte 8) (*)) v))
-                (let ((s 0)) (dotimes (i (length v) s) (incf s (aref v i)))))
-              (cdr (%sdc-vectors '(unsigned-byte 8) 2)))
+   (mapcar (lambda (r) (and (member (first r) '(:type-error (:value 6)) :test #'equal)
+                            (equal (second r) '(:value 6))))
+           (%sdc-over '(lambda (v) (declare (optimize (safety 0))
+                                            (type (simple-array (unsigned-byte 8) (*)) v))
+                        (let ((s 0)) (dotimes (i (length v) s) (incf s (aref v i)))))
+                      (cdr (%sdc-vectors '(unsigned-byte 8) 2))))
    (%sdc-over '(lambda (v) (declare (optimize (safety 0)) (simple-vector v)) (length v))
               (cdr (%sdc-vectors t 0))))
   (((:value 297) (:value 297))
    ((:value 366) (:value 366))
    ((:value 300) (:value 300))
-   ((:value 6) (:value 6))
-   ((:value 6) (:value 6))
-   ((:value 6) (:value 6))
+   t t t
    ((:value 3) (:value 3))
    ((:value 3) (:value 3))
    ((:value 3) (:value 3))))
+
+;; In compiled code the octet rows above are the TYPE-ERROR, not a silent read.
+(deftest-emitting-only simple-array-declaration-check.safety-0-octets-refused
+  (mapcar #'first
+          (%sdc-over '(lambda (v) (declare (optimize (safety 0))
+                                           (type (simple-array (unsigned-byte 8) (*)) v))
+                       (let ((s 0)) (dotimes (i (length v) s) (incf s (aref v i)))))
+                     (cdr (%sdc-vectors '(unsigned-byte 8) 2))))
+  (:type-error :type-error :type-error))
 
 ;;; A value that is not an array at all fails the whole declaration on entry.
 (deftest simple-array-declaration-check.non-array-unchanged

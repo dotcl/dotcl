@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; `dotcl build` (the MSBuild integration's two steps) keeps the bundled ASDF
 ;;; when stock asdf.asd / uiop.asd are visible to the build.
 ;;;

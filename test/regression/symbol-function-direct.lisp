@@ -76,7 +76,8 @@
 
 (deftest symbol-function-direct.18
   (handler-case (mapcar (lambda (x) (if (functionp x) :function x)) (multiple-value-list (LIST (FBOUNDP (QUOTE CAR)) (FBOUNDP (QUOTE WHEN)) (FBOUNDP (QUOTE IF)) (FBOUNDP (QUOTE SFN-UNDEFINED-XYZ)) (FBOUNDP (QUOTE SFN-USER)) (FBOUNDP NIL) (FBOUNDP T) (FBOUNDP (QUOTE (SETF CAR))) (FBOUNDP (QUOTE (SETF SFN-UNDEFINED-XYZ)))))) (error () (list :error)))
-  ((T T T NIL T NIL NIL NIL NIL)))
+  ;; (SETF CAR) is a function now, as in SBCL.
+  ((T T T NIL T NIL NIL T NIL)))
 
 (deftest symbol-function-direct.19
   (handler-case (mapcar (lambda (x) (if (functionp x) :function x)) (multiple-value-list (HANDLER-CASE (FBOUNDP 5) (ERROR (E) (TYPE-OF E))))) (error () (list :error)))

@@ -19,7 +19,7 @@ metaobject protocol, static-vectors for pinned vectors.
 | `dotnet` | built in | Calling .NET: objects, types, delegates, tasks, assemblies, native libraries. [Calling .NET from Lisp](dotnet-package.md) |
 | `dotcl` | built in | The rest of the runtime's extensions: the process, threads, memory, packages, introspection, delivery |
 | `dotcl-mop` | built in | The metaobject protocol (AMOP): class, slot, generic function and method metaobjects |
-| `dotcl-cltl2` | built in | The CLtL2 environment functions: `variable-information`, `function-information` and `declaration-information` report the proclamations and, given the `&environment` of a macro expanded by the compiler, the lexical bindings and declarations around the call; `augment-environment`, `parse-macro`, `enclose`, `macroexpand-all`. The interpreter's environments carry no declarations |
+| `dotcl-cltl2` | built in | The CLtL2 environment functions: `variable-information`, `function-information` and `declaration-information` report the proclamations and, given the `&environment` of a macro expanded by the compiler, the lexical bindings and declarations around the call; `augment-environment`, `parse-macro`, `enclose`, `macroexpand-all`; `map-environment-variables` and `map-environment-functions` call a function on each variable (symbol macros included) or local function (macros included) an `&environment` binds, innermost first, with its kind and declarations. An environment without lexical state binds nothing. The interpreter's environments carry no declarations or frames. `map-environment-blocks` and `map-environment-tags` do the same for the `block` names and `tagbody` tags around the call (each called with the name, `:block` or `:tag`, and NIL), which a code walker needs to follow `return-from` and `go` out of a macro call; SBCL's own `sb-cltl2` has no such function. |
 
 ## Modules
 
@@ -62,6 +62,16 @@ rather than for code you ship.
 
 What other implementations provide and portable libraries build on.
 
+- `dotcl:interactive-interrupt`: the condition Ctrl-C signals at a safepoint, a `serious-condition`. A library that
+  needs a user-abort condition inherits from it (`(define-condition user-abort (dotcl:interactive-interrupt) ())`), the
+  way it names `sb-sys:interactive-interrupt` on SBCL.
+- `dotcl-posix` (Unix only): a thin layer over libc for pseudo-terminals and
+  signals, shaped like Python's `pty`, `os` and `signal`. `spawn-in-pty` starts a
+  program with a new pseudo-terminal as its controlling terminal (no fork:
+  `posix_spawn` with a new session), `pty-write` / `pty-read` / `pty-expect`
+  talk to it, `kill` sends it a signal and `pty-wait` reports its exit code or
+  the signal that ended it. For testing interactive programs, such as the REPL's
+  Ctrl-C handling (`make test-sigint-repl`).
 - `dotcl-thread`: threads, locks, condition variables and semaphores, with a
   bordeaux-threads style surface. `(require "dotcl-thread")`, then
   `(dotcl-thread:make-thread (lambda () ...))`.
@@ -77,6 +87,7 @@ What other implementations provide and portable libraries build on.
 - `dotcl-rotate-byte`: `dotcl-rotate-byte:rotate-byte`, as in sb-rotate-byte.
   A rotate of a whole `(unsigned-byte 32)` or `(unsigned-byte 64)` word
   (`(byte 32 0)`, `(byte 64 0)`) compiles to one rotate instruction.
+- `dotcl-gpu`: `(dotcl-gpu:gpu-map '(lambda (x) (* 2d0 x)) array)` runs a lambda of double-floats over arrays on an ILGPU accelerator (ILGPU is restored from NuGet on first use).
 - `dotcl-simd`: 128-bit SIMD values and operations with the names of sb-simd
   (`dotcl-simd:f64.2`, `f64.2+`, `u8.16-aref` ...). [dotcl-simd](dotcl-simd.md)
 
@@ -245,7 +256,7 @@ Scripts and the process:
 External processes:
 
 - `dotcl:run-process`: run a program to completion; returns the exit code, standard output and standard error.
-- `dotcl:launch-process`: start a program with its standard streams as Lisp streams, or redirected to files. As with `sb-ext:run-program`, `:input`, `:output` and `:error` also take any Lisp stream (a string stream, `*standard-output*`, a Gray stream), copied in a thread until the pipe ends, and `:error :output` sends the error output where the output goes. `dotcl:process-wait` returns once the copies are done, and signals an error that stopped one. On Unix the child leads a process group of its own unless `:input` is `t` (as with SBCL), so killing its group does not reach the caller.
+- `dotcl:launch-process`: start a program with its standard streams as Lisp streams, or redirected to files. As with `sb-ext:run-program`, `:input`, `:output` and `:error` also take any Lisp stream (a string stream, `*standard-output*`, a Gray stream), copied in a thread until the pipe ends, and `:error :output` sends the error output where the output goes. `dotcl:process-wait` returns once the copies are done, and signals an error that stopped one. On Unix the child leads a process group of its own unless `:input` is `t` (as with SBCL), so killing its group does not reach the caller. `:on-exit FUNCTION` calls FUNCTION with the process in a new Lisp thread once the child has exited and the copies to and from Lisp streams are done, so a program can react to a child ending without a thread blocked in `process-wait`. An error in FUNCTION is reported on the standard error and ends nothing else; `process-wait` still returns the exit code and signals a copy failure as before.
 - `dotcl:process-input`, `dotcl:process-output`, `dotcl:process-error`: those streams.
 - `dotcl:process-wait`, `dotcl:process-alive-p`, `dotcl:process-exit-code`, `dotcl:process-pid`, `dotcl:process-kill`: wait for, query and stop a launched process.
 
@@ -269,7 +280,7 @@ Asynchronous code:
 
 Memory:
 
-- `dotcl:gc`: run a full collection, then the pending finalizers.
+- `dotcl:gc`: run a collection and the pending finalizers. With no arguments it collects every generation; `:full t` does the same, `:full nil` collects generation 0, and `:gen n` collects up to generation `n`.
 - `dotcl:gc-stats`: collection counts per generation, heap size, bytes allocated, and the total time the collector has paused the process in internal time units (as `sb-ext:*gc-run-time*`).
 - `dotcl:make-weak-pointer`, `dotcl:weak-pointer-value`, `dotcl:weak-pointer-p`: weak pointers.
 - `make-hash-table :weakness` and `dotcl:hash-table-weakness`: weak hash tables (`:key`, `:value`, `:key-and-value`, `:key-or-value`).

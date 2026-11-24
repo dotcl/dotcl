@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; DEFGENERIC with :GENERIC-FUNCTION-CLASS passes the name to MAKE-INSTANCE
 ;;; as the :NAME initarg (AMOP), so GENERIC-FUNCTION-NAME answers it instead of
 ;;; leaving the generic function unnamed.

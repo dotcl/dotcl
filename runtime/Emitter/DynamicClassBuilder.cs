@@ -85,7 +85,9 @@ public static partial class DynamicClassBuilder
                              // matches parameters BY NAME (Harmony injects its __instance /
                              // __result / __state that way, and so do most DI containers)
                              // cannot see a method whose parameters are nameless.
-                             IReadOnlyList<string>? ParamNames = null);
+                             IReadOnlyList<string>? ParamNames = null,
+                             // Documentation summary for a saved library's XML doc file.
+                             string? Doc = null);
 
     // Invoke signature of the delegates of the library being built: reflection
     // cannot read a member of a type that is still being emitted.
@@ -578,6 +580,7 @@ public static partial class DynamicClassBuilder
         var simple = SanitizeAssemblyName(assemblyName);
         _libraryDelegates.Clear();
         fasl = new FaslAssembler(simple, version);
+        fasl.HideHelperTypes = true;
         return new LibraryBuilder(null, fasl.ModuleBuilder, savePath, "netstandard", simple, fasl);
     }
 
@@ -594,6 +597,8 @@ public static partial class DynamicClassBuilder
         private readonly PersistedAssemblyBuilder? _pab;
         private readonly FaslAssembler? _host;
         private readonly List<(string Name, string[] Uses)> _bakedPackages = new();
+        private readonly Dictionary<string, Type> _classTypes = new();
+        private readonly List<(string Condition, string TypeName)> _conditionMaps = new();
         private readonly ModuleBuilder _mb;
         private readonly string _savePath;
         private readonly string _corlibProfile;
@@ -650,8 +655,16 @@ public static partial class DynamicClassBuilder
             var (type, _) = PopulateType(_mb, fullName, baseType, fields, attributes,
                 methods, ctorBody, properties, interfaces, events, ctorParamTypes,
                 baseCtorArgIndices, ctorSpecs);
+            _classTypes[fullName] = type;
             return type;
         }
+
+        /// <summary>A condition that leaves the library as an exception of the class
+        /// FULLNAME (added with AddClass): the class says (:maps-condition CONDITION).
+        /// Registered by the module initializer, so it needs a library with compiled-in
+        /// bodies.</summary>
+        internal void AddConditionMap(string condition, string typeName)
+            => _conditionMaps.Add((condition, typeName));
 
         /// <summary>
         /// Add one public enum type. Unlike a class facade, an enum is pure
@@ -808,6 +821,7 @@ public static partial class DynamicClassBuilder
             // referenced"). Retarget to the netstandard facade, same as
             // FaslAssembler does for its fasls.
             FaslCorlibRetarget.RetargetCorlib(image, _corlibProfile);
+            FaslTypeVisibility.HideHelperTypes(image);
             System.IO.File.WriteAllBytes(_savePath, image);
             WriteXmlDoc();
         }
@@ -845,6 +859,15 @@ public static partial class DynamicClassBuilder
                     il.Emit(OpCodes.Stelem_Ref);
                 }
                 il.Emit(OpCodes.Call, typeof(DynamicClassBuilder).GetMethod(nameof(EnsureBakedPackage))!);
+            }
+            foreach (var (condition, typeName) in _conditionMaps)
+            {
+                if (!_classTypes.TryGetValue(typeName, out var exType))
+                    throw new ArgumentException($"(:maps-condition {condition}): no class {typeName} in the library");
+                il.Emit(OpCodes.Ldstr, condition);
+                il.Emit(OpCodes.Ldtoken, exType);
+                il.Emit(OpCodes.Call, GetTypeFromHandleMI);
+                il.Emit(OpCodes.Call, typeof(DynamicClassBuilder).GetMethod(nameof(RegisterConditionMap))!);
             }
             il.Emit(OpCodes.Call, _host!.ModuleInitMethod);
             il.Emit(OpCodes.Pop);

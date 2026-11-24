@@ -1,7 +1,8 @@
 ;;; Adaptive in-process repetition for the ledger's steady-state column.
 (defpackage #:ledger-steady
   (:use #:cl)
-  (:export #:env #:env-int #:env-number #:stable-window-p #:window-after-p
+  (:export #:env #:env-int #:env-number #:stable-window-p #:still-dropping-p
+           #:window-after-p
            #:measure))
 
 (in-package #:ledger-steady)
@@ -27,6 +28,15 @@
               (high (reduce #'max window)))
          (and (plusp low) (<= high (* low (+ 1 tolerance)))))))
 
+(defun still-dropping-p (times count tolerance)
+  "True when the last COUNT runs are faster than the COUNT runs before them by
+more than TOLERANCE, i.e. the benchmark is still climbing to a faster tier.
+TIMES is newest first."
+  (and (>= (length times) (* 2 count))
+       (let ((recent (reduce #'min (subseq times 0 count)))
+             (previous (reduce #'min (subseq times count (* 2 count)))))
+         (> previous (* recent (+ 1 tolerance))))))
+
 (defun window-after-p (starts count min-seconds)
   (and (>= (length starts) count)
        (>= (nth (1- count) starts) min-seconds)))
@@ -36,7 +46,7 @@
          (count (env-int "LEDGER_STEADY_WINDOW" 3))
          (min-runs (env-int "LEDGER_STEADY_MIN_RUNS" 10))
          (max-runs (env-int "LEDGER_STEADY_MAX_RUNS" 20))
-         (min-seconds (env-number "LEDGER_STEADY_MIN_SECONDS" 3))
+         (min-seconds (env-number "LEDGER_STEADY_MIN_SECONDS" 8))
          (max-seconds (env-number "LEDGER_STEADY_MAX_SECONDS" 120))
          (start (funcall clock))
          (min-start (or since start))
@@ -59,7 +69,8 @@
       (incf runs)
       (cond ((and (>= runs min-runs)
                   (window-after-p starts count min-seconds)
-                  (stable-window-p times count tolerance))
+                  (stable-window-p times count tolerance)
+                  (not (still-dropping-p times count tolerance)))
              (setf stable t)
              (return))
             ((>= runs-after-min max-runs) (return))

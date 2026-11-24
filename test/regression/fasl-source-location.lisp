@@ -11,7 +11,7 @@
 
 (defun %fasl-sl-setup ()
   (unless *fasl-sl-fasl*
-    (let* ((dir (regression-temp-dir))
+    (let* ((dir (regression-temp-dir/))
            (src (merge-pathnames "fasl-sl-fixture.lisp" dir))
            (fasl (merge-pathnames "fasl-sl-fixture.fasl" dir)))
       (with-open-file (s src :direction :output :if-exists :supersede)

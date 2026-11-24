@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; `dotcl pack --help` prints pack's own help instead of the whole-program
 ;;; help. Before this fix, --help was handled once, before the subcommand was
 ;;; even looked at, so `dotcl pack --help` printed the same wall of text as

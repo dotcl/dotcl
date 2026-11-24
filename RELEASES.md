@@ -3,6 +3,157 @@
 User-facing release notes for dotcl. Each section corresponds to a tagged
 release on the public mirror (dotcl/dotcl).
 
+## v0.1.38 -- 2026-11-23
+
+This release makes more malformed code and wrong arguments signal errors,
+brings `format`, the pretty printer, the reader and `subtypep` closer to the
+standard, and makes many built-in functions and typed numeric loops allocate
+less. Some code that was accepted before now signals; see Upgrading. It also
+adds `dotcl-posix` and language-server completion, and extends .NET interop.
+
+### Upgrading
+
+- **Malformed definitions signal PROGRAM-ERROR**: `defclass`, `defgeneric`,
+  `defmethod`, `define-condition`, `defstruct`, `define-method-combination`,
+  `with-slots`, `with-accessors`, `restart-case`, `restart-bind`, the lambda
+  list of `destructuring-bind`, a number or string used as a place, a
+  `let` that binds a variable twice, a duplicate `tagbody` tag, `(list*)`.
+  A `defstruct` or `define-condition` of a COMMON-LISP symbol is refused.
+- **Constants and locked names**: `defparameter` / `defvar` of a constant,
+  `define-symbol-macro` of a special or constant, `set` / `(setf symbol-value)`
+  of a constant, and `progv` on a constant signal an error. `unintern` and
+  `rename-package` on COMMON-LISP signal PACKAGE-ERROR.
+- **Wrong arguments to built-ins signal TYPE-ERROR** instead of being
+  ignored: `:count` of `find` / `position` / `count`, a package name that is
+  not a string designator, `write` keywords such as `:case` and `:base`, set
+  operations on a non-list, `coerce` of a dotted list, `byte`, non-integer
+  `:start` / `:end`, invalid `make-array` options, `read-char` or
+  `write-string` on a stream of the wrong direction. Many messages now name
+  the value and the expected type, as SBCL does.
+- **An array of rank other than 1 is not a sequence**: `(length (make-array
+  '(2 2)))` signals instead of returning 4.
+- **`make-instance`**: a key that only appears in `:default-initargs` and is
+  not a valid initarg is an error; `make-condition` rejects a non-condition
+  class. `print-object` methods that are only `:around`, `:before` or
+  `:after` now take effect. `(funcall nil)` and `(funcall t)` signal
+  UNDEFINED-FUNCTION.
+  `funcall` / `apply` of a symbol no longer reach the COMMON-LISP function
+  of the same spelling from another package.
+- **Reader**: `:::x`, `cl:::car` and a token that ends in a package marker are
+  READER-ERRORs, as are `#:` before an integer and a ragged `#nA`.
+- **Numbers**: an integer or ratio too large for a float signals
+  FLOATING-POINT-OVERFLOW in `float`, `coerce`, mixed arithmetic, `sqrt`,
+  `expt` and `atan`. At `(safety 3)` a `setq` of a declared variable is
+  checked.
+- **Changed output**: `char-name` gives the Unicode name in upper case
+  (`#\GREEK_SMALL_LETTER_LAMDA`; `Nul`, `Esc`, `Del`, `Sp`). A float whose
+  shortest digits end in an exact tie prints the larger last digit. `sxhash`
+  of an integer mixes all 64 bits, so its values differ. Edge cases of
+  `~F` / `~E` / `~G` and `~@(` changed to match SBCL.
+- **`compile-file`** now warns about argument-count mismatches, duplicate
+  definitions, literal type conflicts and `format` argument counts, so
+  `failure-p` can be true where it was not. One bad form no longer loses the
+  rest of the file. `*macroexpand-hook*` is now called for macros that
+  `compile`, `compile-file` and `eval` expand.
+- **.NET**: NIL passed where every overload takes a numeric or enum value is a
+  type error, not `default(T)`; `dotnet:new` returns NIL for an empty
+  `Nullable<T>`; `dotnet:library` DLLs no longer export `CompiledModule` and
+  the data-blob types.
+- **`save-application :r2r nil`** now turns ReadyToRun off; it was ignored.
+
+### Added
+
+- **Better first-day messages.** An unclosed paren or string says where it
+  began; a missing `(require "quicklisp")` is named; a mistyped `-e` gets a
+  suggestion. Running out of memory in a script reports Heap exhausted
+  (STORAGE-CONDITION); the docs say how to cap the heap.
+- **`dotcl-lsp`** answers completion, signature help and go-to-definition.
+- **`dotcl-posix`** (macOS and Linux): pseudo-terminals, process spawning in a
+  pty, `kill` and `wait-pid` through libc.
+- `map-environment-variables`, `-functions`, `-blocks` and `-tags` for code
+  walkers; `launch-process :on-exit`; `dotcl:interactive-interrupt` exported;
+  `dotcl:gc :full` / `:gen`.
+- **.NET interop**: `error` can signal a .NET exception object; `length`,
+  `elt`, `map` and the sequence functions read .NET arrays and collections; a
+  pathname is accepted where a method takes a string; generic type arguments
+  are inferred for `Task.Run` with a `Func<int>`, LINQ and `System.Array`
+  methods; `[Flags]` enums combine with `logior`; ratios and bignums go to
+  `double` parameters; types are found in NuGet assemblies such as EF Core
+  Sqlite. `dotnet:library` writes XML documentation and throws typed
+  exceptions.
+
+### Faster
+
+Numbers are single before/after measurements from when each change was made,
+on the maintainer's machines; they were not re-run against v0.1.37.
+
+- Reading a child process's output line by line: 1,000,000 lines 8.3 s to
+  0.64 s.
+- `eval` of a `defun`: 2.5 ms to 0.3 ms.
+- Compiling nested integer arithmetic 900 levels deep: 2.8 s to 0.12 s.
+  `cond` and `case` with 10000 clauses now compile, in time linear in them.
+- Loading 20000 functions that call the same names: 23 s to 0.3 s. A file of
+  `trivia` `match*` clauses that took 900 s+ to load takes 7 s.
+- Typed numeric loops: undeclared `double-float` and integer variables stay
+  unboxed in more shapes (a Mandelbrot kernel 95 to 4 ms, 202 MB to none).
+- Printing a bignum: 3^1000000 5.16 s to 0.49 s.
+- Calls with `&optional`, `&key` or `&rest` build no argument array:
+  `(funcall #'+ 1 2 3)` 49 to 11 ns.
+- `make-instance` of a class with `:before`, `:after` or `:around` methods
+  uses the fast path: 326 to 71 ns.
+- `typep` of a constant compound type: `(and sequence (not list))` 35 to
+  2.8 ns. `reverse`, `nreverse` and `subseq` of a vector copy a block.
+- A self tail-recursive `labels` called once is a loop: 610 to 310 ns.
+- File output uses a 64 KB buffer (binary write 0.255 s to 0.13 s). The GC
+  gen0 budget is 64 MB by default.
+- Library kernels: `ironclad` SHA3 1857 to 14.5 ns per byte, `alexandria`
+  `shuffle` of 16000 elements 311 to 5 ms.
+
+### Fixed
+
+- **Pretty printer and `format`**: per-line prefixes, fill and mandatory
+  newlines, nested blocks, `*print-circle*`, `*print-lines*`, `~@<...~:>` and
+  `~&` inside logical blocks now follow SBCL in the cases that differed;
+  `~$` keeps the sign of negative zero.
+- **Reader and printer**: `KEYWORD:NAME` for a new symbol,
+  `set-macro-character` with NIL, nested `#+` / `#-` in a skipped form,
+  symbol bars, and case mapping that does not depend on the host's ICU.
+- **Types**: `subtypep` decides many more cases (disjoint classes, integer and
+  rational ranges, `(not (not x))`, array type names); a bare `*` is the type
+  T; `upgraded-array-element-type` returns one value.
+- **CLOS and MOP**: `defgeneric` redefinition replaces the method
+  combination; `ensure-class` keeps the slots it is not given;
+  `make-instances-obsolete` reaches subclass instances; `allocate-instance`
+  methods on `(eql class)` are used; a failed `defmethod` leaves no empty
+  generic function; redefining a class from several threads no longer fails.
+- **Compiler**: a symbol macro named like a function and a circular literal no
+  longer hang the compile; a macro-made `return-from` to a `labels` / `flet`
+  block is found; `load-time-value` runs once; `eq` on fixnums above 65535
+  compares values; a `defun` in `eval-when` is not installed by `load` before
+  the forms ahead of it; a self call inside `handler-case` runs under it.
+- **Streams and pathnames**: echo, broadcast and synonym streams,
+  `file-position` after `unread-char`, `:replacement` in an external format,
+  `directory` following `..`, logical pathnames, wild characters in names.
+- **Threads and fasl**: `typep` from 50 threads no longer fails with a
+  duplicate key; on Unix one Ctrl-C raises one INTERACTIVE-INTERRUPT;
+  literals shared between `make-load-form` instances stay shared; a function
+  loaded from a fasl names its parameters in the package being loaded into.
+- **Misc**: a `defpackage` redefinition drops old nicknames and a failed one
+  leaves no half-made package; `adjust-array` of a simple string, `maphash`
+  with a function name, `#'(setf car)`, `decode-universal-time` in a DST overlap.
+- A `save-application :executable` no longer recompiles contribs at every start.
+- Recompiling a system in one process keeps far less memory (ironclad reload
+  loop 4.0 MB to 0.37 MB per round).
+
+### Known issues
+
+- Code compiled at the default safety does not check a `let` variable's
+  declared type at the binding, and `svref` / `schar` read from a non-simple
+  array. Both are listed in docs/deviations.md.
+- A build without ReadyToRun starts 8-14% slower than v0.1.37 (a hello script
+  289 to 328 ms on one machine), because the core file is 17% larger. The
+  ReadyToRun build that is shipped starts as before (hello 106 to 108 ms).
+
 ## v0.1.37 -- 2026-11-07
 
 This release makes common operations faster and many built-in forms stricter.

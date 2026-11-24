@@ -1227,7 +1227,14 @@
                                  (cons (length idxs) (cdddr entry)))
                             (and (= (length idxs) (third entry))
                                  (cddr entry))))
-                   (let ((info (constant-array-numeric-info v)))
+                   (let ((info (or (constant-array-numeric-info v)
+                                   ;; A global whose array type is proclaimed: the
+                                   ;; element is stored as that declaration says, the
+                                   ;; same hint a typed parameter gives. The array is
+                                   ;; read from the variable at each access, so an
+                                   ;; assignment or a binding of it is seen.
+                                   (and (not (lookup-symbol-macro v))
+                                        (%declaimed-global-array-info v nil)))))
                      (and info (= (length idxs) (car info)) info))))
              (let ((info (or (struct-accessor-array-info v)
                              (the-array-numeric-info v))))
@@ -1416,6 +1423,18 @@
      (cons (cadr type) (caddr type)))
     (t nil)))
 
+(defun %the-value-type (type)
+  "The type of the one value (THE TYPE FORM) asserts: TYPE, or T1 for (VALUES T1) and
+   (VALUES T1 &OPTIONAL), which assert exactly one value of type T1. Any other VALUES type
+   (several values, &REST, an optional first value) is returned unchanged, for the callers
+   to find no integer range in."
+  (if (and (consp type) (eq (car type) 'values) (consp (cdr type))
+           (not (member (cadr type) lambda-list-keywords))
+           (or (null (cddr type))
+               (and (eq (caddr type) '&optional) (null (cdddr type)))))
+      (cadr type)
+      type))
+
 (defun declared-integer-range (type)
   "Inclusive (LO . HI) for a TYPE declared on a variable or asserted by THE, or
    NIL. On top of INTEGER-TYPE-RANGE it understands (mod N), exclusive and
@@ -1487,6 +1506,10 @@
     ;; the runtime type-checks, and CHAR-CODE-LIMIT is 65536 to match.
     ((string-char-code-ref expr)
      (cons 0 65535))
+    ((%char-code-of-form-p expr)
+     (cons 0 65535))
+    ((%bit-ref-form-p expr)
+     (cons 0 1))
     ;; A word of 2 or 4 adjacent octets (OCTET-WORD-REF-INFO).
     ((let ((ow (octet-word-ref-info expr)))
        (and ow (< (fourth ow) 8) (cons 0 (1- (ash 1 (* 8 (fourth ow))))))))
@@ -1559,6 +1582,11 @@
           (eq (car expr) 'length)
           (not (local-function-entry 'length)))
      (cons 0 (1- (ash 1 31))))
+    ((and (consp expr) (= (length expr) 3)
+          (eq (car expr) 'array-dimension)
+          (not (local-function-entry 'array-dimension))
+          (not (macrolet-shadowed-p 'array-dimension)))
+     (cons 0 (1- (ash 1 31))))
     ;; Raw int64 local (native body) or declared-fixnum local -> full int64 range.
     ((and (symbolp expr)
           (boundp '*cstate*)
@@ -1574,7 +1602,7 @@
     ;; bounds -> declared bounds (only when they fit int64); otherwise
     ;; (the fixnum E) / (the (integer lo *) E) -> full fixnum range.
     ((and (consp expr) (eq (car expr) 'the))
-     (let ((ty (cadr expr)))
+     (let ((ty (%the-value-type (cadr expr))))
        (cond
          ((let ((r (declared-integer-range ty))) (and r (range-fits-int64-p r) r)))
          ((or (eq ty 'fixnum) (and (consp ty) (eq (car ty) 'integer)))
@@ -1590,7 +1618,10 @@
     ;; %dotimes-limit / %loop-limit-floor: a loop limit clamped into int64.
     ((and (consp expr) (= (length expr) 2)
           (member (car expr) '(%dotimes-limit %loop-limit-floor)))
-     (cons +int64-min+ +int64-max+))
+     ;; An integer limit that fits int64 is not changed by the clamp, so its own range holds;
+     ;; anything else (a bignum, a non-integer real) is only known to land in int64.
+     (or (expr-int-range (cadr expr))
+         (cons +int64-min+ +int64-max+)))
     ;; %loop-by: LOOP's BY value, which it checks is positive.
     ((and (consp expr) (= (length expr) 2) (eq (car expr) '%loop-by))
      (let ((r (expr-int-range (cadr expr))))
@@ -1600,7 +1631,9 @@
     ((and (consp expr) (= (length expr) 3) (eq (car expr) 'logand)
           (let ((m (%logand-nonneg-operand (cadr expr) (caddr expr))))
             (and m
-                 (fixnum-wrap-typed-p (if (eq m (cadr expr)) (caddr expr) (cadr expr)))
+                 (let ((other (if (eq m (cadr expr)) (caddr expr) (cadr expr))))
+                   (or (fixnum-wrap-typed-p other)
+                       (and (consp other) (numeric-array-aref-u64-p other))))
                  (cons 0 (cdr (expr-int-range m)))))))
     ;; (logior A B) / (logxor A B) with both operands proved non-negative: the
     ;; result has no bit above the higher operand's top bit, so it is below the
@@ -1888,6 +1921,22 @@
                   `(ash (logand ,v ,mask) ,pos))
              (logand ,x ,(lognot (ash mask pos))))))
 
+(defun %setf-aref-operand (expr)
+  "(%AREF-SET A I... V) when EXPR is (SETF (AREF A I...) V), the expansion COMPILE-FORM
+   would use (through CACHED-MACROEXPAND, so the form compiled later is the same one):
+   a store used as a value is looked at as the store, which the typed paths know
+   (%AREF-SET-NUMERIC-PARTS). NIL for anything else, so SETF of other places and
+   expansions of another shape are left to the generic path."
+  (and *macroexpand-cache*
+       (consp expr) (eq (car expr) 'setf) (consp (cdr expr)) (consp (cddr expr)) (null (cdddr expr))
+       (consp (cadr expr)) (eq (car (cadr expr)) 'aref)
+       (not (local-function-entry 'setf)) (not (macrolet-shadowed-p 'setf))
+       (not (local-function-entry 'aref)) (not (macrolet-shadowed-p 'aref))
+       (let ((expander (find-macro-expander 'setf)))
+         (and expander
+              (let ((e (handler-case (cached-macroexpand expr expander) (error () nil))))
+                (and (consp e) (eq (car e) '%aref-set) e))))))
+
 (defun fold-typed-operand (expr)
   "FOLD-CONSTANT-SYMBOL, and (LDB (BYTE SIZE POS) X) with literal SIZE and POS
    rewritten to the LOGAND / ASH form the LDB compiler entry open-codes (and
@@ -1900,14 +1949,31 @@
       (when c (setf expr c)))
     (let ((a (%typed-vector-struct-read expr)))
       (when a (setf expr a)))
-    (cond ((%literal-ldb-form-p expr) (%literal-ldb-as-logand expr))
+    (cond ((%setf-aref-operand expr))
+          ((%literal-ldb-form-p expr) (%literal-ldb-as-logand expr))
           ((%literal-dpb-form-p expr) (%literal-dpb-as-logior expr))
           ((%literal-byte-field-form-p expr) (%literal-byte-field-as-logand expr))
           ((%logical-complement-form expr))
           ((%cond-as-if expr))
+          ((and (consp expr) (member (car expr) '(let let*)) (consp (cdr expr))
+                (listp (cadr expr)) (%let-const-form expr)))
           ((let ((r (%trivial-integer-op-operand expr))) (and r (fold-typed-operand r))))
           ((let ((r (%logand-noop-mask-operand expr))) (and r (fold-typed-operand r))))
           (t (fold-constant-symbol expr)))))
+
+(defun %proclaimed-fixnum-special-read-p (expr)
+  "True when EXPR is a read of a global special variable that (DECLAIM (FIXNUM VAR)) or
+   (DECLAIM (TYPE FIXNUM VAR)) declared a fixnum. The typed paths take such a read as a fixnum,
+   which keeps the check of the value (nothing checks a binding or a SETQ of a special): the typed
+   paths read it as a long through an unbox that signals the type error. A lexical variable or a symbol macro of the same name is not this variable."
+  (and (symbolp expr) expr
+       (not (keywordp expr))
+       (not (eq expr t))
+       (eq (gethash expr *proclaimed-variable-types*) 'fixnum)
+       (not *cross-compiling*)
+       (global-special-p expr)
+       (not (lookup-local expr))
+       (not (lookup-symbol-macro expr))))
 
 (defun %cond-as-if (expr)
   "(COND (T1 V1...) (T2 V2...) ... (T VN...)) as nested IFs when every clause has a
@@ -1938,6 +2004,13 @@
              ((+ -) (and (= (length (cdr e)) 2) (every #'fixnum-exact-p (cdr e))))
              ((1+ 1-) (and (= (length (cdr e)) 1) (fixnum-exact-p (cadr e))))
              (t nil)))))
+
+(defun %small-noop-operand-p (x)
+  "True when X is small enough to ask about outright. The questions the no-op folds below
+   put (FIXNUM-EXACT-P, EXPR-INT-RANGE) walk X's whole tree outside any memo, and they are
+   asked at every level of a nest of integer operations: without this bound a nest of
+   900 levels walked the operand's tree 900 times over."
+  (< (%form-size x 48) 48))
 
 (defun %trivial-integer-op-operand (expr)
   "X when EXPR is an operation on the integer X that returns X itself and X is
@@ -1973,6 +2046,7 @@
        (let ((a (second expr)) (b (third expr)))
          (flet ((try (mask x)
                   (and (integerp mask) (plusp mask) (< mask (ash 1 62)) (zerop (logand mask (1+ mask)))
+                       (%small-noop-operand-p x)
                        (fixnum-exact-p x)
                        (let ((r (expr-int-range x)))
                          (and r (<= 0 (car r)) (<= (cdr r) mask)))
@@ -2025,6 +2099,8 @@
                                (%macro-expander-here (car expr))
                                (%global-macro-operand-expander (car expr)))))
              (unless expander (return))
+             (when (%global-macro-takes-environment-p (car expr) expander)
+               (return))
              (let ((e (handler-case (cached-macroexpand expr expander)
                         (error () (return)))))
                (when (eq e expr) (return))
@@ -2076,7 +2152,9 @@
   (let* ((spec (%literal-byte-spec (cadr expr)))
          (size (car spec)) (pos (cdr spec))
          (mask (1- (ash 1 size)))
-         (x (caddr expr)))
+         (lowmask (and (plusp pos) (< (+ size pos) 64)
+                       (1- (ash 1 (+ size pos)))))
+         (x (if lowmask `(logand ,(caddr expr) ,lowmask) (caddr expr))))
     (if (zerop pos)
         `(logand ,x ,mask)
         `(logand (ash ,x ,(- pos)) ,mask))))
@@ -2172,6 +2250,21 @@
     ((integerp expr) (cons expr expr))
     ((%rotate-byte-32-long-p expr) (cons 0 #xFFFFFFFF))
     ((%u64-local-field expr) (cons 0 (cddr (%u64-local-field expr))))
+    ;; (%AREF-SET A I... V) stored into an int64-backed array: the value stored fits the element
+    ;; (the store is range-checked), so the form's value lies in the element's range.
+    ((and (consp expr) (eq (car expr) '%aref-set) (%aref-set-numeric-parts expr))
+     (multiple-value-bind (arr idxs val rank) (%aref-set-numeric-parts expr)
+       (declare (ignore val rank))
+       (let ((info (numeric-array-aref-info `(aref ,arr ,@idxs))))
+         (and info (integerp (cadr info)) (cons (cadr info) (cddr info))))))
+    ;; The signed reading of the low N bits of an integer (%SIGN-WRAP-FORM).
+    ((%sign-wrap-form expr)
+     (let ((n (%sign-wrap-form expr)))
+       (cons (- (ash 1 (1- n))) (1- (ash 1 (1- n))))))
+    ;; (setq v e) / (incf v) / (decf v) on an Int64-slot variable: the new value is what the
+    ;; slot holds, an int64 whatever e was (a result that does not fit signals).
+    ((and (consp expr) (member (car expr) '(setq incf decf)) (%long-assignment-parts expr))
+     (cons +int64-min+ +int64-max+))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(+ - *)))
      (let ((ra (expr-int-range (cadr expr)))
            (rb (expr-int-range (caddr expr))))
@@ -2225,6 +2318,10 @@
      (expr-int-range (caddr expr)))
     ((let ((b (%plain-block-body expr))) b)
      (expr-int-range (%plain-block-body expr)))
+    ;; (let ((k 13)) ... k ...): the range of the body with the literal in place.
+    ((and (consp expr) (member (car expr) '(let let*)) (consp (cdr expr))
+          (listp (cadr expr)) (%let-const-form expr))
+     (expr-int-range (%let-const-form expr)))
     ((and (consp expr) (eq (car expr) 'if) (= (length expr) 4))
      (let ((ra (expr-int-range (caddr expr))))
        (and ra
@@ -2540,7 +2637,8 @@
    promoting path (Runtime.Add/Subtract/Multiply) so overflow yields a bignum.
    (The unsafe raw long path inside native bodies is gated separately by
    compile-as-long / fixnum-typed-p and is NOT routed through here.)"
-  (and (expr-int-range expr) t))
+  (let ((r (expr-int-range expr)))
+    (and r (range-fits-int64-p r) t)))
 
 (defun string-char-code-ref (expr)
   "(STRING . INDEX) when EXPR is (char-code (schar S I)) or (char-code (char S I)),

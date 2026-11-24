@@ -3,7 +3,7 @@
 ;;; with :ELEMENT-TYPE :DEFAULT (bytes and characters), still read bytes.
 
 (defun %rbo-file (name)
-  (let ((path (merge-pathnames name (regression-temp-dir))))
+  (let ((path (merge-pathnames name (regression-temp-dir/))))
     (with-open-file (s path :direction :output :if-exists :supersede)
       (write-string "AB" s))
     path))

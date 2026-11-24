@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A RANDOM-STATE printed readably reads back, compiled and interpreted, and
 ;;; reading it interns nothing into COMMON-LISP.
 

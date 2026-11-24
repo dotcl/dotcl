@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Comparing two integers does not go through the rational form.
 ;;;
 ;;; = and < fell through to the general rational comparison, which answers

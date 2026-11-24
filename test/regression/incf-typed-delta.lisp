@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; INCF / DECF of a typed variable by a typed delta stays on the typed path.
 ;;; The delta is bound to a temporary (it is evaluated after the place's
 ;;; subforms and before the place is read), and that temporary was not

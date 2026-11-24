@@ -394,7 +394,7 @@ public static class DotclBuild
             var t = d.Trim().Trim('"');
             if (t.Length == 0) continue;
             var abs = System.IO.Path.GetFullPath(t).Replace("\\", "/");
-            if (!abs.EndsWith("/")) abs += "/";
+            if (!abs.EndsWith("/", System.StringComparison.Ordinal)) abs += "/";
             Runtime.Eval(MultipleValues.Primary(
                 Runtime.ReadFromString(new LispObject[] { new LispString(
                     $"(pushnew #p\"{abs}\" asdf:*central-registry* :test #'equal)") })));
@@ -541,6 +541,8 @@ public static class DotclBuild
                     (dir  (directory-namestring src))
                     (name (asdf:component-name sys))
                     (asd  (asdf:system-source-file sys)))
+               ;; DIR is read only when the fasl goes next to the source (no cache dir) or for R2R.
+               (declare (ignorable dir))
                (list name t
                      {DepFaslForm("name")}
                      {(targetRid == null

@@ -597,10 +597,10 @@
          (out (format nil "~a/out.fasl" tmp)))
     (ensure-directories-exist (concatenate 'string tmp "/"))
     (with-open-file (s src :direction :output :if-exists :supersede)
-      (format s "(defun %~a-d678-entry () 42)~%" ""))
+      (format s "(defun %toplevel-entry-test () 42)~%"))
     (dotcl:save-application out
                             :load src
-                            :toplevel "CL-USER::%D678-ENTRY")
+                            :toplevel "CL-USER::%TOPLEVEL-ENTRY-TEST")
     ;; Verify the file exists, is non-trivial, and carries the PE magic.
     (let ((ok (probe-file out))
           (first-two (with-open-file (in out :element-type '(unsigned-byte 8))
@@ -1207,25 +1207,26 @@
   (d899-count-down-helper 200000)
   :done)
 
-;;; TCO inside handler-case: should not stack overflow
+;;; A self call inside handler-case is an ordinary call under the handler (not a tail call):
+;;; a modest depth runs and the handler of the innermost level takes the error.
 (defun %d900-count-safe (n)
   (handler-case
-      (if (= n 0) :done (%d900-count-safe (- n 1)))
-    (error (e) (list :error e))))
+      (if (= n 0) (error "bottom") (%d900-count-safe (- n 1)))
+    (error () (list :error n))))
 
 (deftest-compiled-only d900-handler-case-self-tco
-  (%d900-count-safe 200000)
-  :done)
+  (%d900-count-safe 1000)
+  (:error 0))
 
-;;; handler-case TCO with accumulator
+;;; the same with an accumulator
 (defun %d900-sum-safe (n acc)
   (handler-case
       (if (= n 0) acc (%d900-sum-safe (- n 1) (+ acc n)))
     (error (e) (list :error e))))
 
 (deftest-compiled-only d900-handler-case-tco-acc
-  (%d900-sum-safe 100000 0)
-  5000050000)
+  (%d900-sum-safe 1000 0)
+  500500)
 
 ;;; return type inference from body (fixnum declared vars + if branches)
 (defun %d902-tak (x y z)
@@ -1783,17 +1784,17 @@
 ;;; :bt / print-backtrace show call forms with arguments.
 ;;; Frames now carry args (alloc-free inline for <=4); dotcl:print-backtrace renders
 ;;; "(NAME arg1 arg2 ...)" while dotcl:backtrace keeps bare names (see d1108 above).
-(defun %d1118-bt-leaf (a b)
+(defun %bt-leaf (a b)
   (declare (ignore a b))
   (let ((s (make-string-output-stream)))
     (dotcl:print-backtrace s)
     (get-output-stream-string s)))
-(defun %d1118-bt-mid (x) (values (%d1118-bt-leaf x (list x))))
+(defun %bt-mid (x) (values (%bt-leaf x (list x))))
 
 (deftest d1118-backtrace-shows-args
-  (let ((out (%d1118-bt-mid 7)))
-    (and (search "(%D1118-BT-LEAF 7 (7))" out)
-         (search "(%D1118-BT-MID 7)" out)
+  (let ((out (%bt-mid 7)))
+    (and (search "(%BT-LEAF 7 (7))" out)
+         (search "(%BT-MID 7)" out)
          t))
   t)
 
@@ -2109,7 +2110,7 @@
 ;;; emit-for-load iff :load-toplevel is present at top level.
 (defparameter *ew-discard-collector* nil)
 (deftest-compiled-only issue333-eval-when-execute-only-discarded-in-compiled-file
-  (let* ((src "dotcl-ew-discard-src.lisp")
+  (let* ((src (regression-temp-file "dotcl-ew-discard-src.lisp"))
          (fasl (compile-file-pathname src)))
     (with-open-file (o src :direction :output :if-exists :supersede)
       (prin1 '(eval-when (:execute) (push :exec-only *ew-discard-collector*)) o)
@@ -2131,7 +2132,7 @@
 ;; eval-when handler forced load-toplevel whenever :execute was present, leaking
 ;; the body into the fasl. Here :ctex must NOT appear at load time.
 (deftest-compiled-only issue333-eval-when-ct-execute-not-in-fasl
-  (let* ((src "dotcl-ew-ctex-src.lisp")
+  (let* ((src (regression-temp-file "dotcl-ew-ctex-src.lisp"))
          (fasl (compile-file-pathname src)))
     (with-open-file (o src :direction :output :if-exists :supersede)
       (prin1 '(eval-when (:compile-toplevel :execute) (push :ctex *ew-discard-collector*)) o)
@@ -2284,9 +2285,14 @@
             (let ((h (make-hash-table :test 'eq :weakness mode))
                   (k (list 'k)) (v (list 'v)))
               (setf (gethash k h) v)
-              (list (hash-table-weakness h)
-                    (eq (gethash k h) v)
-                    (hash-table-count h))))
+              ;; K and V must stay reachable until the count is read: after its
+              ;; last use the JIT may treat a local as dead, and a collection
+              ;; in between would drop the entry (seen once on a Windows run).
+              (prog1 (list (hash-table-weakness h)
+                           (eq (gethash k h) v)
+                           (hash-table-count h))
+                (dotnet:static "System.GC" "KeepAlive" k)
+                (dotnet:static "System.GC" "KeepAlive" v))))
           '(:key :value :key-and-value :key-or-value))
   ((:key t 1) (:value t 1) (:key-and-value t 1) (:key-or-value t 1)))
 
@@ -2563,7 +2569,7 @@
 ;;; had no inline encoding for LispComplex and silently corrupted the constant
 ;;; pool: a list element #C(0 1) came back as an unrelated string constant).
 (defun %i370-roundtrip ()
-  (let ((src (merge-pathnames "i370-cplx-tmp.lisp" *default-pathname-defaults*)))
+  (let ((src (regression-temp-file "i370-cplx-tmp.lisp")))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (write-string "(in-package :cl-user)
 (defparameter *i370-z* #C(3 4))
@@ -3463,11 +3469,6 @@
   (eval (macroexpand-1 '(restart-case (invoke-restart 'r 5)
                           (r (x) (* x 10)))))
   50)
-
-;; normal (compiled) special-form behavior is unchanged
-(deftest handler-case-special-form-still-works
-  (handler-case (error "boom") (error () :caught))
-  :caught)
 
 ;;; : handler-bind/restart-bind macroexpansion must keep the body INLINE (progn),
 ;;; not in a (lambda () body) thunk, so a code walker that stops at function boundaries

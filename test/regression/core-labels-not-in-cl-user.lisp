@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Starting from a SIL core (--asm compiler/cil-out.sil) must not leave the
 ;;; core's local and label names in CL-USER. The core writes them as plain
 ;;; symbols (BB_2974, ELSE_1183, |PKG653#:1_1|, ...); read in CL-USER they made

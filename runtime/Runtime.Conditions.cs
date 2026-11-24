@@ -54,6 +54,18 @@ public static partial class Runtime
         _ => null
     };
 
+    /// <summary>Render a function format control on a string stream; null if it signals.</summary>
+    internal static string? RenderFormatControlFunction(LispFunction fn, LispObject[] formatArgs)
+    {
+        var sw = new System.IO.StringWriter();
+        var stream = new LispStringOutputStream(sw);
+        var callArgs = new LispObject[formatArgs.Length + 1];
+        callArgs[0] = stream;
+        Array.Copy(formatArgs, 0, callArgs, 1, formatArgs.Length);
+        try { fn.Invoke(callArgs); return stream.GetString(); }
+        catch { return null; }
+    }
+
     public static LispObject LispErrorFormat(LispObject[] args)
         => throw ConditionSystem.ErrorExit(ErrorCondition(args));
 
@@ -67,11 +79,16 @@ public static partial class Runtime
             return cond;
         if (args[0] is LispInstance errInst)
             return new LispInstanceCondition(errInst);
+        // (error <.NET exception object>): throw it. The condition keeps the CLR exception
+        // and its type, so dotnet:exception-typep / dotnet:handler-bind see it as if a .NET
+        // call had thrown it, and (error (dotnet:exception-object c)) rethrows a caught one.
+        if (args[0] is LispDotNetObject { Value: Exception clrEx } && args.Length == 1)
+            return (LispCondition)ConditionFromException(clrEx);
         // (error 'condition-type) or (error 'condition-type :initarg val ...); create condition instance
         if (args[0] is Symbol sym)
         {
             var conditionType = Startup.Sym("CONDITION");
-            if (Subtypep(sym, conditionType) == Nil.Instance)
+            if (SubtypepClean(sym, conditionType) == Nil.Instance)
                 throw new LispErrorException(new LispTypeError(
                     $"{sym} does not designate a condition class", sym, conditionType));
             var initargs = args.SubArray(1);
@@ -80,19 +97,7 @@ public static partial class Runtime
         // (error function &rest args): function is a format control (e.g. from formatter)
         if (args[0] is LispFunction fn)
         {
-            // Call the function with a string-output-stream to get the message
-            string msg = "";
-            try
-            {
-                var sw = new System.IO.StringWriter();
-                var stream = new LispStringOutputStream(sw);
-                var callArgs = new LispObject[args.Length];
-                callArgs[0] = stream;
-                Array.Copy(args, 1, callArgs, 1, args.Length - 1);
-                fn.Invoke(callArgs);
-                msg = stream.GetString();
-            }
-            catch { /* ignore formatting errors */ }
+            string msg = RenderFormatControlFunction(fn, args.SubArray(1)) ?? "";
             var simpleErr = new LispError(msg);
             simpleErr.ConditionTypeName = "SIMPLE-ERROR";
             simpleErr.FormatControl = args[0];
@@ -229,24 +234,7 @@ public static partial class Runtime
     // --- Signal / Warn ---
 
     public static LispObject LispSignal(LispObject condition)
-    {
-        if (condition is LispCondition c)
-            return ConditionSystem.Signal(c);
-        if (condition is LispInstance inst)
-            return ConditionSystem.Signal(new LispInstanceCondition(inst));
-        if (condition is Symbol sym)
-            return ConditionSystem.Signal(MakeConditionFromType(sym, Array.Empty<LispObject>()));
-        // String format control => SIMPLE-CONDITION
-        if (FormatControlText(condition) is string fmtText)
-        {
-            var sc = new LispCondition(fmtText);
-            sc.ConditionTypeName = "SIMPLE-CONDITION";
-            sc.FormatControl = condition;
-            sc.FormatArguments = Nil.Instance;
-            return ConditionSystem.Signal(sc);
-        }
-        throw new LispErrorException(new LispTypeError("SIGNAL: not a condition", condition));
-    }
+        => LispSignalFormat(new[] { condition });
 
     public static LispObject LispSignalFormat(LispObject[] args)
     {
@@ -261,14 +249,26 @@ public static partial class Runtime
             var initargs = args.Length > 1 ? args.SubArray(1) : Array.Empty<LispObject>();
             return ConditionSystem.Signal(MakeConditionFromType(sym, initargs));
         }
-        // String message: preserve format control/arguments
-        var sc = new LispCondition(FormatControlText(args[0]) ?? args[0].ToString());
-        sc.ConditionTypeName = "SIMPLE-CONDITION";
-        if (FormatControlText(args[0]) != null)
+        var formatArgs = args.SubArray(1);
+        // (signal function &rest args): function is a format control, as for ERROR.
+        if (args[0] is LispFunction fn)
         {
-            sc.FormatControl = args[0];
-            sc.FormatArguments = Runtime.List(args.SubArray(1));
+            var fsc = new LispCondition(RenderFormatControlFunction(fn, formatArgs) ?? "");
+            fsc.ConditionTypeName = "SIMPLE-CONDITION";
+            fsc.FormatControl = args[0];
+            fsc.FormatArguments = Runtime.List(formatArgs);
+            return ConditionSystem.Signal(fsc);
         }
+        // String message: preserve format control/arguments
+        if (FormatControlText(args[0]) is not string fmtText)
+            throw new LispErrorException(new LispTypeError(
+                $"{args[0]} is not a condition designator", args[0],
+                List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("FUNCTION"),
+                     Startup.Sym("SYMBOL"), Startup.Sym("CONDITION"))));
+        var sc = new LispCondition(fmtText);
+        sc.ConditionTypeName = "SIMPLE-CONDITION";
+        sc.FormatControl = args[0];
+        sc.FormatArguments = Runtime.List(formatArgs);
         return ConditionSystem.Signal(sc);
     }
 
@@ -294,7 +294,13 @@ public static partial class Runtime
         // Name what was actually passed. The old message said only "must be a symbol",
         // which gave the reader nothing to go on when the argument was a live object.
         else throw new LispErrorException(new LispTypeError(
-            $"MAKE-CONDITION: {typeSpec} is not a condition type specifier", typeSpec));
+            $"MAKE-CONDITION: {typeSpec} is not a condition type specifier", typeSpec, TypeSpecifierType()));
+        // CLHS MAKE-CONDITION: TYPE names a subtype of CONDITION. A registered class that is
+        // not a condition class (STANDARD-OBJECT, a user class) is a type error, as in SBCL.
+        if (FindClassOrNil(sym) is LispClass named && !IsConditionClass(named))
+            throw new LispErrorException(new LispTypeError(
+                $"MAKE-CONDITION: {sym.Name} is not a condition type", typeSpec,
+                Startup.Sym("CONDITION")));
         return MakeConditionFromType(sym, initargs);
     }
 
@@ -333,7 +339,7 @@ public static partial class Runtime
                     foreach (var other in types)
                     {
                         if (t == other) continue;
-                        if (Runtime.Subtypep(t, other) is Nil)
+                        if (Runtime.SubtypepClean(t, other) is Nil)
                         {
                             subtypeOfAll = false;
                             break;
@@ -563,15 +569,7 @@ public static partial class Runtime
         // (warn function &rest args): the function is a format control, as for ERROR.
         if (args[0] is LispFunction wfn)
         {
-            var wsw = new System.IO.StringWriter();
-            var wstream = new LispStringOutputStream(wsw);
-            var wcallArgs = new LispObject[args.Length];
-            wcallArgs[0] = wstream;
-            Array.Copy(args, 1, wcallArgs, 1, args.Length - 1);
-            string wmsg = "";
-            try { wfn.Invoke(wcallArgs); wmsg = wstream.GetString(); }
-            catch { /* ignore formatting errors */ }
-            var fwarn = new LispWarning(wmsg);
+            var fwarn = new LispWarning(RenderFormatControlFunction(wfn, args.SubArray(1)) ?? "");
             fwarn.ConditionTypeName = "SIMPLE-WARNING";
             fwarn.FormatControl = args[0];
             fwarn.FormatArguments = Runtime.List(args.SubArray(1));
@@ -654,6 +652,7 @@ public static partial class Runtime
                 RestartClusterStack.PushCluster(new[] { restart });
                 try
                 {
+                    ConditionSystem.CheckBreakOnSignals(condition);   // *BREAK-ON-SIGNALS* sees CERROR too
                     HandlerClusterStack.Signal(condition);
                     // No handler took it: enter debugger with CONTINUE restart still on stack.
                     EnterDebuggerWithHooks(condition);

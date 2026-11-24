@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; An I/O failure on a stream must signal STREAM-ERROR (with the stream in
 ;;; stream-error-stream), not PROGRAM-ERROR. The portable peer-disconnect idiom
 ;;; is (handler-case (read-char s) (stream-error () ...)); before the fix the

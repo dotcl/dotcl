@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression tests for dotnet:static-generic: generic static methods
 
 ;;; Enumerable.Where<int>: filter list with lambda predicate

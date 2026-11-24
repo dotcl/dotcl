@@ -147,6 +147,53 @@ Lisp name is tried after these.")
         (when (getf d :url)
           (format out "~%~%~A" (getf d :url)))))))
 
+;;; LSP CompletionItemKind numbers for what dotcl-code-info calls a kind.
+(defun %completion-kind (kind)
+  (case kind
+    (:function 3) (:macro 3) (:class 7) (:variable 6) (:keyword 14)
+    (:package 9) (:namespace 9) (:method 2) (:property 10) (:field 5) (:type 7)
+    (t 1)))
+
+(defun %completion (document offset)
+  (let ((c (ignore-errors (dotcl-code-info:completions (document-text document) offset))))
+    (when c
+      (let ((range (%range document (getf c :start) (getf c :end))))
+        (list :obj "isIncomplete" (if (getf c :incomplete) t nil)
+              "items"
+              (map 'vector
+                   (lambda (i)
+                     (list* :obj "label" (getf i :label)
+                            "kind" (%completion-kind (getf i :kind))
+                            "textEdit" (list :obj "range" range "newText" (getf i :label))
+                            (when (getf i :detail) (list "detail" (getf i :detail)))))
+                   (getf c :items)))))))
+
+(defun %signature-help (document offset)
+  (let ((s (ignore-errors (dotcl-code-info:signature-at (document-text document) offset))))
+    (when s
+      (list :obj "signatures"
+            (vector (list :obj "label" (getf s :label)
+                          "parameters" (map 'vector (lambda (p) (list :obj "label" p))
+                                            (getf s :parameters))))
+            "activeSignature" 0
+            "activeParameter" (getf s :active)))))
+
+(defun %file-uri (path)
+  (let ((p (namestring path)))
+    (format nil "file://~A~A"
+            (if (and (plusp (length p)) (char= (char p 0) #\/)) "" "/")
+            p)))
+
+(defun %definition (document offset)
+  (let ((ds (ignore-errors (dotcl-code-info:definition-at (document-text document) offset))))
+    (map 'vector
+         (lambda (d)
+           (let ((line (max 0 (1- (getf d :line)))))
+             (list :obj "uri" (%file-uri (getf d :file))
+                   "range" (list :obj "start" (list :obj "line" line "character" 0)
+                                 "end" (list :obj "line" line "character" 0)))))
+         ds)))
+
 (defun %hover (document offset)
   (or (dolist (f *hover-functions*)
         (let ((r (ignore-errors (funcall f document offset))))
@@ -186,7 +233,10 @@ Lisp name is tried after these.")
 (defun %capabilities ()
   (list :obj
         "textDocumentSync" (list :obj "openClose" t "change" 2)
-        "hoverProvider" t))
+        "hoverProvider" t
+        "completionProvider" (list :obj "triggerCharacters" (vector ":" "." "-"))
+        "signatureHelpProvider" (list :obj "triggerCharacters" (vector " " "("))
+        "definitionProvider" t))
 
 (define-condition method-not-found (error)
   ((name :initarg :name :reader method-not-found-method))
@@ -235,6 +285,17 @@ Lisp name is tried after these.")
                                                             (jget p "character")))))
                (when text
                  (list :obj "contents" (list :obj "kind" "markdown" "value" text)))))))
+        ((member method '("textDocument/completion" "textDocument/signatureHelp"
+                          "textDocument/definition")
+                 :test #'string=)
+         (let ((document (doc)))
+           (when document
+             (let* ((p (jget params "position"))
+                    (offset (position-offset document (jget p "line") (jget p "character"))))
+               (cond ((string= method "textDocument/completion") (%completion document offset))
+                     ((string= method "textDocument/signatureHelp")
+                      (%signature-help document offset))
+                     (t (%definition document offset)))))))
         (t (error 'method-not-found :name method))))))
 
 (defun %dispatch (session message)

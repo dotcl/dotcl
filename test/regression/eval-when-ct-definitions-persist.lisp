@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; What (eval-when (:compile-toplevel ...) ...) defines stays defined after
 ;;; COMPILE-FILE returns.
 ;;;
@@ -16,8 +17,8 @@
 ;;; function: MEMOIZED-FUNCALL".
 
 (deftest-compiled-only eval-when-ct-definitions.survive-compile-file
-  (let ((src "ewct-tmp.lisp")
-        (fasl "ewct-tmp.fasl"))
+  (let ((src (regression-temp-file "ewct-tmp.lisp"))
+        (fasl (regression-temp-file "ewct-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)
@@ -35,8 +36,8 @@
 ;; The fare-memoization shape: compile time wraps the function and records the
 ;; wrapper; load time unwraps it through the record, redefines and rewraps.
 (deftest-compiled-only eval-when-ct-definitions.wrap-at-compile-time-then-load
-  (let ((src "ewct2-tmp.lisp")
-        (fasl "ewct2-tmp.fasl"))
+  (let ((src (regression-temp-file "ewct2-tmp.lisp"))
+        (fasl (regression-temp-file "ewct2-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)

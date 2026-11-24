@@ -238,6 +238,19 @@ fi
 # real dotcl code produces a C#-referenceable DLL. Needs the built runtime +
 # a cross-compiled cil-out.sil.
 SIL="$ROOT/compiler/cil-out.sil"
+# How the emit scripts below start dotcl. "dotnet run --project" re-evaluates the MSBuild project
+# on every call (a few seconds each, about twenty calls), and --asm loads the 23 MB sil each time
+# (about two seconds); the built runtime started from dotcl.core, the way a shipped dotcl starts,
+# does neither. The core is used when it is at least as new as the sil.
+DOTCL_RUN="dotnet run --project $ROOT/runtime/runtime.csproj -- --asm $SIL"
+RT_DLL="$ROOT/runtime/bin/Debug/net10.0/runtime.dll"
+if [ -f "$RT_DLL" ]; then
+  if [ -f "$ROOT/compiler/dotcl.core" ] && [ ! "$SIL" -nt "$ROOT/compiler/dotcl.core" ]; then
+    DOTCL_RUN="dotnet $RT_DLL --core $ROOT/compiler/dotcl.core"
+  else
+    DOTCL_RUN="dotnet $RT_DLL --asm $SIL"
+  fi
+fi
 if [ ! -f "$SIL" ]; then
   skip_or_fail "SKIP-LISP: no cil-out.sil (run 'make cross-compile' first)"
 else
@@ -260,8 +273,8 @@ else
 (format t "LISP-EMIT-OK~%")
 EOF
   echo "=== emit facade DLL from ACTUAL dotcl (Lisp) ==="
-  if ! (dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-          --asm "$SIL" "$LISPF_W" 2>"$WORK/lispemit.log" | grep -q LISP-EMIT-OK); then
+  if ! ($DOTCL_RUN \
+          "$LISPF_W" 2>"$WORK/lispemit.log" | grep -q LISP-EMIT-OK); then
     note "Lisp-driven emit failed"; tail -8 "$WORK/lispemit.log"
   fi
   [ -f "$LLIB" ] || note "no Lisp-emitted DLL produced"
@@ -327,8 +340,8 @@ EOF
 (format t "LISP-LIB-OK~%")
 EOF
   echo "=== emit LIBRARY DLL from ACTUAL dotcl (dotnet:library macro) ==="
-  if ! (dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-          --asm "$SIL" "$LIBF_W" 2>"$WORK/lislib.log" | grep -q LISP-LIB-OK); then
+  if ! ($DOTCL_RUN \
+          "$LIBF_W" 2>"$WORK/lislib.log" | grep -q LISP-LIB-OK); then
     note "Lisp-driven library emit failed"; tail -8 "$WORK/lislib.log"
   fi
   [ -f "$CLIB" ] || note "no Lisp-emitted library DLL produced"
@@ -394,8 +407,8 @@ EOF
 (format t "ENUM-EMIT-OK~%")
 EOF
   echo "=== emit ENUM+CONST+STRUCT library from dotcl (standalone metadata) ==="
-  if ! (dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-          --asm "$SIL" "$ENUMF_W" 2>"$WORK/enum.log" | grep -q ENUM-EMIT-OK); then
+  if ! ($DOTCL_RUN \
+          "$ENUMF_W" 2>"$WORK/enum.log" | grep -q ENUM-EMIT-OK); then
     note "Lisp-driven enum emit failed"; tail -8 "$WORK/enum.log"
   fi
   [ -f "$EPACK" ] || note "no enum DLL produced"
@@ -472,8 +485,8 @@ EOF
 (format t "EXC-EMIT-OK~%")
 EOF
   echo "=== emit EXCEPTION-TYPE library from dotcl (standalone) ==="
-  if ! (dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-          --asm "$SIL" "$XF_W" 2>"$WORK/exc.log" | grep -q EXC-EMIT-OK); then
+  if ! ($DOTCL_RUN \
+          "$XF_W" 2>"$WORK/exc.log" | grep -q EXC-EMIT-OK); then
     note "Lisp-driven exception-type emit failed"; tail -8 "$WORK/exc.log"
   fi
   [ -f "$XPACK" ] || note "no exception-type DLL produced"
@@ -538,8 +551,8 @@ EOF
 (format t "IFACE-EMIT-OK~%")
 EOF
   echo "=== emit INTERFACE+DELEGATE library from dotcl (standalone contracts) ==="
-  if ! (dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-          --asm "$SIL" "$IFF_W" 2>"$WORK/iface.log" | grep -q IFACE-EMIT-OK); then
+  if ! ($DOTCL_RUN \
+          "$IFF_W" 2>"$WORK/iface.log" | grep -q IFACE-EMIT-OK); then
     note "Lisp-driven interface emit failed"; tail -8 "$WORK/iface.log"
   fi
   [ -f "$IPACK" ] || note "no interface DLL produced"
@@ -618,8 +631,8 @@ EOF
 (format t "BAKE-EMIT-OK~%")
 EOF
   echo "=== emit BAKED-FUNCTION library from dotcl (bodies compiled in) ==="
-  if ! (dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-          --asm "$SIL" "$BF_W" 2>"$WORK/baked.log" | grep -q BAKE-EMIT-OK); then
+  if ! ($DOTCL_RUN \
+          "$BF_W" 2>"$WORK/baked.log" | grep -q BAKE-EMIT-OK); then
     note "Lisp-driven baked-function emit failed"; tail -8 "$WORK/baked.log"
   fi
   [ -f "$BPACK" ] || note "no baked-function DLL produced"
@@ -693,14 +706,28 @@ EOF
 (format t "PACK-EMIT-OK~%")
 EOF
   echo "=== pack the library as a nupkg (dotnet:library :package) ==="
-  if ! (dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-          --asm "$SIL" "$PKF_W" 2>"$WORK/pack.log" </dev/null | grep -q PACK-EMIT-OK); then
+  if ! ($DOTCL_RUN \
+          "$PKF_W" 2>"$WORK/pack.log" </dev/null | grep -q PACK-EMIT-OK); then
     note "nupkg emit failed"; tail -8 "$WORK/pack.log"
   fi
   [ -f "$FEED/FibLib.1.0.0.nupkg" ] || note "no FibLib.1.0.0.nupkg produced"
-  unzip -Z1 "$FEED/FibLib.1.0.0.nupkg" 2>/dev/null | grep -q '^lib/netstandard2.0/FibLib.dll$' \
+  # Look inside the nupkg with unzip, or with python3 where unzip is not installed
+  # (a bare build host). With neither, say so: a missing tool must not read as a
+  # missing file in the package.
+  if command -v unzip >/dev/null 2>&1; then
+    zip_names() { unzip -Z1 "$1" 2>/dev/null; }
+    zip_member() { unzip -p "$1" "$2" 2>/dev/null; }
+  elif command -v python3 >/dev/null 2>&1; then
+    zip_names() { python3 -c 'import sys, zipfile; print("\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))' "$1" 2>/dev/null; }
+    zip_member() { python3 -c 'import sys, zipfile; sys.stdout.buffer.write(zipfile.ZipFile(sys.argv[1]).read(sys.argv[2]))' "$1" "$2" 2>/dev/null; }
+  else
+    zip_names() { return 1; }
+    zip_member() { return 1; }
+    note "neither unzip nor python3 is installed, so the nupkg cannot be looked into"
+  fi
+  zip_names "$FEED/FibLib.1.0.0.nupkg" | grep -q '^lib/netstandard2.0/FibLib.dll$' \
     || note "nupkg lacks lib/netstandard2.0/FibLib.dll"
-  unzip -p "$FEED/FibLib.1.0.0.nupkg" FibLib.nuspec 2>/dev/null | grep -q 'id="DotCL.Runtime" version="\[' \
+  zip_member "$FEED/FibLib.1.0.0.nupkg" FibLib.nuspec | grep -q 'id="DotCL.Runtime" version="\[' \
     || note "nuspec lacks the DotCL.Runtime dependency"
 
   echo "=== pack DotCL.Runtime onto the same feed ==="
@@ -794,8 +821,8 @@ EOF
 (format t "CLS-EMIT-OK~%")
 EOF
   echo "=== emit BAKED-CLASS library from dotcl (method and ctor bodies compiled in) ==="
-  if ! (dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-          --asm "$SIL" "$CF_W" 2>"$WORK/cls.log" | grep -q CLS-EMIT-OK); then
+  if ! ($DOTCL_RUN \
+          "$CF_W" 2>"$WORK/cls.log" | grep -q CLS-EMIT-OK); then
     note "Lisp-driven baked-class emit failed"; tail -8 "$WORK/cls.log"
   fi
   [ -f "$CPACK" ] || note "no baked-class DLL produced"
@@ -879,12 +906,219 @@ EOF
 (format t "SHAKE-EMIT-OK ~a~%" (length dotnet::*library-core-functions*))
 EOF
   echo "=== emit library whose bodies call core functions (copied in) ==="
-  SOUT="$(dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-          --asm "$SIL" "$SF_W" 2>"$WORK/shake.log" </dev/null | tr -d '\r')"
+  SOUT="$($DOTCL_RUN \
+          "$SF_W" 2>"$WORK/shake.log" </dev/null | tr -d '\r')"
   case "$SOUT" in
     *SHAKE-EMIT-OK*) echo "  core functions copied in: ${SOUT##*SHAKE-EMIT-OK }, $(wc -c <"$SPACK" | tr -d ' ') bytes (FibLib $(wc -c <"$BPACK" | tr -d ' ') bytes)" ;;
     *) note "core-function library emit failed"; tail -8 "$WORK/shake.log" ;;
   esac
+
+  # --- two baked libraries referenced together: only user types are public ---
+  # The module type and the data-blob types are implementation detail. Public,
+  # they list in GetExportedTypes and make "CompiledModule" ambiguous between
+  # two such libraries.
+  if [ -f "$BPACK" ] && [ -f "$SPACK" ]; then
+    mkdir -p "$WORK/consume11"
+    cat > "$WORK/consume11/consume11.csproj" <<EOF
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="FibLib"><HintPath>../FibLib.dll</HintPath></Reference>
+    <Reference Include="ShakeLib"><HintPath>../ShakeLib.dll</HintPath></Reference>
+    <ProjectReference Include="$RT" />
+  </ItemGroup>
+</Project>
+EOF
+    cat > "$WORK/consume11/Program.cs" <<EOF
+using System;
+using System.Linq;
+using FibLib;
+using ShakeLib;
+class Consume11 {
+    static void Main() {
+        var names = typeof(FibLib.MathOps).Assembly.GetExportedTypes()
+            .Concat(typeof(ShakeLib.Ops).Assembly.GetExportedTypes())
+            .Select(t => t.FullName).OrderBy(n => n);
+        Console.WriteLine(string.Join(",", names) + " " + MathOps.Fib(10) + " " + Ops.Sign(-5));
+    }
+}
+EOF
+    echo "=== consume: two baked libraries together, only user types exported ==="
+    if (cd "$WORK/consume11" && dotnet build 2>"$WORK/consume11.log" | grep -q "Build succeeded"); then
+      OUT="$(cd "$WORK/consume11" && dotnet run 2>/dev/null </dev/null | tr -d '\r')"
+      if [ "$OUT" = "FibLib.MathOps,ShakeLib.Ops 55 -1" ]; then
+        echo "  exported: $OUT"
+      else
+        note "exported types / run printed '$OUT'"
+      fi
+    else
+      note "consumer of two baked libraries failed to compile"; tail -8 "$WORK/consume11.log"
+    fi
+  fi
+
+  # --- member documentation: the sidecar .xml names methods, fields and ---
+  # properties with the IDs a C# compiler computes, so an IDE shows the text.
+  DPACK="$WORK/DocLib.dll"
+  DPACK_W="$DPACK"; DF="$WORK/doclib.lisp"; DF_W="$DF"
+  if command -v cygpath >/dev/null 2>&1; then
+    DPACK_W="$(cygpath -m "$DPACK")"; DF_W="$(cygpath -m "$DF")"
+  fi
+  cat > "$DF" <<EOF
+(load "$CONTRIB_W")
+(dotnet:library ("DocLib" :version "1.0.0.0" :path "$DPACK_W")
+  (:class "DocLib.Calc" ()
+    (:doc "A calculator.")
+    (:fields ("Total" Int32 :doc "The running total."))
+    (:properties ("Label" String :doc "A label."))
+    (:methods
+      ("Add" ((a Int32) (b Int32)) :returns Int32 :doc "Adds two numbers." (+ a b))
+      ("Twice" ((a Int32)) :returns Int32 "Doubles A." (* 2 a))
+      ("Plain" () :returns Int32 7)))
+  (:module "DocLib.Ops"
+    (:functions
+      (square ((x Int64)) :returns Int64 "Squares X." (* x x)))))
+(format t "DOC-EMIT-OK~%")
+EOF
+  echo "=== emit library with member documentation ==="
+  if ! ($DOTCL_RUN "$DF_W" \
+          2>"$WORK/doclib.log" </dev/null | grep -q DOC-EMIT-OK); then
+    note "member-doc library emit failed"; tail -6 "$WORK/doclib.log"
+  fi
+  mkdir -p "$WORK/consume12"
+  cat > "$WORK/consume12/consume12.csproj" <<EOF
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="DocLib"><HintPath>../DocLib.dll</HintPath></Reference>
+    <ProjectReference Include="$RT" />
+  </ItemGroup>
+</Project>
+EOF
+  cat > "$WORK/consume12/Program.cs" <<EOF
+using System;
+using System.Linq;
+using System.Reflection;
+using System.Xml.Linq;
+class Consume12 {
+    static void Main() {
+        var asm = typeof(DocLib.Calc).Assembly;
+        var doc = XDocument.Load(System.IO.Path.ChangeExtension(asm.Location, ".xml"));
+        var ids = doc.Descendants("member").ToDictionary(m => (string)m.Attribute("name"), m => ((string)m.Element("summary")).Trim());
+        // every documented method ID must name a real public method, parameter types included
+        int bad = 0, methods = 0;
+        foreach (var id in ids.Keys.Where(k => k.StartsWith("M:"))) {
+            var body = id.Substring(2);
+            int p = body.IndexOf('(');
+            var full = p < 0 ? body : body.Substring(0, p);
+            var args = p < 0 ? "" : body.Substring(p + 1, body.Length - p - 2);
+            int dot = full.LastIndexOf('.');
+            var type = asm.GetType(full.Substring(0, dot));
+            var ok = type != null && type.GetMethods().Any(m => m.Name == full.Substring(dot + 1)
+                && string.Join(",", m.GetParameters().Select(q => q.ParameterType.FullName)) == args);
+            methods++;
+            if (!ok) { bad++; Console.Error.WriteLine("no method for " + id); }
+        }
+        var want = new[] { "T:DocLib.Calc", "F:DocLib.Calc.Total", "P:DocLib.Calc.Label", "M:DocLib.Calc.Add(System.Int32,System.Int32)", "M:DocLib.Calc.Twice(System.Int32)", "M:DocLib.Ops.Square(System.Int64)" };
+        var missing = want.Where(w => !ids.ContainsKey(w)).ToArray();
+        Console.WriteLine(methods + " bad=" + bad + " missing=" + missing.Length + " " + ids["M:DocLib.Calc.Add(System.Int32,System.Int32)"] + "|" + ids["M:DocLib.Calc.Twice(System.Int32)"] + "|" + ids["M:DocLib.Ops.Square(System.Int64)"]);
+    }
+}
+EOF
+  echo "=== consume: member documentation IDs match the emitted members ==="
+  if (cd "$WORK/consume12" && dotnet build 2>"$WORK/consume12.log" | grep -q "Build succeeded"); then
+    OUT="$(cd "$WORK/consume12" && dotnet run 2>"$WORK/consume12.err" </dev/null | tr -d '\r')"
+    if [ "$OUT" = "3 bad=0 missing=0 Adds two numbers.|Doubles A.|Squares X." ]; then
+      echo "  member docs: $OUT"
+    else
+      note "member documentation printed '$OUT'"; tail -4 "$WORK/consume12.err"
+    fi
+  else
+    note "member-doc consumer failed to compile"; tail -8 "$WORK/consume12.log"
+  fi
+
+  # --- errors leaving a library: a typed exception per condition, ---
+  # the condition kept, and a library class mapped with (:maps-condition).
+  EPACK2="$WORK/ExLib.dll"
+  EPACK2_W="$EPACK2"; EF="$WORK/exlib.lisp"; EF_W="$EF"
+  if command -v cygpath >/dev/null 2>&1; then
+    EPACK2_W="$(cygpath -m "$EPACK2")"; EF_W="$(cygpath -m "$EF")"
+  fi
+  cat > "$EF" <<EOF
+(load "$CONTRIB_W")
+(dotnet:library ("ExLib" :version "1.0.0.0" :path "$EPACK2_W")
+  (:class "ExLib.MyUnbound" ("System.Exception")
+    (:maps-condition unbound-variable)
+    (:ctor ((msg String)) (:base msg)))
+  (:module "ExLib.Ops"
+    (:functions
+      (div ((n Int32)) :returns Int32 (/ n 0))
+      (typ ((n Int32)) :returns Int32 (length n))
+      (plain ((n Int32)) :returns Int32 (error "plain ~a" n))
+      (ctl ((n Int32)) :returns Int32 (throw 'nobody n))
+      (unb ((n Int32)) :returns Int32 (symbol-value 'surely-unbound-xyz))
+      (fine ((n Int32)) :returns Int32 (+ n 1)))))
+(format t "EXLIB-EMIT-OK~%")
+EOF
+  echo "=== emit library whose functions signal errors ==="
+  if ! ($DOTCL_RUN "$EF_W" \
+          2>"$WORK/exlib.log" </dev/null | grep -q EXLIB-EMIT-OK); then
+    note "exception-mapping library emit failed"; tail -6 "$WORK/exlib.log"
+  fi
+  mkdir -p "$WORK/consume13"
+  cat > "$WORK/consume13/consume13.csproj" <<EOF
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="ExLib"><HintPath>../ExLib.dll</HintPath></Reference>
+    <ProjectReference Include="$RT" />
+  </ItemGroup>
+</Project>
+EOF
+  cat > "$WORK/consume13/Program.cs" <<EOF
+using System;
+using ExLib;
+class Consume13 {
+    static string T(Func<int> f) {
+        try { f(); return "none"; }
+        catch (Exception e) {
+            string cond = e is DotCL.LispErrorException le ? le.Condition.GetType().Name
+                : (e.Data.Contains("dotcl.condition") ? e.Data["dotcl.condition"].GetType().Name : "?");
+            return e.GetType().Name + "/" + (e is DotCL.LispErrorException) + "/" + cond;
+        }
+    }
+    static void Main() {
+        Console.WriteLine(T(() => Ops.Div(1)) + " " + T(() => Ops.Typ(1)) + " " + T(() => Ops.Plain(1))
+            + " " + T(() => Ops.Ctl(1)) + " " + T(() => Ops.Unb(1)) + " " + Ops.Fine(1));
+    }
+}
+EOF
+  echo "=== consume: typed exceptions keep the condition ==="
+  if (cd "$WORK/consume13" && dotnet build 2>"$WORK/consume13.log" | grep -q "Build succeeded"); then
+    OUT="$(cd "$WORK/consume13" && dotnet run 2>"$WORK/consume13.err" </dev/null | tr -d '\r')"
+    EXPX="LispDivisionByZeroException/True/LispError LispTypeErrorException/True/LispTypeError LispErrorException/True/LispError LispControlErrorException/True/LispControlError MyUnbound/False/LispUnboundVariable 2"
+    if [ "$OUT" = "$EXPX" ]; then
+      echo "  typed exceptions: $OUT"
+    else
+      note "typed exceptions printed '$OUT'"; tail -4 "$WORK/consume13.err"
+    fi
+  else
+    note "typed-exception consumer failed to compile"; tail -8 "$WORK/consume13.log"
+  fi
 
   mkdir -p "$WORK/consume10"
   cat > "$WORK/consume10/consume10.csproj" <<EOF
@@ -1017,8 +1251,8 @@ LISP
                        (if (and (search "HI calls GREETING" m) (search "*GREETING*" m)) :refused m)))))
 LISP
   echo "=== emit library from an ASDF system and the system it depends on ==="
-  YOUT="$(dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-          --asm "$SIL" "$YF_W" 2>"$WORK/sys.log" </dev/null | tr -d '\r')"
+  YOUT="$($DOTCL_RUN \
+          "$YF_W" 2>"$WORK/sys.log" </dev/null | tr -d '\r')"
   echo "$YOUT" | grep '^SYS-' | sed 's/^/  /'
   case "$YOUT" in
     *"SYS-EMIT-OK 6 T"*) ;;
@@ -1146,8 +1380,8 @@ EOF
 (format t "ABI-EMIT-OK~%")
 EOF
   echo "=== emit library exercising the calling convention ==="
-  if ! (dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-          --asm "$SIL" "$AF_W" 2>"$WORK/abi.log" </dev/null | grep -q ABI-EMIT-OK); then
+  if ! ($DOTCL_RUN \
+          "$AF_W" 2>"$WORK/abi.log" </dev/null | grep -q ABI-EMIT-OK); then
     note "calling-convention library emit failed"; tail -8 "$WORK/abi.log"
   fi
   mkdir -p "$WORK/consume11"
@@ -1261,8 +1495,8 @@ EOF
 (format t "CB-EMIT-OK~%")
 EOF
   echo "=== emit library with callbacks and events ==="
-  if ! (dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-          --asm "$SIL" "$DF_W" 2>"$WORK/cb.log" </dev/null | grep -q CB-EMIT-OK); then
+  if ! ($DOTCL_RUN \
+          "$DF_W" 2>"$WORK/cb.log" </dev/null | grep -q CB-EMIT-OK); then
     note "callback library emit failed"; tail -8 "$WORK/cb.log"
   fi
   mkdir -p "$WORK/consume12"
@@ -1368,7 +1602,7 @@ LispErrorException:negative: -3 none InvalidOperationException:boom
 (try "event" (lib (:class "CbErr.C" () (:events ("E" "CbErr.RefD")))))
 EOF
   echo "=== a delegate type that cannot be marshalled is an error when the library is built ==="
-  dotnet run --project "$ROOT/runtime/runtime.csproj" -- --asm "$SIL" "$WORK/cberr.lisp" \
+  $DOTCL_RUN "$WORK/cberr.lisp" \
       2>/dev/null </dev/null | tr -d '\r' >"$WORK/cberr.out" || true
   grep -q "^span: .*parameter 1 is a ref struct" "$WORK/cberr.out" || note "ref struct delegate was not refused"
   grep -q "^ref: .*parameter 1 is passed by reference" "$WORK/cberr.out" || note "by-reference delegate was not refused"
@@ -1407,8 +1641,8 @@ EOF
     (dolist (e (sort (copy-list all) #'string<)) (format o "~a~%" e))))
 EOF
   echo "=== runtime surface of the baked DLLs ==="
-  dotnet run --project "$ROOT/runtime/runtime.csproj" -- \
-      --asm "$SIL" "$SURF_W" 2>"$WORK/surface.log" </dev/null | tr -d '\r' >"$WORK/surface.out" \
+  $DOTCL_RUN \
+      "$SURF_W" 2>"$WORK/surface.log" </dev/null | tr -d '\r' >"$WORK/surface.out" \
     || note "surface listing failed"
   sed 's/^/  /' "$WORK/surface.out"
   [ -s "$SURFOUT" ] || { note "no surface listing"; tail -8 "$WORK/surface.log"; }

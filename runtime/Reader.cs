@@ -271,6 +271,23 @@ public class Reader
         return new LispErrorException(err);
     }
 
+    // A package a program names before the module that defines it is loaded: say which
+    // module to REQUIRE (the usual first-day mistake is (ql:quickload ...) with no
+    // (require "quicklisp") before it).
+    private static string ModuleHintForPackage(string pkgName) => pkgName.ToUpperInvariant() switch
+    {
+        "QL" or "QUICKLISP" => "; (require \"quicklisp\") defines it",
+        "ASDF" or "UIOP" => "; (require \"asdf\") defines it",
+        _ => "",
+    };
+
+    // A DOTNET: name that the dotnet-class module defines, written before it is loaded
+    // (DOTNET:REF is the usual first one).
+    private static string ModuleHintForSymbol(string pkgName, string symName) =>
+        pkgName == "DOTNET" && symName.ToUpperInvariant() is "REF" or "DEFINE-CLASS" or "LIBRARY" or "*TYPE-ALIASES*"
+            ? "; (require \"dotnet-class\") defines it"
+            : "";
+
     private LispErrorException MakeEndOfFileError(string message)
     {
         var err = new LispError(message);
@@ -731,8 +748,8 @@ public class Reader
             if (!tc.Escaped && char.IsLetter(tc.Ch))
             {
                 char converted = hasUpper
-                    ? char.ToLowerInvariant(tc.Ch)
-                    : char.ToUpperInvariant(tc.Ch);
+                    ? CharCase.SimpleLower(tc.Ch)
+                    : CharCase.SimpleUpper(tc.Ch);
                 token.Chars[i] = new TokenChar(converted, false);
             }
         }
@@ -904,6 +921,7 @@ public class Reader
         int startPosition = Position - 1;
         // Column of the opening paren (already consumed, so it sits at Position-1).
         int startCol = Position - _lineStartPos;
+        int openLine = _line;
         var items = new List<LispObject>();
         LispObject? dotCdr = null;
 
@@ -911,7 +929,8 @@ public class Reader
         {
             SkipWhitespace();
             int ch = Peek();
-            if (ch == -1) throw MakeEndOfFileError("Unexpected end of input in list");
+            if (ch == -1) throw MakeEndOfFileError(
+                $"Unexpected end of input in list (the \"(\" opened at line {openLine}, column {startCol} is never closed)");
 
             if (ch == ')')
             {
@@ -1242,7 +1261,7 @@ public class Reader
     /// <summary>Reader macro function for , (CLHS 2.4.7).</summary>
     internal LispObject ReadComma(char _triggerChar)
     {
-        if (s_backquoteLevel == 0)
+        if (s_backquoteLevel == 0 && !_readSuppress)
             throw MakeReaderError("Comma is not inside a backquote");
         var ch = Peek();
         if (ch == '@')
@@ -1266,11 +1285,13 @@ public class Reader
     {
         var sb = new StringBuilder();
         var rt = GetCurrentReadtable();
+        int openLine = _line, openCol = Position - _lineStartPos;
 
         while (true)
         {
             int ch = ReadChar();
-            if (ch == -1) throw MakeEndOfFileError("Unterminated string");
+            if (ch == -1) throw MakeEndOfFileError(
+                $"Unterminated string (the string opened at line {openLine}, column {openCol} has no closing quote)");
             if (ch == _triggerChar) break;
             if (rt.GetSyntaxType((char)ch) == SyntaxType.SingleEscape)
             {
@@ -1299,6 +1320,7 @@ public class Reader
             return new Symbol("NIL");
         }
 
+        if (rank < 0) throw MakeReaderError("#A requires the rank of the array: #nA");
         var contents = Read() ?? Nil.Instance;
 
         if (rank == 0)
@@ -1307,39 +1329,54 @@ public class Reader
             return new LispVector(new LispObject[] { contents }, Array.Empty<int>(), "T");
         }
 
-        // For rank 1, handle non-list sequences (strings, vectors, bit-vectors)
-        if (rank == 1)
-        {
-            if (contents is LispString str)
-            {
-                var chars = str.Value.Select(c => (LispObject)LispChar.Make(c)).ToArray();
-                return new LispVector(chars, "T");
-            }
-            if (contents is LispVector vec)
-            {
-                // Already a vector; re-wrap as general vector
-                var elts = new LispObject[vec.Length];
-                for (int j = 0; j < vec.Length; j++)
-                    elts[j] = vec[j];
-                return new LispVector(elts, "T");
-            }
-            // Fall through to list handling
-        }
-
-        // Compute dimensions by traversing the first-element path
+        // The contents are a nest of sequences (lists, vectors, strings) RANK deep; the
+        // innermost sequences hold the elements.
         var dims = new int[rank];
-        ComputeArrayDims(contents, dims, 0, rank);
-
-        int total = 1;
-        foreach (var d in dims) total *= d;
-
-        var items = new LispObject[total];
-        Compat.Fill(items, Nil.Instance);
-        FlattenArrayContents(contents, items, 0, rank);
-
+        for (int i = 0; i < rank; i++) dims[i] = -1;
+        var flat = new List<LispObject>();
+        CollectArrayContents(contents, dims, 0, rank, flat);
+        for (int i = 0; i < rank; i++) if (dims[i] < 0) dims[i] = 0;
         return rank == 1
-            ? new LispVector(items, "T")
-            : new LispVector(items, dims, "T");
+            ? new LispVector(flat.ToArray(), "T")
+            : new LispVector(flat.ToArray(), dims, "T");
+    }
+
+    // The elements of a sequence, or null when OBJ is not a proper sequence.
+    private static LispObject[]? ArraySequenceItems(LispObject obj)
+    {
+        switch (obj)
+        {
+            case Nil: return Array.Empty<LispObject>();
+            case LispString str: return str.Value.Select(c => (LispObject)LispChar.Make(c)).ToArray();
+            case LispVector { Rank: 1 } vec:
+            {
+                var elts = new LispObject[vec.Length];
+                for (int j = 0; j < vec.Length; j++) elts[j] = vec[j];
+                return elts;
+            }
+            case Cons:
+            {
+                var items = new List<LispObject>();
+                var cur = obj;
+                while (cur is Cons c) { items.Add(c.Car); cur = c.Cdr; }
+                return cur is Nil ? items.ToArray() : null;
+            }
+            default: return null;
+        }
+    }
+
+    private void CollectArrayContents(LispObject contents, int[] dims, int level, int rank, List<LispObject> flat)
+    {
+        var items = ArraySequenceItems(contents);
+        if (items == null)
+            throw MakeReaderError("#A: the contents are not a nest of sequences " + rank + " deep");
+        if (dims[level] < 0) dims[level] = items.Length;
+        else if (dims[level] != items.Length)
+            throw MakeReaderError("#A: the contents are not a regular nest of sequences");
+        if (level + 1 < rank)
+            foreach (var item in items) CollectArrayContents(item, dims, level + 1, rank, flat);
+        else
+            flat.AddRange(items);
     }
 
     internal LispObject ReadStructureLiteral()
@@ -1380,9 +1417,9 @@ public class Reader
             if (key is Symbol keySym)
                 keyName = keySym.Name;
             else if (key is LispString keyStr)
-                keyName = keyStr.Value.ToUpperInvariant();
+                keyName = CharCase.SimpleUpper(keyStr.Value);
             else if (key is LispChar keyChar)
-                keyName = keyChar.Value.ToString().ToUpperInvariant();
+                keyName = CharCase.SimpleUpper(keyChar.Value.ToString());
             else
                 throw MakeReaderError($"#S: invalid slot name: {key}");
 
@@ -1433,57 +1470,6 @@ public class Reader
         if (arr[2] > 624)
             throw MakeReaderError("#S(RANDOM-STATE): the index word of :STATE is above 624");
         return LispRandomState.FromState(arr);
-    }
-
-    private static void ComputeArrayDims(LispObject contents, int[] dims, int level, int rank)
-    {
-        if (level >= rank) return;
-        int count = 0;
-        LispObject? first = null;
-        if (contents is LispVector vec)
-        {
-            count = vec.Length;
-            if (count > 0) first = vec[0];
-        }
-        else
-        {
-            var cur = contents;
-            while (cur is Cons c) { count++; if (first == null) first = c.Car; cur = c.Cdr; }
-        }
-        dims[level] = count;
-        if (first != null && level + 1 < rank)
-            ComputeArrayDims(first, dims, level + 1, rank);
-    }
-
-    private static int FlattenArrayContents(LispObject contents, LispObject[] items, int idx, int rank)
-    {
-        if (rank <= 1)
-        {
-            if (contents is LispVector vec)
-            {
-                for (int i = 0; i < vec.Length; i++)
-                    if (idx < items.Length) items[idx++] = vec[i];
-            }
-            else
-            {
-                var cur = contents;
-                while (cur is Cons c) { if (idx < items.Length) items[idx++] = c.Car; cur = c.Cdr; }
-            }
-        }
-        else
-        {
-            if (contents is LispVector vec)
-            {
-                for (int i = 0; i < vec.Length; i++)
-                    idx = FlattenArrayContents(vec[i], items, idx, rank - 1);
-            }
-            else
-            {
-                var cur = contents;
-                while (cur is Cons c) { idx = FlattenArrayContents(c.Car, items, idx, rank - 1); cur = c.Cdr; }
-            }
-        }
-        return idx;
     }
 
     internal LispObject ReadShareLabel(int label)
@@ -1735,6 +1721,14 @@ public class Reader
                 int next = Peek();
                 if (next == -1 || IsTerminating(next)) break;
                 ReadChar();
+                if (next == '\\')
+                {
+                    // A single escape inside the name: the next character is taken literally.
+                    int escaped = ReadChar();
+                    if (escaped == -1) throw MakeEndOfFileError("Unexpected end of input in character literal");
+                    sb.Append((char)escaped);
+                    continue;
+                }
                 sb.Append((char)next);
             }
             firstName = sb.ToString();
@@ -1746,6 +1740,11 @@ public class Reader
         }
 
         if (_readSuppress) return Nil.Instance;
+
+        // Whitespace that ends the name ends the token: READ discards it, as after a symbol.
+        int after = Peek();
+        if (after == ' ' || after == '\n' || after == '\t' || after == '\r' || after == '\f')
+            WhitespaceTerminated = true;
 
         // The character name is the single constituent token in firstName (read up to
         // the first whitespace/terminator/EOF, which was only peeked: not consumed).
@@ -1833,6 +1832,9 @@ public class Reader
         int colonPos = token.FindUnescapedColon();
         if (colonPos > 0)
             throw MakeReaderError("Uninterned symbol contains a package marker");
+        // A token that reads as a number is not a symbol name (SBCL: reader error).
+        if (!token.HasEscaped && IsPlainInteger(token.ToString(), GetReadBase()))
+            throw MakeReaderError("#: needs a symbol name, not the integer " + token);
         return new Symbol(token.ToString());
     }
 
@@ -1843,10 +1845,30 @@ public class Reader
         var pkgSym = Startup.Sym("*PACKAGE*");
         DynamicBindings.Push(pkgSym, Package.FindPackage("KEYWORD")!);
         LispObject feature;
+        // The expression is read for real even inside a skipped form (it is evaluated there too).
+        var suppressedOuter = _readSuppress;
+        var rsOuterSym = Startup.Sym("*READ-SUPPRESS*");
+        if (suppressedOuter) { _readSuppress = false; DynamicBindings.Push(rsOuterSym, Nil.Instance); }
         try { feature = Read(); }
-        finally { DynamicBindings.Pop(pkgSym); }
-        // Inside a form that is being skipped the expression is not evaluated, so not checked.
-        bool hasFeature = !_readSuppress && EvaluateFeature(feature, true);
+        finally
+        {
+            DynamicBindings.Pop(pkgSym);
+            if (suppressedOuter) { DynamicBindings.Pop(rsOuterSym); _readSuppress = true; }
+        }
+        // Inside a form that is being skipped the expression is still evaluated, as in SBCL, so a
+        // nested #+ / #- tells whether it yields a form (a true test: the skipped form is that
+        // form) or nothing (a false test: the reader goes on to the next object, which is skipped
+        // too). Only the result matters there: nothing is recorded, and a malformed expression
+        // counts as false.
+        bool hasFeature;
+        if (suppressedOuter)
+        {
+            var savedLenient = _featureLenient;
+            _featureLenient = true;
+            try { hasFeature = EvaluateFeature(feature, false); }
+            finally { _featureLenient = savedLenient; }
+        }
+        else hasFeature = EvaluateFeature(feature, true);
         bool shouldInclude = positive ? hasFeature : !hasFeature;
 
         if (shouldInclude)
@@ -1872,6 +1894,15 @@ public class Reader
     ///   (AND f1 f2..) -> all sub-features match
     ///   (NOT f)       -> sub-feature does not match
     /// </summary>
+    // Inside a skipped form a malformed feature expression is not an error: it is false, quietly
+    // (a condition would be signalled before any catch could see it).
+    private bool _featureLenient;
+    private bool FeatureError(string message)
+    {
+        if (_featureLenient) return false;
+        throw MakeReaderError(message);
+    }
+
     private bool EvaluateFeature(LispObject feature, bool record = false)
     {
         if (feature is Symbol sym)
@@ -1910,7 +1941,7 @@ public class Reader
         // operand (an implementation's own operator behind a feature test) is not an error.
         if (feature is Cons cons && cons.Car is Symbol op)
         {
-            var name = op.Name.ToUpperInvariant();
+            var name = CharCase.SimpleUpper(op.Name);
             switch (name)
             {
                 case "OR":
@@ -1921,7 +1952,7 @@ public class Reader
                         if (EvaluateFeature(c.Car, record)) return true;
                         rest = c.Cdr;
                     }
-                    if (rest is not Nil) throw MakeReaderError($"Malformed feature expression: {feature}");
+                    if (rest is not Nil) return FeatureError($"Malformed feature expression: {feature}");
                     return false;
                 }
                 case "AND":
@@ -1932,20 +1963,20 @@ public class Reader
                         if (!EvaluateFeature(c.Car, record)) return false;
                         rest = c.Cdr;
                     }
-                    if (rest is not Nil) throw MakeReaderError($"Malformed feature expression: {feature}");
+                    if (rest is not Nil) return FeatureError($"Malformed feature expression: {feature}");
                     return true;
                 }
                 case "NOT":
                 {
                     if (cons.Cdr is Cons nc && nc.Cdr is Nil)
                         return !EvaluateFeature(nc.Car, record);
-                    throw MakeReaderError($"Malformed feature expression: (NOT) takes exactly one operand: {feature}");
+                    return FeatureError($"Malformed feature expression: (NOT) takes exactly one operand: {feature}");
                 }
             }
-            throw MakeReaderError($"Unknown operator {op.Name} in feature expression {feature}");
+            return FeatureError($"Unknown operator {op.Name} in feature expression {feature}");
         }
 
-        throw MakeReaderError($"Malformed feature expression: {feature}");
+        return FeatureError($"Malformed feature expression: {feature}");
     }
 
     internal LispObject ReadComplex()
@@ -2202,13 +2233,13 @@ public class Reader
                 if (j == n) { result = Fixnum.Make(neg ? -v : v); return true; }
             }
         }
-        var upper = token.ToUpperInvariant();
+        var upper = CharCase.SimpleUpper(token);
 
         // Trailing dot means integer in CL (e.g., "10." = 10)
         // Per CLHS, trailing dot forces base 10 interpretation
         if (upper.Length > 1 && upper[^1] == '.' && IsAllDigitsInBase(upper[..^1], 10))
         {
-            if (BigInteger.TryParse(upper[..^1], out var iv))
+            if (BigInteger.TryParse(upper[..^1], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var iv))
             {
                 result = (Number)Bignum.MakeInteger(iv);
                 return true;
@@ -2300,6 +2331,20 @@ public class Reader
         return true;
     }
 
+    // An optional sign and digits of the radix, nothing else (a trailing dot, a ratio and a float
+    // stay symbols after #:, as in SBCL).
+    private static bool IsPlainInteger(string s, int radix)
+    {
+        int i = (s.Length > 0 && (s[0] == '+' || s[0] == '-')) ? 1 : 0;
+        if (i >= s.Length) return false;
+        for (; i < s.Length; i++)
+        {
+            int dv = DigitValue(s[i]);
+            if (dv < 0 || dv >= radix) return false;
+        }
+        return true;
+    }
+
     private static int GetReadBase()
     {
         var readBaseSym = Startup.Sym("*READ-BASE*");
@@ -2375,7 +2420,21 @@ public class Reader
         if (!hasExplicitMarker)
             isDouble = IsDefaultFloatDouble();
 
-        if (double.TryParse(normalized.ToString(), System.Globalization.NumberStyles.Float,
+        // A single-float is parsed straight to a float: going through a double first
+        // rounds twice, and a decimal just above a halfway point lands on the tie
+        // and then rounds to even, the wrong way.
+        if (!isDouble
+            && float.TryParse(normalized.ToString(), System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var fv))
+        {
+            if (float.IsInfinity(fv))
+                throw MakeReaderError($"Float overflow in token: {token}");
+            result = new SingleFloat(fv);
+            return true;
+        }
+
+        if (isDouble
+            && double.TryParse(normalized.ToString(), System.Globalization.NumberStyles.Float,
                 System.Globalization.CultureInfo.InvariantCulture, out var dv))
         {
             result = MakeFloatOrThrow(dv, isDouble, token);
@@ -2433,6 +2492,15 @@ public class Reader
     // TOKENSTR: the token's string when the caller already built it (READ-ATOM
     // needs it for number parsing), so the unqualified-symbol path does not build
     // the same string a second time for every symbol read.
+    /// <summary>Is there an unescaped package marker at or after FROM? A symbol token has at most one
+    /// marker or two adjacent ones (CLHS 2.3.5), so one after the name started is a reader error.</summary>
+    private static bool HasUnescapedColonFrom(Token token, int from)
+    {
+        for (int i = from; i < token.Length; i++)
+            if (token.Chars[i].Ch == ':' && !token.Chars[i].Escaped) return true;
+        return false;
+    }
+
     private LispObject ParseSymbol(Token token, string? tokenStr = null)
     {
         // Find first unescaped colon
@@ -2445,6 +2513,12 @@ public class Reader
             int nameStart = 1;
             if (nameStart < token.Length && token.Chars[nameStart].Ch == ':' && !token.Chars[nameStart].Escaped)
                 nameStart = 2; // skip second colon in ::NAME
+            if (HasUnescapedColonFrom(token, nameStart))
+                throw MakeReaderError("too many colons in token");
+            // Nothing at all after the marker (not even an escape): CLHS 2.3.5 makes a token
+            // that ends in a package marker a reader error. :|| is a name, the empty one.
+            if (nameStart == token.Length && !token.HasEscaped)
+                throw MakeReaderError("illegal terminating character after a colon");
             var name = token.Substring(nameStart);
             return Startup.Keyword(name);
         }
@@ -2459,9 +2533,13 @@ public class Reader
                 && token.Chars[colonPos + 1].Ch == ':'
                 && !token.Chars[colonPos + 1].Escaped;
 
+            if (HasUnescapedColonFrom(token, isInternal ? colonPos + 2 : colonPos + 1))
+                throw MakeReaderError("too many colons in token");
             var symName = isInternal
                 ? token.Substring(colonPos + 2)
                 : token.Substring(colonPos + 1);
+            if (colonPos + (isInternal ? 2 : 1) == token.Length && !token.HasEscaped)
+                throw MakeReaderError("illegal terminating character after a colon");
 
             // Resolve package: check local nicknames of *package* first (CDR 5)
             var starPkgForNick = DynamicBindings.Get(Startup.Sym("*PACKAGE*"));
@@ -2472,7 +2550,7 @@ public class Reader
                 if (_readSuppress)
                     return new Symbol(symName); // dummy uninterned symbol
             {
-                var perr = new LispError($"Package \"{pkgName}\" not found");
+                var perr = new LispError($"Package \"{pkgName}\" not found{ModuleHintForPackage(pkgName)}");
                 perr.ConditionTypeName = "READER-PACKAGE-ERROR";
                 perr.PackageRef = new LispString(pkgName);
                 if (LispStreamRef != null) perr.StreamErrorStreamRef = LispStreamRef;
@@ -2504,9 +2582,13 @@ public class Reader
                 var (sym, status) = pkg.FindSymbol(symName);
                 if (status == SymbolStatus.External)
                     return Runtime.CanonicalizeSymbol(sym);
+                // Every symbol of the KEYWORD package is external, so KEYWORD:NAME
+                // interns it, as :NAME does.
+                if (pkg.Name == "KEYWORD")
+                    return Runtime.CanonicalizeSymbol(pkg.Intern(symName).Item1);
                 // Not external: signal error per spec (B7)
                 if (_readSuppress) return new Symbol(symName);
-                var xerr = new LispError($"Symbol \"{symName}\" is not external in package \"{pkgName}\"");
+                var xerr = new LispError($"Symbol \"{symName}\" is not external in package \"{pkgName}\"{ModuleHintForSymbol(pkg.Name, symName)}");
                 xerr.ConditionTypeName = "READER-PACKAGE-ERROR";
                 xerr.PackageRef = new LispString(pkg.Name);
                 if (LispStreamRef != null) xerr.StreamErrorStreamRef = LispStreamRef;
@@ -2596,7 +2678,7 @@ public class Reader
             if (ch == -1) throw MakeEndOfFileError($"EOF in {dispChar} dispatch");
         }
 
-        var subChar = char.ToUpperInvariant((char)ch);
+        var subChar = CharCase.SimpleUpper((char)ch);
         var fn = rt.GetDispatchMacroCharacter(dispChar, subChar);
         if (fn != null)
             return fn(this, (char)ch, numArg);
@@ -2664,7 +2746,7 @@ public class Reader
         rt.SetDispatchMacroCharacter('#', '+', (r, c, n) => r.ReadFeature(true));
         rt.SetDispatchMacroCharacter('#', '-', (r, c, n) => r.ReadFeature(false));
         rt.SetDispatchMacroCharacter('#', '|', (r, c, n) => r.ReadBlockComment());
-        rt.SetDispatchMacroCharacter('#', 'A', (r, c, n) => r.ReadArrayLiteral(n >= 0 ? n : 1));
+        rt.SetDispatchMacroCharacter('#', 'A', (r, c, n) => r.ReadArrayLiteral(n));
         rt.SetDispatchMacroCharacter('#', 'B', (r, c, n) => r.ReadRadixNumber(2));
         rt.SetDispatchMacroCharacter('#', 'C', (r, c, n) => r.ReadComplex());
         rt.SetDispatchMacroCharacter('#', 'O', (r, c, n) => r.ReadRadixNumber(8));

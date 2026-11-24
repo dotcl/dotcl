@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; FRESH-LINE after PRINT / PRIN1 / PRINC / WRITE / PPRINT starts a new line.
 ;;;
 ;;; Bug: FRESH-LINE decides from a per-stream "at line start" flag, and only

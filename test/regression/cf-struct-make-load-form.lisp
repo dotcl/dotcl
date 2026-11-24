@@ -25,7 +25,7 @@
 (defmacro csmlf-table () `',*csmlf-table*)
 
 (deftest-compiled-only cf-struct-make-load-form.creation-at-load
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "csmlf.lisp" dir))
          (fasl (merge-pathnames "csmlf.fasl" dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The interpreter's SYMBOL-MACROLET marker must never reach user code.
 ;;;
 ;;; %MINI-EVAL treats an ENV value shaped (<marker> expansion) as a

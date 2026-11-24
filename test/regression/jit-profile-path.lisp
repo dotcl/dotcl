@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Where the multi-core JIT profile is written.
 ;;;
 ;;; The runtime writes a profile of the methods a run compiles, and reads it

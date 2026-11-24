@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; (if c a b) has an integer range when both arms do: the union of the two.
 ;;;
 ;;; Whether integer arithmetic may be computed in raw int64 is decided in three

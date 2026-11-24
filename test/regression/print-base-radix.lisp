@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; An out-of-range print base is a TYPE-ERROR naming the value.
 ;;;
 ;;; The radix check threw ArgumentException, which the CLR-exception mapping

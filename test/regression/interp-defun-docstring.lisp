@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; An interpreted DEFUN must record its docstring.
 ;;;
 ;;; COMPILE-DEFUN emits (setf documentation) for it; the %MINI-EVAL DEFUN case did

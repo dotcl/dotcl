@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A declaimed float return type reaches the native float arithmetic.
 ;;;
 ;;; (declaim (ftype (function (...) double-float) f)) is a promise that every

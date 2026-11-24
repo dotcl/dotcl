@@ -22,7 +22,7 @@
   `(make-cfds-custom :n ,(1+ (cfds-custom-n s))))
 
 (defun %cfds-compile (name forms)
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames (format nil "~a.lisp" name) dir))
          (fasl (merge-pathnames (format nil "~a.fasl" name) dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)
@@ -113,7 +113,7 @@
 ")
 
 (defun %cfds-child-run ()
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (namestring (merge-pathnames "cfdx.lisp" dir)))
          (fasl (namestring (merge-pathnames "cfdx.fasl" dir)))
          (exe (dotnet:static "System.Environment" "ProcessPath"))

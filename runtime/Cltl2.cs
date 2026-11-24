@@ -29,7 +29,9 @@ public static class Cltl2
         foreach (var n in new[] {
             "COMPILER-LET", "VARIABLE-INFORMATION", "FUNCTION-INFORMATION",
             "DECLARATION-INFORMATION", "AUGMENT-ENVIRONMENT", "DEFINE-DECLARATION",
-            "PARSE-MACRO", "ENCLOSE", "MACROEXPAND-ALL" })
+            "PARSE-MACRO", "ENCLOSE", "MACROEXPAND-ALL",
+            "MAP-ENVIRONMENT-VARIABLES", "MAP-ENVIRONMENT-FUNCTIONS",
+            "MAP-ENVIRONMENT-BLOCKS", "MAP-ENVIRONMENT-TAGS" })
         {
             var (s, _) = Cltl2Pkg.Intern(n);
             Cltl2Pkg.Export(s);
@@ -43,6 +45,10 @@ public static class Cltl2
         Reg("PARSE-MACRO", -1, ParseMacro);
         Reg("ENCLOSE", -1, Enclose);
         Reg("MACROEXPAND-ALL", -1, MacroexpandAll);
+        Reg("MAP-ENVIRONMENT-VARIABLES", -1, args => MapEnvironment("MAP-ENVIRONMENT-VARIABLES", "%CLTL2-MAP-VARIABLES", args));
+        Reg("MAP-ENVIRONMENT-FUNCTIONS", -1, args => MapEnvironment("MAP-ENVIRONMENT-FUNCTIONS", "%CLTL2-MAP-FUNCTIONS", args));
+        Reg("MAP-ENVIRONMENT-BLOCKS", -1, args => MapEnvironment("MAP-ENVIRONMENT-BLOCKS", "%CLTL2-MAP-BLOCKS", args));
+        Reg("MAP-ENVIRONMENT-TAGS", -1, args => MapEnvironment("MAP-ENVIRONMENT-TAGS", "%CLTL2-MAP-TAGS", args));
     }
 
     /// <summary>(macroexpand-all form &amp;optional env). The walker itself is
@@ -59,6 +65,21 @@ public static class Cltl2
                  ?? throw new LispErrorException(new LispError(
                      "MACROEXPAND-ALL: the code walker is not loaded"));
         return fn.Invoke(new[] { args[0], args.Length > 1 ? args[1] : Nil.Instance });
+    }
+
+    /// <summary>(map-environment-variables function env) and
+    /// (map-environment-functions function env), (map-environment-blocks function env)
+    /// and (map-environment-tags function env): call FUNCTION on what the
+    /// lexical environment ENV binds. An environment without the compiler's
+    /// lexical state (NIL, or no compiler loaded) binds nothing: NIL.</summary>
+    private static LispObject MapEnvironment(string name, string hookName, LispObject[] args)
+    {
+        if (args.Length != 2)
+            throw new LispErrorException(new LispProgramError(
+                $"{name}: wrong number of arguments: {args.Length} (expected 2)"));
+        if (args[1] is Nil || CompilerFunction(hookName) is not LispFunction hook)
+            return Nil.Instance;
+        return hook.Invoke(new[] { args[0], args[1] });
     }
 
     private static LispFunction Reg(string name, int arity, Func<LispObject[], LispObject> fn)

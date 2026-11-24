@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A non-local exit out of deep interpreted recursion must not kill the process.
 ;;;
 ;;; The tree-walk evaluator wraps every interpreted call in a BLOCK, which it runs

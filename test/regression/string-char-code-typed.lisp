@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; (CHAR-CODE (SCHAR s i)) reads the code directly.
 ;;;
 ;;; Written the ordinary way, that composition cost a full generic call per

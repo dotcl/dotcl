@@ -2,8 +2,9 @@
 
 From an empty machine to a Common Lisp executable you can hand to someone
 else. Every command below was run as written; the output quoted under each
-one is the real output from a released dotcl (0.1.28). A build from source
-reports version 0.0.0 instead.
+one is the real output from a released dotcl; version numbers in it (shown as
+`<version>` where they are not the point) are those of whichever release you install.
+A build from source reports the last release plus the commits since, such as `0.1.37+120.g8047508`.
 
 Along the way: install dotcl, create a project from a template, run it, add a
 library to it, and publish a standalone `.exe`.
@@ -39,7 +40,7 @@ Three ways. Pick one; (a) is the shortest.
 ```console
 $ dotnet tool install --global dotcl
 You can invoke the tool using the following command: dotcl
-Tool 'dotcl' (version '0.1.28') was successfully installed.
+Tool 'dotcl' (version '<version>') was successfully installed.
 ```
 
 `--global` puts it on `PATH` (`~/.dotnet/tools`). To keep it out of the way,
@@ -50,7 +51,7 @@ Check it:
 
 ```console
 $ dotcl --eval "(format t \"hello, ~a ~a~%\" (lisp-implementation-type) (lisp-implementation-version))"
-hello, dotcl 0.1.28
+hello, dotcl <version>
 
 $ dotcl repl
 dotcl REPL. Ctrl+D to exit.
@@ -103,11 +104,11 @@ runtime, the core image and the bundled contrib tree, already compiled
 ahead-of-time for that RID. This is the route Roswell users take.
 
 ```console
-$ curl -sLO https://github.com/dotcl/dotcl/releases/download/v0.1.28/dotcl-win-arm64-0.1.28.tar.bz2
-$ ls -l dotcl-win-arm64-0.1.28.tar.bz2
--rw-r--r-- 1 ... 13046308 ... dotcl-win-arm64-0.1.28.tar.bz2
+$ curl -sLO https://github.com/dotcl/dotcl/releases/download/v<version>/dotcl-win-arm64-<version>.tar.bz2
+$ ls -l dotcl-win-arm64-<version>.tar.bz2
+-rw-r--r-- 1 ... 13046308 ... dotcl-win-arm64-<version>.tar.bz2
 
-$ mkdir dotcl && tar -xjf dotcl-win-arm64-0.1.28.tar.bz2 -C dotcl
+$ mkdir dotcl && tar -xjf dotcl-win-arm64-<version>.tar.bz2 -C dotcl
 $ ls dotcl
 DotCL.Runtime.dll  contrib  dotcl.core  runtime.deps.json
 runtime.dll  runtime.exe  runtime.runtimeconfig.json
@@ -118,7 +119,7 @@ and it takes the same arguments the `dotcl` tool does:
 
 ```console
 $ dotcl/runtime.exe --eval "(format t \"~a ~a on ~a~%\" (lisp-implementation-type) (lisp-implementation-version) (software-type))"
-dotcl 0.1.28 on Microsoft Windows 10.0.26200
+dotcl <version> on Microsoft Windows 10.0.26200
 ```
 
 13 MB to download, 47 MB unpacked. The archive is framework-dependent: it
@@ -168,7 +169,7 @@ The templates ship as their own package:
 
 ```console
 $ dotnet new install DotCL.Templates
-Success: DotCL.Templates@0.1.28 installed the following templates:
+Success: DotCL.Templates@<version> installed the following templates:
 Template Name              Short Name      Language     Tags
 -------------------------  --------------  -----------  ---------------------------
 Common Lisp Class Library  dotcl-classlib  Common Lisp  Library/Windows/Linux/macOS
@@ -210,7 +211,7 @@ reference and one property:
 </PropertyGroup>
 
 <ItemGroup>
-  <PackageReference Include="DotCL.Runtime" Version="0.1.28" />
+  <PackageReference Include="DotCL.Runtime" Version="<version>" />
 </ItemGroup>
 ```
 

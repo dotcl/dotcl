@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The compiler recognises a set of internal lowering targets by SYMBOL-NAME
 ;;; (%MAKE-PACKAGE, %PACKAGE-EXPORT, %SET-ELT, ...: the forms DEFPACKAGE, the
 ;;; package functions and the SETF expanders macroexpand into) and emits a direct

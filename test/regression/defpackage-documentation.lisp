@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; DEFPACKAGE's :DOCUMENTATION option must reach the package object.
 ;;; SBCL's genesis copies each target package's docstring from the host package
 ;;; of the same name, so dropping it here loses package documentation in an

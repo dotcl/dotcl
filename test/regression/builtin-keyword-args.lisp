@@ -5,6 +5,10 @@
 ;;; function in the lambda list tables. Uses CL-LL-SHAPE from
 ;;; cl-builtin-lambda-lists.lisp.
 
+;; This file uses CL-LL-SHAPE and its neighbours from cl-builtin-lambda-lists.lisp; load it when run alone.
+(unless (fboundp 'cl-ll-shape)
+  (load "test/regression/cl-builtin-lambda-lists.lisp"))
+
 (defclass kwargs-c () ((a :initarg :a)))
 (defclass kwargs-d () ((a :initarg :a)))
 

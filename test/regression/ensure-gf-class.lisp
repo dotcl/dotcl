@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; ENSURE-GENERIC-FUNCTION honours :GENERIC-FUNCTION-CLASS (a class name or a
 ;;; class) when it creates the generic function, and refuses to change the
 ;;; class of an existing one instead of silently keeping the old class.

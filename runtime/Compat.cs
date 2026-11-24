@@ -228,9 +228,9 @@ internal static class Compat
     public static bool TryParseInt(ReadOnlySpan<char> s, out int value)
     {
 #if NETSTANDARD2_0
-        return int.TryParse(s.ToString(), out value);
+        return int.TryParse(s.ToString(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out value);
 #else
-        return int.TryParse(s, out value);
+        return int.TryParse(s, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out value);
 #endif
     }
     /// <summary>RUNTIMEINFORMATION.RUNTIMEIDENTIFIER is net5.0+. netstandard2.0 has
@@ -544,7 +544,7 @@ internal static class Compat
     private static ulong ReadSoftStackBytes()
     {
         var env = Environment.GetEnvironmentVariable("DOTCL_STACK_LIMIT_MB");
-        if (env != null && ulong.TryParse(env, out var mb)) return mb * 1024UL * 1024UL;
+        if (env != null && ulong.TryParse(env, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var mb)) return mb * 1024UL * 1024UL;
         return 144UL * 1024UL * 1024UL;
     }
 

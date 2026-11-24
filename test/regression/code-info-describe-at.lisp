@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; dotcl-code-info:describe-at -- what the name under the cursor is.
 ;;;
 ;;; The same positions completion and documentation-url work from, answered

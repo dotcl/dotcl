@@ -112,6 +112,16 @@ public partial class CilAssembler
             _cachedLiteralDepth++;
             try { EmitLoadConstInlineBody(val); }
             finally { _cachedLiteralDepth--; }
+#if NET9_0_OR_GREATER
+            bool inLibrary = LibraryAbiIL.Active;
+#else
+            bool inLibrary = false;
+#endif
+            if (!inLibrary && FaslData.IsCoalescibleLiteral(val))
+            {
+                _il.Emit(OpCodes.Ldsflda, _faslStructMap.CoalesceTableField());
+                _il.Emit(OpCodes.Call, typeof(FaslData).GetMethod("CoalesceLiteral")!);
+            }
             _il.Emit(OpCodes.Dup);
             _il.Emit(OpCodes.Stsfld, field);
             _il.MarkLabel(done);
@@ -139,6 +149,7 @@ public partial class CilAssembler
         public SharedLiteralMemo(LispObject root, HashSet<LispObject> shared) { Root = root; Shared = shared; }
     }
     private SharedLiteralMemo? _sharedMemo;
+    private int _memoFallbackDepth;
 
     /// <summary>The identity-carrying objects that occur in more than one
     /// literal (LOAD-CONST operand) of one top level form's instructions,
@@ -154,7 +165,8 @@ public partial class CilAssembler
     /// below it comes with it. <paramref name="roots"/> gets the literals that
     /// contain a shared object, on both sides.</summary>
     internal static Dictionary<LispObject, System.Reflection.Emit.FieldBuilder?> CollectCrossLiteralNodes(
-        LispObject instrList, out HashSet<LispObject> roots)
+        LispObject instrList, out HashSet<LispObject> roots,
+        IReadOnlyDictionary<LispObject, int>? alreadyShared = null)
     {
         var shared = new Dictionary<LispObject, System.Reflection.Emit.FieldBuilder?>(
             ReferenceEqualityComparer.Instance);
@@ -185,17 +197,21 @@ public partial class CilAssembler
         var st = new Stack<LispObject>();
         var instanceRoots = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
         var work = new List<LispObject>(literals);
-        foreach (var lit in literals) if (lit is LispInstance) instanceRoots.Add(lit);
+        foreach (var lit in literals) if (IsMakeLoadFormObject(lit)) instanceRoots.Add(lit);
         for (int w = 0; w < work.Count; w++)
         {
             var root = work[w];
             var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
-            if (root is LispInstance rootInstance)
+            if (IsMakeLoadFormObject(root))
             {
-                foreach (var sl in rootInstance.Slots) if (sl is LispObject so) st.Push(so);
+                foreach (var sl in MakeLoadFormObjectSlots(root)) if (sl is LispObject so) st.Push(so);
+                PushLoadFormParts(root, st);
             }
             else
+            {
                 st.Push(root);
+                if (root is LispStruct) PushLoadFormParts(root, st);
+            }
             while (st.Count > 0)
             {
                 var node = st.Pop();
@@ -208,6 +224,15 @@ public partial class CilAssembler
                     continue;
                 }
                 owner[node] = root;
+                // An object an earlier form of this file already shared (it sits in a slot
+                // of the shared array, and an instance made earlier holds it there): it is
+                // shared here too, even if this form contains it once.
+                if (alreadyShared != null && alreadyShared.ContainsKey(node))
+                {
+                    shared[node] = null;
+                    roots.Add(root);
+                    continue;
+                }
                 switch (node)
                 {
                     case Cons cc: st.Push(cc.Cdr); st.Push(cc.Car); break;
@@ -216,6 +241,13 @@ public partial class CilAssembler
                             for (int i = v.Length - 1; i >= 0; i--) st.Push(v.ElementAt(i));
                         break;
                     case LispStruct ls:
+                        // A structure the fasl makes by MAKE-LOAD-FORM is built apart from the literal that
+                        // holds it, like an instance: its slots are a root of their own.
+                        if (!StructBuiltFromSlots(ls))
+                        {
+                            if (instanceRoots.Add(ls)) work.Add(ls);
+                            break;
+                        }
                         foreach (var sl in ls.SlotsSnapshot()) if (sl is LispObject so) st.Push(so);
                         break;
                     case LispHashTable ht:
@@ -223,7 +255,7 @@ public partial class CilAssembler
                         // instances are copies of one prototype the fasl keeps (see HtPrototypePart), and
                         // making each build its entries in full for the sake of objects they share would
                         // undo that.
-                        if (root is not LispInstance)
+                        if (!IsMakeLoadFormObject(root))
                             foreach (var kv in ht.Entries) { st.Push(kv.Value); st.Push(kv.Key); }
                         break;
                     case LispInstance li:
@@ -233,7 +265,94 @@ public partial class CilAssembler
                 }
             }
         }
+
+        // An object that a shared object contains and that is reached again outside it (or inside another
+        // shared object) is shared as well. Building the container is skipped when its slot is already
+        // filled, as a load of a cached fasl finds it after the data of an instance has filled it, and a
+        // field kept for the inner object by the build then stays unset for the later reads.
+        // Repeat until nothing new turns up: a newly shared object changes what lies inside it.
+        for (bool grew = true; grew; )
+        {
+            grew = false;
+            foreach (var root in work)
+            {
+                var ctxOf = new Dictionary<LispObject, LispObject?>(ReferenceEqualityComparer.Instance);
+                var stack = new Stack<(LispObject Node, LispObject? Ctx)>();
+                if (IsMakeLoadFormObject(root))
+                {
+                    foreach (var sl in MakeLoadFormObjectSlots(root)) if (sl is LispObject so) stack.Push((so, null));
+                    var parts = new Stack<LispObject>();
+                    PushLoadFormParts(root, parts);
+                    foreach (var pp in parts) stack.Push((pp, null));
+                }
+                else
+                {
+                    stack.Push((root, null));
+                    if (root is LispStruct)
+                    {
+                        var parts = new Stack<LispObject>();
+                        PushLoadFormParts(root, parts);
+                        foreach (var pp in parts) stack.Push((pp, null));
+                    }
+                }
+                while (stack.Count > 0)
+                {
+                    var (node, ctx) = stack.Pop();
+                    if (!HasLiteralIdentity(node)) continue;
+                    if (ctxOf.TryGetValue(node, out var prev))
+                    {
+                        if (!ReferenceEquals(prev, ctx) && !IsMakeLoadFormObject(node) && !shared.ContainsKey(node))
+                        {
+                            shared[node] = null;
+                            roots.Add(root);
+                            grew = true;
+                        }
+                        continue;
+                    }
+                    ctxOf[node] = ctx;
+                    var inner = shared.ContainsKey(node) ? node : ctx;
+                    switch (node)
+                    {
+                        case Cons cc: stack.Push((cc.Cdr, inner)); stack.Push((cc.Car, inner)); break;
+                        case LispVector v:
+                            if (v.ElementTypeName == "T")
+                                for (int i = v.Length - 1; i >= 0; i--) stack.Push((v.ElementAt(i), inner));
+                            break;
+                        case LispStruct ls:
+                            if (!StructBuiltFromSlots(ls)) break;
+                            foreach (var sl in ls.SlotsSnapshot()) if (sl is LispObject so) stack.Push((so, inner));
+                            break;
+                        case LispHashTable ht:
+                            if (!IsMakeLoadFormObject(root))
+                                foreach (var kv in ht.Entries) { stack.Push((kv.Value, inner)); stack.Push((kv.Key, inner)); }
+                            break;
+                    }
+                }
+            }
+        }
         return shared;
+    }
+
+    /// <summary>An object the fasl makes by running its MAKE-LOAD-FORM creation form apart from the
+    /// literal that holds it: an instance, or a structure that is not rebuilt from its slots.</summary>
+    private static bool IsMakeLoadFormObject(LispObject o) =>
+        o is LispInstance || (o is LispStruct ls && !StructBuiltFromSlots(ls));
+
+    private static IEnumerable<LispObject?> MakeLoadFormObjectSlots(LispObject o) =>
+        o is LispInstance li ? li.Slots : ((LispStruct)o).SlotsSnapshot();
+
+    private static void PushLoadFormParts(LispObject root, Stack<LispObject> st)
+    {
+        var mlfSym = Startup.Sym("MAKE-LOAD-FORM");
+        if (mlfSym?.Function == null) return;
+        LispObject raw;
+        try { raw = CallMakeLoadForm(mlfSym.Function, root); } catch { return; }
+        if (raw is MvReturn mv)
+        {
+            if (mv.Count > 0 && mv[0] is not Nil) st.Push(mv[0]);
+            if (mv.Count > 1 && mv[1] is not Nil) st.Push(mv[1]);
+        }
+        else if (raw is not Nil) st.Push(raw);
     }
 
     private void EmitLoadConstInlineBody(LispObject val)
@@ -284,6 +403,26 @@ public partial class CilAssembler
             {
                 if (memo.Fields.TryGetValue(val, out var f))
                 {
+                    if ((val is LispInstance || val is LispStruct) && _memoFallbackDepth < 3)
+                    {
+                        _memoFallbackDepth++;
+                        // The field is set where the instance was first met, and that place can be code
+                        // that did not run (a container whose slot was already filled): look the instance
+                        // up again by its key, which is the same object.
+                        var have = _il.DefineLabel();
+                        _il.Emit(OpCodes.Ldsfld, f);
+                        _il.Emit(OpCodes.Dup);
+                        _il.Emit(OpCodes.Brtrue, have);
+                        _il.Emit(OpCodes.Pop);
+                        memo.Building.Add(val);
+                        try { EmitLoadConstInlineBodyCore(val); }
+                        finally { memo.Building.Remove(val); }
+                        _il.Emit(OpCodes.Dup);
+                        _il.Emit(OpCodes.Stsfld, f);
+                        _il.MarkLabel(have);
+                        _memoFallbackDepth--;
+                        return;
+                    }
                     _il.Emit(OpCodes.Ldsfld, f);
                     return;
                 }
@@ -382,6 +521,8 @@ public partial class CilAssembler
             return;
         }
         _constNodes++;
+        // A cyclic part of a larger literal is built by the reader as a whole.
+        if (_inlineDepth > 1 && EmitCyclicLiteral(val)) return;
         // A circular constant literal (e.g. '#1=(1 2 3 . #1#)) cannot be rebuilt by
         // the naive cons-by-cons inline emitter: the cdr-flatten loop spins on the
         // cycle and OOMs. Shared (acyclic but #N=-coalesced) structure rebuilds but
@@ -403,13 +544,8 @@ public partial class CilAssembler
                 ConstantIsReaderSafe(val, out _);
                 Console.Error.WriteLine($"#CENSUS-KIND {kind}");
             }
-            if (kind == ConstGraphKind.Cyclic)
-            {
-                if (!TryEmitConstantViaReader(val))
-                    throw new LispErrorException(new LispProgramError(
-                        "compile-file: cannot emit a circular constant that is not printably readable"));
+            if (kind == ConstGraphKind.Cyclic && EmitCyclicLiteral(val))
                 return;
-            }
             // A literal of plain data is rebuilt from a data payload (see
             // FaslData) instead of by IL that is JIT-compiled to run once.
             // Unlike the reader route it takes instances (by their
@@ -456,7 +592,7 @@ public partial class CilAssembler
                 return;
             }
             // Too deep: fallback to constant pool (same process only)
-            EmitConstantAs(AddConstant(val), typeof(LispObject));
+            EmitConstantAs(AddDataConstant(val), typeof(LispObject));
             return;
         }
         switch (val)
@@ -539,7 +675,12 @@ public partial class CilAssembler
                 // Flatten proper list to avoid deep CDR recursion
                 var cars = new List<LispObject>();
                 LispObject tail = cons;
-                while (tail is Cons c) { cars.Add(c.Car); tail = c.Cdr; }
+                while (tail is Cons c)
+                {
+                    if (!ReferenceEquals(c, cons) && IsSharedInlineNode(c)) break;
+                    cars.Add(c.Car);
+                    tail = c.Cdr;
+                }
                 if (_faslMode && _faslTypeBuilder != null && cars.Count > MaxInlineListChunk)
                 {
                     EmitFaslChunkedList(cars, tail);
@@ -685,7 +826,7 @@ public partial class CilAssembler
                 if (!_inlineVisited.Add(ls))
                 {
                     // Circular reference: fall back to constant pool
-                    EmitConstantAs(AddConstant(val), typeof(LispObject));
+                    EmitConstantAs(AddDataConstant(val), typeof(LispObject));
                     break;
                 }
                 try
@@ -767,7 +908,7 @@ public partial class CilAssembler
                     }
                     else
                     {
-                        EmitConstantAs(AddConstant(val), typeof(LispObject));
+                        EmitConstantAs(AddDataConstant(val), typeof(LispObject));
                     }
                     break;
                 }
@@ -805,7 +946,7 @@ public partial class CilAssembler
                 else
                 {
                     // Anonymous function: fall back to constant pool
-                    EmitConstantAs(AddConstant(val), typeof(LispObject));
+                    EmitConstantAs(AddDataConstant(val), typeof(LispObject));
                 }
                 break;
             }
@@ -823,6 +964,17 @@ public partial class CilAssembler
                 _il.Emit(OpCodes.Castclass, typeof(LispObject));
                 break;
             }
+            case LispInstanceCondition lic when _faslMode && _faslTypeBuilder != null:
+            {
+                // A condition object is a thin wrapper over a CLOS instance: dump
+                // the instance through the make-load-form protocol and re-wrap it.
+                EmitFaslInstanceInline(lic.Instance);
+                _il.Emit(OpCodes.Castclass, typeof(LispInstance));
+                _il.Emit(OpCodes.Newobj, typeof(LispInstanceCondition).GetConstructor(
+                    new[] { typeof(LispInstance) })!);
+                _il.Emit(OpCodes.Castclass, typeof(LispObject));
+                break;
+            }
             case LispInstance li:
             {
                 if (_faslMode && _faslTypeBuilder != null)
@@ -830,7 +982,7 @@ public partial class CilAssembler
                 else
                 {
                     // Non-fasl mode: constant pool is fine (same process)
-                    EmitConstantAs(AddConstant(val), typeof(LispObject));
+                    EmitConstantAs(AddDataConstant(val), typeof(LispObject));
                 }
                 break;
             }
@@ -847,11 +999,83 @@ public partial class CilAssembler
                     try { Console.Error.WriteLine($"[FASL WARNING] Unsupported constant type in fasl (constant-pool fallback, not cross-process safe): {val.GetType().Name}"); }
                     catch { /* ignore ToString errors */ }
                 }
-                EmitConstantAs(AddConstant(val), typeof(LispObject));
+                EmitConstantAs(AddDataConstant(val), typeof(LispObject));
                 break;
         }
         }
         finally { _inlineDepth--; }
+    }
+
+    private bool IsSharedInlineNode(LispObject node) =>
+        (_faslStructMap?.CrossLiteralShared?.ContainsKey(node) ?? false)
+        || (_sharedMemo?.Shared.Contains(node) ?? false);
+
+    private bool EmitCyclicLiteral(LispObject val)
+    {
+        if (!_faslMode || _faslTypeBuilder == null || val is not (Cons or LispVector)
+            || AnalyzeConstantGraph(val) != ConstGraphKind.Cyclic)
+            return false;
+        if (IsOnCycle(val))
+        {
+            if (TryEmitConstantViaReader(val)) return true;
+            throw new LispErrorException(new LispProgramError(
+                "compile-file: cannot emit a circular constant that is not printably readable"));
+        }
+        return !HasExternalSharedNode(val) && TryEmitConstantViaReader(val);
+    }
+
+    private bool HasExternalSharedNode(LispObject root)
+    {
+        var cross = _faslStructMap?.CrossLiteralShared;
+        if (cross == null || cross.Count == 0) return false;
+        var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+        var st = new Stack<LispObject>();
+        st.Push(root);
+        while (st.Count > 0)
+        {
+            var node = st.Pop();
+            if (!HasLiteralIdentity(node) || !seen.Add(node)) continue;
+            if (!ReferenceEquals(node, root) && cross.ContainsKey(node)) return true;
+            PushLiteralChildren(node, st);
+        }
+        return false;
+    }
+
+    private static void PushLiteralChildren(LispObject node, Stack<LispObject> st)
+    {
+        switch (node)
+        {
+            case Cons c: st.Push(c.Cdr); st.Push(c.Car); break;
+            case LispVector v:
+                if (v.ElementTypeName == "T")
+                    for (int i = v.Length - 1; i >= 0; i--) st.Push(v.ElementAt(i));
+                break;
+            case LispStruct ls:
+                foreach (var sl in ls.SlotsSnapshot()) if (sl is LispObject so) st.Push(so);
+                break;
+            case LispHashTable ht:
+                foreach (var kv in ht.Entries) { st.Push(kv.Value); st.Push(kv.Key); }
+                break;
+            case LispInstance li:
+                foreach (var sl in li.Slots) if (sl is LispObject so) st.Push(so);
+                break;
+        }
+    }
+
+    private static bool IsOnCycle(LispObject root)
+    {
+        var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+        var st = new Stack<LispObject>();
+        PushLiteralChildren(root, st);
+        while (st.Count > 0)
+        {
+            var node = st.Pop();
+            if (!HasLiteralIdentity(node)) continue;
+            if (ReferenceEquals(node, root)) return true;
+            if (!seen.Add(node)) continue;
+            PushLiteralChildren(node, st);
+        }
+        return false;
     }
 
     private enum ConstGraphKind { Simple, Shared, Cyclic }
@@ -902,7 +1126,7 @@ public partial class CilAssembler
     // staying on the other route costs, because a synthetic literal has no
     // structures in it.
     private static readonly int ReaderPathMinNodes =
-        int.TryParse(Environment.GetEnvironmentVariable("DOTCL_LITERAL_READER_MIN_NODES"),
+        int.TryParse(Environment.GetEnvironmentVariable("DOTCL_LITERAL_READER_MIN_NODES"), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture,
                      out var v) && v > 0 ? v : 8;
 
     /// <summary>Whether every node of this constant graph comes back from

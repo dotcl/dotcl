@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A closed generic type's class has the OPEN definition as a superclass, so a
 ;;; method can be specialized on List`1 and apply to every instantiation, while a
 ;;; method on List<Int32> still wins for that one. Same for generic interfaces.

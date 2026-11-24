@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; SXHASH of strings, symbols, characters and numbers must agree between Lisp
 ;;; images (CLHS 18.2.3.2). .NET's String.GetHashCode and BigInteger.GetHashCode
 ;;; are seeded per process, so two children used to print different values.

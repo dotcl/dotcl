@@ -9,6 +9,29 @@
         (ledger-steady:stable-window-p '(1.00 1.00) 3 0.05))
   (t nil nil))
 
+(deftest ledger-steady-still-dropping
+  ;; newest first: the last three runs against the three before them
+  (list (ledger-steady:still-dropping-p '(1.00 1.00 1.00 2.00 2.00 2.00) 3 0.05)
+        (ledger-steady:still-dropping-p '(1.00 1.00 1.00 1.04 1.04 1.04) 3 0.05)
+        (ledger-steady:still-dropping-p '(1.00 1.00 1.00 1.06 1.06 1.06) 3 0.05)
+        (ledger-steady:still-dropping-p '(1.00 1.00 1.00) 3 0.05))
+  (t nil t nil))
+
+(deftest ledger-steady-default-minimum-seconds-is-eight
+  (progn
+    (dolist (name '("LEDGER_STEADY_MIN_RUNS" "LEDGER_STEADY_MIN_SECONDS"
+                    "LEDGER_STEADY_WINDOW" "LEDGER_STEADY_TOLERANCE"
+                    "LEDGER_STEADY_MAX_RUNS" "LEDGER_STEADY_MAX_SECONDS"))
+      (dotcl:unsetenv name))
+    (let* ((ticks 0)
+           (step (round internal-time-units-per-second 2))) ; half a second per run
+      (multiple-value-bind (best count stable)
+          (ledger-steady:measure (lambda () (incf ticks step)) :clock (lambda () ticks))
+        (declare (ignore best))
+        ;; sixteen runs make eight seconds; the window may not start earlier
+        (list stable (>= count 16)))))
+  (t t))
+
 (deftest ledger-steady-minimum-runs
   (let ((runs 0))
     (unwind-protect

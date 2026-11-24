@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; OPEN :IF-EXISTS :APPEND gives every write the then-current end of file.
 ;;;
 ;;; It used to seek to the end once, at open, and then write at the offset the

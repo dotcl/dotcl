@@ -37,8 +37,22 @@
 (deftest constant-assignment.set-signals
   (list (%ca-signals-p (lambda () (set '+ca-c+ 99)))
         (%ca-signals-p (lambda () (set 'nil 1)))
+        (%ca-signals-p (lambda () (set 't 1)))
         +ca-c+)
-  (t t 10))
+  (t t t 10))
+
+;;; Keywords are constant variables too, and SET was the one assignment form
+;;; that still wrote one.
+(deftest constant-assignment.set-keyword-signals
+  (list (%ca-signals-p (lambda () (set :ca-kw 1)))
+        (eq :ca-kw (symbol-value :ca-kw)))
+  (t t))
+
+(deftest constant-assignment.interpreted-set-keyword-signals
+  (let ((dotcl:*evaluator-mode* :interpret))
+    (list (%ca-signals-p (lambda () (eval '(set :ca-kwi 1))))
+          (eq :ca-kwi (symbol-value :ca-kwi))))
+  (t t))
 
 (deftest constant-assignment.interpreted-setq-signals
   (let ((dotcl:*evaluator-mode* :interpret))

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Backquote templates: what they build, not how.
 ;;;
 ;;; The reader expands a template at read time. It used to wrap every element in

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; LAUNCH-PROCESS takes any Lisp stream for :INPUT, :OUTPUT and :ERROR, as
 ;;; sb-ext:run-program does: a string stream, *STANDARD-OUTPUT*, a synonym
 ;;; stream, a Gray stream. The runtime copies between the pipe and the stream

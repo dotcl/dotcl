@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; :INITIAL-CONTENTS for a zero-dimensional array.
 ;;;
 ;;; A rank-0 array holds exactly one element, and :initial-contents IS that

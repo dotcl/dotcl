@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; MAKE-ARRAY built a boxed LispObject[SIZE] for every array and let the
 ;;; constructor pack it into the narrow storage the element type asks for, then
 ;;; drop it. The boxed detour cost 8 bytes an element in garbage -- four times the

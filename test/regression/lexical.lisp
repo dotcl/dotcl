@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression tests for multi-package lexical variable name collision.
 ;;;
 ;;; The compiler's variable lookup and free-var detection used var-name

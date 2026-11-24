@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; An exception block nested inside an unwind-protect cleanup must survive the
 ;;; FASL round trip.
 ;;;

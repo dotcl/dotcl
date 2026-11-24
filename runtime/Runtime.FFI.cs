@@ -512,7 +512,21 @@ static class NativeFFI
     {
         CallbackEntry e;
         lock (_callbackEntries) e = _callbackEntries[id];
-        if (t_nativeDepth == 0) return RunCallback(e, nativeArgs);
+        if (t_nativeDepth == 0)
+        {
+            // A thread dotcl did not start (a C library's own thread) or a call that
+            // did not go through InvokeNative: there is no Lisp caller to reach and
+            // no native call of ours to wait for, and an exception can not unwind
+            // through the native frames below. The error is reported and answered
+            // with the return type's default, as at the other .NET-to-Lisp
+            // boundaries (see InvokeForeignCallback).
+            try { return RunCallback(e, nativeArgs, contained: true); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"FFI callback on a native thread: {ex.Message}");
+                return NativeDefault(e.RetType);
+            }
+        }
         // An exception can not unwind through native frames (the process aborts),
         // so it waits until the native call returns to InvokeNative. Until then
         // further callbacks on this thread return a zero value without running.
@@ -533,6 +547,13 @@ static class NativeFFI
         t_nativeDepth++;
         object? result;
         try { result = dm.Invoke(null, invokeArgs); }
+        catch
+        {
+            // The call itself failed (not a callback): an error that a callback
+            // saved for this call is stale, and must not be thrown by the next one.
+            t_callbackEscape = null;
+            throw;
+        }
         finally { t_nativeDepth--; }
         var escape = t_callbackEscape;
         if (escape != null)
@@ -546,12 +567,12 @@ static class NativeFFI
     static object? NativeDefault(Type t)
         => IsVoidType(t) || !t.IsValueType ? null : Activator.CreateInstance(t);
 
-    static object? RunCallback(CallbackEntry e, object?[] nativeArgs)
+    static object? RunCallback(CallbackEntry e, object?[] nativeArgs, bool contained = false)
     {
         var lispArgs = new LispObject[nativeArgs.Length];
         for (int i = 0; i < nativeArgs.Length; i++)
             lispArgs[i] = ConvertReturn(nativeArgs[i], e.ArgTypes[i]);
-        var lispResult = e.Fn.Invoke(lispArgs);
+        var lispResult = contained ? Runtime.InvokeForeignCallback(e.Fn, lispArgs) : e.Fn.Invoke(lispArgs);
         if (IsVoidType(e.RetType)) return null;
         // A callback body that ends in a multiple-value form hands back an
         // MvReturn, which has no native representation and used to reach

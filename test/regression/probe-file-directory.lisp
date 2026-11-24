@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; PROBE-FILE answers a directory's truename, not the caller's spelling.
 ;;;
 ;;; CLHS 21.4 says probe-file returns the truename, and a directory's truename

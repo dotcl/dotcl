@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; ~G picks its digit count from the value, not from the float type.
 ;;;
 ;;; CLHS 22.3.3.3: with d omitted, "let q be the number of digits needed to print

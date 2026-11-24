@@ -3,7 +3,7 @@
 ;;; kept, and COMPILE-FILE returns NIL, T, T instead of signalling it to the caller.
 
 (defun %cfre-compile (name lines)
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames (format nil "~a.lisp" name) dir))
          (fasl (merge-pathnames (format nil "~a.fasl" name) dir)))
     (when (probe-file fasl) (delete-file fasl))

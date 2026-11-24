@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A FORMAT directive does not allocate a parameter list it has no parameters for.
 ;;;
 ;;; Every directive built a List<object?> for its prefix parameters and then an

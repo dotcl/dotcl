@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; RUN-PROGRAM with :INPUT naming a file hands the child the file's bytes
 ;;; unchanged, as SBCL does.
 ;;;

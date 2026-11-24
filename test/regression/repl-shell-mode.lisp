@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The one-line shell mode of the bundled REPL.
 ;;;
 ;;; A semicolon typed at the start of an empty line does not go into the line:

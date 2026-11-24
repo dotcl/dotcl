@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression tests for dotcl:setenv / dotcl:unsetenv (back uiop:getenv setf / unsetenv)
 
 ;;; set then get returns the value

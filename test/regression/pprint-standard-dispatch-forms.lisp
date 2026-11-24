@@ -209,7 +209,7 @@
   (DEFPARAMETER *Y* 2))")
 
 (deftest pprint-standard-dispatch-forms.with-open-file.31
-  (%psf-print '(with-open-file (stream "/tmp/some/long/path/name.txt" :direction :output :if-exists :supersede) (write-line "hello" stream)) 80)
+  (%psf-print '(with-open-file (stream "/tmp/some/long/path/name.txt" :direction :output :if-exists :supersede) (write-line "hello" stream)) 80) ; fixed-path-ok (quoted data, never executed)
   "(WITH-OPEN-FILE
     (STREAM \"/tmp/some/long/path/name.txt\" :DIRECTION :OUTPUT :IF-EXISTS
      :SUPERSEDE)
@@ -526,7 +526,7 @@
   (DEFPARAMETER *Y* 2))")
 
 (deftest pprint-standard-dispatch-forms.with-open-file.74
-  (%psf-print '(with-open-file (stream "/tmp/some/long/path/name.txt" :direction :output :if-exists :supersede) (write-line "hello" stream)) 40)
+  (%psf-print '(with-open-file (stream "/tmp/some/long/path/name.txt" :direction :output :if-exists :supersede) (write-line "hello" stream)) 40) ; fixed-path-ok (quoted data, never executed)
   "(WITH-OPEN-FILE
     (STREAM
      \"/tmp/some/long/path/name.txt\"

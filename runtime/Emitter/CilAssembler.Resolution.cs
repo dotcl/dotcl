@@ -496,9 +496,39 @@ public partial class CilAssembler
     /// level forms of the same file.</summary>
     private void EmitCachedConst(LispObject instrs)
     {
-        if (!_faslMode || _faslStructMap?.UninternedTypeBuilder == null || _runOnce)
+        if (_runOnce)
         {
-            Assemble(instrs);   // JIT path: the constant pool already shares it
+            Assemble(instrs);   // runs once: nothing to keep
+            return;
+        }
+        if (!_faslMode || _faslStructMap?.UninternedTypeBuilder == null)
+        {
+            // The JIT path. INSTRS is a recipe (symbol lookups and conses: a cross-compiled quoted list of
+            // symbols), not a constant of the pool, so it has to be kept here: a one-cell array in the
+            // pool holds the value once the recipe has run. Assembled as it was, a call of
+            // SPECIAL-OPERATOR-NAME-P built its 25-element list again every time (80 million conses
+            // for one 1024-parameter LABELS in the compiler loaded from the SIL).
+            var cell = _il.DeclareLocal(typeof(object[]));
+            var held = _il.DeclareLocal(typeof(LispObject));
+            var hit = _il.DefineLabel();
+            EmitConstantAs(AddConstant(new LispObject[1]), typeof(LispObject[]));
+            _il.Emit(OpCodes.Stloc, cell);
+            _il.Emit(OpCodes.Ldloc, cell);
+            _il.Emit(OpCodes.Ldc_I4_0);
+            _il.Emit(OpCodes.Ldelem_Ref);
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Brtrue, hit);
+            _il.Emit(OpCodes.Pop);
+            _cachedLiteralDepth++;
+            try { Assemble(instrs); }
+            finally { _cachedLiteralDepth--; }
+            _il.Emit(OpCodes.Dup);
+            _il.Emit(OpCodes.Stloc, held);
+            _il.Emit(OpCodes.Ldloc, cell);
+            _il.Emit(OpCodes.Ldc_I4_0);
+            _il.Emit(OpCodes.Ldloc, held);
+            _il.Emit(OpCodes.Stelem_Ref);
+            _il.MarkLabel(hit);
             return;
         }
         var field = _faslStructMap.DefineLiteralCacheField();
@@ -523,7 +553,7 @@ public partial class CilAssembler
             return;
         }
         // Store the LispObject literal in the constant pool
-        int idx = AddConstant(val);
+        int idx = AddDataConstant(val);
         _il.Emit(OpCodes.Ldc_I4, idx);
         // Typed reads without a castclass: the entry is VAL. A castclass per
         // site is JIT work, and a cast to LispObject is a helper call.

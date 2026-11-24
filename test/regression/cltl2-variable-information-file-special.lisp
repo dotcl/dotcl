@@ -6,7 +6,7 @@
 ;;; time and must get the compiler's answer.
 
 (defun %cvifs-compile-and-load ()
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "cvifs.lisp" dir))
          (fasl (merge-pathnames "cvifs.fasl" dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)

@@ -120,11 +120,11 @@
   (let* ((stored (* 1000 1000))          ; 1000000, outside the small-int cache
          (probe  (* 1000 1000))
          (cell   (list stored)))
-    (list (eq stored probe)              ; distinct objects...
-          (eql stored probe)             ; ...that are EQL
+    (list (eq stored probe)              ; distinct objects, EQ by value like an immediate
+          (eql stored probe)
           (dotcl:compare-and-swap (car cell) probe 0)
           (car cell)))
-  (nil t 1000000 0))
+  (t t 1000000 0))
 
 (deftest cas-bignum-distinct-object
   (let* ((stored (* 1000000 1000000))

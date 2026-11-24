@@ -366,7 +366,7 @@ public partial class CilAssembler
             EmitFaslInlineCacheCell(name, pkg, typeof(GFCallCache));
         else
         {
-            EmitConstantAs(AddConstant(new GFCallCache(Startup.SymInPkg(name, pkg))),
+            EmitConstantAs(AddDataConstant(new GFCallCache(Startup.SymInPkg(name, pkg))),
                            typeof(GFCallCache));
         }
         il.EmitLoc(OpCodes.Ldloc, fnL);
@@ -592,7 +592,7 @@ public partial class CilAssembler
         // Creation forms for instances referenced by THIS creation form must run first.
         var deps = new List<LispInstance>();
         FaslStructInternMap.CollectInstanceRefs(creationForm, deps,
-            new HashSet<LispInstance>(ReferenceEqualityComparer.Instance));
+            new HashSet<LispObject>(ReferenceEqualityComparer.Instance));
         foreach (var dep in deps)
         {
             if (ReferenceEquals(dep, li)) continue;
@@ -742,7 +742,7 @@ public partial class CilAssembler
     }
 
     private static readonly int DataRouteMinNodes =
-        int.TryParse(Environment.GetEnvironmentVariable("DOTCL_LITERAL_DATA_MIN_NODES"),
+        int.TryParse(Environment.GetEnvironmentVariable("DOTCL_LITERAL_DATA_MIN_NODES"), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture,
                      out var v) && v > 0 ? v : 6;
 
     /// <summary>Emit an aggregate literal as a data part and a load of it
@@ -872,6 +872,7 @@ public partial class CilAssembler
     private bool TryEmitMlfIntoBatch(string key, Symbol className, List<(LispObject, LispObject)> sets)
     {
         var map = _faslStructMap!;
+        RegisterSlotValues(map, key, sets);
         foreach (var (_, value) in sets)
             if (!EnsureInstancesForData(value)) return false;
         // Try it on its own first, so that an object that cannot go as data
@@ -910,6 +911,12 @@ public partial class CilAssembler
             throw new InvalidOperationException("fasl: MLF form written once but not twice");
         b.Count++;
         return true;
+    }
+
+    private static void RegisterSlotValues(FaslStructInternMap map, string key,
+        List<(LispObject Slot, LispObject Value)> sets)
+    {
+        foreach (var (slot, value) in sets) map.RegisterSlotValue(value, key, slot);
     }
 
     /// <summary>The open MLF batch of the given kind that the next object can
@@ -1573,7 +1580,8 @@ public partial class CilAssembler
             if (Runtime.FindClassOrNil(ls.TypeName) is LispClass cls2
                 && cls2.IsStructureClass && cls2.StructSlotNames != null
                 && cls2.StructSlotNames.Length == ls.SlotCount
-                && FormIsSlotSaving(ls, cls2, form))
+                && FormIsSlotSaving(ls, cls2, form)
+                && !StructInCycle(ls))
                 return false;
             // In a fasl the structure goes through the make-load-form registry,
             // as an instance does: the creation form runs when the fasl is
@@ -1599,6 +1607,29 @@ public partial class CilAssembler
         {
             return false;
         }
+    }
+
+    /// <summary>Whether LS can reach itself through struct slots, conses and
+    /// simple vectors. The direct intern path cannot rebuild such a cycle in
+    /// another process; the creation-form / init-form registry can.</summary>
+    private static bool StructInCycle(LispStruct root)
+    {
+        var seen = new HashSet<LispObject>(ReferenceEqualityComparer.Instance);
+        var stack = new Stack<LispObject>();
+        foreach (var sl in root.SlotsSnapshot()) stack.Push(sl);
+        while (stack.Count > 0)
+        {
+            var o = stack.Pop();
+            if (ReferenceEquals(o, root)) return true;
+            if (o is LispStruct or Cons or LispVector)
+            {
+                if (!seen.Add(o)) continue;
+                if (o is LispStruct s2) foreach (var sl in s2.SlotsSnapshot()) stack.Push(sl);
+                else if (o is Cons c) { stack.Push(c.Car); stack.Push(c.Cdr); }
+                else if (o is LispVector v) for (int i = 0; i < v.Length; i++) stack.Push(v.ElementAt(i));
+            }
+        }
+        return false;
     }
 
     /// <summary>Whether TryEmitViaLoadForm leaves LS to the direct intern

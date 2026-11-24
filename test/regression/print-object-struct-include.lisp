@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A print-object method on a parent struct must be used for structs that
 ;;; (:include ...) it.
 ;;;

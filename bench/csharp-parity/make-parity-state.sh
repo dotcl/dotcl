@@ -84,7 +84,7 @@ names=$(echo "$dotcl_pairs" | cut -f1)
 
 # lookup <pairs> <name> <field>
 lookup() {
-    echo "$1" | awk -F'\t' -v n="$2" -v f="$3" '$1 == n { print $f; exit }'
+    awk -F'\t' -v n="$2" -v f="$3" '$1 == n { print $f; exit }' <<< "$1"
 }
 
 # Build the new rows first, so a missing counterpart is reported before

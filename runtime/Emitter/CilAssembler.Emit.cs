@@ -101,14 +101,23 @@ public partial class CilAssembler
             "compile/eval statements individually or in chunks, or move sub-parts into their " +
             "own functions."));
 
+    /// <summary>A DynamicMethod of the unit being assembled; remembered so the
+    /// unit's data-constant token can be attached to it (see UnitDataToken).</summary>
+    internal static DynamicMethod NewDm(string name, Type ret, Type[] ps)
+    {
+        var dm = new DynamicMethod(name, ret, ps, typeof(CilAssembler).Module, true);
+        _unitPendingDms?.Add(dm);
+        return dm;
+    }
+
     private static LispObject AssembleAndRunSingle(LispObject instrList)
     {
         EnsureEmitAllowed("eval/compile of a compound form");
         if (IsLoneFunctionForm(instrList)) return AssembleLoneFunction(instrList);
         var asm = new CilAssembler();
         asm._runOnceInMemory = !HasBackwardBranch(instrList);
-        var dm = new DynamicMethod("toplevel", typeof(LispObject),
-            Type.EmptyTypes, typeof(CilAssembler).Module, true);
+        var dm = NewDm("toplevel", typeof(LispObject),
+            Type.EmptyTypes);
         asm._il = dm.GetILGenerator().ForLibrary();
         int savedUnit = _currentUnitId;
         var savedDms = _currentUnitDms;
@@ -116,8 +125,10 @@ public partial class CilAssembler
         var holder = new List<object>();
         _currentUnitId = unitId;
         _currentUnitDms = holder;
+        var savedData = BeginUnitData();
+        _unitPendingDms!.Add(dm);
         try { asm.Assemble(instrList); }
-        finally { _currentUnitId = savedUnit; _currentUnitDms = savedDms; }
+        finally { _currentUnitId = savedUnit; _currentUnitDms = savedDms; EndUnitData(savedData); }
         // Publish weakly only if the unit produced closures; closure-free units
         // (the majority) leave no map entry at all.
         if (holder.Count > 0) RegisterUnit(unitId, holder);
@@ -168,8 +179,8 @@ public partial class CilAssembler
     private static LispObject AssembleLoneFunction(LispObject instrList)
     {
         var asm = new CilAssembler();
-        var dm = new DynamicMethod("toplevel_unused", typeof(LispObject),
-            Type.EmptyTypes, typeof(CilAssembler).Module, true);
+        var dm = NewDm("toplevel_unused", typeof(LispObject),
+            Type.EmptyTypes);
         asm._il = dm.GetILGenerator().ForLibrary();
         int savedUnit = _currentUnitId;
         var savedDms = _currentUnitDms;
@@ -177,8 +188,10 @@ public partial class CilAssembler
         var holder = new List<object>();
         _currentUnitId = unitId;
         _currentUnitDms = holder;
+        var savedData = BeginUnitData();
+        _unitPendingDms!.Add(dm);
         try { asm.Assemble(new Cons(((Cons)instrList).Car, Nil.Instance)); }
-        finally { _currentUnitId = savedUnit; _currentUnitDms = savedDms; }
+        finally { _currentUnitId = savedUnit; _currentUnitDms = savedDms; EndUnitData(savedData); }
         RegisterUnit(unitId, holder);
         return (LispObject)holder[holder.Count - 1];
     }
@@ -327,6 +340,17 @@ public partial class CilAssembler
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     public static LispObject MakeClosure(object[] env, int unitId, int dmIndex, int arity)
     {
+        var sites = t_closureSites ??= new ClosureSiteEntry[ClosureSiteCacheSize];
+        ref var site = ref sites[(unitId * 31 + dmIndex) & (ClosureSiteCacheSize - 1)];
+        if (site.UnitId == unitId && site.DmIndex == dmIndex && site.Del is Func<object[], LispObject[], LispObject> cachedDel
+            && site.Holder!.TryGetTarget(out var liveHolder))
+            return new LispFunction(cachedDel, env, null, arity) { RetainUnit = liveHolder };
+        return MakeClosureSlow(env, unitId, dmIndex, arity, ref site);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispObject MakeClosureSlow(object[] env, int unitId, int dmIndex, int arity, ref ClosureSiteEntry site)
+    {
         var holder = TryGetUnitHolder(unitId)
             ?? throw new LispErrorException(new LispProgramError(
                 "internal: closure compilation unit was collected while still callable"));
@@ -335,6 +359,10 @@ public partial class CilAssembler
         // Pin the unit so this closure can still resolve sibling DMs (e.g. a
         // nested closure built when it is later called), and so the unit's JIT
         // code outlives the enclosing function exactly as long as this closure does.
+        if (_unitStore.TryGetValue(unitId, out var wr))
+        {
+            site.UnitId = unitId; site.DmIndex = dmIndex; site.Holder = wr; site.Del = closureDel;
+        }
         return new LispFunction(closureDel, env, null, arity) { RetainUnit = holder };
     }
 
@@ -360,8 +388,40 @@ public partial class CilAssembler
             $"internal: direct closure unsupported arity {arity}"))
     };
 
+    // The last closure sites this thread made closures for: (unit id, DM index) ->
+    // the site's body delegate and a weak reference to the unit's holder. A closure
+    // creation that finds its site here skips the unit table, the per-holder delegate
+    // cache and the delegate type switch (about half of the 60 ns the lookups cost).
+    // The holder is held weakly and must still be alive for a hit, so the cache never
+    // keeps a unit alive, and a unit that was collected falls to the slow path.
+    private struct ClosureSiteEntry
+    {
+        public int UnitId, DmIndex;
+        public WeakReference<List<object>>? Holder;
+        public Delegate? Del;
+    }
+
+    private const int ClosureSiteCacheSize = 64;
+    [ThreadStatic] private static ClosureSiteEntry[]? t_closureSites;
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     public static LispObject MakeClosureDirect(object[] env, int unitId, int dmIndex, int arity, string fnName)
+    {
+        var sites = t_closureSites ??= new ClosureSiteEntry[ClosureSiteCacheSize];
+        ref var site = ref sites[(unitId * 31 + dmIndex) & (ClosureSiteCacheSize - 1)];
+        if (site.UnitId == unitId && site.DmIndex == dmIndex && site.Del != null
+            && site.Holder!.TryGetTarget(out var liveHolder))
+        {
+            var cached = LispFunction.MakeDirectClosure(site.Del, env, fnName, arity);
+            cached.RetainUnit = liveHolder;
+            return cached;
+        }
+        return MakeClosureDirectSlow(env, unitId, dmIndex, arity, fnName, ref site);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispObject MakeClosureDirectSlow(object[] env, int unitId, int dmIndex, int arity, string fnName,
+                                                    ref ClosureSiteEntry site)
     {
         var holder = TryGetUnitHolder(unitId)
             ?? throw new LispErrorException(new LispProgramError(
@@ -378,10 +438,14 @@ public partial class CilAssembler
             _ => throw new LispErrorException(new LispProgramError(
                 $"internal: MakeClosureDirect unsupported arity {arity}"))
         };
-        var fn = LispFunction.MakeDirectClosure(
-            GetClosureDelegate(holder, dmIndex, delType), env, fnName);
+        var del = GetClosureDelegate(holder, dmIndex, delType);
+        var fn = LispFunction.MakeDirectClosure(del, env, fnName, arity);
         // Pin the unit: same lifetime contract as MakeClosure.
         fn.RetainUnit = holder;
+        if (_unitStore.TryGetValue(unitId, out var wr))
+        {
+            site.UnitId = unitId; site.DmIndex = dmIndex; site.Holder = wr; site.Del = del;
+        }
         return fn;
     }
 
@@ -673,7 +737,7 @@ public partial class CilAssembler
             _il.Emit(OpCodes.Ldsfld, _faslStructMap.GetOrCreateStringField(value));
             return true;
         }
-        EmitConstantAs(AddConstant(new LispString(value)), typeof(LispString));
+        EmitConstantAs(AddDataConstant(new LispString(value)), typeof(LispString));
         return true;
     }
 
@@ -1192,7 +1256,8 @@ public partial class CilAssembler
                 }
                 else
                 {
-                    EmitConstantAs(AddConstant(new Startup.SymSite(symName)),
+                    EmitConstantAs(AddSiteConstant(_symSiteIndex, symName, null,
+                                       () => new Startup.SymSite(symName)),
                                    typeof(Startup.SymSite));
                     _il.Emit(OpCodes.Call, _symSiteResolve);
                 }
@@ -1233,10 +1298,13 @@ public partial class CilAssembler
                 }
                 else
                 {
-                    // JIT mode: one rooted cache cell per call site, filled on first
-                    // execution. Same pattern as READER-IC / WRITER-IC. Takes the
-                    // string-keyed memo lookup out of every function call.
-                    int idx = AddConstant(new Startup.SymFnSite(symName, symPkg));
+                    // JIT mode: one rooted cache cell per (name, package), filled on
+                    // first execution. The cell only memoizes a symbol lookup, so
+                    // sites naming the same symbol share it; a cell per site made
+                    // the pool grow on every recompile. Takes the string-keyed memo
+                    // lookup out of every function call.
+                    int idx = AddSiteConstant(_symFnSiteIndex, symName, symPkg,
+                                              () => new Startup.SymFnSite(symName, symPkg));
                     _il.Emit(OpCodes.Ldc_I4, idx);
                     _il.Emit(OpCodes.Call, _fnSiteSymbol);
                 }
@@ -1290,7 +1358,7 @@ public partial class CilAssembler
                     // JIT mode: one rooted cell in the constant pool per call site, so
                     // the monomorphic (class -> slot-index) fill persists across calls.
                     var cell = new ReaderCache(Startup.SymInPkg(ricName, ricPkg));
-                    EmitConstantAs(AddConstant(cell), typeof(ReaderCache));
+                    EmitConstantAs(AddDataConstant(cell), typeof(ReaderCache));
                     _il.Emit(OpCodes.Call, ricMethod);
                 }
                 break;
@@ -1313,7 +1381,7 @@ public partial class CilAssembler
                 else
                 {
                     var cell = new WriterCache(Startup.SymInPkg(wicName, wicPkg));
-                    EmitConstantAs(AddConstant(cell), typeof(WriterCache));
+                    EmitConstantAs(AddDataConstant(cell), typeof(WriterCache));
                     _il.Emit(OpCodes.Call, wicMethod);
                 }
                 break;

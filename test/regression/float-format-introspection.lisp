@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The functions that report on a float's format have to look at the format.
 ;;;
 ;;; FLOAT-DIGITS answered 53 for everything, FLOAT-PRECISION did the same, and

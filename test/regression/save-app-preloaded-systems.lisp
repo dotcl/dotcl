@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; save-application: a bundled image answers ASDF about the systems it contains.
 ;;;
 ;;; Libraries routinely bind their own version at load time from

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; COMPILE-FILE processes the body of (eval-when (:compile-toplevel
 ;;; :load-toplevel ...) ...) in compile-time-too mode (CLHS 3.2.3.1): each top
 ;;; level form in it is evaluated at compile time as it is processed, so its
@@ -10,8 +11,8 @@
 ;;; shape (varjo registers a type name, then a macro looks the name up).
 
 (defun %ewctt-compile-and-load (lines)
-  (let ((src "ewctt-tmp.lisp")
-        (fasl "ewctt-tmp.fasl"))
+  (let ((src (regression-temp-file "ewctt-tmp.lisp"))
+        (fasl (regression-temp-file "ewctt-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)
@@ -88,8 +89,8 @@
 (defvar *ewn-sits* nil)
 
 (deftest-compiled-only eval-when-nested.compile-only-outer-evaluates
-  (let ((src "ewn-tmp.lisp")
-        (fasl "ewn-tmp.fasl"))
+  (let ((src (regression-temp-file "ewn-tmp.lisp"))
+        (fasl (regression-temp-file "ewn-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)
@@ -118,8 +119,8 @@
 ;; The Process action still treats the body forms as top level: the nested
 ;; {:COMPILE-TOPLEVEL} is EVALUATEd at compile time and not put in the fasl.
 (deftest-compiled-only eval-when-nested.compile-only-inside-compile-and-load
-  (let ((src "ewn2-tmp.lisp")
-        (fasl "ewn2-tmp.fasl"))
+  (let ((src (regression-temp-file "ewn2-tmp.lisp"))
+        (fasl (regression-temp-file "ewn2-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)

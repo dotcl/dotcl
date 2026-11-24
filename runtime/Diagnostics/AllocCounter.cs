@@ -45,7 +45,7 @@ public static class AllocCounter
     private static int ReadIntEnv(string name, int fallback)
     {
         var s = System.Environment.GetEnvironmentVariable(name);
-        return int.TryParse(s, out var n) ? n : fallback;
+        return int.TryParse(s, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var n) ? n : fallback;
     }
 
     // Per-type counter array. GetOrAdd returns a single-element long[]

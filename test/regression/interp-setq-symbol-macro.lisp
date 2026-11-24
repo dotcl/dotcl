@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; SETQ of a name bound by SYMBOL-MACROLET is SETF of that name's expansion
 ;;; (CLHS setq), not a variable assignment. The tree-walk interpreter stored the
 ;;; value straight into the env entry: which not only assigned the wrong place

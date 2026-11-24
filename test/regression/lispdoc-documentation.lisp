@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Docstrings that the runtime attaches to its own built-in functions
 ;;; (DOTCL:SAVE-APPLICATION, DOTNET:MEMBERS and friends) belong to those
 ;;; symbols only. A symbol of the same name in another package -- shadowing,

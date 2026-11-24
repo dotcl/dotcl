@@ -22,7 +22,12 @@
     <PackageTags>lisp;common-lisp;repl;programming-language;dotnet</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
 
-    <RuntimeIdentifiers>win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64;android-arm64;android-x64;any</RuntimeIdentifiers>
+    <RuntimeIdentifiers>win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64;any</RuntimeIdentifiers>
+    <!-- The Android runtime packs are about 2 GB (restored once per restore of this
+         project, and again for each runtime version); only a build that wants the
+         Android RIDs asks for them: -p:DotclAndroid=true. Nothing in the repository's
+         builds, tests or the release path uses them (release already leaves them out). -->
+    <RuntimeIdentifiers Condition="'$(DotclAndroid)' == 'true'">win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64;android-arm64;android-x64;any</RuntimeIdentifiers>
     <PublishReadyToRun>true</PublishReadyToRun>
 
     <!-- No C# debug symbols in Release. The runtime never reads its own pdb at
@@ -82,6 +87,20 @@
        script was sometimes 0.1 s slower on macOS; 5 keeps startup unchanged. -->
   <ItemGroup>
     <RuntimeHostConfigurationOption Include="System.Runtime.TieredCompilation.CallCountingDelayMs" Value="5" />
+  </ItemGroup>
+
+  <!-- Upper bound of the generation 0 allocation budget, in bytes (64 MB). The
+       default budget follows the CPU cache size, so an allocation-heavy program
+       collects the young generation every few megabytes. With 64 MB the same
+       program collects about a tenth as often: 3M conses take 3 collections
+       instead of 28, and hash-table and list-building loops run 20 to 45%
+       faster. Startup is unchanged (the budget is never reached) and
+       (require "asdf") takes about 20 MB more; a long allocation-heavy run peaks
+       35 to 75% higher in resident memory. The value is a decimal number; the
+       environment variable form and System.GC.Gen0Size have no effect. Hosts
+       that embed the runtime use their own runtimeconfig and do not get this. -->
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="System.GC.Gen0MaxBudget" Value="67108864" />
   </ItemGroup>
 
   <!-- Methods first called outside ReadyToRun code are compiled optimized on the
@@ -157,6 +176,7 @@
     <Content Include="contrib/**" Exclude="$(ContribR2RExclude)" Condition="Exists('contrib')" Pack="false">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+      <ExcludeFromSingleFile>true</ExcludeFromSingleFile>
     </Content>
     <!-- Add back this RID's own R2R contrib fasls (empty glob for the any-RID
          package). ResolveDeps probes contrib/<n>/<n>.fasl.r2r-<rid> and falls

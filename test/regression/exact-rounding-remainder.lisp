@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; FLOOR / CEILING / TRUNCATE / ROUND give the remainder the division produced.
 ;;;
 ;;; All four computed it as (- a (* q b)) instead. That is a multiplication by a

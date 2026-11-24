@@ -278,6 +278,9 @@ public static partial class Runtime
     private sealed class DeferredDefun
     {
         private readonly LispObject _form;
+        // The top level form of the file this DEFUN came from (a macro form whose
+        // expansion holds the DEFUN, for one), kept for the duplicate-definition check.
+        private readonly LispObject? _sourceForm;
         private readonly Symbol _sym;
         private readonly bool _setf;
         private LispFunction? _real;
@@ -287,6 +290,9 @@ public static partial class Runtime
         private DeferredDefun(LispObject form, Symbol sym, bool setf)
         {
             _form = form; _sym = sym; _setf = setf;
+            if (DynamicBindings.Get(Startup.Sym("*SAME-FILE-DEFUN-BODIES*")) is LispHashTable bodies
+                && bodies.TryGet(Startup.Keyword("CURRENT-FORM"), out var cur))
+                _sourceForm = cur;
         }
 
         internal static bool TryInstall(LispObject form)
@@ -308,7 +314,11 @@ public static partial class Runtime
             { sym = sn; setf = true; }
             else return false;
             if (sym.HomePackage == null || sym.HomePackage.IsLocked) return false;
-            if ((setf ? sym.SetfFunction : sym.Function) != null) return false;
+            // A name that already holds a plain function (a recompile of a file
+            // that is loaded) is replaced by the stand-in as well; the function it
+            // held is put back at the end of COMPILE-FILE (see EarlyDefunTarget).
+            var held = setf ? sym.SetfFunction : sym.Function;
+            if (held != null && (held is GenericFunction || held is not LispFunction)) return false;
             if (!setf && MacroFunction(sym) is not Nil) return false;
             var d = new DeferredDefun(form, sym, setf);
             string name = setf ? "(SETF " + sym.Name + ")" : sym.Name;
@@ -335,6 +345,9 @@ public static partial class Runtime
                 if (d._real != null) { list.RemoveAt(i); continue; }
                 if (!FormMentions(d._form, sym)) continue;
                 list.RemoveAt(i);
+                // The DEFUN is compiled for the form it came from, not for the DEFMACRO that
+                // made it be forced: a second top-level form noting the same function is
+                // what "Duplicate definition" means.
                 try { d.Force(); } catch { /* the first call reports it, as before */ }
             }
         }
@@ -377,6 +390,15 @@ public static partial class Runtime
                 var before = _setf ? _sym.SetfFunction : _sym.Function;
                 var cfmSym = Startup.Sym("*COMPILE-FILE-MODE*");
                 DynamicBindings.Push(cfmSym, Nil.Instance);
+                // Compiled for the top level form it came from, whatever form is being compiled
+                // when it is first called (a macro expansion of another DEFUN, a DEFMACRO): a
+                // second top level form noting the same function is what "Duplicate definition"
+                // means.
+                var bodies = DynamicBindings.Get(Startup.Sym("*SAME-FILE-DEFUN-BODIES*")) as LispHashTable;
+                var currentFormKey = Startup.Keyword("CURRENT-FORM");
+                LispObject? savedForm = null;
+                bool hadForm = bodies != null && bodies.TryGet(currentFormKey, out savedForm);
+                if (bodies != null) bodies.Set(currentFormKey, _sourceForm ?? _form);
                 try
                 {
                     Eval(_form);
@@ -387,6 +409,7 @@ public static partial class Runtime
                 }
                 finally
                 {
+                    if (bodies != null && hadForm) bodies.Set(currentFormKey, savedForm!);
                     DynamicBindings.Pop(cfmSym);
                     if (_setf) _sym.SetfFunction = before;
                     else _sym.Function = before;

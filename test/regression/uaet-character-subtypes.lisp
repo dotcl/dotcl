@@ -13,4 +13,4 @@
         (let ((v (make-array 3 :element-type '(member #\0 #\1 #\2) :initial-element #\1)))
           (list (stringp v) (parse-integer v)))
         (upgraded-array-element-type '(member #\a 1)))
-  (character character character character (t 111) t))
+  (base-char base-char base-char character (t 111) t))

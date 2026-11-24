@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; COMPILE-FILE evaluates a top level DEFUN early, so that a macro later in
 ;;; the same file can call the function while the file is compiled. That
 ;;; definition must not outlive the compilation (CLHS 3.2.3.1 gives a plain
@@ -11,8 +12,8 @@
 (defun cfedr-call () (cfedr-f))
 
 (deftest-compiled-only cf-early-defun-restore.redefinition-stays-out
-  (let ((src "cfedr-tmp.lisp")
-        (fasl "cfedr-tmp.fasl"))
+  (let ((src (regression-temp-file "cfedr-tmp.lisp"))
+        (fasl (regression-temp-file "cfedr-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)
@@ -32,8 +33,8 @@
 (defun cfedr-g () :old)
 
 (deftest-compiled-only cf-early-defun-restore.compile-toplevel-stays
-  (let ((src "cfedr2-tmp.lisp")
-        (fasl "cfedr2-tmp.fasl"))
+  (let ((src (regression-temp-file "cfedr2-tmp.lisp"))
+        (fasl (regression-temp-file "cfedr2-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)

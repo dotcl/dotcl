@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; `dotcl pack` keeps the bundled ASDF when stock asdf.asd / uiop.asd are
 ;;; visible, and reports a .asd that fails to load as itself.
 ;;;

@@ -51,6 +51,10 @@ public static partial class Runtime
     public static LispObject NconcDestructive2(LispObject a, LispObject b)
     {
         if (a is Nil) return b;
+        if (a is not Cons)
+        {
+            throw new LispErrorException(new LispTypeError("NCONC: not a list: " + FormatObject(a, true), a, Startup.Sym("LIST")));
+        }
         var last = a;
         while (last is Cons c && c.Cdr is Cons) last = c.Cdr;
         Rplacd(last, b);
@@ -70,6 +74,7 @@ public static partial class Runtime
         }
         if (list is LispVector nv)
         {
+            if (ReverseVectorStorage(nv)) return nv;
             int lo = 0, hi = nv.Length - 1;
             while (lo < hi)
             {
@@ -180,9 +185,24 @@ public static partial class Runtime
         return head;
     }
 
+    /// <summary>True when LIST, which may be dotted, is circular (tortoise and hare).</summary>
+    internal static bool IsCircularList(LispObject list)
+    {
+        LispObject slow = list, fast = list;
+        while (fast is Cons f1 && f1.Cdr is Cons f2)
+        {
+            fast = f2.Cdr;
+            slow = ((Cons)slow).Cdr;
+            if (ReferenceEquals(slow, fast) && fast is Cons) return true;
+        }
+        return false;
+    }
+
     public static LispObject Butlast(LispObject list)
     {
         if (list is Nil || list is not Cons) return Nil.Instance;
+        if (IsCircularList(list))
+            throw new LispErrorException(new LispTypeError("not a proper or dotted list: circular", list, Startup.Sym("LIST")));
         var head = new Cons(((Cons)list).Car, Nil.Instance);
         var tail = head;
         var cur = ((Cons)list).Cdr;
@@ -238,6 +258,30 @@ public static partial class Runtime
                 current = c.Cdr;
             }
         }
+        else if (item is LispChar itemChar)
+        {
+            // A character is EQL to a character of the same code: a value compare of the
+            // element, with no pass through the general EQL.
+            char code = itemChar.Value;
+            while (current is Cons c)
+            {
+                var e = c.Car;
+                if (ReferenceEquals(e, item) || (e is LispChar ec ? ec.Value == code : e is MvReturn && IsTrueEql(item, e)))
+                    return current;
+                current = c.Cdr;
+            }
+        }
+        else if (item is Fixnum itemFix)
+        {
+            long v = itemFix.Value;
+            while (current is Cons c)
+            {
+                var e = c.Car;
+                if (e is Fixnum ef ? ef.Value == v : (ReferenceEquals(e, item) || e is MvReturn && IsTrueEql(item, e)))
+                    return current;
+                current = c.Cdr;
+            }
+        }
         else
         {
             while (current is Cons c)
@@ -265,20 +309,54 @@ public static partial class Runtime
         // symbols, and it looks names up in it several times per form.
         key = Primary(key);
         bool symKey = key is Symbol;
+        // A character or a fixnum key is EQL to the same value only: the car compares by value,
+        // no pass through the general EQL.
+        int kind = key is LispChar ? 1 : key is Fixnum ? 2 : 0;
+        long kval = key is LispChar kc ? kc.Value : key is Fixnum kfx ? kfx.Value : 0;
         var current = alist;
         while (current is Cons c)
         {
             var entry = c.Car;
             if (entry is not Nil && entry is not Cons)
-                throw new LispErrorException(new LispTypeError("ASSOC: alist entry is not a cons", entry, Startup.Sym("CONS")));
-            if (entry is Cons pair
-                && (symKey ? ReferenceEquals(key, Primary(pair.Car)) : IsTrueEql(key, pair.Car)))
-                return pair;
+                throw new LispErrorException(new LispTypeError("ASSOC: alist entry is not a cons", entry, Startup.Sym("LIST")));
+            if (entry is Cons pair)
+            {
+                var pk = pair.Car;
+                bool hit = kind == 1 ? (pk is LispChar pc ? pc.Value == kval : pk is MvReturn && IsTrueEql(key, pk))
+                         : kind == 2 ? (pk is Fixnum pf ? pf.Value == kval : pk is MvReturn && IsTrueEql(key, pk))
+                         : symKey ? ReferenceEquals(key, Primary(pk)) : IsTrueEql(key, pk);
+                if (hit) return pair;
+            }
             current = c.Cdr;
         }
         if (current is not Nil)
             throw new LispErrorException(new LispTypeError("ASSOC: not a proper list", current, Startup.Sym("LIST")));
         return Nil.Instance;
+    }
+
+    /// <summary>(MEMBER item list :test #'CHAR=) and (... :test #'CHAR-EQUAL): CI says which. An
+    /// argument that is not a character is CHAR=/CHAR-EQUAL's error, so a list that holds a
+    /// non-character before the match, or an item that is not a character, takes the general
+    /// entry (MEMBER with the test function) and raises it from there.</summary>
+    public static LispObject MemberChar(LispObject item, LispObject list, LispObject ciArg)
+    {
+        bool ci = ciArg is not Nil;
+        item = Primary(item);
+        if (item is LispChar ic)
+        {
+            char ch = ic.Value;
+            char fold = ci ? CharFoldCase(ic) : ch;
+            var current = list;
+            while (current is Cons c)
+            {
+                if (c.Car is not LispChar ec) break;
+                if (ci ? CharFoldCase(ec) == fold : ec.Value == ch) return current;
+                current = c.Cdr;
+            }
+            if (current is Nil) return Nil.Instance;
+        }
+        var kw = new ListKwArgs { Test = Startup.Sym(ci ? "CHAR-EQUAL" : "CHAR=").Function as LispFunction };
+        return MemberCore(item, list, kw);
     }
 
     /// <summary>
@@ -287,9 +365,19 @@ public static partial class Runtime
     public static LispObject MemberEq(LispObject item, LispObject list)
     {
         var current = list;
+        // Only a fixnum item can be EQ to a different object; skip that test otherwise.
+        if (item is Fixnum)
+        {
+            while (current is Cons c)
+            {
+                if (IsEqRef(item, c.Car)) return current;
+                current = c.Cdr;
+            }
+            return Nil.Instance;
+        }
         while (current is Cons c)
         {
-            if (IsEqRef(item, c.Car)) return current;
+            if (ReferenceEquals(item, c.Car)) return current;
             current = c.Cdr;
         }
         return Nil.Instance;
@@ -301,9 +389,19 @@ public static partial class Runtime
     public static LispObject AssocEq(LispObject key, LispObject alist)
     {
         var current = alist;
+        if (key is Fixnum)
+        {
+            while (current is Cons c)
+            {
+                if (c.Car is Cons pair && IsEqRef(key, pair.Car))
+                    return pair;
+                current = c.Cdr;
+            }
+            return Nil.Instance;
+        }
         while (current is Cons c)
         {
-            if (c.Car is Cons pair && IsEqRef(key, pair.Car))
+            if (c.Car is Cons pair && ReferenceEquals(key, pair.Car))
                 return pair;
             current = c.Cdr;
         }
@@ -324,6 +422,13 @@ public static partial class Runtime
 
     /// <summary>(GETF plist indicator) -- the two-argument shape, so the call does
     /// not build an args array just to supply the NIL default.</summary>
+    // Entries the compiler calls directly (GETF is overloaded, and the emitter's method table
+    // keys on a name).
+    public static LispObject GetfNoDefault(LispObject plist, LispObject indicator) =>
+        Getf(plist, indicator, Nil.Instance);
+    public static LispObject GetfDefault(LispObject plist, LispObject indicator, LispObject defaultVal) =>
+        Getf(plist, indicator, defaultVal);
+
     public static LispObject Getf(LispObject plist, LispObject indicator) =>
         Getf(plist, indicator, Nil.Instance);
 
@@ -513,7 +618,7 @@ public static partial class Runtime
 
     public static LispObject Apply(LispObject func, LispObject argList)
     {
-        var fn = CoerceToFunction(func);
+        var fn = CoerceToFunctionFor(func, "APPLY");
         // Walk once to learn the length. Collecting into a List<> and calling
         // ToArray cost three objects for a length that the walk already knows: the
         // List, its power-of-two backing array, and the copy. Nothing user-defined
@@ -562,7 +667,7 @@ public static partial class Runtime
     /// what (APPLY F LIST) costs.</summary>
     public static LispObject ApplySpread1(LispObject func, LispObject a, LispObject argList)
     {
-        var fn = CoerceToFunction(func);
+        var fn = CoerceToFunctionFor(func, "APPLY");
         int n = ApplyTailLength(argList);
         switch (n)
         {
@@ -577,6 +682,12 @@ public static partial class Runtime
             {
                 var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr; var c2 = (Cons)c1.Cdr;
                 return fn.Invoke4(a, c0.Car, c1.Car, c2.Car);
+            }
+            case 4:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr; var c2 = (Cons)c1.Cdr;
+                var c3 = (Cons)c2.Cdr;
+                return fn.Invoke5(a, c0.Car, c1.Car, c2.Car, c3.Car);
             }
         }
         var args = new LispObject[n + 1];
@@ -594,7 +705,7 @@ public static partial class Runtime
     /// list is walked. FIXED is the array of the leading arguments, or null.</summary>
     public static LispObject ApplyArgs(LispObject func, LispObject[]? fixedArgs, LispObject[] rest, int start)
     {
-        var fn = CoerceToFunction(func);
+        var fn = CoerceToFunctionFor(func, "APPLY");
         int nf = fixedArgs == null ? 0 : fixedArgs.Length;
         int nr = rest.Length > start ? rest.Length - start : 0;
         if (nf == 0)
@@ -608,16 +719,139 @@ public static partial class Runtime
                 case 4: return fn.Invoke4(rest[start], rest[start + 1], rest[start + 2], rest[start + 3]);
             }
         }
+        if (nf + nr <= 4)
+        {
+            // Few arguments: the callee's own fixed-arity entry, no array of the combined list.
+            LispObject a0 = null!, a1 = null!, a2 = null!, a3 = null!;
+            for (int i = 0; i < nf + nr; i++)
+            {
+                var v = i < nf ? fixedArgs![i] : rest[start + i - nf];
+                if (i == 0) a0 = v; else if (i == 1) a1 = v; else if (i == 2) a2 = v; else a3 = v;
+            }
+            switch (nf + nr)
+            {
+                case 0: return fn.Invoke0();
+                case 1: return fn.Invoke1(a0);
+                case 2: return fn.Invoke2(a0, a1);
+                case 3: return fn.Invoke3(a0, a1, a2);
+                default: return fn.Invoke4(a0, a1, a2, a3);
+            }
+        }
         var all = new LispObject[nf + nr];
         if (nf > 0) Array.Copy(fixedArgs!, all, nf);
         if (nr > 0) Array.Copy(rest, start, all, nf, nr);
         return fn.Invoke(all);
     }
 
+    private static int ListLengthForValuesList(LispObject list)
+    {
+        int n = 0;
+        var cur = list;
+        while (cur is Cons c) { n++; cur = c.Cdr; }
+        if (cur is not Nil)
+            throw new LispErrorException(new LispTypeError("VALUES-LIST: not a proper list", list));
+        return n;
+    }
+
+    /// <summary>(MULTIPLE-VALUE-CALL F (VALUES-LIST LIST) (VALUES-LIST REST)), REST taken from the frame's
+    /// argument array from START (or in front of LIST when RESTFIRST): the elements go to F's own
+    /// fixed-arity entry when there are four or fewer.</summary>
+    public static LispObject ApplyListRest(LispObject func, LispObject list, LispObject[] rest, int start, int restFirst)
+    {
+        var fn = CoerceToFunctionFor(func, "APPLY");
+        int nl = ListLengthForValuesList(list);
+        int nr = rest.Length > start ? rest.Length - start : 0;
+        int n = nl + nr;
+        if (n <= 4)
+        {
+            LispObject a0 = null!, a1 = null!, a2 = null!, a3 = null!;
+            int k = 0;
+            void Put(LispObject v) { if (k == 0) a0 = v; else if (k == 1) a1 = v; else if (k == 2) a2 = v; else a3 = v; k++; }
+            if (restFirst != 0) for (int i = 0; i < nr; i++) Put(rest[start + i]);
+            for (var cur = list; cur is Cons c; cur = c.Cdr) Put(c.Car);
+            if (restFirst == 0) for (int i = 0; i < nr; i++) Put(rest[start + i]);
+            switch (n)
+            {
+                case 0: return fn.Invoke0();
+                case 1: return fn.Invoke1(a0);
+                case 2: return fn.Invoke2(a0, a1);
+                case 3: return fn.Invoke3(a0, a1, a2);
+                default: return fn.Invoke4(a0, a1, a2, a3);
+            }
+        }
+        var all = new LispObject[n];
+        int p = 0;
+        if (restFirst != 0) { Array.Copy(rest, start, all, 0, nr); p = nr; }
+        for (var cur = list; cur is Cons c; cur = c.Cdr) all[p++] = c.Car;
+        if (restFirst == 0) Array.Copy(rest, start, all, p, nr);
+        return fn.Invoke(all);
+    }
+
+    public static LispObject ApplyListRestM(LispObject func, LispObject list, LispObject[] rest, int start, int restFirst, int mode)
+    {
+        var fn = CoerceToFunctionFor(func, "APPLY");
+        int nl = ListLengthForValuesList(list);
+        int nr = rest.Length > start ? rest.Length - start : 0;
+        int n = nl + nr;
+        if (n <= 4)
+        {
+            LispObject a0 = null!, a1 = null!, a2 = null!, a3 = null!;
+            int k = 0;
+            void Put(LispObject v) { if (k == 0) a0 = v; else if (k == 1) a1 = v; else if (k == 2) a2 = v; else a3 = v; k++; }
+            if (restFirst != 0) for (int i = 0; i < nr; i++) Put(rest[start + i]);
+            for (var cur = list; cur is Cons c; cur = c.Cdr) Put(c.Car);
+            if (restFirst == 0) for (int i = 0; i < nr; i++) Put(rest[start + i]);
+            switch (n)
+            {
+                case 0: return fn.Invoke0M(mode);
+                case 1: return fn.Invoke1M(a0, mode);
+                case 2: return fn.Invoke2M(a0, a1, mode);
+                case 3: return fn.Invoke3M(a0, a1, a2, mode);
+                default: return fn.Invoke4M(a0, a1, a2, a3, mode);
+            }
+        }
+        return ApplyListRest(fn, list, rest, start, restFirst);
+    }
+
+    /// <summary>ApplyArgs with one fixed argument passed directly (no array for it).</summary>
+    public static LispObject ApplyArgs1(LispObject func, LispObject a0, LispObject[] rest, int start)
+    {
+        int nr = rest.Length > start ? rest.Length - start : 0;
+        if (nr <= 3)
+        {
+            var fn = CoerceToFunctionFor(func, "APPLY");
+            switch (nr)
+            {
+                case 0: return fn.Invoke1(a0);
+                case 1: return fn.Invoke2(a0, rest[start]);
+                case 2: return fn.Invoke3(a0, rest[start], rest[start + 1]);
+                default: return fn.Invoke4(a0, rest[start], rest[start + 1], rest[start + 2]);
+            }
+        }
+        return ApplyArgs(func, new[] { a0 }, rest, start);
+    }
+
+    public static LispObject ApplyArgs1M(LispObject func, LispObject a0, LispObject[] rest, int start, int mode)
+    {
+        int nr = rest.Length > start ? rest.Length - start : 0;
+        if (nr <= 3)
+        {
+            var fn = CoerceToFunctionFor(func, "APPLY");
+            switch (nr)
+            {
+                case 0: return fn.Invoke1M(a0, mode);
+                case 1: return fn.Invoke2M(a0, rest[start], mode);
+                case 2: return fn.Invoke3M(a0, rest[start], rest[start + 1], mode);
+                default: return fn.Invoke4M(a0, rest[start], rest[start + 1], rest[start + 2], mode);
+            }
+        }
+        return ApplyArgs(func, new[] { a0 }, rest, start);
+    }
+
     /// <summary>ApplyArgs for a call site that takes the callee's value mode.</summary>
     public static LispObject ApplyArgsM(LispObject func, LispObject[]? fixedArgs, LispObject[] rest, int start, int mode)
     {
-        var fn = CoerceToFunction(func);
+        var fn = CoerceToFunctionFor(func, "APPLY");
         int nf = fixedArgs == null ? 0 : fixedArgs.Length;
         int nr = rest.Length > start ? rest.Length - start : 0;
         if (nf == 0)
@@ -631,12 +865,29 @@ public static partial class Runtime
                 case 4: return fn.Invoke4M(rest[start], rest[start + 1], rest[start + 2], rest[start + 3], mode);
             }
         }
+        if (nf + nr <= 4)
+        {
+            LispObject a0 = null!, a1 = null!, a2 = null!, a3 = null!;
+            for (int i = 0; i < nf + nr; i++)
+            {
+                var v = i < nf ? fixedArgs![i] : rest[start + i - nf];
+                if (i == 0) a0 = v; else if (i == 1) a1 = v; else if (i == 2) a2 = v; else a3 = v;
+            }
+            switch (nf + nr)
+            {
+                case 0: return fn.Invoke0M(mode);
+                case 1: return fn.Invoke1M(a0, mode);
+                case 2: return fn.Invoke2M(a0, a1, mode);
+                case 3: return fn.Invoke3M(a0, a1, a2, mode);
+                default: return fn.Invoke4M(a0, a1, a2, a3, mode);
+            }
+        }
         return ApplyArgs(fn, fixedArgs, rest, start);
     }
 
     public static LispObject ApplyM(LispObject func, LispObject argList, int mode)
     {
-        var fn = CoerceToFunction(func);
+        var fn = CoerceToFunctionFor(func, "APPLY");
         switch (ApplyTailLength(argList))
         {
             case 0: return fn.Invoke0M(mode);
@@ -662,7 +913,7 @@ public static partial class Runtime
 
     public static LispObject ApplySpread1M(LispObject func, LispObject a, LispObject argList, int mode)
     {
-        var fn = CoerceToFunction(func);
+        var fn = CoerceToFunctionFor(func, "APPLY");
         switch (ApplyTailLength(argList))
         {
             case 0: return fn.Invoke1M(a, mode);
@@ -677,6 +928,12 @@ public static partial class Runtime
                 var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr; var c2 = (Cons)c1.Cdr;
                 return fn.Invoke4M(a, c0.Car, c1.Car, c2.Car, mode);
             }
+            case 4:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr; var c2 = (Cons)c1.Cdr;
+                var c3 = (Cons)c2.Cdr;
+                return fn.Invoke5M(a, c0.Car, c1.Car, c2.Car, c3.Car, mode);
+            }
         }
         return ApplySpread1(fn, a, argList);
     }
@@ -684,7 +941,7 @@ public static partial class Runtime
     public static LispObject ApplySpread2M(LispObject func, LispObject a, LispObject b,
                                            LispObject argList, int mode)
     {
-        var fn = CoerceToFunction(func);
+        var fn = CoerceToFunctionFor(func, "APPLY");
         switch (ApplyTailLength(argList))
         {
             case 0: return fn.Invoke2M(a, b, mode);
@@ -694,6 +951,11 @@ public static partial class Runtime
                 var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr;
                 return fn.Invoke4M(a, b, c0.Car, c1.Car, mode);
             }
+            case 3:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr; var c2 = (Cons)c1.Cdr;
+                return fn.Invoke5M(a, b, c0.Car, c1.Car, c2.Car, mode);
+            }
         }
         return ApplySpread2(fn, a, b, argList);
     }
@@ -702,7 +964,7 @@ public static partial class Runtime
     public static LispObject ApplySpread2(LispObject func, LispObject a, LispObject b,
                                           LispObject argList)
     {
-        var fn = CoerceToFunction(func);
+        var fn = CoerceToFunctionFor(func, "APPLY");
         int n = ApplyTailLength(argList);
         switch (n)
         {
@@ -712,6 +974,11 @@ public static partial class Runtime
             {
                 var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr;
                 return fn.Invoke4(a, b, c0.Car, c1.Car);
+            }
+            case 3:
+            {
+                var c0 = (Cons)argList; var c1 = (Cons)c0.Cdr; var c2 = (Cons)c1.Cdr;
+                return fn.Invoke5(a, b, c0.Car, c1.Car, c2.Car);
             }
         }
         var args = new LispObject[n + 2];
@@ -908,6 +1175,11 @@ public static partial class Runtime
     {
         if (symObj is not Symbol sym)
             throw new LispErrorException(new LispTypeError("DEFCONSTANT: not a symbol", symObj));
+        // A keyword is already its own constant value; DEFCONSTANT to that same
+        // value restates it, anything else would change what the keyword means.
+        if (ReferenceEquals(sym.HomePackage, Startup.KeywordPkg) && !ReferenceEquals(value, sym))
+            throw new LispErrorException(new LispProgramError(
+                $"DEFCONSTANT: can't define :{sym.Name} as a constant with a value other than itself"));
         // COMPILE-FILE evaluates DEFCONSTANT at compile time so a macro later in
         // the file can read the value; loading the fasl in the same image then
         // evaluates the form again. For a list, string or vector value the second
@@ -957,6 +1229,29 @@ public static partial class Runtime
         MarkCompileTimeConstant(sym, compileTime);
         return sym;
     }
+
+    /// <summary>
+    /// DEFVAR / DEFPARAMETER of a name that is a constant variable: the name cannot
+    /// also be a special variable (SBCL: "Cannot proclaim a CONSTANT variable
+    /// SPECIAL"). Without this DEFPARAMETER stored a value the compiled references
+    /// to the constant never saw.
+    /// </summary>
+    public static LispObject CheckSpecialProclamation(LispObject symObj, LispObject operatorName)
+    {
+        if (symObj is Symbol sym
+            && (sym.IsConstant || ReferenceEquals(sym.HomePackage, Startup.KeywordPkg)))
+            throw new LispErrorException(new LispProgramError(
+                $"{(operatorName as Symbol)?.Name ?? "DEFVAR"}: {sym.Name} is a constant variable and cannot be made special"));
+        return symObj;
+    }
+
+    /// <summary>
+    /// True when DEFINE-SYMBOL-MACRO may not take NAME: it is a constant variable or
+    /// a special (global) variable (CLHS DEFINE-SYMBOL-MACRO).
+    /// </summary>
+    public static bool SymbolMacroNameConflicts(LispObject nameObj)
+        => nameObj is Symbol sym
+            && (sym.IsConstant || sym.IsSpecial || ReferenceEquals(sym.HomePackage, Startup.KeywordPkg));
 
     // Constants whose current value was installed (or last confirmed) by a
     // DEFCONSTANT evaluated while COMPILE-FILE was running. The next load-time
@@ -1035,6 +1330,27 @@ public static partial class Runtime
     internal static string ParseElementTypeName(LispObject typeSpec)
         => UpgradeElementTypeName(ParseRequestedElementTypeName(typeSpec));
 
+    /// <summary>The integer element types with storage, narrowest first, as specifiers and names.</summary>
+    private static readonly (Func<LispObject> Spec, string Name)[] IntegerElementCandidates =
+    {
+        (() => Startup.Sym("BIT"), "BIT"),
+        (() => Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(2)), "UNSIGNED-BYTE-2"),
+        (() => Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(4)), "UNSIGNED-BYTE-4"),
+        (() => Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(7)), "UNSIGNED-BYTE-7"),
+        (() => Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(8)), "UNSIGNED-BYTE-8"),
+        (() => Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(15)), "UNSIGNED-BYTE-15"),
+        (() => Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(16)), "UNSIGNED-BYTE-16"),
+        (() => Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(31)), "UNSIGNED-BYTE-31"),
+        (() => Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(32)), "UNSIGNED-BYTE-32"),
+        (() => Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(62)), "UNSIGNED-BYTE-62"),
+        (() => Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(63)), "UNSIGNED-BYTE-63"),
+        (() => Runtime.List(Startup.Sym("UNSIGNED-BYTE"), Fixnum.Make(64)), "UNSIGNED-BYTE-64"),
+        (() => Runtime.List(Startup.Sym("SIGNED-BYTE"), Fixnum.Make(8)), "SIGNED-BYTE-8"),
+        (() => Runtime.List(Startup.Sym("SIGNED-BYTE"), Fixnum.Make(16)), "SIGNED-BYTE-16"),
+        (() => Runtime.List(Startup.Sym("SIGNED-BYTE"), Fixnum.Make(32)), "SIGNED-BYTE-32"),
+        (() => Runtime.List(Startup.Sym("SIGNED-BYTE"), Fixnum.Make(64)), "SIGNED-BYTE-64"),
+    };
+
     /// <summary>INTEGER-LENGTH of X: the bits X needs, sign bit excluded.</summary>
     private static int IntegerLength(long x)
     {
@@ -1065,7 +1381,7 @@ public static partial class Runtime
         const string ub = "UNSIGNED-BYTE-";
         const string sb = "SIGNED-BYTE-";
         if (name.StartsWith(ub, StringComparison.Ordinal)
-            && int.TryParse(name.Substring(ub.Length), out int un) && un >= 1)
+            && int.TryParse(name.Substring(ub.Length), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int un) && un >= 1)
         {
             if (un == 1) return "BIT";
             foreach (int w in UnsignedElementWidths)
@@ -1073,7 +1389,7 @@ public static partial class Runtime
             return "T";
         }
         if (name.StartsWith(sb, StringComparison.Ordinal)
-            && int.TryParse(name.Substring(sb.Length), out int sn) && sn >= 1)
+            && int.TryParse(name.Substring(sb.Length), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int sn) && sn >= 1)
         {
             if (sn > 32 && sn < 64) return "FIXNUM";
             int w = sn <= 8 ? 8 : sn <= 16 ? 16 : sn <= 32 ? 32 : sn == 64 ? 64 : 0;
@@ -1132,6 +1448,11 @@ public static partial class Runtime
             // it and SIMPLE-VECTOR-P reject the array. A symbol that names no
             // type at all (a misspelling) is an error, not a general array.
             if (IsUnknownTypeSymbol(ets)) throw UnknownTypeSpecifier(typeSpec);
+            // A named subtype of CHARACTER without storage of its own (EXTENDED-CHAR) upgrades to CHARACTER.
+            if (ets.HomePackage == Startup.CL
+                && Runtime.SubtypepClean(typeSpec, Startup.Sym("CHARACTER")) is not Nil
+                && Runtime.SubtypepClean(typeSpec, Nil.Instance) is Nil)
+                return "CHARACTER";
             return "T";
         }
         if (typeSpec is Cons etCons && etCons.Car is Symbol etHead)
@@ -1213,9 +1534,27 @@ public static partial class Runtime
             // has to upgrade the way CHARACTER does (CLHS 15.1.2.1): the array
             // is a string. The empty type is left out (it is a subtype of
             // everything).
-            if (Runtime.Primary(Runtime.Subtypep(typeSpec, Startup.Sym("CHARACTER"))) is not Nil
-                && Runtime.Primary(Runtime.Subtypep(typeSpec, Nil.Instance)) is Nil)
+            // The empty type upgrades to NIL; a set of base characters to BASE-CHAR, so that
+            // upgrading is monotonic ((eql #\a) is in BASE-CHAR, and so must its upgrade be).
+            // Only a specifier of the COMMON-LISP symbols: another package's UNSIGNED-BYTE is a
+            // different, unknown type, which upgrades to T.
+            if (hname == "") return "T";
+            if (Runtime.SubtypepClean(typeSpec, Nil.Instance) is not Nil)
+                return "NIL";
+            if (Runtime.SubtypepClean(typeSpec, Startup.Sym("BASE-CHAR")) is not Nil)
+                return "BASE-CHAR";
+            if (Runtime.SubtypepClean(typeSpec, Startup.Sym("CHARACTER")) is not Nil)
                 return "CHARACTER";
+            // A set of integers ((member 0 255), (or (integer 0 9) (integer 20 30)), an AND with a
+            // range) upgrades like the narrowest integer type with storage that holds it, so
+            // upgrading stays monotonic: (member 0 1) is in BIT, and so must its upgrade be.
+            if (Runtime.SubtypepClean(typeSpec, Startup.Sym("INTEGER")) is not Nil
+                && Runtime.SubtypepClean(typeSpec, Nil.Instance) is Nil)
+            {
+                foreach (var (candidate, name) in IntegerElementCandidates)
+                    if (Runtime.SubtypepClean(typeSpec, candidate()) is not Nil)
+                        return name;
+            }
             // Same for a compound specifier nothing above specializes:
             // (or null viewport) is stored generally, so it upgrades to T. The
             // head alone ("OR") is not a type the array could report, and TYPEP
@@ -1225,9 +1564,40 @@ public static partial class Runtime
         return "T";
     }
 
+    // LispFunction is not sealed (GenericFunction derives from it), so `designator as LispFunction` is a
+    // call to the cast helper even when the object is a plain LispFunction, which a closure is. The exact
+    // type is one inline compare; every other object takes the ordinary cast.
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispFunction CoerceToFunction(LispObject designator)
-        => designator as LispFunction ?? CoerceToFunctionSlow(designator);
+    {
+        if (designator is not null && designator.GetType() == typeof(LispFunction))
+            return System.Runtime.CompilerServices.Unsafe.As<LispFunction>(designator);
+        return designator as LispFunction ?? CoerceToFunctionSlow(designator!);
+    }
+
+    /// <summary>The LispObject in a closure's environment slot. The compiler stores only LispObjects
+    /// there (boxed variables are the LispBox and LispObject[] slots, read separately), so the cast is
+    /// not checked: the checked one walks the class hierarchy of an abstract base on every read.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static LispObject EnvSlot(object slot) => System.Runtime.CompilerServices.Unsafe.As<LispObject>(slot);
+
+    // The same, for a function argument of the Lisp function CALLER (a :test, :key or
+    // predicate argument): what is not a function designator is a TYPE-ERROR that
+    // names CALLER.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static LispFunction CoerceToFunctionFor(LispObject designator, string caller)
+        => designator as LispFunction ?? CoerceToFunctionSlow(designator, caller);
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static LispFunction CoerceToFunctionSlow(LispObject designator, string caller)
+    {
+        var d = Primary(designator);
+        if (d is LispFunction or Symbol or Nil or T or LispDotNetObject { Value: Delegate })
+            return CoerceToFunctionSlow(designator);
+        throw new LispErrorException(new LispTypeError(
+            $"{caller}: not a function designator: {FormatObject(d, true)}", d,
+            List(Startup.Sym("OR"), Startup.Sym("FUNCTION"), Startup.Sym("SYMBOL"))));
+    }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static LispFunction CoerceToFunctionSlow(LispObject designator)
@@ -1239,21 +1609,25 @@ public static partial class Runtime
             if (sym.Function is LispFunction sfn) return sfn;
             // Cross-package bridge: a helper the C# runtime registered on a
             // CL / DOTCL-INTERNAL symbol is reachable through (funcall 'name)
-            // read in another package. Only dotcl's own packages may answer, and
+            // read in another package. Only dotcl's own packages may answer (a name COMMON-LISP
+            // exports does not: that is the standard operator, not a helper), and
             // the hit is not written back to sym (see FindFunctionAcrossPackages).
-            if (Emitter.CilAssembler.FindFunctionAcrossPackages(sym)
+            if (Emitter.CilAssembler.FindFunctionAcrossPackages(sym, skipStandardNames: true)
                 is LispFunction otherFn)
                 return otherFn;
             return UndefinedFunctionError(sym);
         }
         if (designator is LispDotNetObject { Value: Delegate del })
             return DelegateAsFunction(del);
+        // NIL and T are symbols of the language, though not Symbol objects here: calling one is a
+        // call of an undefined function, as for any other symbol with no function.
+        if (designator is Nil or T) return UndefinedFunctionError(designator);
         throw new LispErrorException(new LispTypeError("FUNCALL: not a function designator", designator));
     }
 
     public static LispObject Funcall(LispObject func, params LispObject[] args)
     {
-        var fn = CoerceToFunction(func);
+        var fn = CoerceToFunctionFor(func, "FUNCALL");
         return fn.Invoke(args);
     }
 
@@ -1263,7 +1637,7 @@ public static partial class Runtime
     {
         if (list is not Nil && list is not Cons)
             throw new LispErrorException(new LispTypeError("MAPCAR: not a list", list, Startup.Sym("LIST")));
-        var fn = CoerceToFunction(func);
+        var fn = CoerceToFunctionFor(func, "MAPCAR");
         if (list is not Cons firstCons)
             return Nil.Instance; // Empty list
         // Build result list directly without intermediate List<>
@@ -1285,13 +1659,23 @@ public static partial class Runtime
     /// <summary>MAPCAR over exactly two lists, as a direct entry: (MAPCAR f a b) is
     /// the common multi-list shape, and reaching it without an argument array means
     /// the call allocates nothing before the walk begins.</summary>
+    /// <summary>True when the MAPCAR cursor CUR has run out (NIL); false for a cons; any other
+    /// object is not a list, which is a type error rather than the end of the list.</summary>
+    private static bool MapCursorEnded(LispObject cur)
+    {
+        if (cur is Cons) return false;
+        if (cur is Nil) return true;
+        throw new LispErrorException(new LispTypeError("not a list", cur, Startup.Sym("LIST")));
+    }
+
     public static LispObject Mapcar2(LispObject func, LispObject l1, LispObject l2)
     {
-        var fn = CoerceToFunction(func);
+        var fn = CoerceToFunctionFor(func, "MAPCAR");
         Cons? head = null, tail = null;
         LispObject a = l1, b = l2;
-        while (a is Cons c0 && b is Cons c1)
+        while (!MapCursorEnded(a) && !MapCursorEnded(b))
         {
+            var c0 = (Cons)a; var c1 = (Cons)b;
             a = c0.Cdr; b = c1.Cdr;
             var cell = new Cons(UnwrapMv(fn.Invoke2(c0.Car, c1.Car)), Nil.Instance);
             if (tail == null) { head = cell; tail = cell; }
@@ -1314,7 +1698,7 @@ public static partial class Runtime
     /// cannot be reused, because a callee with andrest may keep it.</summary>
     public static LispObject MapcarN(LispObject func, LispObject[] lists)
     {
-        var fn = CoerceToFunction(func);
+        var fn = CoerceToFunctionFor(func, "MAPCAR");
         int nLists = lists.Length;
         var cursors = new LispObject[nLists];
         for (int i = 0; i < nLists; i++) cursors[i] = lists[i];
@@ -1324,21 +1708,25 @@ public static partial class Runtime
             LispObject value;
             if (nLists == 2)
             {
-                if (cursors[0] is not Cons c0 || cursors[1] is not Cons c1) break;
+                if (MapCursorEnded(cursors[0]) || MapCursorEnded(cursors[1])) break;
+                var c0 = (Cons)cursors[0]; var c1 = (Cons)cursors[1];
                 cursors[0] = c0.Cdr; cursors[1] = c1.Cdr;
                 value = UnwrapMv(fn.Invoke2(c0.Car, c1.Car));
             }
             else if (nLists == 3)
             {
-                if (cursors[0] is not Cons c0 || cursors[1] is not Cons c1 ||
-                    cursors[2] is not Cons c2) break;
+                if (MapCursorEnded(cursors[0]) || MapCursorEnded(cursors[1]) ||
+                    MapCursorEnded(cursors[2])) break;
+                var c0 = (Cons)cursors[0]; var c1 = (Cons)cursors[1]; var c2 = (Cons)cursors[2];
                 cursors[0] = c0.Cdr; cursors[1] = c1.Cdr; cursors[2] = c2.Cdr;
                 value = UnwrapMv(fn.Invoke3(c0.Car, c1.Car, c2.Car));
             }
             else if (nLists == 4)
             {
-                if (cursors[0] is not Cons c0 || cursors[1] is not Cons c1 ||
-                    cursors[2] is not Cons c2 || cursors[3] is not Cons c3) break;
+                if (MapCursorEnded(cursors[0]) || MapCursorEnded(cursors[1]) ||
+                    MapCursorEnded(cursors[2]) || MapCursorEnded(cursors[3])) break;
+                var c0 = (Cons)cursors[0]; var c1 = (Cons)cursors[1];
+                var c2 = (Cons)cursors[2]; var c3 = (Cons)cursors[3];
                 cursors[0] = c0.Cdr; cursors[1] = c1.Cdr;
                 cursors[2] = c2.Cdr; cursors[3] = c3.Cdr;
                 value = UnwrapMv(fn.Invoke4(c0.Car, c1.Car, c2.Car, c3.Car));
@@ -1349,8 +1737,8 @@ public static partial class Runtime
                 bool done = false;
                 for (int i = 0; i < nLists; i++)
                 {
-                    if (cursors[i] is Cons c) { args[i] = c.Car; cursors[i] = c.Cdr; }
-                    else { done = true; break; }
+                    if (MapCursorEnded(cursors[i])) { done = true; break; }
+                    var c = (Cons)cursors[i]; args[i] = c.Car; cursors[i] = c.Cdr;
                 }
                 if (done) break;
                 value = UnwrapMv(fn.Invoke(args));
@@ -1383,19 +1771,26 @@ public static partial class Runtime
     ///
     /// The state is consumed either way, so a surrounding MULTIPLE-VALUE-LIST does
     /// not see values NTH-VALUE already reduced to one.</summary>
-    public static LispObject NthValueOf(LispObject primary, int n)
+    public static LispObject NthValueOf(LispObject primary, int n) =>
+        NthValueOfLong(primary, n);
+
+    /// <summary>NTH-VALUE with a computed index, checked as NTH checks it.</summary>
+    public static LispObject NthValueOfVariable(LispObject primary, LispObject index) =>
+        NthValueOfLong(primary, IndexLimit("NTH-VALUE", index));
+
+    private static LispObject NthValueOfLong(LispObject primary, long n)
     {
         if (primary is MvReturn mv)
         {
             MultipleValues.Reset();
-            return mv[n];
+            return n >= 0 && n < mv.Count ? mv[(int)n] : Nil.Instance;
         }
         var snap = MultipleValues.TakeSnap(primary, out int sn);
         if (snap != null)
-            return n >= 0 && n < sn ? snap[n] : Nil.Instance;
+            return n >= 0 && n < sn ? snap[(int)n] : Nil.Instance;
         int count = MultipleValues.OwnCount(primary);
         LispObject result = count > 0
-            ? (n >= 0 && n < count ? MultipleValues.OwnNth(n) : Nil.Instance)
+            ? (n >= 0 && n < count ? MultipleValues.OwnNth((int)n) : Nil.Instance)
             : (n == 0 ? primary : Nil.Instance);
         MultipleValues.Reset();
         return result;
@@ -1785,6 +2180,9 @@ public static partial class Runtime
         t_rawSignalled = outcome.Condition;
         try
         {
+            // An error the runtime raises directly is signalled here, so *BREAK-ON-SIGNALS* is
+            // consulted as for ERROR.
+            ConditionSystem.CheckBreakOnSignals(outcome.Condition);
             outcome.Transfer = HandlerClusterStack.SignalForExit(outcome.Condition);
         }
         catch (Exception transfer)
@@ -2303,6 +2701,7 @@ public static partial class Runtime
             if (args[0] is not LispFunction fn)
                 throw new LispErrorException(new LispTypeError("(SETF SYMBOL-FUNCTION): not a function", args[0]));
             var sym = Runtime.GetSymbol(args[1], "(SETF SYMBOL-FUNCTION)");
+            Runtime.ForgetMacroOnFunctionDefinition(sym);
             sym.Function = fn;
             Emitter.CilAssembler.RegisterFunction(sym.Name, fn);
             return args[0];
@@ -2393,12 +2792,13 @@ public static partial class Runtime
         Startup.RegisterUnary("SPECIAL-OPERATOR-P", Runtime.SpecialOperatorP);
 
         // SET, SYMBOL-CONSTANT-P, SET-SYMBOL-CONSTANT
-        Startup.RegisterBinary("SET", (symObj, val) => {
+        // The shared setter also refuses NIL, T and keywords.
+        Startup.RegisterBinary("SET", (symObj, val) => Runtime.SetSymbolValue(symObj, val));
+        // Replaces the value of a symbol even when it is a constant (tests of what compiled code does
+        // when a constant's storage changes underneath it).
+        Startup.RegisterBinary("%FORCE-SYMBOL-VALUE", (symObj, val) => {
             if (symObj is not Symbol sym)
-                throw new LispErrorException(new LispTypeError("SET: not a symbol", symObj));
-            // A constant is not assignable, here as in SETQ (the interpreter's
-            // SETQ for a special variable comes through this function).
-            if (sym.IsConstant) throw ConstantAssignmentError(sym, "SET");
+                throw new LispErrorException(new LispTypeError("%FORCE-SYMBOL-VALUE: not a symbol", symObj));
             DynamicBindings.Set(sym, val);
             return val;
         });
@@ -2407,6 +2807,8 @@ public static partial class Runtime
         // The DEFCONSTANT primitive: set + mark + refuse a non-EQL redefinition.
         // The interpreter's DEFCONSTANT calls this rather than SET, which now
         // (correctly) refuses to assign a symbol that is already constant.
+        Startup.RegisterBinary("%CHECK-SPECIAL-PROCLAMATION", (symObj, op) => Runtime.CheckSpecialProclamation(symObj, op));
+        Startup.RegisterUnary("%SYMBOL-MACRO-NAME-CONFLICTS-P", nameObj => Runtime.SymbolMacroNameConflicts(nameObj) ? T.Instance : Nil.Instance);
         Startup.RegisterBinary("%DEFINE-CONSTANT", (symObj, val) => Runtime.DefineConstant(symObj, val));
 
         // COPY-STRUCTURE, MAKE-SYMBOL
@@ -2468,7 +2870,15 @@ public static partial class Runtime
                     var (sym, status) = Startup.CL.FindSymbol(name);
                     if (status != SymbolStatus.None && sym.Function is LispFunction f
                         && f is not GenericFunction)
+                    {
                         f.SetDirectDelegate(op);
+                        // 3 and 4 arguments: the left fold the wrapper makes, without its args
+                        // array and &rest list ((funcall #'+ 1 2 3) cost 96 B).
+                        f.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject>)
+                            ((a, b, c) => op(op(a, b), c)));
+                        f.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)
+                            ((a, b, c, d) => op(op(op(a, b), c), d)));
+                    }
                 }
                 Attach("+", Runtime.Add);
                 Attach("-", Runtime.Subtract);
@@ -2505,15 +2915,28 @@ public static partial class Runtime
                 if (args.Length == 0) throw new LispErrorException(new LispProgramError($"{opName}: requires at least 1 argument"));
                 if (args.Length == 1 && args[0] is not LispChar)
                     throw new LispErrorException(new LispTypeError($"{opName}: not a character", args[0], Startup.Sym("CHARACTER")));
+                foreach (var o in args)
+                    if (o is not LispChar)
+                        throw new LispErrorException(new LispTypeError($"{opName}: not a character", o, Startup.Sym("CHARACTER")));
                 for (int i = 1; i < args.Length; i++)
                     if (!Runtime.IsTruthy(cmp(args[i-1], args[i]))) return Nil.Instance;
                 return T.Instance;
             });
             fn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)((a, b) =>
                 Runtime.IsTruthy(cmp(a, b)) ? T.Instance : (LispObject)Nil.Instance));
+            static void chr(string op, LispObject o)
+            {
+                if (o is not LispChar)
+                    throw new LispErrorException(new LispTypeError($"{op}: not a character", o, Startup.Sym("CHARACTER")));
+            }
             fn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject>)((a, b, c) =>
-                Runtime.IsTruthy(cmp(a, b)) && Runtime.IsTruthy(cmp(b, c))
-                    ? T.Instance : (LispObject)Nil.Instance));
+            { chr(opName, a); chr(opName, b); chr(opName, c);
+                return Runtime.IsTruthy(cmp(a, b)) && Runtime.IsTruthy(cmp(b, c))
+                    ? T.Instance : (LispObject)Nil.Instance; }));
+            fn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)((a, b, c, d) =>
+            { chr(opName, a); chr(opName, b); chr(opName, c); chr(opName, d);
+                return Runtime.IsTruthy(cmp(a, b)) && Runtime.IsTruthy(cmp(b, c))
+                && Runtime.IsTruthy(cmp(c, d)) ? T.Instance : (LispObject)Nil.Instance; }));
             return fn;
         }
         Emitter.CilAssembler.RegisterFunction("CHAR=",  NaryCharChain("CHAR=",  Runtime.CharEqual));
@@ -2542,6 +2965,7 @@ public static partial class Runtime
             : throw new LispErrorException(new LispTypeError($"{fn}: not a character", o));
         var charEqualFn = new LispFunction(args => {
             if (args.Length < 1) throw new LispErrorException(new LispProgramError("CHAR-EQUAL: requires at least 1 argument"));
+            foreach (var o in args) foldCI(o, "CHAR-EQUAL");
             for (int i = 1; i < args.Length; i++)
                 if (foldCI(args[i-1], "CHAR-EQUAL") != foldCI(args[i], "CHAR-EQUAL")) return Nil.Instance;
             if (args.Length == 1) foldCI(args[0], "CHAR-EQUAL");
@@ -2551,24 +2975,41 @@ public static partial class Runtime
         // (one pairwise fold-compare; the length-1 branch can't fire).
         charEqualFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)((a, b) =>
             foldCI(a, "CHAR-EQUAL") != foldCI(b, "CHAR-EQUAL") ? Nil.Instance : (LispObject)T.Instance));
+        charEqualFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject>)((a, b, c) =>
+        {
+            var fa = foldCI(a, "CHAR-EQUAL"); var fb = foldCI(b, "CHAR-EQUAL"); var fc = foldCI(c, "CHAR-EQUAL");
+            return fa != fb || fb != fc ? Nil.Instance : (LispObject)T.Instance;
+        }));
+        charEqualFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject, LispObject, LispObject>)((a, b, c, d) =>
+        {
+            var fa = foldCI(a, "CHAR-EQUAL"); var fb = foldCI(b, "CHAR-EQUAL");
+            var fc = foldCI(c, "CHAR-EQUAL"); var fd = foldCI(d, "CHAR-EQUAL");
+            return fa != fb || fb != fc || fc != fd ? Nil.Instance : (LispObject)T.Instance;
+        }));
         Emitter.CilAssembler.RegisterFunction("CHAR-EQUAL", charEqualFn);
         Emitter.CilAssembler.RegisterFunction("CHAR-NOT-EQUAL", new LispFunction(args => {
             if (args.Length < 1) throw new LispErrorException(new LispProgramError("CHAR-NOT-EQUAL: requires at least 1 argument"));
+            foreach (var o in args) foldCI(o, "CHAR-NOT-EQUAL");
             for (int i = 0; i < args.Length; i++)
                 for (int j = i+1; j < args.Length; j++)
                     if (foldCI(args[i], "CHAR-NOT-EQUAL") == foldCI(args[j], "CHAR-NOT-EQUAL")) return Nil.Instance;
             if (args.Length == 1) foldCI(args[0], "CHAR-NOT-EQUAL");
             return T.Instance;
         }));
-        Emitter.CilAssembler.RegisterFunction("CHAR-LESSP", new LispFunction(args => {
+        var charLesspFn = new LispFunction(args => {
             if (args.Length < 1) throw new LispErrorException(new LispProgramError("CHAR-LESSP: requires at least 1 argument"));
+            foreach (var o in args) foldCI(o, "CHAR-LESSP");
             for (int i = 1; i < args.Length; i++)
                 if (foldCI(args[i-1], "CHAR-LESSP") >= foldCI(args[i], "CHAR-LESSP")) return Nil.Instance;
             if (args.Length == 1) foldCI(args[0], "CHAR-LESSP");
             return T.Instance;
-        }));
+        });
+        charLesspFn.SetDirectDelegate((Func<LispObject, LispObject, LispObject>)((a, b) =>
+            foldCI(a, "CHAR-LESSP") >= foldCI(b, "CHAR-LESSP") ? Nil.Instance : (LispObject)T.Instance));
+        Emitter.CilAssembler.RegisterFunction("CHAR-LESSP", charLesspFn);
         Emitter.CilAssembler.RegisterFunction("CHAR-GREATERP", new LispFunction(args => {
             if (args.Length < 1) throw new LispErrorException(new LispProgramError("CHAR-GREATERP: requires at least 1 argument"));
+            foreach (var o in args) foldCI(o, "CHAR-GREATERP");
             for (int i = 1; i < args.Length; i++)
                 if (foldCI(args[i-1], "CHAR-GREATERP") <= foldCI(args[i], "CHAR-GREATERP")) return Nil.Instance;
             if (args.Length == 1) foldCI(args[0], "CHAR-GREATERP");
@@ -2576,6 +3017,7 @@ public static partial class Runtime
         }));
         Emitter.CilAssembler.RegisterFunction("CHAR-NOT-LESSP", new LispFunction(args => {
             if (args.Length < 1) throw new LispErrorException(new LispProgramError("CHAR-NOT-LESSP: requires at least 1 argument"));
+            foreach (var o in args) foldCI(o, "CHAR-NOT-LESSP");
             for (int i = 1; i < args.Length; i++)
                 if (foldCI(args[i-1], "CHAR-NOT-LESSP") < foldCI(args[i], "CHAR-NOT-LESSP")) return Nil.Instance;
             if (args.Length == 1) foldCI(args[0], "CHAR-NOT-LESSP");
@@ -2583,6 +3025,7 @@ public static partial class Runtime
         }));
         Emitter.CilAssembler.RegisterFunction("CHAR-NOT-GREATERP", new LispFunction(args => {
             if (args.Length < 1) throw new LispErrorException(new LispProgramError("CHAR-NOT-GREATERP: requires at least 1 argument"));
+            foreach (var o in args) foldCI(o, "CHAR-NOT-GREATERP");
             for (int i = 1; i < args.Length; i++)
                 if (foldCI(args[i-1], "CHAR-NOT-GREATERP") > foldCI(args[i], "CHAR-NOT-GREATERP")) return Nil.Instance;
             if (args.Length == 1) foldCI(args[0], "CHAR-NOT-GREATERP");
@@ -2732,6 +3175,15 @@ public static partial class Runtime
                 throw new LispErrorException(new LispTypeError("SET-MACRO-CHARACTER: not a character", args[0], Startup.Sym("CHARACTER")));
             char ch = macroLc.Value;
             var lispFn = args[1];
+            // NIL is accepted as SBCL does (it is what GET-MACRO-CHARACTER answers for a
+            // character that is not a macro character): the character becomes a constituent.
+            if (lispFn is Nil)
+            {
+                var rtNil = args.Length >= 4 && args[3] is LispReadtable rtn ? rtn
+                    : (LispReadtable)DynamicBindings.Get(Startup.Sym("*READTABLE*"));
+                rtNil.ClearMacroCharacter(ch);
+                return T.Instance;
+            }
             if (!IsFunctionDesignatorForReader(lispFn))
                 throw new LispErrorException(new LispTypeError("SET-MACRO-CHARACTER: not a function designator", lispFn, Startup.Sym("FUNCTION")));
             bool nonTerm = args.Length >= 3 && Runtime.IsTruthy(args[2]);

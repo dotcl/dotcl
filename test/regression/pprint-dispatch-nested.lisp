@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A pprint dispatch function's output goes through the table too.
 ;;;
 ;;; A dispatch function prints the parts of its object with WRITE or PRINC, and

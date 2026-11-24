@@ -39,7 +39,7 @@
     v))
 
 (deftest-compiled-only cf-thread-bindings.two-threads
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src-a (merge-pathnames "cftb-a.lisp" dir))
          (fasl-a (merge-pathnames "cftb-a.fasl" dir))
          (src-b (merge-pathnames "cftb-b.lisp" dir))

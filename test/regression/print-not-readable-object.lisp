@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; PRINT-NOT-READABLE-OBJECT must return the object that could not be printed.
 ;;;
 ;;; It was a stub: it checked its argument count and returned NIL, so a handler
@@ -30,10 +31,10 @@
 ;;; -- so the test looks for it inside the structure rather than at its root.
 (defun %pnro-reachable-p (root obj)
   (do ((p root (car p)) (n 0 (1+ n)))
-      ((or (eq p obj) (not (consp p)) (> n 400)) (eq p obj))))
+      ((or (eq p obj) (not (consp p)) (> n 20000)) (eq p obj))))
 
 (deftest print-not-readable-object.too-deep
-  (let* ((x (let ((y 'a)) (dotimes (i 300 y) (setq y (list y)))))
+  (let* ((x (let ((y 'a)) (dotimes (i 12000 y) (setq y (list y)))))
          (obj (%pnro-object (lambda () (let ((*print-readably* t)) (prin1-to-string x))))))
     (list (consp obj) (%pnro-reachable-p x obj)))
   (t t))

@@ -108,6 +108,12 @@ public static partial class DynamicClassBuilder
     /// were compiled into it: make sure package NAME exists, using USES, before
     /// the library's code interns its symbols there.
     /// </summary>
+    /// <summary>Called from the module initializer of a library that has a class
+    /// saying (:maps-condition NAME): a condition of that type leaves the library
+    /// as an exception of that class.</summary>
+    public static void RegisterConditionMap(string condition, Type exception)
+        => LibraryAbi.RegisterConditionMap(condition, exception);
+
     public static void EnsureBakedPackage(string name, string[] uses)
     {
         if (Package.FindPackage(name) != null) return;

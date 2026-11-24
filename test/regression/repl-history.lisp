@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The bundled REPL's history: the file it survives in, the Ctrl+R search over
 ;;; it, and the word motions that make a long recalled form editable.
 ;;;

@@ -114,20 +114,21 @@ public sealed class LispString : LispObject
         }
     }
 
-    public override string ToString() => $"\"{EscapeString(Value)}\"";
-
-    private static string EscapeString(string s)
+    public override string ToString()
     {
-        var sb = new System.Text.StringBuilder(s.Length);
-        foreach (var c in s)
+        string value = Value;
+        int extra = 0;
+        foreach (char c in value)
+            if (c == '"' || c == '\\') extra++;
+        if (extra == 0) return "\"" + value + "\"";
+        var sb = new System.Text.StringBuilder(value.Length + extra + 2);
+        sb.Append('"');
+        foreach (char c in value)
         {
-            switch (c)
-            {
-                case '"': sb.Append("\\\""); break;
-                case '\\': sb.Append("\\\\"); break;
-                default: sb.Append(c); break;
-            }
+            if (c == '"' || c == '\\') sb.Append('\\');
+            sb.Append(c);
         }
+        sb.Append('"');
         return sb.ToString();
     }
 

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Redefining an EQL-specialized method must replace it, not add a second one.
 ;;; Method identity is (specializers, qualifiers), and a class specializer is an
 ;;; interned object -- but an EQL specializer is a fresh (EQL value) cons on every

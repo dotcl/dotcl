@@ -206,7 +206,7 @@ public partial class CilAssembler
             var key = _prefix + ".inst." + _instanceOrder.Count;
             var deps = new List<LispInstance>();
             if (initForm != null && initForm is not Nil)
-                CollectInstanceRefs(initForm, deps, new HashSet<LispInstance>(ReferenceEqualityComparer.Instance));
+                CollectInstanceRefs(initForm, deps, new HashSet<LispObject>(ReferenceEqualityComparer.Instance));
             _instanceMap[li] = new InstanceEntry(key, initForm, deps);
             _instanceOrder.Add(li);
             if (li is LispInstance inst) LispInstance.PreRegisterIntern(key, inst);
@@ -214,10 +214,14 @@ public partial class CilAssembler
         }
 
         internal static void CollectInstanceRefs(LispObject form, List<LispInstance> result,
-            HashSet<LispInstance> seen)
+            HashSet<LispObject> seen)
         {
             if (form is LispInstance li) { if (seen.Add(li)) result.Add(li); return; }
-            if (form is Cons c) { CollectInstanceRefs(c.Car, result, seen); CollectInstanceRefs(c.Cdr, result, seen); }
+            if (form is Cons c && seen.Add(c))
+            {
+                CollectInstanceRefs(c.Car, result, seen);
+                CollectInstanceRefs(c.Cdr, result, seen);
+            }
         }
 
         // Track which instances are "created" (creation form emitted) and "initialized" (init form emitted)
@@ -532,7 +536,7 @@ public partial class CilAssembler
         /// instructions. Paired with EndFormLiterals.</summary>
         internal void BeginFormLiterals(LispObject instrList)
         {
-            var shared = CollectCrossLiteralNodes(instrList, out var roots);
+            var shared = CollectCrossLiteralNodes(instrList, out var roots, _crossLiteralSlots);
             CrossLiteralShared = shared.Count > 0 ? shared : null;
             CrossLiteralRoots = shared.Count > 0 ? roots : null;
         }
@@ -542,12 +546,14 @@ public partial class CilAssembler
             CrossLiteralShared = null;
             CrossLiteralRoots = null;
             CrossLiteralBuilding.Clear();
-            _crossLiteralSlots.Clear();
+            // _crossLiteralSlots is kept: an object an earlier form shared lives in its slot for
+            // the rest of the file (an instance made by MAKE-LOAD-FORM holds it there), so a later
+            // form that contains the same object has to read that slot, not build a copy.
         }
 
-        // Slots of the shared array (_fshared) for the objects of the current
-        // form that more than one of its literals contains. Slots are not
-        // reused: each form's objects get their own.
+        // Slots of the shared array (_fshared) for the objects that more than one
+        // literal of a form contains, for the whole file. Slots are not reused: an
+        // object keeps its slot, and a later form that contains it reads that slot.
         private readonly Dictionary<LispObject, int> _crossLiteralSlots =
             new(ReferenceEqualityComparer.Instance);
         private int _sharedSlotCount;
@@ -563,8 +569,26 @@ public partial class CilAssembler
             return slot;
         }
 
-        /// <summary>The slot of NODE when it is an object several literals of
-        /// the current form contain and no enclosing code is building it; else -1.</summary>
+        internal sealed record SlotPatch(string TargetKey, LispObject TargetSlot,
+            string OwnerKey, LispObject OwnerSlot);
+
+        internal readonly List<SlotPatch> SlotPatches = new();
+        private readonly Dictionary<LispObject, (string Key, LispObject Slot)> _slotOwners =
+            new(ReferenceEqualityComparer.Instance);
+
+        internal void RegisterSlotValue(LispObject value, string key, LispObject slot)
+        {
+            if (value is not (Cons or LispVector or LispHashTable or LispPathname)) return;
+            if (_slotOwners.TryGetValue(value, out var owner))
+            {
+                if (owner.Key != key)
+                    SlotPatches.Add(new SlotPatch(key, slot, owner.Key, owner.Slot));
+                return;
+            }
+            _slotOwners[value] = (key, slot);
+        }
+
+        /// <summary>The shared slot of NODE, or -1 when it has none or is being built.</summary>
         public int CrossLiteralSlotFor(LispObject node) =>
             CrossLiteralShared != null && CrossLiteralShared.ContainsKey(node)
                 && !CrossLiteralBuilding.Contains(node)
@@ -574,6 +598,16 @@ public partial class CilAssembler
             _sharedSlotsField ??= UninternedTypeBuilder!.DefineField(
                 "_fshared", typeof(LispObject[]),
                 System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+
+        private System.Reflection.Emit.FieldBuilder? _coalesceTableField;
+        /// <summary>The file's table of coalesced list literals (FaslData.CoalesceLiteral).</summary>
+        public System.Reflection.Emit.FieldBuilder CoalesceTableField()
+        {
+            if (_coalesceTableField != null) return _coalesceTableField;
+            var (tb, _) = FieldHolder();
+            return _coalesceTableField = tb.DefineField("_lit_coalesce", typeof(LispHashTable),
+                System.Reflection.FieldAttributes.Public | System.Reflection.FieldAttributes.Static);
+        }
 
         public System.Reflection.Emit.FieldBuilder DefineLiteralCacheField()
         {

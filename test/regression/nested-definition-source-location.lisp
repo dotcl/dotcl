@@ -7,7 +7,7 @@
 
 (defun %ndef-source ()
   (or *ndef-src*
-      (let ((src (merge-pathnames "ndef-fixture.lisp" (regression-temp-dir))))
+      (let ((src (merge-pathnames "ndef-fixture.lisp" (regression-temp-dir/))))
         (with-open-file (s src :direction :output :if-exists :supersede)
           (dolist (l '("(defpackage \"NDEF\" (:use \"CL\"))"                         ; 1
                        "(in-package \"NDEF\")"                                      ; 2
@@ -104,7 +104,7 @@
   t)
 
 (deftest-emitting-only nested-definition-source-location.load-fasl
-  (let ((fasl (merge-pathnames "ndef-fixture.fasl" (regression-temp-dir)))
+  (let ((fasl (merge-pathnames "ndef-fixture.fasl" (regression-temp-dir/)))
         (src (%ndef-source)))
     (when (find-package "NDEF") (delete-package "NDEF"))
     (let ((*error-output* (make-broadcast-stream)))

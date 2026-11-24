@@ -525,6 +525,12 @@
   (let ((*fixnum-wrap-licensed* nil))
     (fixnum-typed-p expr)))
 
+(defun %bit-long-operand-p (x)
+  "True when X is an operand COMPILE-AS-LONG of a bitwise op can produce: a wrap-typed fixnum, or an
+   element of an (unsigned-byte 64) array read as its bits (FIXNUM-TYPED-P admits that only under a
+   LOGAND mask that keeps the low bits)."
+  (or (fixnum-wrap-typed-p x) (and (consp x) (numeric-array-aref-u64-p x))))
+
 (defun fixnum-wrap-typed-p (expr)
   "FIXNUM-TYPED-P under *FIXNUM-WRAP-LICENSED*: COMPILE-AS-LONG of EXPR is
    EXPR's value modulo 2^64. Only for a result that lands in a place declared
@@ -583,6 +589,39 @@
        (not (%block-returns-to-p (cadr expr) (cddr expr)))
        (caddr expr)))
 
+(defun %char-code-of-form-p (expr)
+  "T for (CHAR-CODE X), the CL function: its value is a fixnum in [0, 65535]
+   (CHAR-CODE-LIMIT is 65536) whatever X is, or CHAR-CODE signals."
+  (and (consp expr) (eq (car expr) 'char-code) (consp (cdr expr)) (null (cddr expr))
+       (not (local-function-entry 'char-code))
+       (not (macrolet-shadowed-p 'char-code))))
+
+(defun %bit-ref-form-p (expr)
+  "T for (SBIT A I) / (BIT A I), the CL functions with one subscript that is
+   statically a fixnum: the value is 0 or 1, or the call signals."
+  (and (consp expr) (member (car expr) '(sbit bit)) (= (length expr) 3)
+       (not (local-function-entry (car expr)))
+       (not (macrolet-shadowed-p (car expr)))
+       (fixnum-typed-p (caddr expr))))
+
+(defun %long-assignment-parts (expr)
+  "For EXPR = (SETQ V E), (INCF V [N]) or (DECF V [N]) on a variable V held in an Int64 slot:
+   (values V E) with E the form assigned ((+ V N) for INCF). Else NIL. The value of such a form
+   is V's new value, an int64 (V's slot holds a fixnum)."
+  (and (consp expr) (boundp '*cstate*)
+       (member (car expr) '(setq incf decf))
+       (consp (cdr expr)) (symbolp (cadr expr)) (cadr expr)
+       (not (local-function-entry (car expr)))
+       (not (nth-value 1 (lookup-symbol-macro (cadr expr))))
+       (native-slot-p (cadr expr) (cstate-long-locals))
+       (not (assoc (lookup-local (cadr expr)) *induction-overflow-exits* :test #'equal))
+       (let ((v (cadr expr)))
+         (case (car expr)
+           (setq (and (consp (cddr expr)) (null (cdddr expr)) (values v (caddr expr))))
+           (t (and (or (null (cddr expr)) (and (consp (cddr expr)) (null (cdddr expr))))
+                   (values v `(,(if (eq (car expr) 'incf) '+ '-) ,v
+                               ,(if (cddr expr) (caddr expr) 1)))))))))
+
 (defun fixnum-typed-p (expr)
   "Return T if EXPR is statically known to produce a Fixnum value; see
    %FIXNUM-TYPED-P."
@@ -607,6 +646,12 @@
           (boundp '*cstate*)
           (native-slot-p expr (cstate-long-locals)))
      t)
+    ;; A captured, assigned FIXNUM variable in a LongBox cell: COMPILE-AS-LONG reads the raw long.
+    ((%long-box-var-p expr) t)
+    ;; (setq v e) / (incf v) / (decf v) on an Int64-slot variable: its new value, an int64.
+    ((%long-assignment-parts expr) t)
+    ;; A global special that (declaim (fixnum VAR)) declared: COMPILE-AS-LONG reads it through a checked unbox.
+    ((%proclaimed-fixnum-special-read-p expr) t)
     ;; Local var declared fixnum: must be a non-captured simple local
     ((and (symbolp expr)
           (boundp '*fixnum-locals*)
@@ -621,9 +666,16 @@
     ;; aref on a proven numeric-backed array local: elements are integers
     ;; within the storage range (stores are range-checked by the runtime).
     ((numeric-array-aref-info expr) t)
+    ;; (%aref-set A I... V) into an int64-backed array, used as a value: the stored element.
+    ((%aref-set-numeric-parts expr) t)
     ;; (char-code (schar s i)): a character code is a non-negative integer below
     ;; CHAR-CODE-LIMIT, so it is a fixnum whatever the string holds.
     ((string-char-code-ref expr) t)
+    ;; (char-code X) of anything: the same bound, and an X that is no character
+    ;; signals the type-error CHAR-CODE does (CharCodeOfL).
+    ((%char-code-of-form-p expr) t)
+    ;; (sbit A I) / (bit A I) with a fixnum subscript: a raw 0 or 1.
+    ((%bit-ref-form-p expr) t)
     ;; A word of 2 or 4 adjacent octets (OCTET-WORD-REF-INFO).
     ;; A 64-bit one only where its low 64 bits will do: its bits are those.
     ((let ((ow (octet-word-ref-info expr)))
@@ -644,7 +696,7 @@
     ((let ((b (%plain-block-body expr))) (and b (fixnum-typed-p b)))
      t)
     ((and (consp expr) (eq (car expr) 'the)
-          (let ((ty (cadr expr)))
+          (let ((ty (%the-value-type (cadr expr))))
             (or (eq ty 'fixnum)
                 ;; (the (signed-byte N) E), (the (integer LO HI) E) etc.: only
                 ;; int64-fitting ranges. A wide or half-open type like
@@ -690,6 +742,11 @@
           (or *fixnum-wrap-licensed* (expr-int-range expr)))
      t)
     ((and (consp expr) (= (length expr) 2)
+          (eq (car expr) 'signum)
+          (not (local-function-entry 'signum))
+          (fixnum-typed-p (cadr expr)))
+     t)
+    ((and (consp expr) (= (length expr) 2)
           (eq (car expr) 'isqrt)
           (not (local-function-entry 'isqrt))
           (fixnum-exact-p (cadr expr))
@@ -724,7 +781,11 @@
           (not *fixnum-wrap-licensed*)
           (let ((m (%logand-nonneg-operand (cadr expr) (caddr expr))))
             (and m
-                 (fixnum-wrap-typed-p (if (eq m (cadr expr)) (caddr expr) (cadr expr))))))
+                 (let ((other (if (eq m (cadr expr)) (caddr expr) (cadr expr))))
+                   (or (fixnum-wrap-typed-p other)
+                       ;; An element of an (unsigned-byte 64) array is read as its bits: the low
+                       ;; 63 bits the mask keeps are the element's own.
+                       (and (consp other) (numeric-array-aref-u64-p other)))))))
      t)
     ;; mod/rem of fixnums -> fixnum result (|r| < |divisor|, so no promotion).
     ;; The operands must be exact: the remainder of a wrapped value is not the
@@ -833,6 +894,13 @@
     ((and (consp expr) (= (length expr) 2)
           (eq (car expr) 'length)
           (not (local-function-entry 'length)))
+     t)
+    ;; (ARRAY-DIMENSION A N): the axis size, a C# int in the runtime (Fixnum.Make of one), so
+    ;; a fixnum like LENGTH. A bad array or axis signals as the call does.
+    ((and (consp expr) (= (length expr) 3)
+          (eq (car expr) 'array-dimension)
+          (not (local-function-entry 'array-dimension))
+          (not (macrolet-shadowed-p 'array-dimension)))
      t)
     ;; A call to a function whose ftype promises an integer result that fits
     ;; int64: FIXNUM, or a narrower integer type such as (UNSIGNED-BYTE 32).
@@ -1098,6 +1166,10 @@
           (push (list l :bits expr nil code) *u64-leaves*)
           (list :leaf l :bits))))))
 
+(defun %u64-const-macro-excluded-p (name)
+  "True for the arithmetic operators %U64-CONST-VALUE folds by itself."
+  (member name '(+ -)))
+
 (defun %u64-const-value (expr)
   "The integer EXPR stands for when it is a literal, a constant, a parameter
    bound to one, or a sum or difference of those; else NIL."
@@ -1112,6 +1184,19 @@
                 (<= 2 (length expr) 3))
            (let ((vals (mapcar #'%u64-const-value (cdr expr))))
              (and (every #'integerp vals) (apply (car expr) vals))))
+          ;; A macro call that expands to a constant (ironclad's
+          ;; GET-KECCAK-ROTATE-OFFSET as the count of an inline ROL64): the
+          ;; parameter is bound to that constant, so a shift by it is a
+          ;; constant shift.
+          ((and (consp expr) (symbolp (car expr)) (car expr)
+                (not (special-operator-p (car expr)))
+                (not (local-function-entry (car expr)))
+                (not (%u64-const-macro-excluded-p (car expr))))
+           (let ((expander (%macro-expander-here (car expr))))
+             (and expander
+                  (let ((exp (handler-case (cached-macroexpand expr expander)
+                               (error () nil))))
+                    (and (integerp exp) exp)))))
           (t nil))))
 
 (defun %u64-inline-expansion (expr)
@@ -1303,6 +1388,39 @@
        (let ((a (let ((*u64-mod-operand* t))
                   (u64-plan (cadr expr) :mod))))
          (and a (list :mod a (1- (integer-length (%u64-const-value (caddr expr))))))))
+      ;; A MASK-FIELD of a size proved to be in [0, 64] (see %MFIELD-PARTS).
+      ((and (%mfield-parts expr)
+            (let ((p (%u64-plan-mfield expr))) (and p (setq inl p))))
+       inl)
+      ;; The high 64 bits of a 128-bit product (see %MULHI-PARTS).
+      ((and (%mulhi-parts expr)
+            (let ((p (%u64-plan-mulhi expr))) (and p (setq inl p))))
+       inl)
+      ;; The signed reading of the low N bits of X (see %SIGN-WRAP-FORM). Where only
+      ;; the low 64 bits of the value count, N = 64 changes none of them: X itself.
+      ;; N = 32 sign-extends the low 32 bits of X.
+      ((and (eq need :mod) (not *u64-in-inline-body*) (%sign-wrap-form expr))
+       (multiple-value-bind (n x) (%sign-wrap-form expr)
+         (let ((a (u64-plan x :mod)))
+           (and a (if (= n 64) a (list :sext32 a))))))
+      ;; (THE T X) with T an integer type that holds every value of [0, B], when
+      ;; X has an exact plan whose bound is B: the assertion is proved by the
+      ;; plan itself, so X is planned as it is, with no check and no box. (The
+      ;; stripper above takes only the unbounded integer types.) An X without
+      ;; such a plan stays an operand computed generically, and the check, if
+      ;; the safety asks for one, stays with it.
+      ((and (consp expr) (eq (car expr) 'the) (consp (cdr expr)) (consp (cddr expr))
+            (null (cdddr expr))
+            (let ((r (declared-integer-range (cadr expr))))
+              (and r (<= (car r) 0) (> (cdr r) 0))))
+       (let* ((hi (cdr (declared-integer-range (cadr expr))))
+              (saved *u64-leaves*)
+              (a (u64-plan (caddr expr) :exact))
+              (b (and a (%u64-plan-bound a))))
+         (if (and a (<= (or b +u64-mask+) hi))
+             a
+             (progn (setf *u64-leaves* saved)
+                    (%u64-leaf expr :obj (eq need :exact))))))
       ;; An element of an (unsigned-byte 64) array, or a local whose slot holds
       ;; one: its bits, already exact.
       ((and (consp expr) (not *u64-in-inline-body*) (numeric-array-aref-u64-p expr))
@@ -1339,6 +1457,10 @@
       ((or (%u64-op-p expr 'logand) (%u64-op-p expr 'logior) (%u64-op-p expr 'logxor))
        (and (= (length expr) 3)
             (let* ((op (car expr)) (a (cadr expr)) (b (caddr expr))
+                   ;; A constant first operand is the same mask: the operands of LOGAND, LOGIOR
+                   ;; and LOGXOR swap, and a constant has nothing to evaluate.
+                   (a-b (if (and (integerp a) (not (integerp b))) (list b a) (list a b)))
+                   (a (first a-b)) (b (second a-b))
                    (mask-b (and (integerp b) (<= 0 b +u64-mask+))))
               (u64-plan-binary op a b
                                (cond ((eq need :mod) '(:mod :mod))
@@ -1456,7 +1578,7 @@
     (:shr (ash (or (%u64-plan-bound (second node)) +u64-mask+)
                (- (min 64 (third node)))))
     (:mod (1- (ash 1 (third node))))
-    ((:add :sub :mul :not :shlv :shrv :rotl) nil)))
+    ((:add :sub :mul :not :shlv :shrv :rotl :sext32 :mulhi :mulhis :mfield) nil)))
 
 (defun u64-plan-binary (op a b needs)
   "Plan (OP A B) with A and B asked for (FIRST NEEDS) and (SECOND NEEDS); when
@@ -1483,7 +1605,7 @@
              (case (car node)
                (:const (> (abs (second node)) most-positive-fixnum))
                (:leaf nil)
-               ((:add :sub :mul :shl :shlv :shr :shrv :rotl) t)
+               ((:add :sub :mul :shl :shlv :shr :shrv :rotl :mulhi :mulhis :mfield) t)
                (:mod (wide-p (second node)))
                (t (some #'wide-p (cdr node))))))
     (and (consp plan) (not (eq (car plan) :leaf)) (not (eq (car plan) :const))
@@ -1515,12 +1637,24 @@
     ((:or :xor :add :sub :mul)
      `(,@(%u64-fast (second node)) ,@(%u64-fast (third node)) (,(car node))))
     (:not `(,@(%u64-fast (second node)) (:not)))
+    (:sext32 `(,@(%u64-fast (second node)) (:conv-i4) (:conv-i8)))
+    (:mfield `(,@(%u64-fast (second node)) ,@(%u64-fast (third node))
+               (:call "Runtime.MaskLow64")))
+    (:mulhi `(,@(%u64-fast (second node)) ,@(%u64-fast (third node))
+              (:call "Runtime.MulHiU64")))
+    (:mulhis `(,@(%u64-fast (second node)) ,@(%u64-fast (third node))
+               (:call "Runtime.MulHiS64")))
     (:mod (if (= (third node) 64)
               (%u64-fast (second node))
               `(,@(%u64-fast (second node)) (:ldc-i8 ,(1- (ash 1 (third node)))) (:and))))
     (:shl `(,@(%u64-fast (second node)) (:ldc-i4 ,(third node)) (:shl)))
     (:shlv `(,@(%u64-fast (second node)) (:ldloc ,(second (third node))) (:call "Runtime.ShlU64")))
-    (:shr `(,@(%u64-fast (second node)) (:ldc-i8 ,(min 64 (third node))) (:call "Runtime.ShrU64")))
+    ;; A constant count below 64 is the CIL shift itself. The call is marked for inlining,
+    ;; but the JIT stops inlining in a very large method (a table-driven round function
+    ;; has hundreds of these), and the call then costs more than the shift.
+    (:shr (if (< 0 (third node) 64)
+              `(,@(%u64-fast (second node)) (:ldc-i4 ,(third node)) (:shr-un))
+              `(,@(%u64-fast (second node)) (:ldc-i8 ,(min 64 (third node))) (:call "Runtime.ShrU64"))))
     (:shrv `(,@(%u64-fast (second node)) (:ldloc ,(second (third node))) (:neg)
              (:call "Runtime.ShrU64")))
     (:rotl `(,@(%u64-fast (second node)) (:ldloc ,(second (third node)))
@@ -1540,6 +1674,17 @@
                  (:and "Runtime.Logand2") (:or "Runtime.Logior2") (:xor "Runtime.Logxor2")
                  (:add "Runtime.Add") (:sub "Runtime.Subtract") (:mul "Runtime.Multiply")))))
     (:not `(,@(%u64-generic (second node)) (:call "Runtime.Lognot")))
+    (:sext32 `(,@(%u64-generic (second node)) (:ldc-i4 32) (:call "Runtime.SignWrap")))
+    (:mfield `(,@(%u64-generic (second node)) ,@(%u64-generic (third node))
+               (:call "Runtime.MaskFieldLow")))
+    ((:mulhi :mulhis)
+     `(,@(%u64-generic (second node)) ,@(%u64-generic (third node))
+       (:call "Runtime.Multiply")
+       ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr -64))
+       (:call "Runtime.Ash")
+       ,@(when (fourth node)
+           `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr +u64-mask+))
+             (:call "Runtime.Logand2")))))
     (:mod `(,@(%u64-generic (second node))
             ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                 (compile-expr (ash 1 (third node))))
@@ -1673,6 +1818,165 @@
                  (:label ,done))))
          leaves)))))
 
+;;; The high 64 bits of a 128-bit product: (ldb (byte 64 64) (* X Y)), which the LDB entry
+;;; rewrites to (logand (ash (* X Y) -64) #xFFFFFFFFFFFFFFFF), and (ash (* X Y) -64)
+;;; itself when X and Y are in [0, 2^64). The generic operations build the 128-bit product
+;;; as a bignum. Two machine instructions give the same bits: the unsigned high word
+;;; (X, Y proved to lie in [0, 2^64)) or the signed high word (X, Y proved to be int64,
+;;; whose 2^64-reduced value is the same field of the two's-complement product).
+
+(defun %mulhi-parts (expr)
+  "(values X Y KIND) when EXPR is the high 64 bits of the product X * Y: KIND :FIELD for
+   the masked forms (the value is in [0, 2^64) whatever X and Y are), :SHIFT for the bare
+   (ash (* X Y) -64)."
+  (flet ((product (e)
+           (and (consp e) (eq (car e) '*) (= (length e) 3)
+                (not (local-function-entry '*)) (not (macrolet-shadowed-p '*))
+                (values (cadr e) (caddr e) t)))
+         (shift64 (e)
+           (and (consp e) (eq (car e) 'ash) (= (length e) 3)
+                (eql (%u64-const-value (caddr e)) -64)
+                (not (local-function-entry 'ash)) (not (macrolet-shadowed-p 'ash))
+                (cadr e))))
+    (cond
+      ((and (%literal-ldb-form-p expr)
+            (equal (%literal-byte-spec (cadr expr)) '(64 . 64)))
+       (multiple-value-bind (x y ok) (product (caddr expr))
+         (and ok (values x y :field))))
+      ((and (consp expr) (eq (car expr) 'logand) (= (length expr) 3)
+            (not (local-function-entry 'logand)) (not (macrolet-shadowed-p 'logand)))
+       (let* ((a (cadr expr)) (b (caddr expr))
+              (m (cond ((eql (%u64-const-value b) +u64-mask+) a)
+                       ((eql (%u64-const-value a) +u64-mask+) b))))
+         (and m (let ((sh (shift64 m)))
+                  (and sh (multiple-value-bind (x y ok) (product sh)
+                            (and ok (values x y :field))))))))
+      ((shift64 expr)
+       (multiple-value-bind (x y ok) (product (shift64 expr))
+         (and ok (values x y :shift)))))))
+
+(defun %u64-plan-mulhi (expr)
+  "A plan for the high 64 bits of the product in EXPR (see %MULHI-PARTS), or NIL.
+   The unsigned word: each operand is proved to lie in [0, 2^64) or checked to at run
+   time, a value that fails the check taking the generic product. The signed word (the
+   masked forms only): both operands proved to be int64, with no run-time test."
+  (multiple-value-bind (x y kind) (%mulhi-parts expr)
+    (when kind
+      (let* ((saved *u64-leaves*)
+             (a (u64-plan x :exact))
+             (b (and a (u64-plan y :exact))))
+        (cond
+          ;; Each operand is either proved to lie in [0, 2^64) or checked at run time (a
+          ;; guarded leaf); a value that fails the check takes the generic product.
+          ((and a b)
+           ;; The masked forms are the field, a value in [0, 2^64) whatever the operands are;
+           ;; the bare (ash (* X Y) -64) is signed when an operand is negative, so the
+           ;; generic path must not mask it.
+           (list :mulhi a b (eq kind :field)))
+          (t
+           (setf *u64-leaves* saved)
+           (when (and (eq kind :field) (not *u64-in-inline-body*)
+                      (fixnum-exact-p x) (fixnum-exact-p y))
+             (list :mulhis (%u64-leaf x :long nil) (%u64-leaf y :long nil) t))))))))
+
+;;; (mask-field (byte S 0) V) whose size S is not a literal but is proved to lie in [0, 64]
+;;; (babel's and jzon's %>>>, which take a size of 64 - count): the low S bits of V, so only the
+;;; low 64 bits of V count and the value lies in [0, 2^64). S is read as an int64 and
+;;; V planned for its low 64 bits; a mask of 64 bits keeps V as it is.
+
+(defun %mfield-parts (expr)
+  "(values V S) when EXPR is (MASK-FIELD (BYTE S 0) V) with S not a literal and proved
+   to be an int64 in [0, 64]; else NIL."
+  (when (and (consp expr) (eq (car expr) 'mask-field) (= (length expr) 3)
+             (not (local-function-entry 'mask-field)) (not (macrolet-shadowed-p 'mask-field))
+             (not (local-function-entry 'byte)) (not (macrolet-shadowed-p 'byte)))
+    (let ((spec (cadr expr)))
+      (when (and (consp spec) (eq (car spec) 'byte) (= (length spec) 3)
+                 (eql (%u64-const-value (caddr spec)) 0)
+                 (not (%literal-byte-spec spec)))
+        (let* ((size (cadr spec))
+               (r (and (fixnum-exact-p size) (expr-int-range size))))
+          (when (and r (<= 0 (car r)) (<= (cdr r) 64))
+            (values (caddr expr) size)))))))
+
+(defun %u64-plan-mfield (expr)
+  (multiple-value-bind (v size) (%mfield-parts expr)
+    (when v
+      (let* ((saved *u64-leaves*)
+             (a (u64-plan v :mod)))
+        (if (and a (not *u64-in-inline-body*))
+            (list :mfield a (%u64-leaf size :long nil))
+            (progn (setf *u64-leaves* saved) nil))))))
+
+(defun try-compile-mfield (expr)
+  "EXPR, a variable-size MASK-FIELD (see %MFIELD-PARTS), computed in the 64-bit lane: the
+   boxed value, or NIL."
+  (when (%mfield-parts expr)
+    (try-compile-u64 expr)))
+
+;;; Signed reading of the low N bits (N = 64 or 32), as portable code writes it:
+;;;   (let ((g X)) (logior (ldb (byte N-1 0) g) (- (mask-field (byte 1 N-1) g))))
+;;; For every integer X the value is the two's-complement reading of the low N
+;;; bits of X (the low N-1 bits, ORed with -2^(N-1) when bit N-1 is set), so the
+;;; recognition rests on that identity, not on the operand's type. Taken by the
+;;; generic operations it makes a bignum for the mask-field value 2^(N-1) and
+;;; another for its negation at every use.
+
+(defun %sign-wrap-form (expr)
+  "(values N X) when EXPR is the signed reading of the low N bits of X, N 64 or 32."
+  (when (and (consp expr) (eq (car expr) 'let) (consp (cdr expr)) (consp (cddr expr))
+             (null (cdddr expr))
+             (not (local-function-entry 'let)) (not (macrolet-shadowed-p 'let)))
+    (let ((bindings (cadr expr)) (body (caddr expr)))
+      (when (and (consp bindings) (null (cdr bindings)) (consp (car bindings))
+                 (symbolp (caar bindings)) (caar bindings)
+                 (consp (cdar bindings)) (null (cddar bindings))
+                 (not (special-var-p (caar bindings)))
+                 (consp body) (eq (car body) 'logior) (= (length body) 3)
+                 (not (local-function-entry 'logior)) (not (macrolet-shadowed-p 'logior)))
+        (let* ((g (caar bindings)) (x (cadar bindings))
+               (low (cadr body)) (neg (caddr body)))
+          (when (and (%literal-ldb-form-p low) (eq (caddr low) g)
+                     (consp neg) (eq (car neg) '-) (= (length neg) 2)
+                     (not (local-function-entry '-)) (not (macrolet-shadowed-p '-))
+                     (%literal-byte-field-form-p (cadr neg))
+                     (eq (car (cadr neg)) 'mask-field)
+                     (eq (caddr (cadr neg)) g))
+            (let ((lo (%literal-byte-spec (cadr low)))
+                  (hi (%literal-byte-spec (cadr (cadr neg)))))
+              (when (and lo hi (eql (cdr lo) 0) (eql (car hi) 1)
+                         (member (1+ (car lo)) '(32 64))
+                         (eql (cdr hi) (car lo)))
+                (values (1+ (car lo)) x)))))))))
+
+(defun try-compile-sign-wrap (expr &optional as-long)
+  "EXPR, the signed reading of the low N bits of X (see %SIGN-WRAP-FORM), compiled
+   with X in the 64-bit lane: the boxed int64 result (the raw int64 when AS-LONG),
+   or NIL."
+  (multiple-value-bind (n x) (%sign-wrap-form expr)
+    (when n
+      (let* ((*u64-leaves* nil)
+             (plan (let ((*u64-plan-root* x)) (u64-plan x :mod))))
+        (when plan
+          (let* ((leaves (reverse *u64-leaves*))
+                 (slow (gen-label "SWSLOW"))
+                 (done (gen-label "SWDONE"))
+                 (guards (remove-if-not #'%u64-guarded-leaf-p leaves)))
+            (%u64-alias-leaf-copies
+             `(,@(%u64-leaf-code leaves)
+               ,@(loop for g in guards append (%u64-guard-code g slow))
+               ,@(%u64-fast plan)
+               ,@(when (= n 32) '((:conv-i4) (:conv-i8)))
+               ,@(unless as-long '((:call "Fixnum.Make")))
+               ,@(when guards
+                   `((:br ,done)
+                     (:label ,slow)
+                     ,@(%u64-generic plan)
+                     (:ldc-i4 ,n) (:call "Runtime.SignWrap")
+                     ,@(when as-long '((:unbox-fixnum)))
+                     (:label ,done))))
+             leaves)))))))
+
 ;;; Nested +, -, *: when every operand is a fixnum, the intermediates are int64
 ;;; with an overflow check and only the result is boxed; otherwise the generic calls.
 
@@ -1731,7 +2035,13 @@
           (cond ((integerp x)
                  (and (<= +int64-min+ x +int64-max+) (list :const x)))
                 ((or (numberp x) (characterp x) (stringp x)) nil)
-                ((and after-op (not (%spec-pure-p x))) nil)
+                ;; A later operand with effects is evaluated before the operations in
+                ;; front of it. That could only change which error is signalled first,
+                ;; and an operation whose operands are all raw int64 (fixnum-typed) signals
+                ;; none: an overflow makes a bignum, as the generic path does.
+                ((and after-op (not (%spec-pure-p x))
+                      (notevery (lambda (l) (eq (second l) :long)) *spec-leaves*))
+                 nil)
                 ((> (length *spec-leaves*) 8) nil)
                 ((or (double-float-typed-p x) (single-float-typed-p x) (decimal-typed-p x)) nil)
                 (t (let ((l (gen-local "SPL"))
@@ -1779,6 +2089,11 @@
              (:call ,(ecase (second node)
                        (:add "Runtime.Add") (:sub "Runtime.Subtract")
                        (:mul "Runtime.Multiply")))))))
+
+(defvar *spec-slow-unbox* '(:unbox-fixnum)
+  "The instruction that turns the generic slow path's boxed result into the raw int64
+   TRY-COMPILE-SPEC-ARITH leaves under WANT-LONG. An array subscript binds it to
+   Runtime.IndexL, which reports a value that is no index the way AREF does.")
 
 (defun try-compile-spec-arith (expr &optional want-long divisor)
   "EXPR, a +, - or * with another of them among its operands, computed on int64
@@ -1828,7 +2143,7 @@
           ,@(when divisor
               `((:ldloc ,divl) (:call "Fixnum.Make")
                 (:call ,(if (eq (first divisor) 'mod) "Runtime.Mod" "Runtime.Rem"))))
-          ,@(when (or want-long divisor) '((:unbox-fixnum)))
+          ,@(when (or want-long divisor) (list *spec-slow-unbox*))
           (:label ,done))))))
 
 (defun try-compile-spec-mod-long (expr)
@@ -1963,16 +2278,36 @@
     ((integerp expr)
      `((:ldc-i8 ,expr)))
     ((%rotate-byte-32-long-p expr) (compile-rotate-byte-32-long expr))
+    ((and (%sign-wrap-form expr) (try-compile-sign-wrap expr t)))
+    ;; (%AREF-SET A I... V) on an int64-backed array, as a value: the stored long itself.
+    ((%aref-set-numeric-parts expr)
+     (multiple-value-bind (arr idxs val rank) (%aref-set-numeric-parts expr)
+       (compile-numeric-aref-set-long arr idxs val rank)))
     ((%u64-local-field expr)
      (destructuring-bind (key shift . mask) (%u64-local-field expr)
        `((:ldloc ,key)
-         ,@(when (plusp shift) `((:ldc-i8 ,shift) (:call "Runtime.ShrU64")))
+         ,@(when (plusp shift) `((:ldc-i4 ,shift) (:shr-un)))
          (:ldc-i8 ,mask) (:and))))
     ;; Direct Int64 local in native body: already long, no unbox
     ((and (symbolp expr)
           (boundp '*cstate*)
           (native-slot-p expr (cstate-long-locals)))
      `((:ldloc ,(lookup-local expr))))
+    ;; The cell of a captured, assigned FIXNUM variable holds the raw long.
+    ((%long-box-var-p expr)
+     `((:ldloc ,(lookup-local expr)) (:ldfld "LongBox.Value")))
+    ;; A proclaimed fixnum special: the value is read dynamically and the unbox checks that it is a fixnum
+    ;; (nothing checks a binding or a SETQ of a special), so a wrong value still signals the type error.
+    ((%proclaimed-fixnum-special-read-p expr)
+     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr expr))
+       (:unbox-fixnum)))
+    ((%long-assignment-parts expr)
+     (multiple-value-bind (v val) (%long-assignment-parts expr)
+       (let ((key (lookup-local v)))
+         `(,@(compile-expr-to-long val)
+           (:dup)
+           (:stloc ,key)
+           ,@(%frame-set-instrs key v :long)))))
     ;; An (unsigned-byte 64) local holds the value's bits as a raw Int64, not a
     ;; boxed Fixnum, even when it is also known to be a fixnum (a FIXNUM
     ;; declaration, or a range inferred from its init). The caller has proven
@@ -2028,6 +2363,8 @@
      `((:ldloc ,(lookup-local expr))
        (:unbox-fixnum)))
     ;; aref on a numeric-backed array local: raw long element read, no box.
+    ((and (consp expr) (numeric-array-aref-u64-p expr))
+     (compile-u64-aref-bits (cadr expr) (cddr expr)))
     ((numeric-array-aref-info expr)
      (compile-numeric-aref-as-long
       (cadr expr) (cddr expr) (car (numeric-array-aref-info expr))))
@@ -2035,6 +2372,25 @@
     ((string-char-code-ref expr)
      (let ((ref (string-char-code-ref expr)))
        (compile-string-char-code-as-long (car ref) (cdr ref))))
+    ;; (char-code X): X evaluated as one value, its code read raw.
+    ((%char-code-of-form-p expr)
+     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+           (compile-expr (cadr expr)))
+       (:call "Runtime.CharCodeOfL")))
+    ;; (sbit A I) / (bit A I): the bit read raw. A first, then the subscript.
+    ((%bit-ref-form-p expr)
+     (if (and (simple-expr-p (cadr expr)) (simple-expr-p (caddr expr)))
+         `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (cadr expr)))
+           ,@(compile-expr-to-long (caddr expr))
+           (:call ,(if (eq (car expr) 'sbit) "Runtime.SbitAtL" "Runtime.BitAtL")))
+         (let ((ta (gen-local "BRA")) (ti (gen-local "BRI")))
+           `((:declare-local ,ta "LispObject") (:declare-local ,ti "Int64")
+             ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (cadr expr)))
+             (:stloc ,ta)
+             ,@(compile-expr-to-long (caddr expr))
+             (:stloc ,ti)
+             (:ldloc ,ta) (:ldloc ,ti)
+             (:call ,(if (eq (car expr) 'sbit) "Runtime.SbitAtL" "Runtime.BitAtL"))))))
     ;; A word of adjacent octets: one wide read. A 64-bit one is here only
     ;; under *FIXNUM-WRAP-LICENSED*, which asks for its low 64 bits.
     ((octet-word-ref-info expr)
@@ -2115,6 +2471,9 @@
     ((and (consp expr) (= (length expr) 2) (eq (car expr) 'abs))
      `(,@(compile-as-long (cadr expr))
        (:call "Runtime.AbsFixnumL")))
+    ((and (consp expr) (= (length expr) 2) (eq (car expr) 'signum))
+     `(,@(compile-as-long (cadr expr))
+       (:call "Runtime.SignumFixnumL")))
     ((and (consp expr) (= (length expr) 2) (eq (car expr) 'isqrt))
      `(,@(compile-as-long (cadr expr))
        (:call "Runtime.IsqrtFixnumL")))
@@ -2181,7 +2540,7 @@
     ;; asserted: X may well be a bignum, and unboxing it unconditionally failed
     ;; with a .NET cast error. Such a form takes COMPILE-GUARDED-LONG-BITOP.
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(logand logior logxor))
-          (fixnum-wrap-typed-p (cadr expr)) (fixnum-wrap-typed-p (caddr expr)))
+          (%bit-long-operand-p (cadr expr)) (%bit-long-operand-p (caddr expr)))
      (let ((op (ecase (car expr) (logand :and) (logior :or) (logxor :xor))))
        (compile-long-binop op (cadr expr) (caddr expr))))
     ((and (consp expr) (= (length expr) 3) (member (car expr) '(logand logior logxor)))
@@ -2277,6 +2636,23 @@
    overflow signalling is as good as a generic call signalling later."
   (or (fixnum-typed-p expr) (checked-long-arith-p expr)))
 
+(defun gethash-fixnum-op (expr)
+  "EXPR as (OP A B) for an arithmetic GETHASH key with fixnum operands."
+  (let ((e (fold-nary-arith expr)))
+    (when (and (consp e) (symbolp (car e))
+               (not (local-function-entry (car e)))
+               (not (macrolet-shadowed-p (car e))))
+      (case (car e)
+        ((+ - *)
+         (when (and (= (length e) 3)
+                    (fixnum-typed-p (cadr e))
+                    (fixnum-typed-p (caddr e)))
+           (list (ecase (car e) (+ 0) (- 1) (* 2)) (cadr e) (caddr e))))
+        (1+ (when (and (= (length e) 2) (fixnum-typed-p (cadr e)))
+              (list 0 (cadr e) 1)))
+        (1- (when (and (= (length e) 2) (fixnum-typed-p (cadr e)))
+              (list 1 (cadr e) 1)))))))
+
 (defun compile-checked-long-arith (expr)
   "EXPR as a raw int64, checking for overflow rather than proving it away."
   (let* ((expr (fold-nary-arith expr))
@@ -2291,6 +2667,10 @@
         `(,@(compile-as-long (cadr expr)) (:ldc-i8 1) (:call ,helper))
         `(,@(compile-long-binop-spilled (cadr expr) (caddr expr)) (:call ,helper)))))
 
+(defvar *slot-init-checked* nil
+  "True while the init of a declared-FIXNUM LET binding that is not provably a fixnum is compiled
+   for its Int64 slot: the final unbox then reports a non-fixnum as the declaration's TYPE-ERROR.")
+
 (defun compile-expr-to-long (expr)
   "Compile EXPR leaving a raw int64 on the stack, without risking silent wrap:
    the raw long path (compile-as-long) is taken only when a value-range proof
@@ -2303,6 +2683,7 @@
    declaration-violating bignum then signals (InvalidCast) instead of wrapping.
    Used to initialize and assign Int64-slot locals."
   (cond
+    ((%long-assignment-parts expr) (compile-as-long expr))
     ((fixnum-arith-unboxed-safe-p expr) (compile-as-long expr))
     ((checked-long-arith-p expr) (compile-checked-long-arith expr))
     ;; A nested +, - or * whose operands are fixnums but whose result is only known to be an
@@ -2315,7 +2696,12 @@
     ((compile-as-long-structured expr))
     (t `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
              (compile-expr expr))
-         (:unbox-fixnum)))))
+         ;; The init of a declared-FIXNUM variable that is not provably one: a value that is not
+         ;; signals the declaration's TYPE-ERROR (datum and FIXNUM), as the check of the boxed
+         ;; slot would.
+         ,@(if *slot-init-checked*
+               '((:call "Runtime.UnboxFixnumChecked"))
+               '((:unbox-fixnum)))))))
 
 (defun %u64-masked-index-p (expr)
   "True when EXPR is (LOGAND X M), or an LDB the same as one, with M a literal
@@ -2342,6 +2728,10 @@
         ;; its range fits an int64.
         ((and (%u64-masked-index-p expr) (%u64-low-bits-plan expr))
          (compile-int-slot-init expr))
+        ;; Nested +, - or * of fixnums, (+ (* (mod r rows) cols) (mod c cols)): int64 with
+        ;; an overflow check, the generic arithmetic only when it overflows.
+        ((let ((*spec-slow-unbox* '(:call "Runtime.IndexL")))
+           (try-compile-spec-arith expr t)))
         (t
          `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                (compile-expr expr))
@@ -2435,7 +2825,35 @@
     ((and (consp expr) (member (car expr) '(schar char)) (= (length expr) 3)
           (not (local-function-entry (car expr))))
      (compile-string-char-code-as-long (cadr expr) (caddr expr)))
+    ;; A read of a structure slot declared CHARACTER, or a call of a function whose ftype returns a
+    ;; CHARACTER, whose arguments are variables or constants (so the push is straight-line): the
+    ;; value is a character object the slot or the function already holds, and its code is read
+    ;; without a generic comparison. A value that is not a character is a type error, as with a
+    ;; local declared CHARACTER.
+    ((and (consp expr) (symbolp (car expr)) (car expr)
+          (not (local-function-entry (car expr)))
+          (every (lambda (a) (or (and (symbolp a) a (lookup-local a)) (constantp a))) (cdr expr))
+          (or (and (= (length expr) 2)
+                   (boundp '*struct-accessor-types*)
+                   (member (gethash (car expr) *struct-accessor-types*)
+                           '(character base-char standard-char)))
+              (member (function-return-type (car expr)) '(character base-char standard-char))))
+     `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr expr))
+       (:call "Runtime.CharCodeOfL")))
     (t nil)))
+
+(defun %char-literal-operand (expr)
+  "The character EXPR is a literal of, as the character itself or quoted (what CASE expands
+   its keys into), else NIL."
+  (let ((v (fold-constant-symbol expr)))
+    (cond ((characterp v) v)
+          ((and (consp v) (eq (car v) 'quote) (consp (cdr v)) (characterp (cadr v))) (cadr v)))))
+
+(defun compile-char-lit-test (args method)
+  "ARGS is (EXPR CODE): EXPR's value, then CODE as an immediate, then the bool call METHOD makes."
+  `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args)))
+    (:ldc-i4 ,(second args))
+    (:call ,method)))
 
 (defun compile-char-cmp (args op)
   "Emit a character comparison as an integer comparison of the codes. OP is the
@@ -2526,12 +2944,19 @@
       ,@body)))
 
 (defun literal-symbol-operand (expr)
-  "If EXPR is a quoted symbol literal other than NIL, return that symbol.
-   NIL is left to the IsNilObj test the caller tries first."
-  (and (consp expr)
-       (eq (car expr) 'quote)
-       (let ((s (cadr expr)))
-         (and (symbolp s) (not (null s)) s))))
+  "If EXPR is a symbol literal other than NIL (a quoted symbol, a keyword, or T),
+   return that symbol. NIL is left to the IsNilObj test the caller tries first."
+  (cond ((and (consp expr) (eq (car expr) 'quote))
+         (let ((s (cadr expr)))
+           (and (symbolp s) (not (null s)) s)))
+        ((or (eq expr t) (keywordp expr)) expr)))
+
+(defun %eq-nonnumber-literal-p (expr)
+  "True when EXPR is a literal that can never be a number: NIL, T, a keyword, or a
+   quoted non-number. EQ against it is a plain reference comparison."
+  (or (null expr) (eq expr t) (keywordp expr)
+      (and (consp expr) (eq (car expr) 'quote) (consp (cdr expr)) (null (cddr expr))
+           (not (numberp (cadr expr))))))
 
 (defun compile-sym-eq (args)
   "Emit an inline reference comparison for (EQ x 'SYM) / (EQL x 'SYM).

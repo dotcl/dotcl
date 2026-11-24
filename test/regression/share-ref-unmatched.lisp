@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; #n# with no #n= is an error, not an internal object.
 ;;;
 ;;; The reader answered an unmatched #n# with the SharePlaceholder it uses while

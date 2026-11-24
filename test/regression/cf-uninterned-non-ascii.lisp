@@ -4,7 +4,7 @@
 ;;; type initializer threw).
 
 (defun %cuna-compile-and-load ()
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "cuna.lisp" dir))
          (fasl (merge-pathnames "cuna.fasl" dir))
          (a (make-symbol (coerce (list (code-char 196) #\B #\C) 'string)))

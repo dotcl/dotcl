@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; MACROLET must shadow a global macro even when the compiler lowers that name
 ;;; through its own handler table (CLHS 3.1.2.1.2.2).
 ;;;

@@ -3,7 +3,7 @@
 ;;; SBCL; WARNINGS-P stays NIL. A name nothing defines still gets the warning.
 
 (defun %ufc-compile (name lines)
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames (format nil "~a.lisp" name) dir))
          (fasl (merge-pathnames (format nil "~a.fasl" name) dir))
          (undefined '()) (wp nil))

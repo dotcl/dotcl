@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; An interpreted HANDLER-CASE / HANDLER-BIND must catch raw .NET exceptions.
 ;;;
 ;;; The runtime throws plain .NET exceptions in many places (throw new

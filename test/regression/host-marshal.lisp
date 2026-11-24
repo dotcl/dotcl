@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression: DotclHost's explicit collection conversions.
 ;;;
 ;;; A .NET array handed to DotclHost.Call arrives as a foreign object, not as a

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Members implemented explicitly for an interface.
 ;;;
 ;;; List<T> declares `bool ICollection<T>.IsReadOnly`, which is private on the

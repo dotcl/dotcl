@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; BMP-outside (astral) characters through native :external-format streams.
 ;;;
 ;;; dotcl characters are UTF-16 code units (char-code-limit 65536, ABCL-style):

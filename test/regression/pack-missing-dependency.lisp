@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; `dotcl pack` refuses to build a system whose closure it cannot resolve.
 ;;;
 ;;; The closure walk used to skip a dependency ASDF could not find. When the

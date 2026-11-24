@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The printer's list nesting counter is per thread. It was one counter shared
 ;;; by every thread, bumped and restored with a plain ++/--, so threads printing
 ;;; nested lists at the same time lost updates and left it off by some amount

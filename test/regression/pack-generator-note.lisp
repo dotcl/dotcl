@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; `dotcl pack` runs a system's source generator (a load-op a system asks for
 ;;; in its prepare-op, the way cl-unicode builds its tables) and reports it when
 ;;; the generator stops. When the generator had already written every file it

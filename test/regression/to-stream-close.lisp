@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; CLOSE on a stream made by DOTNET:TO-STREAM closes the .NET stream under it.
 ;;;
 ;;; Bug: the Lisp stream was closed but the .NET stream stayed open. dotcl-socket's

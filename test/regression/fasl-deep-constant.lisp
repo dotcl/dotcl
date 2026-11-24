@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A literal nested deeper than the emitter's inline-depth cap must still be
 ;;; rebuilt by the .fasl itself. Past the cap the constant used to be parked in
 ;;; the process-local constant pool and reloaded with CilAssembler.GetConstant,

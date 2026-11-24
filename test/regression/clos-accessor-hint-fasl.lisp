@@ -8,7 +8,7 @@
 ")
 
 (defun %cahf-load ()
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "clos-accessor-hint.lisp" dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (write-string *cahf-source* s))

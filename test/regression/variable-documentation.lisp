@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A variable docstring belongs to its symbol only, whether DEFVAR,
 ;;; DEFPARAMETER or DEFCONSTANT gave it or (SETF DOCUMENTATION) set it, and
 ;;; setting it to NIL clears it whichever of the two put it there.

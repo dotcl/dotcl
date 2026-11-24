@@ -13,7 +13,7 @@
 (defun %cfts-compile (name forms)
   "Compile FORMS as a file and return what the last form recorded at compile
 time in *CFTS-SEEN*."
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames (format nil "~a.lisp" name) dir))
          (fasl (merge-pathnames (format nil "~a.fasl" name) dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)

@@ -658,17 +658,46 @@ public static class Mop
         }
 
         // -- Protocol GFs (extensible via defmethod) ----------------------
-        // VALIDATE-SUPERCLASS: default = standard-class/standard-class -> T, else NIL
+        // VALIDATE-SUPERCLASS (AMOP): true when the metaclass of the class and the
+        // metaclass of the superclass are the same, or one is STANDARD-CLASS and the
+        // other FUNCALLABLE-STANDARD-CLASS; false otherwise, so a user metaclass that
+        // inherits from STANDARD-CLASS needs its own VALIDATE-SUPERCLASS method to be
+        // mixed with ordinary classes. One method on (CLASS CLASS): a method on
+        // (STANDARD-CLASS STANDARD-CLASS) would also be applicable to every subclass of
+        // STANDARD-CLASS and accept the pair the protocol exists to reject.
         {
             var cls2     = (LispClass)Runtime.FindClass(Startup.Sym("CLASS"));
             var stdCls2  = (LispClass)Runtime.FindClass(Startup.Sym("STANDARD-CLASS"));
-            var builtIn2 = (LispClass)Runtime.FindClass(Startup.Sym("BUILT-IN-CLASS"));
-            // (class class) -> NIL  (least-specific default)
+            var funCls2  = (LispClass)Runtime.FindClass(Startup.Sym("FUNCALLABLE-STANDARD-CLASS"));
             RegisterMopGF("VALIDATE-SUPERCLASS", 2,
-                new LispClass[] { cls2, cls2 }, args => Nil.Instance);
-            // (standard-class standard-class) -> T
-            RegisterMopGFMethod("VALIDATE-SUPERCLASS",
-                new LispClass[] { stdCls2, stdCls2 }, args => T.Instance);
+                new LispClass[] { cls2, cls2 }, args =>
+                {
+                    // CLASS-PROTOTYPE of a metaclass is an instance of that metaclass (a
+                    // LispInstance here, not a LispClass): its metaclass is the class it is an
+                    // instance of, which is what COMPATIBLE-METACLASSES' :VALIDATE-AS asks about.
+                    LispClass? MetaOf(LispObject o) => o switch
+                    {
+                        LispClass k => k.Metaclass ?? stdCls2,
+                        LispInstance li when li.Class.ClassPrecedenceList.Contains(cls2) => li.Class,
+                        _ => null,
+                    };
+                    var mc = MetaOf(args[0]);
+                    var ms = MetaOf(args[1]);
+                    if (mc is null || ms is null) return Nil.Instance;
+                    var sup = args[1] as LispClass;
+                    if (ReferenceEquals(mc, ms)) return T.Instance;
+                    // The implicit superclass of every class with slots is accepted for a
+                    // metaclass derived from STANDARD-CLASS or FUNCALLABLE-STANDARD-CLASS, as
+                    // in SBCL: DEFCLASS with a user metaclass and no superclasses works
+                    // without a VALIDATE-SUPERCLASS method.
+                    if (sup is not null && (sup.Name.Name == "STANDARD-OBJECT" || sup.Name.Name == "FUNCALLABLE-STANDARD-OBJECT")
+                        && (mc.ClassPrecedenceList.Contains(stdCls2) || mc.ClassPrecedenceList.Contains(funCls2)))
+                        return T.Instance;
+                    if ((ReferenceEquals(mc, stdCls2) && ReferenceEquals(ms, funCls2))
+                        || (ReferenceEquals(mc, funCls2) && ReferenceEquals(ms, stdCls2)))
+                        return T.Instance;
+                    return Nil.Instance;
+                });
         }
         // FINALIZE-INHERITANCE: dotcl finalizes eagerly at the end of DEFCLASS, so
         // for a class that is already finalized the default method does nothing.
@@ -975,7 +1004,7 @@ public static class Mop
             var result = new List<LispObject>();
             for (var cur = ll; cur is Cons c; cur = c.Cdr)
             {
-                if (c.Car is Symbol s && s.Name.StartsWith("&"))
+                if (c.Car is Symbol s && s.Name.StartsWith("&", System.StringComparison.Ordinal))
                     break;
                 result.Add(c.Car);
             }
@@ -1158,6 +1187,12 @@ public static class Mop
     // called, so the error does not point at the wrong one.
     private static LispObject InstanceSlotRead(string who, LispObject obj, LispObject location)
     {
+        if (ClassSlotName(who, obj, location) is { } cname)
+        {
+            var cls = (LispClass)obj;
+            return cls.ExtraSlots != null && cls.ExtraSlots.TryGetValue(cname, out var cstored)
+                ? cstored ?? Nil.Instance : Nil.Instance;
+        }
         if (FuncallableSlotName(who, obj, location) is { } name)
         {
             var funcallable = (GenericFunction)obj;
@@ -1175,6 +1210,11 @@ public static class Mop
     private static LispObject InstanceSlotWrite(string who, LispObject obj, LispObject location,
         LispObject newValue)
     {
+        if (ClassSlotName(who, obj, location) is { } cname)
+        {
+            ((LispClass)obj).EnsureExtraSlots()[cname] = newValue;
+            return newValue;
+        }
         if (FuncallableSlotName(who, obj, location) is { } name)
         {
             (((GenericFunction)obj).EnsureExtraSlots())[name] = newValue;
@@ -1190,6 +1230,24 @@ public static class Mop
     /// so it has no slot vector to index -- its slots live by name -- but AMOP still
     /// addresses them by the location the class layout gives, so the index is resolved
     /// through the class.</summary>
+    /// <summary>The slot name a layout index names on a class metaobject whose
+    /// metaclass defines slots of its own (they live by name in ExtraSlots, like a
+    /// funcallable instance's), or null when OBJ is not such a class. The index is
+    /// resolved through the metaclass's effective slots, the way AMOP addresses them.</summary>
+    private static string? ClassSlotName(string who, LispObject obj, LispObject location)
+    {
+        if (obj is not LispClass c || c.Metaclass is not { } meta) return null;
+        if (location is not Fixnum loc)
+            throw new LispErrorException(new LispTypeError(
+                $"{who}: location must be an integer", location));
+        int index = (int)loc.Value;
+        var slots = meta.EffectiveSlots;
+        if (index < 0 || index >= slots.Length)
+            throw new LispErrorException(new LispProgramError(
+                $"{who}: location {index} out of range [0,{slots.Length})"));
+        return slots[index].Name.Name;
+    }
+
     private static string? FuncallableSlotName(string who, LispObject obj, LispObject location)
     {
         if (obj is not GenericFunction gf || gf.StoredClass is not { } cls) return null;
@@ -1291,7 +1349,7 @@ public static class Mop
         var result = new List<LispObject>();
         for (var cur = ll; cur is Cons c; cur = c.Cdr)
         {
-            if (c.Car is Symbol s && s.Name.StartsWith("&")) break;
+            if (c.Car is Symbol s && s.Name.StartsWith("&", System.StringComparison.Ordinal)) break;
             if (c.Car is Cons spec && spec.Cdr is Cons rest)
                 result.Add(rest.Car);
             else

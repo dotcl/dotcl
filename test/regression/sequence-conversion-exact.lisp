@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; COERCE, CONCATENATE and MISMATCH build one exact-size result.
 ;;;
 ;;; Each of them collected the elements into a List<> and then copied the List

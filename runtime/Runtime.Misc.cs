@@ -189,7 +189,8 @@ public static partial class Runtime
         ("Zero_width_no-break_space", (char)0xfeff), // U+FEFF BOM/ZWNBSP (id3v2)
         ("Greek_small_letter_lamda", (char)0x03bb),  // U+03BB GREEK SMALL LETTER LAMDA (fn)
         ("Colon", ':'),                             // U+003A COLON
-        ("Nel", (char)0x0085),                        // U+0085 NEXT LINE
+        ("Next-Line", (char)0x0085),                  // U+0085 NEXT LINE
+        ("Nel", (char)0x0085),
         ("Next_line", (char)0x0085),                  // U+0085 NEXT LINE alias
         ("Hyphen-minus", '-'),                       // U+002D HYPHEN-MINUS
         ("Tilde", '~'),                             // U+007E TILDE
@@ -203,13 +204,63 @@ public static partial class Runtime
         // Read-only aliases SBCL also accepts (its older names for these three).
         // They come after the canonical entries, so CHAR-NAME never returns them.
         ("Slash", '/'), ("Backslash", (char)0x005c), ("Period", '.'),
+        // The short names Del (Rubout) and Sp (Space), also read-only aliases.
+        ("Del", '\x7f'), ("Sp", ' '),
+    };
+
+    // Names SBCL reads through the Unicode name aliases (the long control-character names, the
+    // C1 names, FORMFEED, NL). Read only: CHAR-NAME never returns them, so the table above stays
+    // the one that decides what a character prints as.
+    private static readonly (string name, char ch)[] _charNameAliases = new[]
+    {
+        // The names SBCL gives the C1 controls (hyphenated Unicode aliases, U80 style where it has none).
+        ("U80", (char)0x0080), ("U81", (char)0x0081), ("BREAK-PERMITTED", (char)0x0082),
+        ("NO-BREAK-PERMITTED", (char)0x0083), ("U84", (char)0x0084), ("START-SELECTED-AREA", (char)0x0086),
+        ("END-SELECTED-AREA", (char)0x0087), ("CHARACTER-TABULATION-SET", (char)0x0088), ("CHARACTER-TABULATION-WITH-JUSTIFICATION", (char)0x0089),
+        ("LINE-TABULATION-SET", (char)0x008A), ("PARTIAL-LINE-FORWARD", (char)0x008B), ("PARTIAL-LINE-BACKWARD", (char)0x008C),
+        ("REVERSE-LINEFEED", (char)0x008D), ("SINGLE-SHIFT-TWO", (char)0x008E), ("SINGLE-SHIFT-THREE", (char)0x008F),
+        ("DEVICE-CONTROL-STRING", (char)0x0090), ("PRIVATE-USE-ONE", (char)0x0091), ("PRIVATE-USE-TWO", (char)0x0092),
+        ("SET-TRANSMIT-STATE", (char)0x0093), ("CANCEL-CHARACTER", (char)0x0094), ("MESSAGE-WAITING", (char)0x0095),
+        ("START-GUARDED-AREA", (char)0x0096), ("END-GUARDED-AREA", (char)0x0097), ("START-STRING", (char)0x0098),
+        ("U99", (char)0x0099), ("SINGLE-CHARACTER-INTRODUCER", (char)0x009A), ("CONTROL-SEQUENCE-INTRODUCER", (char)0x009B),
+        ("STRING-TERMINATOR", (char)0x009C), ("OPERATING-SYSTEM-COMMAND", (char)0x009D), ("PRIVACY-MESSAGE", (char)0x009E),
+        ("APPLICATION-PROGRAM-COMMAND", (char)0x009F),
+        ("ACKNOWLEDGE", (char)6), ("APPLICATION_PROGRAM_COMMAND", (char)0x009F), ("BREAK_PERMITTED_HERE", (char)0x0082),
+        ("BYTE_ORDER_MARK", (char)0xFEFF), ("CANCEL", (char)24), ("CANCEL_CHARACTER", (char)0x0094),
+        ("CHARACTER_TABULATION", (char)9), ("CHARACTER_TABULATION_SET", (char)0x0088), ("CHARACTER_TABULATION_WITH_JUSTIFICATION", (char)0x0089),
+        ("CONTROL_SEQUENCE_INTRODUCER", (char)0x009B), ("DATA_LINK_ESCAPE", (char)16), ("DEVICE_CONTROL_FOUR", (char)20),
+        ("DEVICE_CONTROL_ONE", (char)17), ("DEVICE_CONTROL_STRING", (char)0x0090), ("DEVICE_CONTROL_THREE", (char)19),
+        ("DEVICE_CONTROL_TWO", (char)18), ("END_OF_GUARDED_AREA", (char)0x0097), ("END_OF_MEDIUM", (char)25),
+        ("END_OF_SELECTED_AREA", (char)0x0087), ("END_OF_TEXT", (char)3), ("END_OF_TRANSMISSION", (char)4),
+        ("END_OF_TRANSMISSION_BLOCK", (char)23), ("ENQUIRY", (char)5), ("FORMFEED", (char)12),
+        ("INFORMATION_SEPARATOR_FOUR", (char)28), ("INFORMATION_SEPARATOR_ONE", (char)31), ("INFORMATION_SEPARATOR_THREE", (char)29),
+        ("INFORMATION_SEPARATOR_TWO", (char)30), ("LINE_TABULATION", (char)11), ("LINE_TABULATION_SET", (char)0x008A),
+        ("MESSAGE_WAITING", (char)0x0095), ("NEGATIVE_ACKNOWLEDGE", (char)21), ("NL", (char)10),
+        ("NO_BREAK_HERE", (char)0x0083), ("OPERATING_SYSTEM_COMMAND", (char)0x009D), ("PARTIAL_LINE_BACKWARD", (char)0x008C),
+        ("PARTIAL_LINE_FORWARD", (char)0x008B), ("PRIVACY_MESSAGE", (char)0x009E), ("PRIVATE_USE_ONE", (char)0x0091),
+        ("PRIVATE_USE_TWO", (char)0x0092), ("REVERSE_LINE_FEED", (char)0x008D), ("SET_TRANSMIT_STATE", (char)0x0093),
+        ("SHIFT_IN", (char)15), ("SHIFT_OUT", (char)14), ("SINGLE_CHARACTER_INTRODUCER", (char)0x009A),
+        ("SINGLE_SHIFT_THREE", (char)0x008F), ("SINGLE_SHIFT_TWO", (char)0x008E), ("START_OF_GUARDED_AREA", (char)0x0096),
+        ("START_OF_HEADING", (char)1), ("START_OF_SELECTED_AREA", (char)0x0086), ("START_OF_STRING", (char)0x0098),
+        ("START_OF_TEXT", (char)2), ("STRING_TERMINATOR", (char)0x009C), ("SUBSTITUTE", (char)26),
+        ("SYNCHRONOUS_IDLE", (char)22),
+    };
+
+    // Names of this table that stand for a character the Unicode name table also names:
+    // CHAR-NAME gives the Unicode spelling (upper case, as SBCL does); NAME-CHAR still reads these.
+    private static readonly System.Collections.Generic.HashSet<string> _ucdSpelledNames = new()
+    {
+        "No-break_space", "Ideographic_space", "Zero_width_no-break_space", "Greek_small_letter_lamda",
+        "Colon", "Hyphen-minus", "Tilde", "Full_stop", "Semicolon", "Comma", "Solidus",
+        "Reverse_solidus", "Vertical_line", "Quotation_mark", "Slash", "Backslash", "Period",
     };
 
     public static string? CharName(char c)
     {
         foreach (var (name, ch) in _charNames)
-            if (ch == c && name != "Linefeed" && name != "Delete" && name != "Nul"
-                && name != "Altmode") // only canonical names
+            if (ch == c && name != "Linefeed" && name != "Delete" && name != "Null" && name != "Escape"
+                && name != "Altmode" // only canonical names
+                && !(_ucdSpelledNames.Contains(name) && Ucd.CharToName.ContainsKey(c)))
                 return name;
         // UCD names print with underscores (not spaces) so a #\<name> literal reads
         // back as a single token (CLHS #\ reads one token; name-char accepts both
@@ -232,17 +283,20 @@ public static partial class Runtime
         // ^[ 27, ^] 29, ^^ 30, ^_ 31 (letters in either case; ^\ is not a token).
         if (s.Length == 2 && s[0] == '^')
         {
-            char c = char.ToUpperInvariant(s[1]);
+            char c = CharCase.SimpleUpper(s[1]);
             if (c >= '@' && c <= '_' && c != '\\') return (char)(c - '@');
         }
-        var upper = s.ToUpperInvariant();
+        var upper = CharCase.SimpleUpper(s);
         foreach (var (name, ch) in _charNames)
-            if (name.ToUpperInvariant() == upper) return ch;
+            if (CharCase.SimpleUpper(name) == upper) return ch;
+        var aliasKey = upper.Replace(' ', '_');
+        foreach (var (name, ch) in _charNameAliases)
+            if (name == aliasKey) return ch;
         // UCD lookup: normalize underscores to spaces (e.g. "LATIN_SMALL_LETTER_A" -> "LATIN SMALL LETTER A")
         if (Ucd.NameToChar.TryGetValue(upper.Replace('_', ' '), out char ucdCh))
             return ucdCh;
         // Handle U+XXXX format names
-        if (upper.StartsWith("U+") && upper.Length >= 3)
+        if (upper.StartsWith("U+", System.StringComparison.Ordinal) && upper.Length >= 3)
         {
             if (int.TryParse(upper.Substring(2), System.Globalization.NumberStyles.HexNumber, null, out int code)
                 && code >= 0 && code <= char.MaxValue)
@@ -283,6 +337,33 @@ public static partial class Runtime
         if (obj is Number n) return n;
         throw new LispErrorException(new LispTypeError(
             $"Not a number: {obj}", obj, Startup.Sym("NUMBER")));
+    }
+
+    // The argument of a function that takes a REAL: a complex is refused as well.
+    public static Number AsReal(string fn, LispObject obj)
+    {
+        obj = Primary(obj);
+        if (obj is Number n && n is not LispComplex) return n;
+        throw new LispErrorException(new LispTypeError(
+            $"{fn}: not a real number: {FormatObject(obj, true)}", obj, Startup.Sym("REAL")));
+    }
+
+    private static void CheckTimeField(string what, int value, int lo, int hi, LispObject datum)
+    {
+        if (value < lo || value > hi)
+            throw new LispErrorException(new LispTypeError(
+                $"ENCODE-UNIVERSAL-TIME: {what} {value} is not in the range {lo}..{hi}",
+                datum, List(Startup.Sym("INTEGER"), Fixnum.Make(lo), Fixnum.Make(hi))));
+    }
+
+    public static Number AsNumber(string fn, LispObject obj)
+    {
+        obj = Primary(obj);
+        if (obj is Number n) return n;
+        // The type SBCL names: an integer for GCD / LCM, a real for FLOAT / COMPLEX.
+        string expected = fn is "GCD" or "LCM" ? "INTEGER" : fn is "FLOAT" or "COMPLEX" ? "REAL" : "NUMBER";
+        throw new LispErrorException(new LispTypeError(
+            $"{fn}: not a number: {FormatObject(obj, true)}", obj, Startup.Sym(expected)));
     }
 
     /// <summary>Convert a double to exact rational via IEEE 754 decomposition.</summary>
@@ -409,7 +490,10 @@ public static partial class Runtime
                 Array.Copy(args, 1, rest, 0, rest.Length);
                 return Runtime.Format(dest, rest);
             }).WithArgCount(2, -1));
-        Emitter.CilAssembler.RegisterFunction("FORMATTER",
+        Startup.RegisterBinary("%FORMAT-D", Runtime.FormatD);
+        Startup.RegisterBinary("%FORMAT-X", Runtime.FormatX);
+        Startup.RegisterBinary("%FORMAT-B", Runtime.FormatB);
+        Emitter.CilAssembler.RegisterFunction("%FORMATTER",
             new LispFunction(args => {
                 Runtime.CheckArityExact("FORMATTER", args, 1);
                 var controlString = args[0] switch
@@ -719,6 +803,9 @@ public static partial class Runtime
             var result = Runtime.MacroFunction(args[0]);
             if (result != Nil.Instance) return result;
             var sym = Runtime.GetSymbol(args[0], "MACRO-FUNCTION");
+            // A special operator has no macro function (CLHS 3.1.2.1.2.1), even where the
+            // compiler lowers it through an expander of its own.
+            if (Runtime.IsSpecialOperator(sym)) return Nil.Instance;
             var compilerFn = Startup.LookupCompilerMacroAsMacro(sym);
             if (compilerFn != null)
             {
@@ -937,6 +1024,7 @@ public static partial class Runtime
                 if (expander != null && tokens.GlobalSymbolMacros)
                     return MiniExpansionMiss;
                 var expanded = expander == null ? form : MacroexpandOnceOrSelfWithoutHook(form, new Cons(Nil.Instance, Nil.Instance));
+                if (expander != null) Runtime.AnnounceToMacroexpandHook(form);
                 if (tokens.Usable)
                     _miniExpansions.GetValue(cons, _ => new MiniExpansionBox()).Entry
                         = new MiniExpansion(tokens, true, expanded);
@@ -1086,6 +1174,10 @@ public static partial class Runtime
                         wasMacro = true;
                         return CallExpander(rmf, true, form, env, honourHook);
                     }
+                    // A special operator form is not expanded by MACROEXPAND-1 (CLHS 3.1.2.1.2.1);
+                    // the evaluator (honourHook false) still lowers some of them through their
+                    // expanders.
+                    if (honourHook && Runtime.IsSpecialOperator(sym)) return form;
                     var compilerFn = Startup.LookupCompilerMacroAsMacro(sym);
                     if (compilerFn != null)
                     {
@@ -1199,6 +1291,7 @@ public static partial class Runtime
                             var rmf = Runtime.MacroFunction(sym);
                             if (rmf is LispFunction rf) { fn = rf; is2arg = true; }
                         }
+                        if (fn == null && Runtime.IsSpecialOperator(sym)) break;
                         if (fn == null)
                             fn = Startup.LookupCompilerMacroAsMacro(sym);
                         if (fn != null)
@@ -1313,7 +1406,9 @@ public static partial class Runtime
                     return MultipleValues.Values(args[0], wP, fP);
                 }
                 // (compile name): NAME's existing definition is already compiled in dotcl;
-                // just return the designator.
+                // just return the designator. Without a definition NIL names nothing to compile.
+                if (args.Length == 1 && args[0] is Nil)
+                    throw new LispErrorException(new LispProgramError("COMPILE: NIL needs a definition"));
                 if (args[0] is Symbol sym)
                 {
                     return MultipleValues.Values(sym, Nil.Instance, Nil.Instance);
@@ -1572,6 +1667,10 @@ public static partial class Runtime
         // %REGISTER-SYMBOL-MACRO-RT: register a global symbol macro at load time
         Startup.RegisterBinary("%REGISTER-SYMBOL-MACRO-RT", (nameObj, expansion) => {
             var sym = Runtime.GetSymbol(nameObj, "%REGISTER-SYMBOL-MACRO-RT");
+            if (Runtime.SymbolMacroNameConflicts(sym))
+                throw new LispErrorException(new LispProgramError(
+                    $"DEFINE-SYMBOL-MACRO: {sym.Name} is already defined as a "
+                    + (sym.IsConstant ? "constant" : "special variable")));
             Runtime.RegisterGlobalSymbolMacro(sym, expansion);
             // Also register in compiler's *global-symbol-macros* if available
             foreach (var pkgName in new[] { "DOTCL-INTERNAL", "DOTCL.CIL-COMPILER" })
@@ -1650,7 +1749,7 @@ public static partial class Runtime
             return Fixnum.Make(Compat.MonotonicMicroseconds());
         }));
         Startup.RegisterUnary("SLEEP", obj => {
-            double secs = Arithmetic.ToDouble(Runtime.AsNumber(obj));
+            double secs = Arithmetic.ToDouble(Runtime.AsReal("SLEEP", obj));
             if (secs < 0) throw new LispErrorException(new LispTypeError("SLEEP: negative argument", obj));
             bool interrupted = false;
             var self = Runtime.EnterInterruptibleWait();
@@ -1691,9 +1790,9 @@ public static partial class Runtime
             } else {
                 dt = dtUtc.ToLocalTime();
                 var tzInfo = System.TimeZoneInfo.Local;
-                bool isDst = tzInfo.IsDaylightSavingTime(dt);
+                bool isDst = tzInfo.IsDaylightSavingTime(dtUtc);
                 daylightP = isDst ? T.Instance : Nil.Instance;
-                double utcOffsetHours = StandardUtcOffsetHours(tzInfo, dt);
+                double utcOffsetHours = StandardUtcOffsetHours(tzInfo, dtUtc);
                 zone = (-utcOffsetHours == (long)(-utcOffsetHours)) ? (LispObject)Fixnum.Make((long)(-utcOffsetHours)) : new DoubleFloat(-utcOffsetHours);
             }
             int dow = ((int)dt.DayOfWeek + 6) % 7;
@@ -1712,9 +1811,10 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("GET-DECODED-TIME", new LispFunction(_ => {
             if (_.Length != 0) throw new LispErrorException(new LispProgramError("GET-DECODED-TIME: wrong number of arguments: " + _.Length + " (expected 0)"));
             var now = System.DateTime.Now;
+            var nowUtc = System.DateTime.UtcNow;
             var tzInfo = System.TimeZoneInfo.Local;
-            bool isDst = tzInfo.IsDaylightSavingTime(now);
-            double utcOffsetHours = StandardUtcOffsetHours(tzInfo, now);
+            bool isDst = tzInfo.IsDaylightSavingTime(nowUtc);
+            double utcOffsetHours = StandardUtcOffsetHours(tzInfo, nowUtc);
             int dow = ((int)now.DayOfWeek + 6) % 7;
             return MultipleValues.Values(
                 Fixnum.Make(now.Second),
@@ -1747,6 +1847,12 @@ public static partial class Runtime
                 if (year > curYear + 49) year -= 100;
                 else if (year < curYear - 50) year += 100;
             }
+            CheckTimeField("second", second, 0, 59, args[0]);
+            CheckTimeField("minute", minute, 0, 59, args[1]);
+            CheckTimeField("hour", hour, 0, 23, args[2]);
+            CheckTimeField("month", month, 1, 12, args[4]);
+            CheckTimeField("year", year, 1, 9999, args[5]);
+            CheckTimeField("date", date, 1, System.DateTime.DaysInMonth(year, month), args[3]);
             var epoch = new System.DateTime(1900, 1, 1, 0, 0, 0, System.DateTimeKind.Utc);
             System.DateTime dt;
             if (args.Length == 7 && args[6] is not Nil) {
@@ -1882,7 +1988,87 @@ public static partial class Runtime
     /// <summary>Record a function's lambda list as the text it was written as.
     /// Called from the IL a FASL emits, once per function it defines.</summary>
     public static void SetLambdaListSource(LispFunction fn, string text)
-        => fn.StoredLambdaList = new LispString(text);
+    {
+        fn.StoredLambdaList = new LispString(text);
+        InternLambdaListParameterNames(text);
+    }
+
+    /// <summary>A parameter name of a function loaded from a FASL exists as a
+    /// symbol of the package being loaded into, as it does when the source is read
+    /// (the names are written uninterned, "#:NAME", so a process that never read the
+    /// source would otherwise not have them; a name accessible where the text was
+    /// printed appears bare). Interns the parameter names of TEXT,
+    /// a printed lambda list, in *PACKAGE*: the required, &amp;optional and &amp;rest
+    /// names, the variable and supplied-p name of an &amp;key / &amp;aux / optional
+    /// entry. Default forms are not read. A name already accessible is left as it is.</summary>
+    private static void InternLambdaListParameterNames(string text)
+    {
+        if (DynamicBindings.Get(Startup.Sym("*PACKAGE*")) is not Package pkg) return;
+        // dotcl's own packages keep to the symbols their source names: the
+        // interpreter's marker symbols are told apart from user symbols by not
+        // being there.
+        if (pkg.Name.StartsWith("DOTCL", StringComparison.Ordinal)) return;
+        // depth 1: every name; depth 2: element 0 (or the variable of a
+        // ((:key var) ...) element) and element 2 (supplied-p); deeper: nothing.
+        int depth = 0;
+        var index = new int[8];
+        bool keyPair = false;
+        int i = 0, n = text.Length;
+        while (i < n)
+        {
+            char ch = text[i];
+            if (ch == '(') { depth++; if (depth < index.Length) index[depth] = 0; i++; continue; }
+            if (ch == ')')
+            {
+                if (depth == 3 && keyPair) keyPair = false;
+                depth--; i++;
+                if (depth < 0) return;
+                if (depth >= 1 && depth < index.Length) index[depth]++;
+                continue;
+            }
+            if (char.IsWhiteSpace(ch)) { i++; continue; }
+            if (ch == '"')
+            {
+                i++;
+                while (i < n && text[i] != '"') i += text[i] == '\\' ? 2 : 1;
+                i++;
+                if (depth >= 1 && depth < index.Length) index[depth]++;
+                continue;
+            }
+            int start = i;
+            while (i < n && !char.IsWhiteSpace(text[i]) && text[i] != '(' && text[i] != ')' && text[i] != '"') i++;
+            var tok = text.AsSpan(start, i - start);
+            if (tok.Length > 2 && tok[0] == '#' && tok[1] == ':') tok = tok.Slice(2);
+            if (tok.Length > 0 && tok[0] != '|' && depth >= 1 && depth < index.Length)
+            {
+                bool want = depth == 1 || (depth == 2 && (index[2] == 0 || index[2] == 2))
+                            || (depth == 3 && index[3] == 1 && index[2] == 0);
+                if (want && IsPlainSymbolName(tok))
+                {
+                    var name = tok.ToString();
+                    var (found, status) = pkg.FindSymbol(name);
+                    if (found == null || status == SymbolStatus.None) pkg.Intern(name);
+                }
+            }
+            else if (tok.Length > 0 && tok[0] == '|')
+            {
+                // A name with escapes: skip to the closing bar.
+                int j = start + 1;
+                while (j < n && text[j] != '|') j++;
+                i = Math.Min(n, j + 1);
+            }
+            if (depth >= 1 && depth < index.Length) index[depth]++;
+        }
+    }
+
+    private static bool IsPlainSymbolName(ReadOnlySpan<char> s)
+    {
+        if (char.IsDigit(s[0]) || s[0] is '+' or '-' or '.') return false;
+        foreach (var c in s)
+            if (!(char.IsLetterOrDigit(c) || c is '-' or '_' or '*' or '+' or '/' or '<' or '>' or '=' or '!' or '?' or '%' or '$' or '.'))
+                return false;
+        return s.Length > 0;
+    }
     /// <summary>Read a FASL-carried lambda list, once, replacing the text with what
     /// it read. The text is printed relative to the package of the function's own
     /// name, so nothing here depends on which package is current. A text that will not

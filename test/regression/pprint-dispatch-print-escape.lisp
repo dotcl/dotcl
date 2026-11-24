@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A pprint dispatch function sees *PRINT-ESCAPE* as the printing function
 ;;; set it: NIL under PRINC, PRINC-TO-STRING and ~A, T under PRIN1 and ~S.
 ;;;

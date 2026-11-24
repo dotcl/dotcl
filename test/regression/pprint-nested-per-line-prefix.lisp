@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Per-line prefixes of enclosing logical blocks.
 ;;;
 ;;; A new line inside a logical block starts with the per-line prefix of every

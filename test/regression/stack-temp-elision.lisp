@@ -50,8 +50,8 @@
   (loop for i below (dotnet:invoke arr "Length") collect (dotnet:invoke arr "GetValue" i)))
 
 (deftest-compiled-only ste-fasl-method-loses-temps
-  (let ((src "ste-src-tmp.lisp")
-        (fasl "ste-src-tmp.fasl"))
+  (let ((src (regression-temp-file "ste-src-tmp.lisp"))
+        (fasl (regression-temp-file "ste-src-tmp.fasl")))
     (unwind-protect
         (progn
           (with-open-file (s src :direction :output :if-exists :supersede)

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The metaobject class names DOTCL-MOP exports are the class names
 ;;; themselves, as on SBCL where SB-MOP exports the symbols SB-PCL names its
 ;;; classes with. They used to be separate symbols: FIND-CLASS and TYPEP got

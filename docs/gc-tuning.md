@@ -2,9 +2,14 @@
 
 If a long-running computation that allocates a lot (batch jobs, benchmarks,
 Coalton-style code) is slower than you expect, the .NET garbage collector
-settings can help. dotcl keeps the .NET defaults, because the defaults give
-short pauses, which is what a REPL or a server wants. The settings below trade
-pause time for throughput, and apply to the whole process.
+settings can help. The command-line `dotcl`, and executables made with
+`save-application :executable t`, raise the generation 0 budget to 64 MB
+(`System.GC.Gen0MaxBudget` in the runtime configuration) and otherwise keep the
+.NET defaults, because the defaults give short pauses, which is what a REPL or
+a server wants. A .NET application that embeds dotcl uses its own runtime
+configuration and does not get the 64 MB; add the same property to it (see
+"First choice"). The settings below trade pause time for throughput, and apply
+to the whole process.
 
 Measured with the ReadyToRun distribution on Linux x86-64 (sv7), Windows x64
 (lv9) and macOS arm64, 2026-10-26 and 2026-10-27. The tables show sv7 unless
@@ -16,14 +21,38 @@ and individual cl-bench rows vary by about 10%.
 
 Keep them for a REPL, an editor session, or a server. With the defaults, a
 10 ms timer task that allocates about 0.8 MB per tick (live heap about 200 MB)
-is delayed by at most 98 ms. The settings below make that worse.
+is delayed by at most 98 ms. The settings below make that worse. The 64 MB
+generation 0 cap that dotcl sets by default has a smaller cost of the same
+kind: a full collection with 8M conses live took 1.12 to 1.26 times as long on
+x64 (0.77 on arm64), and a long allocation-heavy run peaks 35 to 75% higher in
+resident memory. To go back to the .NET default, remove the property
+`System.GC.Gen0MaxBudget` from `runtimeconfig.json`.
 
 ## First choice: a larger gen0 budget
 
     DOTNET_GCgen0size=0x4000000
 
 This sets the generation 0 budget to 64 MB. It must be an environment variable;
-`System.GC.Gen0Size` in `runtimeconfig.json` has no effect.
+`System.GC.Gen0Size` in `runtimeconfig.json` has no effect. The runtime
+configuration property that works is `System.GC.Gen0MaxBudget`, given as a
+decimal number of bytes under `configProperties`:
+
+    "System.GC.Gen0MaxBudget": 67108864
+
+dotcl sets this itself, so the tables below (measured before it did) show what
+the default gives you now. In a C# host, the same line in the host project:
+
+    <ItemGroup>
+      <RuntimeHostConfigurationOption Include="System.GC.Gen0MaxBudget" Value="67108864" />
+    </ItemGroup>
+
+`DOTNET_GCgen0size` no longer raises the budget above that cap; to go higher,
+set the property to a larger number in the `runtimeconfig.json` of a published
+directory (268435456 gives 1 collection for 3M conses).
+
+On a machine or in a container with a memory limit the runtime lowers the
+budget by itself (a 256 MB container gets about 18 collections for 3M conses
+instead of 3).
 
 | Measure | Default | `GCgen0size` 64 MB |
 |---|---:|---:|
@@ -55,10 +84,42 @@ The gain on the allocation-heavy kernels is about the same (Coalton list-ops
 - A published directory: edit `runtime.runtimeconfig.json` and add the property
   under `configProperties`. This works for `System.GC.Concurrent`.
 - `save-application :executable t` produces a single-file executable with the
-  runtimeconfig embedded, so it cannot be changed afterwards. Use the
-  environment variables instead.
+  runtimeconfig embedded (including the 64 MB generation 0 budget), so it
+  cannot be changed afterwards. Use the environment variables instead.
 - `DOTNET_GCgen0size` is always an environment variable, for every kind of
   executable.
+
+## Memory
+
+dotcl follows the .NET defaults for how much memory a process may take: it sets
+no heap limit of its own, so a program that keeps allocating grows until the
+operating system stops it. (SBCL starts with a 1 GB heap and reports "Heap
+exhausted" when it is full.) To cap the heap, set `DOTNET_GCHeapHardLimit` (a
+hexadecimal number of bytes, so `0x80000000` is 2 GB) in the environment, or
+`System.GC.HeapHardLimit` in the runtime configuration of an executable or a
+host application.
+
+When the limit is reached, the allocation signals a `storage-condition`. It is
+not an `error`, so `handler-case` with an `error` clause does not catch it; name
+`storage-condition`:
+
+```lisp
+(handler-case (let ((arrays '()))
+                (loop (push (make-array 10000000) arrays)))
+  (storage-condition () :out-of-memory))
+```
+
+A script that does not handle it prints `file:line: Heap exhausted: the allocation
+could not be satisfied (STORAGE-CONDITION)` and exits with status 1.
+
+Expect more memory than SBCL for programs that hold many small objects. A cons
+is 32 bytes and a fixnum stored in a general vector or list is a separate 24-byte
+object, where SBCL uses 16 bytes and an immediate value; a list of ten million
+integers takes about 4 times as much, and a simple vector of twenty million about
+3 times. Text is the other way round: a string is two bytes per character here and
+four in SBCL, so a program that reads a 200 MB log used less memory on dotcl in the
+programs measured. An idle REPL is about 100 MB, 150 MB after `(require "asdf")`.
+The GC settings above change speed, not these sizes.
 
 ## What does not help
 

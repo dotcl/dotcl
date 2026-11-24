@@ -718,46 +718,190 @@ public static partial class Runtime
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static LispInstance? MakeFromPlan(CtorPlan plan, LispObject[] initargs)
     {
+        if (plan.Arounds.Length != 0) return MakeFromPlanWithArounds(plan, initargs);
+        if (plan.HasBefores || plan.SharedArounds.Length != 0) return MakeFromPlanWithBefores(plan, initargs);
         var inst = plan.TryMake(initargs, out var effective);
-        if (inst == null || plan.Afters.Length == 0) return inst;
+        if (inst == null || !plan.HasAfters) return inst;
         return RunAfters(plan, inst, effective);
+    }
+
+    /// <summary>The instance of a plan that has :BEFORE methods: allocated with every slot
+    /// unbound, the :BEFORE methods of INITIALIZE-INSTANCE and then of SHARED-INITIALIZE run on
+    /// it, the slots are filled, and the :AFTER methods run (the standard order).</summary>
+    private static LispInstance? MakeFromPlanWithBefores(CtorPlan plan, LispObject[] initargs)
+    {
+        if (!plan.KeysKnown(initargs)) return null;
+        var effective = plan.EffectiveInitargs(initargs);
+        var inst = new LispInstance(plan.Class, plan.Layout);
+        RunBeforesFillAfters(plan, inst, effective, initargs.Length);
+        return inst;
+    }
+
+    /// <summary>The instance of a plan that has :AROUND methods of INITIALIZE-INSTANCE: they run
+    /// first, most specific outermost, and the plan's own steps are the innermost method they
+    /// reach through CALL-NEXT-METHOD (so an :AROUND that does not call it leaves the slots
+    /// unbound, and one that calls it twice runs the steps twice, as the standard
+    /// combination does).</summary>
+    private static LispInstance? MakeFromPlanWithArounds(CtorPlan plan, LispObject[] initargs)
+    {
+        if (!plan.KeysKnown(initargs)) return null;
+        var effective = plan.EffectiveInitargs(initargs);
+        var inst = new LispInstance(plan.Class, plan.Layout);
+        var chain = plan.AroundChain ??= BuildAroundChain(plan);
+        var args = new LispObject[effective.Length + 1];
+        args[0] = inst;
+        Array.Copy(effective, 0, args, 1, effective.Length);
+        InvokeWithNextMethods(chain, 0, args, null, Startup.Sym("INITIALIZE-INSTANCE").Function as GenericFunction);
+        return inst;
+    }
+
+    private static List<LispMethod> BuildAroundChain(CtorPlan plan)
+    {
+        var chain = new List<LispMethod>(plan.Arounds);
+        var terminal = new LispFunction(a =>
+        {
+            var inst = (LispInstance)a[0];
+            var eff = new LispObject[a.Length - 1];
+            Array.Copy(a, 1, eff, 0, eff.Length);
+            RunBeforesFillAfters(plan, inst, eff, eff.Length);
+            return inst;
+        }, "INITIALIZE-INSTANCE");
+        chain.Add(new LispMethod(new LispObject[] { FindClassOrNil(Startup.Sym("T"))! },
+                                 Array.Empty<LispObject>(), terminal));
+        return chain;
+    }
+
+    private static void RunBeforesFillAfters(CtorPlan plan, LispInstance inst, LispObject[] effective, int nSupplied)
+    {
+        if (plan.Befores.Length != 0)
+        {
+            var args = new LispObject[effective.Length + 1];
+            args[0] = inst;
+            Array.Copy(effective, 0, args, 1, effective.Length);
+            foreach (var m in plan.Befores) InvokeAux(m, args);
+        }
+        if (plan.SharedArounds.Length != 0)
+        {
+            // SHARED-INITIALIZE's own chain: its :around methods, then the plan's steps for it.
+            var chain = plan.SharedAroundChain ??= BuildSharedAroundChain(plan);
+            var sargs = new LispObject[effective.Length + 2];
+            sargs[0] = inst;
+            sargs[1] = T.Instance;
+            Array.Copy(effective, 0, sargs, 2, effective.Length);
+            InvokeWithNextMethods(chain, 0, sargs, null, Startup.Sym("SHARED-INITIALIZE").Function as GenericFunction);
+            RunInitAfters(plan, inst, effective);
+            return;
+        }
+        if (plan.SharedBefores.Length != 0)
+            RunSharedBefores(plan, inst, effective);
+        plan.FillSlots(inst, effective, nSupplied);
+        RunAfters(plan, inst, effective);
+    }
+
+    private static void RunSharedBefores(CtorPlan plan, LispInstance inst, LispObject[] effective)
+    {
+        var sargs = new LispObject[effective.Length + 2];
+        sargs[0] = inst;
+        sargs[1] = T.Instance;
+        Array.Copy(effective, 0, sargs, 2, effective.Length);
+        foreach (var m in plan.SharedBefores) InvokeAux(m, sargs);
+    }
+
+    /// <summary>The end of SHARED-INITIALIZE's chain: its :BEFORE methods, the default method (the plan's
+    /// slot filling for SLOT-NAMES T, the general one for any other), then its :AFTER methods, all with
+    /// the arguments the last :around handed on.</summary>
+    private static List<LispMethod> BuildSharedAroundChain(CtorPlan plan)
+    {
+        var chain = new List<LispMethod>(plan.SharedArounds);
+        var terminal = new LispFunction(a =>
+        {
+            var inst = (LispInstance)a[0];
+            foreach (var m in plan.SharedBefores) InvokeAux(m, a);
+            if (a[1] is T)
+            {
+                var eff = new LispObject[a.Length - 2];
+                Array.Copy(a, 2, eff, 0, eff.Length);
+                plan.FillSlots(inst, eff, eff.Length);
+            }
+            else SharedInitializeCore(inst, a[1], a, 2);
+            foreach (var m in plan.SharedAfters) InvokeAux(m, a);
+            return inst;
+        }, "SHARED-INITIALIZE");
+        var tc = FindClassOrNil(Startup.Sym("T"))!;
+        chain.Add(new LispMethod(new LispObject[] { tc, tc }, Array.Empty<LispObject>(), terminal));
+        return chain;
     }
 
     private static LispInstance RunAfters(CtorPlan plan, LispInstance inst, LispObject[] initargs)
     {
-        var args = new LispObject[initargs.Length + 1];
-        args[0] = inst;
-        Array.Copy(initargs, 0, args, 1, initargs.Length);
-        foreach (var m in plan.Afters) InvokeAux(m, args);
+        // INITIALIZE-INSTANCE's primary method calls SHARED-INITIALIZE (with SLOT-NAMES T), so its
+        // :AFTER methods run before those of INITIALIZE-INSTANCE.
+        if (plan.SharedAfters.Length != 0)
+        {
+            var sargs = new LispObject[initargs.Length + 2];
+            sargs[0] = inst;
+            sargs[1] = T.Instance;
+            Array.Copy(initargs, 0, sargs, 2, initargs.Length);
+            foreach (var m in plan.SharedAfters) InvokeAux(m, sargs);
+        }
+        return RunInitAfters(plan, inst, initargs);
+    }
+
+    private static LispInstance RunInitAfters(CtorPlan plan, LispInstance inst, LispObject[] initargs)
+    {
+        if (plan.Afters.Length != 0)
+        {
+            var args = new LispObject[initargs.Length + 1];
+            args[0] = inst;
+            Array.Copy(initargs, 0, args, 1, initargs.Length);
+            foreach (var m in plan.Afters) InvokeAux(m, args);
+        }
         return inst;
     }
 
-    /// <summary>The :AFTER methods of INITIALIZE-INSTANCE applicable to instances of CLS,
-    /// least specific first, when they are all it has besides the default method and
-    /// SHARED-INITIALIZE has none of its own for CLS; null otherwise.</summary>
-    private static LispMethod[]? InitAfterMethodsOnly(LispClass cls)
+    /// <summary>The :BEFORE and :AFTER methods of GF (INITIALIZE-INSTANCE with one specializer,
+    /// SHARED-INITIALIZE with two) applicable to instances of CLS, when they are all it has besides
+    /// the default method. BEFORE is most specific first, AFTER least specific first. False when
+    /// it has anything else (:AROUND, a primary method, an EQL or SLOT-NAMES specializer, a
+    /// changed method combination or protocol).</summary>
+    private static bool CtorMethodLists(GenericFunction? gf, LispClass cls, int nSpecializers,
+                                        out LispMethod[] before, out LispMethod[] after,
+                                        out LispMethod[] around, bool allowAround = false)
     {
-        _initializeInstanceSym ??= Startup.Sym("INITIALIZE-INSTANCE");
-        if (_initializeInstanceSym.Function is not GenericFunction gf || gf.MethodCombination != null
-            || gf.DispatchFunction != null
-            || (AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf))
-            || !SharedInitializeIsDefault(cls))
-            return null;
+        before = after = around = Array.Empty<LispMethod>();
+        if (gf == null || gf.MethodCombination != null || gf.DispatchFunction != null
+            || (AnyInvocationProtocolCustomized && UsesInvocationProtocol(gf)))
+            return false;
         var cpl = cls.ClassPrecedenceList;
+        var befores = new List<LispMethod>();
         var afters = new List<LispMethod>();
+        var arounds = new List<LispMethod>();
         foreach (var m in gf.Methods)
         {
             if (AllTSpecializers(m) && m.Qualifiers.Length == 0) continue;
-            if (m.Specializers.Length != 1 || m.Specializers[0] is not LispClass sc) return null;
+            if (m.Specializers.Length != nSpecializers || m.Specializers[0] is not LispClass sc) return false;
+            if (nSpecializers == 2
+                && (m.Specializers[1] is not LispClass slotNames || !IsSystemClass(slotNames, "T")))
+                return false;
             if (Array.IndexOf(cpl, sc) < 0) continue;
-            if (m.Qualifiers.Length != 1 || m.Qualifiers[0] is not Symbol q || q.Name != "AFTER"
+            if (m.Qualifiers.Length != 1 || m.Qualifiers[0] is not Symbol q
                 || q.HomePackage?.Name != "KEYWORD")
-                return null;
-            afters.Add(m);
+                return false;
+            if (q.Name == "AFTER") afters.Add(m);
+            else if (q.Name == "BEFORE") befores.Add(m);
+            else if (allowAround && q.Name == "AROUND") arounds.Add(m);
+            else return false;
         }
-        afters.Sort((a, b) => Array.IndexOf(cpl, (LispClass)b.Specializers[0])
-                                  .CompareTo(Array.IndexOf(cpl, (LispClass)a.Specializers[0])));
-        return afters.ToArray();
+        afters.Sort((x, y) => Array.IndexOf(cpl, (LispClass)y.Specializers[0])
+                                  .CompareTo(Array.IndexOf(cpl, (LispClass)x.Specializers[0])));
+        befores.Sort((x, y) => Array.IndexOf(cpl, (LispClass)x.Specializers[0])
+                                   .CompareTo(Array.IndexOf(cpl, (LispClass)y.Specializers[0])));
+        arounds.Sort((x, y) => Array.IndexOf(cpl, (LispClass)x.Specializers[0])
+                                   .CompareTo(Array.IndexOf(cpl, (LispClass)y.Specializers[0])));
+        before = befores.ToArray();
+        after = afters.ToArray();
+        around = arounds.ToArray();
+        return true;
     }
 
     private static LispObject MakeInstanceOf(LispObject classSpec, LispObject[] initargs)
@@ -780,6 +924,14 @@ public static partial class Runtime
         }
         else
             throw new LispErrorException(new LispTypeError("MAKE-INSTANCE: invalid class specifier", classSpec));
+
+        // A class that has not been finalized because it, or a superclass, is still
+        // forward-referenced has no precedence list or slots to build an instance from.
+        // (DEFCLASS accepts such a superclass; making an instance is where it is an error.)
+        if (!IsClassFinalized(cls) && ForwardReferencedAncestor(cls) is { } fwdAncestor)
+            throw new LispErrorException(new LispError(ReferenceEquals(fwdAncestor, cls)
+                ? $"MAKE-INSTANCE: the class {cls.Name.Name} is forward-referenced (not defined yet)"
+                : $"MAKE-INSTANCE: the class {cls.Name.Name} has the forward-referenced superclass {fwdAncestor.Name.Name}, which is not defined yet"));
 
         if (LivePlan(cls) is { } plan && MakeFromPlan(plan, initargs) is { } made)
             return made;
@@ -850,7 +1002,7 @@ public static partial class Runtime
         // protocol (e.g. McCLIM's class-with-dynamic-slots). Skip every fast path so the
         // instance is allocated via the GF and slot writes go through SHARED-INITIALIZE,
         // which routes through (setf slot-value-using-class) for custom metaclasses.
-        bool customMeta = cls.Metaclass != null;
+        bool customMeta = cls.Metaclass != null || HasEqlAllocateInstanceMethod(cls);
 
         // Ultra-fast path: bypass GF dispatch for simple classes with no custom methods
         if (!customMeta && cls.HasSimpleInitialization && CanUseSimplePath(cls))
@@ -888,8 +1040,23 @@ public static partial class Runtime
         int slowEpoch = GenericFunction.MethodEpoch;
         ValidateInitargs(cls, initargs, 0);
         if (!customMeta && cls.HasSimpleInitialization && !IsConditionClass(cls)
-            && InitAfterMethodsOnly(cls) is { Length: > 0 } afters)
-            RecordCtorKeys(cls, initargs, slowEpoch, afters);
+            && cls.CtorPlanNoneEpoch != slowEpoch)
+        {
+            if (cls.Ctor is { } livePlan && livePlan.Epoch == slowEpoch)
+                RecordCtorKeys(cls, initargs, slowEpoch, Array.Empty<LispMethod>());
+            else if (CtorMethodLists(Startup.Sym("INITIALIZE-INSTANCE").Function as GenericFunction, cls, 1,
+                                     out var initBefores, out var initAfters, out var initArounds, allowAround: true)
+                     && CtorMethodLists(Startup.Sym("SHARED-INITIALIZE").Function as GenericFunction, cls, 2,
+                                        out var sharedBefores, out var sharedAfters, out var sharedArounds,
+                                        allowAround: true)
+                     && (initAfters.Length > 0 || sharedAfters.Length > 0
+                         || initBefores.Length > 0 || sharedBefores.Length > 0 || initArounds.Length > 0
+                         || sharedArounds.Length > 0))
+                RecordCtorKeys(cls, initargs, slowEpoch, initAfters, sharedAfters, initBefores, sharedBefores,
+                               initArounds, sharedArounds);
+            else
+                cls.CtorPlanNoneEpoch = slowEpoch;
+        }
 
         // Custom metaclass: allocate through the ALLOCATE-INSTANCE GF so user overrides run.
         var inst = customMeta ? AllocateViaGF(cls, initargs) : new LispInstance(cls);
@@ -1149,7 +1316,10 @@ public static partial class Runtime
 
     // After ValidateInitargs accepted INITARGS under EPOCH: remember each key's slot.
     // :ALLOW-OTHER-KEYS is never remembered, so a call that passes it keeps validating.
-    private static void RecordCtorKeys(LispClass cls, LispObject[] initargs, int epoch, LispMethod[] afters)
+    private static void RecordCtorKeys(LispClass cls, LispObject[] initargs, int epoch, LispMethod[] afters,
+                                       LispMethod[]? sharedAfters = null, LispMethod[]? befores = null,
+                                       LispMethod[]? sharedBefores = null, LispMethod[]? arounds = null,
+                                       LispMethod[]? sharedArounds = null)
     {
         var plan = cls.Ctor;
         if (plan == null || plan.Epoch != epoch)
@@ -1157,7 +1327,10 @@ public static partial class Runtime
             if (GenericFunction.MethodEpoch != epoch) return;
             // A MAKE-INSTANCE method of the program applies to the class: no fast plan.
             if (MakeInstanceOverridden(cls)) return;
-            cls.Ctor = plan = new CtorPlan(cls, epoch, afters);
+            var built = new CtorPlan(cls, epoch, afters, sharedAfters, befores, sharedBefores);
+            if (arounds != null) built.Arounds = arounds;
+            if (sharedArounds != null) built.SharedArounds = sharedArounds;
+            cls.Ctor = plan = built;
         }
         var map = cls.InitargToSlotIndex;
         for (int i = 0; i < initargs.Length; i += 2)
@@ -1226,6 +1399,38 @@ public static partial class Runtime
         => c.Name.Name == name && ReferenceEquals(c.Name, Startup.Sym(name));
 
     /// <summary>Check if a class is a condition class (CONDITION in its CPL).</summary>
+    internal static bool IsConditionInstance(LispInstance inst) => IsConditionClass(inst.Class);
+
+    private sealed class EqlAllocateSnapshot
+    {
+        public readonly int Epoch;
+        public readonly HashSet<LispClass> Classes;
+        public EqlAllocateSnapshot(int epoch, HashSet<LispClass> classes) { Epoch = epoch; Classes = classes; }
+    }
+
+    // One immutable reference, replaced whole: a reader never sees an epoch from one
+    // build paired with a set from another.
+    private static EqlAllocateSnapshot? eqlAllocateSnapshot;
+
+    /// <summary>True when a method of ALLOCATE-INSTANCE is specialized on (eql CLS), so
+    /// MAKE-INSTANCE has to allocate through the generic function. Cached per method epoch.</summary>
+    private static bool HasEqlAllocateInstanceMethod(LispClass cls)
+    {
+        int epoch = GenericFunction.MethodEpoch;
+        var snap = System.Threading.Volatile.Read(ref eqlAllocateSnapshot);
+        if (snap == null || snap.Epoch != epoch)
+        {
+            var set = new HashSet<LispClass>();
+            if (Startup.Sym("ALLOCATE-INSTANCE").Function is GenericFunction gf)
+                foreach (var m in gf.Methods)
+                    if (m.Specializers.Length > 0 && m.Specializers[0] is EqlSpecializer { Object: LispClass sc })
+                        set.Add(sc);
+            snap = new EqlAllocateSnapshot(epoch, set);
+            System.Threading.Volatile.Write(ref eqlAllocateSnapshot, snap);
+        }
+        return snap.Classes.Count > 0 && snap.Classes.Contains(cls);
+    }
+
     private static bool IsConditionClass(LispClass cls)
     {
         if (cls.CachedIsConditionClass is bool cached) return cached;
@@ -1290,6 +1495,18 @@ public static partial class Runtime
         return true;
     }
 
+    private static bool SpecializerAcceptsClass(object spec, LispClass cls)
+    {
+        if (spec is LispClass specCls)
+        {
+            if (specCls.Name.Name == "T") return true;
+            foreach (var c in cls.ClassPrecedenceList)
+                if (c == specCls) return true;
+            return false;
+        }
+        return true; // EQL specializer; conservative
+    }
+
     private static bool IsMethodApplicableToClass(LispMethod m, LispClass cls)
     {
         if (m.Specializers.Length == 0) return true;
@@ -1314,7 +1531,7 @@ public static partial class Runtime
         HashSet<string>? extraMethodKeys = null)
     {
         int count = args.Length - startIdx;
-        if (count <= 0) return;
+        if (count <= 0 && cls.DefaultInitargs.Length == 0) return;
 
         // Check if :allow-other-keys t is in the supplied initargs
         bool allowOtherKeys = false;
@@ -1358,8 +1575,6 @@ public static partial class Runtime
                 foreach (var slot in cls.EffectiveSlots)
                     foreach (var ia in slot.Initargs)
                         validKeys.Add(ia.Name);
-                foreach (var (key, _, _) in cls.DefaultInitargs)
-                    validKeys.Add(key.Name);
                 // CLHS 7.1.2: keyword args of applicable initialize-instance and
                 // shared-initialize methods are also valid initargs.
                 bool methodAOK = AddMethodKeysForClass(cls, Startup.Sym("INITIALIZE-INSTANCE"), validKeys)
@@ -1394,6 +1609,24 @@ public static partial class Runtime
                 if (!validKeys.Contains(keyName) && (extraMethodKeys == null || !extraMethodKeys.Contains(keyName)))
                     throw new LispErrorException(new LispProgramError(
                         $"Invalid initarg :{keyName} for class {cls.Name.Name}"));
+            }
+
+            // A default initarg that the call does not supply is added to the call
+            // (CLHS 7.1.3), so it has to be a valid initarg too.
+            foreach (var (dkey, _, _) in cls.DefaultInitargs)
+            {
+                var dn = dkey.Name.Length > 0 && dkey.Name[0] == ':' ? dkey.Name[1..] : dkey.Name;
+                if (validKeys.Contains(dn) || (extraMethodKeys != null && extraMethodKeys.Contains(dn))) continue;
+                bool supplied = false;
+                for (int i = startIdx; i < args.Length - 1 && !supplied; i += 2)
+                    if (args[i] is Symbol ks)
+                    {
+                        var kn = ks.Name.Length > 0 && ks.Name[0] == ':' ? ks.Name[1..] : ks.Name;
+                        supplied = kn == dn;
+                    }
+                if (!supplied)
+                    throw new LispErrorException(new LispProgramError(
+                        $"Invalid initarg :{dn} for class {cls.Name.Name} (from :DEFAULT-INITARGS)"));
             }
         }
     }
@@ -1436,8 +1669,24 @@ public static partial class Runtime
             throw new LispErrorException(new LispError(
                 $"CHANGE-CLASS: cannot change class to built-in class {newClass.Name.Name}"));
 
-        // Per CLHS 7.2: validate initargs against new class
-        ValidateInitargs(newClass, args, 2);
+        // Per CLHS 7.2: validate initargs against new class. The keyword arguments of the
+        // applicable UPDATE-INSTANCE-FOR-DIFFERENT-CLASS methods are valid initargs too (CLHS 7.1.2).
+        var uifdcKeys = new HashSet<string>();
+        bool uifdcAllowsOther = false;
+        if (Startup.Sym("UPDATE-INSTANCE-FOR-DIFFERENT-CLASS").Function is GenericFunction uifdcGf)
+        {
+            var oldCls = inst.Class;
+            foreach (var m in uifdcGf.MethodsArray)
+            {
+                if (m.Specializers.Length < 2) continue;
+                if (!SpecializerAcceptsClass(m.Specializers[0], oldCls) || !SpecializerAcceptsClass(m.Specializers[1], newClass)) continue;
+                if (m.HasAllowOtherKeys) { uifdcAllowsOther = true; break; }
+                if (m.HasKey)
+                    foreach (var kn in m.KeywordNames) uifdcKeys.Add(kn);
+            }
+        }
+        if (!uifdcAllowsOther)
+            ValidateInitargs(newClass, args, 2, uifdcKeys.Count > 0 ? uifdcKeys : null);
 
         // An obsolete instance is updated to its (redefined) class first, so the
         // values carried over are read against the layout they were written in.

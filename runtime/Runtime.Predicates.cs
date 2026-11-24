@@ -41,9 +41,18 @@ public static partial class Runtime
         if (a is MvReturn || b is MvReturn) throw new InvalidOperationException("EQ: a values bundle as an argument");
         AssertNotTableTNil(a); AssertNotTableTNil(b);
 #endif
-        return ReferenceEquals(a, b);
+        if (ReferenceEquals(a, b)) return true;
+        // Fixnums are immediate in other implementations, so EQ compares them by value
+        // here too (the boxes are cached only in a small range).
+        return a is Fixnum fa && b is Fixnum fb && fa.Value == fb.Value;
     }
 
+    /// <summary>EQ where one argument is a literal that is never a number: identity only.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static LispObject EqRef(LispObject a, LispObject b) =>
+        ReferenceEquals(a, b) ? T.Instance : Nil.Instance;
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static LispObject Eq(LispObject a, LispObject b)
     {
         return IsEqRef(a, b) ? T.Instance : Nil.Instance;
@@ -248,8 +257,8 @@ public static partial class Runtime
     {
         if (args.Length < 1 || args.Length > 2)
             throw new LispErrorException(new LispProgramError("COMPLEX: requires 1 or 2 arguments"));
-        var real = AsNumber(args[0]);
-        var imag = args.Length == 2 ? AsNumber(args[1]) : Fixnum.Make(0);
+        var real = AsNumber("COMPLEX", args[0]);
+        var imag = args.Length == 2 ? AsNumber("COMPLEX", args[1]) : Fixnum.Make(0);
         return Arithmetic.MakeComplexPublic(real, imag);
     }
 
@@ -304,13 +313,23 @@ public static partial class Runtime
     public static LispObject Vectorp(LispObject obj)
     { obj = Primary(obj); return (obj is LispVector vp && vp.Rank == 1) || obj is LispString ? T.Instance : Nil.Instance; }
     public static LispObject BitVectorp(LispObject obj) => Primary(obj) is LispVector v && v.IsBitVector && v.Rank == 1 ? T.Instance : Nil.Instance;
+    public static bool IsTrueSimpleVectorp(LispObject obj) =>
+        Primary(obj) is LispVector sv && sv.Rank == 1 && !sv.IsCharVector && !sv.IsBitVector && sv.IsSimple && sv.IsGeneralElement;
     public static LispObject SimpleVectorp(LispObject obj) =>
-        Primary(obj) is LispVector sv && sv.Rank == 1 && !sv.IsCharVector && !sv.IsBitVector && sv.IsSimple && sv.ElementTypeName == "T" ? T.Instance : Nil.Instance;
+        Primary(obj) is LispVector sv && sv.Rank == 1 && !sv.IsCharVector && !sv.IsBitVector && sv.IsSimple && sv.IsGeneralElement ? T.Instance : Nil.Instance;
     public static LispObject SimpleBitVectorp(LispObject obj) =>
         Primary(obj) is LispVector sbv && sbv.IsBitVector && sbv.Rank == 1 && sbv.IsSimple ? T.Instance : Nil.Instance;
+    /// <summary>(TYPEP x 'SEQUENCE): a list, or a one-dimensional vector or string.</summary>
+    public static LispObject Sequencep(LispObject obj)
+    { obj = Primary(obj); return obj is Cons || obj is Nil || (obj is LispVector sv && sv.Rank == 1) || obj is LispString ? T.Instance : Nil.Instance; }
     public static LispObject Arrayp(LispObject obj)
     { obj = Primary(obj); return obj is LispVector || obj is LispString ? T.Instance : Nil.Instance; }
     public static bool IsTrueHashTable(LispObject obj) => obj is LispHashTable;
+    public static bool IsTrueVectorp(LispObject obj) => (obj is LispVector vv && vv.Rank == 1) || obj is LispString;
+    public static bool IsTrueSequencep(LispObject obj) =>
+        obj is Cons || obj is Nil || (obj is LispVector sv && sv.Rank == 1) || obj is LispString;
+    public static bool IsTrueArrayp(LispObject obj) => obj is LispVector || obj is LispString;
+    public static bool IsTrueBitVectorp(LispObject obj) => obj is LispVector bv && bv.IsBitVector && bv.Rank == 1;
     /// <summary>Compare the sum or difference of two int64 values with a third as
     /// the integers they are, however far the sum is out of int64: CODE is the
     /// comparison (0 &lt; 1 &lt;= 2 &gt; 3 &gt;= 4 = 5 /=) plus 8 when the second
@@ -359,17 +378,17 @@ public static partial class Runtime
         if (et == "NIL") return Nil.Instance;
         // Compound types stored as "UNSIGNED-BYTE-8", "SIGNED-BYTE-16", etc.;
         // reconstruct the list form (UNSIGNED-BYTE 8).
-        if (et.StartsWith("UNSIGNED-BYTE-") || et.StartsWith("SIGNED-BYTE-"))
+        if (et.StartsWith("UNSIGNED-BYTE-", System.StringComparison.Ordinal) || et.StartsWith("SIGNED-BYTE-", System.StringComparison.Ordinal))
         {
             int dash = et.LastIndexOf('-');
-            if (int.TryParse(et.Substring(dash + 1), out int n))
+            if (int.TryParse(et.Substring(dash + 1), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int n))
                 return new Cons(Startup.Sym(et[..dash]), new Cons(Fixnum.Make(n), Nil.Instance));
         }
         // (complex X) is stored as "COMPLEX-X". Only the two float part types
         // are reported as themselves, as SBCL does; every other complex element
         // type is general storage and reports T. Handing the stored name to
         // Startup.Sym made up a DOTCL-INTERNAL symbol that is not a type.
-        if (et == "COMPLEX" || et.StartsWith("COMPLEX-"))
+        if (et == "COMPLEX" || et.StartsWith("COMPLEX-", System.StringComparison.Ordinal))
             return ComplexElementPartClass(et) switch
             {
                 'S' => Runtime.List(Startup.Sym("COMPLEX"), Startup.Sym("SINGLE-FLOAT")),
@@ -509,10 +528,14 @@ public static partial class Runtime
             Runtime.CheckArityMin("DIGIT-CHAR", args, 1);
             Runtime.CheckArityMax("DIGIT-CHAR", args, 2);
             // CLHS: the weight is a non-negative integer (a weight past the radix gives NIL).
-            if (args[0] is not Fixnum { Value: >= 0 } wf)
+            bool bigWeight = args[0] is Bignum { Value.Sign: >= 0 };
+            if (!bigWeight && args[0] is not Fixnum { Value: >= 0 })
                 throw new LispErrorException(new LispTypeError("DIGIT-CHAR: the weight is not a non-negative integer", args[0],
                     Startup.Sym("UNSIGNED-BYTE")));
-            int weight = (int)Math.Min(wf.Value, int.MaxValue);
+            int weight = bigWeight ? int.MaxValue : (int)Math.Min(((Fixnum)args[0]).Value, int.MaxValue);
+            if (args.Length >= 2 && args[1] is not Fixnum)
+                throw new LispErrorException(new LispTypeError("DIGIT-CHAR: radix is not an integer in 2..36", args[1],
+                    Runtime.List(Startup.Sym("INTEGER"), Fixnum.Make(2), Fixnum.Make(36))));
             int radix = args.Length >= 2 && args[1] is Fixnum rf ? (int)rf.Value : 10;
             if (radix < 2 || radix > 36) throw new LispErrorException(new LispTypeError("DIGIT-CHAR: radix out of range", args.Length >= 2 ? args[1] : Nil.Instance));
             if (weight < 0 || weight >= radix) return Nil.Instance;
@@ -534,13 +557,17 @@ public static partial class Runtime
         Startup.RegisterUnary("ALPHANUMERICP", Runtime.Alphanumericp);
         Startup.RegisterUnary("GRAPHIC-CHAR-P", Runtime.GraphicCharP);
         Startup.RegisterUnary("BOTH-CASE-P", Runtime.BothCaseP);
-        Emitter.CilAssembler.RegisterFunction("DIGIT-CHAR-P",
-            new LispFunction(args => {
-                Runtime.CheckArityMin("DIGIT-CHAR-P", args, 1);
-                Runtime.CheckArityMax("DIGIT-CHAR-P", args, 2);
-                var radix = args.Length > 1 ? args[1] : Fixnum.Make(10);
-                return Runtime.DigitCharP(args[0], radix);
-            }));
+        var digitCharPFn = new LispFunction(args => {
+            Runtime.CheckArityMin("DIGIT-CHAR-P", args, 1);
+            Runtime.CheckArityMax("DIGIT-CHAR-P", args, 2);
+            var radix = args.Length > 1 ? args[1] : Fixnum.Make(10);
+            return Runtime.DigitCharP(args[0], radix);
+        });
+        // FIND-IF / POSITION-IF / COUNT-IF pass this shape; InvokeSlow built an
+        // argument array for every element without the entry.
+        digitCharPFn.SetDirectDelegate((Func<LispObject, LispObject>)
+            (ch => Runtime.DigitCharP(ch, Fixnum.Make(10))));
+        Emitter.CilAssembler.RegisterFunction("DIGIT-CHAR-P", digitCharPFn);
         Startup.RegisterUnary("CHAR-UPCASE", Runtime.CharUpcase);
         Startup.RegisterUnary("CHAR-DOWNCASE", Runtime.CharDowncase);
         Startup.RegisterUnary("STANDARD-CHAR-P", obj => {

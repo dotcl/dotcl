@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Implicit conversion operators, and the write side of interface members.
 ;;;
 ;;; C# applies a user-defined implicit operator silently and .NET APIs are built

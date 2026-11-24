@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression: CLHS 3.2.2.1.1: a NOTINLINE declaration of a function name
 ;;; suppresses its compiler macro for calls in the declaration's scope. A
 ;;; PROCLAIM (or the DECLAIM that expands to one) puts the declaration in scope

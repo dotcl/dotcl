@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Two built-in classes must not order the same pair differently.
 ;;;
 ;;; GENERIC-FUNCTION has FUNCTION then STANDARD-OBJECT among its superclasses.

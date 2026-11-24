@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The matching bracket in the bundled REPL.
 ;;;
 ;;; With the cursor just past a closing bracket, the line editor paints the

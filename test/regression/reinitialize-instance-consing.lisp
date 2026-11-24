@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; REINITIALIZE-INSTANCE does not pay for validation it cannot need.
 ;;;
 ;;; Three costs, all per call and none of them required:

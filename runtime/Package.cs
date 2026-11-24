@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Linq;
+using System.Threading;
 
 namespace DotCL;
 
@@ -45,6 +46,30 @@ public class Package : LispObject
     private readonly ConcurrentDictionary<string, Package> _localNicknames = new();
 
     private static readonly ConcurrentDictionary<string, Package> _allPackages = new();
+
+    // The distinct packages of _allPackages, as an immutable array. Reading
+    // _allPackages.Values takes every stripe lock of the dictionary, and
+    // EXPORT / PACKAGE-USED-BY-LIST walk all packages on each call. Registering
+    // or unregistering a name (rare) drops the array; the version check keeps a
+    // walk that raced with a change from publishing a stale one.
+    private static volatile Package[]? _distinctPackages;
+    private static int _registryVersion;
+
+    private static void RegistryChanged()
+    {
+        Interlocked.Increment(ref _registryVersion);
+        _distinctPackages = null;
+    }
+
+    private static Package[] DistinctPackages()
+    {
+        var c = _distinctPackages;
+        if (c != null) return c;
+        int v = Volatile.Read(ref _registryVersion);
+        c = _allPackages.Values.Distinct().ToArray();
+        if (Volatile.Read(ref _registryVersion) == v) _distinctPackages = c;
+        return c;
+    }
 
     public Package(string name, params string[] nicknames)
     {
@@ -94,7 +119,7 @@ public class Package : LispObject
         }
 
         /// <summary>A module or system name: owned in any case.</summary>
-        public bool OwnsName(string name) => Owns(name) || Owns(name.ToUpperInvariant());
+        public bool OwnsName(string name) => Owns(name) || Owns(CharCase.SimpleUpper(name));
 
         internal bool Binds(Symbol sym)
         {
@@ -114,12 +139,23 @@ public class Package : LispObject
         internal void Enter()
         {
             lock (_syms)
+            {
+                // Where each special stood before this unit bound it, so that
+                // CallOutsideUnits can show the bindings as they were outside.
+                var before = new int[_syms.Count];
+                var syms = _syms.ToArray();
                 for (int i = 0; i < _syms.Count; i++)
+                {
+                    before[i] = DynamicBindings.PeekTop(_syms[i]);
                     DynamicBindings.Push(_syms[i], _vals[i] ?? DynamicBindings.Unbound);
+                }
+                t_active = new Active(this, syms, before, t_active);
+            }
         }
 
         internal void Leave()
         {
+            if (t_active != null && ReferenceEquals(t_active.Unit, this)) t_active = t_active.Outer;
             lock (_syms)
                 for (int i = _syms.Count - 1; i >= 0; i--)
                 {
@@ -128,6 +164,20 @@ public class Package : LispObject
                 }
         }
     }
+
+    /// <summary>One unit this thread has entered: the specials it bound and where
+    /// each stood just before.</summary>
+    private sealed class Active
+    {
+        public readonly Unit Unit;
+        public readonly Symbol[] Syms;
+        public readonly int[] Before;
+        public readonly Active? Outer;
+        public Active(Unit unit, Symbol[] syms, int[] before, Active? outer)
+        { Unit = unit; Syms = syms; Before = before; Outer = outer; }
+    }
+
+    [ThreadStatic] private static Active? t_active;
 
     public const char UnitSeparator = '!';
 
@@ -139,12 +189,19 @@ public class Package : LispObject
 
     public static Unit? CurrentUnit => _unitsInUse ? _currentUnit.Value : null;
 
+    private static readonly ConcurrentDictionary<string, Unit> _unitsByName = new();
+
     public static Unit MakeUnit(string name, string ownedCsv)
     {
         if (name.Length == 0 || name.Contains(UnitSeparator))
             throw new LispErrorException(new LispError($"MAKE-UNIT: bad unit name \"{name}\""));
-        return new Unit(name, ownedCsv);
+        var u = new Unit(name, ownedCsv);
+        _unitsByName[name] = u;
+        return u;
     }
+
+    /// <summary>The unit made under NAME, or null.</summary>
+    public static Unit? FindUnit(string name) => _unitsByName.TryGetValue(name, out var u) ? u : null;
 
     /// <summary>Make UNIT (or null for none) current in this execution context
     /// and return the previous one. Threads started afterwards inherit it.</summary>
@@ -209,6 +266,37 @@ public class Package : LispObject
         }
     }
 
+    /// <summary>Run BODY as if outside every unit: no unit is current, and the
+    /// specials the units bind show the bindings that were in effect before the
+    /// outermost unit was entered (the global value, or an enclosing LET's). A
+    /// SETQ in BODY lands there, and stays after BODY returns. The units are
+    /// entered again afterwards, with the values they had.</summary>
+    public static T CallOutsideUnits<T>(Func<T> body)
+    {
+        var chain = t_active;
+        var oldCurrent = _currentUnit.Value;
+        var oldEntered = t_entered;
+        var saved = new List<(Symbol sym, int top)>();
+        for (var a = chain; a != null; a = a.Outer)
+            for (int i = 0; i < a.Syms.Length; i++)
+            {
+                if (!saved.Exists(x => ReferenceEquals(x.sym, a.Syms[i])))
+                    saved.Add((a.Syms[i], DynamicBindings.PeekTop(a.Syms[i])));
+                DynamicBindings.SetTop(a.Syms[i], a.Before[i]);   // the outermost wins
+            }
+        _currentUnit.Value = null;
+        t_entered = null;
+        t_active = null;
+        try { return body(); }
+        finally
+        {
+            foreach (var (sym, top) in saved) DynamicBindings.SetTop(sym, top);
+            t_active = chain;
+            t_entered = oldEntered;
+            _currentUnit.Value = oldCurrent;
+        }
+    }
+
     /// <summary>FN, or, made inside a unit, a function that runs FN in that unit
     /// wherever it is called from: for Lisp code .NET calls back into.</summary>
     public static LispObject BindToCurrentUnit(LispObject fn)
@@ -227,17 +315,20 @@ public class Package : LispObject
         if (u == null)
         {
             _allPackages[name] = this;
+            RegistryChanged();
             return name;
         }
         u.Table[name] = this;
         var physical = u.Prefix + name;
         _allPackages[physical] = this;
+        RegistryChanged();
         return physical;
     }
 
     private void Unregister(string physical)
     {
         _allPackages.TryRemove(physical, out _);
+        RegistryChanged();
         var u = HomeUnit;
         if (u != null && physical.StartsWith(u.Prefix, StringComparison.Ordinal))
         {
@@ -363,7 +454,7 @@ public class Package : LispObject
         }
     }
 
-    public static IEnumerable<Package> AllPackages => _allPackages.Values.Distinct();
+    public static IEnumerable<Package> AllPackages => DistinctPackages();
 
     /// <summary>
     /// May a same-named symbol in this package be adopted by one of the
@@ -434,6 +525,7 @@ public class Package : LispObject
 
     public void Export(Symbol sym)
     {
+
         lock (_pkgLock)
         {
             var (found, status) = FindSymbol(sym.Name);
@@ -597,6 +689,7 @@ public class Package : LispObject
 
     public void UsePackage(Package pkg)
     {
+
         lock (_pkgLock)
         {
             if (_useList.Contains(pkg)) return;
@@ -1006,7 +1099,7 @@ public class Package : LispObject
     {
         // Snapshot of AllPackages; each package's use-list is read through its
         // own immutable snapshot, so no per-package lock is needed.
-        var snapshot = _allPackages.Values.Distinct().ToList();
+        var snapshot = DistinctPackages();
         foreach (var pkg in snapshot)
             if (Array.IndexOf(pkg._useSnapshot, this) >= 0)
                 yield return pkg;

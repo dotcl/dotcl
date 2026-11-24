@@ -1042,6 +1042,8 @@ public static partial class Runtime
         {
             bool setf = fname.StartsWith("(SETF ", StringComparison.Ordinal) && fname.EndsWith(")", StringComparison.Ordinal);
             var simple = setf ? fname.Substring(6, fname.Length - 7) : fname;
+            // An uninterned symbol's function is named "#:NAME" (see MANGLE-DEFUN-NAME).
+            if (simple.StartsWith("#:", StringComparison.Ordinal)) simple = simple.Substring(2);
             foreach (var e in EntriesNamed(simple))
                 if (e.Kind == (setf ? "SETF-FUNCTION" : "FUNCTION")
                     && ReferenceEquals(setf ? e.Sym.SetfFunction : e.Sym.Function, fn)
@@ -1057,9 +1059,10 @@ public static partial class Runtime
             if (ReferenceEquals(kv.Value, fn) && Find(kv.Key, "SETF-COMPILER-MACRO") is { } scp)
                 return scp;
         if (fn.Name is { } name && !name.StartsWith("(", StringComparison.Ordinal)
-            && s_uninternedDefSources.TryGetValue((name, "FUNCTION"), out var u))
+            && s_uninternedDefSources.TryGetValue(
+                (name.StartsWith("#:", StringComparison.Ordinal) ? name.Substring(2) : name, "FUNCTION"), out var u))
         {
-            var sym = new Symbol(name);
+            var sym = new Symbol(name.StartsWith("#:", StringComparison.Ordinal) ? name.Substring(2) : name);
             return DefinitionPlist(new DefinitionEntry(sym, "FUNCTION", ""), u.File, u.Line, sym);
         }
         return null;
@@ -1201,6 +1204,7 @@ public static partial class Runtime
                 try
                 {
                     var result = rmf.Invoke(new LispObject[] { form, Nil.Instance });
+                    AnnounceToMacroexpandHook(form);
                     // Macro functions in CL return single value; unwrap MvReturn if present
                     return result is MvReturn mv ? (mv.PrimaryValue) : result;
                 }

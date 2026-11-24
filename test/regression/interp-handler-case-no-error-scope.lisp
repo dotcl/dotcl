@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A HANDLER-CASE :NO-ERROR clause runs after the handlers are gone.
 ;;;
 ;;; CLHS: by the time the :no-error body runs, this HANDLER-CASE's handlers are no

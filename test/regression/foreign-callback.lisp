@@ -208,3 +208,37 @@
               (error () :propagated))
             called)))
   (:propagated nil))
+
+;;; A callback that a thread dotcl did not start calls (a C library's own thread:
+;;; pthread_create here) has no Lisp caller to take the error and no native call of
+;;; ours to wait for. The error used to reach the script's top-level handler and end
+;;; the process (exit code 1); it is reported at the callback boundary now, answered
+;;; with the return type's default, and the process and later callbacks go on.
+;;; Skipped where pthread_create can not be found (Windows).
+(defun %fcb-pthread-create ()
+  (handler-case
+      (let ((h (dotnet:static "System.Runtime.InteropServices.NativeLibrary" "GetMainProgramHandle")))
+        (dotnet:static "System.Runtime.InteropServices.NativeLibrary" "GetExport" h "pthread_create"))
+    (error () nil)))
+
+(defun %fcb-run-in-c-thread (fn)
+  "Run FN as the start routine of a new C thread; wait until it has been entered."
+  (let ((cb (dotnet:make-ffi-callback fn '(:pointer) :pointer))
+        (tid (dotnet:alloc-mem 8)))
+    (unwind-protect
+         (dotnet:%ffi-call-ptr (%fcb-pthread-create)
+                               '(:pointer :pointer :pointer :pointer) :int tid 0 cb 0)
+      (dotnet:free-mem tid))))
+
+(deftest ffi-callback-error-on-native-thread-is-contained
+  (if (not (%fcb-pthread-create))
+      (list t t)
+      (let ((entered nil) (later nil))
+        (%fcb-run-in-c-thread (lambda (x) (declare (ignore x))
+                                (setf entered t)
+                                (error "boom in a C thread")))
+        (loop repeat 100 until entered do (sleep 0.05))
+        (%fcb-run-in-c-thread (lambda (x) (declare (ignore x)) (setf later t) 0))
+        (loop repeat 100 until later do (sleep 0.05))
+        (list entered later)))
+  (t t))

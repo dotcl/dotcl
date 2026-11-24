@@ -96,7 +96,10 @@ public class LispTypeError : LispError
     public LispTypeError(string message, LispObject? datum = null, LispObject? expectedType = null)
         : base(datum != null && NamesNoValue(message)
                    ? () => WithDatum(message, datum)
-                   : (System.Func<string>)(() => message))
+                   : datum != null && NamesNoValueMore(message)
+                       ? () => message.Contains(DatumText(datum), System.StringComparison.Ordinal)
+                                   ? message : WithDatum(message, datum)
+                       : (System.Func<string>)(() => message))
     {
         ConditionTypeName = "TYPE-ERROR";
         Datum = datum ?? Nil.Instance;
@@ -171,7 +174,7 @@ public class LispTypeError : LispError
             @"^index -?\d+ out of range for (?:string|vector|array|list)[^\d]*(\d+)$");
         if (outOfRange.Success)
         {
-            long n = long.Parse(outOfRange.Groups[1].Value);
+            long n = long.Parse(outOfRange.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
             return n > 0
                 ? new Cons(Sym("INTEGER"), new Cons(Fixnum.Make(0), new Cons(Fixnum.Make(n - 1), Nil.Instance)))
                 : Sym("INTEGER");
@@ -179,27 +182,49 @@ public class LispTypeError : LispError
         var bounds = System.Text.RegularExpressions.Regex.Match(rest, @"is not in \[0, (\d+)\]$");
         if (bounds.Success)
             return new Cons(Sym("INTEGER"), new Cons(Fixnum.Make(0),
-                new Cons(Fixnum.Make(long.Parse(bounds.Groups[1].Value)), Nil.Instance)));
-        if (rest.StartsWith("condition is not of type WARNING")) return Sym("WARNING");
+                new Cons(Fixnum.Make(long.Parse(bounds.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture)), Nil.Instance)));
+        if (rest.StartsWith("condition is not of type WARNING", System.StringComparison.Ordinal)) return Sym("WARNING");
         const string coerceTo = "cannot coerce to ";
-        if (rest.StartsWith(coerceTo) && rest.Length > coerceTo.Length
+        if (rest.StartsWith(coerceTo, System.StringComparison.Ordinal) && rest.Length > coerceTo.Length
             && rest.IndexOf(' ', coerceTo.Length) < 0)
             return Sym(rest.Substring(coerceTo.Length).ToUpperInvariant());
         if (rest == "cannot convert to pathname") return Sym("PATHNAME");
-        if (message.StartsWith("Not a pathname designator"))
+        if (message.StartsWith("Not a pathname designator", System.StringComparison.Ordinal))
             return Or("STRING", "PATHNAME", "SYNONYM-STREAM", "FILE-STREAM");
         return null;
     }
 
-    /// <summary>True for a message of the form "OP: not a THING" that says what was
-    /// expected but not what was given, so the value is added when it is reported.</summary>
+    /// <summary>True for a message of the form "OP: not a THING" or "OP: index must be integer"
+    /// that says what was expected but not what was given, so the value is added when it is
+    /// reported.</summary>
     private static bool NamesNoValue(string message)
     {
         int colon = message.IndexOf(": ", System.StringComparison.Ordinal);
         if (colon <= 0 || message.IndexOf(": ", colon + 2, System.StringComparison.Ordinal) >= 0) return false;
         var rest = message.AsSpan(colon + 2);
-        return rest.StartsWith("not a ") || rest.StartsWith("not an ")
-               || rest.StartsWith("cannot coerce to ");
+        return rest.StartsWith("not a ", System.StringComparison.Ordinal) || rest.StartsWith("not an ", System.StringComparison.Ordinal)
+               || rest.StartsWith("cannot coerce to ", System.StringComparison.Ordinal)
+               || rest.IndexOf(" must be ", System.StringComparison.Ordinal) > 0;
+    }
+
+    /// <summary>The other shapes that say what was expected and not what was given:
+    /// "not an integer" with no operator, "RATIONAL: not real", "GCD: argument is not an
+    /// integer", "ASH: count not an integer", "FORMAT: invalid destination" and the like.
+    /// The value is added unless the message already shows it.</summary>
+    private static bool NamesNoValueMore(string message)
+    {
+        int colon = message.IndexOf(": ", System.StringComparison.Ordinal);
+        if (colon < 0)
+            return message.StartsWith("not a ", System.StringComparison.Ordinal)
+                   || message.StartsWith("not an ", System.StringComparison.Ordinal);
+        if (colon == 0 || message.IndexOf(": ", colon + 2, System.StringComparison.Ordinal) >= 0) return false;
+        var rest = message.AsSpan(colon + 2);
+        return rest.StartsWith("not real", System.StringComparison.Ordinal) || rest.StartsWith("not rational", System.StringComparison.Ordinal)
+               || rest.StartsWith("invalid destination", System.StringComparison.Ordinal) || rest.StartsWith("invalid argument", System.StringComparison.Ordinal)
+               || rest.StartsWith("last argument is not ", System.StringComparison.Ordinal)
+               || rest.Equals("cannot convert to pathname", System.StringComparison.Ordinal)
+               || rest.IndexOf(" is not a", System.StringComparison.Ordinal) > 0
+               || rest.IndexOf(" not an ", System.StringComparison.Ordinal) > 0;
     }
 
     private static string WithDatum(string message, LispObject datum)
@@ -339,6 +364,7 @@ public class LispErrorException : Exception
         if (ErrorOrigin.Enabled) Origin = ErrorOrigin.Capture();
         // Per CL spec: error signals the condition through handler-bind before throwing.
         // If a handler does a non-local exit, this constructor never returns.
+        ConditionSystem.CheckBreakOnSignals(condition);   // *BREAK-ON-SIGNALS* applies to every signalled condition
         HandlerClusterStack.Signal(condition);
         // No handler took it: this is where ERROR hands over to the debugger,
         // with the frames that signalled still on the stack.
@@ -1109,7 +1135,7 @@ public static class ConditionSystem
         _countPolls || _interruptRequested
         || System.Threading.Volatile.Read(ref Runtime.SafepointInterruptsPending) != 0;
 
-    private static void CheckBreakOnSignals(LispCondition condition)
+    internal static void CheckBreakOnSignals(LispCondition condition)
     {
         var bosSym = Startup.Sym("*BREAK-ON-SIGNALS*");
         if (DynamicBindings.TryGet(bosSym, out var bosVal) && bosVal is not Nil)
@@ -1163,7 +1189,6 @@ public static class ConditionSystem
 
     public static LispObject Warn(LispCondition condition)
     {
-        CheckBreakOnSignals(condition);
         // CLHS: warn establishes a MUFFLE-WARNING restart, then signals.
         // If a handler calls muffle-warning, the warning is suppressed.
         //
@@ -1184,6 +1209,8 @@ public static class ConditionSystem
         RestartClusterStack.PushCluster(new[] { restart });
         try
         {
+            // After the restart is established: the break hook may invoke MUFFLE-WARNING.
+            CheckBreakOnSignals(condition);
             HandlerClusterStack.Signal(condition);
         }
         catch (RestartInvocationException rie) when (ReferenceEquals(rie.Tag, restart.Tag))
@@ -1206,7 +1233,11 @@ public static class ConditionSystem
             // Painted only where *ERROR-OUTPUT* is still the process's
             // standard error and the REPL has turned colour on for it.
             var errSym = Startup.Sym("*ERROR-OUTPUT*");
-            var text = $"WARNING: {ConditionText.Report(condition)}";
+            // A STYLE-WARNING is reported as one, as SBCL does: a build log that greps
+            // for WARNING: then finds only the warnings that are not about style.
+            var label = Runtime.IsTruthy(Runtime.Typep(condition, Startup.Sym("STYLE-WARNING")))
+                ? "STYLE-WARNING" : "WARNING";
+            var text = $"{label}: {ConditionText.Report(condition)}";
             if (DynamicBindings.TryGet(errSym, out var errStream) && errStream is LispOutputStream los)
             {
                 los.Writer.Write(ReplColor.ForStream("WARNING", text, los));

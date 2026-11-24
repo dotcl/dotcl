@@ -33,9 +33,9 @@ public static class Arithmetic
 
         // Float contagion
         if (a is DoubleFloat || b is DoubleFloat)
-            return new DoubleFloat(ToDouble(a) + ToDouble(b));
+            return new DoubleFloat(ToDoubleChecked(a, "+") + ToDoubleChecked(b, "+"));
         if (a is SingleFloat || b is SingleFloat)
-            return new SingleFloat(ToSingle(a) + ToSingle(b));
+            return new SingleFloat(ToSingleChecked(a, "+") + ToSingleChecked(b, "+"));
 
         // Exact arithmetic
         return AddExact(a, b);
@@ -89,9 +89,9 @@ public static class Arithmetic
             return SubtractComplex(a, b);
 
         if (a is DoubleFloat || b is DoubleFloat)
-            return new DoubleFloat(ToDouble(a) - ToDouble(b));
+            return new DoubleFloat(ToDoubleChecked(a, "-") - ToDoubleChecked(b, "-"));
         if (a is SingleFloat || b is SingleFloat)
-            return new SingleFloat(ToSingle(a) - ToSingle(b));
+            return new SingleFloat(ToSingleChecked(a, "-") - ToSingleChecked(b, "-"));
 
         return SubtractExact(a, b);
     }
@@ -144,9 +144,9 @@ public static class Arithmetic
             return MultiplyComplex(a, b);
 
         if (a is DoubleFloat || b is DoubleFloat)
-            return new DoubleFloat(ToDouble(a) * ToDouble(b));
+            return new DoubleFloat(ToDoubleChecked(a, "*") * ToDoubleChecked(b, "*"));
         if (a is SingleFloat || b is SingleFloat)
-            return new SingleFloat(ToSingle(a) * ToSingle(b));
+            return new SingleFloat(ToSingleChecked(a, "*") * ToSingleChecked(b, "*"));
 
         return MultiplyRational(a, b);
     }
@@ -161,9 +161,19 @@ public static class Arithmetic
         // #C(inf NaN). It also loses a signed zero, since 0*x + 0*y is +0.0
         // whatever the signs were. Scaling keeps both.
         if (a is not LispComplex && b is LispComplex bsc)
+        {
+            if (TryDoubleParts(a, out double sar, out _)
+                && TryDoubleParts(bsc, out double sbr, out double sbi))
+                return new DoubleComplex(sar * sbr, sar * sbi);
             return MakeComplex(Multiply(a, bsc.Real), Multiply(a, bsc.Imaginary));
+        }
         if (b is not LispComplex && a is LispComplex asc)
+        {
+            if (TryDoubleParts(asc, out double ascr, out double asci)
+                && TryDoubleParts(b, out double sbr, out _))
+                return new DoubleComplex(ascr * sbr, asci * sbr);
             return MakeComplex(Multiply(asc.Real, b), Multiply(asc.Imaginary, b));
+        }
         // All-double: the general form below boxes each of the four products
         // and both of the sums, seven allocations to produce one result. It
         // is the same formula over the same doubles rounded at the same
@@ -425,15 +435,24 @@ public static class Arithmetic
         // applies here as it does in Runtime.Divide -- (/ 1 0.0d0) must not
         // answer differently from (/ 1.0d0 0.0d0).
         if (a is DoubleFloat || b is DoubleFloat)
-            return new DoubleFloat(ToDouble(a) / ToDouble(b));
+            return new DoubleFloat(ToDoubleChecked(a, "/") / ToDoubleChecked(b, "/"));
         if (a is SingleFloat || b is SingleFloat)
-            return new SingleFloat(ToSingle(a) / ToSingle(b));
+            return new SingleFloat(ToSingleChecked(a, "/") / ToSingleChecked(b, "/"));
         return DivideRational(a, b);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static Number DivideComplex(Number a, Number b)
     {
+        if (TryDoubleParts(a, out double dar, out double dai)
+            && TryDoubleParts(b, out double dbr, out double dbi))
+        {
+            if (dbr == 0.0 && dbi == 0.0)
+                throw new DivideByZeroException("Division by zero");
+            var dq = new System.Numerics.Complex(dar, dai)
+                     / new System.Numerics.Complex(dbr, dbi);
+            return new DoubleComplex(dq.Real, dq.Imaginary);
+        }
         var ac = AsComplex(a);
         var bc = AsComplex(b);
         static bool IsFlt(Number n) => n is SingleFloat || n is DoubleFloat;
@@ -455,7 +474,7 @@ public static class Arithmetic
                               || bc.Real is SingleFloat || bc.Imaginary is SingleFloat);
             return allSingle
                 ? MakeComplex(new SingleFloat((float)q.Real), new SingleFloat((float)q.Imaginary))
-                : MakeComplex(new DoubleFloat(q.Real), new DoubleFloat(q.Imaginary));
+                : new DoubleComplex(q.Real, q.Imaginary);
         }
         // Exact (integer/rational) complex division: (a+bi)/(c+di) =
         // ((ac+bd) + (bc-ad)i) / (c^2+d^2). BigInteger arithmetic: no overflow.
@@ -560,9 +579,10 @@ public static class Arithmetic
             return (Number)Bignum.MakeInteger(sb.Value + av);
         }
         // A float operand: MOD is the second value of FLOOR, computed the way
-        // FLOOR computes it (see FloatRound).
+        // FLOOR computes it (see FloatRound), but without boxing a quotient
+        // that MOD throws away.
         if (IsFloatNum(a) || IsFloatNum(b))
-            return Floor(a, b).remainder;
+            return FloatRemainder(a, b, false) ?? Floor(a, b).remainder;
         // A ratio operand: the same, exactly. The integer path below reads the
         // numerators only, so (mod 7/2 1) came back as 0.
         if (a is Ratio || b is Ratio)
@@ -582,7 +602,9 @@ public static class Arithmetic
         // A fixnum by a bignum: |a| < |b|, so the truncated quotient is 0.
         if (b is Fixnum { Value: 0 }) throw Runtime.QuotientByZero(a, b);
         if (a is Fixnum && b is Bignum rb && OutsideLong(rb.Value)) return a;
-        if (IsFloatNum(a) || IsFloatNum(b) || a is Ratio || b is Ratio)
+        if (IsFloatNum(a) || IsFloatNum(b))
+            return FloatRemainder(a, b, true) ?? Truncate(a, b).remainder;
+        if (a is Ratio || b is Ratio)
             return Truncate(a, b).remainder;
         var (an, _) = AsRational(a);
         var (bn, _) = AsRational(b);
@@ -660,8 +682,10 @@ public static class Arithmetic
         var den = r.Denominator;
         if (num.IsZero) return 0.0;
         // Both exact as doubles: one IEEE division rounds the quotient correctly.
-        const long Exact = 1L << 53;
-        if (num >= -Exact && num <= Exact && den >= -Exact && den <= Exact)
+        // Bit lengths rather than comparisons with 2^53: a comparison against a long builds a
+        // BigInteger for the bound each time, and this is the conversion every mixed
+        // ratio / float operation pays.
+        if (num.GetBitLength() <= 53 && den.GetBitLength() <= 53)
             return (double)(long)num / (double)(long)den;
         bool negative = (num.Sign < 0) ^ (den.Sign < 0);
         num = BigInteger.Abs(num);
@@ -1035,6 +1059,24 @@ public static class Arithmetic
         }
     }
 
+    // The float remainder without the boxed quotient; NIL when FloatRound declines.
+    private static Number? FloatRemainder(Number a, Number b, bool truncate)
+    {
+        if (a is DoubleFloat || b is DoubleFloat)
+        {
+            double x = ToDouble(a), f = ToDouble(b);
+            double div = x / f;
+            if (double.IsInfinity(div) || double.IsNaN(div)) return null;
+            double q = truncate ? System.Math.Truncate(div) : System.Math.Floor(div);
+            return new DoubleFloat(x - f * (q + 0.0));
+        }
+        float sx = ToSingle(a), sf = ToSingle(b);
+        float sdiv = sx / sf;
+        if (float.IsInfinity(sdiv) || float.IsNaN(sdiv)) return null;
+        float sq = (float)(truncate ? System.Math.Truncate(sdiv) : System.Math.Floor(sdiv));
+        return new SingleFloat(sx - sf * (sq + 0.0f));
+    }
+
     // The value is a float already, so rounding it in double is exact, and a
     // single-precision value comes back unchanged when narrowed again.
     private static double RoundDouble(double d, RoundMode mode) => mode switch
@@ -1196,9 +1238,19 @@ public static class Arithmetic
     }
 
     // --- Helper: convert integer quotient to float matching argument types ---
+    private static bool IsNegativeRational(Number n) => n switch
+    {
+        Fixnum f => f.Value < 0,
+        Bignum bn => bn.Value.Sign < 0,
+        Ratio r => r.Numerator.Sign < 0,
+        _ => false
+    };
+
     private static Number QuotientToFloat(Number quotient, Number a, Number b)
     {
         double qd = ToDouble(quotient);
+        // A zero quotient keeps the sign of the exact one: (ftruncate -1 100) is -0.0.
+        if (qd == 0.0 && IsNegativeRational(a) != IsNegativeRational(b)) qd = -0.0;
         // If either argument is double-float, result is double-float
         if (a is DoubleFloat || b is DoubleFloat)
             return new DoubleFloat(qd);
@@ -1305,8 +1357,30 @@ public static class Arithmetic
         Ratio r => RatioToSingle(r),
         DoubleFloat df => (float)df.Value,
         LispDecimal d => (float)d.Value,
-        _ => throw new NotImplementedException($"ToSingle not implemented for {n.GetType().Name}")
+        _ => throw new LispErrorException(new LispTypeError("not a real number: " + Runtime.FormatObject(n, true), n, Startup.Sym("REAL")))
     };
+
+    // An integer or ratio too large for the float format is an error, not an infinity: there is no
+    // float for it (an infinity operand that is already a float passes through).
+    internal static float ToSingleChecked(Number n, string op)
+    {
+        float r = ToSingle(n);
+        if (float.IsInfinity(r) && (n is Bignum || n is Ratio)) throw Runtime.FloatingPointOverflow(op, n);
+        return r;
+    }
+
+    internal static double ToDoubleChecked(Number n, string op)
+    {
+        double r = ToDouble(n);
+        if (double.IsInfinity(r) && (n is Bignum || n is Ratio)) throw Runtime.FloatingPointOverflow(op, n);
+        return r;
+    }
+
+    // The argument of a transcendental function as a double: a rational is first taken to
+    // single-float (CLHS 12.1.4.1), so its result is the one of the single-float it stands for,
+    // and a rational too large for a single-float signals FLOATING-POINT-OVERFLOW.
+    internal static double ToDoubleArg(Number n, string op)
+        => n is Fixnum or Bignum or Ratio ? (double)ToSingleChecked(n, op) : ToDouble(n);
 
     public static double ToDouble(Number n) => n switch
     {
@@ -1316,7 +1390,7 @@ public static class Arithmetic
         SingleFloat sf => sf.Value,
         DoubleFloat df => df.Value,
         LispDecimal d => (double)d.Value,
-        _ => throw new NotImplementedException($"ToDouble not implemented for {n.GetType().Name}")
+        _ => throw new LispErrorException(new LispTypeError("not a real number: " + Runtime.FormatObject(n, true), n, Startup.Sym("REAL")))
     };
 
     /// <summary>The exact integer value of a FIXNUM or BIGNUM. Used by the
@@ -1447,13 +1521,13 @@ public static class Arithmetic
         // without this the answer was #C(4.5d0 2) -- a complex with one float
         // part and one rational part, which no CL value may be.
         if (real is DoubleFloat && imag is not DoubleFloat)
-            imag = new DoubleFloat(ToDouble(imag));
+            imag = new DoubleFloat(ToDoubleChecked(imag, "COMPLEX"));
         else if (imag is DoubleFloat && real is not DoubleFloat)
-            real = new DoubleFloat(ToDouble(real));
+            real = new DoubleFloat(ToDoubleChecked(real, "COMPLEX"));
         else if (real is SingleFloat && imag is not SingleFloat)
-            imag = new SingleFloat((float)ToDouble(imag));
+            imag = new SingleFloat(ToSingleChecked(imag, "COMPLEX"));
         else if (imag is SingleFloat && real is not SingleFloat)
-            real = new SingleFloat((float)ToDouble(real));
+            real = new SingleFloat(ToSingleChecked(real, "COMPLEX"));
         // After the widening, not before: a zero imaginary part collapses to the
         // real number only while it is still exact. Once contagion has made it
         // 0.0 the value stays complex, which is what CLHS 12.1.5.3 requires.
@@ -1468,14 +1542,14 @@ public static class Arithmetic
             return real;
         // Float contagion: if either part is DoubleFloat, widen the other to DoubleFloat
         if (real is DoubleFloat && imag is not DoubleFloat)
-            imag = new DoubleFloat(ToDouble(imag));
+            imag = new DoubleFloat(ToDoubleChecked(imag, "COMPLEX"));
         else if (imag is DoubleFloat && real is not DoubleFloat)
-            real = new DoubleFloat(ToDouble(real));
+            real = new DoubleFloat(ToDoubleChecked(real, "COMPLEX"));
         // If either part is SingleFloat, coerce the other to SingleFloat (if not already float)
         else if (real is SingleFloat && imag is not SingleFloat)
-            imag = new SingleFloat((float)ToDouble(imag));
+            imag = new SingleFloat(ToSingleChecked(imag, "COMPLEX"));
         else if (imag is SingleFloat && real is not SingleFloat)
-            real = new SingleFloat((float)ToDouble(real));
+            real = new SingleFloat(ToSingleChecked(real, "COMPLEX"));
         // Per CL spec: if imagpart is 0.0 for floats, still return complex (already float)
         return LispComplex.Of(real, imag);
     }

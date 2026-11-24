@@ -25,6 +25,15 @@ public sealed class LispBox
     public LispBox(LispObject value) { Value = value; }
 }
 
+/// <summary>The cell of a variable that a closure captures and assigns and that is
+/// declared FIXNUM: it holds the value as a raw long, so an assignment stores no boxed
+/// number and a read in the fixnum lane needs no unboxing. Not a LispObject.</summary>
+public sealed class LongBox
+{
+    public long Value;
+    public LongBox(long value) { Value = value; }
+}
+
 /// <summary>The value an (:ONCE ...) instruction computed, held by its
 /// compilation unit (see CilAssembler.HandleOnce). Not a LispObject: it holds one.</summary>
 public sealed class OnceCell

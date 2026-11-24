@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A user-defined method class can add slots, and they behave like slots.
 ;;;
 ;;; A method is not a LispInstance and has no slot vector, so the slots its class

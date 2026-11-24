@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Comma commands in the bundled REPL.
 ;;;
 ;;; A line starting with a comma is an instruction to the REPL rather than a

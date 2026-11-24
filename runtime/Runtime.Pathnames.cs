@@ -166,6 +166,25 @@ public static partial class Runtime
         => name is "HOST" or "DEVICE" or "NAME" or "TYPE" or "VERSION"
             or "DIRECTORY" or "DEFAULTS" or "CASE" or "ALLOW-OTHER-KEYS";
 
+    /// <summary>Apply the :CASE argument of a pathname accessor to its result:
+    /// :COMMON maps an all-upper component to lower and an all-lower one to upper,
+    /// :LOCAL (the default) leaves it alone.</summary>
+    public static LispObject PathnameCaseResult(LispObject result, LispObject[] args)
+    {
+        for (int i = 1; i + 1 < args.Length; i += 2)
+        {
+            if (args[i] is Symbol k && k.Name == "CASE")
+            {
+                // Logical pathname components are already in the common case.
+                if (args[i + 1] is Symbol v && v.Name == "COMMON"
+                    && ToPathnameDesignator(args[0], "PATHNAME") is not LispLogicalPathname)
+                    return DiddlePathnameCase(result) ?? Nil.Instance;
+                return result;
+            }
+        }
+        return result;
+    }
+
     private static LispObject? DiddlePathnameCase(LispObject? component)
     {
         if (component is LispString s)
@@ -730,6 +749,17 @@ public static partial class Runtime
     {
         var p = ToPathnameDesignator(path, "MERGE-PATHNAMES");
         var d = ToPathnameDesignator(defaults, "MERGE-PATHNAMES");
+        // A physical-looking PATHNAME merged into logical defaults is read in the
+        // defaults' host (as PARSE-NAMESTRING does), so the result is a logical
+        // pathname with upper-case name and type.
+        if (d is LispLogicalPathname && p is not LispLogicalPathname
+            && p.Host == null && p.Device == null
+            && (p.DirectoryComponent == null || p.DirectoryComponent is Nil
+                || (p.DirectoryComponent is Cons dc0 && dc0.Car is Symbol dk && dk.Name == "RELATIVE")))
+        {
+            p = new LispLogicalPathname(null, null, p.DirectoryComponent,
+                UppercaseLogicalComponent(p.NameComponent), UppercaseLogicalComponent(p.TypeComponent), p.Version);
+        }
         var merged = p.MergeWith(d);
         // CLHS MERGE-PATHNAMES: a version PATHNAME does not supply comes from
         // DEFAULT-PATHNAME only when the name came from there too; when
@@ -807,16 +837,16 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("PATHNAME-DEVICE",
             new LispFunction(args => Runtime.PathnameDevice(args[0]), "PATHNAME-DEVICE", -1).WithKeyArgs(1, 1, false, "CASE"));
         Emitter.CilAssembler.RegisterFunction("PATHNAME-NAME",
-            new LispFunction(args => Runtime.PathnameName(args[0]), "PATHNAME-NAME", -1).WithKeyArgs(1, 1, false, "CASE"));
+            new LispFunction(args => Runtime.PathnameCaseResult(Runtime.PathnameName(args[0]), args), "PATHNAME-NAME", -1).WithKeyArgs(1, 1, false, "CASE"));
         Emitter.CilAssembler.RegisterFunction("PATHNAME-TYPE",
-            new LispFunction(args => Runtime.PathnameType(args[0]), "PATHNAME-TYPE", -1).WithKeyArgs(1, 1, false, "CASE"));
+            new LispFunction(args => Runtime.PathnameCaseResult(Runtime.PathnameType(args[0]), args), "PATHNAME-TYPE", -1).WithKeyArgs(1, 1, false, "CASE"));
 
         Emitter.CilAssembler.RegisterFunction("PATHNAME-VERSION", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError("PATHNAME-VERSION: expected exactly 1 argument"));
             return Runtime.PathnameVersion(args[0]);
         }, "PATHNAME-VERSION", -1));
 
-        var pathnameDirFn = new LispFunction(args => Runtime.PathnameDirectory(args[0]), "PATHNAME-DIRECTORY", -1)
+        var pathnameDirFn = new LispFunction(args => Runtime.PathnameCaseResult(Runtime.PathnameDirectory(args[0]), args), "PATHNAME-DIRECTORY", -1)
             .WithKeyArgs(1, 1, false, "CASE");
         // 1-arg direct delegate: same code path as the wrapper with one argument.
         pathnameDirFn.SetDirectDelegate((Func<LispObject, LispObject>)(a => Runtime.PathnameDirectory(a)));
@@ -839,7 +869,9 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("FILE-NAMESTRING", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError($"FILE-NAMESTRING: expected 1 argument, got {args.Length}"));
             var p = Startup.ToPathname(args[0], "FILE-NAMESTRING");
-            var fileP = new LispPathname(null, null, null, p.NameComponent, p.TypeComponent, p.Version);
+            var fileP = p is LispLogicalPathname
+                ? new LispLogicalPathname(null, null, null, p.NameComponent, p.TypeComponent, p.Version)
+                : new LispPathname(null, null, null, p.NameComponent, p.TypeComponent, p.Version);
             return new LispString(fileP.ToNamestring());
         }));
 
@@ -853,11 +885,11 @@ public static partial class Runtime
             return new LispString(dirP.ToNamestring());
         }));
 
-        // HOST-NAMESTRING: return host portion of namestring, or NIL
+        // HOST-NAMESTRING: the host portion of the namestring ("" for a physical pathname)
         Emitter.CilAssembler.RegisterFunction("HOST-NAMESTRING", new LispFunction(args => {
             if (args.Length != 1) throw new LispErrorException(new LispProgramError($"HOST-NAMESTRING: expected 1 argument, got {args.Length}"));
             var p = Startup.ToPathname(args[0], "HOST-NAMESTRING");
-            return p.Host is LispString hs ? (LispObject)hs : Nil.Instance;
+            return p.Host is LispString hs ? (LispObject)hs : new LispString("");
         }));
 
         // ENOUGH-NAMESTRING: shortest namestring that reproduces pathname when merged with defaults

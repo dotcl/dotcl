@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Printing a list appends into one builder: a nested list goes straight into
 ;;; the parent's builder instead of producing its own string, and the runaway
 ;;; guard for a circular CDR chain is two pointers rather than a per-list table.

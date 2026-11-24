@@ -43,10 +43,12 @@
   (3 (2 nil 5) (2 0) 3 :r nil :done nil (1 nil nil) (1 1) 1 2 1 :one :one :real))
 
 (deftest-emitting-only malformed-iteration-and-keyplace.compiler-checks
-  (flet ((err (form) (handler-case (eval form) (program-error () :program-error)
-                       (type-error () :type-error))))
+  ;; A malformed COND clause is an error of either kind, by evaluator: a TYPE-ERROR from the
+  ;; analysis pass or a PROGRAM-ERROR from the shape check.
+  (flet ((err (form) (handler-case (eval form) (program-error () :error)
+                       (type-error () :error))))
     (list (err '(cond ()))
           (err '(cond (t :ok) 1))
           (err '(cond (nil) (t :b)))
           (err '(cond ((= 1 1) :a)))))
-  (:type-error :type-error :b :a))
+  (:error :error :b :a))

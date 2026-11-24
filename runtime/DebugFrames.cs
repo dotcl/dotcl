@@ -74,6 +74,7 @@ public sealed class DebugFrame
     private static LispObject Read(object holder) => holder switch
     {
         LispBox b => b.Value,
+        LongBox l => Fixnum.Make(l.Value),
         LispObject[] a => a.Length > 0 ? a[0] : Nil.Instance,
         LispObject v => v,
         _ => Nil.Instance,

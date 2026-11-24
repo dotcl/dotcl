@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; LISTEN / CLEAR-INPUT take INPUT-STREAM as an &OPTIONAL argument.
 ;;;
 ;;; Both were registered with Startup.RegisterUnary, which turns args.Length != 1

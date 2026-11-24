@@ -2,7 +2,7 @@
 ;;; its recorded location, also when the fasl's table is resolved only after.
 
 (defun %dsr-source ()
-  (let ((src (merge-pathnames "dsr-fixture.lisp" (regression-temp-dir))))
+  (let ((src (merge-pathnames "dsr-fixture.lisp" (regression-temp-dir/))))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (dolist (l '("(defpackage \"DS-RM\" (:use \"CL\"))"         ; 1
                    "(in-package \"DS-RM\")"                      ; 2
@@ -54,7 +54,7 @@
   t)
 
 (deftest-emitting-only definition-sources-removal.load-fasl
-  (let ((fasl (merge-pathnames "dsr-fixture.fasl" (regression-temp-dir)))
+  (let ((fasl (merge-pathnames "dsr-fixture.fasl" (regression-temp-dir/)))
         (src (%dsr-source)))
     (let ((got (%dsr-run (lambda ()
                            (let ((*error-output* (make-broadcast-stream)))

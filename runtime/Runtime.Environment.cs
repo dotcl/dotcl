@@ -89,16 +89,18 @@ public static partial class Runtime
             zone, Runtime.List(Startup.Sym("REAL"), Fixnum.Make(-24), Fixnum.Make(24))));
     }
 
-    private static double StandardUtcOffsetHours(System.TimeZoneInfo tz, System.DateTime dt)
+    private static double StandardUtcOffsetHours(System.TimeZoneInfo tz, System.DateTime utcInstant)
     {
-        double offset = tz.GetUtcOffset(dt).TotalHours;
-        if (!tz.IsDaylightSavingTime(dt)) return offset;
+        System.TimeSpan offset = tz.GetUtcOffset(utcInstant);
+        if (!tz.IsDaylightSavingTime(utcInstant)) return offset.TotalHours;
+        System.DateTime local = utcInstant + offset;
         System.TimeZoneInfo.AdjustmentRule? match = null;
         foreach (var rule in tz.GetAdjustmentRules())
-            if (dt >= rule.DateStart && dt <= rule.DateEnd
+            if (local >= rule.DateStart
+                && (local <= rule.DateEnd || local.Date == rule.DateEnd.Date)
                 && (match == null || rule.DateStart > match.DateStart))
                 match = rule;
-        return match == null ? offset : offset - match.DaylightDelta.TotalHours;
+        return match == null ? offset.TotalHours : offset.TotalHours - match.DaylightDelta.TotalHours;
     }
 
     public static LispObject AproposList(LispObject[] args)
@@ -114,7 +116,7 @@ public static partial class Runtime
         else if (args[0] is LispVector lv && lv.IsCharVector) searchStr = lv.ToCharString();
         else throw new LispErrorException(new LispTypeError("APROPOS-LIST: argument must be a string designator", args[0]));
 
-        searchStr = searchStr.ToUpperInvariant();
+        searchStr = CharCase.SimpleUpper(searchStr);
 
         IEnumerable<Package> packages;
         bool singlePackage = args.Length >= 2 && !(args[1] is Nil);
@@ -132,7 +134,7 @@ public static partial class Runtime
         var seen = new HashSet<Symbol>();
         void AddMatch(Symbol sym)
         {
-            if (sym.Name.ToUpperInvariant().Contains(searchStr) && seen.Add(sym))
+            if (CharCase.SimpleUpper(sym.Name).Contains(searchStr) && seen.Add(sym))
                 result = new Cons(CanonicalizeSymbol(sym), result);
         }
         foreach (var pkg in packages)
@@ -358,6 +360,14 @@ public static partial class Runtime
 
     /// <summary>(SYMBOL-PLIST symbol) with the one argument the compiler passes straight in.</summary>
     public static LispObject SymbolPlistDirect(LispObject name) => GetSymbol(name, "SYMBOL-PLIST").Plist;
+
+    /// <summary>(SETF (SYMBOL-PLIST symbol) value) without an argument array.</summary>
+    public static LispObject SetSymbolPlistDirect(LispObject value, LispObject name)
+    {
+        var sym = GetSymbol(name, "(SETF SYMBOL-PLIST)");
+        sym.Plist = value;
+        return value;
+    }
 
     // FBOUNDP body (shared by the args-array wrapper and the 1-arg direct delegate).
     private static LispObject FboundpImpl(LispObject obj)
@@ -658,7 +668,7 @@ public static partial class Runtime
                     // Format: "  (:OP arg1 arg2 ...)"
                     var sb = new System.Text.StringBuilder();
                     sb.Append(' ', indent);
-                    sb.Append(opName.ToLower());
+                    sb.Append(opName.ToLowerInvariant());
                     var argCur = ic.Cdr;
                     while (argCur is Cons ac)
                     {
@@ -922,7 +932,7 @@ public static partial class Runtime
         if (tracedName is Symbol origSym)
             RestoreFunctionIfWrapper(origSym, wrapper, original);
         // Also restore on CL/CL-USER symbols
-        if (!key.StartsWith("("))
+        if (!key.StartsWith("(", System.StringComparison.Ordinal))
         {
             var cl = Package.FindPackage("CL");
             if (cl != null)
@@ -941,7 +951,7 @@ public static partial class Runtime
 
     private static LispObject TracedKeyToName(string key)
     {
-        if (key.StartsWith("(SETF "))
+        if (key.StartsWith("(SETF ", System.StringComparison.Ordinal))
         {
             var inner = key.Substring(6, key.Length - 7);
             return new Cons(Startup.Sym("SETF"), new Cons(Startup.Sym(inner), Nil.Instance));

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Native int64 arithmetic on operands that are already raw.
 ;;;
 ;;; A function whose parameters and result are all declared FIXNUM gets an

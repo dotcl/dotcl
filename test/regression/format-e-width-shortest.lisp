@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; ~E with w and no d: print the shortest digits the field allows and pad
 ;;; with spaces; it used to fill the width with trailing zeros.
 

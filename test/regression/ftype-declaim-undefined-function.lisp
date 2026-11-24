@@ -3,7 +3,7 @@
 ;;; still is.
 
 (defun %fdu-compile (name lines)
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames (format nil "~a.lisp" name) dir))
          (fasl (merge-pathnames (format nil "~a.fasl" name) dir))
          (undefined '()))

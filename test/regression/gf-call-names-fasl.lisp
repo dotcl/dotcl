@@ -16,7 +16,7 @@
 (defvar *gcnf-names* '(gcnf-gf gcnf-implicit gcnf-eql))
 
 (defun %gcnf-load ()
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "gf-call-names.lisp" dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (write-string *gcnf-source* s))

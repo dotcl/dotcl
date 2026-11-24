@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; MAKE-HASH-TABLE rejects an unusable :test / :weakness with a TYPE-ERROR.
 ;;;
 ;;; Bug: both were ArgumentException from the LispHashTable constructor, and the

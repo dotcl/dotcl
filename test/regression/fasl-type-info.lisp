@@ -21,11 +21,11 @@
 
 (defvar *fti-core* (regression-child-core))
 
-(defparameter *fti-lib* "fti-lib-tmp.lisp")
-(defparameter *fti-lib-fasl* "fti-lib-tmp.fasl")
-(defparameter *fti-user* "fti-user-tmp.lisp")
-(defparameter *fti-user-fasl* "fti-user-tmp.fasl")
-(defparameter *fti-driver* "fti-driver-tmp.lisp")
+(defparameter *fti-lib* (regression-temp-file "fti-lib-tmp.lisp"))
+(defparameter *fti-lib-fasl* (regression-temp-file "fti-lib-tmp.fasl"))
+(defparameter *fti-user* (regression-temp-file "fti-user-tmp.lisp"))
+(defparameter *fti-user-fasl* (regression-temp-file "fti-user-tmp.fasl"))
+(defparameter *fti-driver* (regression-temp-file "fti-driver-tmp.lisp"))
 
 (defun %fti-write (path text)
   (with-open-file (s path :direction :output :if-exists :supersede)

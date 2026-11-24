@@ -3,6 +3,9 @@
 ;;;; these functions; this file's source is never read or eval'd by the shipped
 ;;;; app. host-log is a host C# function exposed via DotclHost.Register.
 
+;; Defined by the host at run time, so the compiler cannot see it yet.
+(declaim (ftype function host-log))
+
 (defun fib (n)
   (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
 

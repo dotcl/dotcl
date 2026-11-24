@@ -274,7 +274,7 @@ public static partial class Runtime
                 return SlotValueDirect(readerInst, entry.ReaderSlotIndex,
                                        entry.ReaderSlotName!, entry.ReaderSlotName!.Name);
         }
-        return DispatchGF(gf, new[] { a });
+        return DispatchGF(gf, new[] { a }, mode);
     }
 
     /// <summary>The method chain a warm EQL-specialized cache entry runs for A, or null
@@ -320,6 +320,9 @@ public static partial class Runtime
         if (entry != null)
         {
             if (entry.FallbackOnly && gf.FallbackFunction is { } fb2) return fb2.Invoke2(a, b);
+            if (entry.WriterSlotIndex >= 0 && b is LispInstance writerInst)
+                return SetSlotValueDirect(writerInst, entry.WriterSlotIndex,
+                                          entry.WriterSlotName!.Name, a);
             if (entry.PlainPrimaryChain)
             {
                 NoteLoose(gf, entry, 2);
@@ -328,7 +331,7 @@ public static partial class Runtime
             if (entry.PrimaryChainWithBeforeAfter)
                 return InvokeCombinationLoose(gf, entry, a, b, null, null, 2);
         }
-        return DispatchGF(gf, new[] { a, b });
+        return DispatchGF(gf, new[] { a, b }, mode);
     }
 
     /// <summary>Three-argument twin of DISPATCHGF1.</summary>
@@ -345,7 +348,7 @@ public static partial class Runtime
             if (entry.PrimaryChainWithBeforeAfter)
                 return InvokeCombinationLoose(gf, entry, a, b, c, null, 3);
         }
-        return DispatchGF(gf, new[] { a, b, c });
+        return DispatchGF(gf, new[] { a, b, c }, mode);
     }
 
     /// <summary>Run a one-primary-with-:before/:after combination on loose arguments.
@@ -476,7 +479,7 @@ public static partial class Runtime
             if (entry.PrimaryChainWithBeforeAfter)
                 return InvokeCombinationLoose(gf, entry, a, b, c, d, 4);
         }
-        return DispatchGF(gf, new[] { a, b, c, d });
+        return DispatchGF(gf, new[] { a, b, c, d }, mode);
     }
 
     /// <summary>The cache entry for these loose arguments, from the front cache or the
@@ -687,25 +690,29 @@ public static partial class Runtime
         var savedCapturedNmp = nm.CapturedNmp;
         var savedCapturedCnm = nm.CapturedCnm;
         var savedArg0 = nm.Arg0;
-        var savedArg1 = nm.Arg1;
-        var savedArg2 = nm.Arg2;
-        var savedArg3 = nm.Arg3;
+        // Only the first ARGC loose slots are live (CurrentGFArgs reads no more), so only
+        // those are saved and restored; a store of a reference into the heap-held state
+        // costs a GC write barrier, and most calls have one or two arguments.
+        var savedArg1 = argc > 1 ? nm.Arg1 : null;
+        var savedArg2 = argc > 2 ? nm.Arg2 : null;
+        var savedArg3 = argc > 3 ? nm.Arg3 : null;
         var savedArgc = nm.Argc;
         nm.Gf = gf;
         nm.Method = first;
         nm.Chain = primary;
         nm.Index = 1;
-        nm.Args = null;
+        if (savedArgs != null) nm.Args = null;
         nm.Arg0 = a;
-        nm.Arg1 = b;
-        nm.Arg2 = c;
-        nm.Arg3 = d;
+        if (argc > 1) nm.Arg1 = b;
+        if (argc > 2) nm.Arg2 = c;
+        if (argc > 3) nm.Arg3 = d;
         nm.Argc = argc;
-        nm.Fallback = null;
+        if (savedFallback != null) nm.Fallback = null;
         // Leave the slot empty so a capture builds from this chain state.
         bool single = primary.Count == 1;
-        nm.CapturedNmp = single ? _defaultNmp : null;
-        nm.CapturedCnm = null;
+        var newNmp = single ? _defaultNmp : null;
+        if (!ReferenceEquals(savedCapturedNmp, newNmp)) nm.CapturedNmp = newNmp;
+        if (savedCapturedCnm != null) nm.CapturedCnm = null;
         try
         {
             var fn = first.Function;
@@ -723,19 +730,19 @@ public static partial class Runtime
             nm.Method = savedMethod;
             nm.Chain = savedChain;
             nm.Index = savedIndex;
-            nm.Args = savedArgs;
+            if (savedArgs != null || nm.Args != null) nm.Args = savedArgs;
             nm.Arg0 = savedArg0;
-            nm.Arg1 = savedArg1;
-            nm.Arg2 = savedArg2;
-            nm.Arg3 = savedArg3;
+            if (argc > 1) nm.Arg1 = savedArg1;
+            if (argc > 2) nm.Arg2 = savedArg2;
+            if (argc > 3) nm.Arg3 = savedArg3;
             nm.Argc = savedArgc;
-            nm.Fallback = savedFallback;
-            nm.CapturedNmp = savedCapturedNmp;
-            nm.CapturedCnm = savedCapturedCnm;
+            if (savedFallback != null || nm.Fallback != null) nm.Fallback = savedFallback;
+            if (!ReferenceEquals(nm.CapturedNmp, savedCapturedNmp)) nm.CapturedNmp = savedCapturedNmp;
+            if (!ReferenceEquals(nm.CapturedCnm, savedCapturedCnm)) nm.CapturedCnm = savedCapturedCnm;
         }
     }
 
-    private static LispObject DispatchGF(GenericFunction gf, LispObject[] args)
+    private static LispObject DispatchGF(GenericFunction gf, LispObject[] args, int mode = 0)
     {
         // A discriminating function installed on this generic function replaces
         // dispatch entirely -- applicable methods, the cache and the combination are
@@ -744,14 +751,49 @@ public static partial class Runtime
         // that are most common. Null on every generic function until something
         // installs one, so the cost on the usual path is a field read.
         if (gf.DispatchFunction is LispFunction dfN) return dfN.Invoke(args);
-        return DispatchGFCore(gf, args);
+        return DispatchGFCore(gf, args, mode);
     }
 
     /// <summary>dotcl.s own dispatch with the discriminating-function check skipped.
     /// COMPUTE-DISCRIMINATING-FUNCTION.s default method hands this back, so a user
     /// method that calls CALL-NEXT-METHOD and installs the result gets standard
     /// dispatch instead of looping back through the function it just installed.</summary>
-    internal static LispObject DispatchGFCore(GenericFunction gf, LispObject[] args)
+    /// <summary>Whether METHOD has an EQL specializer and could apply to some call whose
+    /// arguments have the classes ARGS have: its class specializers match, and each EQL
+    /// value is of the class of the argument there (an EQL value can only be matched by
+    /// an object of its own class). When no EQL method can, the call's effective methods
+    /// depend on the classes alone, and are cached by them.</summary>
+    private static bool EqlMethodMayApply(LispMethod method, LispObject[] args)
+    {
+        bool hasEql = false;
+        var specs = method.Specializers;
+        for (int i = 0; i < specs.Length; i++)
+        {
+            var spec = specs[i];
+            if (EqlSpecializerValue(spec) is { } v)
+            {
+                hasEql = true;
+                if (i >= args.Length) return false;
+                if (!ReferenceEquals(ArgDispatchClass(args[i]), ArgDispatchClass(v))) return false;
+            }
+            else if (spec is LispClass cls)
+            {
+                if (i >= args.Length) return false;
+                if (cls.Name.Name == "T") continue;
+                var argClass = ArgDispatchClass(args[i]);
+                if (argClass != null)
+                {
+                    bool found = false;
+                    foreach (var c in argClass.ClassPrecedenceList)
+                        if (ReferenceEquals(c, cls)) { found = true; break; }
+                    if (!found && !DotNetVarianceApplicable(cls, argClass)) return false;
+                }
+            }
+        }
+        return hasEql;
+    }
+
+    internal static LispObject DispatchGFCore(GenericFunction gf, LispObject[] args, int mode = 0)
     {
         // Arity check: signal program-error for too few/too many arguments
         int requiredCount = gf.LambdaListInfoSet ? gf.RequiredCount : (gf.Arity >= 0 ? gf.Arity : 0);
@@ -799,6 +841,19 @@ public static partial class Runtime
             // Not among the recent ones: the per-class table remembers the rest, so
             // the applicable methods are not recomputed for a class seen before.
             cached ??= DispatchTableHit(gf, args);
+        }
+        if (cached == null && gf.EqlSigCache is { } sigCache && args.Length >= requiredCount)
+        {
+            var hit = EqlSigLookup(sigCache, args);
+            if (hit != null)
+            {
+                if (gf.LambdaListInfoSet && gf.HasKey && !gf.HasAllowOtherKeys
+                    && args.Length > gf.RequiredCount + gf.OptionalCount)
+                    ValidateGenericKeywords(gf, hit.Applicable!, args);
+                if (hit.Around.Count > 0)
+                    return InvokeAroundCombination(gf, hit.Around, hit.Before, hit.Primary, hit.After, args);
+                return InvokeStandardCombination(gf, hit.Before, hit.Primary, hit.After, args);
+            }
         }
         if (cached != null)
         {
@@ -929,7 +984,7 @@ public static partial class Runtime
                     return DispatchBuiltinCombination(gf, cached.Applicable, args);
                 if (cached.Around.Count > 0)
                     return InvokeAroundCombination(gf, cached, cached.Primary, args);
-                return InvokeStandardCombination(gf, cached.Before, cached.Primary, cached.After, args);
+                return InvokeStandardCombination(gf, cached.Before, cached.Primary, cached.After, args, mode);
         }
 
         // A generic function whose invocation protocol someone specialised is dispatched
@@ -965,9 +1020,8 @@ public static partial class Runtime
         {
             if (IsMethodApplicable(method, args))
                 applicable.Add(method);
-            if (!hasEqlSpec)
-                foreach (var spec in method.Specializers)
-                    if (EqlSpecializerValue(spec) != null) { hasEqlSpec = true; break; }
+            if (!hasEqlSpec && EqlMethodMayApply(method, args))
+                hasEqlSpec = true;
         }
 
         if (applicable.Count == 0)
@@ -1047,14 +1101,18 @@ public static partial class Runtime
         {
             if (m.Qualifiers.Length == 0)
                 primaryMethods.Add(m);
-            else if (m.Qualifiers.Length != 1)
-                continue;
-            else if (LispMethod.QualifierName(m.Qualifiers[0]) == "BEFORE")
+            else if (m.Qualifiers.Length == 1 && LispMethod.QualifierName(m.Qualifiers[0]) == "BEFORE")
                 beforeMethods.Add(m);
-            else if (LispMethod.QualifierName(m.Qualifiers[0]) == "AFTER")
+            else if (m.Qualifiers.Length == 1 && LispMethod.QualifierName(m.Qualifiers[0]) == "AFTER")
                 afterMethods.Add(m);
-            else if (LispMethod.QualifierName(m.Qualifiers[0]) == "AROUND")
+            else if (m.Qualifiers.Length == 1 && LispMethod.QualifierName(m.Qualifiers[0]) == "AROUND")
                 aroundMethods.Add(m);
+            else
+                // CLHS INVALID-METHOD-ERROR: an applicable method whose qualifiers the method
+                // combination does not accept is an error, not a method to skip.
+                throw new LispErrorException(new LispError(
+                    $"{gf.Name.Name}: invalid qualifiers {Runtime.List(m.Qualifiers.Cast<LispObject>().ToArray())} " +
+                    "for an applicable method of the STANDARD method combination"));
         }
 
         if (primaryMethods.Count == 0 && gf.FallbackFunction == null)
@@ -1064,7 +1122,7 @@ public static partial class Runtime
         // Sort: more specific first
         var bySpecificity = new SpecificityComparer(args, false);
         primaryMethods.Sort(bySpecificity);
-        if (gf.FallbackFunction != null)
+        if (gf.FallbackFunction != null && (primaryMethods.Count == 0 || FallbackAppliesTo(gf, args)))
             primaryMethods.Add(FallbackMethodOf(gf, requiredCount));
         beforeMethods.Sort(bySpecificity);
         afterMethods.Sort(new SpecificityComparer(args, true)); // reverse for :after
@@ -1200,6 +1258,12 @@ public static partial class Runtime
             }
         }
 
+        else if (args.Length >= requiredCount && requiredCount >= 2 && primaryMethods.Count > 0)
+        {
+            StoreEqlSigEntry(gf, requiredCount, args, applicable,
+                             aroundMethods, beforeMethods, primaryMethods, afterMethods);
+        }
+
         // Build effective method chain
         if (aroundMethods.Count > 0)
         {
@@ -1211,5 +1275,89 @@ public static partial class Runtime
         {
             return InvokeStandardCombination(gf, beforeMethods, primaryMethods, afterMethods, args);
         }
+    }
+
+    // --- Calls of a generic function with EQL specializers and 2+ required arguments ---
+    //
+    // Which methods apply to such a call, and in which order, depends on the classes of
+    // the required arguments and on which EQL value each EQL-specialized position holds
+    // (an argument is EQL to at most one of the distinct values listed for its position).
+    // That is the key of the entries kept in GenericFunction.EqlSigCache; the entry holds
+    // the complete partitioned, sorted method lists, so a hit does no applicability test
+    // and no sort. Before this, such a call recomputed all of it every time.
+
+    private static bool EqlSigMatches(LispObject a, LispObject v)
+        => ReferenceEquals(a, v)
+           || (a is Fixnum fa ? v is Fixnum fv && fa.Value == fv.Value
+                              : v is not Fixnum && IsTrueEql(a, v));
+
+    private static int EqlSigIndex(LispObject a, LispObject[] values)
+    {
+        for (int i = 0; i < values.Length; i++)
+            if (EqlSigMatches(a, values[i])) return i;
+        return -1;
+    }
+
+    private static CachedDispatch? EqlSigLookup(CachedDispatch[] cache, LispObject[] args)
+    {
+        foreach (var entry in cache)
+        {
+            var types = entry.ArgTypes;
+            bool match = true;
+            for (int i = 0; i < types.Length; i++)
+                if (!ReferenceEquals(ArgDispatchClass(args[i]), types[i])) { match = false; break; }
+            if (!match) continue;
+            var pos = entry.EqlSigPositions!; var vals = entry.EqlSigValues!; var sig = entry.EqlSig!;
+            for (int k = 0; k < pos.Length; k++)
+                if (EqlSigIndex(args[pos[k]], vals[k]) != sig[k]) { match = false; break; }
+            if (match) return entry;
+        }
+        return null;
+    }
+
+    private static void StoreEqlSigEntry(GenericFunction gf, int requiredCount, LispObject[] args,
+        List<LispMethod> applicable, List<LispMethod> around, List<LispMethod> before,
+        List<LispMethod> primary, List<LispMethod> after)
+    {
+        var posList = new List<int>(); var valLists = new List<List<LispObject>>();
+        foreach (var m in gf.Methods)
+        {
+            var specs = m.Specializers;
+            for (int p = 0; p < specs.Length && p < requiredCount; p++)
+            {
+                var v = EqlSpecializerValue(specs[p]);
+                if (v == null) continue;
+                int k = posList.IndexOf(p);
+                if (k < 0) { posList.Add(p); valLists.Add(new List<LispObject>()); k = posList.Count - 1; }
+                bool dup = false;
+                foreach (var e in valLists[k]) if (EqlSigMatches(e, v) && EqlSigMatches(v, e)) { dup = true; break; }
+                if (!dup) valLists[k].Add(v);
+            }
+        }
+        if (posList.Count == 0) return;
+        var vals = new LispObject[posList.Count][];
+        var sig = new int[posList.Count];
+        for (int k = 0; k < vals.Length; k++)
+        {
+            vals[k] = valLists[k].ToArray();
+            sig[k] = EqlSigIndex(args[posList[k]], vals[k]);
+        }
+        var types = new LispClass?[requiredCount];
+        for (int i = 0; i < requiredCount; i++) types[i] = ArgDispatchClass(args[i]);
+        var entry = new CachedDispatch
+        {
+            ArgTypes = types, Around = around, Before = before, Primary = primary, After = after,
+            Applicable = applicable, HasEqlSpecializers = true,
+            EqlSigPositions = posList.ToArray(), EqlSigValues = vals, EqlSig = sig
+        };
+        var old = gf.EqlSigCache;
+        var list = new List<CachedDispatch>(GenericFunction.DispatchCacheWidth * 4) { entry };
+        if (old != null)
+            foreach (var e in old)
+            {
+                if (list.Count >= GenericFunction.DispatchCacheWidth * 4) break;
+                list.Add(e);
+            }
+        gf.EqlSigCache = list.ToArray();
     }
 }

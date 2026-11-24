@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; princ prints with BOTH *print-escape* and *print-readably* false (CLHS
 ;;; 22.1.3.4), and every directive defined as printing "as by princ" inherits
 ;;; that. Suppressing escape alone is not enough: the printer takes

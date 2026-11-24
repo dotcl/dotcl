@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A .NET delegate is a function designator: funcall, apply and the mapping
 ;;; functions call it, marshalling arguments to its parameter types.
 

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; APPEND must not recurse once per element.
 ;;;
 ;;; It used to cons the copy of its first argument on the way out of a

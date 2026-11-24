@@ -5,7 +5,8 @@
 #
 # MACHINE is a row of machines.tsv (name, ssh host, work dir, lock file). The
 # script sends HEAD as a git bundle, checks it out in <work dir>/tree, builds the
-# Release runtime and dotcl.core there (unless LEDGER_NOBUILD=1), runs run.sh with
+# Release runtime there and refreshes dotcl.core and the fasls (bench/ledger/build.sh,
+# unless LEDGER_NOBUILD=1), runs run.sh with
 # the baseline kept in <work dir>/baseline/<name>.tsv, and copies the output back
 # to out/ledger-<name>/ here (LEDGER_DEST overrides). A baseline saved on the
 # machine (LEDGER_SAVE=1) is copied to bench/ledger/baseline/<name>.tsv so it can
@@ -38,8 +39,11 @@ ssh "$host" "set -e; cd $wd
   [ -d tree ] || git init -q tree
   cd tree && git fetch -q ../tree.bundle HEAD && git checkout -q -f --detach FETCH_HEAD && git clean -q -f -d -e out -e contrib/asdf"
 if [ "${LEDGER_NOBUILD:-0}" != 1 ]; then
-  ssh "$host" "cd $wd/tree && export UseSharedCompilation=false MSBUILDDISABLENODEREUSE=1 DOTNET_CLI_USE_MSBUILD_SERVER=0
-    ${lock:+flock $lock} bash -c 'make setup-asdf cross-compile compile-asdf-fasl compile-quicklisp-fasl < /dev/null > $wd/build.log 2>&1 && make bench-build compile-core-fasl < /dev/null >> $wd/build.log 2>&1'"
+  # build.sh builds the Release runtime and then rebuilds every generated file that
+  # depends on the runtime source (dotcl.core, the asdf / quicklisp / contrib fasls),
+  # so a new commit is not measured with the previous commit's core; run.sh checks
+  # that again before it measures.
+  ssh "$host" "cd $wd/tree && ${lock:+flock $lock} bash -c 'bench/ledger/build.sh build $wd/tree < /dev/null > $wd/build.log 2>&1'"
 fi
 pass=""
 for v in LEDGER_ROUNDS LEDGER_STARTUP_COUNT LEDGER_ONLY LEDGER_SAVE LEDGER_REG_PCT LEDGER_APPEND \

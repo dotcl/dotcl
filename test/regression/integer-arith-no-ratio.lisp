@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Integer arithmetic must not go through the rational path. ADD, SUBTRACT and
 ;;; MULTIPLY fell through to (Ratio.Make (* an bn) (* ad bd)) for anything that
 ;;; was not fixnum-by-fixnum, and Ratio.Make reduced by GCD even when the

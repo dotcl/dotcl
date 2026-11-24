@@ -29,6 +29,18 @@ if [ ! -x "$exe" ] || [ ! -f "$core" ]; then
   exit 0
 fi
 
+# Most cases below only look at what the process does with an error, which does not depend on how
+# the compiler was loaded. Loading compiler/dotcl.core (the way a shipped dotcl starts) takes about
+# a quarter of a second, loading cil-out.sil about two seconds, and this script starts a process for
+# nearly every case. The core is used when it is at least as new as the sil; hook_case and the
+# cases that test the --asm / --core difference itself name their flag explicitly.
+boot_flag=--asm
+boot_file="$core"
+if [ -f "$ROOT/compiler/dotcl.core" ] && [ ! "$core" -nt "$ROOT/compiler/dotcl.core" ]; then
+  boot_flag=--core
+  boot_file="$ROOT/compiler/dotcl.core"
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 fails=0
@@ -38,7 +50,7 @@ fails=0
 run_case() {
   name="$1"; want_code="$2"; want_absent="$3"
   set +e
-  out=$("$exe" --asm "$core" "$WORK/$name.lisp" 2>&1 < /dev/null)
+  out=$("$exe" "$boot_flag" "$boot_file" "$WORK/$name.lisp" 2>&1 < /dev/null)
   code=$?
   set -e
   case "$want_code" in
@@ -102,7 +114,7 @@ run_case handled zero ""
 unwind_case() {
   name="$1"; want_code="$2"; want_cleanup="$3"
   set +e
-  out=$("$exe" --asm "$core" "$WORK/$name.lisp" 2>&1 < /dev/null)
+  out=$("$exe" "$boot_flag" "$boot_file" "$WORK/$name.lisp" 2>&1 < /dev/null)
   code=$?
   set -e
   if [ "$code" -ne "$want_code" ]; then
@@ -141,7 +153,7 @@ unwind_case unwind-quit-abort 7 no
 flag_unwind_case() {
   name="$1"; shift
   set +e
-  out=$("$exe" --asm "$core" "$@" 2>&1 < /dev/null)
+  out=$("$exe" "$boot_flag" "$boot_file" "$@" 2>&1 < /dev/null)
   code=$?
   set -e
   if [ "$code" -ne 7 ] || ! printf '%s' "$out" | grep -q CLEANUP; then
@@ -162,7 +174,7 @@ EOF
 where_case() {
   name="$1"; want="$2"; unwant="$3"; shift 3
   set +e
-  out=$(env "$@" "$exe" --asm "$core" "$WORK/where.lisp" 2>&1 < /dev/null)
+  out=$(env "$@" "$exe" "$boot_flag" "$boot_file" "$WORK/where.lisp" 2>&1 < /dev/null)
   code=$?
   set -e
   if [ "$code" -ne 1 ]; then
@@ -178,7 +190,7 @@ where_case() {
   fi
   echo "  ok   $name"
 }
-where_case error-where 'where.lisp:1: Not a number' '(INNER' DOTCL_BACKTRACE=0
+where_case error-where 'where.lisp:1: .*not a number' '(INNER' DOTCL_BACKTRACE=0
 where_case error-backtrace '(INNER 1)' '' DOTCL_BACKTRACE=1
 
 # An error a script signals itself (ERROR) is reported at the file and line too, and a
@@ -285,7 +297,7 @@ cat > "$WORK/user-hook.lisp" <<'EOF'
 (format t "~&REACHED~%")
 EOF
 set +e
-uh_out=$("$exe" --asm "$core" "$WORK/user-hook.lisp" 2>&1 < /dev/null)
+uh_out=$("$exe" "$boot_flag" "$boot_file" "$WORK/user-hook.lisp" 2>&1 < /dev/null)
 uh_code=$?
 set -e
 if [ "$uh_code" -eq 5 ] && printf '%s' "$uh_out" | grep -q USERHOOK && ! printf '%s' "$uh_out" | grep -q REACHED; then
@@ -338,7 +350,7 @@ cat > "$WORK/terpri-t-fresh-line.lisp" <<'EOF'
 (finish-output)
 EOF
 set +e
-tf_out=$("$exe" --asm "$core" "$WORK/terpri-t-fresh-line.lisp" 2>&1 < /dev/null)
+tf_out=$("$exe" "$boot_flag" "$boot_file" "$WORK/terpri-t-fresh-line.lisp" 2>&1 < /dev/null)
 set -e
 if [ "$tf_out" = "a
 b
@@ -355,7 +367,7 @@ fi
 # overloads of one arity, the string argument converts to only one, and the others
 # failing used to open the debugger banner in a REPL (the value was still right).
 set +e
-ov_out=$(printf '%s\n' '(print (type-of (dotnet:static "System.Text.Json.JsonDocument" "Parse" "{}")))' '(format t "~&REACHED~%")' | "$exe" --asm "$core" repl 2>&1 < /dev/stdin)
+ov_out=$(printf '%s\n' '(print (type-of (dotnet:static "System.Text.Json.JsonDocument" "Parse" "{}")))' '(format t "~&REACHED~%")' | "$exe" "$boot_flag" "$boot_file" repl 2>&1 < /dev/stdin)
 set -e
 if printf '%s' "$ov_out" | grep -q 'Debugger entered'; then
   echo "  FAIL dotnet-overload-trial-quiet: the debugger banner appeared"
@@ -381,7 +393,7 @@ cat > "$WORK/interactive-redirected.lisp" <<'EOF'
 (finish-output)
 EOF
 set +e
-is_out=$("$exe" --asm "$core" "$WORK/interactive-redirected.lisp" 2>&1 < /dev/null)
+is_out=$("$exe" "$boot_flag" "$boot_file" "$WORK/interactive-redirected.lisp" 2>&1 < /dev/null)
 set -e
 if [ "$(printf '%s' "$is_out" | sed -n 's/^IS=//p')" = "NIL NIL NIL NIL" ]; then
   echo "  ok   interactive-redirected"
@@ -426,7 +438,7 @@ EOF
 if [ -n "$TMO" ]; then
   timed_case closed-stdin 30 1 'end of file' \
     "$TMO" 30 sh -c "exec \"$exe\" --asm \"$core\" \"$WORK/read-line-closed-stdin.lisp\" 0<&-"
-  echo '"piped"' | "$exe" --asm "$core" "$WORK/read-line-closed-stdin.lisp" > "$WORK/piped.out" 2>&1 || true
+  echo '"piped"' | "$exe" "$boot_flag" "$boot_file" "$WORK/read-line-closed-stdin.lisp" > "$WORK/piped.out" 2>&1 || true
   if grep -q piped "$WORK/piped.out"; then echo "  ok   piped-stdin-still-read"; else
     echo "  FAIL piped-stdin-still-read"; fails=$((fails + 1)); fi
 fi
@@ -458,7 +470,7 @@ cat > "$WORK/closed-stdout.lisp" <<'EOF'
 (format t "hello~%")
 EOF
 set +e
-cs_out=$("$exe" --asm "$core" "$WORK/closed-stdout.lisp" 2>&1 1>&-)
+cs_out=$("$exe" "$boot_flag" "$boot_file" "$WORK/closed-stdout.lisp" 2>&1 1>&-)
 cs_code=$?
 set -e
 if [ "$cs_code" -ne 0 ] && printf '%s' "$cs_out" | grep -q "Bad file descriptor"; then
@@ -471,8 +483,8 @@ fi
 cat > "$WORK/count-lines.lisp" <<'EOF'
 (dotimes (i 5000) (format t "line ~D~%" i))
 EOF
-n_pipe=$("$exe" --asm "$core" "$WORK/count-lines.lisp" 2>&1 | wc -l | tr -d ' ')
-"$exe" --asm "$core" "$WORK/count-lines.lisp" > "$WORK/count-lines.out" 2>&1
+n_pipe=$("$exe" "$boot_flag" "$boot_file" "$WORK/count-lines.lisp" 2>&1 | wc -l | tr -d ' ')
+"$exe" "$boot_flag" "$boot_file" "$WORK/count-lines.lisp" > "$WORK/count-lines.out" 2>&1
 n_file=$(wc -l < "$WORK/count-lines.out" | tr -d ' ')
 if [ "$n_pipe" = 5000 ] && [ "$n_file" = 5000 ]; then echo "  ok   redirected-stdout-complete"
 else echo "  FAIL redirected-stdout-complete: pipe $n_pipe file $n_file"; fails=$((fails + 1)); fi
@@ -489,13 +501,13 @@ cat > "$WORK/exit-hook-quit.lisp" <<'EOF'
 (format t "BODY~%")
 EOF
 if [ -n "$TMO" ]; then
-  timed_case exit-hook-error 30 0 'HOOK1' "$TMO" -k 5 30 "$exe" --asm "$core" "$WORK/exit-hook-error.lisp"
+  timed_case exit-hook-error 30 0 'HOOK1' "$TMO" -k 5 30 "$exe" "$boot_flag" "$boot_file" "$WORK/exit-hook-error.lisp"
   if grep -q HOOK0 "$WORK/exit-hook-error.out" 2>/dev/null && grep -q "hook boom" "$WORK/exit-hook-error.out"; then
     echo "  ok   exit-hook-error-rest-ran"
   else
     echo "  FAIL exit-hook-error-rest-ran: $(cat "$WORK/exit-hook-error.out" 2>/dev/null)"; fails=$((fails + 1))
   fi
-  timed_case exit-hook-quit 30 7 'HOOKQ' "$TMO" -k 5 30 "$exe" --asm "$core" "$WORK/exit-hook-quit.lisp"
+  timed_case exit-hook-quit 30 7 'HOOKQ' "$TMO" -k 5 30 "$exe" "$boot_flag" "$boot_file" "$WORK/exit-hook-quit.lisp"
 fi
 
 # What follows the script's name is the script's: dotcl's own options (--help, --version, --no-init,
@@ -532,10 +544,10 @@ EOF
 cat > "$WORK/stdin-mixed.lisp" <<'EOF'
 (format t "~&MIX=~S~%" (list (read-char) (read-byte *standard-input* nil :eof) (read-char)))
 EOF
-rb_out=$(printf 'ab\n' | "$exe" --asm "$core" "$WORK/stdin-read-byte.lisp" 2>&1)
+rb_out=$(printf 'ab\n' | "$exe" "$boot_flag" "$boot_file" "$WORK/stdin-read-byte.lisp" 2>&1)
 if [ "$(printf '%s' "$rb_out" | sed -n 's/^BYTES=//p')" = "(97 98 10 :EOF)" ]; then echo "  ok   stdin-read-byte"
 else echo "  FAIL stdin-read-byte: $rb_out"; fails=$((fails + 1)); fi
-rb_out=$(printf 'abc' | "$exe" --asm "$core" "$WORK/stdin-mixed.lisp" 2>&1)
+rb_out=$(printf 'abc' | "$exe" "$boot_flag" "$boot_file" "$WORK/stdin-mixed.lisp" 2>&1)
 if [ "$(printf '%s' "$rb_out" | sed -n 's/^MIX=//p')" = '(#\a 98 #\c)' ]; then echo "  ok   stdin-read-byte-mixed"
 else echo "  FAIL stdin-read-byte-mixed: $rb_out"; fails=$((fails + 1)); fi
 
@@ -543,8 +555,8 @@ else echo "  FAIL stdin-read-byte-mixed: $rb_out"; fails=$((fails + 1)); fi
 echo '(dotcl:quit "x")' > "$WORK/quit-string.lisp"
 echo '(dotcl:quit 3)' > "$WORK/quit-three.lisp"
 set +e
-"$exe" --asm "$core" "$WORK/quit-string.lisp" > "$WORK/quit-string.out" 2>&1 < /dev/null; qs=$?
-"$exe" --asm "$core" "$WORK/quit-three.lisp" > /dev/null 2>&1 < /dev/null; q3=$?
+"$exe" "$boot_flag" "$boot_file" "$WORK/quit-string.lisp" > "$WORK/quit-string.out" 2>&1 < /dev/null; qs=$?
+"$exe" "$boot_flag" "$boot_file" "$WORK/quit-three.lisp" > /dev/null 2>&1 < /dev/null; q3=$?
 set -e
 if [ "$qs" -eq 1 ] && [ "$q3" -eq 3 ]; then echo "  ok   quit-exit-codes"
 else echo "  FAIL quit-exit-codes: quit \"x\" exit $qs (wanted 1), quit 3 exit $q3 (wanted 3)"; fails=$((fails + 1)); fi
@@ -555,18 +567,46 @@ echo '(unwind-protect (exit :code 9) (format t "CLEANUP~%"))' > "$WORK/exit-unwi
 echo '(exit :code 5 :abort t)' > "$WORK/exit-abort.lisp"
 echo '(exit)' > "$WORK/exit-bare.lisp"
 set +e
-"$exe" --asm "$core" "$WORK/exit-seven.lisp" > /dev/null 2>&1 < /dev/null; e7=$?
-"$exe" --asm "$core" "$WORK/exit-unwind.lisp" > "$WORK/exit-unwind.out" 2>&1 < /dev/null; e9=$?
-"$exe" --asm "$core" "$WORK/exit-abort.lisp" > /dev/null 2>&1 < /dev/null; e5=$?
-"$exe" --asm "$core" "$WORK/exit-bare.lisp" > /dev/null 2>&1 < /dev/null; e0=$?
+"$exe" "$boot_flag" "$boot_file" "$WORK/exit-seven.lisp" > /dev/null 2>&1 < /dev/null; e7=$?
+"$exe" "$boot_flag" "$boot_file" "$WORK/exit-unwind.lisp" > "$WORK/exit-unwind.out" 2>&1 < /dev/null; e9=$?
+"$exe" "$boot_flag" "$boot_file" "$WORK/exit-abort.lisp" > /dev/null 2>&1 < /dev/null; e5=$?
+"$exe" "$boot_flag" "$boot_file" "$WORK/exit-bare.lisp" > /dev/null 2>&1 < /dev/null; e0=$?
 set -e
 if [ "$e7" -eq 7 ] && [ "$e9" -eq 9 ] && grep -q CLEANUP "$WORK/exit-unwind.out" && [ "$e5" -eq 5 ] && [ "$e0" -eq 0 ]; then echo "  ok   exit-codes"
 else echo "  FAIL exit-codes: seven $e7 (7), unwind $e9 (9), abort $e5 (5), bare $e0 (0)"; fails=$((fails + 1)); fi
 
+# A script that runs out of memory says so in Lisp terms (not the CLR's "Exception of type
+# 'System.OutOfMemoryException' was thrown") and exits 1. The heap is capped so that the
+# test cannot take the machine's memory.
+cat > "$WORK/oom.lisp" <<'EOF2'
+(let ((l nil)) (loop (push (make-array 5000000 :initial-element 0) l)))
+EOF2
+set +e
+oom_out=$(DOTNET_GCHeapHardLimit=0x30000000 "$exe" "$boot_flag" "$boot_file" "$WORK/oom.lisp" 2>&1 < /dev/null)
+oom_code=$?
+set -e
+if [ "$oom_code" -eq 1 ] && printf '%s' "$oom_out" | grep -q 'Heap exhausted' \
+   && ! printf '%s' "$oom_out" | grep -q 'System.OutOfMemoryException'; then
+  echo "  ok   out-of-memory-wording"
+else
+  echo "  FAIL out-of-memory-wording: exit $oom_code: $oom_out"; fails=$((fails + 1))
+fi
+
+# A one-dash spelling of an option dotcl only has in long form names the long one.
+set +e
+short_out=$("$exe" --core "$ROOT/compiler/dotcl.core" -e '(+ 1 2)' 2>&1 < /dev/null)
+short_code=$?
+set -e
+if [ "$short_code" -eq 2 ] && printf '%s' "$short_out" | grep -q "did you mean '--eval'"; then
+  echo "  ok   short-option-hint"
+else
+  echo "  FAIL short-option-hint: exit $short_code: $short_out"; fails=$((fails + 1))
+fi
+
 # A script run through a symlink has the target as *load-truename* (CLHS: the truename).
 echo '(format t "~&TRUENAME=~A~%" *load-truename*)' > "$WORK/lt-real.lisp"
 ln -s lt-real.lisp "$WORK/lt-link.lisp"
-lt_out=$("$exe" --asm "$core" "$WORK/lt-link.lisp" 2>&1 < /dev/null)
+lt_out=$("$exe" "$boot_flag" "$boot_file" "$WORK/lt-link.lisp" 2>&1 < /dev/null)
 case "$lt_out" in
   *lt-real.lisp*) echo "  ok   load-truename-symlink" ;;
   *) echo "  FAIL load-truename-symlink: $lt_out"; fails=$((fails + 1)) ;;

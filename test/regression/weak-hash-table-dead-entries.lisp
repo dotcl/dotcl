@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A weak hash table drops its dead entries even when nothing ever walks it.
 ;;; A collected key is never looked up again, and the entries were removed only
 ;;; by COUNT, MAPHASH or a lookup of that key, so a cache that only ever had new

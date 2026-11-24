@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; `dotcl pack` puts the .asd's :author into the nuspec without mail addresses.
 ;;;
 ;;; By Lisp convention :author is often "Name <mail>", and nuget.org shows

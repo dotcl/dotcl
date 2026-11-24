@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; The inline menu of the bundled REPL, and the debugger's use of it.
 ;;;
 ;;; A menu is drawn on the rows under the line being typed, moved with the

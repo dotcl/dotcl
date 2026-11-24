@@ -1,4 +1,5 @@
-;;; The printer bounds its own recursion so that a deeply nested object cannot
+;;; regression: skip-under-interp
+;;; The printer bounds its own recursion (at 10000 levels) so that a deeply nested object cannot
 ;;; overflow its stack, and past that bound it elides: a list prints as "(...)",
 ;;; an array as "#". That is a fine answer for ordinary printing.
 ;;;
@@ -7,7 +8,7 @@
 ;;; requires an error when readable output is impossible. Eliding produced a
 ;;; SHORTER object that read back as something else: for a caller that stores
 ;;; the representation and reads it later (a .fasl storing a literal), a silently
-;;; wrong constant, or a read error far from the cause: a 1500-deep literal came
+;;; wrong constant, or a read error far from the cause: a 12000-deep literal came
 ;;; back as the text "(...)", and loading it failed with "a token consisting
 ;;; solely of dots is illegal".
 
@@ -22,7 +23,7 @@
 (deftest print-readably-deep-list-signals
   (handler-case
       (let ((*print-readably* t))
-        (write-to-string (%prd-nest 1500))
+        (write-to-string (%prd-nest 12000))
         :no-error)
     (error () :signalled))
   :signalled)
@@ -30,7 +31,7 @@
 (deftest print-readably-deep-vector-signals
   (handler-case
       (let ((*print-readably* t)
-            (v (make-array 1 :initial-element (%prd-nest 1500))))
+            (v (make-array 1 :initial-element (%prd-nest 12000))))
         (write-to-string v)
         :no-error)
     (error () :signalled))
@@ -41,7 +42,7 @@
 (deftest print-readably-deep-condition-type
   (handler-case
       (let ((*print-readably* t))
-        (write-to-string (%prd-nest 1500))
+        (write-to-string (%prd-nest 12000))
         :no-error)
     (print-not-readable () :print-not-readable)
     (error () :some-other-error))
@@ -52,7 +53,7 @@
 
 (deftest print-not-readably-deep-list-elides
   (let ((*print-readably* nil))
-    (let ((s (write-to-string (%prd-nest 1500))))
+    (let ((s (write-to-string (%prd-nest 12000))))
       (and (stringp s) (search "..." s) t)))
   t)
 

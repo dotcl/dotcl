@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The char[] buffer of a SIMPLE-STRING binding is fetched only when the
 ;;; binding is read from inside a loop.
 ;;;

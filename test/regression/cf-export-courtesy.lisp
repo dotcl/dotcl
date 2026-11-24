@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; COMPILE-FILE evaluates a top-level EXPORT (and IMPORT, SHADOW,
 ;;; SHADOWING-IMPORT, USE-PACKAGE) early, although CLHS gives it no
 ;;; compile-time effect. antik does
@@ -10,8 +11,8 @@
 (defpackage :cf-export-courtesy (:use :cl))
 
 (deftest-compiled-only cf-export-courtesy.unbound-argument
-  (let ((src "cfexp-tmp.lisp")
-        (fasl "cfexp-tmp.fasl"))
+  (let ((src (regression-temp-file "cfexp-tmp.lisp"))
+        (fasl (regression-temp-file "cfexp-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)
@@ -30,8 +31,8 @@
 (deftest-compiled-only cf-export-courtesy.early-export-still-happens
   ;; The convenience itself is kept: a symbol exported at top level is external
   ;; while the rest of the file is compiled.
-  (let ((src "cfexp-tmp2.lisp")
-        (fasl "cfexp-tmp2.fasl"))
+  (let ((src (regression-temp-file "cfexp-tmp2.lisp"))
+        (fasl (regression-temp-file "cfexp-tmp2.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)
@@ -52,8 +53,8 @@
   ;; COMPILE-FILE the symbol is still internal, after LOAD it is external.
   ;; hu.dwim.stefil swaps a symbol this way (UNEXPORT + SHADOWING-IMPORT +
   ;; EXPORT) and doing half of it at compile time broke the load.
-  (let ((src "cfexp-tmp3.lisp")
-        (fasl "cfexp-tmp3.fasl"))
+  (let ((src (regression-temp-file "cfexp-tmp3.lisp"))
+        (fasl (regression-temp-file "cfexp-tmp3.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)

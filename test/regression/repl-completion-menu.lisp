@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; TAB completion with several candidates offers them as a menu under the
 ;;; input: the arrows move the mark, Enter or TAB takes it, Escape leaves the
 ;;; line as it was, and any other key closes the menu and goes on to the line.

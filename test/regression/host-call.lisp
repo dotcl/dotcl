@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; DotclHost.Call: the host API a C# program uses to call into Lisp.
 ;;;
 ;;; The string it takes is read the way the Lisp reader reads a symbol token:

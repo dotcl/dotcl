@@ -37,10 +37,10 @@
 (defun itp-f4 (x) (itp-g4 x))
 (deftest itp-inline-self-ref (itp-f4 5) 5)
 
-;; Inlined tail call under handler-case: the try/catch TCO path (leave +
-;; PopCluster) must still fire through the inlined body.
+;; A call under handler-case through an inlined body is an ordinary call under the handler
+;; (not a tail call); a modest depth runs.
 (declaim (inline itp-g5))
 (defun itp-g5 (x acc) (if (<= x 0) acc (itp-f5 (- x 1) (+ acc 1))))
 (defun itp-f5 (x acc) (handler-case (itp-g5 x acc) (error () :err)))
 (deftest itp-inline-handler-correct (itp-f5 100 0) 100)
-(deftest-compiled-only itp-inline-handler-deep    (itp-f5 200000 0) 200000)
+(deftest-compiled-only itp-inline-handler-deep    (itp-f5 1000 0) 1000)

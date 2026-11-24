@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A MACROLET expander's &ENVIRONMENT must let MACROEXPAND see an enclosing
 ;;; SYMBOL-MACROLET (CLHS 3.1.1.1):
 ;;;

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; :FROM-END should stop when it has what it came for.
 ;;;
 ;;; With :FROM-END the answer lives at the right end of the sequence, so the scan

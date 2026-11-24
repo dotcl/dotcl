@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The cmd> prompt of the bundled REPL.
 ;;;
 ;;; A comma typed at the start of an empty line switches the prompt to cmd> for

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; End of file inside a form must be END-OF-FILE, not a raw .NET exception.
 ;;;
 ;;; The reader signals mid-object EOF with an END-OF-FILE condition from

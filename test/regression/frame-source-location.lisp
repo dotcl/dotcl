@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; DOTCL:FUNCTION-SOURCE-LOCATION: LOAD/COMPILE-FILE record where a top-level
 ;;; definition was written, backing swank/micros sldb frame-source-location and
 ;;; find-definitions (M-. / jump to the erroring function).

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; READ-PRESERVING-WHITESPACE leaves the delimiter in the stream.
 ;;;
 ;;; The implementation carried a note saying this was "best-effort: works for

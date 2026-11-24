@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression tests for LispFunction -> Delegate marshal
 ;;; dotnet:make-delegate + auto-marshal in dotnet:new
 

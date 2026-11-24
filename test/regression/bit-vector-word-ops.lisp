@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The bit-array operations, over every word-boundary case.
 ;;;
 ;;; They run on the packed representation a word at a time, and now through a

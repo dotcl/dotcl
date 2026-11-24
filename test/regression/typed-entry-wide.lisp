@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Wide typed entries: a declaimed FTYPE that gives some arguments or the
 ;;; result a raw kind (an integer type inside int64, DOUBLE-FLOAT) and the others
 ;;; any other type, with up to six arguments. The raw ones are passed raw, the

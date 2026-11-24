@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; On Unix a child of LAUNCH-PROCESS leads a process group of its own unless
 ;;; it shares the caller's standard input (:input t), as with SBCL's
 ;;; RUN-PROGRAM. Killing the child's group then leaves the caller running.

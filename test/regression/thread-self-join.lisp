@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Joining the current thread signals an error instead of waiting for ever,
 ;;; on a thread MAKE-THREAD made and on one it did not (the main thread here).
 

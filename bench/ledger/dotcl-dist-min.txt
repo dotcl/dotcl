@@ -1,0 +1,8 @@
+# The oldest dotcl dist (the "version:" line of dists/dotcl/distinfo.txt under
+# $DOTCL_QL_HOME) the ledger measures with. The coalton and ironclad rows load the
+# dist's library releases through the overlay, and an older dist has releases that
+# no longer load on the current runtime (the float-features release of 2026-10-27
+# does not). run.sh refuses to measure below it and prints the version it found;
+# LEDGER_DOTCL_DIST_MIN overrides it. Raise it when a ledger row needs a newer
+# release in the dist.
+2026-11-21

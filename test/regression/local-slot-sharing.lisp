@@ -43,8 +43,8 @@
   (loop for i below (dotnet:invoke arr "Length") collect (dotnet:invoke arr "GetValue" i)))
 
 (deftest-compiled-only local-slot-sharing.fasl-slots-shrink
-  (let ((src "lss-src-tmp.lisp")
-        (fasl "lss-src-tmp.fasl"))
+  (let ((src (regression-temp-file "lss-src-tmp.lisp"))
+        (fasl (regression-temp-file "lss-src-tmp.fasl")))
     (unwind-protect
         (progn
           (with-open-file (s src :direction :output :if-exists :supersede)

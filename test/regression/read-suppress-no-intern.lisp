@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A skipped form must not leave its symbols behind.
 ;;;
 ;;; CLHS 23.2 (*READ-SUPPRESS*): while it is true the reader still parses a

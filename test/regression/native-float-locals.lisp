@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression tests for NATIVE FLOAT LOCAL SLOTS: a double/single-float
 ;;; declared, non-special, non-captured lexical with a float-typed init gets a
 ;;; raw r8/r4 slot instead of a boxed DoubleFloat/SingleFloat. setq stores the
@@ -159,3 +160,41 @@
 (deftest nfl-setq-use-result
   (%nfl-setq-use 3)
   3)
+
+;; An undeclared LET variable whose only use is as the value of a SETF of a
+;; double-float local (the mandelbrot step: (let ((nzr ...)) (setf zi ... zr nzr))) is
+;; a raw double slot as it is for SETQ: the loop allocates nothing per step.
+(defun %nfl-setf-step (n)
+  (declare (fixnum n) (optimize (speed 3) (safety 0)))
+  (let ((zr 0.3d0) (zi 0.4d0) (ci 0.1d0))
+    (declare (double-float zr zi ci))
+    (dotimes (i n)
+      (let ((nzr (+ (- (* zr zr) (* zi zi)) ci)))
+        (setf zi (+ (* 2d0 zr zi) ci) zr nzr)))
+    (+ zr zi)))
+
+(defun %nfl-setf-step-boxed (n)
+  (let ((zr 0.3d0) (zi 0.4d0) (ci 0.1d0))
+    (dotimes (i n)
+      (let ((nzr (+ (- (* zr zr) (* zi zi)) ci)))
+        (setf zi (+ (* 2d0 zr zi) ci) zr nzr)))
+    (+ zr zi)))
+
+(deftest-emitting-only native-float-locals.setf-value-is-raw
+  (let* ((warm (%nfl-setf-step 10))
+         (b0 (nth 4 (dotcl:gc-stats)))
+         (r (%nfl-setf-step 100000))
+         (bytes (- (nth 4 (dotcl:gc-stats)) b0)))
+    (declare (ignore warm))
+    (list (< bytes 10000) (= r (%nfl-setf-step-boxed 100000))))
+  (t t))
+
+;; The syntactic scans for raw-slot uses read unexpanded source, where a SETF can have an
+;; improper tail (a backquote COMMA structure, as in SBCL's own macros: (setf place . ,args)).
+;; They must walk it without signalling.
+(deftest-emitting-only native-float-locals.scan-improper-setf
+  (list (handler-case (dotcl.cil-compiler::%native-int-use-p 'x '((setf a . b) (setf a b . c) (setq a . b)))
+          (error () :error))
+        (handler-case (dotcl.cil-compiler::%native-float-use-p 'x '((setf a . b) (setf a b . c) (psetf a . b)))
+          (error () :error)))
+  (nil nil))

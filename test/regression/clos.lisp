@@ -24,7 +24,7 @@
 ;;; Method combination: standard :around/:before/:after
 (defvar *clos-log* nil)
 (defgeneric clos-logged (x))
-(defclass clos-base-obj ())
+(defclass clos-base-obj () ())
 (defmethod clos-logged :before ((x clos-base-obj))
   (push :before *clos-log*))
 (defmethod clos-logged ((x clos-base-obj))
@@ -120,7 +120,7 @@
 ;;; dispatched previously (which set nmpSym.Function to a stale closure).
 
 (defgeneric nmp-gf (x))
-(defclass nmp-base ())
+(defclass nmp-base () ())
 (defclass nmp-derived (nmp-base) ())
 
 ;; Primary only for nmp-base (fast path: 1 primary, no before/after)
@@ -152,7 +152,7 @@
 ;; next-method-p must return T when there IS a next method (via call-next-method
 ;; inside :around calling the primary for nmp-base).
 (defgeneric nmp-has-next (x))
-(defclass nmp-hn-base ())
+(defclass nmp-hn-base () ())
 (defclass nmp-hn-sub (nmp-hn-base) ())
 
 (defvar *nmp-has-next-result* nil)
@@ -175,7 +175,7 @@
 (defmethod cnm-call-thunk (fn) (funcall fn))
 
 (defgeneric cnm-capture-gf (x))
-(defclass cnm-capture-base ())
+(defclass cnm-capture-base () ())
 (defclass cnm-capture-derived (cnm-capture-base) ())
 
 (defmethod cnm-capture-gf ((x cnm-capture-base)) :base)
@@ -190,7 +190,7 @@
 
 ;;; Same but using #'call-next-method as a first-class value.
 (defgeneric cnm-capture-gf2 (x))
-(defclass cnm-capture-base2 ())
+(defclass cnm-capture-base2 () ())
 (defclass cnm-capture-derived2 (cnm-capture-base2) ())
 
 (defmethod cnm-capture-gf2 ((x cnm-capture-base2)) :base2)

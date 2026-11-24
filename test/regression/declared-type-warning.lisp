@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A type declaration naming something that is not a type is dropped by the
 ;;; compiler. Silently, until now: a typo, or DECIMAL written bare where
 ;;; DOTCL:DECIMAL was meant, cost the declaration (and the native arithmetic it

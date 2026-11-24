@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; Ctrl+Z at the start of a line on standard input.
 ;;;
 ;;; A Windows console ends input on a line that starts with Ctrl+Z, and without

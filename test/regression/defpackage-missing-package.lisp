@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; DEFPACKAGE :IMPORT-FROM / :SHADOWING-IMPORT-FROM naming a package that is
 ;;; not there.
 ;;;

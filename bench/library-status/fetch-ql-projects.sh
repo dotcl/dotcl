@@ -15,7 +15,13 @@ dir=${1:?usage: fetch-ql-projects.sh DIR [COMMIT]}
 commit=${2:-2e314d2b48f6e65a5afc1fb399a1aec2466b8531}
 url=https://github.com/quicklisp/quicklisp-projects.git
 if [ ! -d "$dir/.git" ]; then
-  git clone -q "$url" "$dir"
+  # Up to three tries, ten seconds apart; the third failure stops the script (set -e).
+  for try in 1 2 3; do
+    git clone -q "$url" "$dir" && break
+    echo "clone failed (attempt $try of 3)" >&2
+    [ "$try" -lt 3 ] && sleep 10
+  done
+  [ -d "$dir/.git" ]
 fi
 git -C "$dir" fetch -q origin
 git -C "$dir" -c advice.detachedHead=false checkout -q --detach "$commit"

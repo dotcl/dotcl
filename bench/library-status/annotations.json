@@ -35,5 +35,14 @@
 
   "with-user-abort": "Does not load: the parent of `user-abort` is chosen by `#+sbcl`, `#+ccl`, ... conditionals with no dotcl branch, so the parent list is `(nil)` and `define-condition` rejects it, as SBCL does without its branch. Earlier dotcl accepted it and defined a `user-abort` that was not a condition.",
 
-  "sqlite": "Flaky: the suite is sensitive to a lock conflict (`SQLITE_BUSY`) between threads inserting at the same time, so it varies between runs. Three measurements gave pass 2, fail 1."
+  "sqlite": "Flaky: the suite is sensitive to a lock conflict (`SQLITE_BUSY`) between threads inserting at the same time, so it varies between runs. Three measurements gave pass 2, fail 1.",
+
+  "3d-matrices": "Two checks expect `minv` of a singular matrix to signal an error. SBCL signals `division-by-zero` from the float division; dotcl returns infinity there (float division by zero signals only in code compiled at `(safety 3)`), so `minv` returns a result instead (see `docs/deviations.md`). The other 247 checks pass.",
+
+  "punycode": "Two checks encode and decode an emoji (U+1F609), a character outside the Basic Multilingual Plane. `char-code-limit` is 65536 in dotcl and strings are UTF-16, so `code-char` of it is `nil` and `decode` fails in `(setf char)`; `encode` sees two surrogate characters (see `docs/deviations.md`). The other 52 checks pass.",
+
+  "prove": "One of its own tests expects the exact text of a failed IS-PRINT assertion, which gets a timing suffix (e.g. \"(261ms)\") when the assertion takes longer than prove's 75 ms slow threshold. In the measured run that assertion took 261 ms on dotcl, so the text differs; on SBCL it stays under the threshold.",
+  "docparser": "Its tests check the parsed nodes by position (a running node counter into the index of the test system). The positions of the CFFI and method nodes differ from what the tests expect on dotcl (17 failures); on SBCL the same run reads only 25 nodes and stops with an index-too-large error (11 failures), so the two counts are not comparable.",
+  "cl-async": "The run stops at the POLL-FD test with a native crash: the test gets the socket file descriptor with a per-implementation accessor that has no dotcl branch, so it passes NIL to the libuv poll call. The 75 passed and 2 failed (TCP and SSL client/server) before it are all that was run; SBCL runs the whole suite (131 passed, 3 failed).",
+  "cl-coroutine": "Its test system does not compile on dotcl: `with-call/cc` of `cl-cont` around a `handler-case` reports `return for unknown block`, because `cl-cont` cannot follow the block that dotcl's `handler-case` expansion uses. SBCL compiles the same form."
 }

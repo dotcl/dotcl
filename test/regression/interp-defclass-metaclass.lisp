@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; DEFCLASS with a custom :METACLASS must work where there is no compiler.
 ;;;
 ;;; DEFCLASS lowers to (%register-class (%make-class ...)) normally, but to

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A declaimed return type written (VALUES X &OPTIONAL) or (VALUES X), the way
 ;;; SBCL-style code spells a single result, is X for the caller: an integer
 ;;; range, a fixnum, a float. Other VALUES types say nothing about the call.

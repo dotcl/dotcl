@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; FILE-POSITION after UNREAD-CHAR on a string input stream.
 ;;;
 ;;; A character pushed back has not been consumed -- the next READ-CHAR returns

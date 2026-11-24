@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Built-in docstrings for the COMMON-LISP package.
 ;;;
 ;;; Every external CL symbol that names a function, macro or special operator

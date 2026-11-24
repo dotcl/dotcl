@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; DOTCL:TYPEXPAND-1 and DOTCL:TYPEXPAND expand DEFTYPE forms the way
 ;;; MACROEXPAND-1 and MACROEXPAND expand macro forms, returning
 ;;; (values expansion expandedp). introspect-environment reaches them for its

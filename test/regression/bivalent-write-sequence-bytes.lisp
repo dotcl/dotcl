@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; WRITE-SEQUENCE to a bivalent stream writes integers as octets.
 ;;;
 ;;; Bug: on a DOTNET:TO-STREAM :BIVALENT stream (what DOTCL-SOCKET hands out),

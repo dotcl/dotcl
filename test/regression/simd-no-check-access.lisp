@@ -88,15 +88,23 @@
    (10 11 12 13 14 15 16 17)
    (10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25)))
 
+;; A buffer whose fetch cannot answer null (the unsigned 64, 16 and 8 bit kinds) is read
+;; with the raw entry, which takes no array and no function name for a slow path; the
+;; others still carry the NoCheck entry's arguments for the buffer-missing case.
+(defun %snc-entry-prefix (type)
+  (if (member type '((unsigned-byte 64) (unsigned-byte 16) (unsigned-byte 8)) :test #'equal)
+      "Raw" "NoCheck"))
+
 (deftest-compiled-only simd-no-check-access.shape
   (loop for (type kind) in *snc-kinds*
         append (let ((lane (%snc-lane-name kind))
+                     (entry (%snc-entry-prefix type))
                      (read-name (%snc-name kind "READ"))
                      (write-name (%snc-name kind "WRITE")))
                  (eval `(defun ,read-name ,@(cdr (%snc-read-form type kind))))
                  (eval `(defun ,write-name ,@(cdr (%snc-write-form type kind))))
                  (let ((read-text (%flat-text (dotcl:function-sil (symbol-function read-name))))
                        (write-text (%flat-text (dotcl:function-sil (symbol-function write-name)))))
-                   (list (and (search (format nil "Simd.LoadNoCheck.~A" lane) read-text) t)
-                         (and (search (format nil "Simd.StoreNoCheck.~A" lane) write-text) t)))))
+                   (list (and (search (format nil "Simd.Load~A.~A" entry lane) read-text) t)
+                         (and (search (format nil "Simd.Store~A.~A" entry lane) write-text) t)))))
   (t t t t t t t t t t t t t t))

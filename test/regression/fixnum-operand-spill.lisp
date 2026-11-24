@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Native int64 arithmetic must not leave one operand pending on the CIL stack
 ;;; while the other operand's code runs.
 ;;;

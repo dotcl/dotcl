@@ -144,5 +144,15 @@ namespace DotCL.TestSupport
         int IDerived.OwnValue => 2;
     }
 
+    // The BCL has no public ulong-backed [Flags] enum, so this one covers that width.
+    [System.Flags]
+    public enum ULongFlags : ulong
+    {
+        None = 0,
+        Low = 1,
+        Two = 2,
+        High = 0x8000000000000000
+    }
+
 }
 #endif

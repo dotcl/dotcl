@@ -57,6 +57,9 @@ jobs:
   # two short ones go last, so on two runners they fill the gap the long ones
   # leave instead of starting a third round.
   test:
+    # On push only the dotcl/dotcl repository runs this job; other copies run it from the
+    # schedule and by hand (and for pull requests).
+    if: github.event_name != 'push' || github.repository == 'dotcl/dotcl'
     # The runner comes from the CI_RUNNER repository variable, falling back to
     # ubuntu-latest where it is unset. Keep the fallback: a repository without
     # the variable must still build on GitHub-hosted runners.
@@ -169,7 +172,7 @@ jobs:
       - name: Setup Roswell
         run: |
           if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
-            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+            curl -fL --retry 3 --retry-delay 10 --retry-all-errors https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           fi
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
@@ -259,6 +262,9 @@ jobs:
     timeout-minutes: 75
     env:
       DOTCL_REGRESSION_TIER: full
+      # The files load-skip-under-interp leaves out of the interpreter run are loaded here (the push run,
+      # the gate and the lane runs keep skipping them); see test/framework.lisp.
+      DOTCL_INTERP_UNSKIP: "1"
       DOTCL_CI: "1"
       CL_SOURCE_REGISTRY: '(:source-registry (:tree "${{ github.workspace }}/") :ignore-inherited-configuration)'
     steps:
@@ -311,7 +317,7 @@ jobs:
       - name: Setup Roswell
         run: |
           if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
-            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+            curl -fL --retry 3 --retry-delay 10 --retry-all-errors https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           fi
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
@@ -354,7 +360,13 @@ jobs:
       # through it. It now verifies the core, the stress fixture, and asdf.
       - name: Verify emitted CIL (ilverify)
         run: |
-          dotnet tool install --global dotnet-ilverify >/dev/null 2>&1 || true
+          # Pinned: the newest dotnet-ilverify package does not install ("Settings file
+          # 'DotnetToolSettings.xml' was not found in the package"). A tool that is already
+          # installed is left as it is; a failed install fails the step instead of
+          # surfacing later as a missing command.
+          if ! dotnet tool list --global | grep -qi '^dotnet-ilverify[[:space:]]'; then
+            dotnet tool install --global dotnet-ilverify --version 10.0.13
+          fi
           export PATH="$PATH:$HOME/.dotnet/tools"
           make ilverify
 
@@ -431,7 +443,7 @@ jobs:
       - name: Setup Roswell
         run: |
           if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
-            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+            curl -fL --retry 3 --retry-delay 10 --retry-all-errors https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           fi
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
@@ -553,7 +565,7 @@ jobs:
       - name: Setup Roswell
         run: |
           if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
-            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+            curl -fL --retry 3 --retry-delay 10 --retry-all-errors https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           fi
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
@@ -644,6 +656,7 @@ jobs:
       - name: Project-core MSBuild tasks
         run: make test-project-core-build
 
+
       - name: Disk usage (after)
         if: always()
         run: df -h / && du -sh out/ansi 2>/dev/null || true
@@ -714,7 +727,7 @@ jobs:
       - name: Setup Roswell
         run: |
           if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
-            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+            curl -fL --retry 3 --retry-delay 10 --retry-all-errors https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           fi
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
@@ -735,6 +748,20 @@ jobs:
       - name: MOP protocol tests
         run: make test-mop
 
+      # Keep the ansi-test clone between runs, keyed by the revision the Makefile pins, so a
+      # run does not depend on the git server being reachable. The fasl files its load writes
+      # are left out: they belong to the build that made them. On a miss the next step clones
+      # as before, and the cache is saved when the job succeeds.
+      - name: ansi-test revision
+        id: ansirev
+        run: echo "rev=$(sed -n 's/^ANSI_TEST_REV ?= //p' Makefile)" >> "$GITHUB_OUTPUT"
+      - name: Restore ansi-test
+        uses: actions/cache@v4
+        with:
+          path: |
+            ansi-test
+            !ansi-test/**/*.fasl
+          key: ansi-test-${{ steps.ansirev.outputs.rev }}
       # Fetching ansi-test is its own step so a failure there is reported as
       # what it is. It used to be a prerequisite of the run below, whose `|| true`
       # (there so a known ANSI failure does not fail the build) also swallowed a
@@ -968,7 +995,7 @@ jobs:
       - name: Setup Roswell
         run: |
           if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
-            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+            curl -fL --retry 3 --retry-delay 10 --retry-all-errors https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           fi
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
@@ -1022,11 +1049,23 @@ jobs:
       - name: Script exit codes
         run: make test-cli-exit
 
+      # SIGINT at the REPL through a pseudo-terminal (contrib/dotcl-posix): the interrupt reaches the
+      # running form and the REPL stays alive. About 25 s (measured on macOS; first Linux figure from
+      # this step). Full run only, as this whole job is.
+      - name: REPL SIGINT through a pty
+        run: make test-sigint-repl
+
       # DOTCL_EMIT_PDB: the .lisp must appear in the PDB with sequence points and
       # named locals, which is what makes the VS / VS Code debugger show Lisp
       # source and Locals. ~20s.
       - name: Debug info (PDB)
         run: make test-debug-pdb
+
+      # The Windows push job cross-compiles with the seed through this path (the tree's
+      # COMPILE-DEFMACRO loaded into the seed); seed-check above does not use it. Last,
+      # because it rebuilds compiler/cil-out.sil (an equivalent one: only the generated names differ). ~1 min.
+      - name: Seed-hosted cross-compile (the Windows job's path)
+        run: make cross-compile-seed
 
       - name: Disk usage (after)
         if: always()
@@ -1098,7 +1137,7 @@ jobs:
       - name: Setup Roswell
         run: |
           if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
-            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+            curl -fL --retry 3 --retry-delay 10 --retry-all-errors https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           fi
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
@@ -1245,7 +1284,7 @@ jobs:
       - name: Setup Roswell
         run: |
           if ! command -v ros >/dev/null && [ ! -x "$HOME/.roswell/bin/ros" ]; then
-            curl -L https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
+            curl -fL --retry 3 --retry-delay 10 --retry-all-errors https://raw.githubusercontent.com/roswell/roswell/master/scripts/install-for-ci.sh | bash
           fi
           echo "$HOME/.roswell/bin" >> $GITHUB_PATH
 
@@ -1257,21 +1296,54 @@ jobs:
 
       - name: Publish the playground against this checkout
         run: |
-          git clone --depth 1 https://github.com/dotcl/playground "$RUNNER_TEMP/playground"
+          for try in 1 2 3; do
+            git clone --depth 1 https://github.com/dotcl/playground "$RUNNER_TEMP/playground" && break
+            echo "clone failed (attempt $try of 3)"
+            [ "$try" -lt 3 ] && sleep 10
+          done
+          [ -d "$RUNNER_TEMP/playground/.git" ]
           dotnet publish "$RUNNER_TEMP/playground/src/Playground.csproj" -c Release \
             -p:DotclSource="$GITHUB_WORKSPACE/runtime/DotCL.Runtime.csproj" -p:WasmEnableSIMD=false
 
-      # Installed once on a runner that lacks it (the deb pulls in the libraries
-      # headless Chrome needs); GitHub-hosted images already have it.
+      # The Chrome of the image when there is one (GitHub-hosted images have it).
+      # Otherwise a Chrome for Testing build is unpacked under RUNNER_TEMP, and the
+      # system libraries it needs that the host lacks are unpacked next to it from
+      # downloaded packages (apt-get download and dpkg -x), so nothing here needs
+      # root and nothing is installed on the machine.
       - name: Install Chrome
         run: |
-          if ! command -v google-chrome >/dev/null; then
-            curl -fsSL -o "$RUNNER_TEMP/chrome.deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-            sudo -n apt-get install -y "$RUNNER_TEMP/chrome.deb"
+          set -e
+          libpath=
+          if command -v google-chrome >/dev/null; then
+            chrome=$(command -v google-chrome)
+          else
+            url=$(curl -fsSL --retry 3 --retry-delay 10 --retry-all-errors \
+                    https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json |
+                  python3 -c 'import json,sys; d=json.load(sys.stdin); print([x["url"] for x in d["channels"]["Stable"]["downloads"]["chrome"] if x["platform"] == "linux64"][0])')
+            curl -fsSL --retry 3 --retry-delay 10 --retry-all-errors -o "$RUNNER_TEMP/chrome.zip" "$url"
+            unzip -q -o "$RUNNER_TEMP/chrome.zip" -d "$RUNNER_TEMP/chrome"
+            chrome="$RUNNER_TEMP/chrome/chrome-linux64/chrome"
+            if ldd "$chrome" | grep -q 'not found'; then
+              libs="$RUNNER_TEMP/chrome-libs"
+              mkdir -p "$libs/debs" "$libs/root"
+              (cd "$libs/debs" &&
+               for p in libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 libavahi-client3 \
+                        libavahi-common3 libcairo2 libcups2 libdatrie1 libdrm2 libfontconfig1 \
+                        libfreetype6 libfribidi0 libgbm1 libglib2.0-0 libgraphite2-3 libharfbuzz0b \
+                        libnspr4 libnss3 libpango-1.0-0 libpixman-1-0 libpng16-16 libthai0 libx11-6 \
+                        libxau6 libxcb-render0 libxcb-shm0 libxcb1 libxcomposite1 libxdamage1 \
+                        libxdmcp6 libxext6 libxfixes3 libxi6 libxkbcommon0 libxrandr2 libxrender1; do
+                 apt-get download "${p}t64" 2>/dev/null || apt-get download "$p"
+               done)
+              for f in "$libs"/debs/*.deb; do dpkg -x "$f" "$libs/root"; done
+              libpath="$libs/root/usr/lib/$(uname -m)-linux-gnu"
+            fi
           fi
-          google-chrome --version
-          printf '#!/bin/sh\nexec google-chrome --no-sandbox "$@"\n' > "$RUNNER_TEMP/chrome-wrapper"
+          # An empty LD_LIBRARY_PATH would put the current directory on the search path.
+          printf '#!/bin/sh\n[ -z "%s" ] || export LD_LIBRARY_PATH="%s"\nexec "%s" --no-sandbox "$@"\n' \
+            "$libpath" "$libpath" "$chrome" > "$RUNNER_TEMP/chrome-wrapper"
           chmod +x "$RUNNER_TEMP/chrome-wrapper"
+          "$RUNNER_TEMP/chrome-wrapper" --headless --version
 
       - name: Boot the playground in headless Chrome
         run: |

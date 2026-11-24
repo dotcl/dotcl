@@ -1,5 +1,5 @@
 ;;; A LET variable that is not declared but whose body reads or writes the raw slots of one structure
-;;; three or more times has its raw slot array fetched once, where it is bound. The fetch is a hint:
+;;; four or more times has its raw slot array fetched once, where it is bound. The fetch is a hint:
 ;;; anything that is not an instance of that structure at that layout version takes the code every
 ;;; access had before, so the answers and the errors are the same as without it.
 
@@ -14,8 +14,9 @@
 (defstruct (sbi-parent (:constructor make-sbi-parent (a b c))) (a 0d0 :type double-float) (b 0d0 :type double-float) (c 0d0 :type double-float))
 (defstruct (sbi-child (:include sbi-parent) (:constructor make-sbi-child (a b c d))) (d 0d0 :type double-float))
 
-;; Three accesses (hoisted), two accesses (not).
+;; Three and two accesses (not hoisted), four accesses (hoisted).
 (defun %sbi-three (o) (let ((p o)) (+ (sbi-x p) (sbi-y p) (sbi-z p))))
+(defun %sbi-four (o) (let ((p o)) (+ (sbi-x p) (sbi-y p) (sbi-z p) (sbi-x p))))
 (defun %sbi-two (o) (let ((p o)) (+ (sbi-x p) (sbi-y p))))
 (defun %sbi-seven (o) (let ((p o)) (+ (sbi7-a p) (sbi7-b p) (sbi7-c p) (sbi7-d p) (sbi7-e p) (sbi7-f p) (sbi7-g p))))
 (defun %sbi-boxed (o) (let ((p o)) (list (sbi-boxed-tag p) (+ (sbi-boxed-v p) (sbi-boxed-w p) (sbi-boxed-u p)))))
@@ -120,3 +121,13 @@
                (%sbi-error (lambda () (%sbi-letstar-assigned 5 (make-sbi 1d0 2d0 3d0 1))))))
   ((54d0 55d0 56d0 30d0) 7d0 (1d0 20d0 30d0) (1d0 6d0 7d0)
    #.(type-of (handler-case (%sbi-letstar-declared 5) (error (e) e))) t))
+
+;;; Four accesses is where the fetch starts: the answers and the errors match the three-access
+;;; function that is not fetched.
+(deftest struct-backing-inferred.threshold
+  (list (%sbi-four (make-sbi 1d0 2d0 3d0 4))
+        (equal (%sbi-error (lambda () (%sbi-four 5))) (%sbi-error (lambda () (%sbi-three 5))))
+        (equal (%sbi-error (lambda () (%sbi-four nil))) (%sbi-error (lambda () (%sbi-three nil))))
+        (equal (%sbi-error (lambda () (%sbi-four (make-sbi7 1d0 2d0 3d0 4d0 5d0 6d0 7d0))))
+               (%sbi-error (lambda () (%sbi-three (make-sbi7 1d0 2d0 3d0 4d0 5d0 6d0 7d0))))))
+  (7d0 t t t))

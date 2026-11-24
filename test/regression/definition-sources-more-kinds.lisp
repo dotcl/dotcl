@@ -2,7 +2,7 @@
 ;;; DEFGENERIC, DEFINE-METHOD-COMBINATION, and a DEFUN that is not CL:DEFUN.
 
 (defun %dsm-source ()
-  (let ((src (merge-pathnames "dsm-fixture.lisp" (regression-temp-dir))))
+  (let ((src (merge-pathnames "dsm-fixture.lisp" (regression-temp-dir/))))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (dolist (l '("(defpackage \"DS-MORE\" (:use \"CL\") (:shadow \"DEFUN\"))"   ; 1
                    "(in-package \"DS-MORE\")"                                    ; 2
@@ -51,7 +51,7 @@
   t)
 
 (deftest-emitting-only definition-sources-more-kinds.load-fasl
-  (let ((fasl (merge-pathnames "dsm-fixture.fasl" (regression-temp-dir)))
+  (let ((fasl (merge-pathnames "dsm-fixture.fasl" (regression-temp-dir/)))
         (src (%dsm-source)))
     (when (find-package "DS-MORE") (delete-package "DS-MORE"))
     (let ((*error-output* (make-broadcast-stream)))

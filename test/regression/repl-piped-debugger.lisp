@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; A REPL whose standard input is not a terminal has nobody to ask.
 ;;;
 ;;; The debugger used to prompt anyway, because the REPL counted as interactive

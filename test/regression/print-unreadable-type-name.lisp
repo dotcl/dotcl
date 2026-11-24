@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; PRINT-UNREADABLE-OBJECT :TYPE T prints the type name the way WRITE would
 ;;; under the current *PRINT-ESCAPE*: a package prefix when the symbol is not
 ;;; accessible in *PACKAGE*, |escapes| when needed, and bare under PRINC.

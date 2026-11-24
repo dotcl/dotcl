@@ -144,8 +144,8 @@ rewritten together when a release is prepared.
 ### How it was measured
 
 <!-- ledger:begin setup -->
-- Machine and date: Intel Core i5-8350U CPU @ 1.70GHz (8 logical CPUs, Linux x86_64, .NET 10.0.14), measured on 2026-11-06.
-- dotcl: the development sources at commit b4bf60f2 (after v0.1.36). Release build, with `DOTCL_NO_JIT_PROFILE=1` and `DOTNET_gcServer=0`.
+- Machine and date: Intel Core i5-8350U CPU @ 1.70GHz (8 logical CPUs, Linux x86_64, .NET 10.0.15), measured on 2026-11-22.
+- dotcl: the development sources at commit f52f0ef4 (after v0.1.37). Release build, with `DOTCL_NO_JIT_PROFILE=1` and `DOTNET_gcServer=0`.
   SBCL 2.6.8 (installed through Roswell), started with `--dynamic-space-size 4096`.
 - cl-bench revision 6e1b6e62.
 <!-- ledger:end setup -->
@@ -175,78 +175,78 @@ rewritten together when a release is prepared.
 | statistic | cold | suite |
 | --- | ---: | ---: |
 | benchmarks with a ratio | 56 | 56 |
-| geometric mean of the ratios | 2.55 | 2.44 |
-| median of the ratios | 2.77 | 2.43 |
-| total dotcl time / total SBCL time | 1.40 | 1.45 |
+| geometric mean of the ratios | 2.59 | 2.63 |
+| median of the ratios | 2.90 | 2.82 |
+| total dotcl time / total SBCL time | 1.50 | 1.45 |
 
 Without a cold ratio: `puzzle` (SBCL reported 0 ms).
 
-The 4 longest benchmarks on dotcl (`string-concat`, `strings/adjustable`, `clos/method+after` and `clos/methodcalls`) are 52% of the dotcl total in the cold column, at 0.75x to 4.12x of the SBCL time.
+The 4 longest benchmarks on dotcl (`string-concat`, `strings/adjustable`, `clos/methodcalls` and `clos/method+after`) are 53% of the dotcl total in the cold column, at 0.81x to 4.65x of the SBCL time.
 
 | group | benchmark | runs | dotcl ms | SBCL ms | ratio (cold) | ratio (suite) |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| gabriel | tak | 100 | 22 | 21 | 1.05 | 0.95 |
-| gabriel | takl | 10 | 43 | 18 | 2.39 | 2.39 |
-| gabriel | stak | 50 | 217 | 32 | 6.78 | 6.84 |
-| gabriel | ctak | 50 | 44 | 5 | 8.80 | 9.20 |
-| gabriel | trtak | 100 | 24 | 21 | 1.14 | 1.19 |
-| gabriel | boyer | 10 | 275 | 45 | 6.11 | 6.11 |
-| gabriel | browse | 5 | 195 | 36 | 5.42 | 5.27 |
-| gabriel | dderiv | 50 | 334 | 73 | 4.58 | 5.96 |
-| gabriel | deriv | 50 | 273 | 67 | 4.07 | 2.44 |
-| gabriel | destructive | 50 | 134 | 36 | 3.72 | 3.00 |
-| gabriel | div2-test-1 | 50 | 92 | 36 | 2.56 | 1.76 |
-| gabriel | div2-test-2 | 50 | 149 | 52 | 2.87 | 4.00 |
-| gabriel | fft | 10 | 24 | 3 | 8.00 | 8.67 |
-| gabriel | frpoly/fixnum | 30 | 209 | 31 | 6.74 | 7.56 |
-| gabriel | frpoly/bignum | 10 | 259 | 28 | 9.25 | 7.55 |
-| gabriel | frpoly/float | 30 | 304 | 43 | 7.07 | 6.15 |
-| gabriel | puzzle | 5 | 63 | 0 | - | - |
-| gabriel | triangle | 1 | 298 | 67 | 4.45 | 4.60 |
-| gabriel | traverse | 5 | 391 | 153 | 2.56 | 2.35 |
-| gabriel | fprint/ugly | 50 | 149 | 69 | 2.16 | 2.02 |
-| gabriel | fprint/pretty | 20 | 154 | 80 | 1.93 | 1.58 |
-| math | factorial | 1000 | 228 | 53 | 4.30 | 2.45 |
-| math | fib | 50 | 75 | 58 | 1.29 | 1.27 |
-| math | fib-ratio | 500 | 32 | 7 | 4.57 | 4.00 |
-| math | ackermann | 1 | 1130 | 949 | 1.19 | 1.86 |
-| math | mandelbrot/complex | 100 | 172 | 101 | 1.70 | 2.21 |
-| math | mandelbrot/dfloat | 100 | 9 | 2 | 4.50 | 5.00 |
-| math | mrg32k3a | 20 | 1344 | 227 | 5.92 | 2.22 |
-| math | crc40 | 2 | 412 | 235 | 1.75 | 1.23 |
-| bignum | bignum/elem-100-1000 | 1 | 65 | 21 | 3.10 | 2.81 |
-| bignum | bignum/elem-1000-100 | 1 | 107 | 44 | 2.43 | 1.93 |
-| bignum | bignum/elem-10000-1 | 1 | 114 | 22 | 5.18 | 1.96 |
-| bignum | bignum/pari-100-10 | 1 | 16 | 6 | 2.67 | 2.67 |
-| bignum | bignum/pari-200-5 | 1 | 43 | 18 | 2.39 | 2.11 |
-| bignum | pi-decimal/small | 100 | 467 | 193 | 2.42 | 2.24 |
-| bignum | pi-decimal/big | 2 | 195 | 86 | 2.27 | 2.42 |
-| bignum | pi-atan | 200 | 729 | 317 | 2.30 | 2.40 |
-| bignum | pi-ratios | 2 | 470 | 440 | 1.07 | 0.96 |
-| hash | hash-strings | 2 | 230 | 55 | 4.18 | 2.78 |
-| hash | hash-integers | 10 | 302 | 71 | 4.25 | 4.64 |
-| arrays | 1d-arrays | 1 | 107 | 15 | 7.13 | 6.53 |
-| arrays | 2d-arrays | 1 | 319 | 204 | 1.56 | 1.52 |
-| arrays | 3d-arrays | 1 | 910 | 549 | 1.66 | 1.67 |
-| arrays | bitvectors | 3 | 240 | 101 | 2.38 | 2.37 |
-| arrays | strings | 1 | 121 | 676 | 0.18 | 0.17 |
-| arrays | strings/adjustable | 1 | 3724 | 903 | 4.12 | 2.82 |
-| arrays | string-concat | 1 | 9081 | 8401 | 1.08 | 0.86 |
-| arrays | search-sequence | 1 | 82 | 157 | 0.52 | 0.46 |
-| clos | clos/defclass | 1 | 491 | 114 | 4.31 | 3.23 |
-| clos | clos/defmethod | 1 | 122 | 476 | 0.26 | 0.31 |
-| clos | clos/instantiate | 2 | 674 | 197 | 3.42 | 3.37 |
-| clos | clos/simple-instantiate | 200 | 124 | 28 | 4.43 | 2.74 |
-| clos | clos/methodcalls | 5 | 1664 | 1822 | 0.91 | 1.13 |
-| clos | clos/method+after | 2 | 1857 | 2480 | 0.75 | 3.92 |
-| clos | clos/complex-methods | 5 | 535 | 2203 | 0.24 | 1.08 |
-| clos | clos/eql-fib | 2 | 141 | 41 | 3.44 | 2.83 |
-| richards | richards | 5 | 1421 | 280 | 5.08 | 4.58 |
+| gabriel | tak | 100 | 21 | 18 | 1.17 | 1.35 |
+| gabriel | takl | 10 | 48 | 18 | 2.67 | 2.71 |
+| gabriel | stak | 50 | 227 | 32 | 7.09 | 7.06 |
+| gabriel | ctak | 50 | 45 | 5 | 9.00 | 9.60 |
+| gabriel | trtak | 100 | 26 | 18 | 1.44 | 1.44 |
+| gabriel | boyer | 10 | 268 | 45 | 5.96 | 5.96 |
+| gabriel | browse | 5 | 233 | 34 | 6.85 | 6.09 |
+| gabriel | dderiv | 50 | 344 | 74 | 4.65 | 5.47 |
+| gabriel | deriv | 50 | 278 | 65 | 4.28 | 5.70 |
+| gabriel | destructive | 50 | 152 | 35 | 4.34 | 4.66 |
+| gabriel | div2-test-1 | 50 | 107 | 37 | 2.89 | 4.50 |
+| gabriel | div2-test-2 | 50 | 168 | 51 | 3.29 | 4.42 |
+| gabriel | fft | 10 | 19 | 3 | 6.33 | 7.67 |
+| gabriel | frpoly/fixnum | 30 | 224 | 31 | 7.23 | 7.89 |
+| gabriel | frpoly/bignum | 10 | 279 | 27 | 10.33 | 8.95 |
+| gabriel | frpoly/float | 30 | 317 | 44 | 7.20 | 6.20 |
+| gabriel | puzzle | 5 | 79 | 0 | - | - |
+| gabriel | triangle | 1 | 303 | 55 | 5.51 | 5.58 |
+| gabriel | traverse | 5 | 414 | 154 | 2.69 | 2.31 |
+| gabriel | fprint/ugly | 50 | 148 | 69 | 2.14 | 1.83 |
+| gabriel | fprint/pretty | 20 | 176 | 80 | 2.20 | 1.34 |
+| math | factorial | 1000 | 243 | 52 | 4.67 | 2.44 |
+| math | fib | 50 | 68 | 61 | 1.11 | 1.32 |
+| math | fib-ratio | 500 | 30 | 7 | 4.29 | 5.00 |
+| math | ackermann | 1 | 1132 | 867 | 1.31 | 2.05 |
+| math | mandelbrot/complex | 100 | 193 | 102 | 1.89 | 2.22 |
+| math | mandelbrot/dfloat | 100 | 9 | 2 | 4.50 | 4.50 |
+| math | mrg32k3a | 20 | 1377 | 228 | 6.04 | 2.82 |
+| math | crc40 | 2 | 478 | 235 | 2.03 | 1.39 |
+| bignum | bignum/elem-100-1000 | 1 | 61 | 21 | 2.90 | 3.95 |
+| bignum | bignum/elem-1000-100 | 1 | 101 | 45 | 2.24 | 1.89 |
+| bignum | bignum/elem-10000-1 | 1 | 116 | 22 | 5.27 | 3.92 |
+| bignum | bignum/pari-100-10 | 1 | 15 | 6 | 2.50 | 3.00 |
+| bignum | bignum/pari-200-5 | 1 | 39 | 18 | 2.17 | 1.83 |
+| bignum | pi-decimal/small | 100 | 480 | 193 | 2.49 | 2.31 |
+| bignum | pi-decimal/big | 2 | 192 | 86 | 2.23 | 2.40 |
+| bignum | pi-atan | 200 | 763 | 317 | 2.41 | 2.43 |
+| bignum | pi-ratios | 2 | 484 | 440 | 1.10 | 0.97 |
+| hash | hash-strings | 2 | 162 | 55 | 2.95 | 2.10 |
+| hash | hash-integers | 10 | 260 | 71 | 3.66 | 4.08 |
+| arrays | 1d-arrays | 1 | 82 | 15 | 5.47 | 4.59 |
+| arrays | 2d-arrays | 1 | 324 | 216 | 1.50 | 1.36 |
+| arrays | 3d-arrays | 1 | 793 | 569 | 1.39 | 1.30 |
+| arrays | bitvectors | 3 | 255 | 100 | 2.55 | 2.56 |
+| arrays | strings | 1 | 90 | 670 | 0.13 | 0.20 |
+| arrays | strings/adjustable | 1 | 3953 | 851 | 4.65 | 2.98 |
+| arrays | string-concat | 1 | 9298 | 8238 | 1.13 | 0.79 |
+| arrays | search-sequence | 1 | 88 | 157 | 0.56 | 0.42 |
+| clos | clos/defclass | 1 | 517 | 115 | 4.50 | 3.31 |
+| clos | clos/defmethod | 1 | 117 | 472 | 0.25 | 0.28 |
+| clos | clos/instantiate | 2 | 724 | 204 | 3.55 | 3.63 |
+| clos | clos/simple-instantiate | 200 | 153 | 35 | 4.37 | 4.14 |
+| clos | clos/methodcalls | 5 | 2141 | 1945 | 1.10 | 1.19 |
+| clos | clos/method+after | 2 | 1539 | 1895 | 0.81 | 3.67 |
+| clos | clos/complex-methods | 5 | 462 | 1765 | 0.26 | 1.06 |
+| clos | clos/eql-fib | 2 | 134 | 44 | 3.05 | 2.83 |
+| richards | richards | 5 | 1380 | 296 | 4.66 | 4.92 |
 
-- Cold, 6 of the 56 benchmarks came out faster on dotcl (`strings` 0.18, `clos/complex-methods` 0.24, `clos/defmethod` 0.26, `search-sequence` 0.52, `clos/method+after` 0.75 and `clos/methodcalls` 0.91), 11 are between 1x and 2x, 39 between 2x and 10x, and 0 above 10x.
-- The largest cold ratios: `frpoly/bignum` 9.25, `ctak` 8.80, `fft` 8.00, `1d-arrays` 7.13, `frpoly/float` 7.07 and `stak` 6.78.
+- Cold, 5 of the 56 benchmarks came out faster on dotcl (`strings` 0.13, `clos/defmethod` 0.25, `clos/complex-methods` 0.26, `search-sequence` 0.56 and `clos/method+after` 0.81), 10 are between 1x and 2x, 40 between 2x and 10x, and 1 above 10x (`frpoly/bignum` 10.33).
+- The largest cold ratios: `frpoly/bignum` 10.33, `ctak` 9.00, `frpoly/fixnum` 7.23, `frpoly/float` 7.20, `stak` 7.09 and `browse` 6.85.
 - 5 benchmarks have an SBCL time under 10 ms: `ctak` (5 ms), `fft` (3 ms), `fib-ratio` (7 ms), `mandelbrot/dfloat` (2 ms) and `bignum/pari-100-10` (6 ms).
-- The suite ratio is lower than the cold ratio for 34 of the 56 benchmarks that have both.
+- The suite ratio is lower than the cold ratio for 25 of the 56 benchmarks that have both.
 <!-- ledger:end cl-bench -->
 
 ### Reading it

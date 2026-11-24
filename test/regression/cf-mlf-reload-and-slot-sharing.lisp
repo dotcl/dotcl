@@ -12,7 +12,7 @@
 
 (defun %mrs-load (obj)
   (setf *mrs-obj* obj)
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "mrs-same.lisp" dir))
          (fasl (merge-pathnames "mrs-same.fasl" dir)))
     ;; the same text every time: only the literal differs

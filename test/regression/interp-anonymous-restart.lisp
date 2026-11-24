@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; An anonymous (NIL-named) restart must still be established.
 ;;;
 ;;; CLHS: a (nil () :report ...) restart, and WITH-SIMPLE-RESTART with a NIL name,

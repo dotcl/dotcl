@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The project build collects the .NET type names a unit writes literally, so it
 ;;; can hand them to the trimmer (a fasl reaches .NET only through reflection and
 ;;; the trimmer would remove what it uses). compile-file-concatenated-collecting is

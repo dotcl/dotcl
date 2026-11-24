@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; Standard input that starts with a byte order mark and ends its lines with
 ;;; CR LF, which is what a Windows shell can hand a program on a pipe.
 ;;;

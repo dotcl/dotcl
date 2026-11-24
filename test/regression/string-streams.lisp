@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression tests for string-input-stream file-position.
 ;;; (setf file-position) on string-input-streams was a no-op (returned NIL
 ;;; without repositioning). Also the getter must return the correct position.

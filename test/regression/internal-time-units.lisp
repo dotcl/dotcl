@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; GET-INTERNAL-REAL-TIME / GET-INTERNAL-RUN-TIME and their unit.
 ;;;
 ;;; Two bugs lived here. GET-INTERNAL-RUN-TIME returned TimeSpan ticks (100 ns,

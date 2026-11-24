@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; contrib/asdf-extra-deps: a system whose files use a macro and a special
 ;;; variable from a file they do not depend on. The audit (two builds in child
 ;;; processes, in ASDF's order and in the reverse order its dependencies allow)

@@ -5,7 +5,7 @@
 
 (defun %ds-source ()
   (or *ds-src*
-      (let ((src (merge-pathnames "ds-fixture.lisp" (regression-temp-dir))))
+      (let ((src (merge-pathnames "ds-fixture.lisp" (regression-temp-dir/))))
         (with-open-file (s src :direction :output :if-exists :supersede)
           (dolist (l '("(defpackage \"DS-KIND\" (:use \"CL\"))"                        ; 1
                        "(in-package \"DS-KIND\")"                                     ; 2
@@ -77,7 +77,7 @@
   t)
 
 (deftest-emitting-only definition-sources-by-kind.load-fasl
-  (let ((fasl (merge-pathnames "ds-fixture.fasl" (regression-temp-dir))))
+  (let ((fasl (merge-pathnames "ds-fixture.fasl" (regression-temp-dir/))))
     (load (%ds-source))
     (let ((*error-output* (make-broadcast-stream)))
       (compile-file *ds-src* :output-file fasl))

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression tests for dotcl:launch-process: streaming process handle.
 ;;; Uses `dotnet --version` as a portable child process (present on Windows local
 ;;; and Linux CI). Exercises the launch-program/process-info building blocks:

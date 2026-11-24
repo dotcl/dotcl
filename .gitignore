@@ -49,15 +49,24 @@ bench-state.json
 !scripts/build-quicklisp.sh
 !scripts/contrib-resolve.sh
 !scripts/drop-stale-fasls.sh
+!scripts/sync-contrib-copies.sh
 !scripts/stage-core-source.sh
+!ci/check-test-paths.sh
+!ci/check-test-manifest.sh
+!ci/check-script-refs.sh
+!ci/lane-emitfree-files.sh
 !scripts/check-host-defs.sh
 !scripts/dist-package.sh
 !scripts/ci-memory-report.sh
 !ci/d-number.sh
 !ci/mirror-scrub-workflows.sh
 !ci/windows-ci.sh
+!ci/weekly-measure-compare-test.sh
+!ci/gate/*.sh
+!ci/perf/*.sh
 !runtime/sdk/dev-feed.sh
 !test/ansi-failures.sh
+!test/ci/*.sh
 !test/ansi-gate.sh
 !test/call-coverage/run.sh
 !test/call-coverage/report.sh
@@ -75,6 +84,7 @@ bench-state.json
 !bench/library-status/scrub.sh
 !bench/library-status/check-scrub.sh
 !bench/library-status/run-forks.sh
+!bench/library-status/delta.sh
 !bench/jit-minopts/run.sh
 !bench/library-status/fetch-ql-projects.sh
 !bench/library-status/dists.sh
@@ -83,6 +93,7 @@ bench-state.json
 !bench/ledger/run.sh
 !bench/ledger/remote.sh
 !bench/ledger/doc.sh
+!bench/ledger/build.sh
 !bench/jit-tiering/run.sh
 !bench/jit-tiering/gc-matrix.sh
 !samples/**/*.sh
@@ -119,6 +130,8 @@ scratch.txt
 # by rank.lisp, so losing it would lose the only record of why those targets
 # are on the list at all.
 !bench/library-status/hand-picked.txt
+# ...and the oldest dotcl dist the ledger measures with, read by bench/ledger/run.sh.
+!bench/ledger/dotcl-dist-min.txt
 *.fasl
 # A fasl a released dotcl wrote, loaded by the regression suite as it is.
 !test/regression/legacy-fasl/*.fasl

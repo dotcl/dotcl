@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; SHARED-INITIALIZE does not allocate a duplicate-tracking set it never uses.
 ;;;
 ;;; It built a HashSet<int> on every call to record which slots an initarg had

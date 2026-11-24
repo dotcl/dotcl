@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The version MERGE-PATHNAMES leaves behind, and the one a caller asks for.
 ;;;
 ;;; CLHS gives MERGE-PATHNAMES the keyword :NEWEST as the default for its third

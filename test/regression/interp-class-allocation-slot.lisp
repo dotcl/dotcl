@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; EVAL must be able to run a DEFCLASS with an :ALLOCATION :CLASS slot.
 ;;;
 ;;; The DEFCLASS expansion lowers slot definitions to %MAKE-SLOT-DEF (ordinary)

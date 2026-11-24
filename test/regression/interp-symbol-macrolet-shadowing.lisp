@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A reified &ENVIRONMENT must expand a shadowed symbol-macro to the INNERMOST
 ;;; binding (CLHS 5.1.2.1).
 ;;;

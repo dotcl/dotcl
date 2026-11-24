@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; CLHS 13.1.4.3 case pairs and the string/alphanumeric counterparts, over the BMP.
 
 (defun %char-case-invariants ()

@@ -5,6 +5,10 @@
 
 ;; Not called: they end the process, enter the debugger or a terminal UI, or
 ;; wait. Their counts are checked against the table below instead.
+;; This file uses CL-LL-SHAPE and its neighbours from cl-builtin-lambda-lists.lisp; load it when run alone.
+(unless (fboundp 'cl-ll-shape)
+  (load "test/regression/cl-builtin-lambda-lists.lisp"))
+
 (defparameter *arg-count-not-called*
   '("QUIT" "EXIT" "SAVE-APPLICATION" "INVOKE-DEBUGGER" "ED" "INSPECT" "DRIBBLE" "SLEEP"
     "GC" "MAKE-THREAD" "UI-INVOKE" "UI-POST"))

@@ -291,8 +291,13 @@ public static partial class Runtime
                     stream = tws.InputStream;
                     continue;
                 case LispEchoStream echo:
-                    stream = echo.InputStream;
-                    continue;
+                    // The echo happens in the reader of the echo stream itself, whatever
+                    // wraps it (a concatenated or two-way stream, a synonym): only the
+                    // characters taken from this stream are echoed.
+                    var echoInner = GetTextReader(echo.InputStream);
+                    var cachedEcho = echo.EchoReader;
+                    if (cachedEcho != null && ReferenceEquals(cachedEcho.Inner, echoInner)) return cachedEcho;
+                    return echo.EchoReader = new EchoingTextReader(echoInner, echo.OutputStream);
                 case LispSynonymStream syn:
                     stream = DynamicBindings.Get(syn.Symbol);
                     continue;
@@ -331,6 +336,10 @@ public static partial class Runtime
                     return outs.Writer;
                 case LispFileStream fs when fs.IsOutput:
                     if (fs.IsClosed) throw new LispErrorException(MakeStreamError(stream, "WRITE"));
+                    // A file opened for bytes (not :element-type :default, which takes both) is not
+                    // a character stream.
+                    if (!fs.Bivalent && IsIntegerElementType(fs.ElementType))
+                        throw new LispErrorException(new LispTypeError("not a character output stream: " + FormatObject(stream, true), stream, Startup.Sym("STREAM")));
                     return fs.OutputWriter!;
                 case LispBidirectionalStream bidi:
                     if (bidi.IsClosed) throw new LispErrorException(MakeStreamError(stream, "WRITE"));
@@ -339,6 +348,7 @@ public static partial class Runtime
                 case LispEchoStream es: stream = es.OutputStream; continue;
                 case LispSynonymStream syn: stream = DynamicBindings.Get(syn.Symbol); continue;
                 case LispBroadcastStream bc:
+                    if (bc.IsClosed) throw new LispErrorException(MakeStreamError(stream, "WRITE"));
                     if (bc.Streams.Length == 0) return TextWriter.Null;
                     if (bc.Streams.Length == 1) { stream = bc.Streams[0]; continue; }
                     var bcWriters = new TextWriter[bc.Streams.Length];
@@ -359,7 +369,7 @@ public static partial class Runtime
                     return Console.Out;
                 default:
                     throw new LispErrorException(new LispTypeError(
-                        $"{FormatObject(stream, true)} is not an output stream", stream, Startup.Sym("STREAM")));
+                        $"{FormatObject(stream, true)} is not an output stream", stream, List(Startup.Sym("OR"), Startup.Sym("STREAM"), Startup.Sym("BOOLEAN"))));
             }
         }
     }
@@ -453,30 +463,16 @@ public static partial class Runtime
     internal static bool IsGrayBinaryOutputStream(LispInstance inst)
         => (GrayKinds(inst.Class) & GrayBinOut) != 0;
 
-    /// <summary>Resolve a stream designator to the outermost LispEchoStream, if any, following synonym streams.</summary>
-    private static LispEchoStream? FindEchoStream(LispObject streamObj)
-    {
-        while (true)
-        {
-            switch (streamObj)
-            {
-                case LispSynonymStream syn:
-                    streamObj = DynamicBindings.Get(syn.Symbol);
-                    continue;
-                case LispEchoStream es:
-                    return es;
-                default:
-                    return null;
-            }
-        }
-    }
-
     public static LispObject ReadFromStream(LispObject stream, LispObject eofErrorP, LispObject eofValue)
         => ReadFromStreamRecursive(stream, eofErrorP, eofValue, false);
 
     public static LispObject ReadFromStreamRecursive(LispObject stream, LispObject eofErrorP, LispObject eofValue,
                                                      bool recursiveP)
     {
+        if (stream is LispFileStream { IsInput: false })
+            throw new LispErrorException(new LispTypeError(
+                "READ: not an input stream", stream, Startup.Sym("INPUT-STREAM")));
+        if (stream is LispSynonymStream) RequireInputDirection(stream, "READ");
         var value = GuardStreamIO(stream, stream, eofErrorP, eofValue, recursiveP,
                                   static (st, ee, ev, rp) => ReadFromStreamUnguarded(st, ee, ev, rp));
         // READ returns exactly one value. Inside, "no value" is how a reader macro
@@ -541,6 +537,52 @@ public static partial class Runtime
         return true;
     }
 
+    private sealed class PlainIntSyntax
+    {
+        internal readonly LispReadtable Readtable;
+        internal readonly int Version;
+        internal readonly bool Ok;
+        internal PlainIntSyntax(LispReadtable rt, int version, bool ok) { Readtable = rt; Version = version; Ok = ok; }
+    }
+    private static volatile PlainIntSyntax? _plainIntSyntax;
+
+    /// <summary>S is [+-]digits (at most 18 digits) and nothing else, and the reader would read it
+    /// as that integer: *READ-BASE* 10, *READ-SUPPRESS* NIL, and the digits and signs plain
+    /// constituents in the current readtable. A readtable is checked once per (object, syntax
+    /// version).</summary>
+    private static bool TryReadPlainInteger(string s, out long value)
+    {
+        value = 0;
+        int n = s.Length, i = 0;
+        if (n == 0 || n > 19) return false;
+        bool neg = false;
+        if (s[0] == '+' || s[0] == '-') { neg = s[0] == '-'; i = 1; if (n == 1) return false; }
+        if (n - i > 18) return false;
+        long v = 0;
+        for (; i < n; i++)
+        {
+            int d = s[i] - '0';
+            if ((uint)d > 9) return false;
+            v = v * 10 + d;
+        }
+        var baseVal = DynamicBindings.Get(Startup.Sym("*READ-BASE*"));
+        if (baseVal is not Fixnum { Value: 10 }) return false;
+        if (DynamicBindings.Get(Startup.Sym("*READ-SUPPRESS*")) is not Nil) return false;
+        if (DynamicBindings.Get(Startup.Sym("*READTABLE*")) is not LispReadtable rt) return false;
+        var syn = _plainIntSyntax;
+        if (syn == null || !ReferenceEquals(rt, syn.Readtable) || rt.SyntaxVersion != syn.Version)
+        {
+            bool ok = true;
+            foreach (char c in "0123456789+-")
+                if (rt.GetSyntaxType(c) != SyntaxType.Constituent) { ok = false; break; }
+            syn = new PlainIntSyntax(rt, rt.SyntaxVersion, ok);
+            _plainIntSyntax = syn;
+        }
+        if (!syn.Ok) return false;
+        value = neg ? -v : v;
+        return true;
+    }
+
     public static LispObject ReadFromString(LispObject[] args)
     {
         if (args.Length < 1)
@@ -552,6 +594,11 @@ public static partial class Runtime
             str = vec.ToCharString();
         else
             throw new LispErrorException(new LispTypeError("READ-FROM-STRING: not a string", args[0]));
+
+        // A plain decimal integer with nothing else in the call (JSON numbers, parse-integer-like
+        // uses): no stream, reader or token buffer.
+        if (args.Length == 1 && TryReadPlainInteger(str, out long plain))
+            return MultipleValues.Values2(Fixnum.Make(plain), Fixnum.Make(str.Length));
 
         // Optional positional args: eof-error-p and eof-value
         // CLHS: read-from-string string &optional eof-error-p eof-value &key ...
@@ -581,6 +628,14 @@ public static partial class Runtime
                 break;
             }
         }
+        int IndexArg(LispObject value, string key, bool allowNil)
+        {
+            if (value is Nil) return allowNil ? str.Length : 0;
+            if (value is Fixnum f) return Runtime.ClampIndex(f.Value);
+            if (value is Bignum bn) return bn.Value.Sign < 0 ? int.MinValue : int.MaxValue;
+            throw new LispErrorException(new LispTypeError(
+                $"READ-FROM-STRING: :{key} is not an integer", value, Startup.Sym("INTEGER")));
+        }
         for (int i = optIdx; i < args.Length - 1; i += 2)
         {
             if (args[i] is Symbol kw)
@@ -588,10 +643,10 @@ public static partial class Runtime
                 switch (kw.Name)
                 {
                     case "START":
-                        if (!startSet) { start = args[i + 1] is Fixnum fs ? Runtime.ClampIndex(fs.Value) : 0; startSet = true; }
+                        if (!startSet) { start = IndexArg(args[i + 1], "START", false); startSet = true; }
                         break;
                     case "END":
-                        if (!endSet) { if (args[i + 1] is Fixnum fe) end = Runtime.ClampIndex(fe.Value); endSet = true; }
+                        if (!endSet) { end = IndexArg(args[i + 1], "END", true); endSet = true; }
                         break;
                     case "PRESERVE-WHITESPACE":
                         if (!preserveWhitespaceSet) { preserveWhitespace = args[i + 1] is not Nil; preserveWhitespaceSet = true; }
@@ -622,7 +677,7 @@ public static partial class Runtime
         // A string input stream, as the reader macros see it: FILE-POSITION
         // answers where they are in STRING (Coalton's reader takes its source
         // spans from it), and it counts what the stream API consumes too.
-        var stringStream = new LispStringInputStream(new StringReader(substring), start, str, end);
+        var stringStream = new LispStringInputStream(new StringPositionReader(substring), start, str, end);
         var reader = new Reader(stringStream.Reader) { LispStreamRef = stringStream };
         // The stream's live reader, so a reader macro that reads from the stream
         // again (READ, READ-DELIMITED-LIST, a copied built-in macro) continues on

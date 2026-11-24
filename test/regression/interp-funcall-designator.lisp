@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; (FUNCALL 'name ...) where the symbol has no function.
 ;;;
 ;;; A macro name or a special-operator name is FBOUNDP but has no function to

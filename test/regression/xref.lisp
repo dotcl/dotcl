@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; xref (who-calls): the compiler records caller->callee edges for every
 ;;; named call and #'name reference while a defun body compiles, and plants a
 ;;; load-time registration so the table also rebuilds on fasl load.
@@ -244,3 +245,14 @@
     (dotimes (i 12000) (compile nil '(lambda (x) (1+ x))))
     (< (length dotcl-internal::*xref-pending*) 9000))
   t)
+
+;;; a registration that names a callee twice, made twice, lists the caller once
+(defun %xref-t-twice () (list (%xref-t-callee-b 1) (%xref-t-callee-b 2) (%xref-t-callee-b 3)))
+(defun %xref-t-twice () (list (%xref-t-callee-b 4) (%xref-t-callee-b 5)))
+
+(deftest-compiled-only xref-duplicate-edges-listed-once
+  (list (count "%XREF-T-TWICE" (mapcar #'symbol-name (remove-if-not #'symbolp (dotcl:who-calls '%xref-t-callee-b)))
+               :test #'string=)
+        (count "%XREF-T-CALLEE-B" (mapcar #'symbol-name (dotcl:who-is-called-by '%xref-t-twice))
+               :test #'string=))
+  (1 1))

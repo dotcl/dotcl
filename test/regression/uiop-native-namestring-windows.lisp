@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; On Windows, uiop:native-namestring answers the Windows spelling of a path.
 ;;;
 ;;; A native namestring is the string handed to the operating system. uiop has

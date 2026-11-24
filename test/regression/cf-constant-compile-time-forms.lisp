@@ -7,7 +7,7 @@
 ;;; proclamations. COMPILE-FILE needs the emitter, so not on the emit-free build.
 
 (defun %cfct-compile (name lines &optional load)
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames (format nil "~a.lisp" name) dir))
          (fasl (merge-pathnames (format nil "~a.fasl" name) dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)

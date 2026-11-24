@@ -769,6 +769,4 @@
 ;;; red on a value mismatch -- the only thing that could fail it was an uncaught
 ;;; error aborting the load, which DEFTEST no longer lets happen. Same tail as
 ;;; test/regression/run.lisp.
-(if (= *fail-count* 0)
-    (dotcl:quit 0)
-    (dotcl:quit 1))
+(dotcl:quit (tests-exit-code))

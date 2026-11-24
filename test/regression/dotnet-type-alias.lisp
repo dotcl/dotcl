@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression: DOTNET::*TYPE-ALIASES* applies to every path that names a type.
 ;;;
 ;;; The table was read only by DOTNET:DEFINE-CLASS, so a registered short name

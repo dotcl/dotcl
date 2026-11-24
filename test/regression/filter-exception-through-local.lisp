@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A filter block must move the exception off the evaluation stack before it
 ;;; pushes anything else. Mono's interpreter (browser-wasm), until it tiers a
 ;;; method up, passes a wrong value for a call argument taken directly from the

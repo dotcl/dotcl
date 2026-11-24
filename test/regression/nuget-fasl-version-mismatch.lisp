@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A library package's shipped fasls, read by another dotcl or on another
 ;;; platform than the one that made them.
 ;;;

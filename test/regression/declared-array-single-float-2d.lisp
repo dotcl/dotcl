@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; AREF on a parameter declared (simple-array single-float (* *)) fetches the
 ;;; float32 backing once and reads the element unboxed, like the other element
 ;;; types of the rank-2 path. No other test reached the single-float helper of

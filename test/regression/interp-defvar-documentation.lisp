@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; An interpreted DEFVAR / DEFPARAMETER / DEFCONSTANT dropped the docstring.
 ;;;
 ;;; COMPILE-DEFVAR emitted the Runtime.SetVariableDocumentation call, but the

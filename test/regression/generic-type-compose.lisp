@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Composing closed generic types from Lisp without hand-writing
 ;;; assembly-qualified name strings: dotnet:make-generic-type accepts an
 ;;; already-resolved System.Type for the open definition and for each type

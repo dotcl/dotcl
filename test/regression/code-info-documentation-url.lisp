@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; dotcl-code-info:documentation-url -- the reference page for the name at point.
 ;;;
 ;;; The URLs are built rather than looked up, so what is tested is the spelling

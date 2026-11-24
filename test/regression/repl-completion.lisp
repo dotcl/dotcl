@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; TAB completion in the bundled REPL.
 ;;;
 ;;; The machinery was there (readline dispatches TAB to COMPLETE) but the hook

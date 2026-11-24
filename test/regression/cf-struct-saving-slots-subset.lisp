@@ -8,7 +8,7 @@
 ;;; Coalton's type structures go this way, and Coalton could not be compiled.
 
 (defun %cfsss-compile-load (name lines)
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames (format nil "~a.lisp" name) dir))
          (fasl (merge-pathnames (format nil "~a.fasl" name) dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)

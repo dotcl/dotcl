@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; dotcl-code-info:completions -- candidates for the cursor at an offset.
 ;;;
 ;;; The interesting cases are the ones where it must stay silent: completion
@@ -234,17 +235,11 @@
 ;;;; It says so, and the caller passes that on -- an LSP client turns it into
 ;;;; isIncomplete and asks again.
 
-(defun lac-wait-for-type-index (&optional (seconds 120))
-  "Wait for the background scan, returning T if it finished.
-
-The budget is a bound on a hang, not a statement about how long the scan should
-take: it returns as soon as the scan is done, so a healthy run costs whatever the
-scan costs and nothing more. It was 10 seconds, which is short enough to be a
-deadline rather than a guard -- a run that had just done several builds missed it
-and the two tests below failed together, on a scan that was merely slow."
-  (loop repeat (ceiling seconds 0.05)
-        when (nth-value 1 (dotnet:type-names "X")) return t
-        do (sleep 0.05)))
+(defun lac-wait-for-type-index ()
+  "Finish the scan of the types that are available but not loaded, returning T when
+the index is complete. :WAIT scans on this thread, so the answer does not depend on
+a thread-pool thread getting to the background scan, or on how loaded the machine is."
+  (nth-value 1 (dotnet:type-names "X" :wait t)))
 
 (deftest lac-type-index-reports-completeness
   (lac-wait-for-type-index)

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Loaded last: no earlier test file may leave frame recording switched on.
 ;;;
 ;;; The flag is global and is read while a form is being compiled, so a file that

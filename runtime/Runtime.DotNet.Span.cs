@@ -286,6 +286,8 @@ public static partial class Runtime
     /// the array's storage (the method's writes would be lost).</summary>
     public static object? LispToDotNetParam(LispObject arg, Type paramType)
     {
+        // A ref parameter's in-value is its element type; reflection writes back the result.
+        if (paramType.IsByRef) paramType = paramType.GetElementType()!;
         if (arg is LispVector && (paramType.IsArray || paramType == typeof(Array)))
         {
             if (VectorAsArray(arg, paramType, out bool nonSimple) is { } own) return own;

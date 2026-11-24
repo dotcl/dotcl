@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Two places where printed output disagreed with this implementation's own
 ;;; printer. Both found by running the same forms through dotcl and SBCL 2.6.6;
 ;;; every expectation below matches SBCL exactly.

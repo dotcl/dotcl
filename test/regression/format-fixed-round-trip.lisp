@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The digit-count directives (~,dF and ~w,dF) take their digits from the
 ;;; shortest round-trip decimal too.
 ;;;

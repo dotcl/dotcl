@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A reference to a constant variable whose value is a number or a character
 ;;; compiles as that literal.
 ;;;

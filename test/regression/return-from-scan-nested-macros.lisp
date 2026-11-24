@@ -43,7 +43,7 @@
 (defmacro rfs-drop-first (&rest forms) `(progn ,@(rest forms)))
 
 (deftest-compiled-only return-from-scan.dropped-argument-not-expanded
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "rfs-drop.lisp" dir))
          (fasl (merge-pathnames "rfs-drop.fasl" dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)

@@ -75,7 +75,12 @@ public class LispReadtable : LispObject
     public void SetSyntaxType(char ch, SyntaxType type)
     {
         _syntaxTypes.Set(ch, type);
+        SyntaxVersion++;
     }
+
+    /// <summary>Counts every change to the syntax types of this readtable (the printer keeps
+    /// per-symbol answers that depend on them).</summary>
+    public int SyntaxVersion;
 
     /// <summary>Check if a character is a macro character (terminating or non-terminating).</summary>
     public bool IsMacroCharacter(char ch)
@@ -106,6 +111,18 @@ public class LispReadtable : LispObject
             _nonTerminating.Add(ch);
         else
             _nonTerminating.Remove(ch);
+    }
+
+    /// <summary>Make a character an ordinary constituent again: no macro function, not a
+    /// dispatching character. What SET-MACRO-CHARACTER with a NIL function asks for, as SBCL
+    /// does, so that restoring the value GET-MACRO-CHARACTER gave for a non-macro character works.</summary>
+    public void ClearMacroCharacter(char ch)
+    {
+        _macroFunctions.Remove(ch);
+        _lispMacroFunctions.Remove(ch);
+        _dispatchTables.Remove(ch);
+        _nonTerminating.Remove(ch);
+        SetSyntaxType(ch, SyntaxType.Constituent);
     }
 
     /// <summary>Get the Lisp function object for a macro character, or null if built-in.</summary>
@@ -141,7 +158,7 @@ public class LispReadtable : LispObject
             // CLR-exception mapping.
             throw new LispErrorException(new LispProgramError(
                 $"SET-DISPATCH-MACRO-CHARACTER: {dispChar} is not a dispatching macro character"));
-        var upper = char.ToUpperInvariant(subChar);
+        var upper = CharCase.SimpleUpper(subChar);
         table[upper] = fn;
         if (lispFn != null)
         {
@@ -162,14 +179,14 @@ public class LispReadtable : LispObject
     public Func<Reader, char, int, LispObject?>? GetDispatchMacroCharacter(char dispChar, char subChar)
     {
         if (!_dispatchTables.TryGetValue(dispChar, out var table)) return null;
-        return table.TryGetValue(char.ToUpperInvariant(subChar), out var fn) ? fn : null;
+        return table.TryGetValue(CharCase.SimpleUpper(subChar), out var fn) ? fn : null;
     }
 
     /// <summary>Get the Lisp function object for a dispatch sub-character, or null if built-in or unset.</summary>
     public LispObject? GetLispDispatchMacroFunction(char dispChar, char subChar)
     {
         if (!_lispDispatchFunctions.TryGetValue(dispChar, out var lispTable)) return null;
-        return lispTable.TryGetValue(char.ToUpperInvariant(subChar), out var fn) ? fn : null;
+        return lispTable.TryGetValue(CharCase.SimpleUpper(subChar), out var fn) ? fn : null;
     }
 
     /// <summary>
@@ -221,6 +238,7 @@ public class LispReadtable : LispObject
     {
         Case = source.Case;
         _syntaxTypes.CopyFrom(source._syntaxTypes);
+        SyntaxVersion++;
         _macroFunctions.Clear();
         _macroFunctions.CopyFrom(source._macroFunctions);
         _lispMacroFunctions.Clear();
@@ -275,8 +293,8 @@ public class LispReadtable : LispObject
     {
         return Case switch
         {
-            ReadtableCase.Upcase => char.ToUpperInvariant(ch),
-            ReadtableCase.Downcase => char.ToLowerInvariant(ch),
+            ReadtableCase.Upcase => CharCase.SimpleUpper(ch),
+            ReadtableCase.Downcase => CharCase.SimpleLower(ch),
             ReadtableCase.Preserve => ch,
             ReadtableCase.Invert => ch, // Invert is applied after full token is read
             _ => ch

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The stream LOAD hands to a reader macro has to answer FILE-POSITION.
 ;;;
 ;;; It used to answer NIL: LOAD wrapped the source in a plain StringReader while

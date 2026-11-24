@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; LISTEN and READ-CHAR-NO-HANG on standard input answer NIL at once while an
 ;;; open pipe has nothing in it, instead of waiting for the writer; the child
 ;;; is another dotcl whose standard input is a pipe the test holds open.

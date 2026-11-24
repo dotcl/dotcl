@@ -35,8 +35,8 @@
 
 (deftest-emitting-only constant-array-changed.signals-when-replaced
   (progn
-    (setf (symbol-value '+cac-fix+) (dotcl:make-pinned-vector 4 '(unsigned-byte 32)))
-    (setf (symbol-value '+cac-s32+) (dotcl:make-pinned-vector 4 '(signed-byte 8)))
+    (dotcl-internal::%force-symbol-value '+cac-fix+ (dotcl:make-pinned-vector 4 '(unsigned-byte 32)))
+    (dotcl-internal::%force-symbol-value '+cac-s32+ (dotcl:make-pinned-vector 4 '(signed-byte 8)))
     (list (car (%cac-te (lambda () (%cac-fix 8))))
           (car (%cac-te (lambda () (%cac-s32 8))))
           (let ((c (handler-case (%cac-fix 2) (type-error (e) e))))

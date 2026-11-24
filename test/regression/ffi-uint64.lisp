@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; :uint64 must cover the full 0 .. 2^64-1 range in both directions.
 ;;;
 ;;; Above 2^63-1 the value is a Bignum, and every path assumed Fixnum: writing

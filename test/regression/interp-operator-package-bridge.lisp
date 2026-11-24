@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A symbol in OPERATOR position must resolve the way a compiled call does.
 ;;;
 ;;; dotcl registers a good deal of its runtime on symbols in its own packages,

@@ -184,7 +184,7 @@ public partial class CilAssembler
     /// </summary>
     private static bool TryParseSetfName(string name, out string targetName)
     {
-        if (name.StartsWith("(SETF ", StringComparison.Ordinal) && name.EndsWith(")"))
+        if (name.StartsWith("(SETF ", StringComparison.Ordinal) && name.EndsWith(")", System.StringComparison.Ordinal))
         {
             targetName = name.Substring(6, name.Length - 7);
             return true;
@@ -221,12 +221,16 @@ public partial class CilAssembler
     /// is how a later DEFGENERIC on that symbol came to warn about "redefining an
     /// ordinary function". Returns null if no package has the function.
     /// </summary>
-    internal static LispFunction? FindFunctionAcrossPackages(Symbol sym)
+    internal static LispFunction? FindFunctionAcrossPackages(Symbol sym, bool skipStandardNames = false)
     {
         foreach (var pkg in Package.AllPackages)
         {
             if (pkg == sym.HomePackage || !pkg.IsBridgeSource) continue;
             var (other, status) = pkg.FindSymbol(sym.Name);
+            // A name that COMMON-LISP exports is the standard operator and no other: QQ::CAR of a
+            // package that does not use COMMON-LISP is not CL:CAR.
+            if (skipStandardNames && status != SymbolStatus.None && ReferenceEquals(other.HomePackage, Startup.CL)
+                && Startup.CL.IsExternalSymbol(other.Name)) continue;
             if (status != SymbolStatus.None && other.Function is LispFunction otherFn)
             {
                 if (Startup.TraceBridge)
@@ -368,6 +372,7 @@ public partial class CilAssembler
         // The DEFGENERIC macro already warns when replacing a CL standard function.
         if (fn is not GenericFunction)
             Runtime.CheckPackageLock(sym, "DEFUN");
+        Runtime.ForgetMacroOnFunctionDefinition(sym);
         sym.Function = fn;
     }
 
@@ -386,6 +391,7 @@ public partial class CilAssembler
         // correctly. The "isForeignCL" case used to skip the flat-table write to
         // protect host built-ins; with sym.Function as the sole source, the guard
         // is implicit (the CL symbol still has its own Function slot intact).
+        Runtime.ForgetMacroOnFunctionDefinition(sym);
         sym.Function = fn;
     }
 
@@ -406,7 +412,7 @@ public partial class CilAssembler
         fn.StatsName ??= name;
         // Handle (SETF NAME) functions: register on the target symbol's SetfFunction
         // slot so that #'(setf name) / GetSetfFunctionBySymbol can find them.
-        if (name.StartsWith("(SETF ", StringComparison.Ordinal) && name.EndsWith(")"))
+        if (name.StartsWith("(SETF ", StringComparison.Ordinal) && name.EndsWith(")", System.StringComparison.Ordinal))
         {
             var targetName = name.Substring(6, name.Length - 7);
             var targetSym = Startup.Sym(targetName);
@@ -445,6 +451,104 @@ public partial class CilAssembler
         }
     }
 
+    // Name-keyed resolve caches (SymSite / SymFnSite) hold no per-site state,
+    // so one pool slot per (name, package) serves every site.
+    private static readonly Dictionary<(string, string?), int> _symSiteIndex = new();
+    private static readonly Dictionary<(string, string?), int> _symFnSiteIndex = new();
+
+    internal static int AddSiteConstant(Dictionary<(string, string?), int> index,
+                                        string name, string? pkg, Func<object> make)
+    {
+        lock (_constantsLock)
+        {
+            if (index.TryGetValue((name, pkg), out var idx)) return idx;
+        }
+        int added = AddConstant(make());
+        lock (_constantsLock)
+        {
+            // Racing threads may both have added one; keep the first.
+            if (index.TryGetValue((name, pkg), out var existing)) return existing;
+            index[(name, pkg)] = added;
+            return added;
+        }
+    }
+
+    // --- Data constants owned by a compilation unit ---
+    //
+    // A literal (list, string, number, uninterned symbol) or a call-site cache
+    // that an in-memory unit loads from the pool is "data": nothing needs it once
+    // the unit's code is gone. Such a slot is recorded on the unit's token. The
+    // token is attached (ConditionalWeakTable) to every DynamicMethod the unit
+    // made, and a delegate keeps its DynamicMethod alive, so the token lives
+    // exactly as long as any code of the unit can still run, whichever object
+    // (a LispFunction, a bare delegate, a closure) is what keeps that code
+    // reachable. When the token is collected its slots are queued, and the next
+    // AddConstant that needs a slot clears them and reuses them. Reads are the
+    // same indexed array read as before.
+    internal sealed class UnitDataToken
+    {
+        private int[] _slots = new int[8];
+        private int _n;
+        internal int Count => _n;
+        internal void Add(int idx)
+        {
+            if (_n == _slots.Length) Array.Resize(ref _slots, _n * 2);
+            _slots[_n++] = idx;
+        }
+        ~UnitDataToken()
+        {
+            if (_n == 0) return;
+            var a = new int[_n];
+            Array.Copy(_slots, a, _n);
+            _deadSlots.Enqueue(a);
+        }
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentQueue<int[]> _deadSlots = new();
+    private static readonly Stack<int> _freeSlots = new();
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, UnitDataToken>
+        _dmTokens = new();
+
+    [ThreadStatic] internal static UnitDataToken? _currentToken;
+    [ThreadStatic] internal static List<object>? _unitPendingDms;
+
+    /// <summary>Open the data-constant scope of a unit about to be assembled on
+    /// this thread. Returns the state to give to EndUnitData.</summary>
+    internal static (UnitDataToken? token, List<object>? dms) BeginUnitData()
+    {
+        var saved = (_currentToken, _unitPendingDms);
+        _currentToken = new UnitDataToken();
+        _unitPendingDms = new List<object>();
+        return saved;
+    }
+
+    /// <summary>Close the scope: attach the token to the unit's methods when it
+    /// owns any slot, and restore the enclosing scope.</summary>
+    internal static void EndUnitData((UnitDataToken? token, List<object>? dms) saved)
+    {
+        var tok = _currentToken;
+        var dms = _unitPendingDms;
+        _currentToken = saved.token;
+        _unitPendingDms = saved.dms;
+        if (tok == null || dms == null || tok.Count == 0) return;
+        foreach (var dm in dms) _dmTokens.GetValue(dm, _ => tok);
+    }
+
+    /// <summary>AddConstant for a value only the current unit's code reads. Falls
+    /// back to the permanent pool when no unit is open, and for values that must
+    /// stay (interned symbols, functions).</summary>
+    internal static int AddDataConstant(object value)
+    {
+        // An interned symbol is immortal, so every site naming it shares one slot.
+        if (value is Symbol sym && sym.HomePackage != null) return AddSymbolConstant(sym);
+        var tok = _currentToken;
+        if (tok == null || value is LispFunction)
+            return AddConstant(value);
+        int idx = AddConstantCore(value, reuse: true);
+        tok.Add(idx);
+        return idx;
+    }
+
     public static int AddConstant(object value)
     {
         // A function rooted in the global pool (defun re-registration, anonymous
@@ -457,9 +561,23 @@ public partial class CilAssembler
         if (value is LispFunction lf && lf.RetainUnit == null
             && _currentUnitDms is { Count: > 0 } holder)
             lf.RetainUnit = holder;
+        return AddConstantCore(value, reuse: false);
+    }
 
+    private static int AddConstantCore(object value, bool reuse)
+    {
         lock (_constantsLock)
         {
+            // Slots of collected units go back to the free list here (not in the
+            // finalizer, which must not take the lock).
+            while (_deadSlots.TryDequeue(out var dead))
+                foreach (var d in dead) { _constants[d] = null!; _freeSlots.Push(d); }
+            if (reuse && _freeSlots.Count > 0)
+            {
+                int free = _freeSlots.Pop();
+                _constants[free] = value;
+                return free;
+            }
             int idx = _constantsSize;
             if (idx >= _constants.Length)
             {
@@ -532,11 +650,14 @@ public partial class CilAssembler
     {
         var arr = System.Threading.Volatile.Read(ref _constants);
         int size = System.Threading.Volatile.Read(ref _constantsSize);
-        int dm = 0;
+        int dm = 0, freed = 0;
         int unitTotal = 0, unitDm = 0;
 #if DOTCL_EMIT
         for (int i = 0; i < size; i++)
+        {
+            if (arr[i] == null) { freed++; continue; }   // a freed slot
             if (arr[i] is System.Reflection.Emit.DynamicMethod) dm++;
+        }
         // Closure body DMs live in the per-unit store, not the global
         // pool. Count the live ones (a weak holder may already be collected) so
         // the dynamic-method total reflects what is still rooted: the figure
@@ -551,6 +672,7 @@ public partial class CilAssembler
             }
         }
 #endif
+        size -= freed;
         return (size + unitTotal, dm + unitDm, (size - dm) + (unitTotal - unitDm));
     }
 }

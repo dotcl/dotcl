@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Integer multiplication must stay bit-identical when the 64-bit-limb path
 ;;; is limited to larger operands. The reference uses shifts and additions.
 

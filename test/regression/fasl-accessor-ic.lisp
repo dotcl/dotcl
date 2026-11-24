@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Accessor reads and writes in a compile-file'd function keep their inline
 ;;; cache cell across calls. The cell used to be made afresh on every call in
 ;;; a fasl (the constant pool it lives in for in-memory code is not saved), so
@@ -7,8 +8,8 @@
 ;;; sites stay correct when the class layout or the accessor's methods change,
 ;;; and that a warm read/write loop allocates nothing.
 
-(defparameter *faic-src* "faic-src-tmp.lisp")
-(defparameter *faic-fasl* "faic-src-tmp.fasl")
+(defparameter *faic-src* (regression-temp-file "faic-src-tmp.lisp"))
+(defparameter *faic-fasl* (regression-temp-file "faic-src-tmp.fasl"))
 
 (defun faic-sym (name) (find-symbol name "FAIC-PKG"))
 (defun faic-call (name &rest args) (apply (symbol-function (faic-sym name)) args))

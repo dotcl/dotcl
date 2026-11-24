@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A type or member name may be any string, not only a simple one.
 ;;;
 ;;; CL strings have two runtime representations here, and a caller that builds

@@ -451,6 +451,19 @@ public static partial class Runtime
     // DOTCL:*PACKAGE-LOCKS-DISABLED* is nil.
     // Only external symbols are protected: internal symbols in locked packages
     // (e.g. newly interned symbols like "Lazy CONS" in CL) may be freely defined.
+    // A package-level operation (UNINTERN, RENAME-PACKAGE) on a locked package.
+    public static void CheckPackageNotLocked(Package pkg, string context)
+    {
+        if (!pkg.IsLocked) return;
+        var disabledSym = Startup.SymInPkg("*PACKAGE-LOCKS-DISABLED*", "DOTCL");
+        if (DynamicBindings.TryGet(disabledSym, out var disabled) && disabled is not Nil)
+            return;
+        var err = new LispError($"{context}: package {pkg.Name} is locked");
+        err.ConditionTypeName = "PACKAGE-ERROR";
+        err.PackageRef = new LispString(pkg.Name);
+        throw new LispErrorException(err);
+    }
+
     public static void CheckPackageLock(Symbol sym, string context)
     {
         var home = sym.HomePackage;
@@ -640,12 +653,28 @@ public static partial class Runtime
     public static LispObject InternSymbolV(LispObject[] args)
     {
         if (args.Length < 1 || args.Length > 2) throw MakeProgramError("INTERN", 1, 2, args.Length);
-        var pkg = args.Length > 1 ? args[1] : DynamicBindings.Get(Startup.Sym("*PACKAGE*"));
+        LispObject pkg = args.Length > 1 ? args[1] : CurrentPackage("INTERN");   // checks *PACKAGE*
         if (!(args[0] is LispString || args[0] is LispVector { IsCharVector: true }))
             throw new LispErrorException(new LispTypeError(
                 "INTERN: not a string", args[0], Startup.Sym("STRING")));
         return InternSymbol(args[0], pkg);
     }
+
+    private static LispObject InternDirect(LispObject name, LispObject? pkg)
+    {
+        pkg ??= CurrentPackage("INTERN");
+        if (!(name is LispString || name is LispVector { IsCharVector: true }))
+            throw new LispErrorException(new LispTypeError(
+                "INTERN: not a string", name, Startup.Sym("STRING")));
+        return InternSymbol(name, pkg);
+    }
+
+    public static LispObject Intern1(LispObject name) => MultipleValues.Boxed(InternDirect(name, null));
+    public static LispObject Intern2(LispObject name, LispObject pkg) => MultipleValues.Boxed(InternDirect(name, pkg));
+    public static LispObject Intern1Primary(LispObject name) => MultipleValues.PrimaryAlone(InternDirect(name, null));
+    public static LispObject Intern2Primary(LispObject name, LispObject pkg) => MultipleValues.PrimaryAlone(InternDirect(name, pkg));
+    public static LispObject Intern1Pair(LispObject name) => InternDirect(name, null);
+    public static LispObject Intern2Pair(LispObject name, LispObject pkg) => InternDirect(name, pkg);
 
     public static LispObject InternSymbol(LispObject name, LispObject pkg)
     {
@@ -659,9 +688,10 @@ public static partial class Runtime
         };
         Package p;
         if (pkg is Package pp) p = pp;
-        else if (pkg is LispString || pkg is Symbol && pkg is not Nil || pkg is LispChar || (pkg is LispVector pv && pv.IsCharVector))
+        else if (pkg is LispString || pkg is Symbol || pkg is Nil || pkg is T || pkg is LispChar || (pkg is LispVector pv && pv.IsCharVector))
+            // NIL is the string designator "NIL", not "the current package": the default
+            // for an omitted argument is supplied by InternSymbolV.
             p = ResolvePackage(pkg, "INTERN");
-        else if (pkg is Nil) p = CurrentPackage("INTERN");
         else throw new LispErrorException(new LispTypeError("INTERN: not a package designator", pkg,
             List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("SYMBOL"),
                  Startup.Sym("CHARACTER"), Startup.Sym("PACKAGE"))));
@@ -714,7 +744,9 @@ public static partial class Runtime
             Package p => p.Name,
             LispChar c => c.Value.ToString(),
             LispVector v when v.IsCharVector => v.ToCharString(),
-            _ => obj.ToString()!
+            Nil => "NIL",
+            T => "T",
+            _ => throw new LispErrorException(new LispTypeError($"not a string designator: {FormatObject(obj, true)}", obj, List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("SYMBOL"), Startup.Sym("CHARACTER"))))
         };
     }
 
@@ -969,6 +1001,25 @@ public static partial class Runtime
             var cur = args[2];
             while (cur is Cons c) { nicknames.Add(ToPackageName(c.Car)); cur = c.Cdr; }
         }
+        // Only an actual change of name or nicknames touches a locked package.
+        if (p.Name != newName || !new HashSet<string>(p.Nicknames).SetEquals(nicknames))
+            CheckPackageNotLocked(p, "RENAME-PACKAGE");
+        // CLHS RENAME-PACKAGE: a name or nickname that another package already has is
+        // a PACKAGE-ERROR, and nothing is renamed.
+        foreach (var n in nicknames.Prepend(newName))
+        {
+            var other = Package.FindPackage(n);
+            if (other != null && !ReferenceEquals(other, p))
+                ConditionSystem.Error(MakeConditionFromType(
+                    Startup.Sym("SIMPLE-PACKAGE-ERROR"),
+                    new LispObject[] {
+                        Startup.Keyword("PACKAGE"), other,
+                        Startup.Keyword("FORMAT-CONTROL"),
+                        new LispString("A package named ~A already exists."),
+                        Startup.Keyword("FORMAT-ARGUMENTS"),
+                        new Cons(new LispString(n), Nil.Instance)
+                    }));
+        }
         p.Rename(newName, nicknames);
         return p;
     }
@@ -991,6 +1042,12 @@ public static partial class Runtime
 
     public static LispObject FindSymbolMv(LispObject[] args) => MultipleValues.Boxed(FindSymbolL(args));
     public static LispObject FindSymbolPrimary(LispObject[] args) => MultipleValues.Alone(FindSymbolL(args));
+    public static LispObject FindSymbol1(LispObject name) => MultipleValues.Boxed(FindSymbolIn(name, null));
+    public static LispObject FindSymbol2(LispObject name, LispObject pkg) => MultipleValues.Boxed(FindSymbolIn(name, pkg));
+    public static LispObject FindSymbol1Primary(LispObject name) => MultipleValues.PrimaryAlone(FindSymbolIn(name, null));
+    public static LispObject FindSymbol2Primary(LispObject name, LispObject pkg) => MultipleValues.PrimaryAlone(FindSymbolIn(name, pkg));
+    public static LispObject FindSymbol1Pair(LispObject name) => FindSymbolIn(name, null);
+    public static LispObject FindSymbol2Pair(LispObject name, LispObject pkg) => FindSymbolIn(name, pkg);
 
     /// <summary>FIND-SYMBOL proper. PKG null means *PACKAGE*.</summary>
     private static LispObject FindSymbolIn(LispObject nameArg, LispObject? pkgArg)
@@ -1026,10 +1083,14 @@ public static partial class Runtime
         // (unintern symbol &optional package)
         if (args.Length < 1 || args.Length > 2) throw MakeProgramError("UNINTERN", 1, 2, args.Length);
         var pkg = args.Length > 1 ? ResolvePackage(args[1], "UNINTERN") : CurrentPackage("UNINTERN");
-        if (args[0] is Symbol sym)
-            return pkg.Unintern(sym) ? T.Instance : Nil.Instance;
-        string name = args[0] is LispString s ? s.Value : args[0] is LispChar uc ? uc.Value.ToString() : args[0] is LispVector uv && uv.IsCharVector ? uv.ToCharString() : args[0].ToString()!;
-        return pkg.Unintern(name) ? T.Instance : Nil.Instance;
+        var sym = ResolveSymbol(args[0], "UNINTERN");   // T and NIL are symbols; a string is a TYPE-ERROR
+        {
+            // Only a symbol that is present in the package (not merely inherited) is touched.
+            var (found, status) = pkg.FindSymbol(sym.Name);
+            if (ReferenceEquals(found, sym) && status is SymbolStatus.Internal or SymbolStatus.External)
+                CheckPackageNotLocked(pkg, "UNINTERN");
+        }
+        return pkg.Unintern(sym) ? T.Instance : Nil.Instance;
     }
 
     public static LispObject UnexportSymbol(LispObject sym, LispObject pkg)

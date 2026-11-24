@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; PRINT-OBJECT methods apply to funcallable instances.
 ;;;
 ;;; Bug: an instance of a FUNCALLABLE-STANDARD-CLASS is represented as a

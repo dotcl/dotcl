@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A string pathname designator is parsed the same way everywhere.
 ;;;
 ;;; CLHS defines MERGE-PATHNAMES and the PATHNAME-xxx accessors in terms of

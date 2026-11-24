@@ -6,7 +6,7 @@
 (defvar *sef-char* nil)
 
 (defun %sef-write (name bytes)
-  (let ((path (merge-pathnames name (regression-temp-dir))))
+  (let ((path (merge-pathnames name (regression-temp-dir/))))
     (with-open-file (s path :direction :output :if-exists :supersede :element-type '(unsigned-byte 8))
       (write-sequence (coerce bytes '(vector (unsigned-byte 8))) s))
     path))
@@ -49,7 +49,7 @@
   (progn
     (setf *sef-char* nil)
     (let* ((src (%sef-write "sef6.lisp" (%sef-encode *sef-source* :latin-1)))
-           (fasl (merge-pathnames "sef6.fasl" (regression-temp-dir))))
+           (fasl (merge-pathnames "sef6.fasl" (regression-temp-dir/))))
       (let ((*error-output* (make-broadcast-stream)))
         (compile-file src :output-file fasl :external-format :latin-1))
       (load fasl)
@@ -61,7 +61,7 @@
     (list (handler-case (progn (load src :external-format :no-such-format) :no-error) (error () :error))
           (handler-case (let ((*error-output* (make-broadcast-stream)))
                           (compile-file src :external-format :no-such-format
-                                            :output-file (merge-pathnames "sef7.fasl" (regression-temp-dir)))
+                                            :output-file (merge-pathnames "sef7.fasl" (regression-temp-dir/)))
                           :no-error)
             (error () :error))))
   (:error :error))

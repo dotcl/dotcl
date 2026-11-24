@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Element reads other than AREF through a structure accessor.
 ;;;
 ;;; A slot's :TYPE reaches AREF (struct-slot-array-aref.lisp). The other

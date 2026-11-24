@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; .NET interfaces take part in CLOS dispatch: EnsureDotNetTypeClass makes every
 ;;; implemented interface a superclass, and orders the class precedence list
 ;;; concrete-classes -> interfaces (most derived first) -> T. Before this only the

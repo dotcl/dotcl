@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A restart printed with *print-escape* nil prints its report (CLHS
 ;;; RESTART-CASE :report, WITH-SIMPLE-RESTART): the report function's output,
 ;;; the :report string, or with neither the restart's name as PRIN1 writes it.

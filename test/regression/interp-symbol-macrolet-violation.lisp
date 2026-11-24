@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The interpreted path must also reject SYMBOL-MACROLET's PROGRAM-ERROR cases.
 ;;;
 ;;; CLHS SYMBOL-MACROLET makes three of them a program error:

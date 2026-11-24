@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; compile-file of a DEFCLASS whose :ACCESSOR names an existing generic
 ;;; function must not cost that function its methods when the fasl is loaded.
 ;;;
@@ -15,8 +16,8 @@
 (defmethod cfak-len (x) (list :t x))
 
 (deftest-compiled-only compile-file-accessor-keeps-existing-gf-methods
-  (let ((src "cfak-src-tmp.lisp")
-        (fasl "cfak-src-tmp.fasl"))
+  (let ((src (regression-temp-file "cfak-src-tmp.lisp"))
+        (fasl (regression-temp-file "cfak-src-tmp.fasl")))
     (unwind-protect
         (progn
           (with-open-file (s src :direction :output :if-exists :supersede)

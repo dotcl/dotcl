@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Output on a bivalent socket stream is buffered and goes out as one piece.
 ;;;
 ;;; Bug: every WRITE-BYTE, WRITE-CHAR and WRITE-SEQUENCE on a

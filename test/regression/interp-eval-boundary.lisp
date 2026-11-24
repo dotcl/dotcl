@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Behaviour EVAL must exhibit identically on both evaluator paths.
 ;;;
 ;;; These bind dotcl:*evaluator-mode* around the EVAL under test, so the

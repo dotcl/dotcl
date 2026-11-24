@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; dotnet:documentation -- the prose the framework ships for a type or member.
 ;;;
 ;;; The entries are keyed by a documentation ID built from the member, so what

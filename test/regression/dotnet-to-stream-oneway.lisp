@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Wrapping a one-way .NET stream.
 ;;;
 ;;; dotnet:to-stream was written for sockets, where the .NET Stream reads and

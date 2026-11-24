@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The exponent marker: which letter, and in which case.
 ;;;
 ;;; PRIN1 already picked the letter by CLHS 22.1.3.1.3 -- omit it when the float's

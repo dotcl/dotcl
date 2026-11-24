@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Function names are their own namespace (CLHS 3.1.1), and a function NAME can
 ;;; be the cons (SETF F). The interpreter kept FLET / LABELS bindings in the same
 ;;; alist as variables, keyed by the name and looked up with ASSOC's default EQL

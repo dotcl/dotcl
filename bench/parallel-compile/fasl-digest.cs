@@ -22,6 +22,15 @@
 // they are defined: the numbers come from counters of the whole process, so the
 // same file gets other numbers depending on what the process compiled before it.
 //
+// Branch targets and exception regions are printed as instruction numbers, not
+// byte offsets: a constant from a process-wide counter can be a byte longer in
+// another build, which moves every offset after it. A call that passes the
+// caller's value mode (ldc.i4 MODE; call LispFunction.CallNM) is printed as the
+// plain CallN: the compiler passes the mode only to a callee it already knows
+// takes one (a DEFMETHOD on a standard function such as DOCUMENTATION, or a
+// DEFUN compiled earlier), so the same source gives either form depending on
+// what the process compiled or loaded before it. The two calls do the same.
+//
 // --gensyms also writes as '#' every run of digits in a string literal, in the
 // text of a custom attribute and in a literal data blob, the length of such a
 // blob, and the size in the name of the type that holds it. Uninterned symbols
@@ -36,6 +45,18 @@ using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
 using System.Text;
 using System.Text.RegularExpressions;
+
+static bool IsSimpleLoad(string name) => name.StartsWith("ldc.i4") || name.StartsWith("ldarg") || name.StartsWith("ldloc");
+
+// A symbol-function call site method (sff#N) that takes the caller's value mode as an
+// extra last Int32 argument is written as the one without it (see the mode calls below).
+static string MethodSig(string name, string sig)
+{
+    var m = Regex.Match(sig, @"^00([0-9A-F]{2})(.*)08$");
+    return name.StartsWith("sff#") && m.Success
+        ? "00" + (Convert.ToInt32(m.Groups[1].Value, 16) - 1).ToString("X2") + m.Groups[2].Value
+        : sig;
+}
 
 bool gensyms = args.Contains("--gensyms");
 bool compare = args.Contains("--compare");
@@ -154,25 +175,34 @@ string Digest(string path)
                 return "type " + TypeName(h);
         }
     }
-    void Il(byte[] il)
+    void Il(byte[] il, System.Collections.Immutable.ImmutableArray<ExceptionRegion> regions)
     {
+        // A branch is printed as the number of the instruction it goes to, not as
+        // a byte offset: a constant that comes from a counter of the whole process
+        // (an id, a number in a name) can be one byte longer or shorter in another
+        // build, which moves every offset after it and says nothing about the code.
+        var lines = new List<(int start, string name, string operand, int[]? targets)>();
         int i = 0;
         while (i < il.Length)
         {
+            int start = i;
             OpCode op;
             if (il[i] == 0xfe) { op = twoByte[il[i + 1]]!.Value; i += 2; }
             else { op = oneByte[il[i]]!.Value; i += 1; }
             string operand = "";
+            int[]? targets = null;
             switch (op.OperandType)
             {
                 case OperandType.InlineNone: break;
                 case OperandType.ShortInlineBrTarget:
+                    targets = new[] { i + 1 + (sbyte)il[i] }; i += 1; break;
                 case OperandType.ShortInlineI:
                 case OperandType.ShortInlineVar:
                     operand = il[i].ToString(); i += 1; break;
                 case OperandType.InlineVar:
                     operand = BitConverter.ToUInt16(il, i).ToString(); i += 2; break;
                 case OperandType.InlineBrTarget:
+                    targets = new[] { i + 4 + BitConverter.ToInt32(il, i) }; i += 4; break;
                 case OperandType.InlineI:
                 case OperandType.ShortInlineR:
                     operand = BitConverter.ToInt32(il, i).ToString(); i += 4; break;
@@ -188,9 +218,10 @@ string Digest(string path)
                 case OperandType.InlineSwitch:
                 {
                     int n = BitConverter.ToInt32(il, i); i += 4;
-                    var t = new List<string>();
-                    for (int k = 0; k < n; k++) { t.Add(BitConverter.ToInt32(il, i).ToString()); i += 4; }
-                    operand = string.Join(",", t);
+                    int baseOffset = i + 4 * n;
+                    var t = new int[n];
+                    for (int k = 0; k < n; k++) { t[k] = baseOffset + BitConverter.ToInt32(il, i); i += 4; }
+                    targets = t;
                     break;
                 }
                 default:
@@ -200,10 +231,75 @@ string Digest(string path)
                     break;
                 }
             }
-            sb.Append("    ").Append(op.Name).Append(' ').Append(operand).Append('\n');
+            lines.Add((start, op.Name!, operand, targets));
+        }
+        // A call of LispFunction.CallN that passes the caller's value mode
+        // (ldc.i4 MODE; call CallNM) is the same call as CallN with no mode:
+        // whether the compiler passes the mode depends on whether it already knew
+        // the callee takes one, which depends on what the process compiled or
+        // loaded before (a DEFMETHOD on a standard function, a DEFUN compiled
+        // earlier). It changes how the call is made, not what the code does, so
+        // it is written as the plain call, and the load of the mode is dropped.
+        var modeCall = new Regex(@"^ref DotCL\.LispFunction::Call(\d+)M 00([0-9A-F]{2})(.*)08$");
+        // The same for a call of a symbol-function call site (CompiledModule::sff#N), which
+        // takes the mode as its last argument when the callee was known to take one.
+        var siteCall = new Regex(@"^method CompiledModule::(sff#~\d+) 00([0-9A-F]{2})(.*)08$");
+        var modeStarts = new Dictionary<int, int>();
+        var shown = new List<(int start, string name, string operand, int[]? targets)>();
+        for (int k = 0; k < lines.Count; k++)
+        {
+            var line = lines[k];
+            if (line.name == "call" && siteCall.Match(line.operand) is { Success: true } sm
+                && shown.Count > 0 && IsSimpleLoad(shown[^1].name))
+            {
+                var dropped = shown[^1];
+                shown.RemoveAt(shown.Count - 1);
+                shown.Add((dropped.start, "call", "method CompiledModule::" + sm.Groups[1].Value + " 00"
+                    + (Convert.ToInt32(sm.Groups[2].Value, 16) - 1).ToString("X2") + sm.Groups[3].Value, null));
+                modeStarts[line.start] = dropped.start;
+                continue;
+            }
+            if (line.name == "call" && modeCall.Match(line.operand) is { Success: true } m
+                && shown.Count > 0 && IsSimpleLoad(shown[^1].name))
+            {
+                // the instruction after the dropped load keeps its place for branch targets
+                var dropped = shown[^1];
+                shown.RemoveAt(shown.Count - 1);
+                shown.Add((dropped.start, "call", "ref DotCL.LispFunction::Call" + m.Groups[1].Value + " 00"
+                    + (Convert.ToInt32(m.Groups[2].Value, 16) - 1).ToString("X2") + m.Groups[3].Value, null));
+                modeStarts[line.start] = dropped.start;
+                continue;
+            }
+            shown.Add(line);
+        }
+        var index = new Dictionary<int, int>();
+        for (int k = 0; k < shown.Count; k++) index[shown[k].start] = k;
+        foreach (var (os, ds) in modeStarts) index[os] = index[ds];
+        // A region is printed with instruction numbers too, as a start and a length
+        // counted in instructions.
+        int Ix(int offset) => offset == il.Length ? shown.Count : index.TryGetValue(offset, out var k) ? k : -offset;
+        foreach (var r in regions)
+            sb.Append("   region ").Append(r.Kind).Append(' ').Append(Ix(r.TryOffset)).Append(' ')
+              .Append(Ix(r.TryOffset + r.TryLength) - Ix(r.TryOffset))
+              .Append(' ').Append(Ix(r.HandlerOffset)).Append(' ')
+              .Append(Ix(r.HandlerOffset + r.HandlerLength) - Ix(r.HandlerOffset))
+              .Append(r.CatchType.IsNil ? "" : " " + TypeName(r.CatchType)).Append('\n');
+        // The slot of a LOAD-TIME-VALUE is a number from a counter of the whole process (the
+        // fasl keeps its slots under its own module name, so only the number differs between
+        // builds): in a method that reads or writes such a slot, the integer literals made
+        // into Fixnums are written as '#'.
+        bool ltvMethod = shown.Any(l => l.operand.Contains("LTV-SLOT"));
+        for (int k = 0; ltvMethod && k + 1 < shown.Count; k++)
+            if (shown[k].name == "ldc.i8" && shown[k + 1].operand.Contains("DotCL.Fixnum::Make"))
+                shown[k] = (shown[k].start, shown[k].name, "#", shown[k].targets);
+        foreach (var (start, name, operand, targets) in shown)
+        {
+            string text = operand;
+            if (targets != null)
+                text = string.Join(",", targets.Select(t => index.TryGetValue(t, out var k) ? "@" + k : "?" + t));
+            sb.Append("    ").Append(name).Append(' ').Append(text).Append('\n');
         }
     }
-
     sb.Append("assembly ").Append(Str(md.GetAssemblyDefinition().Name)).Append('\n');
     foreach (var th in md.TypeDefinitions)
     {
@@ -223,6 +319,10 @@ string Digest(string path)
                     && br.ReadTypeHandle() is var th2 && th2.Kind == HandleKind.TypeDefinition)
                     size = md.GetTypeDefinition((TypeDefinitionHandle)th2).GetLayout().Size;
                 byte[] data = pe.GetSectionData(rva).GetContent(0, size).ToArray();
+                // The module name the literal data names (a symbol's home module, a source
+                // file) carries ASDF's random temporary-file suffix, as the assembly's name does.
+                data = Encoding.Latin1.GetBytes(Regex.Replace(Encoding.Latin1.GetString(data),
+                    @"-tmp[A-Z0-9]{8}_[0-9a-f]{8}", "-tmp"));
                 if (gensyms)
                     data = Encoding.Latin1.GetBytes(anyDigits.Replace(Encoding.Latin1.GetString(data), "#"));
                 sb.Append(" data ").Append(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(data)));
@@ -232,16 +332,12 @@ string Digest(string path)
         foreach (var mh in td.GetMethods())
         {
             var m = md.GetMethodDefinition(mh);
-            sb.Append("  method ").Append(memberName[mh]).Append(' ').Append(Blob(m.Signature)).Append('\n');
+            sb.Append("  method ").Append(memberName[mh]).Append(' ').Append(MethodSig(memberName[mh], Blob(m.Signature))).Append('\n');
             if (m.RelativeVirtualAddress == 0) continue;
             var body = pe.GetMethodBody(m.RelativeVirtualAddress);
             sb.Append("   maxstack ").Append(body.MaxStack).Append(" locals ")
               .Append(body.LocalSignature.IsNil ? "-" : Blob(md.GetStandaloneSignature(body.LocalSignature).Signature)).Append('\n');
-            foreach (var r in body.ExceptionRegions)
-                sb.Append("   region ").Append(r.Kind).Append(' ').Append(r.TryOffset).Append(' ').Append(r.TryLength)
-                  .Append(' ').Append(r.HandlerOffset).Append(' ').Append(r.HandlerLength)
-                  .Append(r.CatchType.IsNil ? "" : " " + TypeName(r.CatchType)).Append('\n');
-            Il(body.GetILBytes()!);
+            Il(body.GetILBytes()!, body.ExceptionRegions);
         }
     }
     foreach (var ch in md.CustomAttributes)

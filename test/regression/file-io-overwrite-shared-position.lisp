@@ -4,7 +4,7 @@
 ;;; of "abcdef", writing "XY" made "abcdefXY".
 
 (defun %fiosp-file (name content)
-  (let ((path (merge-pathnames name (regression-temp-dir))))
+  (let ((path (merge-pathnames name (regression-temp-dir/))))
     (with-open-file (s path :direction :output :if-exists :supersede) (write-string content s))
     path))
 

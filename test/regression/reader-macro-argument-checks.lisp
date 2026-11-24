@@ -20,7 +20,8 @@
           (%rmac-class (set-macro-character #\@ nil))
           (%rmac-class (set-macro-character #\@ (lambda (s c) (declare (ignore s c)) 1)))
           (%rmac-class (set-macro-character #\@ 'car))))
-  (:type-error :type-error :ok :ok))
+  ;; NIL is accepted as SBCL does: the character becomes a constituent.
+  (:type-error :ok :ok :ok))
 
 (deftest reader-macro-argument-checks.set-dispatch-macro-character
   (let ((*readtable* (copy-readtable nil)))

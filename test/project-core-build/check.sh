@@ -139,6 +139,13 @@ echo "=== [2] the remedy the message names ==="
 emit_csproj "<DotclAsdSearchPath Include=\"$(win "$WORK/ext")\" />"
 if dotnet build "$(win "$WORK/app/app.csproj")" -c Debug --nologo > "$WORK/build2.log" 2>&1; then
   echo "  PASS: adding DotclAsdSearchPath builds the project"
+  # A first build with no cache prints no compiler WARNING of its own (the generated
+  # dependency walk used to warn that its DIR variable was never used).
+  if grep -q '^WARNING:' "$WORK/build2.log"; then
+    note "the first build prints a compiler WARNING: $(grep -m1 '^WARNING:' "$WORK/build2.log")"
+  else
+    echo "  PASS: the first build prints no compiler warning"
+  fi
 
   echo "=== [2b] a second build with nothing changed does not recompile the root ==="
   # The root compile is incremental on its Inputs. A directory among them (the
@@ -150,6 +157,9 @@ if dotnet build "$(win "$WORK/app/app.csproj")" -c Debug --nologo > "$WORK/build
   stamp="$WORK/stamp2"
   sleep 1; touch "$stamp"
   if dotnet build "$(win "$WORK/app/app.csproj")" -c Debug --nologo > "$WORK/build2b.log" 2>&1; then
+    if grep -q '^WARNING:' "$WORK/build2b.log"; then
+      note "the second (cached) build prints a compiler WARNING: $(grep -m1 '^WARNING:' "$WORK/build2b.log")"
+    fi
     if [ -z "$root_fasl" ] || [ ! -f "$root_fasl" ]; then
       note "no root fasl after the first build"
     elif [ -n "$(find "$root_fasl" -newer "$stamp")" ]; then

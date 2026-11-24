@@ -33,7 +33,7 @@
     (dolist (l lines) (write-line l s))))
 
 (deftest-compiled-only cf-expansion-failure-threads.other-file
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src-a (merge-pathnames "mxf-a.lisp" dir))
          (src-b (merge-pathnames "mxf-b.lisp" dir)))
     (setf *mxf-b-inside* nil *mxf-a-failed* nil *mxf-ran* nil)

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; GO out of the tree-walk interpreter travels as a return value where it can.
 ;;;
 ;;; It used to be a CL THROW, i.e. a .NET exception, always. Unwinding one costs

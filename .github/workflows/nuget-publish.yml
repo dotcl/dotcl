@@ -15,6 +15,11 @@ jobs:
   nuget-push:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 10
+    permissions:
+      contents: read
+      # Needed to ask GitHub for the OIDC token that NuGet/login exchanges
+      # for a short-lived NuGet API key (nuget.org Trusted Publishing).
+      id-token: write
     steps:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -33,10 +38,32 @@ jobs:
       - name: List packages to push
         run: ls -lh out/*.nupkg
 
+      # Trusted Publishing: exchange the workflow's OIDC token for a
+      # short-lived key. The nuget.org policy names this repository and this
+      # workflow file. NUGET_USER is the nuget.org profile name (not an email).
+      # If the exchange fails, the upload below falls back to the long-lived
+      # NUGET_API_KEY secret, which stays until a release has gone out this way.
+      - name: Get a short-lived NuGet API key
+        id: nuget-login
+        continue-on-error: true
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ${{ vars.NUGET_USER }}
+
       - name: Publish to NuGet.org
         run: |
+          if [ -n "${SHORT_LIVED_KEY}" ]; then
+            echo "Using the short-lived key from Trusted Publishing"
+            API_KEY="${SHORT_LIVED_KEY}"
+          else
+            echo "::warning::Trusted Publishing login gave no key; using the NUGET_API_KEY secret"
+            API_KEY="${SECRET_KEY}"
+          fi
           dotnet nuget push out/*.nupkg \
-            --api-key ${{ secrets.NUGET_API_KEY }} \
+            --api-key "${API_KEY}" \
             --source https://api.nuget.org/v3/index.json \
             --skip-duplicate \
             --timeout 900
+        env:
+          SHORT_LIVED_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+          SECRET_KEY: ${{ secrets.NUGET_API_KEY }}

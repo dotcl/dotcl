@@ -173,9 +173,13 @@ nested way back to the global namespace.")
 
 (defun call-in-unit (name thunk)
   "Call THUNK in the unit named NAME (NIL: outside every unit)."
-  (if (equal (and name (string-upcase name)) *unit*)
-      (funcall thunk)
-      (dotcl::%call-in-package-unit (unit-object (find-unit name)) thunk)))
+  (cond ((equal (and name (string-upcase name)) *unit*)
+         (funcall thunk))
+        ;; Outside every unit: the real global bindings, so a SETQ of an ASDF
+        ;; variable in THUNK is the global one, and one made globally since
+        ;; USE-LOCK is seen.
+        ((null name) (dotcl::%call-outside-package-units thunk))
+        (t (dotcl::%call-in-package-unit (unit-object (find-unit name)) thunk))))
 
 (defun system-unit (name)
   "The name of the unit the lock loads system NAME in, NIL when outside every

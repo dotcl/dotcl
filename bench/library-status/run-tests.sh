@@ -113,7 +113,10 @@ judge() {
     # rt: "Doing N pending tests of M tests total." then either
     # "No tests failed." or "K out of M total tests failed: ...".
     /^Doing [0-9]+ pending tests? of [0-9]+ tests total\./ { rt_total = $2; next }
-    /^No tests failed\./ { fw["rt"]=1; pass += rt_total; rt_total = 0; next }
+    /^No tests failed\./ { fw["rt"]=1; pass += rt_total; if (rt_total == 0) notests = 1; rt_total = 0; next }
+    # A library that prints its own pass line and nothing else, e.g.
+    # "global-vars tests passed." counts as one passing suite.
+    /^[A-Za-z0-9._+-]+ tests passed\.$/ { fw["message"]=1; pass += 1; next }
     / out of [0-9]+ total tests failed/ {
       fw["rt"]=1; fail += $1; pass += $4 - $1; rt_total = 0; next }
     # rove and prove: "N tests completed" or "K of M tests failed".
@@ -353,6 +356,32 @@ else echo "run-tests: needs GNU timeout (coreutils; gtimeout on macOS)" >&2; exi
 fi
 
 check_dists run-tests
+
+# A system that two :tree directories of CL_SOURCE_REGISTRY both define (a fork and its upstream
+# clone, say) is found in whichever ASDF scans first, so a row can be measured against the
+# unpatched copy and look like a dotcl failure. Say so on stderr (a copy vendored inside
+# another library shows up here too, so this does not stop the run; run-forks.sh, which owns
+# its fork directories, does stop).
+if [ -n "${CL_SOURCE_REGISTRY:-}" ]; then
+  trees=$(printf '%s' "$CL_SOURCE_REGISTRY" | sed -En 's/.*\(:tree "([^"]*)"\).*/\1/p' | tr -d '\r')
+  dupfile=$(mktemp "${TMPDIR:-/tmp}/rt-dup.XXXXXX")
+  for tree in $trees; do
+    [ -d "$tree" ] || continue
+    for dir in "$tree"/*/; do
+      [ -d "$dir" ] || continue
+      find -H "$dir" -name '*.asd' -exec cat {} + 2>/dev/null \
+        | tr 'A-Z' 'a-z' \
+        | sed -En 's/.*\([[:space:]]*(asdf:|asdf\/[a-z-]*:)?defsystem[[:space:]]+([^[:space:])]+).*/\2/p' \
+        | sed 's/^#://; s/^://; s/"//g' | sort -u | sed "s|\$| $(basename "$dir")|" >> "$dupfile"
+    done
+  done
+  dup=$(awk '{ if ($1 in by && by[$1] != $2) print $1 " (" by[$1] ", " $2 ")"; else by[$1] = $2 }' "$dupfile")
+  rm -f "$dupfile"
+  if [ -n "$dup" ]; then
+    echo "run-tests: warning: these systems are defined by more than one directory under CL_SOURCE_REGISTRY; a row for one of them may be measured against the other copy (ASDF takes the first it finds):" >&2
+    echo "$dup" | sed 's/^/  /' >&2
+  fi
+fi
 checked=$(date +%Y-%m-%d)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -395,6 +424,15 @@ write_json() {
   } > "$out"
 }
 
+
+# extra_test_system_names SYS: test systems whose names do not follow the
+# SYS/test, SYS-test, ... convention, as quoted strings for a Lisp list.
+extra_test_system_names() {
+  case "$1" in
+    cl-dbi) printf ' "dbi-test" "dbi/test"' ;;
+    docparser) printf ' "docparser-test-system"' ;;
+  esac
+}
 
 # Lisp run after TEST-SYSTEM for a library whose tests are plain functions that
 # TEST-OP does not call. The suite is loaded from the library's source (md5
@@ -534,10 +572,16 @@ remember it to load after LIBTEST-BEGIN."
 ;; know about, so their dependencies are on disk when that happens. These are
 ;; guesses, so a failure here is only noted: if the TEST-OP really needs the
 ;; system, the run fails on its own.
-(dolist (name '("$sys/test" "$sys/tests" "$sys-test" "$sys-tests" "$sys.test" "$sys.tests"))
-  (when (ql-dist:find-system name)
+(defvar *libtest-extra-systems* nil)
+(dolist (name '("$sys/test" "$sys/tests" "$sys-test" "$sys-tests" "$sys.test" "$sys.tests"$(extra_test_system_names "$sys")))
+  ;; A test system defined in the release but absent from the Quicklisp index
+  ;; (a subsystem of the library's own .asd, or a file next to it) is found by ASDF.
+  (when (or (ql-dist:find-system name)
+            (ignore-errors (asdf:find-system name nil))
+            (libtest-local-system name "$sys"))
     (handler-case (progn (libtest-prepare name nil)
-                         (format t "~&LIBTEST-EXTRA-SYSTEM ~a~%" name))
+                         (format t "~&LIBTEST-EXTRA-SYSTEM ~a~%" name)
+                         (push name *libtest-extra-systems*))
       (error (e) (format t "~&LIBTEST-NOTE ~a did not load: ~a~%" name e)))))
 ;; The markers start with ~% rather than ~&: the judge only reads a marker at the
 ;; start of a line, and a FRESH-LINE that misjudges the column (after PRINT, on
@@ -563,7 +607,7 @@ remember it to load after LIBTEST-BEGIN."
 ;; reads nothing before it.
 (defun libtest-performs-nothing-p (name &optional seen)
   (let* ((system (asdf:find-system name))
-         (mop (or (find-package "DOTCL-MOP") (find-package "SB-MOP")))
+         (mop (or (find-package "DOTCL-MOP") #+sbcl (find-package "SB-MOP")))
          (specs (and mop (find-symbol "METHOD-SPECIALIZERS" mop)))
          (op-class (find-class 'asdf:test-op)))
     (and specs
@@ -634,6 +678,16 @@ remember it to load after LIBTEST-BEGIN."
     (unless names (libtest-die "LIBTEST-ERROR" "nested OPERATE with :FORCE" 2))
     (libstatus-with-debugger-hook #'libtest-error-hook
       (dolist (name names) (asdf:test-system name)))))
+;; A library whose TEST-OP does nothing but which ships a conventionally named
+;; test system: run that system, so its suites are counted.
+(when (and *libtest-extra-systems* (libtest-performs-nothing-p "$sys"))
+  (let ((names (reverse *libtest-extra-systems*)))
+    (format t "~%LIBTEST-NOTE TEST-OP is empty, running TEST-SYSTEM on~{ ~a~}~%" names)
+    (libstatus-with-debugger-hook #'libtest-error-hook
+      (dolist (name names) (asdf:test-system name))
+      ;; A test system that only defines FiveAM suites runs nothing by itself.
+      (let ((run (and (find-package "FIVEAM") (find-symbol "RUN-ALL-TESTS" "FIVEAM"))))
+        (when run (funcall run))))))
 $(extra_tests "$sys")
 ;; stefil keeps the result of the last suite run in *LAST-TEST-RESULT*. A test
 ;; op that does not print it leaves only progress characters, so print it here.
@@ -707,6 +761,13 @@ DRVEOF
     note=$(sed -n 's/^LIBTEST-ERROR //p' "$log" | head -1)
     [ -n "$note" ] || note=$(sed -n 's/^; Debugger entered on //p' "$log" | head -1)
     [ -n "$note" ] || note=$(sed -n 's/^LIBTEST-MISSING-TEST-SYSTEM \(.*\)/test system not in the release: \1/p' "$log" | head -1)
+    # A conventionally named test system that exists but did not load is not
+    # "nothing to run": with an empty TEST-OP the judge says no-tests, which
+    # hides the load failure. Report it as load-fail.
+    if [ "$1" = "no-tests" ] && grep -q '^LIBTEST-NOTE .* did not load' "$log"; then
+      set -- load-fail - 0 0
+      note=$(sed -n 's/^LIBTEST-NOTE //p' "$log" | head -1)
+    fi
   fi
   verdict=$1; framework=$2; passed=$3; failed=$4
   tsys=$(sed -n 's/^LIBTEST-TEST-SYSTEMS *//p; s/^LIBTEST-EXTRA-SYSTEM //p' "$log" | tr '\n' ' ')

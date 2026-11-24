@@ -91,12 +91,22 @@ public static partial class Runtime
             TextReader streamReader = GetTextReader(filespec);
             var reader = new Reader(streamReader);
 
-            // Save and bind *package* and *readtable* per CLHS (but NOT *load-pathname*/*load-truename* for streams)
+            // Save and bind *package* and *readtable* per CLHS. *load-pathname* and
+            // *load-truename* are the stream's file for a file stream and NIL for any other
+            // stream, not the enclosing load's.
             var packageSym = Startup.Sym("*PACKAGE*");
             var readtableSym2 = Startup.Sym("*READTABLE*");
             var oldPackage = DynamicBindings.Get(packageSym);
             var oldReadtable2 = DynamicBindings.Get(readtableSym2);
             int streamBindDepth = DynamicBindings.Depth;
+            LispObject streamLoadPath = Nil.Instance, streamLoadTrue = Nil.Instance;
+            if (filespec is LispFileStream lfs && !string.IsNullOrEmpty(lfs.FilePath))
+            {
+                streamLoadPath = lfs.OriginalPathname ?? LispPathname.FromString(lfs.FilePath);
+                streamLoadTrue = LispPathname.FromString(Compat.ResolveSymlinks(Path.GetFullPath(lfs.FilePath)));
+            }
+            DynamicBindings.Push(Startup.Sym("*LOAD-PATHNAME*"), streamLoadPath);
+            DynamicBindings.Push(Startup.Sym("*LOAD-TRUENAME*"), streamLoadTrue);
             DynamicBindings.Push(packageSym, oldPackage);
             DynamicBindings.Push(readtableSym2, oldReadtable2);
             PushPolicyBindings();
@@ -260,7 +270,7 @@ public static partial class Runtime
                 LispObject result = Nil.Instance;
                 bool isCompiled = filePath.EndsWith(".sil", StringComparison.OrdinalIgnoreCase)
                     || filePath.EndsWith(".ufsl", StringComparison.OrdinalIgnoreCase)
-                    || source.StartsWith(";; -*- dotcl-compiled -*-");
+                    || source.StartsWith(";; -*- dotcl-compiled -*-", System.StringComparison.Ordinal);
                 if (!isCompiled)
                 {
                     SourceLineTable = new Dictionary<object, SourceSpan>(ReferenceEqualityComparer.Instance);
@@ -526,7 +536,8 @@ public static partial class Runtime
         {
             if (IsNewerRuntimeBindFailure(tie.InnerException))
                 SignalNewerRuntimeFasl(filePath, NeededRuntimeVersion(tie.InnerException), RunningRuntimeVersion());
-            throw tie.InnerException;
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
+            throw;
         }
         catch (IOException ioe) when (IsNewerRuntimeBindFailure(ioe))
         {
@@ -658,8 +669,8 @@ public static partial class Runtime
                 Compat.AddArg(psi, "-r");
                 Compat.AddArg(psi, Path.Combine(AppContext.BaseDirectory, "*.dll"));
                 Compat.AddArg(psi, "--targetos");
-                Compat.AddArg(psi, rid.StartsWith("win") ? "windows"
-                                 : rid.StartsWith("osx") ? "osx" : "linux");
+                Compat.AddArg(psi, rid.StartsWith("win", System.StringComparison.Ordinal) ? "windows"
+                                 : rid.StartsWith("osx", System.StringComparison.Ordinal) ? "osx" : "linux");
                 Compat.AddArg(psi, "--targetarch");
                 Compat.AddArg(psi, rid.Substring(rid.LastIndexOf('-') + 1));
                 Compat.AddArg(psi, "-O");
@@ -714,7 +725,7 @@ public static partial class Runtime
                           Environment.SpecialFolder.UserProfile), ".nuget", "packages");
         var pkg = Path.Combine(home, $"microsoft.netcore.app.crossgen2.{rid}");
         if (!Directory.Exists(pkg)) return null;
-        var exe = rid.StartsWith("win") ? "crossgen2.exe" : "crossgen2";
+        var exe = rid.StartsWith("win", System.StringComparison.Ordinal) ? "crossgen2.exe" : "crossgen2";
         string? best = null;
         Version? bestV = null;
         foreach (var dir in Directory.EnumerateDirectories(pkg))
@@ -1233,16 +1244,49 @@ public static partial class Runtime
                 int count = 0;
                 var tmp = body;
                 while (tmp is Cons) { count++; tmp = ((Cons)tmp).Cdr; }
+                // One body form that is itself a PROGN, LOCALLY or (SYMBOL-)MACROLET holding
+                // several forms is split too: its forms are top level forms (CLHS 3.2.3.1),
+                // and left as one unit a DEFUN in it is installed before the forms ahead of
+                // it have run (an UNMEMOIZE ahead of a DEFUN saw the new function).
+                // The same holds when the one body form is a macro call whose expansion is such a
+                // PROGN (DEFINE-MEMO-FUNCTION expands to (progn (unmemoize ..) (defun ..) (memoize ..))).
+                // Only for LOAD of a source file or EVAL: COMPILE-FILE processes the body of an
+                // EVAL-WHEN a form at a time by itself, and expanding the macro here as well
+                // would expand it twice.
+                List<LispObject>? singleSubs = null;
+                if (count == 1 && DynamicBindings.Get(Startup.Sym("*COMPILE-FILE-MODE*")) is Nil)
+                {
+                    var onlyForm = ((Cons)body).Car;
+                    if (IsSplittableTopLevelScope(onlyForm) || onlyForm is Cons oc && oc.Car is Symbol)
+                    {
+                        // Expanded here once; what comes back is what gets compiled, so a macro is
+                        // not expanded a second time (its expansion may have side effects, or fail).
+                        singleSubs = FlattenTopLevel(onlyForm, scopes, line).ToList();
+                        if (singleSubs.Count == 0) singleSubs = null;
+                    }
+                }
+                if (singleSubs != null)
+                {
+                    foreach (var sub in singleSubs)
+                        yield return new Cons(sym, new Cons(situations, new Cons(sub, Nil.Instance)));
+                    yield break;
+                }
                 if (count > 1)
                 {
                     while (body is Cons bodyCell)
                     {
-                        // (eval-when (situations) single-form)
-                        var wrappedForm = new Cons(sym,
-                            new Cons(situations, new Cons(bodyCell.Car, Nil.Instance)));
-                        // Don't recurse into the wrapped form (it's already single)
-                        // but do flatten the inner form if it's progn
-                        yield return wrappedForm;
+                        if (IsSplittableTopLevelScope(bodyCell.Car))
+                        {
+                            foreach (var sub in FlattenTopLevel(bodyCell.Car, scopes, line))
+                                yield return new Cons(sym,
+                                    new Cons(situations, new Cons(sub, Nil.Instance)));
+                        }
+                        else
+                        {
+                            // (eval-when (situations) single-form)
+                            yield return new Cons(sym,
+                                new Cons(situations, new Cons(bodyCell.Car, Nil.Instance)));
+                        }
                         body = bodyCell.Cdr;
                     }
                     yield break;
@@ -1359,7 +1403,14 @@ public static partial class Runtime
             // Don't expand forms already handled by ShouldExecuteAtCompileTime or
             // IsEvalWhenForCompileFile: they need their original identity preserved.
             // Only CL's own symbols; another package can shadow DEFUN with a macro.
-            if (!inLocalMacroScope && !IsCompileTimeSideEffectForm(sym.Name)
+            // Inside a top level MACROLET the global macro table is used only for a name no
+            // enclosing MACROLET defines: its expansion is made of top level forms as well, so an
+            // EVAL-WHEN in it keeps its compile-time definitions after COMPILE-FILE.
+            // Not under a SYMBOL-MACROLET either: a global macro may read the symbol macros
+            // through its environment (serapeum's DEFCONSTRUCTOR asks for %UNION), and the
+            // expansion made here has no environment.
+            if ((!inLocalMacroScope || !BlocksGlobalMacroExpansion(sym, scopes!))
+                && !IsCompileTimeSideEffectForm(sym.Name)
                 && !(ReferenceEquals(sym.HomePackage, Startup.CL)
                      && (sym.Name is "DEFUN" or "DEFVAR" or "DEFPARAMETER")))
             {
@@ -1427,6 +1478,25 @@ public static partial class Runtime
             if (x is Symbol sx) { if (names.Contains(sx)) return true; }
             else if (x is Cons cx) { stack.Push(cx.Cdr); stack.Push(cx.Car); }
         }
+        return false;
+    }
+
+    /// <summary>True when a global macro call OP inside SCOPES must be left for the scope
+    /// to expand: a MACROLET defines a macro of that name, or a SYMBOL-MACROLET is around it
+    /// (the macro's environment argument would be missing when it is expanded here).</summary>
+    private static bool BlocksGlobalMacroExpansion(Symbol op, List<LocalMacroScope> scopes)
+    {
+        foreach (var scope in scopes)
+            if (scope.Op.Name == "SYMBOL-MACROLET") return true;
+        return ShadowedByLocalMacro(op, scopes);
+    }
+
+    /// <summary>True when OP names a macro one of SCOPES' MACROLETs defines.</summary>
+    private static bool ShadowedByLocalMacro(Symbol op, List<LocalMacroScope> scopes)
+    {
+        foreach (var scope in scopes)
+            if (scope.Op.Name == "MACROLET" && LocalBindingNames(scope.Bindings).Contains(op))
+                return true;
         return false;
     }
 

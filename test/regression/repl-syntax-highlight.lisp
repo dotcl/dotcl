@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Syntax highlighting of the input line in the bundled REPL.
 ;;;
 ;;; Strings, comments and keywords are painted by the redraw, with the same

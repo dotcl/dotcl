@@ -22,7 +22,8 @@
     ("heap"      ilp-heap-selfcheck  200  1343498)
     ("ring"      ilp-ring-selfcheck  500  858950)
     ("tokenizer" ilp-tok-selfcheck   300  74033288)
-    ("vec2"      ilp-vec2-selfcheck 200  245144966))
+    ("vec2"      ilp-vec2-selfcheck 200  245144966)
+    ("bits"      ilp-bits-selfcheck 300  3749992))
   "(NAME FUNCTION ARGUMENT EXPECTED). EXPECTED is what the C# half returns for
    the same argument; Ref.cs carries the same table implicitly.")
 

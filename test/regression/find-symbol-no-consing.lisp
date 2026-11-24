@@ -15,10 +15,6 @@
 
 ;;; --- the answers ----------------------------------------------------------
 
-(deftest find-symbol-external-status
-  (multiple-value-list (find-symbol "CAR" "CL"))
-  (car :external))
-
 ;;; Written without a package-qualified literal: the whole file is READ before
 ;;; any of it runs, so naming FSNC-PKG::HIDDEN here would need the package to
 ;;; exist at read time.

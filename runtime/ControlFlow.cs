@@ -809,11 +809,17 @@ public class LispSourceException : Exception
         Line = line;
     }
 
+    private static string RootMessageOf(Exception ex) => GetRootMessage(ex);
+
     private static string GetRootMessage(Exception ex)
     {
         // Walk to the innermost non-LispSourceException for the actual error message
         while (ex.InnerException is LispSourceException lse)
             ex = lse.InnerException!;
+        // The same words the STORAGE-CONDITION a handler sees carries, not the CLR's
+        // "Exception of type 'System.OutOfMemoryException' was thrown."
+        if (ex is OutOfMemoryException)
+            return "Heap exhausted: the allocation could not be satisfied (STORAGE-CONDITION)";
         return ex.Message;
     }
 
@@ -846,7 +852,7 @@ public class LispSourceException : Exception
             var found = Runtime.DefinitionSourcesForFrame(fn);
             if (found.Count == 1) { file0 = found[0].File; line0 = found[0].Line; }
         }
-        sb.AppendLine($"{file0}:{line0}: {cur.Message}");
+        sb.AppendLine($"{file0}:{line0}: {RootMessageOf(cur)}");
         if (origin?.Frames is { Length: > 0 } frames)
             for (int i = 0; i < frames.Length; i++)
                 sb.AppendLine($"  {i,3}: {frames[i]}");

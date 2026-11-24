@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; COMPILE-FILE does not create the classes a file's top-level DEFCLASS forms
 ;;; define. CLHS asks the compiler only to recognize the name for later
 ;;; declarations, specializers and :METACLASS options in the same file; the

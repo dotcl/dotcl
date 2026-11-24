@@ -71,11 +71,12 @@
   (labels ((g (n &optional (acc 0)) (if (zerop n) acc (g (1- n) (1+ acc))))) (g 50))
   50)
 
-;; Tail self-call inside handler-case (leave, not br): deep, must TCO+catch-clean.
+;; A self call inside the body of HANDLER-CASE is not a tail call: the handler stays in force
+;; for it, so the error at the bottom is caught by the innermost level.
 (deftest-compiled-only labels-self-tco.handler-case-tail
   (labels ((g (n acc)
              (handler-case
-                 (if (zerop n) acc (g (1- n) (1+ acc)))
-               (error () :err))))
-    (g 1000000 0))
-  1000000)
+                 (if (zerop n) (error "bottom") (g (1- n) (1+ acc)))
+               (error () (list :err n acc)))))
+    (g 1000 0))
+  (:err 0 1000))

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A DEFUN compiled under (debug 0) records no frame, and from a .fasl it is
 ;;; still called through an entry pointer, as a framed DEFUN is. Without the
 ;;; entry every call to it went through InvokeN, which made (debug 0) code

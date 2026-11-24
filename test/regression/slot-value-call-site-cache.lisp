@@ -57,7 +57,7 @@
   ((1 1) 100))
 
 (deftest-emitting-only slot-value-call-site-cache.in-a-fasl
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "svc-fasl.lisp" dir))
          (fasl (merge-pathnames "svc-fasl.fasl" dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)

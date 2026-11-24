@@ -38,6 +38,11 @@
       ,@(compile-sym-lookup name)
       (:castclass "Symbol")
       (:stloc ,sym-local)
+      ,@(unless is-defconstant
+          `((:ldloc ,sym-local)
+            (:load-sym-keyword ,(if is-defvar "DEFVAR" "DEFPARAMETER"))
+            (:call "Runtime.CheckSpecialProclamation")
+            (:pop)))
       ,@(if has-init-p
             (let ((skip-label (gen-label "DEFVAR-SKIP")))
               `(,@(if is-defvar
@@ -254,10 +259,14 @@
           (%compiler-let-symbol-p (car form))
           (< depth *macro-expand-depth-limit*)
           (%macro-expander-here (car form)))
-     (handler-case
-         (let ((expanded (%return-from-scan-macroexpand form (%macro-expander-here (car form)))))
-           (form-macroexpands-to-return-from-p name expanded (1+ depth)))
-       (error () t)))
+     (if (%macro-expander-takes-environment-p
+          (car form) (%macro-expander-here (car form)))
+         t
+         (handler-case
+             (let ((expanded (%return-from-scan-macroexpand
+                              form (%macro-expander-here (car form)))))
+               (form-macroexpands-to-return-from-p name expanded (1+ depth)))
+           (error () t))))
     ;; A global macro call may expand to a return-from (possibly after more
     ;; expansions). Local macrolet macros are handled separately by
     ;; form-has-macrolet-p (they are not in the global *macros* table).
@@ -268,19 +277,33 @@
     ((and (symbolp (car form))
           (< depth *macro-expand-depth-limit*)
           (%macro-expander-here (car form)))
-     (handler-case
-         (let ((expanded (%return-from-scan-macroexpand form (%macro-expander-here (car form)))))
-           (if (equal expanded form)
-               (%scan-code-forms (lambda (f) (form-macroexpands-to-return-from-p name f depth))
-                                 (cdr form))
-               (form-macroexpands-to-return-from-p name expanded (1+ depth))))
-       (error () t)))
+     (if (%macro-expander-takes-environment-p
+          (car form) (%macro-expander-here (car form)))
+         t
+         (handler-case
+             (let ((expanded (%return-from-scan-macroexpand
+                              form (%macro-expander-here (car form)))))
+               (if (equal expanded form)
+                   (%scan-code-forms (lambda (f) (form-macroexpands-to-return-from-p name f depth))
+                                     (cdr form))
+                   (form-macroexpands-to-return-from-p name expanded (1+ depth))))
+           (error () t))))
     (t
      ;; Structural recursion into the subforms.
      (do ((cur form (cdr cur)))
          ((atom cur) (when cur (form-macroexpands-to-return-from-p name cur depth)))
        (when (form-macroexpands-to-return-from-p name (car cur) depth)
          (return t))))))
+
+(defun %forms-may-return-from-p (name forms)
+  "T when a form of FORMS has, or through macro expansion may have, a (return-from NAME ...):
+   the test for building the implicit block of a function named NAME."
+  (or (let ((*return-from-scan-memo* (make-hash-table :test 'eq))
+            (*return-from-scan-expansions* (make-hash-table :test 'eq)))
+        (some (lambda (f) (form-macroexpands-to-return-from-p name f 0)) forms))
+      ;; A MACROLET / SYMBOL-MACROLET local macro can also expand to it, and its
+      ;; expander is not in the global table, so the scan above cannot expand it.
+      (some #'form-has-macrolet-p forms)))
 
 (defun form-has-macrolet-p (form)
   "T if FORM contains a MACROLET / SYMBOL-MACROLET anywhere in the tree. Such a
@@ -368,28 +391,28 @@
 (defun %optional-direct-eligible-p (required optional has-key-p rest-param aux)
   "T if a required+&optional function can carry typed direct delegates for its
    concrete arities in addition to the array XEP. Requires: at least one optional,
-   no &key/&rest/&aux, no supplied-p var, and total params <= 8 (the
-   direct-delegate arity ceiling). The default forms themselves are unrestricted:
-   an absent optional is bound by a LET* in the direct body, which evaluates the
-   form at call time exactly where the array XEP would; so (pkg *package*) and
-   defaults that read earlier params are fine."
+   no &key/&rest/&aux, and total params <= 8 (the direct-delegate arity ceiling).
+   The default forms themselves are unrestricted: an absent optional is bound by
+   a LET* in the direct body, which evaluates the form at call time exactly where
+   the array XEP would; so (pkg *package*) and defaults that read earlier params
+   are fine. A supplied-p variable is bound T when a typed entry receives the
+   optional and NIL when the default runs."
   (and optional (not has-key-p) (null rest-param) (null aux)
-       (<= (+ (length required) (length optional)) 8)
-       (every (lambda (o) (null (third o))) optional)))   ; no supplied-p var
+       (<= (+ (length required) (length optional)) 8)))
 
-(defun %key-direct-eligible-p (required optional key rest-param aux)
+(defun %key-direct-eligible-p (required optional key rest-param aux has-key-p)
   "T if a required+&key function can carry a typed direct delegate for its
    required-only arity in addition to the array XEP.
 
    A variadic LispFunction has one entry, taking LispObject[], so a call builds
    an array even when it passes no keywords at all -- and that is most calls to
-   a &key function. Requires: at least one key param, no &optional/&rest/&aux,
-   no supplied-p var, and required <= 8 (the direct-delegate arity ceiling).
+   a &key function. Requires: a &key marker (with or without key params), no
+   &optional/&rest/&aux, and required <= 8 (the direct-delegate arity ceiling).
    The default forms are unrestricted: an absent key is bound by a LET* in the
    direct body, which evaluates the form at call time exactly where the array
    XEP would. A supplied-p var is fine too: on this arity none of them are
    supplied, so each is bound to NIL."
-  (and key (null optional) (null rest-param) (null aux)
+  (and (or key has-key-p) (null optional) (null rest-param) (null aux)
        (<= (length required) 8)))
 
 (defun %anonymous-fn-label (fn-name)
@@ -553,7 +576,10 @@
                `((let ((,rest-param ,rin)) ,@wrapped-body))
                `((let* ,(loop for o in optional
                               for in in ins
-                              collect (list (car o) `(%key-value ,in ,(second o))))
+                              append (list (list (car o) `(%key-value ,in ,(second o))))
+                              when (third o)
+                                collect (list (third o)
+                                              `(not (%key-absent-p ,in))))
                    ,@wrapped-body))))
          (copy :none))
     (flet ((compile-copy ()
@@ -563,7 +589,9 @@
                   required
                   (if rest-param
                       `((let ((,rest-param (list))) ,@wrapped-body))
-                      `((let* ,(mapcar (lambda (o) (list (car o) (second o))) optional)
+                      `((let* ,(loop for o in optional
+                                     append (list (list (car o) (second o)))
+                                     when (third o) collect (list (third o) nil))
                           ,@wrapped-body)))
                   fn-name fn-pkg fn-symbol)
                (unless copy-self-p instrs)))
@@ -773,7 +801,7 @@
 
 
 
-(defun %rest-direct-eligible-p (required optional key rest-param aux)
+(defun %rest-direct-eligible-p (required optional key rest-param aux &optional has-key-p)
   "T if a required+&rest function can carry typed direct delegates for the call
    shapes that pass a small, fixed number of extra arguments, in addition to the
    array XEP.
@@ -785,29 +813,116 @@
    of exactly them, which is what the array entry would have consed. (LIST) with
    no arguments is NIL, so the required-only arity allocates nothing.
 
-   Requires: a rest param, no &optional/&key/&aux (those compose with &rest in
+   Requires: a rest param, no &optional/&key (not even a bare &key marker, which
+   makes an odd keyword list an error)/&aux (those compose with &rest in
    ways the array entry handles and this shape does not), and required <= 8."
-  (and rest-param (null optional) (null key) (null aux)
+  (and rest-param (null optional) (null key) (null aux) (not has-key-p)
        (<= (length required) 8)))
+
+(defparameter +rest-subst-opaque-heads+
+  '(case ecase ccase typecase etypecase ctypecase handler-case restart-case
+    loop do do* destructuring-bind with-slots define-condition
+    flet labels macrolet symbol-macrolet)
+  "Forms whose syntax has symbols in places that are not calls; one that
+   mentions the &rest variable makes %REST-SUBSTITUTE give up.")
+
+(defun %rest-subst-tree-mentions-p (x sym)
+  (cond ((eq x sym) t)
+        ((consp x) (or (%rest-subst-tree-mentions-p (car x) sym)
+                       (%rest-subst-tree-mentions-p (cdr x) sym)))
+        (t nil)))
+
+(defun %rest-substitute (rest xs forms)
+  "FORMS with every use of the &rest variable REST replaced, where REST would be
+   bound to (LIST . XS) with XS the variables of the extra arguments, and every
+   use is one of: (LENGTH REST), (NTH <integer> REST), (CAR / FIRST / CADR /
+   SECOND / CADDR / THIRD REST), (NULL / NOT / ENDP REST), a final argument of
+   APPLY, or an IGNORE / IGNORABLE declaration. Returns the new forms, or :FAIL
+   when REST is used any other way (stored, passed on, assigned, captured by
+   a form this does not read) -- the caller then conses the list."
+  (let ((n (length xs)))
+    (labels ((fail () (return-from %rest-substitute :fail))
+             (is (form head)
+               (and (consp form) (eq (car form) head)
+                    (consp (cdr form)) (eq (cadr form) rest)
+                    (null (cddr form))))
+             (nth-of (k) (if (< k n) (nth k xs) nil))
+             (walk-decl (d)
+               (if (and (consp d) (member (car d) '(ignore ignorable dynamic-extent)))
+                   (let ((vs (remove rest (cdr d))))
+                     (and vs (cons (car d) vs)))
+                   (walk d)))
+             (walk-list (forms)
+               (let ((out '()))
+                 (do ((f forms (cdr f)))
+                     ((atom f)
+                      (when f (fail))
+                      (nreverse out))
+                   (let ((w (walk (car f))))
+                     (unless (and (null w) (consp (car f)) (eq (caar f) 'declare))
+                       (push w out))))))
+             (walk-bindings (bs)
+               (loop for b in bs
+                     collect (cond ((eq b rest) (fail))
+                                   ((consp b)
+                                    (when (eq (car b) rest) (fail))
+                                    (list* (car b) (walk-list (cdr b))))
+                                   (t b))))
+             (walk (form)
+               (cond
+                 ((eq form rest) (fail))
+                 ((atom form) form)
+                 ((eq (car form) 'quote) form)
+                 ((and (symbolp (car form)) (car form)
+                       (member (car form) +rest-subst-opaque-heads+))
+                  (when (%rest-subst-tree-mentions-p form rest) (fail))
+                  form)
+                 ((is form 'length) n)
+                 ((and (eq (car form) 'nth) (consp (cdr form)) (integerp (cadr form))
+                       (>= (cadr form) 0)
+                       (consp (cddr form)) (eq (caddr form) rest) (null (cdddr form)))
+                  (nth-of (cadr form)))
+                 ((or (is form 'car) (is form 'first)) (nth-of 0))
+                 ((or (is form 'cadr) (is form 'second)) (nth-of 1))
+                 ((or (is form 'caddr) (is form 'third)) (nth-of 2))
+                 ((or (is form 'null) (is form 'not) (is form 'endp)) (if (= n 0) t nil))
+                 ((and (eq (car form) 'apply) (consp (cdr form)) (consp (cddr form))
+                       (let ((l (last form))) (and (consp l) (eq (car l) rest) (null (cdr l)))))
+                  `(funcall ,@(walk-list (butlast (cdr form))) ,@xs))
+                 ((eq (car form) 'declare)
+                  (let ((ds (remove nil (mapcar #'walk-decl (cdr form)))))
+                    (and ds (cons 'declare ds))))
+                 ((and (member (car form) '(let let*)) (consp (cdr form)) (listp (cadr form)))
+                  (list* (car form) (walk-bindings (cadr form)) (walk-list (cddr form))))
+                 (t (walk-list form)))))
+      (let ((out '()))
+        (dolist (f forms)
+          (let ((w (walk f)))
+            ;; a DECLARE whose specs all went away leaves nothing
+            (unless (and (consp f) (eq (car f) 'declare) (null w))
+              (push w out))))
+        (nreverse out)))))
 
 (defun %build-rest-direct-specs (required rest-param wrapped-body fn-name fn-pkg fn-symbol
                                  &optional arity0-instrs)
   "((ARITY SELF-P DIRECT-BODY) ...) for the arities of a &rest function that can
-   be typed: required + 0, +1 and +2 extra arguments. ARITY0-INSTRS, if given, is
+   be typed: required + 0 to +4 extra arguments. ARITY0-INSTRS, if given, is
    the required-only arity already compiled (and not calling itself); it is used
    instead of compiling that arity again.
 
-   The cut at 2 is where the shapes stop being common: (F A) and (F A X) are what
-   callers write, and each further arity is another copy of the body in the image.
-   Anything longer, and APPLY, still go through the array XEP."
+   Each further arity is another copy of the body in the image, so the cut is
+   at 4. Anything longer, and APPLY, still go through the array XEP."
   (let ((rn (length required))
         (specs '()))
-    (loop for extra from 0 to 2
+    (loop for extra from 0 to 4
           for n = (+ rn extra)
           when (<= n 8)
             do (let* ((xs (loop repeat extra collect (gensym "REST")))
                       (direct-params (append required xs))
-                      (direct-body `((let ((,rest-param (list ,@xs))) ,@wrapped-body))))
+                      (direct-body (let ((subst (%rest-substitute rest-param xs wrapped-body)))
+                                     (if (eq subst :fail)
+                                         `((let ((,rest-param (list ,@xs))) ,@wrapped-body))
+                                         subst))))
                  (if (and (= extra 0) arity0-instrs)
                      (push (list n nil arity0-instrs) specs)
                      (multiple-value-bind (body-instrs self-p)
@@ -832,9 +947,14 @@
           for present-opts = (subseq optional 0 present)
           for absent-opts = (subseq optional present)
           for direct-params = (append required (mapcar #'car present-opts))
-          for direct-body = (if absent-opts
-                                `((let* ,(mapcar (lambda (o) (list (car o) (second o))) absent-opts)
-                                    ,@wrapped-body))
+          for bindings = (append
+                          (loop for o in present-opts
+                                when (third o) collect (list (third o) t))
+                          (loop for o in absent-opts
+                                append (list (list (car o) (second o)))
+                                when (third o) collect (list (third o) nil)))
+          for direct-body = (if bindings
+                                `((let* ,bindings ,@wrapped-body))
                                 wrapped-body)
           do (multiple-value-bind (body-instrs self-p)
                  (if (and (= present 0) arity0-instrs)
@@ -847,6 +967,74 @@
                ;; per arity tells HandleDefmethod which signature to emit.
                (push (list n (if self-p t nil) body-instrs) specs)))
     (nreverse specs)))
+
+(defun %build-optional-key-direct-specs (required optional key allow-other-keys-p
+                                         has-key-p wrapped-body
+                                         fn-name fn-pkg fn-symbol)
+  "Typed entries for a function with &optional and &key but no &rest: one per
+   number of optionals supplied, plus one with every optional and a single
+   keyword pair. Each entry binds the keys a call did not supply to their
+   defaults, and the array XEP still handles every other arity."
+  (let ((n (length required))
+        (m (length optional))
+        (specs '()))
+    (loop for k from 0 to m
+          for arity = (+ n k)
+          while (<= arity 8)
+          do (let* ((present (subseq optional 0 k))
+                    (absent (subseq optional k))
+                    (params (append required (mapcar #'car present)))
+                    (bindings
+                      (append
+                       (loop for o in present
+                             when (third o) collect (list (third o) t))
+                       (loop for o in absent
+                             append (list (list (car o) (second o)))
+                             when (third o) collect (list (third o) nil))
+                       (loop for kd in key
+                             append (list (list (second kd) (third kd)))
+                             when (fourth kd) collect (list (fourth kd) nil))))
+                    (body (if bindings `((let* ,bindings ,@wrapped-body)) wrapped-body)))
+               (multiple-value-bind (instrs self-p)
+                   (compile-function-body-direct params body fn-name fn-pkg fn-symbol)
+                 (unless self-p (push (list arity nil instrs) specs)))))
+    (when (and (or key has-key-p) (<= (+ n m 2) 8))
+      (let* ((kw-var (gensym "KW"))
+             (val-var (gensym "KVAL"))
+             (params (append required (mapcar #'car optional)
+                             (list kw-var val-var)))
+             (present (loop for o in optional
+                            when (third o) collect (list (third o) t)))
+             (body `((let* ,present
+                       ,@(%build-key-direct-body required key wrapped-body
+                                                 kw-var val-var
+                                                 allow-other-keys-p fn-name)))))
+        (multiple-value-bind (instrs self-p)
+            (compile-function-body-direct params body fn-name fn-pkg fn-symbol)
+          (unless self-p
+            (push (list (+ n m 2) nil instrs) specs)))))
+    (nreverse specs)))
+
+(defun %build-required-only-direct-spec (required optional key rest-param
+                                         wrapped-body fn-name fn-pkg fn-symbol)
+  "The typed required-only arity for a lambda list that mixes &optional, &rest
+   and &key, or NIL. Every other parameter is bound by a LET* to its default
+   (or NIL for a rest parameter or supplied-p variable), which is what the array
+   XEP would do for a call that passes nothing beyond the required arguments."
+  (let* ((bindings
+           (append
+            (loop for o in optional
+                  append (list (list (car o) (second o)))
+                  when (third o) collect (list (third o) nil))
+            (when rest-param (list (list rest-param nil)))
+            (loop for k in key
+                  append (list (list (second k) (third k)))
+                  when (fourth k) collect (list (fourth k) nil))))
+         (body (if bindings `((let* ,bindings ,@wrapped-body)) wrapped-body)))
+    (multiple-value-bind (instrs self-p)
+        (compile-function-body-direct required body fn-name fn-pkg fn-symbol)
+      (unless self-p
+        (list (list (length required) nil instrs))))))
 
 (defun %sil-portable-var (x)
   (if (and (symbolp x) x (not (keywordp x)))
@@ -909,7 +1097,7 @@
           ;; verifiable IL (and AOT codegens like IL2CPP) does not.
           `(,@(compile-sym-lookup name)
             (:castclass "Symbol")
-            ,@(compile-lambda params wrapped-body "" (mangle-name name))
+            ,@(compile-lambda params wrapped-body "" (mangle-defun-name name))
             (:castclass "LispFunction")
             (:call "CilAssembler.RegisterFunctionOnSymbol")
             ,@(compile-sym-lookup name))
@@ -920,7 +1108,7 @@
           ;; register directly on it. (fix fallout; ANSI DEFUN.ERROR.4
           ;; eval's a prog2-nested (defun #:g ...).)
           `((:load-const ,name) (:castclass "Symbol")
-            ,@(compile-lambda params wrapped-body "" (mangle-name name))
+            ,@(compile-lambda params wrapped-body "" (mangle-defun-name name))
             (:castclass "LispFunction")
             (:call "CilAssembler.RegisterFunctionOnSymbol")
             (:load-const ,name)))
@@ -936,17 +1124,17 @@
                (symbol-package (cadr name)))
           `(,@(compile-sym-lookup (cadr name))
             (:castclass "Symbol")
-            ,@(compile-lambda params wrapped-body "" (mangle-name name))
+            ,@(compile-lambda params wrapped-body "" (mangle-defun-name name))
             (:castclass "LispFunction")
             (:call "CilAssembler.RegisterSetfFunctionOnSymbol")
             ,@uninterned-fixup
             ,@(compile-quoted name))
-          `((:ldstr ,(mangle-name name))
-            ,@(compile-lambda params wrapped-body "" (mangle-name name))
+          `((:ldstr ,(mangle-defun-name name))
+            ,@(compile-lambda params wrapped-body "" (mangle-defun-name name))
             (:castclass "LispFunction")
             (:call "CilAssembler.RegisterFunction")
             ,@uninterned-fixup
-            (:ldstr ,(mangle-name name)) (:call "Startup.Sym")))))
+            (:ldstr ,(mangle-defun-name name)) (:call "Startup.Sym")))))
 
 ;;; ------------------------------------------------------------
 ;;; Typed entries
@@ -1215,7 +1403,7 @@
 (defun %self-shortcut-call-p (name args)
   "Whether COMPILE-NAMED-CALL takes a call to NAME with ARGS, made from NAME's
    own body, to the function cached for that body instead of the global one."
-  (let ((name-str (mangle-name name)))
+  (let ((name-str (mangle-defun-name name)))
     (and (cstate-self-fn-local)
          (not (local-function-entry name-str))
          (if (cstate-tco-self-symbol)
@@ -1670,17 +1858,20 @@
        (compile-let (cadr x) (cddr x) (eq op 'let*)
                     (lambda (real-body) (compile-typed-progn real-body spec))))
       ((and (eq op 'block) (consp (cdr x)) (symbolp (cadr x)) (cddr x)
+            (not (%block-opaque-p x))
             (not (%block-returns-to-p (cadr x) (cddr x))))
        (let* ((name (cadr x))
               (tag (list '#:transparent-block))
-              (result (let ((*transparent-blocks*
+              (result (let ((*lexical-decl-frames* (%push-decl-frame :block (list name) nil))
+                            (*transparent-blocks*
                               (cons (list* name tag (%block-identity name))
                                     *transparent-blocks*))
                             (*inlining-stack* (inline-guard-stack name)))
                         (catch tag
                           (compile-typed-progn (cddr x) spec)))))
          (if (eq result :transparent-block-aborted)
-             (compile-typed-result x spec)
+             (progn (%note-block-opaque x)
+                    (compile-typed-result x spec))
              result)))
       ((typed-self-call-p x)
        ;; In tail position this is normally the loop back to the top of the
@@ -1723,7 +1914,7 @@
    functions): :defmethod-native when the whole function proves fixnum-native,
    else :defmethod-direct (with :self t when the body does a non-tail
    self-call, so the backend threads the LispFunction in as arg0)."
-  (let* ((mangled (mangle-name name))
+  (let* ((mangled (mangle-defun-name name))
          (param-names (mapcar #'var-name required))
          (pkg-name (cadr pkg-spec))
          ;; Native eligibility: all fixnum params, fixnum return, <=4 params,
@@ -1838,11 +2029,24 @@
   (when (and *same-file-functions* (symbolp name))
     (setf (gethash name *same-file-functions*) (if eligible (length required) -1))))
 
-(defun %note-same-file-defun (name)
+(defun %current-source-top-level-form ()
+  "The top-level form as COMPILE-FILE read it (COMPILE-FILE leaves it in the table under :CURRENT-FORM),
+   or NIL: the same object for every pass over one source form (an EVAL-WHEN compiles its body twice, and a
+   DEFSTRUCT or a macro expands afresh each time), a different one for a second form of the file."
+  (and *same-file-defun-bodies* (values (gethash :current-form *same-file-defun-bodies*))))
+
+(defun %note-same-file-defun (name &optional (body nil body-p))
   "NAME is DEFUNed in this file: a call to it is no longer a forward reference.
    True when a call earlier in the file was compiled as one."
   (when (and *same-file-functions* (symbolp name))
     (let ((v (gethash name *same-file-functions* :absent)))
+      (when (and body-p *same-file-defun-bodies*)
+        (let ((source (%current-source-top-level-form))
+              (prev (gethash name *same-file-defun-bodies* :none)))
+          ;; Only a definition from a different top-level form of the file is a duplicate.
+          (when (and source (not (eq prev :none)) prev (not (eq prev source)))
+            (warn "Duplicate definition for ~S found in one file." name))
+          (setf (gethash name *same-file-defun-bodies*) source)))
       (when (member v '(:absent :forward))
         (setf (gethash name *same-file-functions*) -1))
       (eq v :forward))))
@@ -1854,7 +2058,7 @@
   (let ((n (gethash name *same-file-functions*)))
     (when (and (integerp n) (>= n 0))
       (let ((how (if (gethash name *same-file-inline-defs*) :inline :direct))
-            (mangled (mangle-name name)))
+            (mangled (mangle-defun-name name)))
         (dolist (ins instrs)
           (when (and (consp ins) (eq (car ins) :defmethod-direct) (equal (cadr ins) mangled))
             (nconc ins (list :forward how))
@@ -1896,7 +2100,7 @@
   ;; xref: collect CALLER->CALLEE edges while this body (and any nested lambda)
   ;; compiles, and prepend a load-time %xref-note registration. The caller must
   ;; be a nameable global: an uninterned gensym defun records nothing.
-  (let ((forward-p (%note-same-file-defun name))
+  (let ((forward-p (%note-same-file-defun name body))
         (*xref-caller* (and (not *cross-compiling*) (or *record-xref* *xref-sink*)
                             (or (and (symbolp name) (symbol-package name) name)
                                 (and (consp name) (eq (car name) 'setf) name))))
@@ -1964,13 +2168,16 @@
               (if decls `((declare ,@decls) ,@body) body))))))
 
 (defun %compile-defun-1 (name params body)
+  (unless *cross-compiling* (%note-defun-arity name params))
   ;; Pre-pass: infer return type before body compilation so self-calls inside the
   ;; body benefit from the single-value elision path. Every definition is
   ;; inferred afresh: an inferred type describes the definition it came from,
   ;; and a redefinition must not inherit its predecessor's.
   (when (symbolp name)
     (record-inferred-return-type
-     name (infer-body-return-type body (mangle-name name))))
+     name (infer-body-return-type body (mangle-defun-name name))))
+  (when (symbolp name)
+    (%record-inferred-array-return-type name params body))
   (setq body (%ftype-arg-declarations name params body))
   ;; Keep the definition for substitution at call sites when the name is
   ;; proclaimed INLINE. Recorded here, at the point the DEFUN is compiled,
@@ -2103,9 +2310,10 @@
                (if (null aux-bindings)
                    wrapped-body
                    (multiple-value-bind (decls rest) (%split-leading-declares body)
-                     (if (and use-direct (not has-literal-return-from))
-                         `(,@decls (let* ,aux-bindings ,@rest))
-                         `(,@decls (block ,block-name (let* ,aux-bindings ,@rest))))))))
+                     (multiple-value-bind (outer inner) (%partition-aux-declares decls aux-bindings)
+                       (if (and use-direct (not has-literal-return-from))
+                           `(,@outer (let* ,aux-bindings ,@inner ,@rest))
+                           `(,@outer (block ,block-name (let* ,aux-bindings ,@inner ,@rest)))))))))
            (pkg-spec (defun-pkg-spec name)))
       ;; For uninterned symbols (gensyms), emit extra code to set .Function
       ;; on the actual symbol object after defmethod registers the function.
@@ -2116,7 +2324,7 @@
                 ((and (symbolp name) (null (symbol-package name)))
                  `((:load-const ,name)
                    (:castclass "Symbol")
-                   (:ldstr ,(mangle-name name))
+                   (:ldstr ,(mangle-defun-name name))
                    (:call "CilAssembler.GetFunction")
                    (:castclass "LispFunction")
                    (:call "CilAssembler.RegisterFunctionOnSymbol")))
@@ -2125,7 +2333,7 @@
                       (symbolp (cadr name)) (null (symbol-package (cadr name))))
                  `((:load-const ,(cadr name))
                    (:castclass "Symbol")
-                   (:ldstr ,(mangle-name name))
+                   (:ldstr ,(mangle-defun-name name))
                    (:call "CilAssembler.GetFunction")
                    (:castclass "LispFunction")
                    (:call "CilAssembler.RegisterSetfFunctionOnSymbol"))))))
@@ -2168,20 +2376,21 @@
                                (%build-positional-shared-specs
                                 required optional nil
                                 (if has-literal-return-from wrapped-body body)
-                                (mangle-name name) (cadr pkg-spec) name)
+                                (mangle-defun-name name) (cadr pkg-spec) name)
                              (or shared
                                  (append
                                   (and backing (list backing))
                                   (%build-optional-direct-specs
                                    required optional wrapped-body
-                                   (mangle-name name) (cadr pkg-spec) name arity0)))))
+                                   (mangle-defun-name name) (cadr pkg-spec) name arity0)))))
                           ;; Same idea for &key: the required-only call is the
                           ;; one that can be typed, and it is the common one.
-                          ((and (%key-direct-eligible-p required optional key rest-param aux)
+                          ((and (%key-direct-eligible-p required optional key rest-param aux
+                                                        has-key-p)
                                 (not (%declares-special-p wrapped-body (mapcar #'second key))))
                            (%build-key-direct-specs
                             required key wrapped-body
-                            (mangle-name name) (cadr pkg-spec) name
+                            (mangle-defun-name name) (cadr pkg-spec) name
                             allow-other-keys-p
                             (every (lambda (k) (null (fifth k))) key)
                             ;; Without a RETURN-FROM the implicit block has
@@ -2193,20 +2402,38 @@
                           ;; parameters and the rest list is consed from exactly
                           ;; them -- (F 1), where the list is empty, then costs
                           ;; nothing at all.
-                          ((and (%rest-direct-eligible-p required optional key rest-param aux)
+                          ((and (%rest-direct-eligible-p required optional key rest-param aux has-key-p)
                                 (not (%declares-special-p wrapped-body (list rest-param))))
                            (multiple-value-bind (shared arity0 backing)
                                (%build-positional-shared-specs
                                 required nil rest-param
                                 (if has-literal-return-from wrapped-body body)
-                                (mangle-name name) (cadr pkg-spec) name)
+                                (mangle-defun-name name) (cadr pkg-spec) name)
                              (or shared
                                  (append
                                   (and backing (list backing))
                                   (%build-rest-direct-specs
                                    required rest-param wrapped-body
-                                   (mangle-name name) (cadr pkg-spec) name arity0)))))))))
-                `((:defmethod ,(mangle-name name)
+                                   (mangle-defun-name name) (cadr pkg-spec) name arity0)))))
+                          ;; A lambda list that mixes these markers still has a
+                          ;; required-only shape that can be typed; the other
+                          ;; arities stay on the array XEP.
+                          ((and (plusp (length required)) (null aux)
+                                (<= (length required) 8)
+                                (not (%declares-special-p
+                                      wrapped-body
+                                      (append (mapcar #'car optional)
+                                              (mapcar #'second key)
+                                              (if rest-param (list rest-param) nil)))))
+                           (if (and optional (null rest-param))
+                               (%build-optional-key-direct-specs
+                                required optional key allow-other-keys-p has-key-p
+                                wrapped-body (mangle-defun-name name)
+                                (cadr pkg-spec) name)
+                               (%build-required-only-direct-spec
+                                required optional key rest-param wrapped-body
+                                (mangle-defun-name name) (cadr pkg-spec) name)))))))
+                `((:defmethod ,(mangle-defun-name name)
                    ,@pkg-spec
                    ,@(when (debug-frames-off-p wrapped-body) '(:no-frame t))
                    ;; Development information for SLIME/SLY autodoc and DESCRIBE.
@@ -2220,13 +2447,13 @@
                    ,@(when direct-specs `(:direct-delegates ,direct-specs))
                    :body ,(cond
                             ((not (and direct-specs (eq (car (first direct-specs)) :shared)))
-                             (compile-function-body params wrapped-body (mangle-name name)))
-                            (key
+                             (compile-function-body params wrapped-body (mangle-defun-name name)))
+                            ((and (or key has-key-p) (null optional) (null rest-param))
                              (%compile-key-shared-xep required key allow-other-keys-p
-                                                      (mangle-name name)))
+                                                      (mangle-defun-name name)))
                             (t
                              (%compile-positional-shared-xep required optional rest-param
-                                                             (mangle-name name)))))
+                                                             (mangle-defun-name name)))))
                   ,@uninterned-fixup
                   ,@(if (symbolp name)
                         (compile-sym-lookup name)
@@ -2270,6 +2497,7 @@
   (when (symbolp (cadr expr))
     (remhash (cadr expr) *struct-keyword-ctors*)
     (remhash (cadr expr) *typed-struct-keyword-ctors*)
+    (remhash (cadr expr) *struct-boa-ctors*)
     (remhash (cadr expr) *struct-predicates*)
     (remhash (cadr expr) *typed-vector-struct-accessors*))
   ;; CLHS 3.4.11: extract docstring (first form if string AND more forms follow).
@@ -2284,7 +2512,10 @@
                              (consp body) (stringp (car body)) (cdr body)))
          (docstring (when has-docstring (car body)))
          (real-body (if has-docstring (cdr body) body))
-         (defun-instrs (compile-defun name params real-body)))
+         (defun-instrs (compile-defun name params
+                                      (if *cross-compiling*
+                                          real-body
+                                          (%rebind-u64-params name params real-body)))))
     (if has-docstring
         ;; defun-instrs ends with sym on stack. Set documentation
         ;; via (funcall #'(setf documentation) docstring 'name 'function),
@@ -2297,6 +2528,99 @@
                 (compile-sym-lookup name)
                 (compile-quoted name)))
         defun-instrs)))
+
+;;; A required parameter declared (UNSIGNED-BYTE 64) arrives as a boxed object. Every use
+;;; of it in 64-bit arithmetic then checks it (IsU64), takes its low bits and boxes
+;;; the result on the generic path, and in a large function (a table-driven round
+;;; function uses it in dozens of places) each of those is a call. A LET binding of
+;;; a variable declared (UNSIGNED-BYTE 64) holds the bits in an int64 slot, checked
+;;; once, and its uses are the plain machine operations. So a parameter whose every
+;;; use is an operand of a bitwise operator is rebound that way at entry. (+, - and * are
+;; left out: an index like (+ start 8) is not 64-bit lane arithmetic, and computing it as
+;; one only adds conversions.)
+(defun %u64-declared-type-p (ty)
+  (or (equal ty '(unsigned-byte 64))
+      (equal ty '(integer 0 18446744073709551615))
+      (equal ty '(mod 18446744073709551616))))
+
+(defun %u64-param-bitwise-only-p (sym forms)
+  "True when SYM occurs in FORMS at least once and every occurrence is a direct operand
+   of a 64-bit arithmetic operator (a use that passes it on, returns it, binds or assigns
+   it, or hides it in a macro call is not)."
+  (let ((uses 0) (budget 20000))
+    (labels ((operand-p (x) (and (symbolp x) (string= (symbol-name x) (symbol-name sym))))
+             (walk (x)
+               (cond ((<= (decf budget) 0) (return-from %u64-param-bitwise-only-p nil))
+                     ((operand-p x) (return-from %u64-param-bitwise-only-p nil))
+                     ((atom x) nil)
+                     ((and (symbolp (car x)) (string= (symbol-name (car x)) "QUOTE")) nil)
+                     ((and (symbolp (car x))
+                           (member (symbol-name (car x))
+                                   '("LOGXOR" "LOGAND" "LOGIOR" "LOGEQV" "LOGNOT" "LOGANDC1" "LOGANDC2"
+                                     "LOGNAND" "LOGNOR" "LOGORC1" "LOGORC2")
+                                   :test #'string=)
+                           (eq (symbol-package (car x)) (find-package "COMMON-LISP")))
+                      (dolist (a (cdr x))
+                        (if (operand-p a) (incf uses) (walk a))))
+                     (t (loop for tail = x then (cdr tail)
+                              while (consp tail)
+                              do (walk (car tail))
+                              finally (when tail (walk tail)))))))
+      (dolist (f forms) (walk f)))
+    (plusp uses)))
+
+;; A function smaller than 150 conses is left alone: it is a candidate for being inlined into its
+;; callers (an INLINE declaration up to 80 conses, the automatic same-file inline below that),
+;; and a rebinding changes the code that expansion is made from.
+(defun %cons-count-at-least-p (x n)
+  (let ((count 0) (seen (make-hash-table :test 'eq)))
+    (labels ((walk (x)
+               (when (and (consp x) (not (gethash x seen)))
+                 (setf (gethash x seen) t)
+                 (when (>= (incf count) n) (return-from %cons-count-at-least-p t))
+                 (walk (car x))
+                 (walk (cdr x)))))
+      (walk x))
+    nil))
+
+(defun %rebind-u64-params-1 (name params body)
+  "BODY, wrapped in a LET that rebinds each required parameter declared
+   (UNSIGNED-BYTE 64) and used only as an operand of 64-bit arithmetic (see above); BODY
+   itself when there is no such parameter. Not done for a function that calls itself (the
+   self tail call is a loop over the parameters), or for a parameter also declared special."
+  (let ((decls '()) (forms body))
+    (loop while (and (consp forms) (consp (car forms)) (eq (caar forms) 'declare))
+          do (push (pop forms) decls))
+    (setf decls (nreverse decls))
+    (when (and decls forms (listp params)
+               (%cons-count-at-least-p forms 150)
+               (not (and name (symbolp name) (%calls-self-p body name))))
+      (let ((specials '()) (u64 '()))
+        (dolist (d decls)
+          (dolist (decl (cdr d))
+            (when (consp decl)
+              (cond ((and (symbolp (car decl)) (string= (symbol-name (car decl)) "SPECIAL"))
+                     (setf specials (append (cdr decl) specials)))
+                    ((and (symbolp (car decl)) (string= (symbol-name (car decl)) "TYPE")
+                          (consp (cdr decl)) (%u64-declared-type-p (cadr decl)))
+                     (setf u64 (append (cddr decl) u64)))))))
+        (let ((mine '()))
+          (dolist (p params)
+            (when (member p lambda-list-keywords) (return))
+            (when (and (symbolp p) p
+                       (member p u64 :test (lambda (a b) (string= (symbol-name a) (symbol-name b))))
+                       (not (member p specials))
+                       (%u64-param-bitwise-only-p p forms))
+              (push p mine)))
+          (when mine
+            (setf mine (nreverse mine))
+            (append decls
+                    (list `(let ,(mapcar (lambda (p) (list p p)) mine)
+                             (declare (type (unsigned-byte 64) ,@mine))
+                             ,@forms)))))))))
+
+(defun %rebind-u64-params (name params body)
+  (or (%rebind-u64-params-1 name params body) body))
 
 (defun %doc-first (body)
   "BODY with a docstring that follows leading declarations moved in front of them:
@@ -2320,6 +2644,12 @@
   (when (and (not *cross-compiling*) (symbolp name)
              (not (gethash (macro-key-for-symbol name) *macros*)))
     (%check-package-lock name "DEFMACRO"))
+  ;; A call to NAME compiled earlier in this file went out as a function call.
+  (when (and (not *cross-compiling*) *same-file-called* *compile-file-mode* (symbolp name)
+             (gethash name *same-file-called*))
+    (warn 'style-warning
+          :format-control "~S is being redefined as a macro when it was previously assumed to be a function."
+          :format-arguments (list name)))
   (let* ((whole-sym (gensym "WHOLE"))
          ;; If lambda-list starts with &whole var, bind var to whole form
          (whole-var (when (and (consp lambda-list) (eq (car lambda-list) '&whole))
@@ -2432,6 +2762,7 @@
                             (%deferred-macro-expander eval-form)))))
     ;; Only register if eval succeeded
     (when expander-fn
+      (%note-macro-takes-environment name (and env-var t) (%body-walkable-p body))
       (let ((mkey (macro-key-for-symbol name)))
         (cond
           ((not (gethash mkey *macros*))
@@ -2468,6 +2799,7 @@
     (compile-expr `(progn (%set-function-lambda-list
                            (%register-macro-function-rt ',name ,expander-form-2arg)
                            ',lambda-list)
+                          (%note-macro-takes-environment ',name ,(and env-var t) ,(%body-walkable-p body))
                           ',name))))
 
 (defun %deferred-macro-expander (eval-form)
@@ -2649,6 +2981,37 @@
     (and (<= (length required) 8)
          (null optional) (null key) (not has-key-p) (null rest-param))))
 
+(defun %partition-aux-declares (decls aux-bindings)
+  "(values OUTER INNER) for the leading DECLARE forms DECLS of a function with &aux
+   variables. A declaration in the function's head that names an &aux variable is a
+   bound declaration of it (CLHS 3.3.3), so it belongs to the LET* that binds the variable:
+   the type of (declare (type (integer 0 23) pos)) then reaches the binding and its slot,
+   as it does for a LET. OUTER keeps everything about the parameters; INNER has the specs
+   for the &aux variables, with the variables of a mixed spec split between the two."
+  (let ((aux (mapcar #'car aux-bindings)))
+    (if (null aux)
+        (values decls nil)
+        (let ((outer '()) (inner '()))
+          (dolist (d decls)
+            (let ((o '()) (i '()))
+              (dolist (spec (cdr d))
+                (let* ((typed (and (consp spec) (eq (car spec) 'type)))
+                       (vars-spec-p (and (consp spec) (consp (cdr spec))
+                                         (or typed
+                                             (member (car spec) '(ignore ignorable special dynamic-extent))
+                                             (%type-declaration-spec-p spec)))))
+                  (if (not vars-spec-p)
+                      (push spec o)
+                      (let* ((head (if typed (list 'type (cadr spec)) (list (car spec))))
+                             (vars (if typed (cddr spec) (cdr spec)))
+                             (vi (remove-if-not (lambda (v) (and (symbolp v) (member v aux))) vars))
+                             (vo (remove-if (lambda (v) (and (symbolp v) (member v aux))) vars)))
+                        (when vo (push (append head vo) o))
+                        (when vi (push (append head vi) i))))))
+              (when o (push (cons 'declare (nreverse o)) outer))
+              (when i (push (cons 'declare (nreverse i)) inner))))
+          (values (nreverse outer) (nreverse inner))))))
+
 (defun %aux-bindings (params)
   "&aux entries of PARAMS as LET* bindings, or NIL when there are none."
   (let ((aux (nth-value 4 (parse-lambda-list params))))
@@ -2664,7 +3027,8 @@
     (if (null aux-bindings)
         body
         (multiple-value-bind (decls rest) (%split-leading-declares body)
-          `(,@decls (let* ,aux-bindings ,@rest))))))
+          (multiple-value-bind (outer inner) (%partition-aux-declares decls aux-bindings)
+            `(,@outer (let* ,aux-bindings ,@inner ,@rest)))))))
 
 (defun inline-sequence-predicate-call (op args)
   "For (OP (LAMBDA (X) BODY...) SEQ), OP one of POSITION-IF, FIND-IF,
@@ -2672,8 +3036,11 @@
    BODY substituted for each element, or NIL when the call is not that shape.
    The loop is written with its own block and tags, so a RETURN in BODY still
    means what it meant inside the lambda."
-  (when (= (length args) 2)
-    (let ((fn (first args)) (seq (second args)))
+  (when (or (= (length args) 2)
+            (and (= (length args) 4) (eq (third args) :key)))
+    (let ((fn (first args)) (seq (second args))
+          (key-form (and (= (length args) 4) (fourth args)))
+          (keyed (= (length args) 4)))
       (when (and (consp fn) (eq (car fn) 'function) (consp (cdr fn)) (null (cddr fn)))
         (setf fn (cadr fn)))
       (when (and (consp fn) (eq (car fn) 'lambda)
@@ -2688,19 +3055,32 @@
                (s (gensym "SEQ")) (l (gensym "L")) (i (gensym "I")) (n (gensym "N"))
                (e (gensym "E")) (c (gensym "C")) (blk (gensym "SEQBLK"))
                (top (gensym "TOP")) (top2 (gensym "TOP"))
+               (kf (gensym "KF"))
+               ;; The element the lambda sees: E itself, or the :KEY of it. #'F is called directly (F may be a
+               ;; local function or an accessor the compiler opens); any other key form is evaluated once, before
+               ;; the loop, as FIND-IF does, and NIL means identity.
+               (key-fn-sym (and keyed (consp key-form) (eq (car key-form) 'function) (consp (cdr key-form))
+                                (null (cddr key-form)) (symbolp (cadr key-form))
+                                (not (member (cadr key-form) '(nil t)))
+                                (cadr key-form)))
+               (keyed-elt (cond ((not keyed) e)
+                                ((null key-form) e)
+                                (key-fn-sym `(,key-fn-sym ,e))
+                                (t `(if ,kf (funcall ,kf ,e) ,e))))
                (negate (member op '(position-if-not find-if-not count-if-not)))
                (kind (case op
                        ((position-if position-if-not) :position)
                        ((find-if find-if-not) :find)
                        (t :count)))
-               (test (let ((call `(let ((,var ,e)) ,@body)))
+               (test (let ((call `(let ((,var ,keyed-elt)) ,@body)))
                        (if negate `(not ,call) call)))
                (hit (ecase kind
                       (:position `(return-from ,blk ,i))
                       (:find `(return-from ,blk ,e))
                       (:count `(setq ,c (+ ,c 1)))))
                (done (if (eq kind :count) c nil)))
-          `(let ((,s ,seq) (,i 0) (,c 0))
+          `(let ((,s ,seq) (,i 0) (,c 0)
+                 ,@(when (and keyed key-form (not key-fn-sym)) `((,kf ,key-form))))
              (declare (fixnum ,i ,c) (ignorable ,c))
              (block ,blk
                (if (listp ,s)
@@ -2760,6 +3140,9 @@
                  ;; so it can't contain (:ldloc KEY). Don't descend: walking a
                  ;; cyclic constant loops forever.
                  ((eq (car x) :load-const) nil)
+                 ;; The :LAMBDA-LIST value of a :MAKE-FUNCTION is the user's lambda
+                 ;; list, whose default forms can hold a circular literal. Not SIL.
+                 ((and (eq (car x) :lambda-list) (consp (cdr x))) (walk (cddr x)))
                  (t (walk (car x)) (walk (cdr x)))))))
     (walk tree)
     nil))
@@ -2783,13 +3166,18 @@
                (eq (car x) :load-const)))
          (finish (x)
            (if (and (consp x) (eq (car x) :ldloc)) '(:ldarg 0) x)))
-    (let ((spine '()) (tail tree))
+    (let ((spine '()) (tail tree) (prev nil))
       (loop until (stop-p tail)
-            do (push tail spine)
-               (setq tail (cdr tail)))
+            do (push (cons tail (eq prev :lambda-list)) spine)
+               (setq prev (car tail)
+                     tail (cdr tail)))
       (let ((result (finish tail)))
-        (dolist (cell spine result)
-          (let ((a (%sil-subst-self-arg0 (car cell) key)))
+        (dolist (entry spine result)
+          ;; The element after :LAMBDA-LIST is the user's lambda list, not SIL.
+          (let* ((cell (car entry))
+                 (a (if (cdr entry)
+                        (car cell)
+                        (%sil-subst-self-arg0 (car cell) key))))
             (setq result
                   (if (and (eq a (car cell)) (eq result (cdr cell)))
                       cell
@@ -3128,28 +3516,40 @@
 
 (defun compile-args-key-check-instrs (fn-name key-specs has-key-p allow-other-keys-p
                                       key-start args-array-instrs)
-  "Unknown-keyword check for an args-array function body (shared inner/
-   closure). Fires for any &key lambda list (even a bare &key with no key
-   params; hence HAS-KEY-P) without &allow-other-keys; explicit-package
+  "Keyword check for an args-array function body (shared inner/closure). Fires
+   for any &key lambda list (even a bare &key with no key params; hence
+   HAS-KEY-P). With &allow-other-keys it still checks for an odd number of
+   keyword arguments, which that marker does not excuse; explicit-package
    keyword names compare via the package-aware CheckNoUnknownKeys2."
+  (when (and has-key-p allow-other-keys-p)
+    ;; &ALLOW-OTHER-KEYS waives unknown keywords, not an odd keyword list.
+    (return-from compile-args-key-check-instrs
+      `((:ldstr ,fn-name) ,@args-array-instrs (:ldc-i4 ,key-start)
+        (:ldnull)
+        (:call "Runtime.CheckNoUnknownKeys"))))
   (when (and has-key-p (not allow-other-keys-p))
     (let ((has-explicit (some #'fifth key-specs)))
       ;; The name and package vectors are the same for every call of this
-      ;; function, and CheckNoUnknownKeys only reads them, so they are emitted as
-      ;; one cached array per site rather than being rebuilt in the prologue.
+      ;; function, and the checks only read them, so they are emitted as one
+      ;; cached array per site rather than being rebuilt in the prologue.
       ;; Building them per call put a string[] on every &key call -- including
       ;; the calls that pass no keyword at all, where the check returns on its
       ;; first line.
       `((:ldstr ,fn-name)
         ,@args-array-instrs (:ldc-i4 ,key-start)
         (:const-str-array ,(mapcar #'first key-specs))
-        ,@(if has-explicit
-              ;; Pass package array for explicit key matching. NIL entries are
-              ;; nulls in the array: only keys written with an explicit package
-              ;; have one, and the runtime compares by name for the rest.
-              `((:const-str-array ,(mapcar #'fifth key-specs))
-                (:call "Runtime.CheckNoUnknownKeys2"))
-              `((:call "Runtime.CheckNoUnknownKeys")))))))
+        ,@(cond
+            (allow-other-keys-p
+             `((:ldc-i4 1)
+               (:call "Runtime.CheckKeywordArgs")))
+            (has-explicit
+             ;; Pass package array for explicit key matching. NIL entries are
+             ;; nulls in the array: only keys written with an explicit package
+             ;; have one, and the runtime compares by name for the rest.
+             `((:const-str-array ,(mapcar #'fifth key-specs))
+               (:call "Runtime.CheckNoUnknownKeys2")))
+            (t
+             `((:call "Runtime.CheckNoUnknownKeys"))))))))
 
 (defun direct-param-instrs (required local-keys arg0-offset native-p &optional long-keys)
   "Parameter-binding instructions for the direct calling convention (params
@@ -3984,6 +4384,7 @@
                          (not (member rest-param special-param-syms))
                          (not (boxed-var-p rest-param))
                          (null (find-mutated-and-captured-vars body (list (var-name rest-param))))
+                         (%rest-var-only-applied-p body rest-param)
                          (list rest-param (cdr (assoc rest-param local-keys)) args-arg-idx key-start)))
                   (body-instrs (compile-progn body)))
              (merge-disjoint-locals

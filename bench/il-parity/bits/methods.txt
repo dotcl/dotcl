@@ -1,0 +1,6 @@
+# C# method            Lisp function
+Bits.Set              ILP-BITS-SET
+Bits.Test             ILP-BITS-TEST
+Bits.LogBit           ILP-BITS-LOGBIT
+Bits.DivMod           ILP-BITS-DIVMOD
+Bits.Adder            ILP-BITS-ADDER

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; SORT on a list reuses the list it was given.
 ;;;
 ;;; ANSI lets SORT destroy its argument, and the vector and string paths here

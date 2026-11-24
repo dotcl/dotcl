@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Lambda list keywords come in the order &optional, &rest / &body, &key,
 ;;; &allow-other-keys, &aux, each at most once; nothing but &key and &aux may
 ;;; follow the &rest variable; &allow-other-keys needs &key.

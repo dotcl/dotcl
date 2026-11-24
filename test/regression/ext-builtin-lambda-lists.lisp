@@ -3,6 +3,10 @@
 ;;; Uses CL-LL-SHAPE, CL-LL-ACCEPTS-P and CL-LL-WELL-FORMED-P from
 ;;; cl-builtin-lambda-lists.lisp.
 
+;; This file uses CL-LL-SHAPE and its neighbours from cl-builtin-lambda-lists.lisp; load it when run alone.
+(unless (fboundp 'cl-ll-shape)
+  (load "test/regression/cl-builtin-lambda-lists.lisp"))
+
 (dolist (m '("dotnet-class" "dotcl-gray" "dotcl-socket" "dotcl-thread" "dotcl-simd"))
   (require m))
 

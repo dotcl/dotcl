@@ -9,8 +9,14 @@ namespace DotCL;
 /// buffer, blocking until data is available or the drain has completed.</summary>
 public sealed class ProcessStreamReader : System.IO.TextReader
 {
-    private readonly System.Text.StringBuilder _buf = new();
+    // The characters drained from the child and not yet consumed are _data[_pos.._len).
+    // A flat array, not a StringBuilder: StringBuilder's indexer walks its chunk list, so
+    // reading a long output one character at a time (what READ-LINE does) was quadratic.
+    // The consumed prefix is dropped as the drain thread appends, so memory follows what is
+    // buffered, not everything the child ever wrote.
+    private char[] _data = new char[8192];
     private int _pos;
+    private int _len;
     private bool _eof;
     private readonly object _lock = new();
 
@@ -38,7 +44,7 @@ public sealed class ProcessStreamReader : System.IO.TextReader
                     int n;
                     while ((n = src.Read(chunk, 0, chunk.Length)) > 0)
                     {
-                        lock (_lock) { _buf.Append(chunk, 0, n); System.Threading.Monitor.PulseAll(_lock); }
+                        lock (_lock) { Append(chunk, n); System.Threading.Monitor.PulseAll(_lock); }
                     }
                 }
                 catch { /* pipe closed/broken; treat as EOF */ }
@@ -53,12 +59,28 @@ public sealed class ProcessStreamReader : System.IO.TextReader
         }
     }
 
+    // Call with _lock held.
+    private void Append(char[] chunk, int n)
+    {
+        if (_pos == _len) { _pos = 0; _len = 0; }
+        else if (_pos > 0 && _len + n > _data.Length)
+        {
+            System.Array.Copy(_data, _pos, _data, 0, _len - _pos);
+            _len -= _pos;
+            _pos = 0;
+        }
+        if (_len + n > _data.Length)
+            System.Array.Resize(ref _data, System.Math.Max(_data.Length * 2, _len + n));
+        System.Array.Copy(chunk, 0, _data, _len, n);
+        _len += n;
+    }
+
     public override int Read()
     {
         lock (_lock)
         {
-            while (_pos >= _buf.Length && !_eof) System.Threading.Monitor.Wait(_lock);
-            return _pos < _buf.Length ? _buf[_pos++] : -1;
+            while (_pos >= _len && !_eof) System.Threading.Monitor.Wait(_lock);
+            return _pos < _len ? _data[_pos++] : -1;
         }
     }
 
@@ -66,7 +88,7 @@ public sealed class ProcessStreamReader : System.IO.TextReader
     // (CL READ-CHAR-NO-HANG / LISTEN depend on Peek not blocking).
     public override int Peek()
     {
-        lock (_lock) { return _pos < _buf.Length ? _buf[_pos] : -1; }
+        lock (_lock) { return _pos < _len ? _data[_pos] : -1; }
     }
 
     public override int Read(char[] buffer, int index, int count)
@@ -74,11 +96,11 @@ public sealed class ProcessStreamReader : System.IO.TextReader
         if (count <= 0) return 0;
         lock (_lock)
         {
-            while (_pos >= _buf.Length && !_eof) System.Threading.Monitor.Wait(_lock);
-            int avail = _buf.Length - _pos;
+            while (_pos >= _len && !_eof) System.Threading.Monitor.Wait(_lock);
+            int avail = _len - _pos;
             if (avail <= 0) return 0;
             int n = System.Math.Min(avail, count);
-            _buf.CopyTo(_pos, buffer, index, n);
+            System.Array.Copy(_data, _pos, buffer, index, n);
             _pos += n;
             return n;
         }
@@ -165,6 +187,62 @@ public sealed class LispProcess : LispObject
         return Process.ExitCode;
     }
 
+    /// <summary>Call FN with this process once the child has exited and every copy
+    /// between it and a Lisp stream has finished, in a new Lisp thread. The wait
+    /// is on a thread of its own that Lisp does not see, so a process nobody waits
+    /// for costs no Lisp thread until it exits. Unlike Wait, this does not take the
+    /// copy failure: a later PROCESS-WAIT still signals it. An error in FN ends only
+    /// its own thread (MAKE-THREAD reports it); it does not reach the caller.</summary>
+    public void OnExit(LispObject fn)
+    {
+        var watcher = new System.Threading.Thread(() =>
+        {
+            try
+            {
+                Process.WaitForExit();
+                foreach (var h in _helpers) { try { h.Join(); } catch { } }
+                Runtime.MakeThread(new LispObject[] {
+                    new LispFunction(_ => RunOnExit(fn), "ON-EXIT"),
+                    Startup.Keyword("NAME"), new LispString("dotcl-on-exit-" + Process.Id) });
+            }
+            catch { /* the runtime is shutting down */ }
+        }) { IsBackground = true, Name = "dotcl-on-exit-watch" };
+        watcher.Start();
+    }
+
+    /// <summary>Run the :ON-EXIT function in the calling (Lisp) thread with an
+    /// ERROR handler around it. A Lisp thread with an unhandled error ends the
+    /// whole process in a script, and a callback must not take the program down.</summary>
+    private LispObject RunOnExit(LispObject fn)
+    {
+        var tag = new object();
+        var handler = new LispFunction(
+            hargs => throw new HandlerCaseInvocationException(
+                tag, 0, hargs.Length > 0 ? hargs[0] : Nil.Instance),
+            "%ON-EXIT-GUARD", -1);
+        var depth = HandlerClusterStack.Depth;
+        HandlerClusterStack.PushCluster(
+            new[] { new HandlerBinding(Startup.Sym("ERROR"), handler) });
+        LispObject? condition = null;
+        try
+        {
+            return Runtime.Funcall(fn, this);
+        }
+        catch (HandlerCaseInvocationException ex) when (ReferenceEquals(ex.Tag, tag))
+        {
+            condition = ex.Condition;
+        }
+        finally
+        {
+            HandlerClusterStack.TruncateTo(depth);
+        }
+        var w = System.Console.Error;
+        w.WriteLine($"dotcl: the :on-exit function of process {Process.Id} signalled an error: "
+                    + ConditionText.Report(condition!));
+        w.Flush();
+        return Nil.Instance;
+    }
+
     /// <summary>A ProcessStartInfo that runs PROGRAM with ARGUMENTS, each argument
     /// reaching the child as the same string.
     ///
@@ -192,9 +270,28 @@ public sealed class LispProcess : LispObject
             return new System.Diagnostics.ProcessStartInfo(
                 System.IO.Path.Combine(System.Environment.SystemDirectory, "cmd.exe"),
                 BatchCommandLine(ResolveBatchFile(program), arguments));
+        // cmd /c COMMAND with the command as one string (what UIOP:RUN-PROGRAM makes of a string
+        // command on Windows): cmd parses its own command line, so the string goes through as it is.
+        // ArgumentList would quote it MSVCRT-style and turn every inner " into \", which cmd does not
+        // undo. The outer quotes are the ones cmd strips again (see "cmd /?", the /C rules).
+        if (Compat.IsWindows() && IsCmdShell(program) && arguments.Count == 2
+            && (arguments[0] == "/c" || arguments[0] == "/C" || arguments[0] == "/k" || arguments[0] == "/K")
+            && arguments[1].IndexOfAny(new[] { '\r', '\n', '\0' }) < 0)
+        {
+            var cmdPsi = new System.Diagnostics.ProcessStartInfo(program);
+            cmdPsi.Arguments = arguments[0] + " \"" + arguments[1] + "\"";
+            return cmdPsi;
+        }
         var psi = new System.Diagnostics.ProcessStartInfo(program);
         foreach (var a in arguments) Compat.AddArg(psi, a);
         return psi;
+    }
+
+    private static bool IsCmdShell(string program)
+    {
+        var name = System.IO.Path.GetFileName(program.TrimEnd('.', ' '));
+        return name.Equals("cmd", System.StringComparison.OrdinalIgnoreCase)
+            || name.Equals("cmd.exe", System.StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsBatchFile(string program)
@@ -231,7 +328,7 @@ public sealed class LispProcess : LispObject
 
     private static string BatchCommandLine(string script, System.Collections.Generic.IList<string> arguments)
     {
-        if (script.IndexOf('"') >= 0 || script.EndsWith("\\"))
+        if (script.IndexOf('"') >= 0 || script.EndsWith("\\", System.StringComparison.Ordinal))
             throw new LispErrorException(new LispError(
                 $"Cannot run batch file {script}: its name contains a double quote or ends with a backslash"));
         // cmd.exe /c "<line>": cmd removes the first and the last quote of <line>.

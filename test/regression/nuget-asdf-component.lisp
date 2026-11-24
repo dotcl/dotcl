@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; (:nuget "Package.Id" ...) as a component in a system definition.
 ;;;
 ;;; A system declares the NuGet packages it needs instead of calling

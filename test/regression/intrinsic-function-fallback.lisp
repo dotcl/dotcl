@@ -37,6 +37,11 @@
     ;; compiler's own MAPCAR / SOME / ... handlers make it, and compile it at
     ;; once; no macro expands into it.
     "%MAP-OPEN"
+    ;; The COMPILER's FORMAT handler makes these for a literal control string and
+    ;; a NIL destination. They are compiled in the same step; no macro expands
+    ;; into them, so the interpreter never meets them.
+    "%FORMAT-NIL-0" "%FORMAT-NIL-1" "%FORMAT-NIL-2" "%FORMAT-NIL-3"
+    "%FORMAT-NIL-4"
     ;; The steps of a MAPHASH opened the same way, made and compiled by the
     ;; compiler's MAPHASH handler only.
     "%HASH-WALK-BEGIN" "%HASH-WALK-NEXT" "%HASH-WALK-KEY" "%HASH-WALK-VALUE"

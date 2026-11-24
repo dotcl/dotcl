@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; READ through an ECHO-STREAM echoes what it consumed.
 ;;;
 ;;; The Lisp reader takes the TextReader from underneath the echo-stream

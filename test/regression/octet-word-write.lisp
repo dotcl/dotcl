@@ -195,19 +195,20 @@
                     (make-array 9 :element-type '(unsigned-byte 8) :adjustable t) 0 0))
   (:type-error :type-error :type-error :type-error))
 
-;;; At safety 0 a non-simple octet vector under the declaration is written
-;;; octet by octet, as the octet stores write it here. The declaration is
-;;; false, so this is dotcl's choice: SBCL writes elsewhere.
+;;; At safety 0 a non-simple octet vector under the declaration is refused where
+;;; it is bound, as above safety 0. The declaration is false; SBCL's behaviour
+;;; there is undefined.
 (defun %oww-w32-0 (v o x)
   (declare (type %oww-octets v) (type %oww-index o) (optimize speed (safety 0)))
   (setf (%oww-32be v o) x)
   v)
 (deftest-emitting-only octet-word-write.non-simple-safety-0
-  (coerce (%oww-w32-0 (make-array 6 :element-type '(unsigned-byte 8) :adjustable t
-                                     :initial-element 0)
-                      1 #x01020304)
-          'list)
-  (0 1 2 3 4 0))
+  (let ((v (make-array 6 :element-type '(unsigned-byte 8) :adjustable t
+                         :initial-element 0)))
+    (list (handler-case (progn (%oww-w32-0 v 1 #x01020304) :no-error)
+            (type-error () :type-error))
+          (coerce v 'list)))
+  (:type-error (0 0 0 0 0 0)))
 
 ;;; The place's arguments are evaluated before the new value (CLHS 5.1.1.1).
 (deftest octet-word-write.order

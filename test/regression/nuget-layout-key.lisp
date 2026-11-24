@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; What NUGET keeps between processes, what it refuses to resolve on its own,
 ;;; and what `dotcl pack' carries beside an executable.
 ;;;

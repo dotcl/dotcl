@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Argument-count checks for the C# builtins that indexed the argument array
 ;;; without checking it.
 ;;;

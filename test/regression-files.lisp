@@ -2,7 +2,7 @@
 ;;; (space separated), in the mode the process was started in. Used by
 ;;; `make test-regression-files FILES="test/regression/a.lisp ..." MODE=compiled|interp|emitfree`.
 ;;; Prints the PASSED / FAILED counts and the names of the failing tests; exits non-zero on a
-;;; failure or when no file was named.
+;;; failure, when no file was named, or when a compiled run registered no test.
 
 (load "test/framework.lisp")
 
@@ -19,4 +19,5 @@
   (dolist (f files) (load f))
   (do-tests-summary)
   (cleanup-regression-temp-dir)
-  (dotcl:quit (if (= *fail-count* 0) 0 1)))
+  ;; Files that are compiled-only legitimately register nothing when the run is not a compiled one.
+  (dotcl:quit (tests-exit-code :allow-none (not (compiled-mode-p)))))

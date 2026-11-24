@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; REQUIRE's module search (.fasl, .sil, .lisp) loaded a contrib's fasl even
 ;;; when the .lisp beside it had been edited since, so the old behavior ran.
 ;;; A .fasl / .sil older than its .lisp is now skipped and the source loads.

@@ -146,7 +146,7 @@ public static partial class Runtime
             case "COMPLEX":
                 if (n == 0 || VtsIsStar(args[0])) return true;
                 if (!VtsValid(args[0], d, false)) return false;
-                try { return IsTruthy(Subtypep(args[0], Startup.Sym("REAL"))); }
+                try { return SubtypepClean(args[0], Startup.Sym("REAL")) is not Nil; }
                 catch (Exception) { return false; }
             case "CONS":
                 foreach (var a in args) if (!VtsValid(a, d, false)) return false;

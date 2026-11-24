@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; :DEFAULT-INITARGS under FUNCALLABLE-STANDARD-CLASS.
 ;;;
 ;;; MAKE-INSTANCE allocates an instance of a funcallable class through a

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A call to a global macro in an integer operand position is looked at
 ;;; through its expansion, as a MACROLET-bound one already was. A library that
 ;;; names its word arithmetic with macros -- (defmacro p+ (a b)

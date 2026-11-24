@@ -36,18 +36,22 @@ dotcl_results=$(extract_results "$dotcl_file")
 sbcl_results=$(extract_results "$sbcl_file")
 
 # Collect new benchmark names
-declare -A new_names
+# (No associative arrays: macOS ships bash 3.2, which has none.)
+new_names_str=""
 new_names_list=()
 while IFS=$'\t' read -r name _; do
     if [ -n "$name" ]; then
-        new_names["$name"]=1
+        new_names_str="$new_names_str$name"$'\n'
         new_names_list+=("$name")
     fi
 done <<< "$dotcl_results"
 
 # Collect existing entries not in new results
 existing_order=()
-declare -A ex_raw
+ex_raw_file=$(mktemp "${TMPDIR:-/tmp}/make-state.XXXXXX")
+trap 'rm -f "$ex_raw_file"' EXIT
+is_new() { printf '%s' "$new_names_str" | grep -Fxq -- "$1"; }
+ex_raw_of() { awk -F'\t' -v n="$1" '$1 == n { sub(/^[^\t]*\t/, ""); print; exit }' "$ex_raw_file"; }
 if [ -n "$existing_file" ] && [ -f "$existing_file" ]; then
     while IFS= read -r line; do
         # Match any entry line:    "name": {...}
@@ -63,9 +67,9 @@ if [ -n "$existing_file" ] && [ -f "$existing_file" ]; then
         # an entry named "benchmarks".
         name=$(echo "$line" | sed -n 's/^ *"\([^"]*\)": {.*},\{0,1\}$/\1/p')
         [ -z "$name" ] && continue
-        [ -n "${new_names[$name]+_}" ] && continue
+        is_new "$name" && continue
         existing_order+=("$name")
-        ex_raw["$name"]=$(echo "$line" | sed 's/^ *"[^"]*": //; s/,$//')
+        printf '%s\t%s\n' "$name" "$(echo "$line" | sed 's/^ *"[^"]*": //; s/,$//')" >> "$ex_raw_file"
     done < "$existing_file"
 fi
 
@@ -80,7 +84,7 @@ echo "  \"benchmarks\": {"
 for i in "${!all_names[@]}"; do
     name="${all_names[$i]}"
 
-    if [ -n "${new_names[$name]+_}" ]; then
+    if is_new "$name"; then
         # New result
         dotcl_val=$(echo "$dotcl_results" | awk -F'\t' -v n="$name" '$1 == n {print $2}')
         sbcl_val=$(echo "$sbcl_results" | awk -F'\t' -v n="$name" '$1 == n {print $2}')
@@ -111,7 +115,7 @@ for i in "${!all_names[@]}"; do
         comma=","
         if [ $i -eq $((total - 1)) ]; then comma=""; fi
 
-        printf '    "%s": %s%s\n' "$name" "${ex_raw[$name]}" "$comma"
+        printf '    "%s": %s%s\n' "$name" "$(ex_raw_of "$name")" "$comma"
     fi
 done
 

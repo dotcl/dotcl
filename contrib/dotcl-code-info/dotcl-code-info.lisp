@@ -17,7 +17,8 @@
 
 (defpackage :dotcl-code-info
   (:use :cl)
-  (:export #:completions #:documentation-url #:describe-at))
+  (:export #:completions #:documentation-url #:describe-at
+           #:signature-at #:definition-at))
 
 (in-package :dotcl-code-info)
 
@@ -606,5 +607,55 @@ member the framework documents nowhere still have a signature worth showing."
       (case kind
         (:symbol (%symbol-description object))
         (:dotnet (%dotnet-description object member))))))
+
+;;;; Calling a function, and where it is defined
+
+(defun %operator-at (text offset package)
+  "The symbol naming the operator of the form enclosing OFFSET, and how many of
+its arguments are already complete before OFFSET; NIL when the cursor is not in
+the argument part of a form."
+  (multiple-value-bind (in-string string-start elements token-start)
+      (%scan text offset)
+    (declare (ignore string-start token-start))
+    (when (and (not in-string) elements)
+      (let* ((token (%text text (first elements)))
+             (name (and (plusp (length token))
+                        (string-left-trim "'#" token)))
+             (symbol (and name (plusp (length name)) (%token-symbol name package))))
+        (when (and symbol (symbolp symbol))
+          (values symbol (1- (length elements))))))))
+
+(defun signature-at (text offset &key package)
+  "The call being written at OFFSET in TEXT: for the cursor in the argument part
+of (OPERATOR ...), the operator's lambda list.
+
+Returns (:label \"(operator a b &optional c)\" :parameters (\"a\" \"b\" \"c\") :active N),
+or NIL. :ACTIVE is the position of the parameter the cursor is on, counting only
+parameters (not the lambda list keywords); it stays on the last parameter past
+the end, as for &REST. A function with no recorded lambda list gives NIL."
+  (let ((package (or package (%text-package text offset *package*))))
+    (multiple-value-bind (symbol done) (%operator-at text offset package)
+      (when (and symbol (fboundp symbol))
+        (let ((lambda-list (ignore-errors (dotcl:function-lambda-list symbol))))
+          (when (consp lambda-list)
+            (let* ((params (remove-if (lambda (x) (member x lambda-list-keywords))
+                                      lambda-list))
+                   (names (mapcar (lambda (x)
+                                    (string-downcase
+                                     (princ-to-string (if (consp x) (car x) x))))
+                                  params)))
+              (list :label (string-downcase (princ-to-string (cons symbol lambda-list)))
+                    :parameters names
+                    :active (min done (max 0 (1- (length names))))))))))))
+
+(defun definition-at (text offset &key package)
+  "Where the name at OFFSET in TEXT was defined in this image: a list of
+(:file F :line L), or NIL. Only definitions the image has recorded are found."
+  (let ((package (or package (%text-package text offset *package*))))
+    (multiple-value-bind (kind object) (%at-point text offset package)
+      (when (eq kind :symbol)
+        (let ((d (ignore-errors (dotcl:function-source-location object))))
+          (when (and (consp d) (getf d :file) (getf d :line))
+            (list (list :file (getf d :file) :line (getf d :line)))))))))
 
 (provide "dotcl-code-info")

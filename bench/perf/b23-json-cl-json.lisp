@@ -1,0 +1,15 @@
+(load "bench/perf/pcommon.lisp")
+(setf *bench-group* "23-cl-json")
+;; cl-json: decode and encode a 1000-element array of objects.
+;; Libraries to install on the runner: cl-json
+(load-ql-system :cl-json)
+(defvar *sink* nil)
+(defvar *json* (with-output-to-string (s)
+  (write-string "[" s)
+  (dotimes (i 1000)
+    (when (plusp i) (write-string "," s))
+    (format s "{\"id\":~D,\"name\":\"item ~D\",\"price\":~D.25,\"tags\":[\"a\",\"b\",\"c\"],\"ok\":true,\"none\":null}" i i i))
+  (write-string "]" s)))
+(defvar *obj* (cl-json:decode-json-from-string *json*))
+(bench "cl-json decode-json-from-string 1000 objects" 20 (setq *sink* (cl-json:decode-json-from-string *json*)))
+(bench "cl-json encode-json-to-string 1000 objects" 20 (setq *sink* (cl-json:encode-json-to-string *obj*)))

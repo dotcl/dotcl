@@ -445,4 +445,64 @@ public static class LibraryAbi
     public static int RestartMatches(object ex, object[] tags) => ControlFlowFilters.RestartCaseTag(ex, tags);
 
     public static LispObject[] RestartArguments(object ex) => ((RestartInvocationException)ex).Arguments;
+
+    // --- Errors leaving a library ---
+
+    // Conditions a library maps to its own plain exception types (a class that
+    // says (:maps-condition NAME)), most recently registered first. Such a type
+    // derives from System.Exception and has a constructor taking the message, so
+    // it needs nothing from this runtime; the condition goes in Data.
+    private static readonly System.Collections.Generic.List<(string Condition, Type Exception)> _conditionMaps = new();
+
+    /// <summary>The key of Exception.Data that holds the condition on an exception
+    /// of a library's own type.</summary>
+    public const string ConditionDataKey = "dotcl.condition";
+
+    /// <summary>Called by a library's module initializer for each class that maps a
+    /// condition (:maps-condition).</summary>
+    internal static void RegisterConditionMap(string condition, Type exception)
+    {
+        lock (_conditionMaps) _conditionMaps.Insert(0, (condition.ToUpperInvariant(), exception));
+    }
+
+    // The runtime's own table, most specific first: a condition becomes the first
+    // class its type satisfies. Anything else stays a LispErrorException.
+    private static readonly (string Condition, Func<LispCondition, LispErrorException> Make)[] _exceptionTable =
+    {
+        ("DIVISION-BY-ZERO",   c => new LispDivisionByZeroException(c)),
+        ("ARITHMETIC-ERROR",   c => new LispArithmeticErrorException(c)),
+        ("UNBOUND-VARIABLE",   c => new LispUnboundVariableException(c)),
+        ("UNDEFINED-FUNCTION", c => new LispUndefinedFunctionException(c)),
+        ("CELL-ERROR",         c => new LispCellErrorException(c)),
+        ("TYPE-ERROR",         c => new LispTypeErrorException(c)),
+        ("END-OF-FILE",        c => new LispEndOfFileException(c)),
+        ("STREAM-ERROR",       c => new LispStreamErrorException(c)),
+        ("FILE-ERROR",         c => new LispFileErrorException(c)),
+        ("CONTROL-ERROR",      c => new LispControlErrorException(c)),
+        ("PROGRAM-ERROR",      c => new LispProgramErrorException(c)),
+    };
+
+    private static bool ConditionIs(LispCondition c, string typeName)
+        => Runtime.Typep(c, Startup.Sym(typeName)) is not Nil;
+
+    /// <summary>The exception a library call throws for CONDITION: the type a library
+    /// registered with (:maps-condition) if the condition is one of that condition
+    /// type, else the closest of the runtime's LispErrorException subclasses, else a
+    /// plain LispErrorException. The condition is kept (Condition on the subclasses,
+    /// Data["dotcl.condition"] on a library's own type).</summary>
+    internal static Exception ExceptionFor(LispCondition condition)
+    {
+        (string Condition, Type Exception)[] maps;
+        lock (_conditionMaps) maps = _conditionMaps.ToArray();
+        foreach (var (name, type) in maps)
+        {
+            if (!ConditionIs(condition, name)) continue;
+            var ex = (Exception)Activator.CreateInstance(type, condition.Message)!;
+            ex.Data[ConditionDataKey] = condition;
+            return ex;
+        }
+        foreach (var (name, make) in _exceptionTable)
+            if (ConditionIs(condition, name)) return make(condition);
+        return new LispErrorException(condition);
+    }
 }

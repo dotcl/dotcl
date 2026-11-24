@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; READ-DELIMITED-LIST takes part in the enclosing read.
 ;;;
 ;;; It built a fresh Reader over the stream and never adopted the stream's

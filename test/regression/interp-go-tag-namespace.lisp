@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Go tags live in their own namespace (CLHS 3.1.1): a tag may share its name
 ;;; with a variable, a function, or a block without disturbing any of them.
 ;;;

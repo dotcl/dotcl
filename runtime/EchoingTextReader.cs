@@ -21,7 +21,8 @@ namespace DotCL;
 internal sealed class EchoingTextReader : TextReader
 {
     private readonly TextReader _inner;
-    private readonly TextWriter _echo;
+    private TextWriter? _echo;
+    private readonly LispObject? _echoStream;
 
     internal EchoingTextReader(TextReader inner, TextWriter echo)
     {
@@ -29,21 +30,55 @@ internal sealed class EchoingTextReader : TextReader
         _echo = echo;
     }
 
+    /// <summary>The echo stream's output is resolved on the first character echoed, not
+    /// when the reader is made: PEEK-CHAR makes a reader and echoes nothing, so a closed
+    /// output stream must not make it fail.</summary>
+    internal EchoingTextReader(TextReader inner, LispObject echoOutputStream)
+    {
+        _inner = inner;
+        _echoStream = echoOutputStream;
+    }
+
     internal TextReader Inner => _inner;
+
+    private LispStream? _plainOut;   // the output when it is a plain stream, so nothing needs resolving per character
+
+    private void Echo(char c)
+    {
+        if (_echo != null) { _echo.Write(c); return; }
+        var plain = _plainOut;
+        if (plain != null && !plain.IsClosed)
+        {
+            // A string or file output stream: no wrapper to look through, no synonym that
+            // could be rebound, and a closed stream goes the slow way to signal.
+            _plainEchoWriter!.Write(c);
+            plain.AtLineStart = c == '\n';
+            return;
+        }
+        Runtime.GetTextWriter(_echoStream!).Write(c);
+        Runtime.UpdateAtLineStart(_echoStream!, c);
+        if (_echoStream is LispOutputStream or LispFileStream && _echoStream is LispStream ls)
+        {
+            _plainOut = ls;
+            _plainEchoWriter = Runtime.GetTextWriter(_echoStream);
+        }
+    }
+
+    private TextWriter? _plainEchoWriter;
 
     public override int Peek() => _inner.Peek();
 
     public override int Read()
     {
         int c = _inner.Read();
-        if (c != -1) _echo.Write((char)c);
+        if (c != -1) Echo((char)c);
         return c;
     }
 
     public override int Read(char[] buffer, int index, int count)
     {
         int n = _inner.Read(buffer, index, count);
-        if (n > 0) _echo.Write(buffer, index, n);
+        for (int i = 0; i < n; i++) Echo(buffer[index + i]);
         return n;
     }
 }

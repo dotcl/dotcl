@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; ~F and ~G with no user-supplied digit count must print the shortest decimal
 ;;; that reads back to the same float, not the float's exact binary value.
 ;;;

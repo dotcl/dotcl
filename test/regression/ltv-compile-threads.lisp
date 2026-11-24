@@ -5,7 +5,7 @@
 
 (require "dotcl-thread")
 
-(deftest ltv-compile-threads.distinct-slots
+(deftest-emitting-only ltv-compile-threads.distinct-slots
   (let* ((nthreads 4) (per 200) (go nil)
          (bad (make-array nthreads :initial-element 0))
          (threads

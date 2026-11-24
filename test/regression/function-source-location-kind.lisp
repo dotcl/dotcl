@@ -2,7 +2,7 @@
 ;;; definition, not to a later definition of another kind under that name.
 
 (defparameter *fslk-file*
-  (let ((src (merge-pathnames "fslk-fixture.lisp" (regression-temp-dir))))
+  (let ((src (merge-pathnames "fslk-fixture.lisp" (regression-temp-dir/))))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (dolist (l '("(defun fslk-foo () 1)"                          ; 1
                    "(defvar fslk-foo 2)"                            ; 2

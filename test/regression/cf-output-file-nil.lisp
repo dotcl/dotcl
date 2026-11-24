@@ -3,7 +3,7 @@
 ;;; and a string or a pathname gives that file.
 
 (defun %cfonil-source (name)
-  (let ((path (merge-pathnames name (regression-temp-dir))))
+  (let ((path (merge-pathnames name (regression-temp-dir/))))
     (with-open-file (s path :direction :output :if-exists :supersede)
       (write-string "(defun cfonil-f () 1)" s))
     path))
@@ -17,7 +17,7 @@
 (deftest-compiled-only compile-file-output-file-nil.valid-forms
   (let* ((*error-output* (make-broadcast-stream))
          (src (%cfonil-source "cfonil2.lisp"))
-         (named (merge-pathnames "cfonil2-out.fasl" (regression-temp-dir))))
+         (named (merge-pathnames "cfonil2-out.fasl" (regression-temp-dir/))))
     (list (and (probe-file (compile-file src :output-file named)) t)
           (and (probe-file (compile-file src :output-file (namestring named))) t)
           (and (probe-file (compile-file src)) t)))

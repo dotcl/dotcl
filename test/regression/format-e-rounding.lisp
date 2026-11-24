@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; ~E must round the VALUE, not a rounded decimal of it.
 ;;;
 ;;; The digits used to come from ToString("G17"): enough to round-trip a double,

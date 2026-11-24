@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; COMPILE-FILE and a DEFMACRO that is not a top-level form.
 ;;;
 ;;; CLHS 3.2.3.1: only a top-level DEFMACRO has a compile-time side effect. One
@@ -16,8 +17,8 @@
 ;;; body and defines both.
 
 (defun ntdm-compile-and-load (name lines)
-  (let ((src (format nil "~a-tmp.lisp" name))
-        (fasl (format nil "~a-tmp.fasl" name)))
+  (let ((src (regression-temp-file (format nil "~a-tmp.lisp" name)))
+        (fasl (regression-temp-file (format nil "~a-tmp.fasl" name))))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)
@@ -45,8 +46,8 @@
 ;; evaluates a top-level DEFUN early, and that evaluation compiles the body
 ;; outside COMPILE-FILE's rules.)
 (deftest-compiled-only nontoplevel-defmacro.not-defined-by-compiling
-  (let ((src "ntdm2-tmp.lisp")
-        (fasl "ntdm2-tmp.fasl"))
+  (let ((src (regression-temp-file "ntdm2-tmp.lisp"))
+        (fasl (regression-temp-file "ntdm2-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)

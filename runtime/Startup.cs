@@ -1642,6 +1642,9 @@ public static class Startup
         table[name] = new SymCacheEntry(sym, epoch);
     }
 
+    // Not inlined: emitted code calls this per DEFUN registration, and inlining its
+    // body into every one-shot toplevel method made each JIT take ~2 ms.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     public static Symbol SymInPkg(string name, string pkgName)
     {
         int epoch = Package.MappingEpoch;
@@ -1817,6 +1820,11 @@ public static class Startup
         // Import into CL-USER so (interactive-interrupt) is accessible without CL: prefix,
         // but keep NOT-exported from CL to avoid failing NO-EXTRA-SYMBOLS ANSI test.
         CLUser.Import(iiCls.Name);
+        // The same condition by a public name: library code that waits for Ctrl-C
+        // (a user-abort condition inheriting the implementation's interrupt condition)
+        // names DOTCL:INTERACTIVE-INTERRUPT where it names SB-SYS:INTERACTIVE-INTERRUPT on SBCL.
+        DotclPkg.Import(iiCls.Name);
+        DotclPkg.Export(iiCls.Name);
         // Multiple-inheritance condition classes (CL standard hierarchy)
         MakeCondClass("SIMPLE-ERROR", simpleCondition, error);       // [SIMPLE-ERROR, SIMPLE-CONDITION, ERROR, ...]
         MakeCondClass("SIMPLE-WARNING", simpleCondition, warning);   // [SIMPLE-WARNING, SIMPLE-CONDITION, WARNING, ...]
@@ -1960,16 +1968,35 @@ public static class Startup
         // Runtime.RegisterMiscBuiltins, which runs later in this method and
         // therefore owns them. They used to be registered here as well, where
         // editing them had no effect.
-        // DOTCL:GC: trigger .NET GC, then drain any finalizer thunks the
-        // collection enqueued (on this normal thread, not the GC finalizer thread).
+        // DOTCL:GC: collect up to :GEN, or everything with :FULL, then drain the
+        // finalizer thunks the collection enqueued on this normal thread.
         {
-            var gcFn = new LispFunction(_ => {
-                GC.Collect(2, Compat.AggressiveGCMode, true, true);
-                GC.WaitForPendingFinalizers();
-                GC.Collect(2, Compat.AggressiveGCMode, true, true);
+            var gcFn = new LispFunction(args => {
+                bool full = args.Length == 0;
+                int generation = 0;
+                for (int i = 0; i + 1 < args.Length; i += 2)
+                {
+                    if (args[i] is not Symbol key) continue;
+                    if (key.Name == "FULL") full = args[i + 1] is not Nil;
+                    else if (key.Name == "GEN")
+                    {
+                        if (args[i + 1] is not Fixnum g)
+                            throw new LispErrorException(new LispTypeError(
+                                "DOTCL:GC: :GEN is not an integer", args[i + 1]));
+                        generation = g.Value < 0 ? 0 : g.Value > 2 ? 2 : (int)g.Value;
+                    }
+                }
+                if (full) generation = 2;
+                var mode = generation == 2 ? Compat.AggressiveGCMode : GCCollectionMode.Forced;
+                GC.Collect(generation, mode, true, true);
+                if (full)
+                {
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect(generation, mode, true, true);
+                }
                 Runtime.RunFinalizers();
                 return Nil.Instance;
-            }, "DOTCL:GC", -1).WithArgCount(0, 0);
+            }, "DOTCL:GC", -1).WithKeyArgs(0, 0, false, "FULL", "GEN");
             var gcSym = SymInPkg("GC", "DOTCL");
             gcSym.Function = gcFn;
             DotclPkg.Export(gcSym);
@@ -2602,6 +2629,8 @@ public static class Startup
                              "%LOOP-LIMIT-FLOOR", 1));
         Emitter.CilAssembler.RegisterFunction("%LOOP-BY",
             new LispFunction(args => Runtime.LoopBy(args[0]), "%LOOP-BY", 1));
+        Emitter.CilAssembler.RegisterFunction("%REQUIRE-REAL",
+            new LispFunction(args => Runtime.RequireReal(args[0]), "%REQUIRE-REAL", 1));
 
         // Same shape: the compiler lowers (%getenv "X") to a direct call, and the
         // compiler's own source uses it (reading DOTCL_DUMP_SIL_FOR), so an
@@ -2648,6 +2677,18 @@ public static class Startup
             var old = Package.SwapUnit(args[0] is LispDotNetObject o ? o.Value : null);
             return old == null ? Nil.Instance : new LispDotNetObject(old);
         }, "%SWAP-PACKAGE-UNIT", 1));
+        // The name of the current package unit, or NIL; and a call in the unit of that name.
+        RegisterDotclInternal("%CURRENT-PACKAGE-UNIT-NAME", new LispFunction(args => {
+            Runtime.CheckArityExact("%CURRENT-PACKAGE-UNIT-NAME", args, 0);
+            var u = Package.CurrentUnit;
+            return u == null ? Nil.Instance : new LispString(u.UnitName);
+        }, "%CURRENT-PACKAGE-UNIT-NAME", 0));
+        RegisterDotclInternal("%CALL-IN-PACKAGE-UNIT-NAMED", new LispFunction(args => {
+            Runtime.CheckArityExact("%CALL-IN-PACKAGE-UNIT-NAMED", args, 2);
+            var u = args[0] is LispString un ? Package.FindUnit(un.Value) : null;
+            var fn = args[1];
+            return u == null ? Startup.Keyword("NOT-FOUND") : Package.CallInUnit(u, () => Runtime.Funcall(fn));
+        }, "%CALL-IN-PACKAGE-UNIT-NAMED", 2));
         RegisterDotclInternal("%ADD-PACKAGE-UNIT-SPECIAL", new LispFunction(args => {
             Runtime.CheckArityExact("%ADD-PACKAGE-UNIT-SPECIAL", args, 2);
             var u = (Package.Unit)((LispDotNetObject)args[0]).Value;
@@ -2655,6 +2696,12 @@ public static class Startup
             u.AddSpecial(sym, DynamicBindings.Get(sym));
             return Nil.Instance;
         }, "%ADD-PACKAGE-UNIT-SPECIAL", 2));
+        // Calls FN outside every package unit, seeing the unit specials' outer bindings.
+        RegisterDotclInternal("%CALL-OUTSIDE-PACKAGE-UNITS", new LispFunction(args => {
+            Runtime.CheckArityExact("%CALL-OUTSIDE-PACKAGE-UNITS", args, 1);
+            var fn = args[0];
+            return Package.CallOutsideUnits(() => Runtime.Funcall(fn));
+        }, "%CALL-OUTSIDE-PACKAGE-UNITS", 1));
         // Nested, unlike %SWAP-PACKAGE-UNIT: safe inside bindings of the unit's specials.
         RegisterDotclInternal("%CALL-IN-PACKAGE-UNIT", new LispFunction(args => {
             Runtime.CheckArityExact("%CALL-IN-PACKAGE-UNIT", args, 2);
@@ -3217,11 +3264,20 @@ public static class Startup
             bool binary = elementType is Cons et && et.Car is Symbol etSym
                 && etSym.Name == "UNSIGNED-BYTE" && et.Cdr is Cons etArg
                 && etArg.Car is Fixnum etBits && etBits.Value == 8;
-            return LispProcess.Launch(program, argStrings, dir, input, output, error,
+            LispObject onExit = Nil.Instance;
+            for (int i = 2; i + 1 < args.Length; i += 2)
+                if (args[i] == Keyword("ON-EXIT")) { onExit = args[i + 1]; break; }
+            if (onExit is not Nil && onExit is not LispFunction
+                && !(onExit is Symbol { Function: LispFunction }))
+                throw new LispErrorException(new LispTypeError(
+                    "LAUNCH-PROCESS: :ON-EXIT is not a function", onExit, Sym("FUNCTION")));
+            var launched = LispProcess.Launch(program, argStrings, dir, input, output, error,
                                       ifInputDne, ifOutputExists, ifErrorExists, env, encoding, binary);
+            if (onExit is not Nil) launched.OnExit(onExit);
+            return launched;
         }).WithKeyArgs(1, 2, false, "DIRECTORY", "ENVIRONMENT", "INPUT", "OUTPUT", "ERROR",
             "IF-INPUT-DOES-NOT-EXIST", "IF-OUTPUT-EXISTS", "IF-ERROR-EXISTS", "EXTERNAL-FORMAT",
-            "ELEMENT-TYPE", "ERROR-OUTPUT", "IF-ERROR-OUTPUT-EXISTS"));
+            "ELEMENT-TYPE", "ERROR-OUTPUT", "IF-ERROR-OUTPUT-EXISTS", "ON-EXIT"));
         RegisterDotcl("PROCESS-INPUT", new LispFunction(args =>
             args[0] is LispProcess p ? p.InputStream
             : throw new LispErrorException(new LispTypeError("PROCESS-INPUT: not a process", args[0]))).WithArgCount(1, 1));
@@ -3677,7 +3733,7 @@ public static class Startup
         RegisterDotNet(DotNetPkg, "CAST", new LispFunction(Runtime.DotNetCast, "DOTNET:CAST", 2),
             "(dotnet:cast obj type) => object\nReference cast: verify OBJ is an instance of TYPE (error if not) and return it\nre-wrapped carrying TYPE as its static hint, so later dotnet:invoke/new overload\nresolution treats it as TYPE (upcast to a base class/interface). For value-type\nconversions use dotnet:box instead.");
         RegisterDotNet(DotNetPkg, "MAKE-ARRAY", new LispFunction(Runtime.DotNetMakeArray, "DOTNET:MAKE-ARRAY", -1),
-            "(dotnet:make-array element-type &rest dimensions) => array\nCreate a typed .NET array of ELEMENT-TYPE sized by DIMENSIONS, filled with the\nelement type's default. One dimension => 1-D array; several => multi-dimensional.\nELEMENT-TYPE is a type-name string/symbol or a resolved System.Type.\ne.g. (dotnet:make-array \"System.Int32\" 100) or (dotnet:make-array \"System.Single\" 10 20).\nAccess elements via (dotnet:invoke arr \"get_Item\"/\"set_Item\" idx... [val]).");
+            "(dotnet:make-array element-type dimensions &key initial-element initial-contents) => array\nCreate a typed .NET array of ELEMENT-TYPE. DIMENSIONS is a list of sizes or\none integer per axis; one size => 1-D array, several => multi-dimensional.\n:INITIAL-ELEMENT fills every element; :INITIAL-CONTENTS is a flat sequence for\nrank 1 and a nested sequence for higher ranks. ELEMENT-TYPE is a type-name\nstring/symbol or a resolved System.Type. e.g. (dotnet:make-array \"System.Int32\"\n100) or (dotnet:make-array \"System.Single\" '(10 20) :initial-element 0).\nAccess elements via (dotnet:invoke arr \"get_Item\"/\"set_Item\" idx... [val]) or AREF.");
         RegisterDotNet(DotNetPkg, "NEW-ARRAY", new LispFunction(Runtime.DotNetNewArray, "DOTNET:NEW-ARRAY", -1),
             "(dotnet:new-array element-type &rest elements) => array\nCreate a typed .NET array (element-type[]) filled with the marshalled ELEMENTS.\nELEMENT-TYPE is a type-name string/symbol or a resolved System.Type. Build from\na Lisp list with (apply #'dotnet:new-array element-type list). A Lisp list or\nvector is also auto-marshalled to an array-typed parameter or property.");
         RegisterDotNet(DotNetPkg, "%DEFINE-CLASS", new LispFunction(Runtime.DotNetDefineClass, "DOTNET:%DEFINE-CLASS", -1));
@@ -3691,7 +3747,7 @@ public static class Startup
             return Runtime.DotNetHintType(args[0]);
         }, "DOTNET:HINT-TYPE", 1),
             "(dotnet:hint-type obj) => type-or-nil\nFor a dotnet:box value, return its hint type (the user-supplied static type used\nto choose overloads) as a System.Type; NIL if OBJ carries no hint. See\ndotnet:object-type for the actual runtime type.");
-        RegisterDotNet(DotNetPkg, "TYPE-NAMES", new LispFunction(Runtime.DotNetTypeNames, "DOTNET:TYPE-NAMES", -1).WithKeyArgs(1, 1, false, "LIMIT"),
+        RegisterDotNet(DotNetPkg, "TYPE-NAMES", new LispFunction(Runtime.DotNetTypeNames, "DOTNET:TYPE-NAMES", -1).WithKeyArgs(1, 1, false, "LIMIT", "WAIT"),
             "(dotnet:type-names prefix &key limit) => list of plists\nThe type names starting with PREFIX, as (:name :kind). KIND is :class for a type and\n:namespace for a name that only leads to more names, so \"System.Te\" answers with the\nnamespace \"System.Text.\" as well as the types directly under it. LIMIT caps the\nwhole result, namespaces first (default 200). Indexed once per change to the loaded assemblies, so a package\npulled in with nuget:require shows up without restarting.");
         RegisterDotNet(DotNetPkg, "DOCUMENTATION", new LispFunction(Runtime.DotNetDocumentation, "DOTNET:DOCUMENTATION", -1),
             "(dotnet:documentation type-or-object &optional member-name) => plist-or-nil\nThe prose .NET ships for a type, or for one of its members: (:summary :parameters\n:returns :exceptions), where :parameters and :exceptions are alists. Read from the XML\nfile beside the assembly, or from the reference pack for the shared framework (which\nships none). NIL when nothing documents it. A property accessor is answered under the\nproperty (get_Length as Length), and an inherited member under the type that declares\nit. e.g. (dotnet:documentation \"System.Text.StringBuilder\" \"AppendLine\").");

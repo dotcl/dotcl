@@ -23,7 +23,8 @@
     (tagbody
      top
        (incf k)
-       (when (< k n) (funcall (lambda () (go top)))))
+       ;; A closure that is called through a variable: it can GO, so the switch stays.
+       (when (< k n) (let ((f (lambda () (go top)))) (funcall f))))
     k))
 
 (defun %tdg-arg (n)

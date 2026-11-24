@@ -146,7 +146,10 @@
   (0 0 0 0 0))
 
 (deftest-compiled-only mda-reads-storage
+  ;; the subscript check of an axis is inline IL ending in a call of AxisIndexError, not a call of
+  ;; AxisIndexL (see aref-axis-check-inline.lisp); at (safety 0) there is no check at all
   (list (plusp (%mda-sil-count #'%mda-u64-3d "LDELEM-I8"))
-        (%mda-sil-count #'%mda-u64-3d "AxisIndexL")
-        (plusp (%mda-sil-count #'%mda-ref "AxisIndexL")))
-  (t 0 t))
+        (%mda-sil-count #'%mda-u64-3d "AxisIndexError")
+        (plusp (%mda-sil-count #'%mda-ref "AxisIndexError"))
+        (%mda-sil-count #'%mda-ref "AxisIndexL"))
+  (t 0 t 0))

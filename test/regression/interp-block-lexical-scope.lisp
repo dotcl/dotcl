@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; BLOCK names are LEXICAL: a same-named inner BLOCK must not hide the outer one.
 ;;;
 ;;; %MINI-EVAL's BLOCK used the block-name symbol itself as the CATCH tag, which

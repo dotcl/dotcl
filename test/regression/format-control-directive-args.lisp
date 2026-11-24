@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The control-structure directives need their arguments too.
 ;;;
 ;;; The printing directives were made to signal on exhaustion earlier; ~[ ~{ ~*

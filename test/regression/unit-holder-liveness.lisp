@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A lambda built by one EVAL must keep its compilation unit alive: while the
 ;;; lambda is reachable its body can run, and a body can load a constant from
 ;;; the unit that produced it. Collecting the unit first turns a later call into

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A docstring in a LAMBDA body is the documentation of the function it makes,
 ;;; for (lambda ...), #'(lambda ...), COMPILE and the interpreter alike.
 

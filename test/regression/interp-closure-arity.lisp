@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; An interpreted closure must report the same arity as a compiled one.
 ;;;
 ;;; The tree-walk evaluator builds every closure as one variadic

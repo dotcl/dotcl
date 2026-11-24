@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; #'ASSOC must not let a malformed alist entry through.
 ;;;
 ;;; CLHS: an alist element is a cons or NIL. NIL is skipped; any other non-cons is

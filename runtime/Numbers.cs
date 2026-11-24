@@ -28,7 +28,22 @@ public sealed class Fixnum : Number
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Fixnum Make(long value) =>
-        (value >= CacheMin && value <= CacheMax) ? Cache[value - CacheMin] : new Fixnum(value);
+        (value >= CacheMin && value <= CacheMax) ? Cache[value - CacheMin]
+        : (ulong)(value - (CacheMax + 1)) < (ulong)MidSize ? MakeMid(value)
+        : new Fixnum(value);
+
+    // Above the eager cache, up to MidMax: boxes are made on first use and kept, so a list or an
+    // array of small counters does not allocate one box per element, and a process that never
+    // sees such numbers pays nothing but the (untouched) array.
+    private const int MidSize = (1 << 18) - (CacheMax + 1);
+    private static readonly Fixnum?[] Mid = new Fixnum?[MidSize];
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static Fixnum MakeMid(long value)
+    {
+        int i = (int)(value - (CacheMax + 1));
+        return Mid[i] ??= new Fixnum(value);
+    }
 
     public override string ToString() => Value.ToString();
 
@@ -348,7 +363,7 @@ internal static class FloatText
             }
             return v.ToString("G17", inv);
         }
-        return s;
+        return TieUp(s, v);
     }
 
     public static string R(float v)
@@ -365,7 +380,101 @@ internal static class FloatText
             }
             return v.ToString("G9", inv);
         }
-        return s;
+        return TieUp(s, v);
+    }
+
+    // When the value is exactly halfway between the shortest digit string S and the next one up
+    // (922126456.03515625 between ...562 and ...563), .NET keeps the even last digit and Steele-White
+    // free-format printing (SBCL's) takes the larger one. Both read back as V; use the larger.
+    private static string TieUp(string s, double v)
+    {
+        long bits = BitConverter.DoubleToInt64Bits(v);
+        int be = (int)((bits >> 52) & 0x7FF);
+        if (be == 0x7FF) return s;
+        long frac = bits & 0xFFFFFFFFFFFFFL;
+        long m64 = be == 0 ? frac : (frac | (1L << 52));
+        int exp2 = (be == 0 ? 1 : be) - 1075;
+        if (!CanBeTie(m64, exp2, 59900)) return s;
+        return TieUpDouble(s, v, m64, exp2);
+    }
+
+    // apart from TieUp so the closure it needs is not allocated for the values CanBeTie turns away
+    private static string TieUpDouble(string s, double v, long m64, int exp2)
+        => TieUpDigits(s, m64, exp2, t => double.Parse(t, System.Globalization.CultureInfo.InvariantCulture) == v);
+
+    private static string TieUp(string s, float v)
+    {
+        int bits = Compat.SingleToInt32Bits(v);
+        int be = (bits >> 23) & 0xFF;
+        if (be == 0xFF) return s;
+        int frac = bits & 0x7FFFFF;
+        long m32 = be == 0 ? frac : (frac | (1 << 23));
+        int exp2 = (be == 0 ? 1 : be) - 150;
+        if (!CanBeTie(m32, exp2, 33300)) return s;
+        return TieUpFloat(s, v, m32, exp2);
+    }
+
+    private static string TieUpFloat(string s, float v, long m32, int exp2)
+        => TieUpDigits(s, m32, exp2, t => float.Parse(t, System.Globalization.CultureInfo.InvariantCulture) == v);
+
+    // A value can sit exactly halfway between two shortest-digit strings only when its exact decimal
+    // expansion is a short finite one: V = M x 2^E with M odd needs -E digits after the point (E < 0)
+    // and has about log10(M x 5^-E) significant digits, at most one more than the shortest digits
+    // (17 for a double, 9 for a single). LIMIT is that count as a bit length times 1000
+    // (10^18 is 2^59.8; 10^10 is 2^33.2). Almost every value fails this with a few integer operations,
+    // so the BigInteger test below is for the few that pass.
+    private static bool CanBeTie(long mant, int exp2, int limit)
+    {
+        if (mant == 0) return false;
+        // the exponent of a power of two (and of an integer below 2^53) as a double is its bit position
+        int tz = (int)((BitConverter.DoubleToInt64Bits((double)(mant & -mant)) >> 52) - 1023);
+        int k = -(exp2 + tz);
+        if (k < 1 || k > 26) return false;
+        int bits = (int)((BitConverter.DoubleToInt64Bits((double)(mant >> tz)) >> 52) - 1023) + 1;
+        return bits * 1000 + 2322 * k <= limit;
+    }
+
+    private static string TieUpDigits(string s, System.Numerics.BigInteger mant, int exp2, Func<string, bool> readsBack)
+    {
+        if (mant.IsZero) return s;
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+        string body = s.TrimStart('-');
+        string sign = s.Length > body.Length ? "-" : "";
+        int exp10 = 0;
+        int ei = body.IndexOf('E');
+        string mpart = body;
+        if (ei >= 0)
+        {
+            exp10 = int.Parse(body.Substring(ei + 1), inv);
+            mpart = body.Substring(0, ei);
+        }
+        int point = mpart.IndexOf('.');
+        string digits = mpart.Replace(".", "");
+        int intLen = point < 0 ? mpart.Length : point;
+        // value = 0.DIGITS x 10^e10, after the leading and trailing zeros are dropped
+        int e10 = exp10 + intLen;
+        int lead = 0;
+        while (lead < digits.Length - 1 && digits[lead] == '0') { lead++; e10--; }
+        digits = digits.Substring(lead).TrimEnd('0');
+        if (digits.Length == 0 || ((digits[digits.Length - 1] - '0') & 1) != 0) return s;
+        // the midpoint (N * 10 + 5) x 10^(e10 - n - 1) must be the value exactly
+        var n = System.Numerics.BigInteger.Parse(digits, inv);
+        var mid = n * 10 + 5;
+        int q = e10 - digits.Length - 1;
+        var left = mant;
+        var right = mid;
+        if (exp2 >= 0) left *= System.Numerics.BigInteger.Pow(2, exp2); else right *= System.Numerics.BigInteger.Pow(2, -exp2);
+        if (q >= 0) right *= System.Numerics.BigInteger.Pow(10, q); else left *= System.Numerics.BigInteger.Pow(10, -q);
+        if (left != right) return s;
+        // raise the last significant digit of S in place (it is even, so there is no carry); the text
+        // keeps the shape ("R" chose fixed or scientific) its callers expect
+        int endMant = s.IndexOf('E');
+        if (endMant < 0) endMant = s.Length;
+        int last = endMant - 1;
+        while (last >= 0 && s[last] == '0' && s.IndexOf('.') >= 0 && last > s.IndexOf('.')) last--;
+        if (last < 0 || !char.IsDigit(s[last])) return s;
+        string t = s.Substring(0, last) + (char)(s[last] + 1) + s.Substring(last + 1);
+        return readsBack(t) ? t : s;
     }
 
     // "E16" gives d.dddddddddddddddE-008; return it in the same shape "R" would have used
@@ -376,7 +485,7 @@ internal static class FloatText
         // always acceptable to them, so hand back the E form without leading zeros in the exponent.
         int ei = e.IndexOf('E');
         var mant = e.Substring(0, ei).TrimEnd('0');
-        if (mant.EndsWith(".")) mant = mant.Substring(0, mant.Length - 1);
+        if (mant.EndsWith(".", System.StringComparison.Ordinal)) mant = mant.Substring(0, mant.Length - 1);
         int exp = int.Parse(e.Substring(ei + 1), System.Globalization.CultureInfo.InvariantCulture);
         return mant + "E" + (exp < 0 ? "-" : "+") + Math.Abs(exp).ToString(System.Globalization.CultureInfo.InvariantCulture);
     }

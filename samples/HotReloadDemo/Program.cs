@@ -60,14 +60,19 @@ using var watcher = new FileSystemWatcher(Environment.CurrentDirectory, "handler
     EnableRaisingEvents = true,
 };
 DateTime lastReload = DateTime.MinValue;
-watcher.Changed += (_, _) =>
+void OnSaved()
 {
     var now = DateTime.UtcNow;
     if ((now - lastReload).TotalMilliseconds < 200) return; // debounce editor double-fires
     lastReload = now;
     Thread.Sleep(50); // let the editor finish writing
     LoadHandlers("file changed");
-};
+}
+// Many editors save by writing a temporary file and renaming it over the original,
+// which arrives as Created or Renamed rather than Changed.
+watcher.Changed += (_, _) => OnSaved();
+watcher.Created += (_, _) => OnSaved();
+watcher.Renamed += (_, _) => OnSaved();
 
 Console.WriteLine("host running; edit handlers.lisp and save to hot-reload (Ctrl+C to quit)");
 for (long n = 1; ; n++)

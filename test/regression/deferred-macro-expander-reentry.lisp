@@ -5,7 +5,7 @@
 (defvar *dmer-made* 0)
 
 (deftest-compiled-only deferred-macro-expander-reentry
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "dmer.lisp" dir))
          (fasl (merge-pathnames "dmer.fasl" dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)

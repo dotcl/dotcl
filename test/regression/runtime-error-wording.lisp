@@ -44,7 +44,7 @@
   5)
 
 (deftest rew-open-directory
-  (let ((m (rew-message (lambda () (open #-windows "/tmp" #+windows "C:/Windows")))))
+  (let ((m (rew-message (lambda () (open #-windows "/tmp" #+windows "C:/Windows"))))) ; fixed-path-ok (opens an existing directory, expects an error)
     (and (search "directory" m) t))
   t)
 

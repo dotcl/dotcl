@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; dotnet:members -- what can be called on a .NET type.
 ;;;
 ;;; The interop surface names members with strings, so an image that knows a

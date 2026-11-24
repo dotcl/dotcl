@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A symbol that appears only inside a macro's backquote template must exist in
 ;;; its package as soon as the .fasl is loaded: before anything expands the
 ;;; macro. SBCL interns the whole constant pool at load time; dotcl emitted the

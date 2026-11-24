@@ -35,8 +35,8 @@
   :undefined-function)
 
 (deftest-compiled-only edf-compile-file-nontoplevel-symbol-macro
-  (let ((src "edf-sm-tmp.lisp")
-        (fasl "edf-sm-tmp.fasl"))
+  (let ((src (regression-temp-file "edf-sm-tmp.lisp"))
+        (fasl (regression-temp-file "edf-sm-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)

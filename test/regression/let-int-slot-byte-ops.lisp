@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; An undeclared LET variable whose init has a known integer range gets a raw
 ;;; Int64 slot when the body reads it as an integer operand. LDB, DPB,
 ;;; MASK-FIELD, DEPOSIT-FIELD and the two-argument LOGANDC1 .. LOGEQV count as

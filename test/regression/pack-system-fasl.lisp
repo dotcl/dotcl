@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; `dotcl pack` builds a system and its whole closure into one fasl.
 ;;;
 ;;; Two things are pinned here, each of which used to stop a pack outright.

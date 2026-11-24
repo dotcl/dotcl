@@ -210,9 +210,76 @@
            (when (%db-has-nil-var elem)
              (return t))))))))
 
+;;; The syntax of a destructuring lambda list (CLHS 3.4.5), as DESTRUCTURING-BIND takes it:
+;;; [&whole var] required* [&optional ...] [{&rest | &body} var] [&key ...] [&allow-other-keys]
+;;; [&aux ...], where a required variable, a &rest variable, and a variable of a &optional /
+;;; &key entry may itself be a destructuring lambda list.  The dotted tail (a . b) means &rest.
+(defun %check-destructuring-pattern (pattern &optional (who 'destructuring-bind))
+  (labels ((bad (control &rest args)
+             (error 'program-error :format-control "~S: ~?" :format-arguments (list who control args)))
+           (var-p (v) (and v (symbolp v) (not (keywordp v))
+                           (char/= (char (symbol-name v) 0) #\&)))
+           (lk-p (x) (and x (symbolp x) (char= (char (symbol-name x) 0) #\&)))
+           (var-or-pattern (v ll)
+             ;; NIL stands for the empty list: a pattern that matches nothing
+             (cond ((var-p v)) ((null v))
+                   ((consp v) (check v nil))
+                   (t (bad "~S is not a variable in ~S" v ll))))
+           (entry (x ll max keyp)
+             ;; VAR | (VAR [INIT [SVAR]]); for &key also ((KEYWORD VAR) [INIT [SVAR]])
+             (cond ((var-p x))
+                   ((and (consp x) (null (cdr (last x))) (<= (length x) max))
+                    (let ((v (car x)))
+                      (cond ((and keyp (consp v))
+                             (unless (and (consp (cdr v)) (null (cddr v)) (symbolp (car v)))
+                               (bad "malformed entry ~S in ~S" x ll))
+                             (var-or-pattern (cadr v) ll))
+                            (t (var-or-pattern v ll)))))
+                   (t (bad "malformed entry ~S in ~S" x ll))))
+           (check (ll top)
+             (let ((rest ll) (state :required) (stage 0))
+               (loop
+                 (cond
+                   ((null rest) (return))
+                   ((atom rest)
+                    (unless (and (var-p rest) (member state '(:required :optional))) (bad "malformed tail in ~S" ll))
+                    (return)))
+                 (let ((x (car rest)))
+                   (cond
+                     ((lk-p x)
+                      (case x
+                        (&whole
+                         (unless (and (eq rest ll) (consp (cdr rest))) (bad "&WHOLE is out of place in ~S" ll))
+                         (var-or-pattern (cadr rest) ll)
+                         (setf rest (cdr rest)))
+                        ((&optional &rest &body &key &allow-other-keys &aux)
+                         (let ((n (case x (&optional 1) ((&rest &body) 2) (&key 3) (&allow-other-keys 4) (t 5))))
+                           (when (or (< n stage) (and (= n stage) (/= n 4)) (and (= n 4) (< stage 3)))
+                             (bad "~S is out of place in ~S" x ll))
+                           (setf stage n)
+                           (setf state (case x (&optional :optional) ((&rest &body) :rest-done) (&key :key)
+                                         (&allow-other-keys :aok) (t :aux)))
+                           (when (member x '(&rest &body))
+                             (unless (consp (cdr rest)) (bad "~S needs a variable in ~S" x ll))
+                             (var-or-pattern (cadr rest) ll)
+                             (setf rest (cdr rest)))))
+                        (t (bad "~S is not allowed in ~S" x ll))))
+                     (t
+                      (case state
+                        (:required (var-or-pattern x ll))
+                        (:optional (entry x ll 3 nil))
+                        (:key (entry x ll 3 t))
+                        (:aux (entry x ll 2 nil))
+                        (t (bad "unexpected ~S in ~S" x ll))))))
+                 (setf rest (cdr rest))))))
+    (cond ((null pattern))
+          ((consp pattern) (check pattern t))
+          (t (bad "~S is not a destructuring lambda list" pattern)))))
+
 (setf (gethash 'destructuring-bind *macros*)
       (lambda (form)
         ;; (destructuring-bind pattern expr body...)
+        (%check-destructuring-pattern (cadr form))
         (let ((pattern (cadr form))
               (expr (caddr form))
               (body (cdddr form))
@@ -258,11 +325,29 @@ before.")
 ;;; Returns a list with one entry per slot: the position in the raw array, or
 ;;; -1 for a slot that stays boxed. NIL when no slot qualifies, which is the
 ;;; signal not to emit a registration at all.
+(defun %deftype-slot-storage-type (declared)
+  "DECLARED with a DEFTYPE expanded, when what it expands to is an integer range within
+   32 bits (an index type such as (unsigned-byte 31)): such a slot is stored raw, as the
+   same range written out is. A wider range behind a DEFTYPE name (a 64-bit class one)
+   stays as declared, boxed: its values are small in practice, and the raw form of a
+   small node costs more than the cached boxed fixnum."
+  (let* ((expanded (%typexpand-for-range declared))
+         (r (and (not (eq expanded declared)) (integer-type-range expanded))))
+    (if (and r (>= (car r) (- (ash 1 31))) (< (cdr r) (ash 1 32)))
+        expanded
+        declared)))
+
 (defun %slot-raw-kind (slot)
   "0 when SLOT is stored as a raw int64, 1 when as a raw double, 2 when as a
    raw single-float (its bits in the low half of the long), 3 when as the bits
    of an (unsigned-byte 64), NIL when it stays boxed."
-  (let ((ty (getf (cddr slot) :type)))
+  (let ((ty (let ((declared (getf (cddr slot) :type)))
+              ;; A DEFTYPE that names an integer range decides the storage as its
+              ;; expansion does (fixed here, when the structure is defined).
+              (if (and declared (not (member declared '(fixnum double-float long-float
+                                                         single-float short-float))))
+                  (%deftype-slot-storage-type declared)
+                  declared))))
     (cond ((null ty) nil)
           ((member ty (quote (double-float long-float))) 1)
           ((member ty (quote (single-float short-float))) 2)
@@ -550,6 +635,9 @@ quietly took every typed slot back off the raw path."
   (setf (gethash acc *struct-accessors*) raw-index)
   (setf (gethash acc *struct-accessor-owners*) sname)
   (let ((ty (getf (cddr slot) :type)))
+    ;; The type a raw integer slot is stored as: its expansion when it was a DEFTYPE.
+    (when (and ty (eql (%slot-raw-kind slot) 0))
+      (setq ty (%deftype-slot-storage-type ty)))
     (if ty
         (setf (gethash acc *struct-accessor-types*) ty)
         (remhash acc *struct-accessor-types*)))
@@ -596,6 +684,21 @@ quietly took every typed slot back off the raw path."
    argument array plus the keyword scan, ~140 B a call. Standard (non-typed)
    structs only, and the constructor keeps its ordinary &key definition for
    APPLY, #' and non-constant keywords.")
+
+(defvar *struct-boa-ctors* (make-hash-table :test #'eq :synchronized t)
+  "Maps a standard DEFSTRUCT's BOA constructor whose lambda list is only required
+   parameters, each naming a slot, to (STRUCT-NAME KEYWORDS INITFORMS SLOTS PARAMS):
+   the first four are as in *STRUCT-KEYWORD-CTORS*, and PARAMS are the keywords of
+   the slots the parameters name, in lambda-list order. A call with exactly that
+   many arguments is the keyword call with the arguments paired to PARAMS, so it
+   is built at the call site the same way (see %STRUCT-CTOR-DIRECT-FORM).")
+
+(defun %register-struct-boa-ctor (ctor struct-name keywords initforms slots params)
+  "Record CTOR as a BOA constructor of STRUCT-NAME that can be built at the call
+   site; see *STRUCT-BOA-CTORS*. Called from the DEFSTRUCT expansion after the
+   constructor's DEFUN, so a later DEFUN of the same name drops the entry."
+  (setf (gethash ctor *struct-boa-ctors*)
+        (list struct-name keywords initforms slots params)))
 
 (defvar *typed-struct-keyword-ctors* (make-hash-table :test #'eq :synchronized t)
   "Maps the keyword constructor of a (:TYPE VECTOR) or (:TYPE LIST) structure to (STRUCT-NAME
@@ -746,9 +849,13 @@ quietly took every typed slot back off the raw path."
 ;; (setf (documentation x doc-type) new-value)
 (setf (gethash "DOCUMENTATION" *setf-expanders*)
       (lambda (place value)
-        (let ((tmp (gensym "V")))
-          `(let ((,tmp ,value))
-             (funcall #'(setf documentation) ,tmp ,(cadr place) ,(caddr place))
+        (let ((obj (gensym "OBJ"))
+              (doc-type (gensym "DOC-TYPE"))
+              (tmp (gensym "V")))
+          `(let* ((,obj ,(cadr place))
+                  (,doc-type ,(caddr place))
+                  (,tmp ,value))
+             (funcall #'(setf documentation) ,tmp ,obj ,doc-type)
              ,tmp))))
 
 ;; (setf (char string index) char) -> Runtime.SetChar
@@ -771,7 +878,9 @@ quietly took every typed slot back off the raw path."
 
 (setf (gethash "SVREF" *setf-expanders*)
       (lambda (place value)
-        `(%set-elt ,(second place) ,(third place) ,value)))
+        ;; The store AREF makes: it takes a subscript known to be a fixnum raw, where
+        ;; %SET-ELT (the generic sequence store) always builds a Fixnum for it.
+        `(%aref-set ,(second place) ,(third place) ,value)))
 
 (setf (gethash "FILL-POINTER" *setf-expanders*)
       (lambda (place value)
@@ -880,7 +989,12 @@ quietly took every typed slot back off the raw path."
 
 (setf (gethash "SYMBOL-PLIST" *setf-expanders*)
       (lambda (place value)
-        `((lambda (v s) (funcall #'(setf symbol-plist) v s) v) ,value ,(second place))))
+        (let ((sym (gensym "SYM"))
+              (v (gensym "V")))
+          `(let* ((,sym ,(second place))
+                  (,v ,value))
+             (funcall #'(setf symbol-plist) ,v ,sym)
+             ,v))))
 
 (setf (gethash "GET" *setf-expanders*)
       (lambda (place value)
@@ -940,8 +1054,9 @@ quietly took every typed slot back off the raw path."
                         (,val-temp ,value))
                    (funcall (function (setf ,fn-sym)) ,val-temp ,@arg-temps)))
               ;; Normal CL:MACRO-FUNCTION setf
-              `(let ((v ,value) (n ,(second place))
-                     ,@(when env-form `((,(gensym "ENV") ,env-form))))
+              `(let* ((n ,(second place))
+                      ,@(when env-form `((,(gensym "ENV") ,env-form)))
+                      (v ,value))
                  (unless (functionp v)
                    (error 'type-error :datum v :expected-type 'function))
                  (let ((mkey (macro-key-for-symbol n)))
@@ -1473,7 +1588,7 @@ quietly took every typed slot back off the raw path."
                      (if bindings
                          `(let* ,bindings ,call)
                          call)))
-                  (t (error "SETF: unsupported place ~s" place))))
+                  (t (error 'program-error :format-control "SETF: ~S is not a place" :format-arguments (list place)))))
               ;; Multi-pair
               (let ((result '()))
                 (loop while pairs
@@ -1838,7 +1953,7 @@ quietly took every typed slot back off the raw path."
                                         `(,(car place) ,@temps)))
                               (let ((s (gensym "STORE")))
                                 (values nil nil (list s) `(setf ,place ,s) place))))))))))))
-    (t (error "get-setf-expansion: unknown place: ~s" place))))
+    (t (error 'program-error :format-control "GET-SETF-EXPANSION: ~S is not a place" :format-arguments (list place)))))
 
 ;;; Get-setf-expansion of a CCASE / CTYPECASE keyplace, or a read-once literal.
 (defun %get-keyplace-expansion (keyform)
@@ -2048,6 +2163,25 @@ quietly took every typed slot back off the raw path."
 ;;; holds a raw int64 (a declared parameter or LET binding) lowers the sum it
 ;;; is given natively, but a store temporary in between is a boxed binding, so
 ;;; the sum went through the generic promoting add and was unboxed again.
+(defun %struct-incf-match (setter stores)
+  "For the setter of a structure accessor whose slot is declared FIXNUM,
+   (PROGN (%CHECK-SLOT-TYPE S 'FIXNUM 'STRUCT 'SLOT) (%STRUCT-SET OBJ IDX S 'TYPE)) with S the one
+   store variable: (OBJ IDX TYPE (STRUCT . SLOT)); else NIL."
+  (and (consp setter) (eq (car setter) 'progn) (= (length setter) 3)
+       (null (cdr stores))
+       (let ((chk (second setter)) (set (third setter)) (v (car stores)))
+         (and (consp chk) (eq (car chk) '%check-slot-type) (= (length chk) 5)
+              (eq (second chk) v)
+              (equal (third chk) '(quote fixnum))
+              (consp (fourth chk)) (eq (car (fourth chk)) 'quote)
+              (consp (fifth chk)) (eq (car (fifth chk)) 'quote)
+              (consp set) (eq (car set) '%struct-set) (= (length set) 5)
+              (integerp (third set))
+              (eq (fourth set) v)
+              (consp (fifth set)) (eq (car (fifth set)) 'quote)
+              (list (second set) (third set) (cadr (fifth set))
+                    (cons (cadr (fourth chk)) (cadr (fifth chk))))))))
+
 (defun %incf-expansion (form op tmp-name)
   "The expansion of INCF (OP +) or DECF (OP -) FORM."
   (%check-macro-arity form 1 2)
@@ -2061,6 +2195,26 @@ quietly took every typed slot back off the raw path."
          (getter (fifth exp))
          (literal (numberp delta))
          (delta-tmp (gensym tmp-name)))
+    ;; (INCF (GETHASH KEY TABLE [DEF]) DELTA): one call that finds the entry once. KEY, TABLE,
+    ;; DEF and DELTA are evaluated in this order, before the table is read, as in the general
+    ;; expansion below.
+    (when (and (consp place) (eq (car place) 'gethash) (<= 3 (length place) 4)
+               (not (local-function-entry 'gethash))
+               (not (macrolet-shadowed-p 'gethash)))
+      (return-from %incf-expansion
+        `(,(if (eq op '+) '%gethash-incf '%gethash-decf)
+          ,(second place) ,(third place) ,(if (fourth place) (fourth place) nil) ,delta)))
+    ;; INCF / DECF of a structure slot declared FIXNUM: one primitive reads, adds, checks that the
+    ;; result is still a fixnum and stores, on the raw slot, instead of boxing the sum for a
+    ;; separate check and store. The setter is the one the accessor's SETF expansion made.
+    (let ((m (%struct-incf-match setter stores)))
+      (when m
+        (return-from %incf-expansion
+          `(let* (,@(mapcar #'list temps vals)
+                  ,@(unless literal `((,delta-tmp ,delta))))
+             (,(if (eq op '+) '%struct-incf '%struct-decf)
+              ,(first m) ,(second m) ,(if literal delta delta-tmp)
+              (quote ,(third m)) (quote ,(fourth m)))))))
     (if (and (symbolp place) (null temps)
              (equal setter `(setq ,place ,(car stores))))
         (if literal
@@ -2568,6 +2722,54 @@ quietly took every typed slot back off the raw path."
                   (go ,loop-tag))))))))
 
 ;;; --- dotimes ---
+(defun %dotimes-var-assigned-p (var forms)
+  "True when VAR may be assigned inside FORMS: it is named after an assignment operator."
+  (labels ((walk (x)
+             (cond ((atom x) nil)
+                   ((eq (car x) 'quote) nil)
+                   ((and (symbolp (car x))
+                         (member (car x) '(setq setf psetq psetf incf decf push pop pushnew
+                                           shiftf rotatef multiple-value-setq remf))
+                         (member var (cdr x)))
+                    t)
+                   (t (or (walk (car x)) (walk (cdr x)))))))
+    (walk forms)))
+
+(defun %mentions-double-literal-p (x)
+  (cond ((typep x 'double-float) t)
+        ((consp x) (or (%mentions-double-literal-p (car x)) (%mentions-double-literal-p (cdr x))))
+        (t nil)))
+
+(defun %dotimes-real-count-p (count-form fx-count var real-body result-form)
+  "True when DOTIMES should bind its count variable again as a checked real: the count is a
+   plain lexical variable that is not a fixnum already, nothing in the body or the result
+   form assigns it, no closure can (it is not boxed), and the body works with double-float
+   literals, where knowing the variable is a real lets the arithmetic stay raw."
+  (and (not fx-count)
+       (symbolp count-form) count-form (not (eq count-form var))
+       (not (keywordp count-form))
+       (not *cross-compiling*)
+       (lookup-local count-form)
+       (not (boxed-var-p count-form))
+       (not (global-special-p count-form))
+       (%mentions-double-literal-p real-body)
+       (not (%dotimes-var-assigned-p count-form (cons result-form real-body)))
+       (every #'consp real-body)))
+
+(defun %declared-type-of-var-in-decls (decls var)
+  "The type a (DECLARE (TYPE T VAR)) or short-form (DECLARE (BIT VAR)) among DECLS gives VAR, or NIL."
+  (dolist (d decls nil)
+    (when (and (consp d) (eq (car d) 'declare))
+      (dolist (spec (cdr d))
+        (when (and (consp spec) (symbolp (car spec)) (consp (cdr spec)))
+          (cond ((and (member (car spec) '(type cl:type)) (member var (cddr spec)))
+                 (return-from %declared-type-of-var-in-decls (cadr spec)))
+                ((and (member (symbol-name (car spec))
+                              '("INTEGER" "BIT" "REAL" "RATIONAL" "NUMBER" "FLOAT" "DOUBLE-FLOAT" "SINGLE-FLOAT")
+                              :test #'string=)
+                      (member var (cdr spec)))
+                 (return-from %declared-type-of-var-in-decls (car spec)))))))))
+
 (setf (gethash 'dotimes *macros*)
       (lambda (form)
         ;; (dotimes (var count-form &optional result) body...)
@@ -2578,6 +2780,7 @@ quietly took every typed slot back off the raw path."
                (result-form (if (cddr var-clause) (caddr var-clause) nil))
                (body (cddr form))
                (limit-var (gensym "LIMIT"))
+               (check-form nil)
                (loop-tag (gensym "DOTIMES-LOOP"))
                ;; When the count form is statically a fixnum the LIMIT can be
                ;; declared too, so the loop test is a raw int64 compare. A
@@ -2609,13 +2812,24 @@ quietly took every typed slot back off the raw path."
                                    (%induction ,var 1 ,limit-var nil)))))
           (%check-result-forms-for-declare (list result-form) 'dotimes)
           (multiple-value-bind (decls real-body) (extract-declarations body)
+            ;; A variable declared narrower than a fixnum is checked at (safety 3) each time
+            ;; round the loop, including the last, when it holds the count itself.
+            (let ((user-type (%declared-type-of-var-in-decls decls var)))
+              (when (and user-type (not (member user-type '(t fixnum integer cl:fixnum cl:integer))))
+                (setf *expansion-unreusable* t)
+                (when (eql (body-safety body) 3)
+                  (setf check-form `(%check-declared-type ',user-type ,var)))))
             `(block nil
+              (,@(if (%dotimes-real-count-p count-form fx-count var real-body result-form)
+                     `(let ((,count-form (%require-real ,count-form))))
+                     '(progn))
                (let ((,limit-var ,(if fx-count count-form `(%dotimes-limit ,count-form)))
                      (,var 0))
                  ,@fx-decl
                  ,@decls
                  (tagbody
                   ,loop-tag
+                  ,@(when check-form (list check-form))
                   (if (>= ,var ,limit-var)
                       (return ,(or result-form nil)))
                   ,@real-body
@@ -2624,7 +2838,7 @@ quietly took every typed slot back off the raw path."
                   ;; enabling a raw native add on an Int64-slot counter where a
                   ;; plain (1+ var) could not prove the +1 stays in range.
                   (setq ,var (%dotimes-1+ ,var))
-                  (go ,loop-tag))))))))
+                  (go ,loop-tag)))))))))
 
 ;;; --- multiple-value-bind ---
 (setf (gethash 'multiple-value-bind *macros*)
@@ -2639,16 +2853,39 @@ quietly took every typed slot back off the raw path."
                (value-form (caddr form))
                (body (cdddr form))
                (primary-var (gensym "MVP"))
-               (split (or (%mv-split-floor vars value-form body)
-                          (%mv-split-float-round vars value-form body))))
-          (if split
-              split
+               (split (or (%mv-split-values vars value-form body)
+                          (%mv-split-floor vars value-form body)
+                          (%mv-split-floor-forms vars value-form body)
+                          (%mv-split-float-round vars value-form body)
+                          (%mv-split-float-ffloor vars value-form body)
+                          (%mv-split-gethash vars value-form body)
+                          (%mv-split-parse-integer vars value-form body))))
+          ;; The shortcut was chosen from the local functions in scope where the form was expanded,
+          ;; and the analysis walks expand it outside the FLET / LABELS / MACROLET around it: the
+          ;; compiler has to expand it again where it compiles it.
+          (when split (setf *expansion-unreusable* t))
+          (cond
+            (split split)
+            ;; One variable takes the first value, which is what a LET binding of the
+            ;; form takes: no values are captured (about 13 ns a binding, and a
+            ;; ROTATEF of two places is two of them).
+            ((and (consp vars) (null (cdr vars)) (symbolp (car vars)) (car vars)
+                  (not (keywordp (car vars))))
+             `(let ((,(car vars) ,value-form)) ,@body))
+            (t
           `(let* ((,primary-var (%mv-capture ,value-form))
                   ,@(loop for v in vars
                           for i from 0
                           collect `(,v (%mv-nth ,i))))
              (declare (ignorable ,primary-var))
-             ,@body)))))
+             ,@body))))))
+
+(defun %op-shadowed-p (name)
+  "True when NAME names a local function (FLET / LABELS) or a MACROLET operator at the point
+   being expanded: the multiple-value shortcuts below read the call as the global operator and
+   must not be taken then."
+  (or (local-function-entry name)
+      (assoc name *lexical-operators*)))
 
 (defun %floor-split-operands-p (op-form vars)
   "True when OP-FORM is (FLOOR A B) or (TRUNCATE A B) with A and B symbols or
@@ -2664,8 +2901,8 @@ quietly took every typed slot back off the raw path."
               (cdr op-form))
        (not (member (third op-form) vars))
        (not (and (second vars) (member (second op-form) (cdr vars))))
-       (not (local-function-entry (car op-form)))
-       (not (local-function-entry (if (eq (car op-form) 'floor) 'mod 'rem)))))
+       (not (%op-shadowed-p (car op-form)))
+       (not (%op-shadowed-p (if (eq (car op-form) 'floor) 'mod 'rem)))))
 
 (defun %mv-setq-split-floor (vars value-form)
   "(MULTIPLE-VALUE-SETQ (Q R) (FLOOR A B)) as (SETQ R (MOD A B)) and
@@ -2682,6 +2919,98 @@ quietly took every typed slot back off the raw path."
          ,@(when (second vars)
              `((setq ,(second vars) (,(if (eq op 'floor) 'mod 'rem) ,a ,b))))
          (setq ,(first vars) (,op ,a ,b))))))
+
+(defun %mv-split-floor-forms (vars value-form body)
+  "Like %MV-SPLIT-FLOOR for (FLOOR A B) / (TRUNCATE A B) whose operands are
+   arbitrary forms: each non-atomic operand is bound once, in order, to a
+   fresh variable, and the split is taken over those."
+  (when (and (consp value-form)
+             (member (car value-form) '(floor truncate))
+             (= (length value-form) 3)
+             (some #'consp (cdr value-form))
+             (not (%op-shadowed-p (car value-form))))
+    (let* ((temps (mapcar (lambda (x) (if (consp x) (gensym "MVF") x))
+                          (cdr value-form)))
+           (inner (%mv-split-floor vars (cons (car value-form) temps) body)))
+      (when inner
+        `(let* ,(loop for x in (cdr value-form) for tm in temps
+                      when (consp x) collect (list tm x))
+           ,inner)))))
+
+(defun %mv-split-values (vars value-form body)
+  "(MULTIPLE-VALUE-BIND (A B C) (VALUES X Y) BODY...) as the LETs it means: X and Y evaluated in
+   order, then A bound to the first, B to the second and C to NIL. No values are captured and read
+   back (about 18 ns for the capture, whatever the count). Not for a VALUES that is rebound, or
+   variables that are not distinct plain symbols."
+  (when (and (consp value-form) (eq (car value-form) 'values)
+             (listp (cdr value-form)) (null (cdr (last value-form)))
+             (consp vars)
+             (every (lambda (v) (and (symbolp v) v (not (keywordp v)))) vars)
+             (= (length vars) (length (remove-duplicates vars)))
+             (not (%op-shadowed-p 'values)))
+    (setf *expansion-unreusable* t)
+    (let* ((forms (cdr value-form))
+           (temps (mapcar (lambda (f) (declare (ignore f)) (gensym "MVV")) forms)))
+      `(let (,@(mapcar #'list temps forms))
+         (declare (ignorable ,@temps))
+         (let (,@(loop for v in vars
+                       for i from 0
+                       collect (list v (nth i temps))))
+           ,@body)))))
+
+(defun %mv-split-gethash (vars value-form body)
+  "(MULTIPLE-VALUE-BIND (V P) (GETHASH K H [D]) BODY...) as one lookup that
+   needs no values channel: GETHASH is asked for a marker only this expansion
+   holds as its default, so a found entry is a value other than the marker and P is
+   whether it is. V is then the value, or D when nothing was found. K, H and D are
+   evaluated once, in order, before the lookup, as the call's arguments are. Only
+   two variables take this shape; a single variable is the ordinary LET of the
+   primary value."
+  (when (and (consp value-form) (eq (car value-form) 'gethash)
+             (consp (cdr value-form)) (consp (cddr value-form))
+             (null (cdddr (cdr value-form)))
+             (consp vars) (consp (cdr vars)) (null (cddr vars))
+             (every (lambda (v) (and (symbolp v) v (not (keywordp v)))) vars)
+             (not (eq (first vars) (second vars)))
+             (not (%op-shadowed-p 'gethash))
+             (not (%op-shadowed-p 'eq))
+             (not (%op-shadowed-p 'not)))
+    (let* ((k (gensym "K")) (h (gensym "H")) (d (gensym "D")) (v (gensym "V")) (m (gensym "M"))
+           (marker (make-symbol "GETHASH-ABSENT")))
+      `(let* ((,k ,(second value-form))
+              (,h ,(third value-form))
+              (,d ,(fourth value-form))
+              (,m ',marker)
+              (,v (gethash ,k ,h ,m)))
+         (let ((,(first vars) (if (eq ,v ,m) ,d ,v))
+               (,(second vars) (not (eq ,v ,m))))
+           ,@body)))))
+
+(defun %mv-split-parse-integer (vars value-form body)
+  "(MULTIPLE-VALUE-BIND (V P) (PARSE-INTEGER S [:RADIX R]) BODY...) with P the
+   length of S: without :JUNK-ALLOWED the parse must reach the end of the string,
+   so the second value PARSE-INTEGER returns is always the upper bounding index,
+   which is the length when no :END is given. S, then R, are evaluated once and
+   in order; the call is the ordinary one-value call. Only two variables, and
+   only the calls with no :START, :END or :JUNK-ALLOWED."
+  (when (and (consp value-form) (eq (car value-form) 'parse-integer)
+             (consp (cdr value-form))
+             (or (null (cddr value-form))
+                 (and (eq (third value-form) :radix)
+                      (consp (cdddr value-form))
+                      (null (cddddr value-form))))
+             (consp vars) (consp (cdr vars)) (null (cddr vars))
+             (every (lambda (v) (and (symbolp v) v (not (keywordp v)))) vars)
+             (not (eq (first vars) (second vars)))
+             (not (%op-shadowed-p 'parse-integer))
+             (not (%op-shadowed-p 'length)))
+    (let ((str (gensym "S")) (rad (gensym "R")) (val (gensym "V")))
+      `(let* ((,str ,(second value-form))
+              ,@(when (cddr value-form) `((,rad ,(fourth value-form))))
+              (,val (parse-integer ,str ,@(when (cddr value-form) `(:radix ,rad)))))
+         (let ((,(first vars) ,val)
+               (,(second vars) (length ,str)))
+           ,@body)))))
 
 (defun %mv-split-floor (vars value-form body)
   "(MULTIPLE-VALUE-BIND (Q R) (FLOOR A B) BODY...) as a LET* of (FLOOR A B)
@@ -2709,7 +3038,7 @@ quietly took every typed slot back off the raw path."
              (<= 1 (length vars) 2)
              (every (lambda (v) (and (symbolp v) v)) vars)
              (not (and (second vars) (eq (first vars) (second vars))))
-             (notany #'local-function-entry '(ffloor ftruncate fceiling fround + -)))
+             (notany #'%op-shadowed-p '(ffloor ftruncate fceiling fround + -)))
     (unless (numberp (cadr value-form))
       (setf *expansion-unreusable* t))
     (let ((kind (%float-round-arg-kind (car value-form) (cdr value-form))))
@@ -2725,6 +3054,41 @@ quietly took every typed slot back off the raw path."
                    (declare (type ,ty ,ft))
                    (let ((,(first vars) (,(car value-form) ,ft))
                          (,(second vars) (- ,fx (+ ,ft ,(if (eq kind :single) 0f0 0d0)))))
+                     ,@body)))))))))
+
+(defun %mv-split-float-ffloor (vars value-form body)
+  "(MULTIPLE-VALUE-BIND (Q R) (FFLOOR X [Y]) BODY...) on raw floats."
+  (when (and (consp value-form)
+             (member (car value-form) '(ffloor fceiling ftruncate fround))
+             (consp (cdr value-form)) (null (cdddr value-form))
+             (<= 1 (length vars) 2)
+             (every (lambda (v) (and (symbolp v) v)) vars)
+             (not (and (second vars) (eq (first vars) (second vars))))
+             (not (member (cadr value-form) vars))
+             (not (and (cddr value-form) (member (caddr value-form) (cdr vars))))
+             (notany #'%op-shadowed-p
+                     '(ffloor ftruncate fceiling fround + - *)))
+    (unless (numberp (cadr value-form))
+      (setf *expansion-unreusable* t))
+    (let ((kind (%float-round-arg-kind (car value-form) (cdr value-form))))
+      (when kind
+        (if (null (cdr vars))
+            `(let ((,(first vars) ,value-form)) ,@body)
+            (let* ((two (cddr value-form))
+                   (a (cadr value-form))
+                   (b (caddr value-form))
+                   (fa (gensym "FA")) (fb (gensym "FB")) (q (gensym "FQ"))
+                   (ty (if (eq kind :single) 'single-float 'double-float))
+                   (zero (if (eq kind :single) 0f0 0d0))
+                   (r (if two
+                          `(- ,fa (* ,q ,fb))
+                          `(- ,fa (+ ,q ,zero)))))
+              ;; An operand may be a fixnum beside a float one: it is converted to the format.
+              `(let ((,fa (float ,a ,zero)) ,@(when two `((,fb (float ,b ,zero)))))
+                 (declare (type ,ty ,fa ,@(when two `(,fb))))
+                 (let ((,q (,(car value-form) ,fa ,@(when two `(,fb)))))
+                   (declare (type ,ty ,q))
+                   (let ((,(first vars) ,q) (,(second vars) ,r))
                      ,@body)))))))))
 
 ;;; --- dotcl:async / dotcl:await (step B) ---------------------------
@@ -3117,6 +3481,16 @@ quietly took every typed slot back off the raw path."
                (%disassociate-condition-restarts %wcr-condition %wcr-restarts))))))
 
 ;;; --- ignore-errors ---
+;;; --- formatter ---
+;;; FORMATTER is a macro (CLHS): it has no function definition of its own, so (function
+;;; formatter) is an error. The work is done by the function %FORMATTER.
+(setf (gethash 'formatter *macros*)
+      (lambda (form)
+        (unless (and (consp (cdr form)) (null (cddr form)))
+          (error 'program-error :format-control "FORMATTER: wrong number of arguments in ~S"
+                                :format-arguments (list form)))
+        `(%formatter ,(cadr form))))
+
 (setf (gethash 'ignore-errors *macros*)
       (lambda (form)
         ;; (ignore-errors body...) -> (handler-case (progn body...) (error (c) (values nil c)))
@@ -3368,10 +3742,16 @@ quietly took every typed slot back off the raw path."
         (format *error-output* "~&;; DEFSTRUCT-CHECK: ~?~%" control args)
         (error 'program-error :format-control control :format-arguments args))))
 
-(defun %defstruct-check-slot-names (name own-slots inherited-slots)
-  "CLHS 3.4.5 / DEFSTRUCT: slot names are distinct, by name, among a structure's own slots
-   and the ones it includes."
-  (let ((seen '()))
+(defun %defstruct-check-slot-names (name own-slots inherited-slots &optional overrides)
+  "CLHS 3.4.5 / DEFSTRUCT: slot names are distinct, including in :INCLUDE overrides."
+  (let ((seen '())
+        (overridden '()))
+    (dolist (override overrides)
+      (let ((n (symbol-name (if (consp override) (car override) override))))
+        (when (member n overridden :test #'string=)
+          (%defstruct-diagnose "DEFSTRUCT ~S: the slot name ~A is used more than once (an :INCLUDE override names it twice)"
+                               name n))
+        (push n overridden)))
     (dolist (s inherited-slots) (push (symbol-name (car s)) seen))
     (dolist (s own-slots)
       (let ((n (symbol-name (car s))))
@@ -3407,8 +3787,58 @@ quietly took every typed slot back off the raw path."
     (%defstruct-diagnose "DEFSTRUCT ~S: (:CONSTRUCTOR NIL) cannot be combined with another :CONSTRUCTOR option"
                          name)))
 
+;;; The shape of a DEFSTRUCT form: the name-and-options, and the slot descriptions.
+(defun %defstruct-check-shape (form)
+  "DEFSTRUCT forms that are malformed in shape: a name that is not a symbol or (symbol option*),
+   an unknown option, an option with the wrong number or kind of arguments, and a slot description
+   that is not SYMBOL or (SYMBOL [DEFAULT [:TYPE type] [:READ-ONLY flag]])."
+  (flet ((bad (control &rest args)
+           (apply #'%defstruct-diagnose (concatenate 'string "DEFSTRUCT: " control) args)))
+    (unless (and (consp (cdr form)) (null (cdr (last form)))) (bad "malformed form ~S" form))
+    (let* ((spec (cadr form))
+           (name (if (consp spec) (car spec) spec))
+           (options (and (consp spec) (cdr spec))))
+      (unless (and name (symbolp name)) (bad "the structure name must be a symbol: ~S" name))
+      ;; A COMMON-LISP symbol names a built-in class; defining a structure over it fails
+      ;; only after the type tables have been changed, which leaves (typep 5 'integer) false.
+      (when (eq (symbol-package name) (find-package "COMMON-LISP"))
+        (bad "the structure name ~S is a COMMON-LISP symbol and cannot be redefined" name))
+      (unless (and (listp options) (null (cdr (last options)))) (bad "malformed options ~S" options))
+      (dolist (opt options)
+        (let* ((key (if (consp opt) (car opt) opt))
+               (args (if (consp opt) (cdr opt) nil))
+               (n (length args)))
+          (unless (and (symbolp key) (or (symbolp opt) (null (cdr (last opt)))))
+            (bad "malformed option ~S" opt))
+          (case key
+            (:conc-name (unless (and (<= n 1) (or (null args) (null (car args)) (symbolp (car args)) (stringp (car args)) (characterp (car args))))
+                          (bad "malformed :CONC-NAME option ~S" opt)))
+            (:constructor (unless (and (<= n 2) (or (null args) (symbolp (car args)))
+                                       (or (< n 2) (listp (cadr args))))
+                            (bad "malformed :CONSTRUCTOR option ~S" opt)))
+            ((:copier :predicate) (unless (and (<= n 1) (or (null args) (symbolp (car args))))
+                                    (bad "malformed ~S option ~S" key opt)))
+            (:include (unless (and (consp args) (car args) (symbolp (car args)))
+                        (bad "malformed :INCLUDE option ~S" opt)))
+            ((:print-function :print-object) (unless (<= n 1) (bad "malformed ~S option ~S" key opt)))
+            (:type (unless (= n 1) (bad "malformed :TYPE option ~S" opt)))
+            (:named (unless (= n 0) (bad "malformed :NAMED option ~S" opt)))
+            (:initial-offset (unless (and (= n 1) (integerp (car args)) (>= (car args) 0))
+                               (bad "malformed :INITIAL-OFFSET option ~S" opt)))
+            (t (bad "unknown option ~S" opt)))))
+      (let ((slots (cddr form)))
+        (when (and slots (stringp (car slots))) (setf slots (cdr slots)))
+        (dolist (slot slots)
+          (cond ((symbolp slot))
+                ((and (consp slot) (symbolp (car slot)) (null (cdr (last slot)))
+                      (or (null (cdr slot)) (evenp (length (cddr slot))))
+                      (do ((p (cddr slot) (cddr p))) ((null p) t)
+                        (unless (member (car p) '(:type :read-only)) (return nil)))))
+                (t (bad "malformed slot description ~S" slot))))))))
+
 (setf (gethash 'defstruct *macros*)
       (lambda (form)
+        (%defstruct-check-shape form)
         ;; (defstruct name slot1 (slot2 default2) ...)
         ;; name can be a symbol or (name options...) with various option forms
         (let* ((name-spec (cadr form))
@@ -3532,7 +3962,7 @@ quietly took every typed slot back off the raw path."
                (parent-base-offset (when include-info
                                      (getf include-info :base-offset)))
                ;; All slots = inherited + own
-               (slot-names-checked (%defstruct-check-slot-names name slots include-slots))
+               (slot-names-checked (%defstruct-check-slot-names name slots include-slots include-overrides))
                (options-checked (%defstruct-check-options name all-ctors options type-raw))
                (all-slots (append (or include-slots nil) slots))
                (n-slots (length all-slots))
@@ -3683,6 +4113,12 @@ quietly took every typed slot back off the raw path."
                                            slots))
                ;; All accessor names in order (inherited first, then own)
                (accessor-names (append (or include-accessor-names nil) own-accessor-names))
+               ;; A call of a slot accessor takes the one structure: it is checked as a call of a DEFUN is.
+               (_accessors-registered
+                 (unless *cross-compiling*
+                   (dolist (acc accessor-names)
+                     (when (and acc (symbolp acc))
+                       (setf (gethash acc *defun-arities*) (cons 1 1))))))
                ;; An inherited slot whose accessor name is already an ancestor's
                ;; accessor of that slot keeps the ancestor's definition, as in
                ;; SBCL; redefining it would reject the ancestor's other children.
@@ -3964,6 +4400,27 @@ quietly took every typed slot back off the raw path."
                                            all-slots)
                                  ',(mapcar #'cadr all-slots)
                                  ',(mapcar #'copy-list all-slots)))
+                             regs))
+                     ;; A BOA constructor taking only required parameters, each
+                     ;; one a distinct slot: the same call-site construction.
+                     (when (and spec (eq (car spec) :boa) (cadr spec)
+                                (let ((ll (caddr spec)))
+                                  (and (listp ll)
+                                       (every (lambda (p) (and p (symbolp p)
+                                                               (not (member p lambda-list-keywords))
+                                                               (assoc p all-slots)))
+                                              ll)
+                                       (= (length ll) (length (remove-duplicates ll))))))
+                       (push `(eval-when (:compile-toplevel :load-toplevel :execute)
+                                (dotcl.cil-compiler::%register-struct-boa-ctor
+                                 ',(cadr spec) ',name
+                                 ',(mapcar (lambda (s)
+                                             (intern (symbol-name (car s)) "KEYWORD"))
+                                           all-slots)
+                                 ',(mapcar #'cadr all-slots)
+                                 ',(mapcar #'copy-list all-slots)
+                                 ',(mapcar (lambda (p) (intern (symbol-name p) "KEYWORD"))
+                                           (caddr spec))))
                              regs)))
                    (nreverse regs)))
              ;; Accessors (for all slots including inherited)
@@ -4054,12 +4511,12 @@ quietly took every typed slot back off the raw path."
                     `((defun ,copy-name (obj) (copy-seq obj))))))
              ;; Print-function / print-object (CLHS 8.1.3)
              ,@(when (and (null type-option)
-                          print-fn-raw (not (eq print-fn-raw :bare)))
+                          print-fn-raw (not (eq print-fn-raw :bare)) (cadr print-fn-raw))
                  `((defmethod print-object ((obj ,name) stream)
                      (funcall (function ,(cadr print-fn-raw)) obj stream
                               (%print-object-depth)))))
              ,@(when (and (null type-option)
-                          print-obj-raw (not (eq print-obj-raw :bare)))
+                          print-obj-raw (not (eq print-obj-raw :bare)) (cadr print-obj-raw))
                  `((defmethod print-object ((obj ,name) stream)
                      (funcall (function ,(cadr print-obj-raw)) obj stream))))
              ;; Documentation (CLHS 8.1)
@@ -4079,10 +4536,56 @@ quietly took every typed slot back off the raw path."
              ',name))))
 
 ;;; --- defclass ---
+(defun %defclass-check-shape (form)
+  "Signal a PROGRAM-ERROR unless FORM is (DEFCLASS name (superclass*) (slot-spec*) class-option*)
+   with the pieces in the shapes CLHS gives: a symbol name, a proper list of symbols, slot specs
+   that are a symbol or (symbol {option value}*) with an even option list, and class options
+   that are lists whose :METACLASS and :DOCUMENTATION take one argument and appear once and
+   whose :DEFAULT-INITARGS takes an even list."
+  (flet ((bad (control &rest args)
+           (error 'program-error :format-control (concatenate 'string "DEFCLASS: " control)
+                                 :format-arguments args)))
+    (unless (and (consp (cdr form)) (consp (cddr form)) (consp (cdddr form)) (listp (cddddr form))
+                 (null (cdr (last form))))
+      (bad "malformed form ~S" form))
+    (let ((name (cadr form)) (supers (caddr form)) (slots (cadddr form)) (options (cddddr form)))
+      (unless (and name (symbolp name)) (bad "the class name must be a symbol: ~S" name))
+      (unless (and (listp supers) (null (cdr (last supers))) (every #'symbolp supers))
+        (bad "the superclass list must be a proper list of symbols: ~S" supers))
+      (unless (and (listp slots) (null (cdr (last slots)))) (bad "the slot list must be a proper list: ~S" slots))
+      (dolist (spec slots)
+        (cond ((and spec (symbolp spec)))
+              ((and (consp spec) (symbolp (car spec)) (car spec)
+                    (null (cdr (last spec))) (evenp (length (cdr spec)))))
+              (t (bad "malformed slot specification ~S" spec)))
+        (when (consp spec)
+          (do ((p (cdr spec) (cddr p))) ((null p))
+            (when (and (eq (car p) :documentation) (cadr p) (not (stringp (cadr p))))
+              (bad "the :documentation of slot ~S must be a string: ~S" (car spec) (cadr p))))))
+      (let ((seen nil))
+        (dolist (opt options)
+          (unless (and (consp opt) (symbolp (car opt))
+                       (or (not (member (car opt) '(:metaclass :documentation :default-initargs)))
+                           (null (cdr (last opt)))))
+            (bad "malformed class option ~S" opt))
+          (case (car opt)
+            (:metaclass
+             (unless (and (consp (cdr opt)) (null (cddr opt)) (symbolp (cadr opt)))
+               (bad "malformed :metaclass option ~S" opt)))
+            (:documentation
+             (unless (and (consp (cdr opt)) (null (cddr opt)) (stringp (cadr opt)))
+               (bad "malformed :documentation option ~S" opt)))
+            (:default-initargs
+             (unless (evenp (length (cdr opt))) (bad "malformed :default-initargs option ~S" opt))))
+          (when (member (car opt) '(:metaclass :documentation :default-initargs))
+            (when (member (car opt) seen) (bad "the ~S class option appears twice" (car opt)))
+            (push (car opt) seen)))))))
+
 (setf (gethash 'defclass *macros*)
       (lambda (form)
         ;; (defclass name (supers...) ((slot-name :initarg :x :initform val :accessor acc) ...)
         ;;   (:default-initargs :key1 val1 :key2 val2 ...))
+        (%defclass-check-shape form)
         (let* ((name (cadr form))
                (supers-spec (caddr form))
                (slot-specs (cadddr form))
@@ -4397,10 +4900,14 @@ quietly took every typed slot back off the raw path."
                            (writers (seventh ps)))
                        ;; Accessor = reader + writer (use defmethod to work with defgeneric)
                        (dolist (accessor accessors)
+                         (push `(%class-hook-save ',accessor ',name nil) defs)
                          (push `(defmethod ,accessor ((obj ,name)) (slot-value obj ',sname)) defs)
                          (push `(%register-accessor-method #',accessor (find-class ',name) ',sname) defs)
+                         (push `(%class-hook-restore ',accessor ',name nil) defs)
+                         (push `(%class-hook-save ',accessor ',name t) defs)
                          (push `(defmethod (setf ,accessor) ((val t) (obj ,name)) (%set-slot-value obj ',sname val) val) defs)
                          (push `(%register-accessor-method #'(setf ,accessor) (find-class ',name) ',sname) defs)
+                         (push `(%class-hook-restore ',accessor ',name t) defs)
                          ;; Register setf expander: calls (setf accessor) GF so that
                          ;; :around and other qualifier methods are properly dispatched.
                          (let ((acc accessor))
@@ -4428,8 +4935,10 @@ quietly took every typed slot back off the raw path."
                                         ,tmp))))))
                        ;; Readers (use defmethod)
                        (dolist (reader readers)
+                         (push `(%class-hook-save ',reader ',name nil) defs)
                          (push `(defmethod ,reader ((obj ,name)) (slot-value obj ',sname)) defs)
-                         (push `(%register-accessor-method #',reader (find-class ',name) ',sname) defs))
+                         (push `(%register-accessor-method #',reader (find-class ',name) ',sname) defs)
+                         (push `(%class-hook-restore ',reader ',name nil) defs))
                        ;; Writers (use defmethod): :writer names a GF taking
                        ;; (new-value object); the accessor's (setf acc) is handled above.
                        (dolist (writer writers)
@@ -4522,12 +5031,30 @@ quietly took every typed slot back off the raw path."
                   (not (eq state '&key)))
              (return t))))))
 
+(defun %deftype-undot-lambda-list (params)
+  "PARAMS with a dotted tail (A . D) written as (A &REST D)."
+  (if (and (consp params) (cdr (last params)))
+      (let ((head (loop for tail = params then (cdr tail)
+                        while (consp tail) collect (car tail)))
+            (tail (cdr (last params))))
+        (append head (list '&rest tail)))
+      params))
+
+(defun %deftype-star-pattern (pattern)
+  "A destructuring PATTERN of a DEFTYPE lambda list with the unsupplied &OPTIONAL / &KEY
+   parameters of the pattern and of the patterns inside it defaulting to *."
+  (if (and (consp pattern) (null (cdr (last pattern))))
+      (deftype-default-star
+       (mapcar (lambda (x) (if (consp x) (%deftype-star-pattern x) x)) pattern))
+      pattern))
+
 (defun %deftype-expander-lambda (name params body)
   "The expander function of (DEFTYPE NAME PARAMS . BODY): called with the arguments of the
    type specifier. A plain lambda list is the lambda list of the function; one with
    &WHOLE (bound to the whole specifier), &ENVIRONMENT (bound to NIL: dotcl keeps no
    compile-time environment for types) or destructuring patterns goes through
    DESTRUCTURING-BIND, as DEFMACRO's lambda list does (CLHS 3.4.4)."
+  (setf params (%deftype-undot-lambda-list params))
   (multiple-value-bind (decls forms) (extract-declarations body)
     (if (not (%deftype-destructuring-p params))
         `(lambda ,(deftype-default-star params)
@@ -4549,6 +5076,8 @@ quietly took every typed slot back off the raw path."
                                          (list p ''*))
                                         ((and (member state '(&optional &key)) (consp p) (symbolp (car p)) (null (cdr p)))
                                          (list (car p) ''*))
+                                        ((and (eq state :required) (consp p))
+                                         (%deftype-star-pattern p))
                                         (t p))
                                   clean)))))
           (setf clean (nreverse clean))
@@ -4579,8 +5108,47 @@ quietly took every typed slot back off the raw path."
              ',name))))
 
 ;;; --- define-condition ---
+;;; --- define-condition ---
+(defun %define-condition-check-shape (form)
+  "Signal a PROGRAM-ERROR unless FORM is (DEFINE-CONDITION name (parent*) (slot-spec*) option*)
+   with a symbol name, a proper list of parents, slot specs that are a symbol or
+   (symbol {option value}*), and options that are lists: :REPORT and :DOCUMENTATION take
+   exactly one argument, :DEFAULT-INITARGS an even list, and none appears twice."
+  (flet ((bad (control &rest args)
+           (error 'program-error :format-control (concatenate 'string "DEFINE-CONDITION: " control)
+                                 :format-arguments args)))
+    (unless (and (consp (cdr form)) (consp (cddr form)) (consp (cdddr form))
+                 (null (cdr (last form))))
+      (bad "malformed form ~S" form))
+    (let ((name (cadr form)) (parents (caddr form)) (slots (cadddr form)) (options (cddddr form)))
+      (unless (and name (symbolp name)) (bad "the condition name must be a symbol: ~S" name))
+      ;; A COMMON-LISP symbol names a standard condition type; redefining it (even as a
+      ;; subclass of itself) leaves the class precedence lists of every later condition broken.
+      (when (eq (symbol-package name) (find-package "COMMON-LISP"))
+        (bad "the condition name ~S is a COMMON-LISP symbol and cannot be redefined" name))
+      (unless (and (listp parents) (null (cdr (last parents))) (every #'symbolp parents))
+        (bad "the parent list must be a proper list of symbols: ~S" parents))
+      (unless (and (listp slots) (null (cdr (last slots)))) (bad "the slot list must be a proper list: ~S" slots))
+      (dolist (spec slots)
+        (unless (or (and spec (symbolp spec))
+                    (and (consp spec) (symbolp (car spec)) (car spec)
+                         (null (cdr (last spec))) (evenp (length (cdr spec)))))
+          (bad "malformed slot specification ~S" spec)))
+      (let ((seen nil))
+        (dolist (opt options)
+          (unless (and (consp opt) (symbolp (car opt)) (null (cdr (last opt))))
+            (bad "malformed option ~S" opt))
+          (case (car opt)
+            (:report (unless (and (consp (cdr opt)) (null (cddr opt))) (bad "malformed :report option ~S" opt)))
+            (:documentation (unless (and (consp (cdr opt)) (null (cddr opt)) (or (null (cadr opt)) (stringp (cadr opt))))
+                              (bad "malformed :documentation option ~S" opt)))
+            (:default-initargs (unless (evenp (length (cdr opt))) (bad "malformed :default-initargs option ~S" opt))))
+          (when (member (car opt) seen) (bad "the ~S option appears twice" (car opt)))
+          (push (car opt) seen))))))
+
 (setf (gethash 'define-condition *macros*)
       (lambda (form)
+        (%define-condition-check-shape form)
         ;; (define-condition name (parents...) (slots...) &rest options)
         ;; -> expand to defclass + return name
         ;; Extract :report option to generate print-object method
@@ -4596,6 +5164,8 @@ quietly took every typed slot back off the raw path."
             (let ((opt (car rest)))
               (cond ((and (consp opt) (eq (car opt) :report))
                      (setf report-option (cadr opt)))
+                    ;; (:documentation nil) means no documentation; DEFCLASS does not take it.
+                    ((and (consp opt) (eq (car opt) :documentation) (null (cadr opt))))
                     ((consp opt)
                      (push opt defclass-options)))))
           (let* ((validation-form
@@ -4645,13 +5215,17 @@ quietly took every typed slot back off the raw path."
                                               (if rest-pos
                                                   (subseq lambda-list 0 rest-pos)
                                                   lambda-list)))))
-          (if rest-param
-              ;; Has &rest: extra-args = (list* opt1 opt2 ... rest-arg)
-              `(defmacro ,name (,place-var ,@lambda-list)
-                 (%dmm-helper ,place-var ',fn (list* ,@opt-params ,rest-param)))
-              ;; No &rest: extra-args = (list opt1 opt2 ...)
-              `(defmacro ,name (,place-var ,@lambda-list)
-                 (%dmm-helper ,place-var ',fn (list ,@opt-params)))))))
+          ;; The optional documentation string is the macro's docstring.
+          (let ((doc (and (stringp (fifth form)) (list (fifth form)))))
+            (if rest-param
+                ;; Has &rest: extra-args = (list* opt1 opt2 ... rest-arg)
+                `(defmacro ,name (,place-var ,@lambda-list)
+                   ,@doc
+                   (%dmm-helper ,place-var ',fn (list* ,@opt-params ,rest-param)))
+                ;; No &rest: extra-args = (list opt1 opt2 ...)
+                `(defmacro ,name (,place-var ,@lambda-list)
+                   ,@doc
+                   (%dmm-helper ,place-var ',fn (list ,@opt-params))))))))
 
 ;;; --- assert ---
 (setf (gethash 'assert *macros*)
@@ -4700,8 +5274,67 @@ quietly took every typed slot back off the raw path."
               `(%make-instance-dyn ,class-expr ,@initargs)))))
 
 ;;; --- with-accessors ---
+;;; The argument shapes of WITH-SLOTS, WITH-ACCESSORS, WITH-HASH-TABLE-ITERATOR,
+;;; WITH-PACKAGE-ITERATOR, WITH-OUTPUT-TO-STRING and WITH-INPUT-FROM-STRING.
+(defun %with-form-bad (who control &rest args)
+  (error 'program-error :format-control "~S: ~?" :format-arguments (list who control args)))
+
+(defun %check-with-slot-form (form)
+  "(WITH-SLOTS (slot-entry*) instance-form body*) and (WITH-ACCESSORS ((variable accessor)*)
+   instance-form body*), whose entries are SLOT or (VARIABLE SLOT) / (VARIABLE ACCESSOR)."
+  (let ((who (car form)))
+    (unless (and (consp (cdr form)) (consp (cddr form)) (null (cdr (last form))))
+      (%with-form-bad who "malformed form ~S" form))
+    (let ((entries (cadr form)))
+      (unless (and (listp entries) (null (cdr (last entries))))
+        (%with-form-bad who "the entry list must be a proper list: ~S" entries))
+      (dolist (e entries)
+        (unless (if (eq who 'with-slots)
+                    (or (and e (symbolp e))
+                        (and (consp e) (consp (cdr e)) (null (cddr e)) (symbolp (car e)) (car e) (symbolp (cadr e))))
+                    (and (consp e) (consp (cdr e)) (null (cddr e)) (symbolp (car e)) (car e) (symbolp (cadr e))))
+          (%with-form-bad who "malformed entry ~S" e))))))
+
+(defun %check-with-iterator-form (form)
+  "(WITH-HASH-TABLE-ITERATOR (name hash-table-form) body*) and
+   (WITH-PACKAGE-ITERATOR (name package-list-form symbol-type+) body*)."
+  (let ((who (car form)))
+    (unless (and (consp (cdr form)) (null (cdr (last form))))
+      (%with-form-bad who "malformed form ~S" form))
+    (let ((spec (cadr form)))
+      (unless (and (consp spec) (null (cdr (last spec))) (car spec) (symbolp (car spec)) (consp (cdr spec)))
+        (%with-form-bad who "malformed iterator specification ~S" spec))
+      (if (eq who 'with-hash-table-iterator)
+          (unless (null (cddr spec)) (%with-form-bad who "malformed iterator specification ~S" spec))
+          (progn
+            (unless (cddr spec) (%with-form-bad who "at least one symbol type is required: ~S" spec))
+            (dolist (type (cddr spec))
+              (unless (member type '(:internal :external :inherited))
+                (%with-form-bad who "~S is not one of :INTERNAL, :EXTERNAL and :INHERITED" type))))))))
+
+(defun %check-with-string-stream-form (form)
+  "(WITH-OUTPUT-TO-STRING (var [string-form [:element-type type]]) body*) and
+   (WITH-INPUT-FROM-STRING (var string-form [:index place] [:start n] [:end n]) body*)."
+  (let ((who (car form)))
+    (unless (and (consp (cdr form)) (null (cdr (last form))))
+      (%with-form-bad who "malformed form ~S" form))
+    (let ((spec (cadr form)))
+      (unless (and (consp spec) (null (cdr (last spec))) (symbolp (car spec)))
+        (%with-form-bad who "malformed specification ~S" spec))
+      (let* ((out (eq who 'with-output-to-string))
+             (tail (cdr spec)))
+        (when (and (not out) (null tail)) (%with-form-bad who "the string form is required: ~S" spec))
+        ;; WITH-OUTPUT-TO-STRING has always taken the keywords directly after the variable too
+        (unless (and out (consp tail) (keywordp (car tail)))
+          (when tail (setf tail (cdr tail))))
+        (unless (evenp (length tail)) (%with-form-bad who "malformed keyword arguments in ~S" spec))
+        (do ((p tail (cddr p))) ((null p))
+          (unless (member (car p) (if out '(:element-type) '(:index :start :end)))
+            (%with-form-bad who "unknown keyword argument ~S in ~S" (car p) spec)))))))
+
 (setf (gethash 'with-accessors *macros*)
       (lambda (form)
+        (%check-with-slot-form form)
         ;; (with-accessors ((variable-name accessor-name) ...) instance-form body...)
         ;; Expands to symbol-macrolet so reads/writes go through accessor calls.
         (let* ((slots (cadr form))
@@ -4719,6 +5352,7 @@ quietly took every typed slot back off the raw path."
 ;;; --- with-slots ---
 (setf (gethash 'with-slots *macros*)
       (lambda (form)
+        (%check-with-slot-form form)
         ;; (with-slots (slot-entry...) instance-form body...)
         ;; slot-entry ::= slot-name | (variable-name slot-name)
         ;; Expands to symbol-macrolet so reads/writes go through slot-value.
@@ -4735,8 +5369,86 @@ quietly took every typed slot back off the raw path."
                ,@body)))))
 
 ;;; --- defgeneric ---
+;;; The checks DEFGENERIC and DEFMETHOD share: a generic function name, and the lambda list
+;;; of a generic function (CLHS 3.4.2: no &aux, no init forms, no supplied-p variables).
+(defun %gf-check-name (who name)
+  (unless (or (and name (symbolp name))
+              (and (consp name) (eq (car name) 'setf) (consp (cdr name))
+                   (null (cddr name)) (symbolp (cadr name)) (cadr name)))
+    (error 'program-error :format-control "~S: ~S is not a function name"
+                          :format-arguments (list who name))))
+
+(defun %gf-check-lambda-list (who ll)
+  "Signal a PROGRAM-ERROR unless LL is a generic function lambda list (CLHS 3.4.2)."
+  (flet ((bad (control &rest args)
+           (error 'program-error :format-control (concatenate 'string "~S: " control)
+                                 :format-arguments (cons who args))))
+    (unless (and (listp ll) (null (cdr (last ll)))) (bad "the lambda list ~S is not a proper list" ll))
+    (let ((state :required) (seen nil) (stage 0))
+      (flet ((note (var)
+               (unless (and var (symbolp var)) (bad "~S is not a variable name in ~S" var ll))
+               (when (member var seen) (bad "the variable ~S appears twice in ~S" var ll))
+               (push var seen)))
+        (dolist (p ll)
+          (cond
+            ((member p '(&optional &rest &key &allow-other-keys &aux))
+             (when (eq p '&aux) (bad "&AUX is not allowed in ~S" ll))
+             (let ((n (ecase p (&optional 1) (&rest 2) (&key 3) (&allow-other-keys 4))))
+               (when (or (< n stage) (and (= n stage) (/= n 4)) (and (= n 4) (< stage 3)))
+                 (bad "~S is out of place in ~S" p ll))
+               (setf stage n state (case p (&optional :optional) (&rest :rest) (&key :key) (t :aok)))))
+            ((and (symbolp p) (> (length (symbol-name p)) 0) (char= (char (symbol-name p) 0) #\&))
+             (bad "~S is not allowed in ~S" p ll))
+            (t
+             (ecase state
+               (:required (note p))
+               (:rest (note p) (setf state :after-rest))
+               (:optional (cond ((symbolp p) (note p))
+                                ((and (consp p) (null (cdr p))) (note (car p)))
+                                (t (bad "malformed optional parameter ~S" p))))
+               (:key (cond ((symbolp p) (note p))
+                           ((and (consp p) (null (cdr p)))
+                            (if (consp (car p))
+                                (if (and (consp (cdar p)) (null (cddar p)) (symbolp (caar p)))
+                                    (note (cadar p))
+                                    (bad "malformed keyword parameter ~S" p))
+                                (note (car p))))
+                           (t (bad "malformed keyword parameter ~S" p))))
+               ((:after-rest :aok) (bad "unexpected ~S in ~S" p ll))))))
+        (when (eq state :rest) (bad "&REST needs a variable in ~S" ll))))))
+
+(defun %defgeneric-check-shape (form)
+  "Signal a PROGRAM-ERROR unless FORM is (DEFGENERIC name lambda-list option*) with a valid
+   generic function lambda list and options that are lists, with the single-use ones (everything
+   but :METHOD and DECLARE) appearing once and :DOCUMENTATION / :GENERIC-FUNCTION-CLASS /
+   :METHOD-CLASS taking exactly one argument."
+  (flet ((bad (control &rest args)
+           (error 'program-error :format-control (concatenate 'string "DEFGENERIC: " control)
+                                 :format-arguments args)))
+    (unless (and (consp (cdr form)) (consp (cddr form)) (null (cdr (last form))))
+      (bad "malformed form ~S" form))
+    (%gf-check-name 'defgeneric (cadr form))
+    (%gf-check-lambda-list 'defgeneric (caddr form))
+    (let ((seen nil))
+      (dolist (opt (cdddr form))
+        (unless (and (consp opt) (symbolp (car opt)) (null (cdr (last opt))))
+          (bad "malformed option ~S" opt))
+        (let ((n (symbol-name (car opt))))
+          (cond
+            ((member n '("DOCUMENTATION" "GENERIC-FUNCTION-CLASS" "METHOD-CLASS") :test #'string=)
+             (unless (and (consp (cdr opt)) (null (cddr opt))
+                          (if (string= n "DOCUMENTATION") (or (null (cadr opt)) (stringp (cadr opt))) (symbolp (cadr opt))))
+               (bad "malformed ~A option ~S" n opt))))
+          (cond
+            ((string= n "METHOD")
+             (unless (member-if #'listp (cdr opt)) (bad "malformed :METHOD option ~S" opt)))
+            ((string= n "DECLARE"))
+            (t (when (member n seen :test #'string=) (bad "the ~A option appears twice" n))
+               (push n seen))))))))
+
 (setf (gethash 'defgeneric *macros*)
       (lambda (form)
+        (%defgeneric-check-shape form)
         (%note-mv-tail-function (cadr form))
         (when (symbolp (cadr form)) (setf (gethash (cadr form) *gf-call-names*) t))
         ;; (defgeneric name (params...) &optional options...)
@@ -4768,6 +5480,14 @@ quietly took every typed slot back off the raw path."
                (mc-order (if mc-opt (caddr mc-opt) nil))
                ;; For long-form: extra args after name
                (mc-args (if (and mc-opt (cddr mc-opt)) (cddr mc-opt) nil))
+               ;; The standard method combination takes no arguments (CLHS DEFGENERIC).
+               (mc-standard-check
+                 (when (and mc-opt (symbolp mc-name) mc-name
+                            (string= (symbol-name mc-name) "STANDARD")
+                            (cddr mc-opt))
+                   (error 'program-error
+                          :format-control "DEFGENERIC ~S: the STANDARD method combination takes no arguments, but ~S was given"
+                          :format-arguments (list name (cddr mc-opt)))))
                ;; Extract :method options for inline method definitions
                (method-opts (remove-if-not (lambda (opt)
                                              (and (consp opt)
@@ -4919,10 +5639,15 @@ quietly took every typed slot back off the raw path."
                                       ;; :generic-function-class specified: always create a new instance of
                                       ;; that class, even if a GF already exists with a different class.
                                       ;; AMOP: the name reaches the instance as the :NAME initarg.
-                                      `(let ((%new-gf (make-instance ',gf-class-name :name ',name
-                                                                     :lambda-list ',params)))
-                                         (%register-gf ',name %new-gf)
-                                         %new-gf)
+                                      ;; A generic function that already has that class stays: its
+                                      ;; DEFMETHOD methods are not removed by a DEFGENERIC (CLHS DEFGENERIC).
+                                      `(let ((%old-gf (%find-gf ',name)))
+                                         (if (and %old-gf (eq (class-of %old-gf) (find-class ',gf-class-name)))
+                                             %old-gf
+                                             (let ((%new-gf (make-instance ',gf-class-name :name ',name
+                                                                           :lambda-list ',params)))
+                                               (%register-gf ',name %new-gf)
+                                               %new-gf)))
                                       ;; No :generic-function-class: reuse existing GF or create
                                       ;; standard one, unless another thread registers one first.
                                       `(or (%find-gf ',name)
@@ -4947,15 +5672,15 @@ quietly took every typed slot back off the raw path."
                                          (list ,@(mapcar (lambda (k) `',k) gf-keyword-names))
                                          (list ,@apo-order)
                                          ',params)
-               ,@(if (and mc-name (not (string= (symbol-name mc-name) "STANDARD")))
-                     `((%set-method-combination %gf ',mc-name))
-                     nil)
-               ,@(if (and mc-order (symbolp mc-order) (string= (symbol-name mc-order) "MOST-SPECIFIC-LAST"))
-                     `((%set-method-combination-order %gf ',mc-order))
-                     nil)
-               ,@(if mc-args
-                     `((%set-method-combination-args %gf (list ,@mc-args)))
-                     nil)
+               ;; A DEFGENERIC that redefines a generic function replaces its method
+               ;; combination (CLHS 7.7: the new definition is what stays), so the
+               ;; absence of the option puts the standard combination back.
+               (%set-method-combination %gf ',(or mc-name 'standard))
+               (%set-method-combination-order
+                %gf ',(if (and mc-order (symbolp mc-order) (string= (symbol-name mc-order) "MOST-SPECIFIC-LAST"))
+                          mc-order
+                          'most-specific-first))
+               (%set-method-combination-args %gf (list ,@mc-args))
                ;; AMOP: defgeneric asks for the method combination metaobject by
                ;; name. dotcl decides the combination from the symbol either way;
                ;; the call is what a generic function class specializes.
@@ -5049,10 +5774,28 @@ quietly took every typed slot back off the raw path."
 (defun %next-method-scan-forms (forms depth)
   (%scan-code-forms (lambda (f) (%next-method-scan f depth)) forms))
 
+(defvar *next-method-scan-local-macros* nil
+  "The names of the MACROLET macros whose body %NEXT-METHOD-SCAN is walking.")
+
 (defun %next-method-scan (form depth)
   (cond
     ((atom form) (%next-method-mention-p form))
     ((not (symbolp (car form))) (%next-method-mention-p form))
+    ;; (MACROLET defs body...) whose definitions never name call-next-method or
+    ;; next-method-p (nor open another macro scope): the calls of its macros expand
+    ;; to their own arguments and literal symbols, so the body is walked with those
+    ;; calls read as plain forms.
+    ((and (eq (car form) 'macrolet) (consp (cdr form)) (listp (cadr form))
+          (null (cdr (last (cadr form))))
+          (every (lambda (d) (and (consp d) (symbolp (car d)))) (cadr form))
+          (not (%next-method-mention-p (cadr form))))
+     (let ((*next-method-scan-local-macros*
+             (append (mapcar #'car (cadr form)) *next-method-scan-local-macros*)))
+       (%next-method-scan-forms (cddr form) depth)))
+    ((member (car form) *next-method-scan-local-macros* :test #'eq)
+     (do ((x (cdr form) (cdr x)))
+         ((not (consp x)) (and x (%next-method-mention-p x)))
+       (when (%next-method-scan (car x) depth) (return t))))
     ((member (car form) '(quote macrolet symbol-macrolet compiler-let) :test #'eq)
      (%next-method-mention-p form))
     ((member (car form) '(lambda named-lambda) :test #'eq)
@@ -5081,12 +5824,14 @@ quietly took every typed slot back off the raw path."
                            (and mf (lambda (f) (funcall mf f nil)))))))
        (or (null expander)
            (>= depth *macro-expand-depth-limit*)
-           (handler-case
-               (let ((expanded (%return-from-scan-macroexpand form expander)))
-                 (if (equal expanded form)
-                     (%next-method-scan-forms (cdr form) depth)
-                     (%next-method-scan expanded (1+ depth))))
-             (error () t)))))
+           (if (%macro-expander-takes-environment-p (car form) expander)
+               t
+               (handler-case
+                   (let ((expanded (%return-from-scan-macroexpand form expander)))
+                     (if (equal expanded form)
+                         (%next-method-scan-forms (cdr form) depth)
+                         (%next-method-scan expanded (1+ depth))))
+                 (error () t))))))
     (t
      (or (%next-method-mention-p (car form))
          (do ((x (cdr form) (cdr x)))
@@ -5109,6 +5854,82 @@ quietly took every typed slot back off the raw path."
        (null *symbol-macros*)
        (not (%method-body-may-use-next-methods-p lambda-list body))))
 
+(defun %apply-cnm-form-p (form targets)
+  "True when FORM is (APPLY #'CALL-NEXT-METHOD . TARGETS): the arguments the method was called with."
+  (and (consp form) (eq (car form) 'apply)
+       (consp (cdr form))
+       (let ((f (cadr form)))
+         (and (consp f) (eq (car f) 'function) (consp (cdr f)) (null (cddr f))
+              (eq (cadr f) 'call-next-method)))
+       (equal (cddr form) targets)))
+
+(defun %mentions-any-p (form targets)
+  (cond ((symbolp form) (and form (member form targets :test #'eq) t))
+        ((atom form) nil)
+        (t (loop for y = form then (cdr y)
+                 while (consp y)
+                 thereis (%mentions-any-p (car y) targets)
+                 finally (return (and y (%mentions-any-p y targets)))))))
+
+(defun %non-cl-macro-call-p (form)
+  "True when FORM, outside quoted data, calls a macro that is not a COMMON-LISP one. Such a macro
+   may name a variable of the method (setq it, or read it) without the symbol showing in the body."
+  (cond ((atom form) nil)
+        ((member (car form) '(quote function)) nil)
+        ((and (symbolp (car form))
+              (not (eq (symbol-package (car form)) (find-package "COMMON-LISP")))
+              (or (%macro-expander-here (car form)) (macro-function (car form))))
+         t)
+        (t (loop for y = form then (cdr y)
+                 while (consp y)
+                 thereis (%non-cl-macro-call-p (car y))))))
+
+(defun %only-in-apply-cnm-p (form targets)
+  "True when no symbol of TARGETS occurs in FORM outside the arguments of an
+   (APPLY #'CALL-NEXT-METHOD . TARGETS) form. Quoted data counts as an occurrence."
+  (cond ((null form) t)
+        ((symbolp form) (not (member form targets :test #'eq)))
+        ((atom form) t)
+        ((eq (car form) 'quote) (not (%mentions-any-p form targets)))
+        ((%apply-cnm-form-p form targets) t)
+        (t (loop for y = form then (cdr y)
+                 while (consp y)
+                 always (%only-in-apply-cnm-p (car y) targets)
+                 finally (return (or (null y) (%only-in-apply-cnm-p y targets)))))))
+
+(defun %rewrite-apply-cnm (forms lambda-list)
+  "FORMS with each (APPLY #'CALL-NEXT-METHOD REQ... REST) -- the required parameters in order and the
+   &REST variable of the method, which therefore passes on the arguments it was called with -- made
+   (CALL-NEXT-METHOD), which means the same (CLHS 7.6.6.1) and needs neither a closure nor the
+   argument list. Done only when the parameters occur nowhere else in the body, so none of them can
+   have been changed (macros are not looked into: any other occurrence, a read too, keeps the form)."
+  (if (or *macrolet-shadowed* *symbol-macros*
+          (member '&optional lambda-list) (member '&aux lambda-list))
+      forms
+      (let* ((req (loop for p in lambda-list until (member p lambda-list-keywords) collect p))
+             (rest-tail (or (member '&rest lambda-list) (member '&body lambda-list)))
+             (rest (and rest-tail (cdr rest-tail) (symbolp (cadr rest-tail)) (cadr rest-tail)))
+             (targets (and rest (every #'symbolp req) (append req (list rest)))))
+        (if (and targets (some (lambda (f) (%contains-apply-cnm-p f targets)) forms)
+                 (every (lambda (f) (%only-in-apply-cnm-p f targets)) forms)
+                 (notany #'%non-cl-macro-call-p forms))
+            (mapcar (lambda (f) (%replace-apply-cnm f targets)) forms)
+            forms))))
+
+(defun %contains-apply-cnm-p (form targets)
+  (cond ((atom form) nil)
+        ((%apply-cnm-form-p form targets) t)
+        (t (loop for y = form then (cdr y)
+                 while (consp y)
+                 thereis (%contains-apply-cnm-p (car y) targets)))))
+
+(defun %replace-apply-cnm (form targets)
+  (cond ((atom form) form)
+        ((eq (car form) 'quote) form)
+        ((%apply-cnm-form-p form targets) '(call-next-method))
+        (t (cons (%replace-apply-cnm (car form) targets)
+                 (if (consp (cdr form)) (%replace-apply-cnm (cdr form) targets) (cdr form))))))
+
 (defun %walk-replace-cnm (form cv nv)
   "Replace CNM/NMP occurrences in FORM with funcall of CV/NV (local variables)."
   (cond ((atom form) form)
@@ -5129,11 +5950,87 @@ quietly took every typed slot back off the raw path."
          `(funcall ,nv))
         ;; Don't descend into nested defmethod
         ((eq (car form) 'defmethod) form)
-        ;; General recursion: use cons recursion to handle improper lists safely
+        ;; Quoted data is data: (quote (#'call-next-method)) stays as written
+        ((eq (car form) 'quote) form)
+        ;; The name and lambda list of a local function are not calls (a local function called
+        ;; CALL-NEXT-METHOD is undefined by CLHS 11.1.2.1.2; it was a compile error here); its body
+        ;; and the body of the form are walked as usual.
+        ((and (member (car form) '(flet labels macrolet) :test #'eq)
+              (consp (cdr form)) (listp (cadr form)))
+         (list* (car form)
+                (mapcar (lambda (b)
+                          (if (and (consp b) (consp (cdr b)))
+                              (list* (car b) (cadr b)
+                                     (mapcar (lambda (x) (%walk-replace-cnm x cv nv)) (cddr b)))
+                              b))
+                        (cadr form))
+                (mapcar (lambda (x) (%walk-replace-cnm x cv nv)) (cddr form))))
+        ;; Variables named CALL-NEXT-METHOD (the function and variable namespaces are separate): the
+        ;; names a binding form introduces are not calls, its init forms and body are walked.
+        ((and (member (car form) '(let let* prog prog*) :test #'eq)
+              (consp (cdr form)) (listp (cadr form)))
+         (list* (car form)
+                (mapcar (lambda (b)
+                          (if (and (consp b) (consp (cdr b)))
+                              (cons (car b) (mapcar (lambda (x) (%walk-replace-cnm x cv nv)) (cdr b)))
+                              b))
+                        (cadr form))
+                (mapcar (lambda (x) (%walk-replace-cnm x cv nv)) (cddr form))))
+        ((and (member (car form) '(do do*) :test #'eq)
+              (consp (cdr form)) (listp (cadr form)) (consp (cddr form)))
+         (list* (car form)
+                (mapcar (lambda (b)
+                          (if (and (consp b) (consp (cdr b)))
+                              (cons (car b) (mapcar (lambda (x) (%walk-replace-cnm x cv nv)) (cdr b)))
+                              b))
+                        (cadr form))
+                (mapcar (lambda (x) (%walk-replace-cnm x cv nv)) (cddr form))))
+        ((and (member (car form) '(multiple-value-bind destructuring-bind) :test #'eq)
+              (consp (cdr form)))
+         (list* (car form) (cadr form)
+                (mapcar (lambda (x) (%walk-replace-cnm x cv nv)) (cddr form))))
+        ((and (eq (car form) 'lambda) (consp (cdr form)))
+         (list* 'lambda (cadr form)
+                (mapcar (lambda (x) (%walk-replace-cnm x cv nv)) (cddr form))))
+        ;; General recursion over the elements: a list's tail is not itself a form, so
+        ;; (LIST CALL-NEXT-METHOD) is the variable, not a call. An improper tail is kept.
         (t (cons (%walk-replace-cnm (car form) cv nv)
-                 (if (consp (cdr form))
-                     (%walk-replace-cnm (cdr form) cv nv)
-                     (cdr form))))))
+                 (%walk-replace-cnm-tail (cdr form) cv nv)))))
+
+(defun %walk-replace-cnm-tail (tail cv nv)
+  (if (consp tail)
+      (cons (%walk-replace-cnm (car tail) cv nv)
+            (%walk-replace-cnm-tail (cdr tail) cv nv))
+      tail))
+
+(defun %lambda-form-of (x)
+  "The (LAMBDA ...) form of X, which is that form or (FUNCTION (LAMBDA ...)); else NIL."
+  (cond ((and (consp x) (eq (car x) 'lambda) (consp (cdr x))) x)
+        ((and (consp x) (eq (car x) 'function) (consp (cdr x)) (null (cddr x))
+              (consp (cadr x)) (eq (car (cadr x)) 'lambda) (consp (cdr (cadr x))))
+         (cadr x))
+        (t nil)))
+
+(defun %immediate-lambda-of (form)
+  "The lambda FORM calls on the spot: ((LAMBDA ...) args), or the function argument of
+   (MULTIPLE-VALUE-CALL / FUNCALL / APPLY fn args), or NIL."
+  (cond ((and (consp form) (consp (car form)) (eq (car (car form)) 'lambda)
+              (consp (cdr (car form))))
+         (car form))
+        ((and (consp form) (member (car form) '(multiple-value-call funcall apply) :test #'eq)
+              (consp (cdr form)))
+         (%lambda-form-of (cadr form)))
+        (t nil)))
+
+(defun %immediate-lambda-call-p (form)
+  (and (consp form) (listp (cdr form)) (null (cdr (last form)))
+       (%immediate-lambda-of form) t))
+
+(defun %immediate-lambda-other-forms (form)
+  "The forms of FORM other than the lambda that is called on the spot."
+  (if (and (consp (car form)) (eq (car (car form)) 'lambda))
+      (cdr form)
+      (cddr form)))
 
 ;;; %cnm-needs-capture-p -- does the body need the CAPTURED closures, or is a
 ;;; plain call enough?
@@ -5156,6 +6053,14 @@ quietly took every typed slot back off the raw path."
         ((and (eq (car form) 'function) (consp (cdr form))
               (member (cadr form) '(call-next-method next-method-p) :test #'eq))
          t)
+        ;; A lambda that is called on the spot, by MULTIPLE-VALUE-CALL / FUNCALL /
+        ;; APPLY or in the operator position, runs inside this body's dynamic
+        ;; extent like the code around it: it does not need the capture. What its
+        ;; own body nests inside it still does.
+        ((%immediate-lambda-call-p form)
+         (let ((fn (%immediate-lambda-of form)))
+           (or (some #'%cnm-needs-capture-p (cddr fn))
+               (some #'%cnm-needs-capture-p (%immediate-lambda-other-forms form)))))
         ;; A nested function: whatever is inside it may run later, under someone
         ;; else's dispatch.
         ((and (member (car form) '(lambda function flet labels macrolet) :test #'eq)
@@ -5163,6 +6068,8 @@ quietly took every typed slot back off the raw path."
          t)
         ;; A nested defmethod has its own context
         ((eq (car form) 'defmethod) nil)
+        ;; Quoted data is not code
+        ((eq (car form) 'quote) nil)
         (t (do ((x form (cdr x)))
                ((not (consp x)) nil)
              (when (%cnm-needs-capture-p (car x)) (return t))))))
@@ -5217,8 +6124,70 @@ quietly took every typed slot back off the raw path."
           (t lambda-form)))))
 
 ;;; --- defmethod ---
+;;; DEFMETHOD: the name, then qualifiers (non-NIL atoms), then a specialized lambda list.
+(defun %defmethod-check-shape (form)
+  "Signal a PROGRAM-ERROR unless FORM has a function name and a specialized lambda list: required
+   parameters that are a variable or (variable specializer), (EQL form) taking exactly one form,
+   and the ordinary &optional / &rest / &key / &aux parameter syntax with distinct variables."
+  (flet ((bad (control &rest args)
+           (error 'program-error :format-control (concatenate 'string "DEFMETHOD: " control)
+                                 :format-arguments args)))
+    (unless (and (consp (cdr form)) (null (cdr (last form)))) (bad "malformed form ~S" form))
+    (%gf-check-name 'defmethod (cadr form))
+    (let ((rest (cddr form)))
+      (loop while (and (consp rest) (car rest) (atom (car rest))) do (pop rest))
+      (unless (and (consp rest) (listp (car rest)) (null (cdr (last (car rest)))))
+        (bad "no specialized lambda list in ~S" form))
+      (let ((seen nil) (state :required) (stage 0))
+        (labels ((note (var)
+                   (unless (and var (symbolp var)) (bad "~S is not a variable name in ~S" var (car rest)))
+                   (when (and (member var seen) (not (eq state :aux)))
+                     (bad "the variable ~S appears twice in ~S" var (car rest)))
+                   (push var seen))
+                 (init-spec (p keyp)
+                   ;; VAR | (VAR [INIT [SVAR]]); for &key also ((KEYWORD VAR) [INIT [SVAR]])
+                   (cond ((symbolp p) (note p))
+                         ((and (consp p) (null (cdr (last p))) (<= (length p) 3))
+                          (let ((v (car p)))
+                            (cond ((and keyp (consp v))
+                                   (unless (and (consp (cdr v)) (null (cddr v)) (symbolp (car v)))
+                                     (bad "malformed keyword parameter ~S" p))
+                                   (note (cadr v)))
+                                  (t (note v)))
+                            (when (cddr p) (note (caddr p)))))
+                         (t (bad "malformed parameter ~S" p)))))
+          (dolist (p (car rest))
+            (cond
+              ((member p '(&optional &rest &body &key &allow-other-keys &aux))
+               (let ((n (ecase p (&optional 1) ((&rest &body) 2) (&key 3) (&allow-other-keys 4) (&aux 5))))
+                 (when (or (< n stage) (and (= n stage) (/= n 4)) (and (= n 4) (< stage 3)))
+                   (bad "~S is out of place in ~S" p (car rest)))
+                 (setf stage n state (case p (&optional :optional) ((&rest &body) :rest) (&key :key)
+                                       (&aux :aux) (t :aok)))))
+              ((and (symbolp p) p (char= (char (symbol-name p) 0) #\&))
+               (bad "~S is not allowed in ~S" p (car rest)))
+              (t
+               (ecase state
+                 (:required
+                  (cond ((symbolp p) (note p))
+                        ((and (consp p) (consp (cdr p)) (null (cddr p)))
+                         (note (car p))
+                         (let ((spec (cadr p)))
+                           (when (and (consp spec) (eq (car spec) 'eql)
+                                      (not (and (consp (cdr spec)) (null (cddr spec)))))
+                             (bad "malformed EQL specializer ~S" spec))))
+                        (t (bad "malformed required parameter ~S" p))))
+                 (:optional (init-spec p nil))
+                 (:rest (note p) (setf state :after-rest))
+                 (:key (init-spec p t))
+                 ;; &AUX variables may rebind a parameter, as LET* would
+                 (:aux (init-spec p nil))
+                 ((:after-rest :aok) (bad "unexpected ~S in ~S" p (car rest)))))))
+          (when (eq state :rest) (bad "&REST needs a variable in ~S" (car rest))))))))
+
 (setf (gethash 'defmethod *macros*)
       (lambda (form)
+        (%defmethod-check-shape form)
         (%note-mv-tail-function (cadr form))
         (when (symbolp (cadr form)) (setf (gethash (cadr form) *gf-call-names*) t))
         ;; (defmethod name qualifier* ((param1 class1) param2 ...) body...)
@@ -5348,6 +6317,11 @@ quietly took every typed slot back off the raw path."
                                              collect p)))
                               (when req
                                 (push `(declare (ignorable ,@req)) decls)))
+                            (let ((rewritten (%rewrite-apply-cnm forms plain-params)))
+                              (unless (eq rewritten forms)
+                                (let ((rest-tail (or (member '&rest plain-params) (member '&body plain-params))))
+                                  (push `(declare (ignorable ,(cadr rest-tail))) decls)))
+                              (setq forms rewritten))
                             (if (some #'%cnm-needs-capture-p forms)
                                 `(lambda ,plain-params
                                    ,@decls
@@ -5405,6 +6379,9 @@ quietly took every typed slot back off the raw path."
                    ;; installs both the GF registry entry and sym.Function (so this
                    ;; also handles extending CL generic functions when CL is
                    ;; locked), unless another thread registered one first.
+                   ;; The specializers are resolved first: one that fails (an
+                   ;; undefined class) must not leave an empty generic function.
+                   (let ((%specs (list ,@specializers)))
                    (if (null (%find-gf ',name))
                        (let ((%gf (%make-gf ',name ,n-params)))
                          ;; Auto-created GF takes &key/&rest from the method but NOT
@@ -5416,11 +6393,11 @@ quietly took every typed slot back off the raw path."
                                                    ,(if m-has-rest t nil)
                                                    ,(if m-has-key t nil)
                                                    ,(if m-has-allow-other-keys t nil)
-                                                   nil)
+                                                   nil nil ',(%implicit-gf-lambda-list unspec-ll))
                          (%register-gf-if-absent ',name %gf)))
                    ;; defmethod returns the method object (CL spec)
                    (let ((%m (%make-method
-                               (list ,@specializers)
+                               %specs
                                ,qual-list
                                ,method-lambda)))
                      (%set-method-lambda-list-info %m ,m-required-count ,m-optional-count
@@ -5439,7 +6416,23 @@ quietly took every typed slot back off the raw path."
                      (%add-method (%find-gf ',name) %m)
                      ,@(when (and docstring (not *cross-compiling*))
                          `((funcall #'(setf documentation) ,docstring %m t)))
-                     %m))))))))))
+                     %m)))))))))))
+
+(defun %implicit-gf-lambda-list (method-ll)
+  "The lambda list of the generic function a DEFMETHOD makes when there is none, from METHOD-LL,
+   the method's lambda list with the specializers dropped: the parameter names as written, the
+   optional ones without their defaults, &REST and &KEY (the keyword names themselves are left
+   to each method), without &AUX."
+  (let ((out '()) (state :required))
+    (dolist (p method-ll (nreverse out))
+      (cond ((eq p '&optional) (setf state :optional) (push p out))
+            ((member p '(&rest &body)) (setf state :rest) (push '&rest out))
+            ((eq p '&key) (setf state :key) (push p out))
+            ((eq p '&allow-other-keys) (push p out))
+            ((eq p '&aux) (return (nreverse out)))
+            ((eq state :required) (push (if (consp p) (car p) p) out))
+            ((eq state :optional) (push (if (consp p) (car p) p) out))
+            ((eq state :rest) (push p out))))))
 
 ;;; What a DEFMETHOD whose specializers are all class names expands to.
 ;;; INFO is (n-params required optional rest-p key-p allow-other-keys-p
@@ -5457,11 +6450,14 @@ quietly took every typed slot back off the raw path."
     ;; locked). It takes &key/&rest from the method but
     ;; not the keyword names: the GF accepts whatever each applicable method
     ;; accepts.
+    ;; The specializers are resolved first: one that fails (an undefined class)
+    ;; must not leave an empty generic function behind.
+    (let ((classes (mapcar #'%specializer-class spec-names)))
     (when (null (%find-gf name))
       (let ((gf (%make-gf name n-params)))
-        (%set-gf-lambda-list-info gf req opt rest-p key-p aok-p nil)
+        (%set-gf-lambda-list-info gf req opt rest-p key-p aok-p nil nil (%implicit-gf-lambda-list ll))
         (%register-gf-if-absent name gf)))
-    (let ((m (%make-method (mapcar #'%specializer-class spec-names)
+    (let ((m (%make-method classes
                            (copy-list qualifiers)
                            fn)))
       (%set-method-lambda-list-info m req opt rest-p key-p aok-p
@@ -5472,7 +6468,7 @@ quietly took every typed slot back off the raw path."
       (%add-method (%find-gf name) m)
       (when docstring
         (funcall #'(setf documentation) docstring m t))
-      m)))
+      m))))
 
 ;;; --- defpackage ---
 
@@ -5540,7 +6536,9 @@ quietly took every typed slot back off the raw path."
                     ((eq key :export)
                      (dolist (s args) (push (string s) export-names)))
                     ((eq key :nicknames)
-                     (dolist (n args) (push (string n) nickname-strings)))
+                     (dolist (n args)
+                       (unless (string= (string n) pkg-name)
+                         (push (string n) nickname-strings))))
                     ((eq key :local-nicknames)
                      (dolist (pair args)
                        (push (cons (string (car pair)) (string (cadr pair)))
@@ -5661,7 +6659,9 @@ quietly took every typed slot back off the raw path."
                                  (import-clause args ":SHADOWING-IMPORT-FROM"))
                              shadowing-imports))
                       ((eq key :nicknames)
-                       (dolist (n args) (push (string n) nicknames)))
+                       (dolist (n args)
+                         (unless (string= (string n) pkg-name)
+                           (push (string n) nicknames))))
                       ((eq key :local-nicknames)
                        (dolist (pair args)
                          (push (cons (string (car pair)) (string (cadr pair)))
@@ -5782,34 +6782,108 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                   :report (lambda (s) (format s "Skip this ~A clause." clause-name))
                   nil))))))))))
 
+(defun %defpackage-snapshot (pkg)
+  "What DEFPACKAGE may change in the existing package PKG, to put back if the form fails:
+   (USE-LIST NICKNAMES LOCAL-NICKNAMES PRESENT), PRESENT being (SYMBOL . EXTERNALP) for
+   each symbol present in PKG."
+  (let ((present '()))
+    (do-symbols (sym pkg)
+      (multiple-value-bind (found status) (find-symbol (symbol-name sym) pkg)
+        (when (and (eq found sym) (member status '(:internal :external)))
+          (push (cons sym (eq status :external)) present))))
+    (list (copy-list (package-use-list pkg))
+          (copy-list (package-nicknames pkg))
+          (copy-list (package-local-nicknames pkg))
+          present)))
+
+(defun %defpackage-rollback (pkg snapshot)
+  "Put the existing package PKG back as SNAPSHOT recorded it, after a DEFPACKAGE form
+   that changed it failed part of the way."
+  (destructuring-bind (use-list nicknames local-nicknames present) snapshot
+    ;; Symbols the form added go; ones it displaced come back; export states are restored.
+    (let ((old (make-hash-table :test 'eq)))
+      (dolist (entry present) (setf (gethash (car entry) old) t))
+      (let ((added '()))
+        (do-symbols (sym pkg)
+          (multiple-value-bind (found status) (find-symbol (symbol-name sym) pkg)
+            (when (and (eq found sym) (member status '(:internal :external))
+                       (not (gethash sym old)))
+              (push sym added))))
+        (dolist (sym added) (ignore-errors (unintern sym pkg))))
+      (dolist (entry present)
+        (let ((sym (car entry)))
+          (multiple-value-bind (found status) (find-symbol (symbol-name sym) pkg)
+            (unless (and (eq found sym) (member status '(:internal :external)))
+              (ignore-errors (shadowing-import sym pkg)))
+            (multiple-value-bind (found2 status2) (find-symbol (symbol-name sym) pkg)
+              (when (eq found2 sym)
+                (cond ((and (cdr entry) (not (eq status2 :external)))
+                       (ignore-errors (export sym pkg)))
+                      ((and (not (cdr entry)) (eq status2 :external))
+                       (ignore-errors (unexport sym pkg))))))))))
+    (let ((now (package-use-list pkg)))
+      (dolist (u now)
+        (unless (member u use-list) (ignore-errors (unuse-package u pkg))))
+      (dolist (u use-list)
+        (unless (member u now) (ignore-errors (use-package u pkg)))))
+    (unless (equal (sort (copy-list (package-nicknames pkg)) #'string<)
+                   (sort (copy-list nicknames) #'string<))
+      (ignore-errors (rename-package pkg (package-name pkg) nicknames)))
+    (dolist (entry (package-local-nicknames pkg))
+      (unless (member entry local-nicknames :test #'equal)
+        (ignore-errors (remove-package-local-nickname (car entry) pkg))))
+    (dolist (entry local-nicknames)
+      (unless (member entry (package-local-nicknames pkg) :test #'equal)
+        (ignore-errors (add-package-local-nickname (car entry) (cdr entry) pkg))))
+    pkg))
+
 (defun %defpackage-run (spec)
   "Define the package SPEC describes: what a DEFPACKAGE form expands to. SPEC is
    (name nickname-checks nicknames local-nicknames shadows shadowing-imports uses
-   imports interns exports docs), built by the DEFPACKAGE macro."
+   imports interns exports docs), built by the DEFPACKAGE macro.
+
+   A form that fails leaves nothing behind: a package it made is deleted again, and one
+   it redefined is put back as it was (SBCL checks the whole form first and changes
+   nothing; the package a failed form left half done would otherwise be what the next
+   evaluation of the corrected form starts from)."
   (destructuring-bind (pkg-name nickname-checks nicknames local-nicknames shadows
                        shadowing-imports uses imports interns exports docs)
       spec
-    (let ((pkg (%make-package pkg-name)))
-      (dolist (n nickname-checks)
-        (let ((other (find-package n)))
-          (when (and other (not (eq other pkg)))
-            (error 'simple-package-error
-                   :package n
-                   :format-control "DEFPACKAGE ~A: nickname ~A conflicts with existing package"
-                   :format-arguments (list pkg-name n)))))
-      (dolist (n nicknames) (%package-nickname pkg n))
-      (dolist (pair local-nicknames) (%add-local-nickname (car pair) (cdr pair) pkg))
-      (dolist (s shadows) (%package-shadow pkg s))
-      (dolist (c shadowing-imports) (%defpackage-import-clause pkg pkg-name c t))
-      (dolist (u uses)
-        (if (consp u)
-            (%defpackage-clash pkg-name u)
-            (%package-use pkg u)))
-      (dolist (c imports) (%defpackage-import-clause pkg pkg-name c nil))
-      (dolist (s interns) (intern s pkg))
-      (dolist (s exports) (%package-export pkg (intern s pkg)))
-      (dolist (d docs) (setf (documentation pkg t) d))
-      pkg)))
+    (let* ((existing (find-package pkg-name))
+           (pkg (%make-package pkg-name))
+           (snapshot (and existing (%defpackage-snapshot pkg)))
+           (done nil))
+      (unwind-protect
+           (progn
+             (dolist (n nickname-checks)
+               (let ((other (find-package n)))
+                 (when (and other (not (eq other pkg)))
+                   (error 'simple-package-error
+                          :package n
+                          :format-control "DEFPACKAGE ~A: nickname ~A conflicts with existing package"
+                          :format-arguments (list pkg-name n)))))
+             ;; Redefining a package replaces its nicknames: one the new form does not list goes.
+             (let ((old (package-nicknames pkg)))
+               (when (set-difference old nicknames :test #'string=)
+                 (rename-package pkg (package-name pkg) nicknames)))
+             (dolist (n nicknames) (%package-nickname pkg n))
+             (dolist (pair local-nicknames) (%add-local-nickname (car pair) (cdr pair) pkg))
+             (dolist (s shadows) (%package-shadow pkg s))
+             (dolist (c shadowing-imports) (%defpackage-import-clause pkg pkg-name c t))
+             (dolist (u uses)
+               (if (consp u)
+                   (%defpackage-clash pkg-name u)
+                   (%package-use pkg u)))
+             (dolist (c imports) (%defpackage-import-clause pkg pkg-name c nil))
+             (dolist (s interns) (intern s pkg))
+             (dolist (s exports) (%package-export pkg (intern s pkg)))
+             (dolist (d docs) (setf (documentation pkg t) d))
+             (setf done t)
+             pkg)
+        (unless done
+          (if existing
+              (%defpackage-rollback pkg snapshot)
+              (ignore-errors (delete-package pkg))))))))
 
 ;;; --- do-symbols / do-external-symbols ---
 
@@ -5889,6 +6963,7 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
 
 (setf (gethash 'with-package-iterator *macros*)
       (lambda (form)
+        (%check-with-iterator-form form)
         ;; (with-package-iterator (name pkg-list-form &rest sym-types) body...)
         (let* ((iter-spec (cadr form))
                (name (car iter-spec))
@@ -6125,6 +7200,30 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                                  (error "MAKE-METHOD is only valid inside CALL-METHOD")))
                       ,form))))))))
 
+(defun %check-define-method-combination-syntax (form)
+  "Signal a PROGRAM-ERROR for a malformed DEFINE-METHOD-COMBINATION FORM: a short form whose
+   options are not a property list of :DOCUMENTATION (a string), :IDENTITY-WITH-ONE-ARGUMENT and
+   :OPERATOR, or a long form whose :GENERIC-FUNCTION option is not exactly one symbol."
+  (flet ((bad (what)
+           (error 'program-error
+                  :format-control "DEFINE-METHOD-COMBINATION: ~A in ~S"
+                  :format-arguments (list what form))))
+    (let ((rest (cddr form)))
+      (if (and rest (listp (car rest)) (cdr rest) (listp (cadr rest)) (not (keywordp (car rest))))
+          (dolist (item (cddr rest))
+            (when (and (consp item) (eq (car item) :generic-function)
+                       (not (and (consp (cdr item)) (null (cddr item))
+                                 (cadr item) (symbolp (cadr item)))))
+              (bad "the :GENERIC-FUNCTION option takes exactly one symbol")))
+          (progn
+            (unless (and (listp rest) (null (cdr (last rest))) (evenp (length rest)))
+              (bad "the options are not a property list"))
+            (loop for (key value) on rest by #'cddr
+                  do (unless (member key '(:documentation :identity-with-one-argument :operator))
+                       (bad (format nil "unknown option ~S" key)))
+                     (when (and (eq key :documentation) (not (stringp value)))
+                       (bad "the documentation is not a string"))))))))
+
 (setf (gethash 'define-method-combination *macros*)
       (lambda (form)
         ;; Detect long form: (define-method-combination name lambda-list (method-group-spec*) ...)
@@ -6133,6 +7232,7 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
         ;; and the fourth element is a list of lists (method-group-specs)
         (let ((name (cadr form))
               (rest (cddr form)))
+          (%check-define-method-combination-syntax form)
           ;; Check for long form: rest starts with a list (lambda-list) followed by a list of lists
           (if (and rest (listp (car rest))
                    (cdr rest) (listp (cadr rest))
@@ -6290,6 +7390,11 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
 
 (setf (gethash 'with-open-file *macros*)
       (lambda (form)
+        (let ((spec (and (consp (cdr form)) (cadr form))))
+          (unless (and (consp spec) (symbolp (car spec)) (consp (cdr spec)) (null (cdr (last spec)))
+                       (evenp (length (cddr spec))))
+            (error 'program-error :format-control "WITH-OPEN-FILE: malformed specification ~S"
+                                  :format-arguments (list spec))))
         ;; (with-open-file (var path &rest options) declaration* form*)
         (let* ((spec (cadr form))
                (var (car spec))
@@ -6311,6 +7416,7 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
 
 (setf (gethash 'with-output-to-string *macros*)
       (lambda (form)
+        (%check-with-string-stream-form form)
         ;; (with-output-to-string (var &optional string-form &key element-type) decl* form*)
         (let* ((spec (cadr form))
                (var (car spec))
@@ -6345,41 +7451,46 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                           (setq kw-rest (cddr kw-rest)))
                          (t (setq kw-rest (cddr kw-rest)))))))))))
           (multiple-value-bind (decls real-body) (extract-declarations (cddr form))
-            (if string-form
-                ;; String-form provided: write to existing string, return last body form value
-                ;; element-type must still be evaluated for side effects (CLHS: left-to-right)
-                ;; Evaluation order: string-form, then element-type
-                (if element-type
-                    (let ((str-var (gensym "STR"))
-                          (et-var (gensym "ET")))
-                      `(let* ((,str-var ,string-form)
-                              (,et-var ,element-type)
-                              (,var (make-string-output-stream-to-string ,str-var)))
-                         (declare (ignore ,et-var))
+            ;; The stream is held in a variable of its own, so that a body that assigns VAR still
+            ;; leaves the right stream to close and to take the string from.
+            (let ((g (gensym "STREAM")))
+              (if string-form
+                  ;; String-form provided: write to existing string, return last body form value
+                  ;; element-type must still be evaluated for side effects (CLHS: left-to-right)
+                  ;; Evaluation order: string-form, then element-type
+                  (if element-type
+                      (let ((str-var (gensym "STR"))
+                            (et-var (gensym "ET")))
+                        `(let* ((,str-var ,string-form)
+                                (,et-var ,element-type)
+                                (,g (make-string-output-stream-to-string ,str-var))
+                                (,var ,g))
+                           (declare (ignore ,et-var))
+                           ,@decls
+                           (unwind-protect
+                             (progn ,@real-body)
+                             (close ,g))))
+                      `(let* ((,g (make-string-output-stream-to-string ,string-form))
+                              (,var ,g))
                          ,@decls
                          (unwind-protect
                            (progn ,@real-body)
-                           (close ,var))))
-                    `(let ((,var (make-string-output-stream-to-string ,string-form)))
-                       ,@decls
-                       (unwind-protect
-                         (progn ,@real-body)
-                         (close ,var))))
-                ;; No string-form: create new stream, return accumulated string
-                ;; declare var special so eval can see the binding (SBCL-compatible)
-                `(let ((,var (make-string-output-stream
-                               ,@(when element-type `(:element-type ,element-type)))))
-                   (declare (special ,var))
-                   ,@decls
-                   (unwind-protect
-                     (progn ,@real-body
-                            (get-output-stream-string ,var))
-                     (close ,var))))))))
+                           (close ,g))))
+                  ;; No string-form: create new stream, return accumulated string
+                  `(let* ((,g (make-string-output-stream
+                                 ,@(when element-type `(:element-type ,element-type))))
+                          (,var ,g))
+                     ,@decls
+                     (unwind-protect
+                       (progn ,@real-body
+                              (get-output-stream-string ,g))
+                       (close ,g)))))))))
 
 ;;; --- with-input-from-string ---
 
 (setf (gethash 'with-input-from-string *macros*)
       (lambda (form)
+        (%check-with-string-stream-form form)
         ;; (with-input-from-string (var string &key index start end) &body body)
         (let* ((spec (cadr form))
                (var (car spec))
@@ -6420,6 +7531,14 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
 
 ;;; --- case / ecase / ccase ---
 
+;;; The test of one CASE clause whose key is a list. A short list is a few EQL tests,
+;;; which the compiler turns into inline comparisons; MEMBER with a :TEST function is a
+;;; call through the function table on every evaluation, and a long list keeps it.
+(defun %case-keys-test (keyvar keys)
+  (cond ((null (cdr keys)) `(eql ,keyvar ',(car keys)))
+        ((<= (length keys) 6) `(or ,@(mapcar (lambda (k) `(eql ,keyvar ',k)) keys)))
+        (t `(member ,keyvar '(,@keys) :test #'eql))))
+
 (setf (gethash 'case *macros*)
       (lambda (form)
         ;; (case keyform (keys body...)...)
@@ -6428,6 +7547,13 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
         (let ((keyvar (gensym "KEY"))
               (keyform (cadr form))
               (clauses (cddr form)))
+          ;; T / OTHERWISE as the keys of a clause that is not the last one makes the later
+          ;; clauses unreachable; SBCL reports the clause as bad.
+          (loop for tail on clauses
+                for clause = (car tail)
+                when (and (cdr tail) (consp clause) (member (car clause) '(t otherwise) :test #'eq))
+                  do (warn "Bad CASE clause:  ~S~%~A allowed as the key designator only in the final otherwise-clause, not in a normal-clause."
+                           clause (car clause)))
           `(let ((,keyvar ,keyform))
              (cond
                ,@(remove nil
@@ -6441,7 +7567,7 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                                    ((null keys)
                                     nil) ; empty key list: never matches
                                    ((consp keys)
-                                    `((member ,keyvar '(,@keys) :test #'eql) ,@result))
+                                    `(,(%case-keys-test keyvar keys) ,@result))
                                    (t
                                     `((eql ,keyvar ',keys) ,@result))))))
                            clauses)))))))
@@ -6464,7 +7590,7 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
          (wrapped (if wrap-return `((return (progn ,@result))) result)))
     (cond
       ((null keys) nil)
-      ((consp keys) `((member ,keyvar '(,@keys) :test #'eql) ,@wrapped))
+      ((consp keys) `(,(%case-keys-test keyvar keys) ,@wrapped))
       (t `((eql ,keyvar ',keys) ,@wrapped)))))
 
 (setf (gethash 'ecase *macros*)
@@ -6647,13 +7773,19 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
 
 (setf (gethash 'multiple-value-setq *macros*)
       (lambda (form)
+        (unless (and (listp (cadr form)) (null (cdr (last (cadr form)))))
+          (error 'program-error :format-control "MULTIPLE-VALUE-SETQ: ~S is not a list of variables"
+                                :format-arguments (list (cadr form))))
         ;; (multiple-value-setq (var1 var2 ...) values-form)
         ;; Correct expansion: evaluate ALL place subforms FIRST (before values-form),
         ;; then evaluate values-form, then store. This matches (setf (values ...) form).
         (let* ((vars (cadr form))
                (values-form (caddr form))
-               (split (or (%mv-setq-split-floor vars values-form)
-                          (%mv-setq-sink-inline vars values-form)))
+               (split (let ((sp (or (%mv-setq-split-floor vars values-form)
+                                    (%mv-setq-sink-inline vars values-form))))
+                        ;; Chosen from the local functions in scope here: see MULTIPLE-VALUE-BIND.
+                        (when sp (setf *expansion-unreusable* t))
+                        sp))
                (let-bindings '())   ; place temp bindings (evaluated before values-form)
                (store-vars '())     ; store variables for multiple-value-bind
                (setters '()))       ; setters (in order)
@@ -6742,6 +7874,7 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
 ;;; Each call returns: (values more? key value)
 (setf (gethash 'with-hash-table-iterator *macros*)
       (lambda (form)
+        (%check-with-iterator-form form)
         (let ((name (caadr form))
               (ht-expr (cadadr form))
               (body (cddr form)))
@@ -6919,19 +8052,28 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                  (count-var (gensym "PPRINT-COUNT"))
                  ;; PPRINT-POP and PPRINT-EXIT-IF-LIST-EXHAUSTED leave this block, not
                  ;; whatever NIL block (a LOOP, say) the call sits in.
-                 (block-var (gensym "PPRINT-BLOCK")))
-            `(let ((,actual-stream ,(cond ((null stream-sym) '*standard-output*)
-                                          ((eq stream-sym t) '*terminal-io*)
-                                          (t actual-stream))))
+                 (block-var (gensym "PPRINT-BLOCK"))
+                 (pfx-var (gensym "PPRINT-PREFIX"))
+                 (real-var (gensym "PPRINT-REAL")))
+            `(let* ((,real-var ,(cond ((null stream-sym) '*standard-output*)
+                                      ((eq stream-sym t) '*terminal-io*)
+                                      (t actual-stream)))
+                    (,actual-stream (%pprint-shadow-for ,real-var)))
                (declare (ignorable ,actual-stream))
-               (let ((,list-var ,list-form)
+              (unwind-protect
+               (let (,@(cond ((null stream-sym) `((*standard-output* ,actual-stream)))
+                             ((eq stream-sym t) `((*terminal-io* ,actual-stream))))
+                     (,list-var ,list-form)
                      (,count-var 0)
-                     (.first-pop. t))
-                 (declare (ignorable ,count-var .first-pop.))
+                     (.first-pop. t)
+                     (,pfx-var nil))
+                 (declare (ignorable ,count-var .first-pop. ,pfx-var))
+                 ;; The prefix expression is evaluated once. CLHS: it must be a string
+                 ;; (NIL is a type error here, which ansi-test checks; SBCL accepts NIL).
                  ,@(when (or prefix per-line-prefix)
-                     `((let ((.pfx. ,(or prefix per-line-prefix)))
-                         (unless (stringp .pfx.)
-                           (error 'type-error :datum .pfx. :expected-type 'string)))))
+                     `((setq ,pfx-var ,(or prefix per-line-prefix))
+                       (unless (stringp ,pfx-var)
+                         (error 'type-error :datum ,pfx-var :expected-type 'string))))
                  ,@(when suffix
                      `((let ((.sfx. ,suffix))
                          (unless (stringp .sfx.)
@@ -6962,10 +8104,10 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                                       ;; *print-pretty*: only the dynamic newline/indent
                                       ;; (%pprint-start/end-block) is gated on pretty.
                                       ,@(when (or prefix per-line-prefix)
-                                          `((write-string ,(or prefix per-line-prefix) ,actual-stream)))
+                                          `((write-string ,pfx-var ,actual-stream)))
                                       (%pprint-start-block ,actual-stream
-                                        ,(if (or prefix per-line-prefix) `(length ,(or prefix per-line-prefix)) 0)
-                                        ,@(when per-line-prefix (list per-line-prefix)))
+                                        ,(if (or prefix per-line-prefix) `(length ,pfx-var) 0)
+                                        ,@(when per-line-prefix (list pfx-var)))
                                       (unwind-protect
                                         (block ,block-var
                                           (macrolet ((pprint-exit-if-list-exhausted ()
@@ -7014,7 +8156,8 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
                                       ,@(when suffix
                                           `((write-string ,suffix ,actual-stream))))))))))
                      (when .circle-started. (%pprint-circle-end))))
-                 nil))))))
+                 nil)
+               (%pprint-shadow-finish ,real-var ,actual-stream)))))))
 
 ;;; --- print-unreadable-object ---
 ;;; (print-unreadable-object (object stream &key type identity) &body body)
@@ -7153,12 +8296,9 @@ defined). Write ~A here, or declare the nickname on the package this form is rea
             (let ((body (cons 'progn (cddr form)))
                   ;; The code walker is a runtime function (cil-stdlib), reached
                   ;; by name because the compiler's own package does not have
-                  ;; it. SB-CLTL2 is the cross-compile host's equivalent; the
-                  ;; core itself uses no COMPILER-LET, so that branch is there
-                  ;; for a core that starts to.
+                  ;; it.
                   (mea (dolist (spec '(("MACROEXPAND-ALL" . "DOTCL-CLTL2")
-                                       ("%MACROEXPAND-ALL" . "DOTCL")
-                                       ("MACROEXPAND-ALL" . "SB-CLTL2")))
+                                       ("%MACROEXPAND-ALL" . "DOTCL")))
                          (let* ((pkg (find-package (cdr spec)))
                                 (s (and pkg (find-symbol (car spec) pkg))))
                            (when (and s (fboundp s)) (return s))))))

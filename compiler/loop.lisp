@@ -119,7 +119,9 @@
 ;;; end of the list might be suboptimal because the end of the list will
 ;;; probably be RPLACDed and so cdr-normal should be used instead.
 (defmacro loop-copylist* (l)
-  `(copy-list ,l))
+  ;; An atom is passed through (APPEND does this for its last argument).
+  (let ((v (gensym "L")))
+    `(let ((,v ,l)) (if (listp ,v) (copy-list ,v) ,v))))
 
 
 (defvar *loop-gentemp*
@@ -183,15 +185,28 @@
 (defmacro with-loop-list-collection-head ((head-var tail-var &optional user-head-var)
 					  &body body)
   (let ((l (and user-head-var (list (list user-head-var nil)))))
-    `(let* ((,head-var (list nil)) (,tail-var ,head-var) ,@l)
+    `(let* ((,head-var nil) (,tail-var nil) ,@l)
        ,@body)))
 
 
 (defmacro loop-collect-rplacd (&environment env
 			       (head-var tail-var &optional user-head-var) form)
   (declare)
+  (let ((append-p (and (consp form) (eq (car form) 'loop-copylist*))))
   (setq form (macroexpand form env))
-  (flet ((cdr-wrap (form n)
+  (flet ((tail-for-set (tail)
+           ;; Appending after a piece that ended in a non-NIL atom is an error.
+           (if append-p
+               (let ((v (gensym "T")))
+                 `(let ((,v ,tail))
+                    (if (and (consp ,v) (cdr ,v)) (error 'type-error :datum (cdr ,v) :expected-type 'list) ,v)))
+               tail))
+         (tail-of (x)
+           ;; After an APPEND the new piece may be an atom: it is the end of the list.
+           (if append-p
+               (let ((v (gensym "V"))) `(let ((,v ,x)) (if (consp ,v) (last ,v) ,v)))
+               `(last ,x)))
+         (cdr-wrap (form n)
 	   (declare (fixnum n))
 	   (do () ((<= n 4) (setq form `(,(case n
 					    (1 'cdr)
@@ -215,28 +230,29 @@
 		 (setq ncdrs (- (length (cdr form)) 2))))))
       (let ((answer
 	      (cond ((null ncdrs)
-		     `(when (setf (cdr ,tail-var) ,tail-form)
-			(setq ,tail-var (last (cdr ,tail-var)))))
+		     `(if ,head-var
+			  (when (setf (cdr ,(tail-for-set tail-var)) ,tail-form)
+			    (setq ,tail-var ,(tail-of `(cdr ,tail-var))))
+			  (when (setq ,head-var ,tail-form)
+			    (setq ,tail-var ,(tail-of head-var)))))
 		    ((< ncdrs 0) (return-from loop-collect-rplacd nil))
 		    ((= ncdrs 0)
-		     ;;@@@@ Here we have a choice of two idioms:
-		     ;; (rplacd tail (setq tail tail-form))
-		     ;; (setq tail (setf (cdr tail) tail-form)).
-		     ;;Genera and most others I have seen do better with the former.
-		     `(rplacd ,tail-var (setq ,tail-var ,tail-form)))
-		    (t `(setq ,tail-var ,(cdr-wrap `(setf (cdr ,tail-var) ,tail-form)
-						   ncdrs))))))
-	;;If not using locatives or something similar to update the user's
-	;; head variable, we've got to set it...  It's harmless to repeatedly set it
-	;; unconditionally, and probably faster than checking.
+		     `(if ,head-var
+			  (rplacd ,tail-var (setq ,tail-var ,tail-form))
+			  (setq ,head-var ,tail-form
+				,tail-var ,head-var)))
+		    (t `(if ,head-var
+			    (setq ,tail-var ,(cdr-wrap `(setf (cdr ,tail-var) ,tail-form)
+						       ncdrs))
+			    (setq ,head-var ,tail-form
+				  ,tail-var ,(cdr-wrap head-var ncdrs)))))))
 	(when user-head-var
-	  (setq answer `(progn ,answer (setq ,user-head-var (cdr ,head-var)))))
-	answer))))
+	  (setq answer `(progn ,answer (setq ,user-head-var ,head-var))))
+	answer)))))
 
 
 (defmacro loop-collect-answer (head-var &optional user-head-var)
-  (or user-head-var
-      `(cdr ,head-var)))
+  (or user-head-var head-var))
 
 
 ;;;; Maximization Technology
@@ -867,7 +883,7 @@ same result as assigning them in parallel."
 		      ;; by recognizing CL function names and nothing else.
 		      (if (symbolp (cadr x))
 			  1
-			  (throw 'duplicatable-code-p nil)))
+			  (throw 'estimate-code-size nil)))
 		     ((eq fn 'multiple-value-setq) (f (length (second x)) (cddr x)))
 		     ((eq fn 'return-from) (1+ (estimate-code-size-1 (third x) env)))
 		     ((or (special-operator-p fn) (member fn *estimate-code-size-punt*))
@@ -1102,10 +1118,13 @@ collected result will be returned as the value of the LOOP."
 
 
 (defun loop-typed-init (data-type)
-  (when (and data-type (subtypep data-type 'number))
-    (if (or (subtypep data-type 'float) (subtypep data-type '(complex float)))
-	(coerce 0 data-type)
-	0)))
+  (cond ((and data-type (subtypep data-type 'number))
+         (if (or (subtypep data-type 'float) (subtypep data-type '(complex float)))
+             (coerce 0 data-type)
+             0))
+        ;; A variable declared a character type must start as a character.
+        ((and data-type (subtypep data-type 'character) (not (subtypep data-type 'nil)))
+         (find-if (lambda (c) (typep c data-type)) '(#\x #\a #\0 #\Space)))))
 
 
 (defun loop-optional-type (&optional variable)
@@ -2420,8 +2439,8 @@ collected result will be returned as the value of the LOOP."
 
 (defun %expand-loop-copylist* (form)
   ;; (loop-copylist* l) -> (copy-list l)
-  (let ((l (cadr form)))
-    `(copy-list ,l)))
+  (let ((l (cadr form)) (v (gensym "L")))
+    `(let ((,v ,l)) (if (listp ,v) (copy-list ,v) ,v))))
 
 (defun %expand-with-loop-list-collection-head (form)
   ;; (with-loop-list-collection-head (head tail [user-head]) body...)
@@ -2431,7 +2450,7 @@ collected result will be returned as the value of the LOOP."
          (user-head-var (third args))
          (body (cddr form))
          (l (and user-head-var (list (list user-head-var nil)))))
-    `(let* ((,head-var (list nil)) (,tail-var ,head-var) ,@l)
+    `(let* ((,head-var nil) (,tail-var nil) ,@l)
        ,@body)))
 
 (defun %expand-loop-collect-rplacd (form)
@@ -2442,8 +2461,19 @@ collected result will be returned as the value of the LOOP."
          (user-head-var (third args))
          (collected-form (caddr form)))
     ;; macroexpand with nil env (safe: only affects optimization)
+    (let ((append-p (and (consp collected-form) (eq (car collected-form) 'loop-copylist*))))
     (setq collected-form (macroexpand collected-form nil))
-    (flet ((cdr-wrap (form n)
+    (flet ((tail-for-set (tail)
+             (if append-p
+                 (let ((v (gensym "T")))
+                   `(let ((,v ,tail))
+                      (if (and (consp ,v) (cdr ,v)) (error 'type-error :datum (cdr ,v) :expected-type 'list) ,v)))
+                 tail))
+           (tail-of (x)
+             (if append-p
+                 (let ((v (gensym "V"))) `(let ((,v ,x)) (if (consp ,v) (last ,v) ,v)))
+                 `(last ,x)))
+           (cdr-wrap (form n)
              (do () ((<= n 4)
                      (setq form `(,(case n (1 'cdr) (2 'cddr) (3 'cdddr) (4 'cddddr))
                                   ,form)))
@@ -2457,23 +2487,31 @@ collected result will be returned as the value of the LOOP."
                    (setq ncdrs (- (length (cdr collected-form)) 2))))))
         (let ((answer
                 (cond ((null ncdrs)
-                       `(when (setf (cdr ,tail-var) ,tail-form)
-                          (setq ,tail-var (last (cdr ,tail-var)))))
+                       `(if ,head-var
+                            (when (setf (cdr ,(tail-for-set tail-var)) ,tail-form)
+                              (setq ,tail-var ,(tail-of `(cdr ,tail-var))))
+                            (when (setq ,head-var ,tail-form)
+                              (setq ,tail-var ,(tail-of head-var)))))
                       ((< ncdrs 0) (return-from %expand-loop-collect-rplacd nil))
                       ((= ncdrs 0)
-                       `(rplacd ,tail-var (setq ,tail-var ,tail-form)))
-                      (t `(setq ,tail-var ,(cdr-wrap `(setf (cdr ,tail-var) ,tail-form)
-                                                     ncdrs))))))
+                       `(if ,head-var
+                            (rplacd ,tail-var (setq ,tail-var ,tail-form))
+                            (setq ,head-var ,tail-form
+                                  ,tail-var ,head-var)))
+                      (t `(if ,head-var
+                              (setq ,tail-var ,(cdr-wrap `(setf (cdr ,tail-var) ,tail-form)
+                                                         ncdrs))
+                              (setq ,head-var ,tail-form
+                                    ,tail-var ,(cdr-wrap head-var ncdrs)))))))
           (when user-head-var
-            (setq answer `(progn ,answer (setq ,user-head-var (cdr ,head-var)))))
-          answer)))))
+            (setq answer `(progn ,answer (setq ,user-head-var ,head-var))))
+          answer))))))
 
 (defun %expand-loop-collect-answer (form)
   ;; (loop-collect-answer head-var [user-head-var])
   (let ((head-var (cadr form))
         (user-head-var (caddr form)))
-    (or user-head-var
-        `(cdr ,head-var))))
+    (or user-head-var head-var)))
 
 (defun %expand-with-minimax-value (form)
   ;; (with-minimax-value lm body...)
@@ -2684,6 +2722,9 @@ collected result will be returned as the value of the LOOP."
 (setf (gethash 'loop-store-table-data dotcl.cil-compiler::*macros*) #'%expand-loop-store-table-data)
 (setf (gethash 'loop-really-desetq dotcl.cil-compiler::*macros*) #'%expand-loop-really-desetq)
 (setf (gethash 'loop-body dotcl.cil-compiler::*macros*) #'%expand-loop-body)
+;; The registered expanders above take no &ENVIRONMENT, unlike the DEFMACROs they replace.
+(dolist (sym '(loop-collect-rplacd loop-really-desetq loop-body))
+  (dotcl.cil-compiler::%note-macro-takes-environment sym nil))
 
 (defun loop-expand-all (form)
   "Recursively expand only internal loop macros in FORM.
@@ -2721,11 +2762,76 @@ collected result will be returned as the value of the LOOP."
                               proper)
                        (loop-expand-all current))))))))))
 
+;;; A counting clause whose start or step is not a constant -- (loop for j from
+;;; (* i i) to n by i ...) with untyped I and N -- leaves the counter, the limit
+;;; and the step boxed numbers: the compiler can prove nothing about them, and a
+;;; boxed counter allocates on every step. When the clause is the first one, the
+;;; loop is expanded twice behind a test made once before it: if START, LIMIT and
+;;; STEP are all integers in a range where the counter and its last step cannot
+;;; leave int64, the counter is a declared integer of that range and runs in the
+;;; long lane; otherwise the loop is the ordinary one. The forms are evaluated
+;;; once, in the order the clause gives them, as LOOP does. A constant positive
+;;; step is left as it is in both copies.
+(defconstant +loop-guard-bound+ (expt 2 61))
+
+(defun %loop-tree-mentions-loop-p (x)
+  (cond ((consp x) (or (%loop-tree-mentions-loop-p (car x)) (%loop-tree-mentions-loop-p (cdr x))))
+        (t (and (symbolp x) x (string= (symbol-name x) "LOOP")))))
+
+(defun %loop-tree-size (x)
+  (if (consp x) (+ 1 (%loop-tree-size (car x)) (%loop-tree-size (cdr x))) 0))
+
+(defun %loop-kw-p (x name)
+  (and (symbolp x) x (string= (symbol-name x) name)))
+
+(defun %loop-guard-expansion (clauses)
+  "CLAUSES is the loop's body. Return the guarded two-copy expansion, or NIL
+when the loop is not of the form (for VAR from START to/upto/below LIMIT [by STEP] ...)."
+  (let ((c clauses))
+    (when (and (consp c)
+               (or (%loop-kw-p (car c) "FOR") (%loop-kw-p (car c) "AS"))
+               (consp (cdr c)) (symbolp (cadr c)) (cadr c)
+               (consp (cddr c)) (or (%loop-kw-p (caddr c) "FROM") (%loop-kw-p (caddr c) "UPFROM"))
+               (consp (cdddr c))
+               (consp (cddddr c))
+               (or (%loop-kw-p (car (cddddr c)) "TO") (%loop-kw-p (car (cddddr c)) "UPTO")
+                   (%loop-kw-p (car (cddddr c)) "BELOW"))
+               (consp (cdr (cddddr c))))
+      (let* ((var (cadr c))
+             (start (cadddr c))
+             (limit-kw (car (cddddr c)))
+             (limit (cadr (cddddr c)))
+             (rest (cddr (cddddr c)))
+             (by-p (and (consp rest) (%loop-kw-p (car rest) "BY") (consp (cdr rest))))
+             (by (and by-p (cadr rest)))
+             (by-const (and by-p (integerp by) (plusp by)))
+             (by-var (and by-p (not by-const)))
+             (tail (if by-p (cddr rest) rest)))
+        (when (and (not (and (integerp start) (or (not by-p) (integerp by))))
+                   ;; the next token must not join this clause to another with AND
+                   (not (and (consp tail) (%loop-kw-p (car tail) "AND")))
+                   ;; no nested loop (the copies would multiply), and a body small
+                   ;; enough that two copies cost little
+                   (not (%loop-tree-mentions-loop-p tail))
+                   (< (%loop-tree-size tail) 80))
+          (let* ((s (gensym "S")) (l (gensym "L")) (b (gensym "B"))
+                 (hi +loop-guard-bound+) (lo (- +loop-guard-bound+))
+                 (r `(integer ,lo ,hi)) (rb `(integer 1 ,hi))
+                 (fast `(,(car c) ,var of-type fixnum from (the ,r ,s) ,limit-kw (the ,r ,l)
+                         ,@(cond (by-const `(by ,by)) (by-var `(by (the ,rb ,b)))) ,@tail))
+                 (slow `(,(car c) ,var from ,s ,limit-kw ,l
+                         ,@(cond (by-const `(by ,by)) (by-var `(by ,b))) ,@tail)))
+            `(let* ((,s ,start) (,l ,limit) ,@(when by-var `((,b ,by))))
+               (if (and (typep ,s ',r) (typep ,l ',r) ,@(when by-var `((typep ,b ',rb))))
+                   ,(loop-standard-expansion fast nil *loop-ansi-universe*)
+                   ,(loop-standard-expansion slow nil *loop-ansi-universe*)))))))))
+
 ;;; Register LOOP in dotcl's macro table
 (setf (gethash 'loop dotcl.cil-compiler::*macros*)
       (lambda (form)
         (loop-expand-all
-         (loop-standard-expansion (cdr form) nil *loop-ansi-universe*))))
+         (or (%loop-guard-expansion (cdr form))
+             (loop-standard-expansion (cdr form) nil *loop-ansi-universe*)))))
 
 ;;; Register LOOP-FINISH in dotcl's macro table
 (setf (gethash 'loop-finish dotcl.cil-compiler::*macros*)

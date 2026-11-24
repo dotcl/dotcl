@@ -62,6 +62,46 @@ public static partial class Runtime
     public static long CheckLongRange(long v, long lo, long hi) =>
         v >= lo && v <= hi ? v : throw TypedEntryTypeError(Fixnum.Make(v), IntegerRangeType(lo, hi));
 
+    /// <summary>The value of a fixnum, or the TYPE-ERROR of a declaration that said FIXNUM:
+    /// the init or a store of a declared-FIXNUM variable held in a raw slot, and every unbox of a
+    /// value the compiler took to be a fixnum. The hit is one type test and a load; the miss is
+    /// out of line.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long UnboxFixnumChecked(LispObject v) =>
+        v is Fixnum f ? f.Value : UnboxFixnumMiss(v);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static long UnboxFixnumMiss(LispObject v)
+    {
+        if (v is MvReturn mv && mv.PrimaryValue is Fixnum pf) return pf.Value;
+        throw TypedEntryTypeError(v is MvReturn m ? m.PrimaryValue : v, Startup.Sym("FIXNUM"));
+    }
+
+    /// <summary>The value of a double-float, or the TYPE-ERROR of a declaration that said
+    /// DOUBLE-FLOAT (see UnboxFixnumChecked).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static double UnboxDoubleChecked(LispObject v) =>
+        v is DoubleFloat d ? d.Value : UnboxDoubleMiss(v);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static double UnboxDoubleMiss(LispObject v)
+    {
+        if (v is MvReturn mv && mv.PrimaryValue is DoubleFloat pd) return pd.Value;
+        throw TypedEntryTypeError(v is MvReturn m ? m.PrimaryValue : v, Startup.Sym("DOUBLE-FLOAT"));
+    }
+
+    /// <summary>UnboxDoubleChecked for SINGLE-FLOAT.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float UnboxSingleChecked(LispObject v) =>
+        v is SingleFloat f ? f.Value : UnboxSingleMiss(v);
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static float UnboxSingleMiss(LispObject v)
+    {
+        if (v is MvReturn mv && mv.PrimaryValue is SingleFloat ps) return ps.Value;
+        throw TypedEntryTypeError(v is MvReturn m ? m.PrimaryValue : v, Startup.Sym("SINGLE-FLOAT"));
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void CheckArgFixnum(LispObject v)
     {
@@ -179,6 +219,7 @@ public static partial class Runtime
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void CheckArgStructSym(LispObject v, LispObject sym)
     {
+        if (v is LispInstance inst && ReferenceEquals(inst.Class.Name, sym) && !inst.Class.Superseded) return;
         if (!(LispStruct.TryAs(v, out var s) && (ReferenceEquals(s.TypeName, sym) || IsStructSubclass(s.TypeName, sym))))
             CheckArgType(v, sym);
     }

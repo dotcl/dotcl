@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; AREF through a structure accessor reads the element unboxed.
 ;;;
 ;;; A slot declared (simple-array fixnum (*)) says exactly which backing the

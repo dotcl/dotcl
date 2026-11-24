@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A call to an INLINE function whose FTYPE promises an integer that fits int64
 ;;; is compiled with its last form left as a raw int64 where the caller wants
 ;;; one, instead of boxing the result of the expansion's BLOCK only to unbox it

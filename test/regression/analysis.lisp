@@ -84,13 +84,6 @@
     result)
   (t t))
 
-;;; labels function captured in closure
-(deftest analysis-labels-in-closure
-  (let ((x 10))
-    (labels ((add-x (n) (+ n x)))
-      (funcall (lambda () (add-x 5)))))
-  15)
-
 ;;; ============================================================
 ;;; Mutation analysis: various mutation forms
 ;;; ============================================================

@@ -31,7 +31,10 @@
   t)
 
 (deftest dntp-unrelated-class-name-is-nil
-  (typep (dotnet:new "System.Text.StringBuilder") 'uri)
+  ;; URI is a class name only once something has touched System.Uri (see the note above);
+  ;; touch it here, so the test does not depend on an earlier file having done it.
+  (progn (dotnet:class-for-type "System.Uri")
+         (typep (dotnet:new "System.Text.StringBuilder") 'uri))
   nil)
 
 ;;; A plain Lisp object must not be dragged into the .NET registry lookup.

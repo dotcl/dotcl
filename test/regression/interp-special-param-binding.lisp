@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A SPECIAL-declared parameter must be bound dynamically DURING the lambda-list
 ;;; walk, not after it.
 ;;;

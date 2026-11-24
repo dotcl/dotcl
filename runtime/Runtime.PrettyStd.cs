@@ -32,6 +32,11 @@ public static partial class Runtime
         public int SectionEnd; // newline / block start: index of the next newline at depth <= Depth, -1 = end
         public int Match;     // block start: index of its block end
         public string? Str;   // text, or the suffix of a block start
+        public int Group;     // text of an object's own PRINT-OBJECT output (see AddObjectText), 0 = none
+        public bool Cont;     // ... on a line after the first: its indentation was written for column 0
+        public Dictionary<object, int>? Snap; // the circle table before the object first printed
+        public int SnapCounter;
+        public LispObject? Obj; // an object printed by its own PRINT-OBJECT: Str is its flat text, laid out again at its column
     }
 
     /// <summary>Whether TABLE's standard entries apply to OBJ (a list, or a
@@ -410,7 +415,90 @@ public static partial class Runtime
                 PprintArrayDim(arr, arr.Dimensions, 0, 0, $"#{arr.Rank}A(");
                 return;
             }
-            AddText(FormatAtom(obj, _escape), PpAtom);
+            // The labels taken while the object prints are undone for a second printing (see Layout).
+            Dictionary<object, int>? snap = null;
+            int snapCounter = 0;
+            if (_circleTable != null && (obj is LispInstance || obj is LispCondition || LispStruct.TryAs(obj, out _)))
+            {
+                snap = new Dictionary<object, int>(_circleTable, ReferenceEqualityComparer.Instance);
+                snapCounter = _circleLabelCounter;
+            }
+            AddObjectText(FormatAtom(obj, _escape), obj, snap, snapCounter);
+        }
+
+        private int _group;
+
+        /// <summary>OBJ printed by its own PRINT-OBJECT method as if it started at column COL.</summary>
+        private string? RenderObjectAt(LispObject obj, int col, Dictionary<object, int>? snap, int snapCounter)
+        {
+            // The first printing took the labels of the object and of what it holds; the second has to
+            // put them out again, so the circle table is put back as it was before the first one and
+            // restored afterwards (later text was printed against the state the first one left).
+            Dictionary<object, int>? after = null;
+            int afterCounter = _circleLabelCounter;
+            if (snap != null && _circleTable != null)
+            {
+                after = new Dictionary<object, int>(_circleTable, ReferenceEqualityComparer.Instance);
+                _circleTable.Clear();
+                foreach (var kv in snap) _circleTable[kv.Key] = kv.Value;
+                _circleLabelCounter = snapCounter;
+                // Its text starts after the label it is about to take.
+                if (_circleTable.TryGetValue(obj, out int own) && own == 0)
+                    col += ("#" + (snapCounter + 1) + "=").Length;
+            }
+            var suspended = PprintSuspend();
+            int savedCol = _printStartColumn, savedDepth = _formatConsDepth;
+            var savedDest = _printStartDest; var savedSb = _printStartFormatSb;
+            try
+            {
+                _printStartColumn = col; _printStartDest = null; _printStartFormatSb = null;
+                _formatConsDepth = 0;
+                return FormatObject(obj, _escape);
+            }
+            finally
+            {
+                _printStartColumn = savedCol; _printStartDest = savedDest; _printStartFormatSb = savedSb;
+                _formatConsDepth = savedDepth;
+                if (after != null && _circleTable != null) { _circleTable.Clear(); foreach (var kv in after) _circleTable[kv.Key] = kv.Value; _circleLabelCounter = afterCounter; }
+                PprintResume(suspended);
+            }
+        }
+        public bool HasObjectText => _group > 0;
+
+        /// <summary>The text of OBJ's own PRINT-OBJECT output. Printed on its own, it was laid out from
+        /// column 0; here its lines after the first are shifted to the column it starts at, and the
+        /// forced newlines in it belong to a block nested in the current one, so the conditional
+        /// newlines before it see them in their section.</summary>
+        private void AddObjectText(string s, LispObject obj, Dictionary<object, int>? snap, int snapCounter)
+        {
+            bool own = obj is LispInstance || obj is LispCondition || LispStruct.TryAs(obj, out _);
+            if (!own)
+            {
+                AddText(s, PpAtom);
+                return;
+            }
+            if (s.IndexOf('\n') < 0)
+            {
+                // Printed on its own it was not laid out for the column it will start at; the layout
+                // prints it again there when it does not fit (see Layout).
+                Add(new PpOpRec { Op = PpAtom, Str = s, Obj = obj, Snap = snap, SnapCounter = snapCounter });
+                _pos += s.Length;
+                return;
+            }
+            int group = ++_group;
+            int start = 0;
+            bool cont = false;
+            while (true)
+            {
+                int nl = s.IndexOf('\n', start);
+                if (nl < 0) break;
+                if (nl > start) { Add(new PpOpRec { Op = PpAtom, Str = s.Substring(start, nl - start), Group = group, Cont = cont }); _pos += nl - start; }
+                Add(new PpOpRec { Op = PpNewline, Kind = NlLiteral, Group = group, Cont = true });
+                var rec = _ops[_ops.Count - 1]; rec.Depth++; _ops[_ops.Count - 1] = rec;
+                cont = true;
+                start = nl + 1;
+            }
+            if (start < s.Length) { Add(new PpOpRec { Op = PpAtom, Str = s.Substring(start), Group = group, Cont = cont }); _pos += s.Length - start; }
         }
 
         private void PprintStruct(LispStruct st)
@@ -456,7 +544,9 @@ public static partial class Runtime
                 int? printLength = GetPrintLength();
                 for (int i = 0; i < dims[dimIdx]; i++)
                 {
-                    if (i > 0) { Text(" "); Newline(NlFill); }
+                    // The rows of an outer dimension break all together (as SBCL does); the
+                    // elements of the innermost one fill.
+                    if (i > 0) { Text(" "); Newline(dimIdx == dims.Length - 1 ? NlFill : NlLinear); }
                     if (printLength.HasValue && i >= printLength.Value) { Text("..."); break; }
                     int o = offset + i * stride;
                     if (dimIdx == dims.Length - 1) Obj(arr.ElementAt(o));
@@ -1086,7 +1176,8 @@ public static partial class Runtime
                         break;
                     case PpNewline:
                         if (op.Kind == NlLiteral) sb.Append('\n');
-                        else if (op.Kind == NlLinear || op.Kind == NlMandatory) Tok("STD:LINEAR");
+                        else if (op.Kind == NlMandatory) Tok("STD:MANDATORY");
+                        else if (op.Kind == NlLinear) Tok("STD:LINEAR");
                         else if (op.Kind == NlFill) Tok("STD:FILL");
                         else Tok("STD:MISER");
                         break;
@@ -1146,6 +1237,7 @@ public static partial class Runtime
             int? printLines = readably ? null : GetPrintLines();
 
             var sb = new StringBuilder();
+            var groupCol = new Dictionary<int, int>();
             int col = start;
             int cur = 0;          // flat position of the output so far
             int line = 0;
@@ -1180,6 +1272,25 @@ public static partial class Runtime
                 {
                     case PpText:
                     case PpAtom:
+                        if (op.Obj != null && col + op.Str!.Length > margin && !GetPrintLevel().HasValue
+                            && RenderObjectAt(op.Obj, col, op.Snap, op.SnapCounter) is string again && again != op.Str)
+                        {
+                            sb.Append(again);
+                            int lastNl = again.LastIndexOf('\n');
+                            col = lastNl < 0 ? col + again.Length : again.Length - lastNl - 1;
+                            cur += op.Str.Length;
+                            keep = sb.Length;
+                            break;
+                        }
+                        if (op.Group != 0)
+                        {
+                            if (!op.Cont) groupCol[op.Group] = col;
+                            else if (groupCol.TryGetValue(op.Group, out int shift) && shift > 0)
+                            {
+                                sb.Append(' ', shift);
+                                col += shift;
+                            }
+                        }
                         sb.Append(op.Str);
                         col += op.Str!.Length;
                         cur += op.Str.Length;

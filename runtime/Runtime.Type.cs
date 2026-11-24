@@ -159,12 +159,95 @@ public static partial class Runtime
         return false;
     }
 
+    // True for (FUNCTION), (FUNCTION *), (FUNCTION * *), (FUNCTION (&REST T) *), (FUNCTION * T) ...:
+    // an argument list that is * or (&rest t), and a value type that is * or T.
+    private static bool IsUnconstrainedFunctionType(Cons compound)
+    {
+        static bool Wild(LispObject o) => o is Symbol { Name: "*" } || o is T;
+        var rest = compound.Cdr;
+        if (rest is Nil) return true;
+        if (rest is not Cons c1) return false;
+        var args = c1.Car;
+        bool argsWild = args is Symbol { Name: "*" }
+            || (args is Cons ac && ac.Car is Symbol { Name: "&REST" } && ac.Cdr is Cons ac2 && ac2.Car is T && ac2.Cdr is Nil);
+        if (!argsWild) return false;
+        if (c1.Cdr is Nil) return true;
+        return c1.Cdr is Cons c2 && Wild(c2.Car) && c2.Cdr is Nil;
+    }
+
     public static LispObject Typep(LispObject obj, LispObject typeSpec)
     {
         if (LispStruct.TryAs(obj, out var st) && ReferenceEquals(st.TypeName, typeSpec)) return T.Instance;
         if (typeSpec is Symbol sym && SymbolTypeTest(sym) is { } test)
             return test.Test(obj) ? T.Instance : Nil.Instance;
+        if (typeSpec is Cons cs && ConsSpecTest(cs) is { } ctest)
+            return ctest.Test(obj) ? T.Instance : Nil.Instance;
         return TypepGeneral(obj, typeSpec);
+    }
+
+    // A compound specifier written in the code ((SIMPLE-ARRAY (UNSIGNED-BYTE 8) (81)),
+    // (INTEGER 0 80), (OR NULL FOO)) is the same constant cons at every call of its
+    // site. TYPEP used to interpret it from the cons each time (about 120 ns and 230 B
+    // for the array specifier above); its test is built once per cons instead. The
+    // tests of BuildTypeTest read the class and DEFTYPE tables at test time or carry
+    // their epochs, so one built from a cons stays right. A specifier only the
+    // general TYPEP can answer is remembered as such (null) and takes that path.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<Cons, SpecTestBox> s_consSpecTests = new();
+    private sealed class SpecTestBox { internal TypeTest? Test; }
+    [System.ThreadStatic] private static Cons? t_lastSpec;
+    [System.ThreadStatic] private static TypeTest? t_lastSpecTest;
+
+    // Only a specifier whose every part is one the built tests answer exactly as the
+    // general TYPEP does is cached. Anything malformed (a dotted list, a part that is not
+    // a specifier, a bad bound) stays with the general TYPEP, which signals for it.
+    private static bool WellFormedCachedSpec(LispObject spec)
+    {
+        if (spec is Symbol) return true;
+        if (spec is not Cons c || c.Car is not Symbol head || head.HomePackage != Startup.CL) return false;
+        int n = 0;
+        LispObject cur = c.Cdr;
+        for (; cur is Cons pc; cur = pc.Cdr) n++;
+        if (cur is not Nil) return false;
+        switch (head.Name)
+        {
+            case "OR":
+            case "AND":
+                for (var p = c.Cdr; p is Cons pc; p = pc.Cdr)
+                    if (!WellFormedCachedSpec(pc.Car)) return false;
+                return true;
+            case "NOT":
+                return n == 1 && WellFormedCachedSpec(((Cons)c.Cdr).Car);
+            case "MEMBER":
+                return true;
+            case "EQL":
+                return n == 1;
+            case "SATISFIES":
+                return n == 1 && ((Cons)c.Cdr).Car is Symbol;
+            case "INTEGER":
+            case "UNSIGNED-BYTE":
+            case "SIGNED-BYTE":
+            case "SIMPLE-ARRAY":
+            case "SIMPLE-VECTOR":
+            case "SIMPLE-BIT-VECTOR":
+                return BuildTypeTest(c) is not GeneralTypeTest;
+            default:
+                return false;
+        }
+    }
+
+    private static TypeTest? ConsSpecTest(Cons spec)
+    {
+        if (ReferenceEquals(spec, t_lastSpec)) return t_lastSpecTest;
+        var box = s_consSpecTests.GetValue(spec, static c =>
+        {
+            TypeTest? built = null;
+            try { if (WellFormedCachedSpec(c)) built = BuildTypeTest(c); }
+            catch (LispErrorException) { built = null; }
+            return new SpecTestBox { Test = built is GeneralTypeTest ? null : built };
+        });
+        t_lastSpec = spec;
+        t_lastSpecTest = box.Test;
+        return box.Test;
     }
 
     /// <summary>TYPEP by interpreting the specifier. Typep answers a symbol
@@ -433,7 +516,10 @@ public static partial class Runtime
                                 if (tac.Car is Number or LispString or LispChar or LispVector
                                     || (tac.Car is Cons { Car: var th } && (th is not Symbol || th is Symbol { Name: "*" })))
                                     throw InvalidCompoundTypeSpecifier(typeSpec);
-                        s_validatedTypeSpecs.Add(compound, s_validatedMarker);
+                        // GetValue, not Add: two threads that both miss the lookup above would
+                        // both Add, and the second throws "An item with the same key has already
+                        // been added".
+                        s_validatedTypeSpecs.GetValue(compound, static _ => s_validatedMarker);
                         s_lastValidatedSpec = compound;
                     }
                     else s_lastValidatedSpec = compound;
@@ -466,6 +552,10 @@ public static partial class Runtime
                 case "VALUES":
                     throw new LispErrorException(new LispTypeError("TYPEP: VALUES is not a valid type specifier", typeSpec));
                 case "FUNCTION":
+                    // (function *), (function * *), (function (&rest t) *) and the like say
+                    // nothing about the signature: a function is of the type, anything else is
+                    // not. A type that does constrain arguments or values cannot be tested.
+                    if (IsUnconstrainedFunctionType(compound)) return obj is LispFunction ? T.Instance : Nil.Instance;
                     throw new LispErrorException(new LispTypeError("TYPEP: FUNCTION compound type specifier not supported in TYPEP", typeSpec));
                 case "NOT":
                     return IsTruthy(Typep(obj, Car(Cdr(typeSpec)))) ? Nil.Instance : T.Instance;
@@ -505,7 +595,7 @@ public static partial class Runtime
                     var sizeSpec = compound.Cdr is Cons sc ? sc.Car : null;
                     if (sizeSpec == null || (sizeSpec is Symbol ss && ss.Name == "*"))
                         return T.Instance;
-                    int expectedLen = sizeSpec is Fixnum sf ? (int)sf.Value : -1;
+                    int expectedLen = sizeSpec is Fixnum sf ? SizeSpecInt(sf.Value) : -1;
                     int actualLen = obj is LispString ls ? ls.Length : (obj is LispVector lv ? VectorDimension(lv) : -1);
                     return actualLen == expectedLen ? T.Instance : Nil.Instance;
                 }
@@ -565,7 +655,7 @@ public static partial class Runtime
                                             if (obj is LispString sls2) actualDim = sls2.Length;
                                             else if (obj is LispVector slv2) actualDim = di < slv2.Dimensions.Length ? slv2.Dimensions[di] : -1;
                                             else return Nil.Instance;
-                                            if (actualDim != (int)dimFi.Value) return Nil.Instance;
+                                            if (actualDim != SizeSpecInt(dimFi.Value)) return Nil.Instance;
                                         }
                                     }
                                 }
@@ -584,7 +674,7 @@ public static partial class Runtime
                         var sizeSpec = bvSizeCons.Car;
                         if (!(sizeSpec is Symbol bvSS && bvSS.Name == "*"))
                         {
-                            int expectedSize = sizeSpec is Fixnum sf2 ? (int)sf2.Value : -1;
+                            int expectedSize = sizeSpec is Fixnum sf2 ? SizeSpecInt(sf2.Value) : -1;
                             int actualSize = obj is LispVector sv3 ? VectorDimension(sv3) : -1;
                             if (actualSize != expectedSize) return Nil.Instance;
                         }
@@ -618,7 +708,7 @@ public static partial class Runtime
                             var sizeSpec = vecSizeCons.Car;
                             if (!(sizeSpec is Symbol ss2 && ss2.Name == "*"))
                             {
-                                int expectedSize = sizeSpec is Fixnum sf2 ? (int)sf2.Value : -1;
+                                int expectedSize = sizeSpec is Fixnum sf2 ? SizeSpecInt(sf2.Value) : -1;
                                 int actualSize = obj is LispVector sv3 ? VectorDimension(sv3) : (obj is LispString ls3 ? ls3.Length : -1);
                                 if (actualSize != expectedSize) return Nil.Instance;
                             }
@@ -635,7 +725,7 @@ public static partial class Runtime
                     if (!CheckSimpleType(obj, headName)) return Nil.Instance;
                     if (compound.Cdr is Cons nbCons && nbCons.Car is Fixnum nbF)
                     {
-                        int bits = (int)nbF.Value;
+                        int bits = nbF.Value > int.MaxValue ? int.MaxValue : nbF.Value < 1 ? 1 : (int)nbF.Value;
                         if (obj is Fixnum objF)
                         {
                             if (headName == "UNSIGNED-BYTE")
@@ -664,13 +754,15 @@ public static partial class Runtime
                             if (headName == "UNSIGNED-BYTE")
                             {
                                 if (objB.Value < 0) return Nil.Instance;
-                                var maxVal = System.Numerics.BigInteger.Pow(2, bits);
-                                if (objB.Value >= maxVal) return Nil.Instance;
+                                if (bits <= 1_000_000 && objB.Value >= System.Numerics.BigInteger.Pow(2, bits)) return Nil.Instance;
                             }
                             else // SIGNED-BYTE
                             {
-                                var half = System.Numerics.BigInteger.Pow(2, bits - 1);
-                                if (objB.Value < -half || objB.Value >= half) return Nil.Instance;
+                                if (bits <= 1_000_000)
+                                {
+                                    var half = System.Numerics.BigInteger.Pow(2, bits - 1);
+                                    if (objB.Value < -half || objB.Value >= half) return Nil.Instance;
+                                }
                             }
                         }
                     }
@@ -856,7 +948,7 @@ public static partial class Runtime
 
     private static bool CheckSimpleType(LispObject obj, string typeName) => typeName switch
     {
-        "T" => true,
+        "T" or "*" => true,
         "NIL" => false,
         "NULL" => obj is Nil,
         "CONS" => obj is Cons,
@@ -1016,9 +1108,9 @@ public static partial class Runtime
             var aa = ToList(etAC.Cdr).ToArray();
             return ArrayElementTypeMatches(obj, Funcall(etAE2, aa));
         }
-        // String/char-vector -> element type is CHARACTER (not T)
+        // A string holds CHARACTERs: the array is of the type when the element type upgrades to that.
         if (obj is LispString)
-            return elemType is Symbol es && es.Name == "CHARACTER";
+            return MatchesElementType(elemType, "CHARACTER");
         if (obj is LispVector v)
         {
             string et = v.ElementTypeName ?? "T";
@@ -1049,6 +1141,15 @@ public static partial class Runtime
     // Check if a LispVector's ElementTypeName matches a compound element-type specifier like (unsigned-byte 8)
     private static bool MatchesElementType(LispObject elemTypeSpec, string storedET)
     {
+        bool r = MatchesElementTypeCore(elemTypeSpec, storedET);
+        // Upgrading an element type such as (or bit character) asks SUBTYPEP, which
+        // publishes two values; TYPEP returns one.
+        MultipleValues.Reset();
+        return r;
+    }
+
+    private static bool MatchesElementTypeCore(LispObject elemTypeSpec, string storedET)
+    {
         // Expand deftype aliases (e.g., unicode-char -> character) before matching
         if (elemTypeSpec is Symbol etAliasSym && TryGetTypeExpander(etAliasSym, out var etAliasExp))
             return MatchesElementType(Funcall(etAliasExp), storedET);
@@ -1057,6 +1158,17 @@ public static partial class Runtime
         {
             var aliasArgs = ToList(etAliasCons.Cdr).ToArray();
             return MatchesElementType(Funcall(etAliasExp2, aliasArgs), storedET);
+        }
+        // (array X) names the arrays whose element type is what X upgrades to
+        // (CLHS 15.1.2.1): the same answer UPGRADED-ARRAY-ELEMENT-TYPE and MAKE-ARRAY give.
+        // A specifier that cannot be upgraded (an unknown type name) keeps the rules below.
+        if (!(elemTypeSpec is Symbol { Name: "*" }))
+        {
+            string? upgraded = null;
+            try { upgraded = ParseElementTypeName(elemTypeSpec); }
+            catch (LispErrorException) { }
+            if (upgraded != null)
+                return SameElementTypeName(upgraded, CanonicalElementTypeName(storedET));
         }
         // An array with specialized integer storage has exactly one element
         // type, and (array X) names it only when X upgrades to that same type
@@ -1116,7 +1228,7 @@ public static partial class Runtime
                 string partName = etCons.Cdr is Cons pc && pc.Car is Symbol ps ? ps.Name : "*";
                 char want = Runtime.ComplexElementPartClass("COMPLEX-" + partName);
                 char have = storedET == "T" ? 'O'
-                          : storedET == "COMPLEX" || storedET.StartsWith("COMPLEX-") ? Runtime.ComplexElementPartClass(storedET)
+                          : storedET == "COMPLEX" || storedET.StartsWith("COMPLEX-", System.StringComparison.Ordinal) ? Runtime.ComplexElementPartClass(storedET)
                           : '\0';
                 return want == have;
             }
@@ -1682,6 +1794,18 @@ public static partial class Runtime
         public int Rank;        // -1 = any, else specific rank
         public List<int?>? Dims; // null = wildcard rank, else specific dims (null entry = *)
     }
+    /// <summary>The element type name of a compound element specifier such as (UNSIGNED-BYTE 8)
+    /// or (MEMBER 1 2): its upgraded name, so two specifiers meaning the same arrays compare
+    /// equal. One that cannot be read gets a name no other element type has; it was
+    /// treated as the wildcard "*" or as T, which made SUBTYPEP answer T for a vector of
+    /// anything against (VECTOR (UNSIGNED-BYTE 8)).</summary>
+    private static string ElementNameOfCompound(LispObject elemObj)
+    {
+        if (elemObj is Symbol { Name: "*" }) return "*";
+        try { return ParseElementTypeName(elemObj); }
+        catch (LispErrorException) { return "?" + FormatObject(elemObj, true); }
+    }
+
     private static ArrayTypeInfo? ExtractArrayTypeInfo(LispObject spec)
     {
         string typeName;
@@ -1708,14 +1832,14 @@ public static partial class Runtime
                 // * means any; compound types that aren't * map to their upgraded name.
                 var elemObj = r1.Car;
                 // Compound element types like (INTEGER 0 0), (UNSIGNED-BYTE 8) upgrade to T
-                et = TypeSpecName(elemObj) ?? (elemObj is Cons ? "T" : "*");
+                et = TypeSpecName(elemObj) ?? ElementNameOfCompound(elemObj);
                 if (r1.Cdr is Cons r2) dimSpec = r2.Car;
             }
         }
         else if (typeName == "VECTOR")
         {
             // (vector et) or (vector et size) = rank 1
-            if (rest is Cons r1) { et = TypeSpecName(r1.Car) ?? "*"; if (r1.Cdr is Cons r2) dimSpec = r2.Car; }
+            if (rest is Cons r1) { et = TypeSpecName(r1.Car) ?? ElementNameOfCompound(r1.Car); if (r1.Cdr is Cons r2) dimSpec = r2.Car; }
             return new ArrayTypeInfo { ElemType = et, Rank = 1, Dims = dimSpec == null ? null : ParseVectorDims(dimSpec) };
         }
         else if (typeName == "SIMPLE-VECTOR")
@@ -1754,23 +1878,27 @@ public static partial class Runtime
         if (dimSpec is Nil) // NIL = 0-dimensional
             return new ArrayTypeInfo { ElemType = et, Rank = 0, Dims = new List<int?>() };
         if (dimSpec is Fixnum rf)
-            return new ArrayTypeInfo { ElemType = et, Rank = (int)rf.Value, Dims = null };
+            return new ArrayTypeInfo { ElemType = et, Rank = SizeSpecInt(rf.Value), Dims = null };
         if (dimSpec is Cons dimList)
         {
             var dims = new List<int?>();
             LispObject cur = dimSpec;
             while (cur is Cons dc) {
-                dims.Add(dc.Car is Fixnum df ? (int?)df.Value : null);
+                dims.Add(dc.Car is Fixnum df ? (int?)SizeSpecInt(df.Value) : null);
                 cur = dc.Cdr;
             }
             return new ArrayTypeInfo { ElemType = et, Rank = dims.Count, Dims = dims };
         }
         return new ArrayTypeInfo { ElemType = et, Rank = -1, Dims = null };
     }
+    /// <summary>A size, rank or dimension written in a type specifier, as an int that no real size
+    /// equals when it is beyond the int range (a cast would wrap it onto a small real size).</summary>
+    internal static int SizeSpecInt(long v) => v >= 0 && v <= int.MaxValue ? (int)v : (v < 0 ? -2 : int.MaxValue);
+
     private static List<int?> ParseVectorDims(LispObject dimSpec)
     {
         if (dimSpec is Symbol ds && ds.Name == "*") return new List<int?> { null };
-        if (dimSpec is Fixnum df) return new List<int?> { (int)df.Value };
+        if (dimSpec is Fixnum df) return new List<int?> { SizeSpecInt(df.Value) };
         return new List<int?> { null };
     }
     private static bool ArrayDimsSubtype(ArrayTypeInfo a1, ArrayTypeInfo a2)
@@ -1860,6 +1988,16 @@ public static partial class Runtime
         }
     }
 
+    /// <summary>The primary value of SUBTYPEP for a runtime entry that only wants the answer: the
+    /// pair SUBTYPEP published is dropped, so a caller that returns a single value is not left with
+    /// a stale second value.</summary>
+    public static LispObject SubtypepClean(LispObject type1, LispObject type2)
+    {
+        var r = Primary(Subtypep(type1, type2));
+        MultipleValues.Reset();
+        return r;
+    }
+
     public static LispObject SubtypepMv(LispObject type1, LispObject type2)
         => MultipleValues.Boxed(Subtypep(type1, type2));
     public static LispObject SubtypepPrimary(LispObject type1, LispObject type2)
@@ -1890,11 +2028,14 @@ public static partial class Runtime
             for (var a = c.Cdr; a is Cons ac; a = ac.Cdr) CheckCompoundShape(ac.Car, depth + 1);
     }
 
+    internal static LispObject TypeSpecifierType()
+        => List(Startup.Sym("OR"), Startup.Sym("CONS"), Startup.Sym("SYMBOL"), Startup.Sym("CLASS"));
+
     private static void CheckTypeSpecifierObject(LispObject spec)
     {
         if (spec is Number or LispChar or LispString or LispVector or LispHashTable or Package or LispFunction
-            or LispPathname or LispReadtable or LispRandomState or LispStream or LispInstance or LispCondition || (LispStruct.TryAs(spec, out _) && spec is not LispClass))
-            throw new LispErrorException(new LispTypeError("invalid type specifier: " + FormatObject(spec, true), spec));
+            or LispPathname or LispReadtable or LispRandomState or LispStream or LispInstance or LispCondition or LispMethod || (LispStruct.TryAs(spec, out _) && spec is not LispClass))
+            throw new LispErrorException(new LispTypeError("invalid type specifier: " + FormatObject(spec, true), spec, TypeSpecifierType()));
     }
 
     private static LispObject SubtypepImpl(LispObject type1, LispObject type2)
@@ -1903,6 +2044,8 @@ public static partial class Runtime
         if (type2 is not (Symbol or Nil or T or Cons or LispClass)) CheckTypeSpecifierObject(type2);
         CheckCompoundShape(type1, 0);
         CheckCompoundShape(type2, 0);
+        type1 = ReplaceExactSatisfies(type1);
+        type2 = ReplaceExactSatisfies(type2);
         // If both arguments are the same symbol, it's trivially a subtype of itself
         if (type1 is Symbol && ReferenceEquals(type1, type2))
         {
@@ -2544,6 +2687,57 @@ public static partial class Runtime
         return type is Cons c && c.Car is Symbol s && _compoundTypeHeads.Contains(s.Name);
     }
 
+    // (SATISFIES P) for a standard predicate whose CLHS entry says it tests exactly one
+    // type is that type, so SUBTYPEP can answer for it instead of giving up with (NIL NIL).
+    private static readonly Dictionary<string, string> s_exactPredicateTypes = new()
+    {
+        ["INTEGERP"] = "INTEGER", ["RATIONALP"] = "RATIONAL", ["REALP"] = "REAL",
+        ["FLOATP"] = "FLOAT", ["NUMBERP"] = "NUMBER", ["COMPLEXP"] = "COMPLEX",
+        ["SYMBOLP"] = "SYMBOL", ["KEYWORDP"] = "KEYWORD", ["LISTP"] = "LIST",
+        ["CONSP"] = "CONS", ["ATOM"] = "ATOM", ["NULL"] = "NULL",
+        ["STRINGP"] = "STRING", ["SIMPLE-STRING-P"] = "SIMPLE-STRING",
+        ["CHARACTERP"] = "CHARACTER", ["VECTORP"] = "VECTOR", ["ARRAYP"] = "ARRAY",
+        ["SIMPLE-VECTOR-P"] = "SIMPLE-VECTOR", ["BIT-VECTOR-P"] = "BIT-VECTOR",
+        ["SIMPLE-BIT-VECTOR-P"] = "SIMPLE-BIT-VECTOR", ["FUNCTIONP"] = "FUNCTION",
+        ["COMPILED-FUNCTION-P"] = "COMPILED-FUNCTION", ["PACKAGEP"] = "PACKAGE",
+        ["HASH-TABLE-P"] = "HASH-TABLE", ["STREAMP"] = "STREAM", ["PATHNAMEP"] = "PATHNAME",
+        ["RANDOM-STATE-P"] = "RANDOM-STATE", ["READTABLEP"] = "READTABLE",
+    };
+
+    private static LispObject ReplaceExactSatisfies(LispObject type)
+    {
+        if (type is not Cons c || c.Car is not Symbol head || head.HomePackage != Startup.CL) return type;
+        switch (head.Name)
+        {
+            case "SATISFIES":
+                if (c.Cdr is Cons sc && sc.Cdr is Nil && sc.Car is Symbol pred
+                    && pred.HomePackage == Startup.CL
+                    && s_exactPredicateTypes.TryGetValue(pred.Name, out var typeName))
+                    return Startup.Sym(typeName);
+                return type;
+            case "AND":
+            case "OR":
+            case "NOT":
+            {
+                var items = new List<LispObject>();
+                bool changed = false;
+                LispObject cur = c.Cdr;
+                for (; cur is Cons pc; cur = pc.Cdr)
+                {
+                    var r = ReplaceExactSatisfies(pc.Car);
+                    if (!ReferenceEquals(r, pc.Car)) changed = true;
+                    items.Add(r);
+                }
+                if (!changed || cur is not Nil) return type;
+                LispObject tail = Nil.Instance;
+                for (int i = items.Count - 1; i >= 0; i--) tail = new Cons(items[i], tail);
+                return new Cons(head, tail);
+            }
+            default:
+                return type;
+        }
+    }
+
     private static LispObject NormalizeTrivialCompound(LispObject type)
     {
         if (type is not Cons c || c.Car is not Symbol s) return type;
@@ -2553,6 +2747,8 @@ public static partial class Runtime
                 return T.Instance;                    // (AND) = T
             case "OR" when c.Cdr is Nil:
                 return Nil.Instance;                  // (OR) = NIL
+            case "MEMBER" when c.Cdr is Nil:
+                return Nil.Instance;                  // (MEMBER) = NIL
             case "AND" when c.Cdr is Cons ac && ac.Cdr is Nil:
                 return NormalizeTrivialCompound(ac.Car);  // (AND x) = x
             case "OR" when c.Cdr is Cons oc && oc.Cdr is Nil:
@@ -2562,6 +2758,8 @@ public static partial class Runtime
                 var inner = NormalizeTrivialCompound(nc.Car);
                 if (inner is T) return Nil.Instance;          // (NOT T) = NIL (empty type)
                 if (inner is Nil) return T.Instance;          // (NOT NIL) = T (universal type)
+                if (inner is Cons { Car: Symbol { Name: "NOT" } } dn && dn.Cdr is Cons { Cdr: Nil } dnArg)
+                    return NormalizeTrivialCompound(dnArg.Car);   // (NOT (NOT x)) = x
                 if (!ReferenceEquals(inner, nc.Car))
                     return new Cons(s, new Cons(inner, Nil.Instance));
                 return type;

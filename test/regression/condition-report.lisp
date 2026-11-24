@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Conditions signalled from Lisp must report what they hold.
 ;;;
 ;;; (error 'type-error :datum 7 :expected-type 'list) -- the shape CIL-STDLIB

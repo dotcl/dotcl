@@ -17,6 +17,9 @@ yourself:
 
 Numbers have rules of their own, which .NET numeric types arrive as which Lisp
 types, when an integer argument is rejected, and how `System.Decimal` works.
+A ratio crosses to a `double` or an `object` parameter as a double, a bignum
+crosses to `object` as an `Int64`, `UInt64` or `BigInteger` by its range, and
+to `decimal` a ratio or bignum must be exact.
 See [Numbers across the .NET boundary](numbers.md).
 
 ## Objects, methods, properties
@@ -128,11 +131,22 @@ plain arrays:
 
 Multi-dimensional indexers take several keys: `(dotnet:ref grid row col)`.
 
+`dotnet:make-array` takes one size per axis or a list of sizes, and
+`:initial-element` / `:initial-contents` fill it as `make-array` does (a flat
+sequence for rank 1, nested sequences for higher ranks).
+
+`length`, `elt`, `coerce`, `aref`, `row-major-aref` (and its `setf`),
+`array-rank`, `array-dimensions`, `array-dimension`, `array-total-size`,
+`array-in-bounds-p` and `array-row-major-index` accept a .NET array; a jagged
+array counts as rank 1. A wrong number of subscripts or an out-of-range
+subscript signals an ordinary Lisp error naming the rank or the bound.
+
 ## Disposables
 
 `dotnet:using` is C#'s `using`: each variable is bound in turn and `Dispose` is
 called on the way out, including when the body signals. Nested bindings are
-disposed innermost first.
+disposed innermost first. A NIL resource is skipped, and an error from the body
+wins over one from `Dispose`.
 
 ```lisp
 (require "dotnet-class")                  ; once per process
@@ -163,6 +177,16 @@ instead of being spelled as one assembly-qualified string:
 A resolved type is accepted anywhere a type name is; `dotnet:new`,
 `dotnet:make-delegate`, `dotnet:static-generic`, and as a method specializer.
 
+The CLR boxes a `Nullable<T>` as its underlying `T`, so a value arrives as that
+`T` and an empty `Nullable<T>` is `NIL`. Construct the empty value with no
+argument, then test it with `null`; `HasValue` and `Value` are not on the boxed
+value:
+
+```lisp
+(dotnet:new (dotnet:make-generic-type "System.Nullable" (list "System.Int32")))   ; => NIL
+(dotnet:new (dotnet:make-generic-type "System.Nullable" (list "System.Int32")) 5) ; => Int32 5
+```
+
 ## Collections and LINQ
 
 ```lisp
@@ -181,21 +205,57 @@ one argument for the plain form, two for the indexed one:
 ```lisp
 (dotnet:-> l ("Where" (lambda (x) (oddp x)))
              ("Select" (lambda (x) (* x 10)))
-             "ToList")                                          ; => List<object>
+             "ToList")                                          ; => List<int>
 ```
 
-`Select<TSource,TResult>` cannot infer `TResult` from a Lisp closure, so it comes
-back as `object`. Use `dotnet:static-generic` when a specific instantiation
-matters.
+The collection arguments pin the element type parameters (`TFirst`, `TSecond` in
+`Zip`), and a lambda whose result type is still open is called once with default
+arguments to read the type of its first value. `Select`, `Zip`, `Join`,
+`GroupJoin` and the `SelectMany` forms therefore take bare lambdas:
+
+```lisp
+(dotnet:-> l ("Zip" l (lambda (a b) (+ a b))) "ToList")
+(dotnet:-> l ("SelectMany" (lambda (x) (list x x))) "ToList")
+(dotnet:-> l ("SelectMany" (lambda (x i) (list x i))) "ToList")
+```
+
+A collection selector may return a .NET enumerable, a Lisp list or a Lisp
+vector; each is converted to the `IEnumerable<T>` the delegate asks for. If the
+result type is still not evident (the first returned value is NIL, say), it
+stays `object`, as `Select` has always used. `Cast` and `OfType` take their one
+type argument after the receiver, as a name or a `System.Type`:
+
+```lisp
+(dotnet:-> l ("Cast" "System.Object") "Count")
+(dotnet:-> l ("OfType" (dotnet:resolve-type "System.Int32")) "Count")
+```
+
+A generic method called with `dotnet:static` or `dotnet:invoke` also infers its
+type arguments when the values pin them: a typed delegate contributes its own
+delegate type, a Lisp string contributes `System.String`, and a fixnum that fits
+`System.Int32` contributes `Int32` where the parameter is the bare type
+parameter. The call is made only when one instantiation leaves exactly one
+overload, so `Task.Run` with `Func<int>`, `List<T>.ConvertAll` with a
+`Converter<int,string>`, `Tuple.Create` with an integer and a string, and
+`Task.FromResult` with an integer need no explicit form. NIL, an integer wider
+than `Int32`, or any other value that fits more than one instantiation or
+overload still needs `dotnet:static-generic` or `dotnet:invoke-generic`.
 
 ## Enums, out parameters, exceptions
 
 ```lisp
 (dotnet:enum-or "System.IO.FileAccess" "Read" "Write")          ; => ReadWrite
 
+(logior (dotnet:static "System.IO.FileAccess" "Read")
+        (dotnet:static "System.IO.FileAccess" "Write"))        ; => ReadWrite
+
 (multiple-value-list (dotnet:call-out "System.Int32" "TryParse" "42"))
 ;; => (T 42): return value first, then each out/ref parameter
 ```
+
+`LOGIOR`, `LOGAND`, `LOGXOR`, `LOGTEST`, `LOGANDC1` and `LOGANDC2` accept values
+of one `[Flags]` enum type, and integers, and return that enum type. A
+non-`[Flags]` enum or a mix of two enum types is a `TYPE-ERROR`.
 
 A COM object reached through IDispatch carries no signature, so there every
 argument is passed, out positions included, and each one's value after the call
@@ -304,6 +364,70 @@ instead:
 Non-local exits are not affected by containment; `return-from` and `throw` out
 of a callback unwind to their target as usual.
 
+### What crosses a .NET frame
+
+There are three kinds of boundary, and they differ in what an error does.
+
+- **A library function with a compiled-in body** (a `dotnet:library` function or
+  method named by a symbol), called from C# or from Lisp. Lisp's condition
+  system is not in the way: called from Lisp, an enclosing `handler-case`,
+  `handler-bind` (with the special bindings around the call) and `restart-case`
+  all see the error, and `throw` to an enclosing `catch` works. Called from C#
+  with no Lisp frame outside, the error leaves as a `DotCL.LispErrorException`
+  (see below).
+- **A method of a `dotnet:define-class` class whose body is a Lisp lambda** and
+  **a delegate or event handler built from a Lisp function**. The boundary
+  establishes its own `ERROR` handler, so an enclosing `handler-bind` does not
+  see the error first; by default it is reported and the caller gets the return
+  type's default. With `dotcl:*foreign-callback-propagate*` true the error is
+  signalled again after the callback's frames have unwound, so an enclosing
+  `handler-case` or `handler-bind` sees it, with its condition type intact and
+  with the special bindings outside the callback, but without the restarts the
+  callback established. A `warning` is not an `ERROR` and reaches enclosing
+  handlers either way.
+- **Non-local exits** (`throw`, `return-from`, `go`) cross both kinds of boundary
+  as ordinary .NET exceptions, running `unwind-protect` cleanups on the way. Two
+  consequences: a C# frame between the callback and its target that has a
+  catch-all (`catch (Exception)`) swallows the exit, and the target is then not
+  reached; and a callback that runs on another thread cannot throw to a `catch`
+  of the thread that started it, because catch tags belong to a thread, so that
+  `throw` is a `CONTROL-ERROR` in the callback (contained as above). A `throw`
+  to a tag nobody catches is a `CONTROL-ERROR` at the `throw`, never a stray
+  exception in the C# caller.
+
+### Errors leaving a library
+
+A library function with a compiled-in body that is called from C# throws a
+subclass of `DotCL.LispErrorException`, chosen by the type of the condition. All
+of them keep the condition in `Condition`, and an existing
+`catch (LispErrorException)` still catches them:
+
+| condition type | exception |
+|---|---|
+| `division-by-zero` | `LispDivisionByZeroException` (a `LispArithmeticErrorException`) |
+| `arithmetic-error` | `LispArithmeticErrorException` |
+| `unbound-variable` | `LispUnboundVariableException` (a `LispCellErrorException`) |
+| `undefined-function` | `LispUndefinedFunctionException` (a `LispCellErrorException`) |
+| `cell-error` | `LispCellErrorException` |
+| `type-error` | `LispTypeErrorException` |
+| `end-of-file` | `LispEndOfFileException` (a `LispStreamErrorException`) |
+| `stream-error` | `LispStreamErrorException` |
+| `file-error` | `LispFileErrorException` |
+| `control-error` | `LispControlErrorException` |
+| `program-error` | `LispProgramErrorException` |
+| anything else | `LispErrorException` |
+
+A library can also name an exception type of its own. A `:class` that derives from
+`System.Exception` and says `(:maps-condition type-error)` is thrown, built with the
+condition's report as its message, for a condition of that type, in place of the
+runtime's class; the condition is in `Exception.Data["dotcl.condition"]`. Such a
+class needs nothing from this runtime, so it cannot derive from `LispErrorException`
+(.NET has single inheritance), which is why it carries the condition in `Data`. For
+the same reason there is no mapping to `InvalidCastException` or another framework
+exception: that type could not also be a `LispErrorException`. A library that wants
+a framework type defines its own class deriving from it and maps the condition to
+it.
+
 ## Tasks
 
 ```lisp
@@ -353,6 +477,24 @@ definition. So `List<int>` picks `:any-list` above, `String[]` picks
 
 `(typep obj 'class-name)` and `subtypep` agree with that ordering, and
 `dotnet:class-for-type` returns the class object for a type.
+
+## Coming from C#: what to write instead
+
+The forms below are the first thing a C# programmer writes that does not do what
+it looks like, with what to write. Each one was run.
+
+| In C# | Written naively | What to write |
+|---|---|---|
+| `await client.GetStringAsync(url)` | `(dotnet:invoke client "GetStringAsync" url)` returns the `Task`, not the string; the first use of it fails ("not a sequence", "not a number"). | `(dotnet:await (dotnet:invoke client "GetStringAsync" url))` |
+| `Task.Run(() => 42).Result` | `(dotnet:static "System.Threading.Tasks.Task" "Run" (lambda () 42))` binds the lambda to `Run(Action)`, so the result is a plain `Task` with no `Result` ("Method ... Result not found"). | `(dotnet:await (dotnet:static-generic "System.Threading.Tasks.Task" "Run" '("System.Int32") (lambda () 42)))` |
+| `new byte[64]` | `(dotnet:new-array "System.Byte" 64)` is an array of one element, the number 64 (`new-array` takes the elements). A later `Stream.Read(buf, 0, 64)` fails with "Offset and length were out of bounds". | `(dotnet:make-array "System.Byte" 64)`, or a Lisp vector `(make-array 64 :element-type '(unsigned-byte 8))`, which passes as `byte[]` |
+| `dict.TryGetValue(k, out v)` | `(dotnet:invoke dict "TryGetValue" k)` ("Method ... not found": the out parameter is missing). | `(multiple-value-list (dotnet:call-out dict "TryGetValue" k))` gives `(T v)`; `call-out` also takes an object, not only a type name |
+| `list[0]`, `dict["a"]` | `dotnet:ref` is not defined until the module that provides it is loaded (`Symbol "REF" is not external`). | `(require "dotnet-class")` once, then `(dotnet:ref list 0)` |
+| `foreach (var m in matches)` | `dolist` does not accept a .NET collection or array ("not of type LIST"), and neither do `find`, `position`, `remove-if`, `subseq`, `reduce` and the other sequence functions ("not a sequence"). `length`, `elt`, `coerce` to `list` / `vector`, `map`, `some` and `loop ... across` read a .NET array or collection as a sequence, and `aref` indexes an array. | `(dolist (m (coerce matches 'list)) ...)`; the same coercion lets the other sequence functions take the elements. Or index it with `aref` / `(dotnet:ref coll i)`, or walk `GetEnumerator` with `MoveNext` / `Current` |
+| `JsonSerializer.Serialize(new[] {1, 2, 3})` | A Lisp list is not a .NET collection: `JsonConvert.SerializeObject` of one writes its cons cells (`{"Car":1,"Cdr":...}`), and `JsonSerializer.Serialize` finds no overload. | build a .NET array or list, and name the type for a generic method: `(dotnet:static-generic "System.Text.Json.JsonSerializer" "Serialize" '("System.Int32[]") (dotnet:new-array "System.Int32" 1 2 3))` |
+| `a == b` on two enum values | `(eql (dotnet:static "System.DayOfWeek" "Monday") (dotnet:static "System.DayOfWeek" "Monday"))` is NIL: each call boxes a new object. | `(dotnet:invoke a "Equals" b)` |
+| `Span<T>` returned by a method (`AsSpan`) | "Method ... not found": a `Span<T>` cannot be held in a Lisp variable. | pass the array to the method that wants the span instead (see "Spans and memory") |
+| `app.MapGet("/", () => "hi")` (ASP.NET Core minimal API) | With only `Microsoft.AspNetCore` loaded, `MapGet` (an extension method in `Microsoft.AspNetCore.Routing`) is "no method of that name". Route and query parameters are bound by the delegate's parameter names, and `Func<string, string>` names its parameter `arg`, not the `{n}` of the route. | `(dotnet:load-assembly "Microsoft.AspNetCore.Routing")`, then `(dotnet:invoke app "MapGet" "/" (dotnet:make-delegate "System.Func`1[System.String]" (lambda () "hi")))`; a `RequestDelegate` or `Func<HttpContext, IResult>` works too. Then `(dotnet:invoke (dotnet:invoke app "Urls") "Add" "http://127.0.0.1:5000")` and `(dotnet:invoke app "Start")` |
 
 ## What can I call?
 

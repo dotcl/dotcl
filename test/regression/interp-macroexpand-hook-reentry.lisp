@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A non-default *MACROEXPAND-HOOK* must not re-enter itself.
 ;;;
 ;;; An INTERPRETED hook used to recurse forever. The tree-walk evaluator

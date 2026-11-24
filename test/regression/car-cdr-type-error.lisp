@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; CAR / CDR type errors: the offending value, and nothing about the runtime.
 ;;;
 ;;; CAR's report used to carry eight .NET frames after the message --

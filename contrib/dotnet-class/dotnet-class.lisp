@@ -234,6 +234,7 @@
           (method-attrs nil)
           (cs-name nil)
           (static force-static)
+          (doc nil)
           (body (cddr tail))
           ;; SELF interned in the CALLER's package (see %process-ctor-form).
           (self-sym (intern "SELF" *package*)))
@@ -244,10 +245,17 @@
                  (:attributes (setf method-attrs (second body)))
                  (:static (setf static (second body)))
                  (:name (setf cs-name (second body)))
+                 (:doc (setf doc (second body)))
                  (otherwise
                   (error "dotnet: unknown method option ~S in ~S"
                          (first body) name)))
                (setf body (cddr body)))
+      ;; A leading string followed by more forms is a docstring, as in a
+      ;; lambda body: it documents the member and is not part of the code (a
+      ;; baked defun with a docstring would need (setf documentation)).
+      (when (and (stringp (first body)) (rest body))
+        (unless doc (setf doc (first body)))
+        (setf body (rest body)))
       (let* ((param-names (mapcar #'first params))
              (param-types (mapcar (lambda (p) (dotnet::%resolve-type (second p)))
                                   params))
@@ -283,7 +291,8 @@
                     'nil)
                ,static
                (list ,@(mapcar (function dotnet::%param-name-string)
-                               param-names)))))))
+                               param-names))
+               ,doc)))))
 
 (defun dotnet::%baked-class-p (options)
   "True when a class in a dotnet:library has its bodies compiled into the
@@ -293,12 +302,32 @@
            (some (lambda (m) (and (consp m) (symbolp (first m))))
                  (cdr (assoc :methods options))))))
 
+(defparameter dotnet::*class-option-names*
+  '(:fields :attributes :methods :functions :ctor :properties :implements :events :bake :doc :maps-condition)
+  "The clauses a class description may have.")
+
+(defun dotnet::%check-class-options (full-name options)
+  "A clause that is not one of *CLASS-OPTION-NAMES* is an error, with the usual
+   singular spelling named, instead of being dropped and leaving a class without
+   the member the author wrote."
+  (dolist (opt options)
+    (let ((key (and (consp opt) (car opt))))
+      (unless (member key dotnet::*class-option-names*)
+        (let ((hint (cdr (assoc key '((:field . :fields) (:method . :methods) (:property . :properties)
+                                      (:event . :events) (:attribute . :attributes)
+                                      (:constructor . :ctor) (:constructors . :ctor)
+                                      (:interface . :implements) (:interfaces . :implements)
+                                      (:implement . :implements))))))
+          (error "dotnet:define-class ~A: unknown clause ~S~@[ (did you mean ~S?)~]. The clauses are ~{~S~^ ~}."
+                 full-name opt hint dotnet::*class-option-names*))))))
+
 (defun dotnet::%class-spec-args (full-name supers options)
   "Return a LIST of 12 forms = the positional dotnet:%define-class args 0-11
    (full-name .. ctor-specs) for a class/module described by SUPERS + OPTIONS.
    Shared by dotnet:define-class (single type) and dotnet:library (one entry
    per type). OPTIONS accepts the define-class option forms plus :functions
    (methods emitted as `public static', i.e. defun exports)."
+  (dotnet::%check-class-options full-name options)
   (let* ((dotnet::*class-full-name* full-name)
          (bake (dotnet::%baked-class-p options))
          (base-type (when supers (dotnet::%resolve-type (first supers))))
@@ -338,6 +367,7 @@
                          (loop while tail
                                do (case (first tail)
                                     (:notify (setf notify (second tail)))
+                                    (:doc nil)
                                     (otherwise
                                      (error "dotnet: unknown property option ~S in ~S"
                                             (first tail) pname)))
@@ -365,6 +395,20 @@
                               (dotnet::%process-ctor-form c (and bake (incf i))))
                             ctor-forms)))
          'nil))))
+
+(defun dotnet::%member-docs-spec-form (full-name options)
+  "A (:memberdocs nil full-name (kind name doc)...) member-spec for the
+   documented fields (kind \"F\") and properties (kind \"P\") of a type, or NIL
+   when there are none. Methods carry their doc in their own spec."
+  (let ((docs (append
+               (loop for f in (cdr (assoc :fields options))
+                     for doc = (getf (cddr f) :doc)
+                     when doc collect (list "F" (first f) doc))
+               (loop for p in (cdr (assoc :properties options))
+                     for doc = (getf (cddr p) :doc)
+                     when doc collect (list "P" (first p) doc)))))
+    (when docs
+      `(list :memberdocs nil ,full-name ,@(mapcar (lambda (d) `(quote ,d)) docs)))))
 
 (defmacro dotnet:define-class (full-name supers &body options)
   `(dotnet:%define-class ,@(dotnet::%class-spec-args full-name supers options)))
@@ -422,6 +466,20 @@
 ;;; :class/:module, or a leading :doc "..." for the other kinds. It is written to
 ;;; a sidecar <assembly-name>.xml next to the .dll so a C# consumer's IntelliSense
 ;;; shows the summary.
+;;;
+;;; Members of a :class/:module carry summaries too, written under the IDs a C#
+;;; compiler computes (M: with the parameter types, F:, P:). A method or
+;;; function takes a :doc "..." option after :returns, or a leading string before
+;;; further body forms, as a lambda body does (the string is not part of the
+;;; code). A field (name type :doc "...") and a property (name type :doc "...")
+;;; take the option the same way.
+;;;
+;;; A :class that derives from System.Exception can say (:maps-condition NAME):
+;;; a Lisp condition of type NAME that leaves a library function reaches C# as an
+;;; exception of this class, built with the condition's report as the message, and
+;;; the condition is in Exception.Data["dotcl.condition"]. Such a class wins over
+;;; the runtime's own subclasses of LispErrorException (LispTypeErrorException,
+;;; LispDivisionByZeroException, ...). Needs a library with compiled-in bodies.
 ;;;
 ;;; The :class/:module types are facades (bodies dispatch to their Lisp
 ;;; lambdas), so running THEIR methods needs DotCL.Runtime + the Lisp loaded.
@@ -525,6 +583,21 @@
           `(list :delegate ,doc ,full-name ,(dotnet::%resolve-type return-type)
                  (list ,@param-types)))))))
 
+(defun dotnet::%condition-map-of (m)
+  "The (:conditionmap nil class-name \"CONDITION\") spec for a :class member-form
+   with a (:maps-condition NAME) option, or NIL."
+  (when (eq (first m) :class)
+    (let ((opt (assoc :maps-condition (cdddr m))))
+      (when opt
+        `(list :conditionmap nil ,(second m) ,(symbol-name (second opt)))))))
+
+(defun dotnet::%member-docs-of (m)
+  "The (:memberdocs ...) spec for a :class or :module member-form, or NIL."
+  (when (member (first m) '(:class :module))
+    (if (eq (first m) :class)
+        (dotnet::%member-docs-spec-form (second m) (cdddr m))
+        (dotnet::%member-docs-spec-form (second m) (cddr m)))))
+
 (defun dotnet::%member-spec-form (m)
   "Expand one dotnet:library member-form into a tagged (KIND DOC . rest) spec form."
   (ecase (first m)
@@ -611,7 +684,12 @@
                                 package package-id package-version authors description)
       spec
     (let* ((dotnet::*library-defuns* '())
-           (specs (remove nil (mapcar #'dotnet::%member-spec-form members)))
+           (specs (remove nil
+                         (mapcan (lambda (m)
+                                   (list (dotnet::%member-spec-form m)
+                                         (dotnet::%member-docs-of m)
+                                         (dotnet::%condition-map-of m)))
+                                 members)))
            (out (gensym "PATH"))
            (save `(dotnet:%save-library
                    ,out ,asm-name ,version
@@ -678,6 +756,7 @@
 ;;; Binds each VAR to INIT-EXPR in sequence and guarantees (dotnet:invoke var
 ;;; "Dispose") is called on exit: even if BODY signals an error.  Resources
 ;;; are disposed in innermost-first order, matching C# `using` semantics.
+;;; A NIL resource is skipped, and an error from BODY wins over one from Dispose.
 
 (export 'dotnet::using (find-package :dotnet))
 
@@ -686,11 +765,25 @@
       `(progn ,@body)
       (let* ((binding (car bindings))
              (var (car binding))
-             (expr (cadr binding)))
+             (expr (cadr binding))
+             (body-error (gensym "BODY-ERROR"))
+             (body-values (gensym "BODY-VALUES")))
         `(let ((,var ,expr))
-           (unwind-protect
-             (dotnet::using ,(cdr bindings) ,@body)
-             (dotnet:invoke ,var "Dispose"))))))
+           (if (null ,var)
+               (dotnet::using ,(cdr bindings) ,@body)
+               (let ((,body-error nil) (,body-values nil))
+                 (unwind-protect
+                   (handler-case
+                       (setf ,body-values
+                             (multiple-value-list
+                              (dotnet::using ,(cdr bindings) ,@body)))
+                     (error (c) (setf ,body-error c)))
+                   (if ,body-error
+                       (progn
+                         (ignore-errors (dotnet:invoke ,var "Dispose"))
+                         (error ,body-error))
+                       (dotnet:invoke ,var "Dispose")))
+                 (values-list ,body-values)))))))
 
 (provide :dotnet-class)
 

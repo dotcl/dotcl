@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Float literals in native float arithmetic are IL immediates.
 ;;;
 ;;; A DOUBLE-FLOAT (or SINGLE-FLOAT) local declared as such gets a native r8

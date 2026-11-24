@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; project-core CONCATENATED build (dotcl build <asd> --output) evaluates
 ;;; toplevel module/package setup forms at compile time, so a macro provided by a
 ;;; bare (load ...) / (require ...) in an earlier part of the concatenated unit is

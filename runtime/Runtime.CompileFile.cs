@@ -336,7 +336,8 @@ public static partial class Runtime
             if (compilerFn != null) return compilerFn.Invoke(new LispObject[] { args[0] });
             var test = rest.Car;
             var body = rest.Cdr;
-            var progn = new Cons(PROGN, body);
+            // An empty body is NIL itself: a code walker that rebuilds (IF test (PROGN)) drops the empty PROGN.
+            LispObject progn = body is Nil ? Nil.Instance : new Cons(PROGN, body);
             return new Cons(IF, new Cons(test, new Cons(progn, Nil.Instance)));
         }, "WHEN-MACRO-EXPANDER", 2));
 
@@ -350,7 +351,7 @@ public static partial class Runtime
             var test = rest.Car;
             var body = rest.Cdr;
             var notTest = new Cons(NOT, new Cons(test, Nil.Instance));
-            var progn = new Cons(PROGN, body);
+            LispObject progn = body is Nil ? Nil.Instance : new Cons(PROGN, body);
             return new Cons(IF, new Cons(notTest, new Cons(progn, Nil.Instance)));
         }, "UNLESS-MACRO-EXPANDER", 2));
 
@@ -829,6 +830,33 @@ public static partial class Runtime
     /// the code being walked, intact.
     [ThreadStatic] private static bool _inMacroexpandHook;
 
+    /// The evaluator and COMPILE-FILE's top-level flattening expand macros without
+    /// going through *MACROEXPAND-HOOK* (the hook's own body is evaluated by the
+    /// same evaluator, so calling it there would re-enter it without end). A program
+    /// that collects definitions through the hook (docparser) still has to see the
+    /// form, so tell it, with a function that returns the form unchanged and a
+    /// result that is dropped. The flag keeps the hook's own body from announcing
+    /// itself again, and is restored when the hook leaves by an error or a throw.
+    internal static void AnnounceToMacroexpandHook(LispObject form)
+    {
+        if (_inMacroexpandHook) return;
+        var value = DynamicBindings.Get(Startup.Sym("*MACROEXPAND-HOOK*"));
+        LispFunction? hook = value switch
+        {
+            Symbol s when s.Name == "FUNCALL" => null,
+            Symbol s => s.Function as LispFunction,
+            LispFunction f => f,
+            _ => null,
+        };
+        if (hook == null) return;
+        _inMacroexpandHook = true;
+        try
+        {
+            hook.Invoke(new LispObject[] { new LispFunction(a => a[0], "%ANNOUNCE-ONLY", 2), form, Nil.Instance });
+        }
+        finally { _inMacroexpandHook = false; }
+    }
+
     /// <summary>
     /// When true, COMPILE-FILE emits a Portable PDB even without the
     /// DOTCL_EMIT_PDB env var: set by CompileProject on a Debug build so a
@@ -1053,6 +1081,10 @@ public static partial class Runtime
         DynamicBindings.Push(compileFileModeSym, T.Instance);
         var sameFileSym = Startup.Sym("*SAME-FILE-FUNCTIONS*");
         DynamicBindings.Push(sameFileSym, new LispHashTable("EQ"));
+        DynamicBindings.Push(Startup.Sym("*SAME-FILE-CALLED*"), new LispHashTable("EQ"));
+        var defunSourcesTable = new LispHashTable("EQ");
+        DynamicBindings.Push(Startup.Sym("*SAME-FILE-DEFUN-BODIES*"), defunSourcesTable);
+        var currentFormKey = Startup.Keyword("CURRENT-FORM");
         DynamicBindings.Push(Startup.Sym("*SAME-FILE-INLINE-DEFS*"), new LispHashTable("EQ"));
         // Compared around each form below: only this file's failures may count.
         var cfFailuresSym = Startup.Sym("*MACROEXPANSION-FAILURES*");
@@ -1390,6 +1422,8 @@ public static partial class Runtime
                     formLine = reader.LastFormLine;
                     xrefSource = form;
                     SetCompilerTopLevel(form, formLine);
+                    // The form as read, for the duplicate-definition check (see %NOTE-SAME-FILE-DEFUN).
+                    defunSourcesTable.Set(currentFormKey, form);
                     RecordDefinitionSources(form, inputPath, formLine, useSourceLines: true);
                     AddFaslDefinitionSources(faslAsm, form, inputPath, formLine);
                     try

@@ -22,11 +22,36 @@ public partial class CilAssembler
     /// copied structurally without interpretation.
     /// </summary>
     private static LispObject InternLambdaList(LispObject ll, Package? pkg)
+        => InternLambdaList(ll, pkg, null);
+
+    // MEMO keeps a default form that is circular (a quoted #1=(a . #1#)) from
+    // recursing for ever, and keeps shared parts shared in the copy.
+    private static LispObject InternLambdaList(LispObject ll, Package? pkg,
+        Dictionary<LispObject, LispObject>? memo)
     {
         switch (ll)
         {
             case Cons c:
-                return new Cons(InternLambdaList(c.Car, pkg), InternLambdaList(c.Cdr, pkg));
+            {
+                memo ??= new Dictionary<LispObject, LispObject>(ReferenceEqualityComparer.Instance);
+                if (memo.TryGetValue(c, out var done)) return done;
+                var head = new Cons(Nil.Instance, Nil.Instance);
+                memo[c] = head;
+                head.Car = InternLambdaList(c.Car, pkg, memo);
+                var tail = head;
+                var rest = c.Cdr;
+                while (rest is Cons rc && !memo.ContainsKey(rc))
+                {
+                    var cell = new Cons(Nil.Instance, Nil.Instance);
+                    memo[rc] = cell;
+                    cell.Car = InternLambdaList(rc.Car, pkg, memo);
+                    tail.Cdr = cell;
+                    tail = cell;
+                    rest = rc.Cdr;
+                }
+                tail.Cdr = rest is Cons seen ? memo[seen] : InternLambdaList(rest, pkg, memo);
+                return head;
+            }
             // FindSymbol, never Intern: this runs for every compiled DEFUN, and
             // creating a symbol here would be a visible side effect of recording
             // display data -- (defstruct (s (:conc-name nil)) otherpkg::a) then
@@ -74,8 +99,8 @@ public partial class CilAssembler
             int nShared = (int)((Fixnum)Cadr(spec)).Value;
             var sharedTypes = new Type[nShared];
             for (int i = 0; i < nShared; i++) sharedTypes[i] = typeof(LispObject);
-            keyShared = new DynamicMethod(name + "_keybody", typeof(LispObject),
-                sharedTypes, typeof(CilAssembler).Module, true);
+            keyShared = NewDm(name + "_keybody", typeof(LispObject),
+                sharedTypes);
             new CilAssembler { _il = keyShared.GetILGenerator().ForLibrary() }.Assemble(Caddr(spec));
         }
         return keyShared;
@@ -114,8 +139,8 @@ public partial class CilAssembler
             int off = withSelf ? 1 : 0;
             if (withSelf) directParamTypes[0] = typeof(LispFunction);
             for (int i = 0; i < arity; i++) directParamTypes[off + i] = typeof(LispObject);
-            var ddm = new DynamicMethod(name + "_opt" + arity, typeof(LispObject),
-                directParamTypes, typeof(CilAssembler).Module, true);
+            var ddm = NewDm(name + "_opt" + arity, typeof(LispObject),
+                directParamTypes);
             var ddAsm = new CilAssembler { _il = ddm.GetILGenerator().ForLibrary(), _keyShared = keyShared };
             if (selfFramed)
             {
@@ -201,8 +226,8 @@ public partial class CilAssembler
         }
 
         // Compile the body as DynamicMethod(LispObject[] args) -> LispObject
-        var dm = new DynamicMethod(name, typeof(LispObject),
-            new[] { typeof(LispObject[]) }, typeof(CilAssembler).Module, true);
+        var dm = NewDm(name, typeof(LispObject),
+            new[] { typeof(LispObject[]) });
         var keyShared = BuildKeySharedDm(name, directDelegates, out var sharedInstrs);
 
         var innerAsm = new CilAssembler();
@@ -258,6 +283,7 @@ public partial class CilAssembler
                         && homePkg2.Name == "COMMON-LISP";
                     if (!isForeignCL2)
                     {
+                        Runtime.ForgetMacroOnFunctionDefinition(s);
                         s.Function = fn;
                         pkgSym = s;
                     }
@@ -265,7 +291,7 @@ public partial class CilAssembler
             }
             catch { /* ignore errors during bootstrap */ }
         }
-        else if (name.StartsWith("(SETF ") && name.EndsWith(")"))
+        else if (name.StartsWith("(SETF ", System.StringComparison.Ordinal) && name.EndsWith(")", System.StringComparison.Ordinal))
         {
             // (SETF NAME): register fn on the target NAME symbol's SetfFunction slot (Phase 1)
             var targetName = name.Substring(6, name.Length - 7);
@@ -466,9 +492,9 @@ public partial class CilAssembler
         }
         else
         {
-            var dm = new DynamicMethod(llShape.Length > 0 ? "lambda_" + llShape : "lambda",
+            var dm = NewDm(llShape.Length > 0 ? "lambda_" + llShape : "lambda",
                 typeof(LispObject),
-                new[] { typeof(LispObject[]) }, typeof(CilAssembler).Module, true);
+                new[] { typeof(LispObject[]) });
             var keyShared = BuildKeySharedDm(dm.Name, directDelegates, out _);
             var innerAsm = new CilAssembler();
             innerAsm._il = dm.GetILGenerator().ForLibrary();
@@ -605,8 +631,8 @@ public partial class CilAssembler
         var directParamTypes2 = new Type[paramCount];
         for (int i = 0; i < paramCount; i++) directParamTypes2[i] = typeof(LispObject);
 
-        var directDm = new DynamicMethod("lambda_direct", typeof(LispObject),
-            directParamTypes2, typeof(CilAssembler).Module, true);
+        var directDm = NewDm("lambda_direct", typeof(LispObject),
+            directParamTypes2);
         var innerAsm2 = new CilAssembler();
         innerAsm2._il = directDm.GetILGenerator().ForLibrary();
         int before = _currentUnitDms?.Count ?? 0;
@@ -834,8 +860,8 @@ public partial class CilAssembler
             for (int i = 0; i < paramCount; i++) directParamTypes[i] = typeof(LispObject);
         }
 
-        var directDm = new DynamicMethod(name + "_direct", typeof(LispObject),
-            directParamTypes, typeof(CilAssembler).Module, true);
+        var directDm = NewDm(name + "_direct", typeof(LispObject),
+            directParamTypes);
         var innerAsm = new CilAssembler();
         innerAsm._il = directDm.GetILGenerator().ForLibrary();
         bool leaf = selfFramed && !selfArg0 && paramCount <= 4 && IsDirectLeaf(bodyInstrs, false);
@@ -989,6 +1015,7 @@ public partial class CilAssembler
                     isForeignCL = homePkg != null && homePkg != pkg
                         && homePkg.Name == "COMMON-LISP";
                     // Always update sym.Function for runtime override dispatch
+                    Runtime.ForgetMacroOnFunctionDefinition(s);
                     s.Function = fn;
                     if (!isForeignCL)
                     {
@@ -999,7 +1026,7 @@ public partial class CilAssembler
             }
             catch { /* ignore errors during bootstrap */ }
         }
-        else if (name.StartsWith("(SETF ") && name.EndsWith(")"))
+        else if (name.StartsWith("(SETF ", System.StringComparison.Ordinal) && name.EndsWith(")", System.StringComparison.Ordinal))
         {
             // (SETF NAME): register fn on the target NAME symbol's SetfFunction slot
             // HandleDefun had this, but HandleDefunDirect was missing it: causing
@@ -1190,8 +1217,7 @@ public partial class CilAssembler
         var nativeParamTypes = new Type[paramCount + 1];
         nativeParamTypes[0] = typeof(LispFunction);
         for (int i = 0; i < paramCount; i++) nativeParamTypes[i + 1] = typeof(long);
-        var nativeDm = new DynamicMethod(name + "_native", typeof(LispObject), nativeParamTypes,
-            typeof(CilAssembler).Module, true);
+        var nativeDm = NewDm(name + "_native", typeof(LispObject), nativeParamTypes);
         var innerAsm = new CilAssembler();
         innerAsm._il = nativeDm.GetILGenerator().ForLibrary();
         innerAsm.Assemble(bodyInstrs);
@@ -1290,13 +1316,14 @@ public partial class CilAssembler
                     var (s, _) = pkg.Intern(name);
                     var homePkg = s.HomePackage;
                     bool isForeignCL = homePkg != null && homePkg != pkg && homePkg.Name == "COMMON-LISP";
+                    Runtime.ForgetMacroOnFunctionDefinition(s);
                     s.Function = fn;
                     if (!isForeignCL) pkgSym = s;
                 }
             }
             catch { }
         }
-        else if (name.StartsWith("(SETF ") && name.EndsWith(")"))
+        else if (name.StartsWith("(SETF ", System.StringComparison.Ordinal) && name.EndsWith(")", System.StringComparison.Ordinal))
         {
             var targetName = name.Substring(6, name.Length - 7);
             try
@@ -1376,6 +1403,7 @@ public partial class CilAssembler
         // DOTCL_EMIT_PDB: see LispBox). They cast differently on load.
         var boxedSlots = new HashSet<int>();
         var lispboxSlots = new HashSet<int>();
+        var longboxSlots = new HashSet<int>();
         if (envMap != null)
         {
             var cur = envMap;
@@ -1393,6 +1421,8 @@ public partial class CilAssembler
                             boxedSlots.Add(slotIdx);
                         else if (kind == "lispbox")
                             lispboxSlots.Add(slotIdx);
+                        else if (kind == "longbox")
+                            longboxSlots.Add(slotIdx);
                     }
                 }
                 cur = mc.Cdr;
@@ -1441,6 +1471,7 @@ public partial class CilAssembler
             innerAsm._faslStructMap = _faslStructMap;
             innerAsm._boxedEnvSlots = boxedSlots;
             innerAsm._lispboxEnvSlots = lispboxSlots;
+            innerAsm._longboxEnvSlots = longboxSlots;
             // A :direct body reads its parameters as arguments (:load-arg i ->
             // ldarg i+1) and omits the compiler's arity-check prefix, because the
             // delegate signature makes argc structural and MakeDirectClosure's
@@ -1529,12 +1560,13 @@ public partial class CilAssembler
             var paramTypes = new Type[paramCount + 1];
             paramTypes[0] = withEntry ? typeof(object) : typeof(object[]);
             for (int i = 1; i < paramTypes.Length; i++) paramTypes[i] = typeof(LispObject);
-            var dm = new DynamicMethod("lambda_closure_direct", typeof(LispObject),
-                paramTypes, typeof(CilAssembler).Module, true);
+            var dm = NewDm("lambda_closure_direct", typeof(LispObject),
+                paramTypes);
             var innerAsm = new CilAssembler();
             innerAsm._il = dm.GetILGenerator().ForLibrary();
             innerAsm._boxedEnvSlots = boxedSlots;
             innerAsm._lispboxEnvSlots = lispboxSlots;
+            innerAsm._longboxEnvSlots = longboxSlots;
             innerAsm._directParams = true;
             innerAsm._selfEnvBody = withEntry;
             if (withEntry) innerAsm.EmitSelfOrEnvPrologue();
@@ -1566,14 +1598,14 @@ public partial class CilAssembler
         else
         {
             // DynamicMethod mode (original path)
-            var dm = new DynamicMethod("lambda_closure", typeof(LispObject),
-                new[] { typeof(object[]), typeof(LispObject[]) },
-                typeof(CilAssembler).Module, true);
+            var dm = NewDm("lambda_closure", typeof(LispObject),
+                new[] { typeof(object[]), typeof(LispObject[]) });
             var innerAsm = new CilAssembler();
             innerAsm._il = dm.GetILGenerator().ForLibrary();
 
             innerAsm._boxedEnvSlots = boxedSlots;
             innerAsm._lispboxEnvSlots = lispboxSlots;
+            innerAsm._longboxEnvSlots = longboxSlots;
             // Defensive: a :direct body assembled on the args-array signature
             // (can only happen if the arity gate above and the compiler's gate
             // ever disagree) must get its omitted arity check back.
@@ -1705,6 +1737,10 @@ public partial class CilAssembler
     // variables under DOTCL_EMIT_PDB: see LispBox). Disjoint from _boxedEnvSlots.
     private HashSet<int>? _lispboxEnvSlots;
 
+    // For closure body: which env slots hold LongBox cells (captured, assigned FIXNUM
+    // variables; see LongBox). Disjoint from the other two sets.
+    private HashSet<int>? _longboxEnvSlots;
+
     // For direct-params closure bodies: :load-arg i maps to ldarg (i+1)
     // (real CLR params) instead of args-array indexing. Set only while
     // assembling a :direct :make-closure body.
@@ -1725,9 +1761,11 @@ public partial class CilAssembler
         _il.Emit(OpCodes.Ldelem_Ref);
         if (_lispboxEnvSlots != null && _lispboxEnvSlots.Contains(index))
             _il.Emit(OpCodes.Castclass, typeof(LispBox));
+        else if (_longboxEnvSlots != null && _longboxEnvSlots.Contains(index))
+            _il.Emit(OpCodes.Castclass, typeof(LongBox));
         else if (_boxedEnvSlots != null && _boxedEnvSlots.Contains(index))
             _il.Emit(OpCodes.Castclass, typeof(LispObject[]));
         else
-            _il.Emit(OpCodes.Castclass, typeof(LispObject));
+            _il.Emit(OpCodes.Call, typeof(Runtime).GetMethod("EnvSlot")!);
     }
 }

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; SETF of SYMBOL-VALUE and of GET expand into the lowering targets
 ;;; %SET-SYMBOL-VALUE and PUT-PROP. The compiler recognises both in its
 ;;; special-form emit table and calls Runtime.SetSymbolValue / Runtime.PutProp

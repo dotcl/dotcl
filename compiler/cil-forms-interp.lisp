@@ -545,7 +545,7 @@
    not check for markers: to the TAGBODY's catch with the index, or to the
    BLOCK's catch with the values."
   (if (eq (car (cadr m)) '%mini-block)
-      (throw (cadr m) (values-list (cddr m)))
+      (throw (%mini-block-catch-tag (cadr m)) (values-list (cddr m)))
       (throw (cadr m) (cddr m))))
 
 (defun %mini-block-catch-tag (tag)
@@ -719,6 +719,20 @@
                (:call "Runtime.CheckArgStructSymKnown"))
              `(,@(compile-expr var) ,@(compile-quoted-cached spec)
                (:call "Runtime.CheckArgStructSym")))))
+      ;; A type TYPEP takes apart at compile time (\(VECTOR * N), KEYWORD, an
+      ;; AND / OR of such) is tested inline; only a failure goes to CheckArgType,
+      ;; which then reports (or accepts, for a type it cannot decide).
+      ((and (symbolp var) (not (eq ty t))
+            (not (and (consp ty) (member (car ty) '(member eql))))
+            (let ((form (%typep-spec-expansion var ty 0)))
+              (and form (not (and (consp form) (eq (car form) 'typep)))
+                   (let ((fail (gen-label "ACF")) (ok (gen-label "ACOK")))
+                     `(,@(compile-expr form) ,@(emit-nil) (:beq ,fail)
+                       (:br ,ok)
+                       (:label ,fail)
+                       ,@(compile-expr var) ,@(compile-quoted-cached spec)
+                       (:call "Runtime.CheckArgType")
+                       (:label ,ok)))))))
       (t `(,@(compile-expr var) ,@(compile-quoted-cached spec) (:call "Runtime.CheckArgType"))))))
 
 (defun %member-symbol-literals (ty)
@@ -1185,6 +1199,7 @@
 (defun %mini-defining-form-p (form)
   "True for the CL defining macros this evaluator handles as special forms."
   (and (consp form) (symbolp (car form))
+       (eq (symbol-package (car form)) (load-time-value (find-package "COMMON-LISP")))
        (member (symbol-name (car form))
                '("DEFUN" "DEFMACRO" "DEFVAR" "DEFPARAMETER" "DEFCONSTANT")
                :test #'string=)
@@ -1422,6 +1437,10 @@
                 ;; Special (dynamic) vars bind via progv; lexical vars via alist.
                 ;; All init forms are evaluated in the outer env (parallel).
                 (let ((spec-vars '()) (spec-vals '()) (lex '()))
+                  (let ((dup (%duplicate-let-variable (cadr form))))
+                    (when dup
+                      (error 'program-error :format-control "LET: the variable ~S is bound twice"
+                                            :format-arguments (list dup))))
                   (dolist (b (cadr form))
                     (let ((var (check-binding-name
                                 (if (consp b) (car b) b) "LET"))
@@ -1454,26 +1473,32 @@
                 ;; Bind one at a time instead, so each PROGV is established before
                 ;; the next init form is evaluated and the body runs inside all of
                 ;; them. Lexicals keep accumulating in ENV as before.
-                (labels ((bind-seq (bindings benv tail)
+                (let ((declared (%mini-body-special-decls (cddr form))))
+                 (labels ((bind-seq (bindings benv tail)
                            (if (null bindings)
                                (%mini-eval-progn
                                 (cddr form) benv
-                                (mapcar (lambda (b) (if (consp b) (car b) b))
-                                        (cadr form))
+                                (remove-if (lambda (v) (member v declared))
+                                           (mapcar (lambda (b) (if (consp b) (car b) b))
+                                                   (cadr form)))
                                 tail gop)
                                (let* ((b (car bindings))
                                       (var (check-binding-name
                                             (if (consp b) (car b) b) "LET*"))
                                       (val (when (consp b)
                                              (%mini-eval (cadr b) benv))))
-                                 (if (%runtime-special-p var)
+                                 (if (or (%runtime-special-p var) (member var declared))
+                                     ;; A variable the body declares special is
+                                     ;; dynamic from its own binding on, so the
+                                     ;; later init forms see it too.
                                      ;; PROGV must outlive the body: from here in,
                                      ;; nothing under it is a tail position.
                                      (progv (list var) (list val)
-                                       (bind-seq (cdr bindings) benv nil))
+                                       (bind-seq (cdr bindings)
+                                                 (remove var benv :key #'car) nil))
                                      (bind-seq (cdr bindings)
                                                (cons (cons var val) benv) tail))))))
-                  (bind-seq (cadr form) env tailp)))
+                  (bind-seq (cadr form) env tailp))))
                (setq
                 ;; CLHS 5.1.2.4 / setq: assigning a name that is a symbol macro
                 ;; is SETF of its expansion, not a variable assignment. The env
@@ -1742,7 +1767,7 @@
                 (let ((lex-macros '()))
                   (dolist (def (cadr form))
                     (push (cons (car def)
-                                (%mini-eval (%macrolet-expander-form (cadr def) (cddr def))
+                                (%mini-eval (%macrolet-expander-form (cadr def) (cddr def) (car def))
                                             env))
                           lex-macros))
                   (%mini-eval-progn
@@ -1756,7 +1781,8 @@
                 (let* ((tb-id (list 'tagbody))
                        ;; Parse body into segments: list of (tag . forms)
                        (segs
-                        (let ((cur-tag nil) (cur-forms '()) (result '()))
+                        (let ((cur-tag (make-symbol "TAGBODY-START"))
+                              (cur-forms '()) (result '()))
                           (dolist (item (cdr form))
                             (if (or (symbolp item) (integerp item))
                                 (progn
@@ -1765,6 +1791,13 @@
                                 (push item cur-forms)))
                           (push (cons cur-tag (nreverse cur-forms)) result)
                           (nreverse result)))
+                       (dup-tag
+                        (multiple-value-bind (d dup-p)
+                            (%tagbody-duplicate-tag (mapcar #'car (cdr segs)))
+                          (when dup-p
+                            (error 'program-error
+                                   :format-control "TAGBODY: the tag ~S appears more than once"
+                                   :format-arguments (list d)))))
                        ;; Go tags live in their OWN namespace (CLHS 3.1.1), so they
                        ;; are collected under one private key instead of being
                        ;; pushed onto ENV under the tag symbol itself. Sharing the
@@ -1779,11 +1812,10 @@
                        ;; shadow outer ones by consing in front.
                        (outer-tags (cdr (assoc '%mini-go-tags env)))
                        (tagged-env
-                        (let ((tl '()) (idx 0))
-                          (dolist (seg segs)
-                            (when (car seg)
-                              (push (cons (car seg) (cons tb-id idx)) tl))
-                            (incf idx))
+                        (let ((tl '()))
+                          (loop for seg in (cdr segs)
+                                for idx from 1
+                                do (push (cons (car seg) (cons tb-id idx)) tl))
                           (cons (cons '%mini-go-tags (append (nreverse tl) outer-tags))
                                 env)))
                        (done-marker (list 'done))
@@ -1907,6 +1939,7 @@
                ;; (DEFVAR.4/5, DEFPARAMETER.4/5).
                (defvar
                 (let ((name (cadr form)) (doc (cadddr form)))
+                  (%check-special-proclamation name 'defvar)
                   (proclaim (list 'special name))
                   (when (and (cddr form) (not (boundp name)))
                     (set name (%mini-eval (caddr form) env)))
@@ -1915,6 +1948,7 @@
                (defparameter
                 (%check-defvar-syntax form)
                 (let ((name (cadr form)) (doc (cadddr form)))
+                  (%check-special-proclamation name 'defparameter)
                   (proclaim (list 'special name))
                   (set name (%mini-eval (caddr form) env))
                   (when (stringp doc) (setf (documentation name 'variable) doc))

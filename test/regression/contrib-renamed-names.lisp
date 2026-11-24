@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The four contribs that used to ship under an unprefixed name.
 ;;;
 ;;; advice / clrmd / decompiler / nuget are ordinary words, and dotcl pushes the

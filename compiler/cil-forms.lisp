@@ -104,6 +104,18 @@
             (:stelem-ref) (:stloc ,key)
             ,@(%local-var-marker key var :box)))))
 
+(defun emit-long-box-create (key value-instrs var)
+  "Emit IL creating the LongBox cell of a captured, assigned FIXNUM variable in local slot KEY,
+   initialized to the fixnum VALUE-INSTRS push (anything else is a type error). The key is
+   marked, which is how every later reference to the variable knows the cell is a LongBox."
+  (setf (get key 'long-box) t)
+  (let ((tmp (gen-local "LBOXINIT")))
+    `((:declare-local ,key "LongBox")
+      (:declare-local ,tmp "LispObject")
+      ,@value-instrs (:stloc ,tmp)
+      (:ldloc ,tmp) (:unbox-fixnum) (:newobj "LongBox") (:stloc ,key)
+      ,@(%local-var-marker key var :box))))
+
 (defun %instrs-need-empty-stack-p (instrs)
   "True if INSTRS contain a LEAVE or open a protected region, either of which
    requires the evaluation stack to hold nothing of the caller's."
@@ -169,6 +181,22 @@
     (unless (when (>= (length form) 2)
               (list (cadr form) nil (cons 'progn (cddr form)))))))
 
+(defun %cond-for-effect (clauses)
+  "The COND with clauses CLAUSES as nested IFs, for a body whose value is discarded; NIL when
+   a clause is not a list with a body (a test-only clause yields its test value, which the
+   ordinary COND path keeps) or the list is not proper."
+  (and (listp clauses)
+       (null (cdr (last clauses)))
+       (every (lambda (c) (and (consp c) (consp (cdr c)) (null (cdr (last c))))) clauses)
+       (labels ((build (cs)
+                  (cond ((null cs) nil)
+                        ((eq (caar cs) t) `(progn ,@(cdar cs)))
+                        (t (let ((rest (build (cdr cs))))
+                             (if (cdr cs)
+                                 `(if ,(caar cs) (progn ,@(cdar cs)) ,rest)
+                                 `(if ,(caar cs) (progn ,@(cdar cs)))))))))
+         (or (build clauses) (and (null clauses) '(progn))))))
+
 (defun compile-and-pop (form)
   "Compile FORM for effect. Uses void call variants when available to avoid allocation.
    Returns CIL instructions without (:pop) if a void variant was used."
@@ -196,6 +224,22 @@
             (not (local-function-entry op))
             (%conditional-arms form))
        (compile-if (%conditional-arms form) t))
+      ;; A COND whose value is discarded is the same chain of IFs for effect: otherwise the last
+      ;; form of a clause is compiled for its value (a boxed (INCF I)) that nobody reads.
+      ((and (eq op 'cond)
+            (not (macrolet-shadowed-p op))
+            (not (local-function-entry op))
+            (%cond-for-effect (cdr form)))
+       (compile-and-pop (%cond-for-effect (cdr form))))
+      ;; A MACROLET / SYMBOL-MACROLET whose value is discarded discards its body's value.
+      ((and (member op '(macrolet symbol-macrolet))
+            (not *at-toplevel*)
+            (not (macrolet-shadowed-p op))
+            (not (local-function-entry op))
+            (consp (cdr form)) (listp (cadr form)))
+       (if (eq op 'macrolet)
+           (compile-macrolet (cadr form) (cddr form) #'%compile-discarded-body)
+           (compile-symbol-macrolet (cadr form) (cddr form) #'%compile-discarded-body)))
       ;; Every form of a discarded PROGN is discarded, the last one included.
       ;; Without this the arms above stop here, since WHEN's body arrives wrapped
       ;; in one.
@@ -394,6 +438,8 @@
   (member method
           '("Fixnum.Make" "MultipleValues.Reset" "MultipleValues.ResetOnExit"
             "Runtime.ArefNumL" "Runtime.ArefSetNumL"
+            "Runtime.ArefNumLCold" "Runtime.ArefSetNumLCold" "Runtime.ArefNum2DLCold"
+            "Runtime.ArefSetNum2DLCold" "Runtime.ArefNum3DLCold" "Runtime.ArefSetNum3DLCold"
             "Runtime.BoxU64" "Runtime.ShlU64" "Runtime.ShrU64"
             "Runtime.RotateLeft32" "Runtime.RotateLeft64"
             "Runtime.BackingU64" "Runtime.ArefU64Bits" "Runtime.ArefSetU64Bits"
@@ -506,6 +552,99 @@
                                  (*in-mv-context* nil))
                              (compile-as-long arg))
                          (:stloc ,tmp))))))
+
+;;; (FORMAT dest "literal ~A ~S ~D ~% ~~" args...) with a literal control string made only of
+;;; literal text and the parameterless ~A ~S ~D ~% ~~ directives is written as the stream calls it
+;;; means: the control string is not parsed again at each call, and no argument vector is built.
+;;; Anything else (other directives, parameters or modifiers, a count of arguments that does not
+;;; match) is left to the FORMAT function. So is a destination of NIL: it has to build a string
+;;; stream first, which costs more than the FORMAT function's own buffer.
+(defun %format-simple-parts (control nargs)
+  "The parts of the control string CONTROL: strings, :A :S :D (one argument each) and :NL; or
+   :DECLINE when it is not made of those or does not take NARGS arguments."
+  (let ((parts '()) (lit (make-string-output-stream)) (n 0) (i 0) (len (length control)) (args 0))
+    (flet ((flush () (let ((s (get-output-stream-string lit)))
+                       (when (plusp (length s)) (push s parts)))))
+      (loop while (< i len)
+            do (let ((c (char control i)))
+                 (cond ((char/= c #\~) (write-char c lit) (incf i))
+                       ((>= (1+ i) len) (return-from %format-simple-parts :decline))
+                       (t (let ((d (char control (1+ i))))
+                            (cond ((char= d #\~) (write-char #\~ lit))
+                                  ((char= d #\%) (flush) (push :nl parts))
+                                  ((char= d #\&) (flush) (push :amp parts))
+                                  ((char-equal d #\a) (flush) (push :a parts) (incf args))
+                                  ((char-equal d #\s) (flush) (push :s parts) (incf args))
+                                  ((char-equal d #\d) (flush) (push :d parts) (incf args))
+                                  ((char-equal d #\x) (flush) (push :x parts) (incf args))
+                                  ((char-equal d #\b) (flush) (push :b parts) (incf args))
+                                  ((char-equal d #\c) (flush) (push :c parts) (incf args))
+                                  (t (return-from %format-simple-parts :decline)))
+                            (incf i 2))))))
+      (setq n args)
+      (flush))
+    (if (= n nargs) (nreverse parts) :decline)))
+
+(defun %format-simple-form (args)
+  "The form that writes (FORMAT . ARGS) directly, or NIL to leave the call alone."
+  (when (and (consp args) (consp (cdr args)) (stringp (cadr args)))
+    (let* ((dest (car args)) (control (cadr args)) (vals (cddr args))
+           (parts (%format-simple-parts control (length vals))))
+      (unless (eq parts :decline)
+        (let* ((temps (mapcar (lambda (v) (declare (ignore v)) (gensym "FA")) vals))
+               (sv (gensym "FS"))
+               (dv (gensym "FD"))
+               (writes (let ((ts temps))
+                         (mapcar (lambda (p)
+                                   (cond ((stringp p) `(write-string ,p ,sv))
+                                         ((eq p :nl) `(terpri ,sv))
+                                         ((eq p :amp) `(fresh-line ,sv))
+                                         (t (let ((tmp (pop ts)))
+                                              (ecase p
+                                                (:a `(princ ,tmp ,sv))
+                                                (:s `(prin1 ,tmp ,sv))
+                                                (:d `(%format-d ,tmp ,sv))
+                                                (:x `(%format-x ,tmp ,sv))
+                                                (:b `(%format-b ,tmp ,sv))
+                                                (:c `(write-char ,tmp ,sv)))))))
+                                 parts)))
+               (val-bindings (mapcar #'list temps vals)))
+          (cond ((eq dest t)
+                 `(let* ,val-bindings
+                    (let ((,sv *standard-output*))
+                      ,@writes
+                      nil)))
+                ((null dest)
+                 (let ((n (length temps)))
+                   (if (<= n 4)
+                       `(let* ,val-bindings
+                          (,(intern (format nil "%FORMAT-NIL-~D" n) "DOTCL-INTERNAL")
+                           ,control ,@temps))
+                       `(let* ,val-bindings
+                          (funcall 'format nil ,control ,@temps)))))
+                (t
+                 `(let* ((,dv ,dest) ,@val-bindings)
+                    (if (streamp ,dv)
+                        (let ((,sv ,dv))
+                          ,@writes
+                          nil)
+                        (funcall 'format ,dv ,control ,@temps))))))))))
+
+;; The structure may be redefined later, so a call built here must not be the one that
+;; reports a slot type the new definition no longer has. A value for a typed slot is
+;; accepted only when it is statically of the slot's type (the check is then empty);
+;; any other typed slot leaves the call to the constructor itself.
+(defun %boa-args-need-no-check-p (entry args)
+  (let ((slots (fourth entry)))
+    (loop for kw in (fifth entry)
+          for a in args
+          always (let* ((slot (find kw slots
+                                    :key (lambda (s) (intern (symbol-name (car s)) "KEYWORD"))))
+                        (ty (and slot (getf (cddr slot) :type))))
+                   (or (null ty) (eq ty t)
+                       (and (eq ty 'double-float) (double-float-typed-p a))
+                       (and (eq ty 'single-float) (single-float-typed-p a))
+                       (and (eq ty 'fixnum) (fixnum-typed-p a)))))))
 
 (defun %struct-ctor-key-args (keywords args)
   "ARGS parsed as a keyword argument list for KEYWORDS: an alist of
@@ -787,7 +926,12 @@
                      (and spread (list spread)))
                    (and (= n-args (length (cstate-tco-param-entries)))
                         (list args))))))
-      (when (and (eq *in-tail-position* t)
+      (when (and (or (eq *in-tail-position* t)
+                     ;; The tail of a BLOCK that is the tail of the body (what a
+                     ;; (COND ...) of the NEW-LET package expands to): the call's
+                     ;; value is the body's value, and the jump leaves the block.
+                     (and (eq *in-tail-position* :block-value)
+                          (not *in-try-block*) (not (cstate-tco-in-try-catch))))
                  ;; try/finally (special-var LET) suppresses TCO, but handler-case's
                  ;; try/catch allows it via the tco-in-try-catch slot (`leave`, not `br`)
                  (or (cstate-tco-in-try-catch) (not *in-try-block*))
@@ -856,9 +1000,14 @@
                      (loop for tmp in temps
                            for (key . boxed-p) in (cstate-tco-param-entries)
                            if boxed-p
+                             ;; A fresh cell per iteration: a closure made by an
+                             ;; earlier iteration holds the previous cell, and writing
+                             ;; through it would change what that closure sees.
                              append (if *emit-source-lines*
-                                        `((:ldloc ,key) (:ldloc ,tmp) (:stfld "LispBox.Value"))
-                                        `((:ldloc ,key) (:ldc-i4 0) (:ldloc ,tmp) (:stelem-ref)))
+                                        `((:ldloc ,tmp) (:newobj "LispBox") (:stloc ,key))
+                                        `((:ldc-i4 1) (:newarr "LispObject") (:dup)
+                                          (:ldc-i4 0) (:ldloc ,tmp) (:stelem-ref)
+                                          (:stloc ,key)))
                            else if (%float-slot-kind key)
                              append `((:ldloc ,tmp) (:stloc ,key)
                                       ,@(%frame-set-instrs-for-key key (%float-slot-kind key)))
@@ -892,6 +1041,12 @@
               ;; try/finally (special-var LET) already suppressed above via *in-try-block*.
               ,(cond ((cstate-tco-in-try-catch)
                       `(:leave ,(cstate-tco-loop-label)))
+                     ;; From inside a block: it may be a try region.
+                     ((eq *in-tail-position* :block-value)
+                      `(:leave ,(if (and (not typed-self) (not use-native-tco)
+                                         (%tco-args-checked-p args))
+                                    (second (cstate-tco-checked))
+                                    (cstate-tco-loop-label))))
                      ((and (not typed-self) (not use-native-tco)
                            (%tco-args-checked-p args))
                       `(:br ,(second (cstate-tco-checked))))
@@ -908,7 +1063,15 @@
                    (tcoloop-label (fourth mtco))
                    (shared-param-keys (fifth mtco)))
               (when (= n-args (length shared-param-keys))
-                (let* ((da (compile-direct-call-args args))
+                (let* ((da (if (some #'%raw-slot-kind shared-param-keys)
+                               ;; A raw Int64 shared slot (see
+                               ;; %LABELS-MUTUAL-LONG-POSITIONS): that argument is
+                               ;; computed and checked as an int64, as for a
+                               ;; self tail call into a raw parameter.
+                               (%tco-raw-slot-args args
+                                                   (mapcar (lambda (k) (cons k nil))
+                                                           shared-param-keys))
+                               (compile-direct-call-args args)))
                        (temps (car da))
                        (eval-instrs (cdr da)))
                   (return-from compile-named-call
@@ -1001,6 +1164,21 @@
                        (gethash name *typed-struct-keyword-ctors*))))
         (when (and entry (not (%global-notinline-p name)))
           (let ((form (%struct-ctor-direct-form entry args)))
+            (when form
+              (return-from compile-named-call (compile-expr form)))))))
+    ;; BOA struct constructor with only required parameters, each a slot: the keyword
+    ;; call with the arguments paired to the parameters' keywords, built the same way.
+    (when (and (symbolp name)
+               (not *cross-compiling*)
+               (not (local-function-entry name))
+               (not (member name *notinline-functions*)))
+      (let ((entry (gethash name *struct-boa-ctors*)))
+        (when (and entry (not (%global-notinline-p name))
+                   (listp args) (= (length args) (length (fifth entry)))
+                   (%boa-args-need-no-check-p entry args))
+          (let ((form (%struct-ctor-direct-form
+                       (subseq entry 0 4)
+                       (loop for k in (fifth entry) for a in args append (list k a)))))
             (when form
               (return-from compile-named-call (compile-expr form)))))))
     ;; Inline CLOS simple-reader accessor: (reader obj) -> Runtime.ReaderIC(obj, cell),
@@ -1205,11 +1383,15 @@
 (defun %struct-own-representation (name info)
   "The representation of NAME's own instances: 0 for the array-backed
    LispStruct, 1 to 4 for LispStruct1 .. LispStruct4, 5 for
-   LispStructR."
+   LispStructR, 6 for LispStructRB."
   (let ((slots (getf info :slots))
         (raw (gethash name *struct-raw-layouts*)))
-    (cond (raw (let ((k (%struct-raw-inline-count (cdr raw))))
-                 (if k 5 0)))
+    (cond (raw (let ((k (%struct-raw-inline-count (cdr raw)))
+                     (n (length (cdr raw))))
+                 ;; 6: up to four slots, some raw and some boxed (LispStructRB)
+                 (cond ((null k) 0)
+                       ((and (<= n 4) (> n k)) 6)
+                       (t 5))))
           ((or (null slots) (> (length slots) 4)) 0)
           (t (length slots)))))
 
@@ -1257,7 +1439,7 @@
            '((:call "LispStruct.TypeNameOf")))
           ((and (equal reps '(0)) (%struct-array-reps-stable-p type))
            '((:call "LispStruct.TypeNameOfStruct")))
-          ((equal reps '(5))
+          ((or (equal reps '(5)) (equal reps '(6)))
            '((:call "LispStruct.TypeNameOfRawInline")))
           (t
            `((:ldc-i4 ,(%struct-representations-mask reps))
@@ -1391,6 +1573,41 @@
                  (char< :lt) (char> :gt) (char<= :le)
                  (char>= :ge) (char= :eq) (char/= :ne))
                args))
+        ;; CHAR= / CHAR/= / EQL / EQ with a character literal on one side and an operand whose code
+        ;; is not reachable without building a character (an untyped local, a call result): the
+        ;; literal's code goes in as an immediate and the call returns a bool, so there is no
+        ;; second object to load and test.
+        ((and (= nargs 2) (member op '(char= char/= eq eql)) (not (local-function-entry op))
+              (let ((l1 (%char-literal-operand (first args))) (l2 (%char-literal-operand (second args))))
+                (or (and l2 (not l1)) (and l1 (not l2)))))
+         (let* ((l1 (%char-literal-operand (first args)))
+                (lit (or l1 (%char-literal-operand (second args))))
+                (other (if l1 (second args) (first args))))
+           (list :char-lit
+                 (ecase op
+                   (char= "Runtime.IsTrueCharEqCode") (char/= "Runtime.IsTrueCharNeCode")
+                   ((eq eql) "Runtime.IsTrueEqlCode"))
+                 (list other (char-code lit)))))
+        ;; The ordering comparisons, two operands whose codes are not both reachable, and the chained
+        ;; three-operand forms ((char<= #\0 c #\9) is the usual one): one bool call each.
+        ((and (= nargs 2) (member op '(char< char> char<= char>=)) (not (local-function-entry op)))
+         (list :binary (ecase op (char< "Runtime.IsTrueCharLt") (char> "Runtime.IsTrueCharGt")
+                         (char<= "Runtime.IsTrueCharLe") (char>= "Runtime.IsTrueCharGe"))
+               args))
+        ((and (= nargs 3) (member op '(char= char< char> char<= char>=)) (not (local-function-entry op)))
+         (list :ternary (ecase op (char= "Runtime.IsTrueCharEq3") (char< "Runtime.IsTrueCharLt3")
+                          (char> "Runtime.IsTrueCharGt3") (char<= "Runtime.IsTrueCharLe3")
+                          (char>= "Runtime.IsTrueCharGe3"))
+               args))
+        ;; The same two operands neither a literal: CHAR= / CHAR/= as one bool call, not the
+        ;; generic entry that builds T / NIL for the branch to unwrap.
+        ((and (= nargs 2) (member op '(char= char/=)) (not (local-function-entry op)))
+         (list :binary (if (eq op 'char=) "Runtime.IsTrueCharEq" "Runtime.IsTrueCharNe") args))
+        ;; CHAR-EQUAL / CHAR-NOT-EQUAL of two operands: one bool call (the case fold of the generic
+        ;; entry, without the T / NIL object and the LispChar the call is made through).
+        ((and (= nargs 2) (member op '(char-equal char-not-equal)) (not (local-function-entry op)))
+         (list :binary (if (eq op 'char-equal) "Runtime.IsTrueCharEqualCI" "Runtime.IsTrueCharNotEqualCI")
+               args))
         ;; Binary numeric comparisons (generic path)
         ((and (= nargs 2)
               (cdr (assoc op '((> . "Runtime.IsTrueGt")
@@ -1441,8 +1658,9 @@
                                         (equalp . "Runtime.IsTrueEqualp")))) args))
         ;; Unary type predicates: consp, atom, null (as predicate, not as not)
         ((and (= nargs 1)
-              (member op '(consp atom listp numberp integerp symbolp stringp
-                           characterp functionp endp)))
+              (member op '(consp atom listp numberp integerp symbolp stringp simple-vector-p
+                           characterp functionp endp
+                           alpha-char-p upper-case-p lower-case-p alphanumericp)))
          (list :unary (cdr (assoc op '((consp . "Runtime.IsTrueConsp")
                                        (endp . "Runtime.IsTrueEndp")
                                        (atom . "Runtime.IsTrueAtom")
@@ -1451,8 +1669,13 @@
                                        (integerp . "Runtime.IsTrueIntegerp")
                                        (symbolp . "Runtime.IsTrueSymbolp")
                                        (stringp . "Runtime.IsTrueStringp")
+                                       (simple-vector-p . "Runtime.IsTrueSimpleVectorp")
                                        (characterp . "Runtime.IsTrueCharacterp")
-                                       (functionp . "Runtime.IsTrueFunctionp")))) args))
+                                       (functionp . "Runtime.IsTrueFunctionp")
+                                       (alpha-char-p . "Runtime.IsTrueAlphaCharP")
+                                       (upper-case-p . "Runtime.IsTrueUpperCaseP")
+                                       (lower-case-p . "Runtime.IsTrueLowerCaseP")
+                                       (alphanumericp . "Runtime.IsTrueAlphanumericp")))) args))
         ;; (%fixnum-range-p x LO HI): the test a (typep x '(integer LO HI)) lowers to
         ((and (eq op '%fixnum-range-p) (= nargs 3) (integerp (second args)) (integerp (third args))
               (not (local-function-entry op)))
@@ -1484,6 +1707,10 @@
                                     (character . "Runtime.IsTrueCharacterp")
                                     (function . "Runtime.IsTrueFunctionp")
                                     (hash-table . "Runtime.IsTrueHashTable")
+                                    (vector . "Runtime.IsTrueVectorp")
+                                    (sequence . "Runtime.IsTrueSequencep")
+                                    (array . "Runtime.IsTrueArrayp")
+                                    (bit-vector . "Runtime.IsTrueBitVectorp")
                                     (atom . "Runtime.IsTrueAtom"))))))
            (if predicate
                (list :unary predicate (list (first args)))
@@ -1536,7 +1763,7 @@
    variant, with OWNER's representation mask, when an instance may keep its raw
    slots in fields."
   (let ((mask (and owner (%struct-known-mask owner))))
-    (if (and mask (logtest mask #x20))
+    (if (and mask (logtest mask #x60))
         `((:ldc-i4 ,mask) (:call ,(concatenate 'string method "K")))
         `((:call ,method)))))
 
@@ -1796,17 +2023,20 @@
             (%boolean-branchable-let-p (cadr expr) (cddr expr)))
        (compile-let (cadr expr) (cddr expr) (eq (car expr) 'let*) :long))
       ((and (eq (car expr) 'block) (consp (cdr expr)) (symbolp (cadr expr)) (cddr expr)
+            (not (%block-opaque-p expr))
             (not (%block-returns-to-p (cadr expr) (cddr expr))))
        (let* ((name (cadr expr))
               (tag (list '#:transparent-block))
-              (result (let ((*transparent-blocks*
+              (result (let ((*lexical-decl-frames* (%push-decl-frame :block (list name) nil))
+                            (*transparent-blocks*
                               (cons (list* name tag (%block-identity name))
                                     *transparent-blocks*))
                             (*inlining-stack* (inline-guard-stack name)))
                         (catch tag
                           (compile-progn-long-tail (cddr expr))))))
          (if (eq result :transparent-block-aborted)
-             `(,@(compile-expr expr) (:unbox-fixnum))
+             (progn (%note-block-opaque expr)
+                    `(,@(compile-expr expr) (:unbox-fixnum)))
              result)))
       ((and (eq (car expr) 'progn) (cdr expr))
        (compile-progn-long-tail (cdr expr)))
@@ -1916,7 +2146,8 @@
       (block
        (let* ((name (cadr expr))
               (btag (list '#:transparent-block))
-              (result (let ((*transparent-blocks*
+              (result (let ((*lexical-decl-frames* (%push-decl-frame :block (list name) nil))
+                            (*transparent-blocks*
                               (cons (list* name btag (%block-identity name))
                                     *transparent-blocks*))
                             (*inlining-stack* (inline-guard-stack name)))
@@ -2002,6 +2233,18 @@
 ;; aimed at the dropped block; it throws to TAG and the BLOCK is compiled with
 ;; its binding.
 (defvar *transparent-blocks* nil)
+
+;; A BLOCK form whose transparent compile was abandoned (a macro expanded into
+;; a RETURN-FROM to it) is compiled with its binding from then on. Without
+;; this every enclosing transparent block redid the attempt as well: a body
+;; nesting n such blocks (a TRIVIA MATCH* clause) took 2^n compiles.
+(defvar *opaque-block-forms* (make-hash-table :test 'eq :weakness :key :synchronized t))
+
+(defun %block-opaque-p (form) (gethash form *opaque-block-forms*))
+
+(defun %note-block-opaque (form)
+  (setf (gethash form *opaque-block-forms*) t)
+  :transparent-block-aborted)
 
 (defun %block-identity (name)
   "What identifies the block NAME resolves to here, or NIL for none: its
@@ -2098,7 +2341,18 @@
               r))))
 
 (defun compile-fixnum-range-test (x range)
-  "The Runtime.IsFixnumInRange test of X against RANGE = (LO . HI), as a bool."
+  "The Runtime.IsFixnumInRange test of X against RANGE = (LO . HI), as a bool.
+   An X that is already a raw int64 is compared as one: decided now when its own
+   range lies inside RANGE, else one unsigned comparison of X - LO."
+  (when (and (not *cross-compiling*) (fixnum-exact-p x))
+    (let ((xr (expr-int-range x)))
+      (return-from compile-fixnum-range-test
+        (if (and xr (<= (car range) (car xr)) (<= (cdr xr) (cdr range)))
+            `((:ldc-i4 1))
+            `(,@(compile-as-long x)
+              (:ldc-i8 ,(car range)) (:sub)
+              (:ldc-i8 ,(- (cdr range) (car range))) (:cgt-un)
+              (:ldc-i4 0) (:ceq))))))
   `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr x))
     (:ldc-i8 ,(car range)) (:ldc-i8 ,(cdr range))
     (:call "Runtime.IsFixnumInRange")))
@@ -2155,7 +2409,10 @@
    Otherwise, branch when condition is false (brfalse).
    Handles fused comparisons, (not x), nested (and ...) / (or ...) recursively."
   (let ((fused (compile-if-fused-comparison-p
-                (setq expr (or (%typep-constant-rewrite expr) expr)))))
+                (setq expr (or (%typep-constant-rewrite expr)
+                               (%member-literal-rewrite expr)
+                               (%logbit-rewrite expr)
+                               expr)))))
     (cond
       ;; A constant: the branch is decided now.
       ((or (eq expr t) (eq expr nil) (keywordp expr) (numberp expr) (characterp expr)
@@ -2172,6 +2429,8 @@
                (:u64-cmp (compile-u64-cmp (third fused) (second fused)))
                (:char-cmp (compile-char-cmp (third fused) (second fused)))
                (:sym-eq (compile-sym-eq (third fused)))
+               (:char-lit (compile-char-lit-test (third fused) (second fused)))
+               (:ternary (compile-ternary-call (third fused) (second fused)))
                (:double-cmp (compile-double-cmp (third fused) (second fused)))
                (:fixnum-range (compile-fixnum-range-test (first (third fused)) (second fused)))
                (:sum-cmp (compile-sum-cmp (second fused)))
@@ -2200,17 +2459,20 @@
                     (cons label branch-on-true)))
       ;; A BLOCK nothing returns from is transparent here.
       ((and (consp expr) (eq (car expr) 'block) (cddr expr)
+            (not (%block-opaque-p expr))
             (not (%block-returns-to-p (cadr expr) (cddr expr))))
        (let* ((name (cadr expr))
               (tag (list '#:transparent-block))
-              (result (let ((*transparent-blocks*
+              (result (let ((*lexical-decl-frames* (%push-decl-frame :block (list name) nil))
+                            (*transparent-blocks*
                               (cons (list* name tag (%block-identity name))
                                     *transparent-blocks*))
                             (*inlining-stack* (inline-guard-stack name)))
                         (catch tag
                           (compile-progn-boolean-tail (cddr expr) label branch-on-true)))))
          (if (eq result :transparent-block-aborted)
-             (%boolean-branch-default expr label branch-on-true)
+             (progn (%note-block-opaque expr)
+                    (%boolean-branch-default expr label branch-on-true))
              result)))
       ;; A call to a predicate proclaimed INLINE. The substitution normally
       ;; happens inside COMPILE-EXPR, which is already past this decision, so
@@ -2322,6 +2584,8 @@
                (:u64-cmp (compile-u64-cmp (third fused-method) (second fused-method)))
                (:char-cmp (compile-char-cmp (third fused-method) (second fused-method)))
                (:sym-eq (compile-sym-eq (third fused-method)))
+               (:char-lit (compile-char-lit-test (third fused-method) (second fused-method)))
+               (:ternary (compile-ternary-call (third fused-method) (second fused-method)))
                (:double-cmp (compile-double-cmp (third fused-method) (second fused-method)))
                (:fixnum-range (compile-fixnum-range-test (first (third fused-method)) (second fused-method)))
                (:sum-cmp (compile-sum-cmp (second fused-method)))
@@ -2377,6 +2641,8 @@
                      (:u64-cmp (compile-u64-cmp (third inner-fused) (second inner-fused)))
                      (:char-cmp (compile-char-cmp (third inner-fused) (second inner-fused)))
                      (:sym-eq (compile-sym-eq (third inner-fused)))
+               (:char-lit (compile-char-lit-test (third inner-fused) (second inner-fused)))
+               (:ternary (compile-ternary-call (third inner-fused) (second inner-fused)))
                      (:double-cmp (compile-double-cmp (third inner-fused) (second inner-fused)))
                      (:fixnum-range (compile-fixnum-range-test (first (third inner-fused)) (second inner-fused)))
                (:sum-cmp (compile-sum-cmp (second inner-fused)))
@@ -2403,7 +2669,8 @@
                                (reset-unless-loops else)
                                (list `(:label ,end-label)))))
              (arms `(,@test
-               (:call "MultipleValues.Reset")
+               ,@(unless (and (consp cond-expr) (eq (car cond-expr) '%hash-walk-next))
+                   '((:call "MultipleValues.Reset")))
                (:brfalse ,else-label)))))))))))
 
 (defun %invoke-test-p (test)
@@ -2615,17 +2882,20 @@
    to the ordinary BLOCK, as in a test position (*TRANSPARENT-BLOCKS*)."
   (let ((name (cadr form)) (body (cddr form)))
     (if (or (%list-longer-than-p body *progn-chunk-threshold*)
+            (%block-opaque-p form)
             (%block-returns-to-p name body))
         `(,@(compile-expr form) (:pop))
         (let* ((tag (list '#:transparent-block))
-               (result (let ((*transparent-blocks*
+               (result (let ((*lexical-decl-frames* (%push-decl-frame :block (list name) nil))
+                            (*transparent-blocks*
                                (cons (list* name tag (%block-identity name))
                                      *transparent-blocks*))
                              (*inlining-stack* (inline-guard-stack name)))
                          (catch tag
                            (%compile-discarded-body body)))))
           (if (eq result :transparent-block-aborted)
-              `(,@(compile-expr form) (:pop))
+              (progn (%note-block-opaque form)
+                     `(,@(compile-expr form) (:pop)))
               result)))))
 
 (defun compile-progn (forms)

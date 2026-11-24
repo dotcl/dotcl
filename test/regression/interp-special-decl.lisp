@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; (declare (special V)) in a body makes references to V within that body
 ;;; dynamic (CLHS 3.3.4). WHICH binding that reaches depends on whether the
 ;;; enclosing form bound V:

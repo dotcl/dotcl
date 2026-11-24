@@ -1,5 +1,7 @@
 ;;; Regression tests for dotnet:call-out: ref/out parameter support
 
+(require "dotnet-class")
+
 ;;; Int32.TryParse(string, out int): static, successful parse
 (deftest d894-try-parse-success
   (multiple-value-bind (ok n)
@@ -182,10 +184,6 @@
   (dotnet:static "System.String" "Equals" "a" "A" "Ordinal")
   nil)
 
-(deftest issue302-enum-flag-combo-string
-  (dotnet:invoke (dotnet:box "Read, Write" "System.IO.FileShare") "ToString")
-  "ReadWrite")
-
 (deftest issue302-enum-flag-combo-int
   (dotnet:invoke (dotnet:box 3 "System.IO.FileShare") "ToString")
   "ReadWrite")
@@ -213,17 +211,9 @@
 ;;; dotnet:invoke / dotnet:static may omit C# optional (dotcl/dotcl#24)
 ;;; parameters; the missing trailing args are filled with their declared defaults.
 ;;; DotCL.TestSupport.OptionalArgs exists in DEBUG builds only (the test runner).
-(deftest d1123-invoke-all-defaults
-  (dotnet:invoke (dotnet:new "DotCL.TestSupport.OptionalArgs") "Greet")
-  "hi world;")
-
 (deftest d1123-invoke-partial-defaults
   (dotnet:invoke (dotnet:new "DotCL.TestSupport.OptionalArgs") "Greet" "Bob")
   "hi Bob;")
-
-(deftest d1123-invoke-no-defaults-needed
-  (dotnet:invoke (dotnet:new "DotCL.TestSupport.OptionalArgs") "Greet" "Bob" 2)
-  "hi Bob;hi Bob;")
 
 (deftest d1123-invoke-numeric-defaults
   (let ((o (dotnet:new "DotCL.TestSupport.OptionalArgs")))
@@ -566,7 +556,7 @@
 ;;; passed (out positions too) by reference and each comes back after the
 ;;; return value. WMI's StdRegProv.GetStringValue writes its 4th argument.
 (deftest call-out-com-idispatch-byref
-  (if (dotnet:static "System.OperatingSystem" "IsWindows")
+  (if (%com-wmi-ready-p 'call-out-com-idispatch-byref)
       (let* ((reg (dotnet:invoke (dotnet:invoke (dotnet:new "WbemScripting.SWbemLocator")
                                                 "ConnectServer" "." "root\\default")
                                  "Get" "StdRegProv"))

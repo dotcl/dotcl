@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A MACROLET macro may have a dotted lambda list (a . rest), as DEFMACRO does.
 
 (deftest macrolet-dotted-lambda-list.compile

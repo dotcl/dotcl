@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; ~F, ~E, ~G and ~$ print a non-number like ~wD instead of zero.
 ;;; Expected values are SBCL 2.6.6's.
 

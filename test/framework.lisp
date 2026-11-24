@@ -109,12 +109,38 @@
       (setq *asdf-immutable-systems-seen* now)
       t)))
 
+;;; Wall-clock per test, when DOTCL_TEST_TIMING names a file: each DEFTEST records the
+;;; time since the previous one ended (so the top-level work between tests, a file's setup, is
+;;; charged to the next test of that file), and the table is written as tab-separated
+;;; "milliseconds, file, test" lines when the summary prints.
+(defvar *test-timing-file* (dotcl:getenv "DOTCL_TEST_TIMING"))
+(defvar *test-timing-records* nil)
+(defvar *test-timing-last* (get-internal-real-time))
+
+(defun %test-timing-note (name)
+  (let* ((now (get-internal-real-time))
+         (ms (round (* 1000 (- now *test-timing-last*)) internal-time-units-per-second)))
+    (push (list ms (and *load-truename* (file-namestring *load-truename*)) name) *test-timing-records*)
+    (setq *test-timing-last* (get-internal-real-time))))
+
+(defun %test-timing-dump ()
+  (when (and *test-timing-file* *test-timing-records*)
+    (with-open-file (o *test-timing-file* :direction :output :if-exists :supersede)
+      (dolist (r (reverse *test-timing-records*))
+        (format o "~D~C~A~C~A~%" (first r) #\Tab (second r) #\Tab (third r))))))
+
 (setf (fdefinition '%run-deftest)
  (lambda (name thunk expected)
   (incf *test-count*)
   (let ((leaked (%asdf-immutable-systems-changed-p)))
     (multiple-value-bind (result cond) (%run-test-form thunk)
+      ;; An interrupt request that nobody took would be delivered at the next safepoint of
+      ;; whatever runs next, outside any test: the run then ends with INTERACTIVE-INTERRUPT and
+      ;; no test name (gate 659 and 673). Drop it here and say which test left it.
+      (when (dotnet:static "DotCL.ConditionSystem" "DiscardInterrupt")
+        (format t "~&NOTE: test ~S left an interrupt request pending; discarded~%" name))
       (when (%asdf-immutable-systems-changed-p) (setq leaked t))
+      (when *test-timing-file* (%test-timing-note name))
       (cond (cond
              (incf *fail-count*)
              (push name *fail-names*)
@@ -355,8 +381,19 @@
           (when (null line) (return count))
           (incf count (%count-deftests-in-line line emitting)))))))
 
-(defun load-skip-under-interp (path)
-  (if (interpret-mode-p)
+(defparameter *interp-still-skipped* '("typed-entry.lisp")
+  "Files that stay out of the interpreter run even when DOTCL_INTERP_UNSKIP=1: their assertions are
+   about typed entries, which an interpreted DEFUN never has.")
+
+(defun %interp-unskip-p (path)
+  "True in the interpreter run of the full CI job (DOTCL_INTERP_UNSKIP=1): the files LOAD-SKIP-UNDER-INTERP
+   would leave out are loaded, but for those in *INTERP-STILL-SKIPPED*."
+  (let ((v (dotcl:getenv "DOTCL_INTERP_UNSKIP")))
+    (and v (string= v "1")
+         (not (member (file-namestring path) *interp-still-skipped* :test #'string=)))))
+
+(defun load-skip-under-interp (path &key (unskip t))
+  (if (and (interpret-mode-p) (not (and unskip (%interp-unskip-p path))))
       (progn
         (incf *skip-under-interp-skipped-files*)
         (incf *skip-under-interp-skipped-source-tests*
@@ -383,11 +420,22 @@
   t)
 (defmacro do-tests-summary ()
   '(progn
+     (%test-timing-dump)
      (print (list *pass-count* 'PASSED *fail-count* 'FAILED
                   'OF *test-count* 'TOTAL))
-     (if (= *fail-count* 0)
-         (print 'ALL-TESTS-PASSED)
-         (progn (print (list 'FAILED-TESTS *fail-names*))))))
+     (cond ((> *fail-count* 0) (print (list 'FAILED-TESTS *fail-names*)))
+           ;; A run that registered no test is not a pass: every file skipped, an empty list of
+           ;; files, a load that stopped early.
+           ((= *test-count* 0) (print 'NO-TESTS-RAN))
+           (t (print 'ALL-TESTS-PASSED)))))
+
+(defun tests-exit-code (&key allow-none)
+  "The exit status of a test run: 1 when a test failed, 1 when no test ran at all (unless ALLOW-NONE:
+   a run in a mode that skips the files it was given on purpose, such as the interpreter on files of
+   compiled-only tests), else 0."
+  (cond ((> *fail-count* 0) 1)
+        ((and (= *test-count* 0) (not allow-none)) 1)
+        (t 0)))
 
 ;;; --- Scratch files: one temp directory per test process ---
 ;;;
@@ -451,6 +499,13 @@ A name that does not parse is treated as alive, so it is never deleted."
         (ensure-directories-exist (concatenate 'string dir "/"))
         (setf *regression-temp-dir* dir))))
 
+(defun regression-temp-dir/ ()
+  "REGRESSION-TEMP-DIR with a trailing slash. MERGE-PATHNAMES of a file name
+with the slashless form lands the file in the PARENT directory (the shared
+system temp dir), where concurrent runs from other trees overwrite each other's
+files; use this one when merging a name into the directory."
+  (concatenate 'string (regression-temp-dir) "/"))
+
 (defun regression-temp-file (name)
   "NAME inside this process's scratch directory, as a string."
   (concatenate 'string (regression-temp-dir) "/" name))
@@ -461,6 +516,18 @@ A name that does not parse is treated as alive, so it is never deleted."
     (ignore-errors
      (dotnet:static "System.IO.Directory" "Delete" *regression-temp-dir* t))
     (setf *regression-temp-dir* nil)))
+
+;;; Files the run itself leaves in the working directory. On Windows a fasl that
+;;; was loaded cannot be deleted until the process exits, so a test that compiles
+;;; into the tree (rather than REGRESSION-TEMP-FILE) leaves a "*.in-use-*" file
+;;; behind for good. The snapshot is taken when the framework loads; the last
+;;; test of the run compares against it.
+(defun tree-leftovers ()
+  (sort (mapcar #'file-namestring
+                (append (directory "*.in-use-*") (directory "*-tmp.*")))
+        #'string<))
+
+(defvar *tree-leftovers-before* (tree-leftovers))
 
 ;;; ansi-test compatibility helpers
 (defun notnot (x) (not (not x)))
@@ -551,7 +618,9 @@ A name that does not parse is treated as alive, so it is never deleted."
         (unless (and skip-under-interp (interpret-mode-p))
           (incf *full-tier-loaded-files*))
         (if skip-under-interp
-            (load-skip-under-interp path)
+            ;; Not the files DOTCL_INTERP_UNSKIP brings back: those were measured one by one, and these
+            ;; (pack and child-process files) were not.
+            (load-skip-under-interp path :unskip nil)
             (load path))))
   t)
 

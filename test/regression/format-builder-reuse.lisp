@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 (defun fmt-reuse-printer (stream arg colon at &rest params)
   ;; ~/name/ calls out to Lisp from inside FORMAT; this one formats again.
   (declare (ignore colon at params))

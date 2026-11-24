@@ -1,3 +1,4 @@
+;;; regression: full-tier-only skip-under-interp
 ;;; `dotcl build <asd> --output <fasl>` loads the system's :depends-on closure
 ;;; before compiling it, and leaves no intermediate files next to the output.
 ;;;

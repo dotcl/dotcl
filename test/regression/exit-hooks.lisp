@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; DOTCL:*EXIT-HOOKS*, as SB-EXT:*EXIT-HOOKS*: functions of no arguments run
 ;;; when the process exits, through DOTCL:QUIT or at the end of the program.
 ;;; Libraries (exit-hooks) attached their own handler to the .NET ProcessExit

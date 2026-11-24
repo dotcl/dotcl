@@ -1,7 +1,9 @@
 | tokenizer | 300 | 74033288 |
 | vec2 | 200 | 245144966 |
+| bits | 300 | 3749992 |
 | `tokenizer` | the only character case: one element read per iteration, compared against constants |
 | `vec2` | the float case: DOUBLE-FLOAT slots, where the boxed representation costs an object per value rather than per value outside a cache |
+| `bits` | the paths the compiler special-cases: a bit vector element write and read, LOGBITP on fixnums, TRUNCATE with both values read, a closure made at run time |
 # il-parity
 
 Five small data structures written twice -- once in C#, once in fully declared

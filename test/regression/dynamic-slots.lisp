@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Custom slot-definition metaobject protocol.
 ;;; A reduced version of McCLIM's class-with-dynamic-slots metaclass, exercising
 ;;; direct-/effective-slot-definition-class, compute-effective-slot-definition,

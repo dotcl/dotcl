@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; COUNT, COUNT-IF, POSITION-IF, REDUCE, RASSOC and GETF get direct entries.
 ;;;
 ;;; Each of them was registered as a plain variadic function, so (count x l)

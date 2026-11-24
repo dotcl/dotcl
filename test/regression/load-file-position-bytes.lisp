@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; FILE-POSITION on the stream LOAD and COMPILE-FILE hand to reader macros
 ;;; counts bytes of the file, as a stream opened on the file does.
 ;;;

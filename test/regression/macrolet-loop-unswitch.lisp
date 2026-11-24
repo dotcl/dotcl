@@ -47,10 +47,37 @@
   (255 #.(logxor (mod (* 3 7) 256) (mod (* 2 13) 256))
    #.(logxor (mod (* 66 7) 256) (mod (* 65 13) 256)) 255 t t))
 
+;;; An octet buffer's fetch cannot answer null, so its accesses carry no test at all and
+;;; the loop body is not emitted twice. The loop-in-a-macrolet detection still decides
+;;; for a kind whose fetch can answer null (signed 32 bit): the loop is unswitched and the
+;;; accesses outside any loop keep their test.
+(defun %mlu-xor-i32 (len a as b bs c cs)
+  (declare (type (simple-array (signed-byte 32) (*)) a b c)
+           (type (integer 0 1000000) len as bs cs)
+           (optimize speed (safety 0)))
+  (macrolet ((xor-words (size form)
+               `(loop until (< len ,size) do
+                  ,form
+                  (incf cs ,size) (incf as ,size) (incf bs ,size)
+                  (decf len ,size))))
+    (xor-words 1 (setf (aref c cs) (logxor (aref a as) (aref b bs)))))
+  (values))
+
+(defun %mlu-once-i32 (a as c cs)
+  (declare (type (simple-array (signed-byte 32) (*)) a c)
+           (type (integer 0 1000000) as cs)
+           (optimize speed (safety 0)))
+  (macrolet ((copy1 (form) form))
+    (copy1 (setf (aref c cs) (aref a as))))
+  (values))
+
 (deftest-emitting-only macrolet-loop-unswitch.sil
   (list (%mlu-count "ABFALL" #'%mlu-xor)
-        (plusp (%mlu-count "ABUSLOW" #'%mlu-xor))
-        (plusp (%mlu-count "ABFALL" #'%mlu-once)))
-  (0 t t))
+        (%mlu-count "ABUSLOW" #'%mlu-xor)
+        (%mlu-count "ABFALL" #'%mlu-once)
+        (%mlu-count "ABFALL" #'%mlu-xor-i32)
+        (plusp (%mlu-count "ABUSLOW" #'%mlu-xor-i32))
+        (plusp (%mlu-count "ABFALL" #'%mlu-once-i32)))
+  (0 0 0 0 t t))
 
 (setf dotcl:*save-sil* nil)

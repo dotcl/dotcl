@@ -142,8 +142,8 @@
 ;; redefined, loaded where instances of the older definition are still around.
 ;; It must report, not read the position the slot used to have.
 (deftest-compiled-only struct-redefinition.fasl-against-a-later-version
-  (let ((src "srd-fasl-tmp.lisp")
-        (fasl "srd-fasl-tmp.fasl"))
+  (let ((src (regression-temp-file "srd-fasl-tmp.lisp"))
+        (fasl (regression-temp-file "srd-fasl-tmp.fasl")))
     (unwind-protect
         (progn
           (eval '(defstruct srd-fasl (a 0 :type fixnum) (b 0 :type fixnum)))

@@ -235,7 +235,11 @@ public static class TypeParser
 
             case LispClass cls:
                 // Built-in type classes -> NamedType for consistent comparison
-                if (Runtime.IsBuiltinTypeName(cls.Name.Name))
+                // (A class of a program's own, whose name is that of a built-in type in another
+                // package, is not that built-in type.)
+                if (Runtime.IsBuiltinTypeName(cls.Name.Name)
+                    && (cls.IsBuiltIn || cls.Name.HomePackage == Startup.CL
+                        || cls.Name.HomePackage == Startup.Internal))
                     return NamedType.Get(cls.Name.Name);
                 return new ClassCType(cls);
 
@@ -261,10 +265,21 @@ public static class TypeParser
             return qResult;
         }
 
+        // A class a program defined under a symbol of its own is that class, even when the
+        // symbol's name is that of a built-in type: (:shadow #:error) and a DEFCLASS of ERROR
+        // in the package make a type that has nothing to do with CL:ERROR.
+        if (sym.HomePackage != Startup.CL && sym.HomePackage != Startup.Internal
+            && Runtime.FindClassOrNil(sym) is LispClass ownClass && !ownClass.IsBuiltIn)
+        {
+            var ownType = new ClassCType(ownClass);
+            _symbolCache[sym] = ownType;
+            return ownType;
+        }
+
         // Built-in type names: return singleton NamedType
         if (Runtime.IsBuiltinTypeName(name) || name == "T" || name == "NIL" || name == "*")
         {
-            var nt = NamedType.Get(name);
+            var nt = NamedType.Get(name == "*" ? "T" : name);
             _symbolCache[sym] = nt;
             return nt;
         }
@@ -760,6 +775,11 @@ public static class CTypeOps
             case NegationType n: return ProvablyEmpty(n.Inner, depth + 1);
             case UnionType u:
                 foreach (var m in u.Types) if (ProvablyUniversal(m, depth + 1)) return true;
+                // A member and its negation: (OR INTEGER (NOT INTEGER)).
+                foreach (var m in u.Types)
+                    if (m is NegationType mn)
+                        foreach (var o in u.Types)
+                            if (StructurallyEqual(o, mn.Inner)) return true;
                 return false;
             case IntersectionType i:
                 foreach (var m in i.Types) if (!ProvablyUniversal(m, depth + 1)) return false;
@@ -772,9 +792,70 @@ public static class CTypeOps
     /// Determine if ct1 is a subtype of ct2.
     /// Returns (result, certain) where certain=true means the answer is definitive.
     /// </summary>
+    // The built-in types that are the union of two others (CLHS 4.2.2): LIST is NULL and CONS, NUMBER
+    // is REAL and COMPLEX, RATIONAL is INTEGER and RATIO. SEQUENCE is left out: other sequence classes may exist.
+    private static readonly Dictionary<string, string[]> s_unionOfNamed = new()
+    {
+        ["LIST"] = new[] { "NULL", "CONS" },
+        ["NUMBER"] = new[] { "REAL", "COMPLEX" },
+        ["RATIONAL"] = new[] { "INTEGER", "RATIO" },
+    };
+
+    [ThreadStatic] private static int t_subtypepDepth;
+    // How many case analyses one top-level Subtypep may start: each can call Subtypep again, whose
+    // answers can be uncertain in turn, so without a budget a type table (ansi-test's types-and-classes)
+    // spends minutes in them.
+    [ThreadStatic] private static int t_caseBudget;
+    [ThreadStatic] private static int t_subtypepNest;
+
+    /// <summary>What the rules of SubtypepCore leave open: a type that is the union of known parts is below
+    /// whatever holds every part, and (AND A (NOT B)) is below C when A is below (OR B C).</summary>
+    private static bool SubtypepByCases(CType ct1, CType ct2)
+    {
+        if (t_subtypepDepth > 4 || t_caseBudget <= 0) return false;
+        t_caseBudget--;
+        t_subtypepDepth++;
+        try
+        {
+            if (ct1 is NamedType n && s_unionOfNamed.TryGetValue(n.Name, out var parts))
+            {
+                bool all = true;
+                foreach (var part in parts)
+                {
+                    var (pr, pk) = Subtypep(NamedType.Get(part), ct2);
+                    if (!(pr && pk)) { all = false; break; }
+                }
+                if (all) return true;
+            }
+            if (ct1 is IntersectionType inter)
+            {
+                for (int i = 0; i < inter.Types.Length; i++)
+                {
+                    if (inter.Types[i] is not NegationType neg) continue;
+                    var others = inter.Types.Where((_, j) => j != i).ToArray();
+                    if (others.Length == 0) continue;
+                    CType rest = others.Length == 1 ? others[0] : new IntersectionType(others);
+                    var (r, k) = Subtypep(rest, new UnionType(new[] { neg.Inner, ct2 }));
+                    if (r && k) return true;
+                }
+            }
+            return false;
+        }
+        finally { t_subtypepDepth--; }
+    }
+
     public static (bool result, bool certain) Subtypep(CType ct1, CType ct2)
     {
+        if (t_subtypepNest == 0) t_caseBudget = 8;
+        t_subtypepNest++;
+        try { return SubtypepOnce(ct1, ct2); }
+        finally { t_subtypepNest--; }
+    }
+
+    private static (bool result, bool certain) SubtypepOnce(CType ct1, CType ct2)
+    {
         var (r, k) = SubtypepCore(ct1, ct2);
+        if (!r && !k && SubtypepByCases(ct1, ct2)) return (true, true);
         // "Not a subtype, for certain" needs an object of ct1 outside ct2. For a type made of AND / OR / NOT
         // the rules below can find no such object because ct1 holds none at all -- (AND (NOT A) (NOT B)) with
         // (OR A B) the universe is empty, and an empty type is below everything -- so the answer is only
@@ -784,13 +865,26 @@ public static class CTypeOps
         return (r, k);
     }
 
+    private static bool IsBuiltinTypeClass(LispClass cls)
+        => Runtime.IsBuiltinTypeName(cls.Name.Name)
+           && (cls.IsBuiltIn || cls.Name.HomePackage == Startup.CL
+               || cls.Name.HomePackage == Startup.Internal);
+
     private static (bool result, bool certain) SubtypepCore(CType ct1, CType ct2)
     {
         // === Normalize ClassCType to NamedType for built-in classes ===
-        if (ct1 is ClassCType cls1n && Runtime.IsBuiltinTypeName(cls1n.Class.Name.Name))
+        // (Only classes of CL itself: a class of a program's own that has the name of a
+        // built-in type in another package is a different type.)
+        if (ct1 is ClassCType cls1n && IsBuiltinTypeClass(cls1n.Class))
             ct1 = NamedType.Get(cls1n.Class.Name.Name);
-        if (ct2 is ClassCType cls2n && Runtime.IsBuiltinTypeName(cls2n.Class.Name.Name))
+        if (ct2 is ClassCType cls2n && IsBuiltinTypeClass(cls2n.Class))
             ct2 = NamedType.Get(cls2n.Class.Name.Name);
+
+        // BOOLEAN is (MEMBER NIL T): the algebra below knows member sets.
+        if (ct1 is NamedType { Name: "BOOLEAN" } && ct2 is not NamedType { Name: "BOOLEAN" })
+            ct1 = new MemberType(new LispObject[] { Nil.Instance, T.Instance });
+        if (ct2 is NamedType { Name: "BOOLEAN" } && ct1 is not NamedType { Name: "BOOLEAN" })
+            ct2 = new MemberType(new LispObject[] { Nil.Instance, T.Instance });
 
         // === Identity ===
         if (ReferenceEquals(ct1, ct2) || StructurallyEqual(ct1, ct2)) return (true, true);
@@ -868,6 +962,23 @@ public static class CTypeOps
             }
         }
 
+        // A small finite set of integers is decided integer by integer.
+        if (!s_inFiniteIntegers && ct2 is MemberType or UnionType or IntersectionType or NegationType
+            && !ContainsSatisfies(ct2) && !ContainsUnknownName(ct2))
+        {
+            s_inFiniteIntegers = true;
+            try
+            {
+                if (FiniteIntegers(ct1) is { } ints)
+                {
+                    foreach (var i in ints)
+                        if (!IsTypep(i, ct2)) return (false, true);
+                    return (true, true);
+                }
+            }
+            finally { s_inFiniteIntegers = false; }
+        }
+
         // (MEMBER a b) <: X is decided object by object, whatever the shape of X,
         // so it goes before the rules on X that only find sufficient conditions:
         // (MEMBER :X :Y) <: (OR (EQL :X) (EQL :Y)) holds though neither member of
@@ -890,6 +1001,11 @@ public static class CTypeOps
             return SubtypepUnion1(union1, ct2);
         if (ct1 is IntersectionType inter1)
             return SubtypepIntersection1(inter1, ct2);
+        if (ct1 is NegationType negAtom && ct2 is NamedType { Name: "ATOM" })
+        {
+            // ATOM is what is not a cons: (NOT A) holds no cons exactly when every cons is an A.
+            if (Subtypep(NamedType.Get("CONS"), negAtom.Inner).result) return (true, true);
+        }
         if (ct1 is NegationType neg1)
         {
             // (NOT A) <: B: hard in general. A built-in type disjoint from both A
@@ -996,6 +1112,17 @@ public static class CTypeOps
 
         if (ct1 is MemberType mem1)
             return SubtypepMember(mem1, ct2);
+
+        // A cons type holds only conses, so it is below whatever holds every cons.
+        if (ct1 is ConsType && ct2 is NamedType)
+        {
+            var (consSub, _) = Subtypep(NamedType.Get("CONS"), ct2);
+            if (consSub) return (true, true);
+        }
+        // NULL is the type of NIL alone.
+        if (ct1 is NamedType { Name: "NULL" } && ct2 is MemberType memNil
+            && System.Array.Exists(memNil.Members, m => m is Nil))
+            return (true, true);
 
         // Disjoint built-in shapes are a certain NO whatever their form.
         if (AreDisjointCore(ct1, ct2)) return (false, true);
@@ -1854,6 +1981,33 @@ public static class CTypeOps
     /// Check if an intersection type is provably empty.
     /// Detects (AND X (NOT X)) and (AND X (NOT Y)) where X subset-of Y patterns.
     /// </summary>
+    [ThreadStatic] private static bool s_inFiniteIntegers;
+    private const int FiniteIntegerLimit = 256;
+
+    /// <summary>The integers of CT when it is an INTEGER range, or an AND with such a range among its
+    /// conjuncts, holding at most FiniteIntegerLimit of them; otherwise null.</summary>
+    private static List<LispObject>? FiniteIntegers(CType ct)
+    {
+        NumericType? range = ct as NumericType ?? (ct is NamedType { Name: "BIT" } ? new NumericType("INTEGER", Fixnum.Make(0), false, Fixnum.Make(1), false) : null);
+        if (range == null && ct is IntersectionType inter)
+        {
+            if (ContainsSatisfies(ct) || ContainsUnknownName(ct)) return null;
+            foreach (var t in inter.Types)
+                if (t is NumericType { NumClass: "INTEGER" } r && r.Low is Fixnum && r.High is Fixnum) { range = r; break; }
+        }
+        if (range is not { NumClass: "INTEGER", Low: Fixnum lo, High: Fixnum hi }) return null;
+        long low = range.LowExclusiveP ? lo.Value + 1 : lo.Value;
+        long high = range.HighExclusiveP ? hi.Value - 1 : hi.Value;
+        if (high < low || (ulong)(high - low) >= (ulong)FiniteIntegerLimit) return null;
+        var result = new List<LispObject>();
+        for (long n = low; n <= high; n++)
+        {
+            var obj = Fixnum.Make(n);
+            if (ReferenceEquals(range, ct) || IsTypep(obj, ct)) result.Add(obj);
+        }
+        return result;
+    }
+
     private static bool NumericRangeIsEmpty(NumericType n)
     {
         if (n.Low is not Number lo || n.High is not Number hi) return false;
@@ -1976,8 +2130,34 @@ public static class CTypeOps
             if (belowFixnum || aboveFixnum) return (true, true);
             return (false, false);  // might overlap with fixnum range
         }
+        // A range of rationals with no integer in it ((RATIONAL (0) (1))) holds only ratios.
+        if (named.Name == "RATIO" && num.NumClass == "RATIONAL" && !RangeHasInteger(num)
+            && num.Low != null && num.High != null && num.Low is Fixnum or Ratio && num.High is Fixnum or Ratio)
+            return (true, true);
         if (Runtime.IsBuiltinTypeName(named.Name)) return (false, true);
         return (false, false);
+    }
+
+    /// <summary>True unless a range with rational bounds is known to hold no integer.</summary>
+    private static bool RangeHasInteger(NumericType n)
+    {
+        static (System.Numerics.BigInteger, System.Numerics.BigInteger) Frac(LispObject o) => o switch
+        {
+            Fixnum f => (new System.Numerics.BigInteger(f.Value), System.Numerics.BigInteger.One),
+            Ratio r => (r.Numerator, r.Denominator),
+            _ => (System.Numerics.BigInteger.Zero, System.Numerics.BigInteger.Zero),
+        };
+        static System.Numerics.BigInteger FloorDiv(System.Numerics.BigInteger a, System.Numerics.BigInteger b)
+        {
+            var q = System.Numerics.BigInteger.DivRem(a, b, out var rem);
+            return rem.Sign != 0 && (rem.Sign < 0) != (b.Sign < 0) ? q - 1 : q;
+        }
+        if (n.Low == null || n.High == null) return true;
+        var (ln, ld) = Frac(n.Low); var (hn, hd) = Frac(n.High);
+        if (ld.IsZero || hd.IsZero) return true;
+        var smallest = n.LowExclusiveP ? FloorDiv(ln, ld) + 1 : -FloorDiv(-ln, ld);
+        var largest = n.HighExclusiveP ? -FloorDiv(-hn, hd) - 1 : FloorDiv(hn, hd);
+        return smallest <= largest;
     }
 
     private static bool BoundBelow(LispObject bound, bool exclusive, long limit)
@@ -2268,9 +2448,12 @@ public static class CTypeOps
         if (!Runtime.IsBuiltinTypeName(n2.Name) && n2.Name is not ("T" or "NIL" or "*")
             && Runtime.FindSystemClassByName(n2.Name) == null)
             return (false, false);
-        // Check CPL for the named type
+        // Check CPL for the named type. (A class of a program's own with the name of a
+        // built-in type in another package is not that type.)
         foreach (var c in c1.Class.ClassPrecedenceList)
-            if (c.Name.Name == n2.Name) return (true, true);
+            if (c.Name.Name == n2.Name
+                && (!Runtime.IsBuiltinTypeName(n2.Name) || IsBuiltinTypeClass(c)))
+                return (true, true);
         // Also check built-in hierarchy for structure-object etc.
         if (c1.Class.IsStructureClass && Runtime.CheckSubtypeByName("STRUCTURE-OBJECT", n2.Name))
             return (true, true);
@@ -2350,6 +2533,34 @@ public static class CTypeOps
     /// (OR STRING BIT-VECTOR) because #(1 2) is neither. Types with SATISFIES are
     /// not tried (the predicate could do anything), nor are objects whose TYPEP fails.
     /// </summary>
+    /// <summary>Numbers just outside the bounds of the numeric ranges in CT, a third of a unit past each
+    /// bound, so that a ratio is among the candidates: RATIO is not within (RATIONAL -1/2 1/2).</summary>
+    private static void CollectOutsideNumericCandidates(CType ct, List<LispObject> into)
+    {
+        switch (ct)
+        {
+            case NumericType n:
+                try
+                {
+                    var third = Runtime.Divide(Fixnum.Make(1), Fixnum.Make(3));
+                    if (n.High != null) into.Add(Runtime.Add(n.High, n.High is Fixnum or Ratio ? third : (LispObject)Fixnum.Make(1)));
+                    if (n.Low != null) into.Add(Runtime.Subtract(n.Low, n.Low is Fixnum or Ratio ? third : (LispObject)Fixnum.Make(1)));
+                    // One float of each format past each bound, for a range of rationals (or of anything)
+                    // that a FLOAT type is asked about.
+                    foreach (LispObject unit in new LispObject[] { new SingleFloat(1.0f), new DoubleFloat(1.0) })
+                    {
+                        if (n.High != null) into.Add(Runtime.Add(n.High, unit));
+                        if (n.Low != null) into.Add(Runtime.Subtract(n.Low, unit));
+                    }
+                }
+                catch { }
+                break;
+            case NegationType neg: CollectOutsideNumericCandidates(neg.Inner, into); break;
+            case UnionType u: foreach (var t in u.Types) CollectOutsideNumericCandidates(t, into); break;
+            case IntersectionType i: foreach (var t in i.Types) CollectOutsideNumericCandidates(t, into); break;
+        }
+    }
+
     public static bool HasMemberWitness(CType ct1, CType ct2, LispObject type1, LispObject type2)
     {
         if (ContainsSatisfies(ct1) || ContainsSatisfies(ct2)) return false;
@@ -2357,6 +2568,7 @@ public static class CTypeOps
         var objs = new List<LispObject>();
         CollectMembers(ct1, objs);
         CollectMembers(ct2, objs);
+        CollectOutsideNumericCandidates(ct2, objs);
         foreach (var o in objs)
         {
             try
@@ -2565,8 +2777,28 @@ public static class CTypeOps
         return AreDisjointCore(a, b);
     }
 
+    /// <summary>1 structure class, 2 condition class, 3 standard class (instances of
+    /// STANDARD-OBJECT, classes included), 0 anything else.</summary>
+    private static int ClassFamily(LispClass cls)
+    {
+        foreach (var c in cls.ClassPrecedenceList)
+        {
+            var n = c.Name.Name;
+            if (n == "STRUCTURE-OBJECT") return 1;
+            if (n == "CONDITION") return 2;
+            if (n == "STANDARD-OBJECT") return 3;
+        }
+        return 0;
+    }
+
     /// <summary>Disjointness without calling SUBTYPEP, so the SUBTYPEP fallback
     /// can use it. Conservative: returns false if unsure.</summary>
+    private static bool NoIntegerRange(CType t)
+        => t is NumericType { NumClass: "RATIONAL", Low: Fixnum or Ratio, High: Fixnum or Ratio } n && !RangeHasInteger(n);
+
+    private static bool IsIntegerType(CType t)
+        => t is NumericType { NumClass: "INTEGER" } || t is NamedType { Name: "INTEGER" or "FIXNUM" or "BIGNUM" or "BIT" or "UNSIGNED-BYTE" or "SIGNED-BYTE" };
+
     private static bool AreDisjointCore(CType a, CType b)
     {
         // NIL is disjoint with everything (it's the empty type), including itself.
@@ -2584,6 +2816,10 @@ public static class CTypeOps
             return System.Array.TrueForAll(ua.Types, t => AreDisjointCore(t, b));
         if (b is UnionType ub)
             return System.Array.TrueForAll(ub.Types, t => AreDisjointCore(a, t));
+
+        // A range of rationals with no integer in it ((RATIONAL (0) (1))) shares nothing with an integer type.
+        if (NoIntegerRange(a) && IsIntegerType(b)) return true;
+        if (NoIntegerRange(b) && IsIntegerType(a)) return true;
 
         // A MEMBER or EQL type holds only the objects it names, so ask TYPEP
         // about each one. A SATISFIES or unknown name cannot be asked safely.
@@ -2605,6 +2841,24 @@ public static class CTypeOps
         if (a is ComplexType) return AreDisjointCore(NamedType.Get("COMPLEX"), b);
         if (b is ComplexType) return AreDisjointCore(a, NamedType.Get("COMPLEX"));
 
+        // Integer ranges that share no integer: (INTEGER 0 5) and (INTEGER 10 20). BIGNUM, the
+        // integers outside the fixnum range, shares none with a range inside it.
+        if (IntegerRangeOf(a) is var ra && IntegerRangeOf(b) is var rb && ra.ok && rb.ok)
+        {
+            if ((ra.hi.HasValue && rb.lo.HasValue && ra.hi.Value < rb.lo.Value)
+                || (rb.hi.HasValue && ra.lo.HasValue && rb.hi.Value < ra.lo.Value))
+                return true;
+        }
+        // BIGNUM holds only integers beyond the fixnum range.
+        if ((a is NamedType { Name: "BIGNUM" } && IntegerRangeOf(b) is var rbb && rbb.ok && rbb.lo.HasValue && rbb.hi.HasValue
+                && rbb.lo.Value >= long.MinValue && rbb.hi.Value <= long.MaxValue)
+            || (b is NamedType { Name: "BIGNUM" } && IntegerRangeOf(a) is var raa && raa.ok && raa.lo.HasValue && raa.hi.HasValue
+                && raa.lo.Value >= long.MinValue && raa.hi.Value <= long.MaxValue))
+            return true;
+        // KEYWORD is a symbol other than NIL, so it shares nothing with NULL, CONS or LIST.
+        if (a is NamedType { Name: "KEYWORD" } && b is NamedType { Name: "NULL" or "CONS" or "LIST" }) return true;
+        if (b is NamedType { Name: "KEYWORD" } && a is NamedType { Name: "NULL" or "CONS" or "LIST" }) return true;
+
         // Two numeric classes neither of which contains the other: INTEGER and RATIO,
         // (INTEGER 0 *) and FLOAT, REAL and COMPLEX.
         if (NumericNode(a) is string na && NumericNode(b) is string nb
@@ -2618,12 +2872,19 @@ public static class CTypeOps
                 if (ReferenceEquals(c, cb3.Class)) return false;
             foreach (var c in cb3.Class.ClassPrecedenceList)
                 if (ReferenceEquals(c, ca3.Class)) return false;
-            return true;
+            // Two unrelated standard classes, or two unrelated condition classes, can still
+            // have a common subclass (multiple inheritance); structure classes cannot, and
+            // neither can classes of different families.
+            int fa = ClassFamily(ca3.Class);
+            return fa != ClassFamily(cb3.Class) || fa == 1 || fa == 0;
         }
 
         // An array has one simplicity, one upgraded element type and one set of
         // dimensions; a different one of any of those cannot be the same array.
-        if (a is ArrayType aa && b is ArrayType bb)
+        // The array type names (SIMPLE-VECTOR, STRING, BIT-VECTOR...) are asked the same way.
+        if ((a is ArrayType || a is NamedType) && (b is ArrayType || b is NamedType)
+            && (a as ArrayType ?? (a is NamedType nna ? NamedToArrayType(nna.Name) : null)) is ArrayType aa
+            && (b as ArrayType ?? (b is NamedType nnb ? NamedToArrayType(nnb.Name) : null)) is ArrayType bb)
         {
             if ((aa.SimpleP == true && bb.SimpleP == false)
                 || (aa.SimpleP == false && bb.SimpleP == true))
@@ -2647,6 +2908,39 @@ public static class CTypeOps
             return true;
 
         return false;
+    }
+
+    /// <summary>The integers a type holds as a range, ok=false when it is not a plain integer range
+    /// (or BIGNUM, which is two ranges and is answered as the one that reaches furthest below
+    /// the fixnums or above them: neither side is claimed, so ok stays false).</summary>
+    private static (bool ok, System.Numerics.BigInteger? lo, System.Numerics.BigInteger? hi) IntegerRangeOf(CType t)
+    {
+        if (t is NamedType { Name: "FIXNUM" })
+            return (true, long.MinValue, long.MaxValue);
+        if (t is NamedType { Name: "BIT" }) return (true, 0, 1);
+        if (t is not NumericType { NumClass: "INTEGER" } n) return (false, null, null);
+        System.Numerics.BigInteger? lo = null, hi = null;
+        if (n.Low != null)
+        {
+            if (!TryBig(n.Low, out var l)) return (false, null, null);
+            lo = n.LowExclusiveP ? l + 1 : l;
+        }
+        if (n.High != null)
+        {
+            if (!TryBig(n.High, out var h)) return (false, null, null);
+            hi = n.HighExclusiveP ? h - 1 : h;
+        }
+        return (true, lo, hi);
+    }
+
+    private static bool TryBig(LispObject x, out System.Numerics.BigInteger v)
+    {
+        switch (x)
+        {
+            case Fixnum f: v = f.Value; return true;
+            case Bignum b: v = b.Value; return true;
+            default: v = default; return false;
+        }
     }
 
     private static bool MemberSetDisjoint(MemberType mem, CType other)

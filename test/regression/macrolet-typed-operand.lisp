@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A call to a MACROLET-bound macro in an integer operand position is looked
 ;;; at through its expansion. A local macro is how a library names an element
 ;;; of the state inside a hot function -- ironclad's Salsa20 core has

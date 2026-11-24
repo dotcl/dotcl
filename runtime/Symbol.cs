@@ -18,6 +18,19 @@ public sealed class Symbol : LispObject
     private LispString? _nameString;
     public LispString NameString => _nameString ??= new LispString(Name);
     public Package? HomePackage { get; set; }
+
+    /// <summary>The last answer of the printer's "does this name need escaping" test for this symbol,
+    /// with what it depended on (see Runtime.SymbolNeedsEscaping). One immutable object, replaced
+    /// whole, so a reader on another thread sees a key and its answer that belong together.</summary>
+    internal sealed class EscapeCache
+    {
+        internal readonly object Readtable;
+        internal readonly long Key;
+        internal readonly bool NeedsEscaping;
+        internal EscapeCache(object readtable, long key, bool needsEscaping)
+        { Readtable = readtable; Key = key; NeedsEscaping = needsEscaping; }
+    }
+    internal volatile EscapeCache? EscapeCached;
     // Mutable Symbol slots are public volatile fields so cross-
     // thread reads see a consistent reference. Reference assignment to a
     // volatile field on .NET is atomic, and the volatile modifier emits the
@@ -35,6 +48,9 @@ public sealed class Symbol : LispObject
         set
         {
             if (DefinitionJournal.Depth != 0) DefinitionJournal.Note(this);
+            if (_function == null && value is LispFunction idf && Name == "IDENTITY"
+                && HomePackage != null && HomePackage.Name == "COMMON-LISP")
+                Runtime.OriginalIdentity = idf;
             _typedCode = 0;
             _function = value;
             _callee = value as LispFunction;

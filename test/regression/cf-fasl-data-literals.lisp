@@ -16,7 +16,7 @@
   (make-load-form-saving-slots n :environment env))
 
 (defun %cfdl-compile (name forms)
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames (format nil "~a.lisp" name) dir))
          (fasl (merge-pathnames (format nil "~a.fasl" name) dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)
@@ -146,11 +146,11 @@
 
 (deftest-compiled-only cf-fasl-data-literals.sharing
   (progn
-    (load (%cfdl-compile "cfdl-share" '((defun cfdl-twice () (cfdl-twice))
-                                        (defun cfdl-cross () (cfdl-cross))
+    (load (%cfdl-compile "cfdl-share" '((defun cfdl-twice-fn () (cfdl-twice))
+                                        (defun cfdl-cross-fn () (cfdl-cross))
                                         (defun cfdl-leaf3 () (cfdl-lit *cfdl-leaf*)))))
-    (let ((tw (funcall (intern "CFDL-TWICE")))
-          (cr (funcall (intern "CFDL-CROSS")))
+    (let ((tw (funcall (intern "CFDL-TWICE-FN")))
+          (cr (funcall (intern "CFDL-CROSS-FN")))
           (leaf (funcall (intern "CFDL-LEAF3"))))
       (list (eq (first tw) (second tw))
             (subseq (first tw) 0 7)

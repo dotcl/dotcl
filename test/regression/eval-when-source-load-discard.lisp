@@ -9,7 +9,7 @@
 ;;; dotcl and failed on SBCL.
 
 (defun %ewsl-load-source (lines)
-  (let ((src "ewsl-tmp.lisp"))
+  (let ((src (regression-temp-file "ewsl-tmp.lisp")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)

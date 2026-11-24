@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The debugger's :frames: the backtrace offered as a menu under the prompt.
 ;;;
 ;;; The arrows (or digits, as :frame N takes them) mark a frame and Enter

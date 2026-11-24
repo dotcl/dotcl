@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; LAUNCH-PROCESS with :ELEMENT-TYPE (UNSIGNED-BYTE 8) gives byte streams for
 ;;; its :STREAM targets. The element type was ignored, so the standard input
 ;;; was a character stream and WRITE-BYTE on it signalled "not a binary output

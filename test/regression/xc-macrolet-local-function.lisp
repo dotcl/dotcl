@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; While cross-compiling, a MACROLET expansion that names an enclosing FLET
 ;;; function or lexical variable refers to that binding.
 ;;;

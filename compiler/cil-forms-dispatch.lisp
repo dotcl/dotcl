@@ -22,6 +22,26 @@
   (let ((*in-tail-position* nil) (*in-mv-context* nil))
     (compile-expr arg)))
 
+;; The type functions the TYPEP rewrite needs, looked up by name the first time a compilation wants them
+;; (the SBCL cross-compile host has no DOTCL package). The load-time probes *KNOWN-TYPE-NAME-P-FN* and
+;; *TYPEXPAND-1-FN* were NIL in the shipped compiler, so the rewrite never ran.
+(defvar *typep-rewrite-fns* nil
+  "NIL until resolved, then (KNOWN-TYPE-NAME-P . TYPEXPAND-1) functions, or :NONE where DOTCL has none.")
+
+(defun %typep-rewrite-fns ()
+  "(values KNOWN-TYPE-NAME-P-FN TYPEXPAND-1-FN), or NIL when the runtime has no such functions."
+  (when (null *typep-rewrite-fns*)
+    (setq *typep-rewrite-fns*
+          (or (ignore-errors
+               (let ((k (find-symbol "KNOWN-TYPE-NAME-P" "DOTCL"))
+                     (x (find-symbol "TYPEXPAND-1" "DOTCL")))
+                 (and k x (fboundp k) (fboundp x)
+                      (cons (symbol-function k) (symbol-function x)))))
+              :none)))
+  (if (consp *typep-rewrite-fns*)
+      (values (car *typep-rewrite-fns*) (cdr *typep-rewrite-fns*))
+      nil))
+
 (defun %typep-spec-expansion (v spec depth)
   "A form testing V against the constant type SPEC by its parts, or NIL when
    SPEC is best left to TYPEP whole. DEFTYPEs known now are expanded (CLHS
@@ -33,13 +53,20 @@
       ((> depth 16) nil)
       ((and (symbolp spec) spec (not (eq spec t))
             (not (eq (symbol-package spec) (find-package "COMMON-LISP")))
-            (eq (funcall *known-type-name-p-fn* spec) :deftype)
+            (let ((k (%typep-rewrite-fns))) (and k (eq (funcall k spec) :deftype)))
             (null (find-class spec nil)))
        (multiple-value-bind (e expanded)
-           (ignore-errors (funcall *typexpand-1-fn* spec))
+           (handler-case (funcall (nth-value 1 (%typep-rewrite-fns)) spec) (error () (values nil nil)))
          (and expanded (not (eq e spec))
               (or (%typep-spec-expansion v e (1+ depth))
                   (and (symbolp e) `(typep ,v ',e))))))
+      ;; KEYWORD is a plain test; (VECTOR * N) is a vector whose total size is N (the fill
+      ;; pointer does not count: CLHS 4.2.3 reads the dimension of the array, not LENGTH).
+      ((eq spec 'keyword) `(keywordp ,v))
+      ((and (consp spec) (eq (car spec) 'vector) (consp (cdr spec)) (eq (cadr spec) '*)
+            (consp (cddr spec)) (typep (caddr spec) '(integer 0 #.most-positive-fixnum))
+            (null (cdddr spec)))
+       `(and (vectorp ,v) (= (array-dimension ,v 0) ,(caddr spec))))
       ((not (and (consp spec) (listp (cdr spec)))) nil)
       ((and (member (car spec) '(or and)) (cdr spec))
        (cons (car spec) (mapcar #'part (cdr spec))))
@@ -53,7 +80,7 @@
 
 (defun %typep-constant-rewrite (expr)
   "(TYPEP x 'SPEC) rewritten by %TYPEP-SPEC-EXPANSION, or NIL."
-  (when (and (not *cross-compiling*) *known-type-name-p-fn* *typexpand-1-fn*
+  (when (and (not *cross-compiling*) (%typep-rewrite-fns)
              (consp expr) (eq (car expr) 'typep)
              (consp (cdr expr)) (consp (cddr expr)) (null (cdddr expr))
              (not (local-function-entry 'typep)))
@@ -64,6 +91,101 @@
                (form (%typep-spec-expansion v (cadr type-arg) 0)))
           (when form
             `(let ((,v ,(cadr expr))) ,form)))))))
+
+(defun %builtin-type-spec-p (spec)
+  "True when SPEC names only COMMON-LISP types and numbers: nothing a later DEFTYPE,
+   DEFCLASS or DEFSTRUCT can change the answer for."
+  (cond ((null spec) t)
+        ((symbolp spec) (and (eq (symbol-package spec) (find-package "COMMON-LISP")) t))
+        ((numberp spec) t)
+        ((consp spec) (and (%builtin-type-spec-p (car spec))
+                           (let ((rest (cdr spec)))
+                             (loop while (consp rest)
+                                   always (%builtin-type-spec-p (pop rest)))
+                             t)))
+        (t nil)))
+
+(defun %subtypep-constant-rewrite (expr)
+  "(SUBTYPEP 'A 'B) with two constant specifiers, as the (VALUES ...) it means."
+  (when (and (not *cross-compiling*)
+             (consp expr) (eq (car expr) 'subtypep)
+             (consp (cdr expr)) (consp (cddr expr)) (null (cdddr expr))
+             (not (local-function-entry 'subtypep)))
+    (let ((a (cadr expr)) (b (caddr expr)))
+      (when (and (consp a) (eq (car a) 'quote) (consp (cdr a)) (null (cddr a))
+                 (consp b) (eq (car b) 'quote) (consp (cdr b)) (null (cddr b)))
+        (let ((res (handler-case
+                       (multiple-value-list (subtypep (cadr a) (cadr b)))
+                     (error () nil))))
+          (when (and res (= (length res) 2)
+                     (or (eq (first res) t) (null (first res)))
+                     ;; Only a certain answer about built-in types is folded.
+                     (eq (second res) t)
+                     (%builtin-type-spec-p (cadr a))
+                     (%builtin-type-spec-p (cadr b)))
+            (list 'values (list 'quote (first res)) (list 'quote (second res)))))))))
+
+(defun %logbit-rewrite (expr)
+  "(LOGBITP k x) with K a literal in 0..61 and X a fixnum, or (LOGTEST m x) / (LOGTEST x m) with M
+   a positive fixnum literal and X a fixnum, as (> (LOGAND ...) 0): native int64 arithmetic and a
+   fused compare, not two boxed arguments and a call. The mask is positive, so the LOGAND is
+   never negative. NIL when EXPR is not one of those."
+  (when (and (not *cross-compiling*) (consp expr) (consp (cdr expr)) (consp (cddr expr))
+             (null (cdddr expr))
+             (not (local-function-entry (car expr)))
+             (not (macrolet-shadowed-p (car expr)))
+             (not (member (car expr) *notinline-functions* :test #'equal)))
+    (case (car expr)
+      (logbitp (let ((k (second expr)) (x (third expr)))
+                 (and (typep k '(integer 0 61)) (fixnum-exact-p x)
+                      `(> (logand ,x ,(ash 1 k)) 0))))
+      (logtest (let ((a (second expr)) (b (third expr)))
+                 (cond ((and (typep a '(integer 1 #.most-positive-fixnum)) (fixnum-exact-p b))
+                        `(> (logand ,a ,b) 0))
+                       ((and (typep b '(integer 1 #.most-positive-fixnum)) (fixnum-exact-p a))
+                        `(> (logand ,a ,b) 0))
+                       (t nil))))
+      (t nil))))
+
+(defun %strip-the-fixnum-literal (form)
+  "(THE FIXNUM n) / (THE INTEGER n) / (THE (SIGNED-BYTE 64) n) for an integer literal n of that type is n."
+  (if (and (consp form) (eq (car form) 'the) (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+           (integerp (caddr form))
+           (member (cadr form) '(fixnum integer (signed-byte 64) (signed-byte 63) (signed-byte 62)) :test #'equal)
+           (typep (caddr form) (cadr form))
+           (not (local-function-entry 'the)))
+      (caddr form)
+      form))
+
+(defun %member-test-name (form)
+  "EQL, CHAR=, or CHAR-EQUAL when FORM is #'name for one of them (a global function: not shadowed
+   by a local one), else NIL."
+  (and (consp form) (eq (car form) 'function) (consp (cdr form)) (null (cddr form))
+       (member (cadr form) '(eql char= char-equal))
+       (not (local-function-entry (cadr form)))
+       (not (member (cadr form) *notinline-functions* :test #'equal))
+       (cadr form)))
+
+(defun %member-literal-rewrite (expr)
+  "(MEMBER x '(c1 ... cn)) in a test position, n <= 8, each ci a character, a
+   fixnum or a symbol, rewritten as a chain of EQL tests (only the truth of the
+   answer matters there, not the tail), or NIL."
+  (when (and (not *cross-compiling*)
+             (consp expr) (eq (car expr) 'member)
+             (consp (cdr expr)) (consp (cddr expr)) (null (cdddr expr))
+             (not (local-function-entry 'member))
+             (not (macrolet-shadowed-p 'member))
+             (not (member 'member *notinline-functions* :test #'equal)))
+    (let ((lst (caddr expr)))
+      (when (and (consp lst) (eq (car lst) 'quote) (consp (cdr lst)) (null (cddr lst))
+                 (listp (cadr lst)) (null (cdr (last (cadr lst))))
+                 (<= 1 (length (cadr lst)) 8)
+                 (every (lambda (c) (or (characterp c) (symbolp c)
+                                        (typep c '(signed-byte 62))))
+                        (cadr lst)))
+        (let ((v (gensym "MEM")))
+          `(let ((,v ,(cadr expr)))
+             (or ,@(mapcar (lambda (c) `(eql ,v ',c)) (cadr lst)))))))))
 
 (defun compile-struct-typep-value (obj type)
   "COMPILE-STRUCT-TYPEP as a Lisp value: T or NIL, not the branch flag."
@@ -117,12 +239,72 @@
                                        (function . "Runtime.Functionp")
                                        (atom . "Runtime.Atom")
                                        (vector . "Runtime.Vectorp")
+                                       (sequence . "Runtime.Sequencep")
+                                       (array . "Runtime.Arrayp")
+                                       (bit-vector . "Runtime.BitVectorp")
                                        (hash-table . "Runtime.Hash_table_p")
                                        (package . "Runtime.Packagep"))))))
                (if predicate
                    (compile-unary-call (list (car a)) predicate "TYPEP")
                    (compile-binary-call (list (car a) type-arg) "Runtime.Typep"))))
            (t (compile-binary-call (list (car a) type-arg) "Runtime.Typep"))))))))
+
+(defun %mvc-values-list-pair (x var)
+  "For X = (MULTIPLE-VALUE-CALL F (VALUES-LIST A) (VALUES-LIST B)) where exactly one of A, B is
+   the symbol VAR: (:REST-LAST F-FORM LIST-FORM) when VAR is B, (:REST-FIRST F-FORM LIST-FORM)
+   when VAR is A (the other being LIST-FORM); else NIL."
+  (and (consp x) (eq (car x) 'multiple-value-call) (consp (cdr x)) (consp (cddr x))
+       (consp (cdddr x)) (null (cddddr x))
+       (let ((a (caddr x)) (b (cadddr x)))
+         (and (consp a) (eq (car a) 'values-list) (consp (cdr a)) (null (cddr a))
+              (consp b) (eq (car b) 'values-list) (consp (cdr b)) (null (cddr b))
+              (cond ((and (eq (cadr b) var) (not (eq (cadr a) var)))
+                     (list :rest-last (cadr x) (cadr a)))
+                    ((and (eq (cadr a) var) (not (eq (cadr b) var)))
+                     (list :rest-first (cadr x) (cadr b))))))))
+
+(defun %rest-var-only-applied-p (body var)
+  "True when every occurrence of VAR in BODY (leaving out quoted data and declarations) is the
+   last argument of an APPLY. Only then may (APPLY f ... VAR) take its arguments straight from
+   the frame's argument array (*REST-FORWARD*): a rest list that is read, passed to another
+   function or changed in place (mito edits its INITARGS with (PUSH x (GETF initargs k)) in a
+   helper) must be the list that APPLY then sees, and it is consed when it is used that way."
+  (labels ((walk (x)
+             (cond ((eq x var) nil)
+                   ((atom x) t)
+                   ((member (car x) '(quote declare)) t)
+                   ((let ((m (%mvc-values-list-pair x var)))
+                      (and m (walk (second m)) (walk (third m)))))
+                   ((and (eq (car x) 'apply) (consp (cdr x)) (listp (cdr x)) (cddr x)
+                         (null (cdr (last x))))
+                    (let ((args (cdr x)))
+                      (and (every #'walk (butlast args))
+                           (or (eq (car (last args)) var) (walk (car (last args)))))))
+                   (t (loop for y = x then (cdr y)
+                            while (consp y)
+                            always (walk (car y))
+                            finally (return (or (null y) (walk y))))))))
+    (every #'walk body)))
+
+(defun %rest-forward-mvc (expr rf)
+  "(MULTIPLE-VALUE-CALL F (VALUES-LIST L) (VALUES-LIST REST)) (or with REST first), REST being the
+   &REST variable of the frame (see *REST-FORWARD*): the call takes the rest from the frame's
+   argument array, and the other list's elements."
+  (destructuring-bind (sym key args-idx start) *rest-forward*
+    (declare (ignore sym key))
+    (let* ((rest-first (eq (first rf) :rest-first))
+           (mode (%call-site-mv-mode (list (second rf) (third rf))))
+           (tf (gen-local "RMF")) (tl (gen-local "RML")))
+      `((:declare-local ,tf "LispObject")
+        (:declare-local ,tl "LispObject")
+        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (second rf)))
+        (:stloc ,tf)
+        ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (third rf)))
+        (:stloc ,tl)
+        (:ldloc ,tf) (:ldloc ,tl) (:ldarg ,args-idx) (:ldc-i4 ,start)
+        (:ldc-i4 ,(if rest-first 1 0))
+        ,@mode
+        (:call ,(if mode "Runtime.ApplyListRestM" "Runtime.ApplyListRest"))))))
 
 (defun %rest-forward-apply (expr)
   "(APPLY F A... REST) with REST the &REST variable of the frame being compiled (see
@@ -131,17 +313,26 @@
     (declare (ignore sym key))
     (let* ((f (second expr))
            (fixed (butlast (cddr expr)))
+           (one (= (length fixed) 1))
            (mode (and (<= 2 (length (cdr expr)) 4) (%call-site-mv-mode (cdr expr))))
            (tf (gen-local "RFF")) (ta (gen-local "RFA")))
       `((:declare-local ,tf "LispObject")
         (:declare-local ,ta "LispObject[]")
         ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr f))
         (:stloc ,tf)
-        ,@(if fixed (compile-args-array fixed) '((:ldnull)))
-        (:stloc ,ta)
-        (:ldloc ,tf) (:ldloc ,ta) (:ldarg ,args-idx) (:ldc-i4 ,start)
+        ,@(cond (one nil)
+                (fixed (compile-args-array fixed))
+                (t '((:ldnull))))
+        ,@(unless one `((:stloc ,ta)))
+        (:ldloc ,tf)
+        ,@(if one
+              (let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-value-arg (car fixed)))
+              `((:ldloc ,ta)))
+        (:ldarg ,args-idx) (:ldc-i4 ,start)
         ,@mode
-        (:call ,(if mode "Runtime.ApplyArgsM" "Runtime.ApplyArgs"))))))
+        (:call ,(if one
+                    (if mode "Runtime.ApplyArgs1M" "Runtime.ApplyArgs1")
+                    (if mode "Runtime.ApplyArgsM" "Runtime.ApplyArgs")))))))
 
 (defun compile-aref-form (expr)
   "The AREF form handler. Numeric/float-backed array locals read the element
@@ -256,9 +447,14 @@
         (car (numeric-array-aref-entry aref-form)) float-kind))
       (t
        (case (length args)
-         (3 (if native
-                (compile-aref-native-index-call (first args) idxs "Runtime.ArefSetL" val)
-                (compile-ternary-call args "Runtime.ArefSet")))
+         (3 (cond ((and native (consp (first args)) (eq (car (first args)) '%check-sbit)
+                        (= (length (first args)) 2))
+                   ;; (SETF (SBIT A I) V): SbitSetL makes the simple-bit-array check
+                   ;; itself, in the same call as the store.
+                   (compile-aref-native-index-call (second (first args)) idxs "Runtime.SbitSetL" val))
+                  (native
+                   (compile-aref-native-index-call (first args) idxs "Runtime.ArefSetL" val))
+                  (t (compile-ternary-call args "Runtime.ArefSet"))))
          (4 (if native
                 (compile-aref-native-index-call (first args) idxs "Runtime.ArefSet2DL" val)
                 (compile-quaternary-call args "Runtime.ArefSet2D")))
@@ -382,7 +578,7 @@
             (eq (funcall *known-type-name-p-fn* spec) :deftype)
             (null (find-class spec nil)))
        (multiple-value-bind (e expanded)
-           (ignore-errors (funcall *typexpand-1-fn* spec))
+           (handler-case (funcall *typexpand-1-fn* spec) (error () (values nil nil)))
          (and expanded (not (eq e spec)) (%slot-inline-form v e (1+ depth)))))
       ((and (consp spec) (eq (car spec) 'member) (cdr spec) (listp (cdr spec))
             (<= (length (cdr spec)) 8))
@@ -443,6 +639,9 @@
              (string 'string)
              (cons 'cons)
              (t nil))))
+        ;; (%REQUIRE-REAL X): checked to be a real number.
+        ((and (consp expr) (symbolp (car expr)) (string= (symbol-name (car expr)) "%REQUIRE-REAL"))
+         'real)
         ((and (symbolp expr) (boundp '*cstate*))
          (let ((key (lookup-local expr)))
            (let ((ty (and key (cdr (assoc key (cstate-proven-type-locals) :test #'equal)))))
@@ -524,6 +723,15 @@
             (when (find :boxed kinds :key #'car :test-not #'eq)
               (cons (car entry) kinds))))))))
 
+;;; Return a raw store's result: the original object for a variable or constant.
+(defun %struct-raw-store-result (val default)
+  "The result of a raw slot store of VAL, or DEFAULT when VAL must be boxed."
+  (if (if (symbolp val)
+          (not (nth-value 1 (lookup-symbol-macro val)))
+          (constantp val))
+      `((:pop) ,@(compile-value-arg val))
+      default))
+
 (defun %compile-make-struct-raw (expr plan)
   "Instructions for EXPR as %MAKE-STRUCT-RAW-PLAN planned it: each value into a
    temporary of its kind, in order, then the boxed ones into a LispObject[]
@@ -551,12 +759,18 @@
                            (:single `(,@(compile-as-single v) (:call "Runtime.SingleBits"))))
                        (:stloc ,tmp)))
       (:ldloc ,name-tmp)
-      ,@(if all-raw
-            '((:ldnull))
-            `((:ldc-i4 ,n) (:newarr "LispObject")
-              ,@(loop for k in kinds for tmp in temps for i from 0
-                      when (eq k :boxed)
-                        append `((:dup) (:ldc-i4 ,i) (:ldloc ,tmp) (:stelem-ref)))))
+      ,@(cond
+          ;; At most four slots, some boxed and some raw: the boxed values go as
+          ;; arguments (by slot), and the instance keeps them in its own fields.
+          ((and (not all-raw) (<= n 4) (<= nraw 4))
+           (loop for i from 0 below 4
+                 append (let ((tmp (and (< i n) (eq (nth i kinds) :boxed) (nth i temps))))
+                          (if tmp `((:ldloc ,tmp)) '((:ldnull))))))
+          (all-raw '((:ldnull)))
+          (t `((:ldc-i4 ,n) (:newarr "LispObject")
+               ,@(loop for k in kinds for tmp in temps for i from 0
+                       when (eq k :boxed)
+                         append `((:dup) (:ldc-i4 ,i) (:ldloc ,tmp) (:stelem-ref))))))
       ,@(if (<= nraw 4)
             `(,@(loop for p from 0 below 4
                       collect (let ((tmp (loop for k in kinds for tmp in temps for pos in positions
@@ -564,7 +778,9 @@
                                                  return tmp)))
                                 (if tmp `(:ldloc ,tmp) '(:ldc-i8 0))))
               (:ldc-i4 ,version) (:ldc-i8 ,mask) (:ldc-i4 ,n) (:ldc-i4 ,nraw)
-              (:call "Runtime.MakeStructRawInline"))
+              (:call ,(if (and (not all-raw) (<= n 4))
+                          "Runtime.MakeStructRawInlineBoxed"
+                          "Runtime.MakeStructRawInline")))
             `((:ldc-i4 ,nraw) (:newarr "Int64")
               ,@(loop for k in kinds for tmp in temps for pos in positions
                       unless (eq k :boxed)
@@ -981,7 +1197,9 @@
    wrong type, as safe code should (CLHS 1.4.2). A literal NIL or 0 init is left alone: LOOP binds its
    variables to those before the first iteration, whatever their declared type. BINDINGS itself when
    the code is not at SAFETY 3 or nothing is declared."
-  (if (not (and (compiling-at-safety-3-p) (listp bindings)))
+  ;; The safety the body's own (declare (optimize (safety 3))) asks for counts: it is not yet in
+  ;; force when this is called, as the function's is.
+  (if (not (and (eql (body-safety body) 3) (listp bindings)))
       bindings
       (let ((types '()))
         (dolist (f body)
@@ -991,17 +1209,82 @@
               (cond ((eq (car spec) 'type)
                      (dolist (v (cddr spec)) (when (symbolp v) (push (cons v (cadr spec)) types))))
                     ((member (symbol-name (car spec))
-                             '("FIXNUM" "INTEGER" "STRING" "SYMBOL" "LIST" "CONS" "NUMBER" "FLOAT" "DOUBLE-FLOAT" "SINGLE-FLOAT"
+                             '("FIXNUM" "INTEGER" "BIT" "UNSIGNED-BYTE" "SIGNED-BYTE" "STRING" "SYMBOL" "LIST" "CONS" "NUMBER" "FLOAT" "DOUBLE-FLOAT" "SINGLE-FLOAT"
                                "CHARACTER" "SIMPLE-STRING" "VECTOR" "SIMPLE-VECTOR" "REAL" "RATIONAL" "FUNCTION" "HASH-TABLE")
                              :test #'string=)
                      (dolist (v (cdr spec)) (when (symbolp v) (push (cons v (car spec)) types))))))))
         (if (null types)
             bindings
             (mapcar (lambda (b)
-                      (if (and (consp b) (consp (cdr b)) (not (member (cadr b) '(nil 0))) (assoc (car b) types))
+                      (if (and (consp b) (consp (cdr b)) (not (member (cadr b) '(nil 0))) (assoc (car b) types)
+                               ;; A FIXNUM variable whose init is provably one needs no check of the
+                               ;; init, and left unwrapped it is an Int64 slot, where a later SETQ of
+                               ;; a non-fixnum is the TYPE-ERROR (the wrapped init made the slot a
+                               ;; boxed one that nothing checked after the binding).
+                               (not (and (member (cdr (assoc (car b) types)) '(fixnum cl:fixnum))
+                                         (fixnum-typed-p (cadr b)))))
                           (list (car b) (list '%check-declared-type (list 'quote (cdr (assoc (car b) types))) (cadr b)))
                           b))
                     bindings)))))
+
+(defun %compile-parse-integer-single-keyword (args)
+  "Instructions for (PARSE-INTEGER STR :RADIX R) or (PARSE-INTEGER STR :JUNK-ALLOWED J)."
+  (when (= (length args) 3)
+    (let ((str (first args)) (key (second args)) (val (third args)))
+      (when (keywordp key)
+        (let ((method (case key
+                        (:radix "Runtime.ParseIntegerRadix")
+                        (:junk-allowed "Runtime.ParseIntegerJunkAllowed")
+                        (t nil))))
+          (when method
+            (let ((ts (gen-local "PIS")) (tv (gen-local "PIV")))
+              `((:declare-local ,ts "LispObject")
+                (:declare-local ,tv "LispObject")
+                ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr str)) (:stloc ,ts)
+                ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr val)) (:stloc ,tv)
+                (:ldloc ,ts)
+                (:ldloc ,tv)
+                (:call ,method)))))))))
+
+(defun %compile-parse-integer-start-end-junk (args)
+  "Instructions for (PARSE-INTEGER STR :START S :END E :JUNK-ALLOWED J), the three keywords in any
+   order, each once; NIL otherwise."
+  (when (= (length args) 7)
+    (let ((keys (list (second args) (fourth args) (sixth args)))
+          (vals (list (third args) (fifth args) (seventh args))))
+      (when (and (every #'keywordp keys)
+                 (equal (sort (copy-list keys) #'string<) '(:end :junk-allowed :start)))
+        (let ((ts (gen-local "PIS")) (tmps (loop repeat 3 collect (gen-local "PIK"))))
+          `((:declare-local ,ts "LispObject")
+            ,@(loop for tm in tmps collect `(:declare-local ,tm "LispObject"))
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr (first args))) (:stloc ,ts)
+            ,@(loop for v in vals for tm in tmps
+                    append `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr v)) (:stloc ,tm)))
+            (:ldloc ,ts)
+            ,@(loop for k in '(:start :end :junk-allowed)
+                    collect `(:ldloc ,(nth (position k keys) tmps)))
+            (:call "Runtime.ParseIntegerStartEndJunk")))))))
+
+(defun %compile-parse-integer-start-end (args)
+  "Instructions for (PARSE-INTEGER STR :START S :END E), either keyword order; NIL otherwise."
+  (when (= (length args) 5)
+    (let ((str (first args))
+          (k1 (second args)) (v1 (third args))
+          (k2 (fourth args)) (v2 (fifth args)))
+      (when (and (keywordp k1) (keywordp k2)
+                 (or (and (eq k1 :start) (eq k2 :end))
+                     (and (eq k1 :end) (eq k2 :start))))
+        (let ((ts (gen-local "PIS")) (t1 (gen-local "PI1")) (t2 (gen-local "PI2")))
+          `((:declare-local ,ts "LispObject")
+            (:declare-local ,t1 "LispObject")
+            (:declare-local ,t2 "LispObject")
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr str)) (:stloc ,ts)
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr v1)) (:stloc ,t1)
+            ,@(let ((*in-tail-position* nil) (*in-mv-context* nil)) (compile-expr v2)) (:stloc ,t2)
+            (:ldloc ,ts)
+            (:ldloc ,(if (eq k1 :start) t1 t2))
+            (:ldloc ,(if (eq k1 :end) t1 t2))
+            (:call "Runtime.ParseIntegerStartEnd")))))))
 
 (let ((h *compile-form-handlers*))
 
@@ -1074,7 +1357,15 @@
                 `(,@(compile-args-array args) (:call "Runtime.NumNotEqualN"))))))
 
   ;; Equality
-  (setf (gethash 'eq h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.Eq")))
+  (setf (gethash 'eq h)
+        (lambda (expr)
+          ;; Against a literal that is never a number the comparison is by reference only.
+          (compile-binary-call (cdr expr)
+                               (if (and (= (length (cdr expr)) 2)
+                                        (or (%eq-nonnumber-literal-p (second expr))
+                                            (%eq-nonnumber-literal-p (third expr))))
+                                   "Runtime.EqRef"
+                                   "Runtime.Eq"))))
   (setf (gethash 'eql h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.Eql")))
   (setf (gethash 'equal h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.Equal")))
   (setf (gethash 'equalp h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.Equalp" "EQUALP")))
@@ -1085,7 +1376,41 @@
   (setf (gethash 'cdr h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.Cdr" "CDR")))
   (setf (gethash 'list h) (lambda (expr) (compile-list-call (cdr expr))))
   (setf (gethash 'list* h) (lambda (expr) (compile-list-star-call (cdr expr))))
+  (setf (gethash '%check-sbit h)
+        (lambda (expr) (compile-unary-call (cdr expr) "Runtime.CheckSimpleBitArray" "%CHECK-SBIT")))
+  (dolist (name '(sbit bit))
+    (let ((name name))
+      (setf (gethash name h)
+            (lambda (expr)
+              (if (%bit-ref-form-p expr)
+                  `(,@(compile-as-long expr) (:call "Fixnum.Make"))
+                  (compile-named-call name (cdr expr)))))))
+  (setf (gethash 'vector h) (lambda (expr) (compile-vector-call (cdr expr))))
   (setf (gethash 'append h) (lambda (expr) (compile-append (cdr expr))))
+  ;; CHAR= CHAR< CHAR> CHAR<= CHAR>= of two or three operands (their value is T or NIL): a direct
+  ;; call, not a lookup of the function by symbol and an Invoke. Other counts take the
+  ;; variadic function. (CHAR= with two is handled where it always was.)
+  (dolist (entry '((char= "Runtime.CharEq3" nil) (char< "Runtime.CharLt3" "Runtime.CharLt")
+                   (char> "Runtime.CharGt3" "Runtime.CharGt") (char<= "Runtime.CharLe3" "Runtime.CharLe")
+                   (char>= "Runtime.CharGe3" "Runtime.CharGe")))
+    (let ((name (first entry)) (m3 (second entry)) (m2 (third entry)))
+      (setf (gethash name h)
+            (lambda (expr)
+              (case (length (cdr expr))
+                (3 (compile-ternary-call (cdr expr) m3 (symbol-name name)))
+                (2 (if m2
+                       (compile-binary-call (cdr expr) m2 (symbol-name name))
+                       (compile-named-call name (cdr expr))))
+                (t (compile-named-call name (cdr expr))))))))
+  ;; (GETF plist indicator [default]): a direct call, not a lookup of the function by symbol
+  ;; and an Invoke with the entry's arity at each use.
+  (setf (gethash 'getf h)
+        (lambda (expr)
+          (case (length (cdr expr))
+            (2 (compile-binary-call (cdr expr) "Runtime.GetfNoDefault" "GETF"))
+            (3 (compile-ternary-call (cdr expr) "Runtime.GetfDefault" "GETF"))
+            (t (compile-static-program-error
+                (format nil "GETF: wrong number of arguments: ~a (expected 2 to 3)" (length (cdr expr))))))))
   (setf (gethash 'length h)
         (lambda (expr)
           (let ((e (and (= (length expr) 2)
@@ -1130,6 +1455,15 @@
                     (let ((tf (fourth args)))
                       (and (consp tf) (eq (car tf) 'function) (eq (cadr tf) 'eq))))
                (compile-binary-call (list (first args) (second args)) "Runtime.MemberEq"))
+              ;; (member x l :test #'eql) is the default test; with a character test,
+              ;; the keyword parsing and the call through the function object are skipped.
+              ((and (= n-args 4) (eq (third args) :test) (%member-test-name (fourth args)))
+               (let ((name (%member-test-name (fourth args))))
+                 (case name
+                   (eql (compile-binary-call (list (first args) (second args)) "Runtime.Member" "MEMBER"))
+                   (t (compile-ternary-call (list (first args) (second args)
+                                                  (if (eq name 'char-equal) t nil))
+                                            "Runtime.MemberChar")))))
               ((cddr args) (compile-named-call 'member args))
               (t (compile-binary-call args "Runtime.Member" "MEMBER"))))))
 
@@ -1377,9 +1711,12 @@
   (setf (gethash 'subtypep h)
         (lambda (expr)
           (let ((args (cdr expr)))
-            (if (= (length args) 3)
-                (compile-binary-call (list (first args) (second args)) "Runtime.SubtypepMv")
-                (compile-binary-call args "Runtime.SubtypepMv")))))
+            (cond
+              ((%subtypep-constant-rewrite expr)
+               (compile-expr (%subtypep-constant-rewrite expr)))
+              ((= (length args) 3)
+               (compile-binary-call (list (first args) (second args)) "Runtime.SubtypepMv"))
+              (t (compile-binary-call args "Runtime.SubtypepMv"))))))
 
   ;; Array ops. When every index is statically fixnum-typed (e.g. an
   ;; Int64-slot loop counter), lower the indices as raw longs and call the
@@ -1410,7 +1747,25 @@
                       (list 'row-major-aref (first args) (second args))))
                 (compile-%aref-set-form (cons '%aref-set args))
                 (compile-named-call '%set-row-major-aref args)))))
-  (setf (gethash '%char-set h) (lambda (expr) (compile-ternary-call (cdr expr) "Runtime.CharSet")))
+  (setf (gethash '%char-set h)
+        (lambda (expr)
+          (if (and (= (length (cdr expr)) 3) (fixnum-typed-p (third expr)))
+              (compile-char-set-long (cdr expr))
+              (compile-ternary-call (cdr expr) "Runtime.CharSet"))))
+  ;; Fill-pointer operations on a vector: a direct call, not a lookup of the function by
+  ;; symbol and an Invoke at each use.
+  (setf (gethash 'fill-pointer h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.FillPointer" "FILL-POINTER")))
+  (setf (gethash '%set-fill-pointer h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.SetFillPointer" "%SET-FILL-POINTER")))
+  (setf (gethash 'array-has-fill-pointer-p h)
+        (lambda (expr) (compile-unary-call (cdr expr) "Runtime.ArrayHasFillPointerP" "ARRAY-HAS-FILL-POINTER-P")))
+  (setf (gethash 'adjustable-array-p h)
+        (lambda (expr) (compile-unary-call (cdr expr) "Runtime.AdjustableArrayP" "ADJUSTABLE-ARRAY-P")))
+  (setf (gethash 'vector-pop h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.VectorPop1" "VECTOR-POP")))
+  (setf (gethash 'array-rank h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.ArrayRank1" "ARRAY-RANK")))
+  (setf (gethash 'array-total-size h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.ArrayTotalSize1" "ARRAY-TOTAL-SIZE")))
+  (setf (gethash 'array-dimension h) (lambda (expr) (compile-binary-call (cdr expr) "Runtime.ArrayDimension2" "ARRAY-DIMENSION")))
+  (setf (gethash '%gethash-incf h) (lambda (expr) (compile-quaternary-call (cdr expr) "Runtime.GethashIncf")))
+  (setf (gethash '%gethash-decf h) (lambda (expr) (compile-quaternary-call (cdr expr) "Runtime.GethashDecf")))
   (setf (gethash 'vector-push-extend h)
         (lambda (expr)
           (if (= (length (cdr expr)) 2)
@@ -1450,6 +1805,8 @@
   (setf (gethash 'locally h)
         (lambda (expr)
           (let ((*at-toplevel* *compile-was-toplevel*)
+                ;; (locally (declare (optimize (safety N))) ...) sets the safety of its body.
+                (*function-safety* (or (body-declared-safety (cdr expr)) *function-safety*))
                 (*lexical-decl-frames* (%push-decl-frame :locally nil (cdr expr)))
                 ;; (locally (declare (notinline f)) ...) extends the notinline set
                 ;; for the body (CLHS 3.2.2.1.1).
@@ -1667,6 +2024,20 @@
                                                (list* tl nil (acons key spec (cddr e)))
                                                (list* tl nil (acons key spec nil))))))))
                   `(,@(%arg-check-instrs var spec) ,@(emit-nil)))))))
+  ;; (%STRUCT-INCF OBJ IDX DELTA 'TYPE 'INFO) / %STRUCT-DECF: INCF / DECF of a FIXNUM slot, one call.
+  (dolist (entry '((%struct-incf . "Runtime.StructIncf") (%struct-decf . "Runtime.StructDecf")))
+    (let ((name (car entry)) (method (cdr entry)))
+      (setf (gethash name h)
+            (lambda (expr)
+              (destructuring-bind (obj idx delta type info) (cdr expr)
+                (flet ((unq (q) (if (and (consp q) (eq (car q) 'quote)) (cadr q) q)))
+                  `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                        `(,@(compile-value-arg obj)
+                          ,@(compile-value-arg idx)
+                          ,@(compile-value-arg delta)))
+                    ,@(compile-quoted (unq type))
+                    ,@(compile-quoted (unq info))
+                    (:call ,method))))))))
   (setf (gethash '%struct-ref h)
         (lambda (expr)
           (let ((obj (first (cdr expr))) (idx (second (cdr expr))))
@@ -1684,63 +2055,66 @@
                     ;; double: no box either way. StructSetD falls back when the
                     ;; slot turns out not to be raw, so this is safe to emit
                     ;; whenever the VALUE is a double.
-                    (let ((hit (struct-backing-entry obj idx type)))
+                    (let ((hit (struct-backing-entry obj idx type))
+                          (result (%struct-raw-store-result val '((:newobj "DoubleFloat")))))
                       (if (and hit (eql (cddr hit) 1))
                           `(,@(%struct-backing-write
                                hit obj idx
                                (let ((*in-tail-position* nil) (*in-mv-context* nil))
                                  (compile-as-double val))
                                type)
-                            (:newobj "DoubleFloat"))
+                            ,@result)
                           `(,@(compile-struct-object obj type)
                             (:ldc-i4 ,idx)
                             ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                                 (compile-as-double val))
                             ,@(%raw-struct-call "Runtime.StructSetD" owner)
-                            (:newobj "DoubleFloat"))))
+                            ,@result)))
                 (if (and (single-float-typed-p val) (not (fixnum-typed-p val)))
                     ;; A single-typed value: StructSetF stores its bits into a
                     ;; raw single-float slot and falls back to the boxed store
                     ;; otherwise, like StructSetD.
-                    (let ((hit (struct-backing-entry obj idx type)))
+                    (let ((hit (struct-backing-entry obj idx type))
+                          (result (%struct-raw-store-result val '((:newobj "SingleFloat")))))
                       (if (and hit (eql (cddr hit) 2))
                           `(,@(%struct-backing-write
                                hit obj idx
                                (let ((*in-tail-position* nil) (*in-mv-context* nil))
                                  (compile-as-single val))
                                type)
-                            (:newobj "SingleFloat"))
+                            ,@result)
                           `(,@(compile-struct-object obj type)
                             (:ldc-i4 ,idx)
                             ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                                 (compile-as-single val))
                             ,@(%raw-struct-call "Runtime.StructSetF" owner)
-                            (:newobj "SingleFloat"))))
+                            ,@result)))
                 (if (u64-native-local-p val)
                     `(,@(compile-struct-object obj type)
                       (:ldc-i4 ,idx)
                       (:ldloc ,(u64-native-local-p val))
                       ,@(%raw-struct-call "Runtime.StructSetU64" owner)
-                      (:call "Runtime.BoxU64"))
+                      ,@(%struct-raw-store-result val '((:call "Runtime.BoxU64"))))
                 (if (fixnum-typed-p val)
                     ;; Fixnum value: store the raw long. The box the ordinary path
                     ;; makes for the call was the entire allocation of a
                     ;; struct-writing loop. Fixnum.Make here re-boxes for the SETF
                     ;; value, and in statement position the peephole removes it.
-                    (let ((hit (struct-backing-entry obj idx type)))
+                    (let ((hit (struct-backing-entry obj idx type))
+                          (result (%struct-raw-store-result val '((:call "Fixnum.Make")))))
                       (if (and hit (eql (cddr hit) 0))
                           `(,@(%struct-backing-write
                                hit obj idx
                                (let ((*in-tail-position* nil) (*in-mv-context* nil))
                                  (compile-as-long val))
                                type)
-                            (:call "Fixnum.Make"))
+                            ,@result)
                           `(,@(compile-struct-object obj type)
                             (:ldc-i4 ,idx)
                             ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                                 (compile-as-long val))
                             ,@(%raw-struct-call "Runtime.StructSetL" owner)
-                            (:call "Fixnum.Make"))))
+                            ,@result)))
                 `(,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
                       (compile-expr obj))
                   (:ldc-i4 ,idx)
@@ -1840,12 +2214,16 @@
   (setf (gethash '%find-class-or-nil h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.FindClassOrNil")))
   (setf (gethash 'class-of h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.ClassOf")))
   (setf (gethash 'boundp h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.Boundp")))
-  ;; (parse-integer s) with no keywords is a direct call; any keyword takes the ordinary call.
+  ;; (parse-integer s) with no keywords and the :START/:END shape are direct calls;
+  ;; any other keyword list takes the ordinary call.
   (setf (gethash 'parse-integer h)
         (lambda (expr)
-          (if (= (length (cdr expr)) 1)
-              (compile-unary-call (cdr expr) "Runtime.ParseInteger1")
-              (compile-named-call (car expr) (cdr expr)))))
+          (or (%compile-parse-integer-start-end (cdr expr))
+              (%compile-parse-integer-start-end-junk (cdr expr))
+              (%compile-parse-integer-single-keyword (cdr expr))
+              (if (= (length (cdr expr)) 1)
+                  (compile-unary-call (cdr expr) "Runtime.ParseInteger1")
+                  (compile-named-call (car expr) (cdr expr))))))
   (setf (gethash 'fboundp h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.FboundpDirect")))
   (setf (gethash 'symbol-plist h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.SymbolPlistDirect")))
   (setf (gethash 'symbol-function h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.SymbolFunction")))
@@ -2043,6 +2421,14 @@
              `(,@(compile-as-single (cadr expr)) (:conv-r4) (:call "Math.AbsSingle")
                (:newobj "SingleFloat")))
             (t (compile-unary-call (cdr expr) "Runtime.Abs")))))
+  ;; SIGNUM of a fixnum is one of three cached fixnums; the raw lane keeps a
+  ;; declared-fixnum local from being boxed just to reach the runtime entry.
+  (setf (gethash 'signum h)
+        (lambda (expr)
+          (let ((args (cdr expr)))
+            (if (and (= (length args) 1) (fixnum-typed-p (first args)))
+                `(,@(compile-as-long expr) (:call "Fixnum.Make"))
+                (compile-named-call 'signum args)))))
   ;; Fixnum-typed operands take the raw int64 path: (mod i 128) in a loop over an
   ;; Int64-slot counter otherwise boxes the counter on every iteration just to
   ;; call the generic entry.
@@ -2091,9 +2477,9 @@
               (let ((kind (and (not *in-mv-context*) (not *in-tail-position*)
                                (%float-round-arg-kind op (cdr expr)))))
                 (case kind
-                  (:single `(,@(compile-float-round-raw op (cadr expr) kind)
+                  (:single `(,@(compile-float-round-raw-args op (cdr expr) kind)
                              (:newobj "SingleFloat")))
-                  (:double `(,@(compile-float-round-raw op (cadr expr) kind)
+                  (:double `(,@(compile-float-round-raw-args op (cdr expr) kind)
                              (:newobj "DoubleFloat")))
                   (t (compile-named-call op (cdr expr)))))))))
   (setf (gethash 'min h)
@@ -2118,7 +2504,155 @@
                   ((= (length args) 1) (compile-named-call 'max args))
                   ((= (length args) 2) (compile-binary-call args "Runtime.Max"))
                   (t (compile-expr (reduce (lambda (a b) `(max ,a ,b)) args)))))))
-;; (POSITION-IF (LAMBDA (X) ...) SEQ) and its relatives, with a literal
+  ;; Real unary functions of a declared float: one raw System.Math call and one
+  ;; box. The generic entry takes the argument boxed and returns a box, which a
+  ;; raw parameter has to be boxed again for.
+  (dolist (op '(sin cos tan exp atan sinh cosh tanh))
+    (let ((op op)
+          (entry (cdr (assoc op +double-real-unary-entries+))))
+      (setf (gethash op h)
+            (lambda (expr)
+              (let ((args (cdr expr)))
+                (cond
+                  ((and (= (length args) 1) (not (compiling-at-safety-3-p))
+                        (not (local-function-entry op))
+                        (double-float-typed-p (first args)))
+                   `(,@(compile-as-double (first args)) (:call ,entry)
+                     (:newobj "DoubleFloat")))
+                  ((and (= (length args) 1) (not (compiling-at-safety-3-p))
+                        (not (local-function-entry op))
+                        (single-float-typed-p (first args)))
+                   `(,@(compile-as-single (first args)) (:conv-r8)
+                     (:call ,entry) (:conv-r4) (:newobj "SingleFloat")))
+                  (t (compile-named-call op args))))))))
+  ;; SQRT and LOG of a declared float take the raw lane and box the result;
+  ;; their value is complex for a negative argument, which the runtime entry
+  ;; handles itself.
+  (setf (gethash 'sqrt h)
+        (lambda (expr)
+          (let ((args (cdr expr)))
+            (cond
+              ((and (not (compiling-at-safety-3-p))
+                    (= (length args) 1) (not (local-function-entry 'sqrt))
+                    (double-float-typed-p (first args)))
+               `(,@(compile-as-double (first args)) (:call "Runtime.SqrtDoubleBoxed")))
+              ((and (not (compiling-at-safety-3-p))
+                    (= (length args) 1) (not (local-function-entry 'sqrt))
+                    (single-float-typed-p (first args)))
+               `(,@(compile-as-single (first args)) (:call "Runtime.SqrtSingleBoxed")))
+              (t (compile-named-call 'sqrt args))))))
+  (setf (gethash 'log h)
+        (lambda (expr)
+          (let ((args (cdr expr)))
+            (cond
+              ((and (not (compiling-at-safety-3-p))
+                    (= (length args) 1) (not (local-function-entry 'log))
+                    (double-float-typed-p (first args)))
+               `(,@(compile-as-double (first args)) (:call "Runtime.LogBoxedDouble")))
+              ((and (not (compiling-at-safety-3-p))
+                    (= (length args) 1) (not (local-function-entry 'log))
+                    (single-float-typed-p (first args)))
+               `(,@(compile-as-single (first args)) (:call "Runtime.LogBoxedSingle")))
+              ((and (not (compiling-at-safety-3-p))
+                    (= (length args) 2) (not (local-function-entry 'log))
+                    (float-typed-p (first args)) (float-typed-p (second args)))
+               (if (or (double-float-typed-p (first args))
+                       (double-float-typed-p (second args)))
+                   `(,@(compile-as-double-widened (first args))
+                     ,@(compile-as-double-widened (second args))
+                     (:call "Runtime.Log2BoxedDouble"))
+                   `(,@(compile-as-single (first args))
+                     ,@(compile-as-single (second args))
+                     (:call "Runtime.Log2BoxedSingle"))))
+              (t (compile-named-call 'log args))))))
+  ;; ATAN with two arguments, in either float format.
+  (setf (gethash 'atan h)
+        (lambda (expr)
+          (let ((args (cdr expr)))
+            (cond
+              ((and (not (compiling-at-safety-3-p))
+                    (= (length args) 1) (not (local-function-entry 'atan))
+                    (double-float-typed-p (first args)))
+               `(,@(compile-as-double (first args)) (:call "Math.AtanDouble")
+                 (:newobj "DoubleFloat")))
+              ((and (not (compiling-at-safety-3-p))
+                    (= (length args) 1) (not (local-function-entry 'atan))
+                    (single-float-typed-p (first args)))
+               `(,@(compile-as-single (first args)) (:conv-r8)
+                 (:call "Math.AtanDouble") (:conv-r4) (:newobj "SingleFloat")))
+              ((and (not (compiling-at-safety-3-p))
+                    (= (length args) 2) (not (local-function-entry 'atan))
+                    (float-typed-p (first args)) (float-typed-p (second args)))
+               (if (or (double-float-typed-p (first args))
+                       (double-float-typed-p (second args)))
+                   `(,@(compile-as-double-widened (first args))
+                     ,@(compile-as-double-widened (second args))
+                     (:call "Runtime.Atan2DoubleBoxed"))
+                   `(,@(compile-as-single (first args))
+                     ,@(compile-as-single (second args))
+                     (:call "Runtime.Atan2SingleBoxed"))))
+              (t (compile-named-call 'atan args))))))
+  ;; FLOAT with a prototype is a conversion to one format, not an array call.
+  (setf (gethash 'float h)
+        (lambda (expr)
+          (let ((args (cdr expr)))
+            (cond
+              ((and (= (length args) 1) (not (compiling-at-safety-3-p))
+                    (not (local-function-entry 'float)))
+               (compile-unary-call args "Runtime.FloatDefault" "FLOAT"))
+              ((and (= (length args) 2) (not (compiling-at-safety-3-p))
+                    (not (local-function-entry 'float))
+                    (typep (second args) '(or single-float double-float)))
+               (let ((want-double (typep (second args) 'double-float))
+                     (x (first args)))
+                 (cond
+                   ((and want-double (double-float-typed-p x))
+                    `(,@(compile-as-double x) (:newobj "DoubleFloat")))
+                   ((and (not want-double) (single-float-typed-p x))
+                    `(,@(compile-as-single x) (:conv-r4) (:newobj "SingleFloat")))
+                   (t
+                    `(,@(compile-value-arg x)
+                      (:call ,(if want-double "Runtime.FloatDouble"
+                                  "Runtime.FloatSingle")))))))
+              (t (compile-named-call 'float args))))))
+  ;; SCALE-FLOAT of a declared float and a fixnum exponent: one scaleB.
+  (setf (gethash 'scale-float h)
+        (lambda (expr)
+          (let ((args (cdr expr)))
+            (if (and (= (length args) 2) (not (compiling-at-safety-3-p))
+                     (not (local-function-entry 'scale-float)))
+                (let ((x (first args)) (n (second args)))
+                  (cond
+                    ((and (not (compiling-at-safety-3-p)) (double-float-typed-p x) (fixnum-typed-p n))
+                     `(,@(compile-as-double x) ,@(compile-expr-to-long n)
+                       (:call "Runtime.ScaleFloatD")))
+                    ((and (not (compiling-at-safety-3-p)) (single-float-typed-p x) (fixnum-typed-p n))
+                     `(,@(compile-as-single x) ,@(compile-expr-to-long n)
+                       (:call "Runtime.ScaleFloatS")))
+                    (t (compile-binary-call args "Runtime.ScaleFloat"))))
+                (compile-named-call 'scale-float args)))))
+  (setf (gethash 'float-digits h)
+        (lambda (expr)
+          (let ((args (cdr expr)))
+            (cond
+              ((and (not (compiling-at-safety-3-p))
+                    (= (length args) 1) (double-float-typed-p (first args)))
+               `((:ldc-i8 53) (:call "Fixnum.Make")))
+              ((and (not (compiling-at-safety-3-p))
+                    (= (length args) 1) (single-float-typed-p (first args)))
+               `((:ldc-i8 24) (:call "Fixnum.Make")))
+              (t (compile-unary-call args "Runtime.FloatDigits" "FLOAT-DIGITS"))))))
+  ;; COMPLEX of two numbers: one complex, no argument array.
+  (setf (gethash 'complex h)
+        (lambda (expr)
+          (let ((args (cdr expr)))
+            (if (and (member (length args) '(1 2))
+                     (not (local-function-entry 'complex)))
+                (if (= (length args) 1)
+                    (compile-unary-call args "Runtime.MakeComplex1" "COMPLEX")
+                    (compile-binary-call args "Runtime.MakeComplex2"))
+                (compile-named-call 'complex args)))))
+  ;; (POSITION-IF (LAMBDA (X) ...) SEQ) and its relatives, with a literal
   ;; one-parameter lambda and no keyword arguments: the lambda body is
   ;; substituted into a loop over the sequence instead of being made into a
   ;; function object. A lambda with a free variable is a closure, and building
@@ -2131,16 +2665,18 @@
                 (if inline
                     (compile-expr inline)
                     (compile-named-call op (cdr expr))))))))
-  (setf (gethash 'gcd h)
-        (lambda (expr)
-          (if (= (length (cdr expr)) 2)
-              (compile-binary-call (cdr expr) "Runtime.Gcd")
-              (compile-named-call 'gcd (cdr expr)))))
-  (setf (gethash 'lcm h)
-        (lambda (expr)
-          (if (= (length (cdr expr)) 2)
-              (compile-binary-call (cdr expr) "Runtime.Lcm")
-              (compile-named-call 'lcm (cdr expr)))))
+  (dolist (op '(gcd lcm))
+    (let ((op op)
+          (method (if (eq op 'gcd) "Runtime.Gcd" "Runtime.Lcm")))
+      (setf (gethash op h)
+            (lambda (expr)
+              (let ((args (cdr expr)))
+                (cond ((= (length args) 2) (compile-binary-call args method))
+                      ;; Associative: three arguments fold into two native calls.
+                      ((= (length args) 3)
+                       (compile-expr `(,op (,op ,(first args) ,(second args))
+                                           ,(third args))))
+                      (t (compile-named-call op args))))))))
   (setf (gethash 'expt h)
         (lambda (expr)
           (if (= (length (cdr expr)) 2)
@@ -2148,7 +2684,9 @@
               (compile-named-call 'expt (cdr expr)))))
   (setf (gethash 'ash h)
         (lambda (expr)
-          (let ((args (cdr expr)))
+          ;; (ASH x (THE FIXNUM 5)): the count is the literal 5 (macros that wrap every operand in THE).
+          (let ((args (mapcar #'%strip-the-fixnum-literal (cdr expr))))
+            (setf expr (cons (car expr) args))
             (if (= (length args) 2)
                 (or (compile-ash-fast args)
                     (and (not (integerp (second args))) (fixnum-typed-p expr)
@@ -2166,19 +2704,36 @@
             (if (and spec (not (local-function-entry 'byte)))
                 (let* ((size (car spec)) (pos (cdr spec))
                        (mask (1- (ash 1 size)))
-                       (x (caddr expr)))
-                  (compile-expr (if (zerop pos)
-                                    `(logand ,x ,mask)
-                                    `(logand (ash ,x ,(- pos)) ,mask))))
+                       (x (caddr expr))
+                       ;; Masking X to the bits the field reads keeps the
+                       ;; shifted intermediate a fixnum for a wide integer.
+                       (lowmask (and (plusp pos) (< (+ size pos) 64)
+                                     (1- (ash 1 (+ size pos))))))
+                  (compile-expr
+                   (cond ((zerop pos) `(logand ,x ,mask))
+                         (lowmask `(logand (ash (logand ,x ,lowmask) ,(- pos)) ,mask))
+                         (t `(logand (ash ,x ,(- pos)) ,mask)))))
                 (if (= (length (cdr expr)) 2)
                     (compile-binary-call (cdr expr) "Runtime.Ldb")
                     (compile-named-call 'ldb (cdr expr)))))))
   ;; A byte specifier is a cons (SIZE . POSITION), as BYTE builds it.
   (setf (gethash 'byte h)
         (lambda (expr)
-          (if (= (length (cdr expr)) 2)
-              (compile-expr `(cons ,@(cdr expr)))
-              (compile-named-call 'byte (cdr expr)))))
+          (cond
+            ((/= (length (cdr expr)) 2)
+             (compile-named-call 'byte (cdr expr)))
+            ((and (typep (cadr expr) '(integer 0 *))
+                  (typep (caddr expr) '(integer 0 *)))
+             (compile-expr `(cons ,@(cdr expr))))
+            (t
+             ;; The checks come before the cons; a failed check calls the function,
+             ;; which signals the type error.
+             (let ((n (gensym "N")) (p (gensym "P")))
+               (compile-expr
+                `(let ((,n ,(cadr expr)) (,p ,(caddr expr)))
+                   (if (and (integerp ,n) (>= ,n 0) (integerp ,p) (>= ,p 0))
+                       (cons ,n ,p)
+                       (funcall 'byte ,n ,p)))))))))
   (setf (gethash 'byte-size h)
         (lambda (expr)
           (if (= (length (cdr expr)) 1)
@@ -2210,9 +2765,10 @@
     (let ((op op))
       (setf (gethash op h)
             (lambda (expr)
-              (if (%literal-byte-field-form-p expr)
-                  (compile-expr (%literal-byte-field-as-logand expr))
-                  (compile-named-call op (cdr expr)))))))
+              (cond ((%literal-byte-field-form-p expr)
+                     (compile-expr (%literal-byte-field-as-logand expr)))
+                    ((and (eq op 'mask-field) (try-compile-mfield expr)))
+                    (t (compile-named-call op (cdr expr))))))))
   (dolist (op '(logandc1 logandc2 logorc1 logorc2 lognand lognor logeqv))
     (let ((op op))
       (setf (gethash op h)
@@ -2238,7 +2794,9 @@
   (setf (gethash 'logtest h)
         (lambda (expr)
           (if (= (length (cdr expr)) 2)
-              (compile-binary-call (cdr expr) "Runtime.Logtest")
+              (if (%logbit-rewrite expr)
+                  (compile-form (%logbit-rewrite expr))
+                  (compile-binary-call (cdr expr) "Runtime.Logtest"))
               (compile-named-call 'logtest (cdr expr)))))
   (setf (gethash 'integer-length h)
         (lambda (expr)
@@ -2248,7 +2806,9 @@
   (setf (gethash 'logbitp h)
         (lambda (expr)
           (if (= (length (cdr expr)) 2)
-              (compile-binary-call (cdr expr) "Runtime.Logbitp")
+              (if (%logbit-rewrite expr)
+                  (compile-form (%logbit-rewrite expr))
+                  (compile-binary-call (cdr expr) "Runtime.Logbitp"))
               (compile-named-call 'logbitp (cdr expr)))))
   (dolist (item (list (list 'logior "Runtime.Logior2" "Runtime.Logior" 0 :or)
                       (list 'logand "Runtime.Logand2" "Runtime.Logand" -1 :and)
@@ -2314,15 +2874,55 @@
                      (compile-named-call name (cdr expr)))
                     ((null (cdr expr)) `((:call ,call0)))
                     (t (compile-unary-call (cdr expr) call1)))))))
+  (dolist (spec '((%format-nil-0 "Runtime.FormatNil0" 0)
+                  (%format-nil-1 "Runtime.FormatNil1" 1)
+                  (%format-nil-2 "Runtime.FormatNil2" 2)
+                  (%format-nil-3 "Runtime.FormatNil3" 3)
+                  (%format-nil-4 "Runtime.FormatNil4" 4)))
+    (let ((name (first spec)) (method (second spec)) (n (third spec)))
+      (setf (gethash name h)
+            (lambda (expr)
+              (let ((args (cdr expr)))
+                (unless (= (length args) (1+ n))
+                  (compile-static-program-error "internal FORMAT inline path: wrong argument count"))
+                `(,@(compile-value-args args)
+                  (:call ,method)))))))
+  (setf (gethash 'write-to-string h)
+        (lambda (expr)
+          (let ((args (cdr expr)))
+            (if (and (= (length args) 3) (eq (second args) :base)
+                     (not (member 'write-to-string *notinline-functions*))
+                     (not (%global-notinline-p 'write-to-string)))
+                (let ((ts (gen-local "WTS")) (tv (gen-local "WTB")))
+                  `((:declare-local ,ts "LispObject")
+                    (:declare-local ,tv "LispObject")
+                    ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                        (compile-expr (first args))) (:stloc ,ts)
+                    ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                        (compile-expr (third args))) (:stloc ,tv)
+                    (:ldloc ,ts)
+                    (:ldloc ,tv)
+                    (:call "Runtime.WriteToStringBase")))
+                (compile-named-call 'write-to-string args)))))
   (setf (gethash 'format h)
         (lambda (expr)
-          (let ((stream-tmp (gen-local "FMTDST")) (args-tmp (gen-local "FMTARGS")))
-            `((:declare-local ,stream-tmp "LispObject")
-              (:declare-local ,args-tmp "LispObject[]")
-              ,@(compile-value-arg (cadr expr)) (:stloc ,stream-tmp)
-              ,@(compile-args-array (cddr expr)) (:stloc ,args-tmp)
-              (:ldloc ,stream-tmp) (:ldloc ,args-tmp)
-              (:call "Runtime.Format")))))
+          ;; A literal control string of simple directives is written as the stream calls it
+          ;; means (%FORMAT-SIMPLE-FORM).
+          (let ((simple (and (not *cross-compiling*)
+                             (not (local-function-entry 'format))
+                             (not (macrolet-shadowed-p 'format))
+                             (not (member 'format *notinline-functions*))
+                             (not (%global-notinline-p 'format))
+                             (%format-simple-form (cdr expr)))))
+            (if simple
+                (compile-expr simple)
+                (let ((stream-tmp (gen-local "FMTDST")) (args-tmp (gen-local "FMTARGS")))
+                  `((:declare-local ,stream-tmp "LispObject")
+                    (:declare-local ,args-tmp "LispObject[]")
+                    ,@(compile-value-arg (cadr expr)) (:stloc ,stream-tmp)
+                    ,@(compile-args-array (cddr expr)) (:stloc ,args-tmp)
+                    (:ldloc ,stream-tmp) (:ldloc ,args-tmp)
+                    (:call "Runtime.Format")))))))
   (setf (gethash 'open h)
         (lambda (expr)
           (if (null (cdr expr))
@@ -2408,6 +3008,22 @@
           (if (= (length (cdr expr)) 1)
               `(,@(compile-value-arg (cadr expr)) ,@(compile-value-arg '*standard-input*) (:call "Runtime.UnreadChar"))
               (compile-binary-call (cdr expr) "Runtime.UnreadChar"))))
+  (setf (gethash 'write h)
+        (lambda (expr)
+          (let ((args (cdr expr)))
+            (cond
+              ((and (= (length args) 3) (eq (second args) :stream))
+               `(,@(compile-value-args (list (first args) (third args)))
+                 (:call "Runtime.WriteStream2")))
+              ((and (= (length args) 5) (eq (second args) :stream)
+                    (member (fourth args) '(:escape :base :radix)))
+               (let ((method (ecase (fourth args)
+                               (:escape "Runtime.WriteStreamEscape3")
+                               (:base "Runtime.WriteStreamBase3")
+                               (:radix "Runtime.WriteStreamRadix3"))))
+                 `(,@(compile-value-args (list (first args) (third args) (fifth args)))
+                   (:call ,method))))
+              (t (compile-named-call 'write args))))))
   (setf (gethash 'write-char h)
         (lambda (expr)
           (if (= (length (cdr expr)) 1)
@@ -2418,16 +3034,28 @@
   ;; pays on every string it writes.
   (setf (gethash 'write-string h)
         (lambda (expr)
-          (case (length (cdr expr))
-            (1 (compile-unary-call (cdr expr) "Runtime.WriteString1"))
-            (2 (compile-binary-call (cdr expr) "Runtime.WriteString2"))
-            (t `(,@(compile-args-array (cdr expr)) (:call "Runtime.WriteString"))))))
+          (let ((args (cdr expr)))
+            (case (length args)
+              (1 (compile-unary-call args "Runtime.WriteString1"))
+              (2 (compile-binary-call args "Runtime.WriteString2"))
+              (6 (if (and (eq (third args) :start) (eq (fifth args) :end))
+                     `(,@(compile-value-args (list (first args) (second args)
+                                                   (fourth args) (sixth args)))
+                       (:call "Runtime.WriteString4"))
+                     `(,@(compile-args-array args) (:call "Runtime.WriteString"))))
+              (t `(,@(compile-args-array args) (:call "Runtime.WriteString")))))))
   (setf (gethash 'write-line h)
         (lambda (expr)
-          (case (length (cdr expr))
-            (1 (compile-unary-call (cdr expr) "Runtime.WriteLine1"))
-            (2 (compile-binary-call (cdr expr) "Runtime.WriteLine2"))
-            (t `(,@(compile-args-array (cdr expr)) (:call "Runtime.WriteLine"))))))
+          (let ((args (cdr expr)))
+            (case (length args)
+              (1 (compile-unary-call args "Runtime.WriteLine1"))
+              (2 (compile-binary-call args "Runtime.WriteLine2"))
+              (6 (if (and (eq (third args) :start) (eq (fifth args) :end))
+                     `(,@(compile-value-args (list (first args) (second args)
+                                                   (fourth args) (sixth args)))
+                       (:call "Runtime.WriteLine4"))
+                     `(,@(compile-args-array args) (:call "Runtime.WriteLine"))))
+              (t `(,@(compile-args-array args) (:call "Runtime.WriteLine")))))))
   (setf (gethash 'directory h) (lambda (expr) `(,@(compile-args-array (cdr expr)) (:call "Runtime.Directory"))))
   (setf (gethash 'probe-file h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.ProbeFile")))
   (setf (gethash 'truename h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.Truename")))
@@ -2512,7 +3140,11 @@
     (let ((method (second spec)))
       (setf (gethash (first spec) h)
             (lambda (expr) (compile-unary-call (cdr expr) method)))))
-  (setf (gethash 'code-char h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.CodeChar")))
+  (setf (gethash 'code-char h)
+        (lambda (expr)
+          (if (and (= (length (cdr expr)) 1) (fixnum-typed-p (second expr)))
+              `(,@(compile-expr-to-long (second expr)) (:call "Runtime.CodeCharL"))
+              (compile-unary-call (cdr expr) "Runtime.CodeChar"))))
   (setf (gethash 'digit-char-p h)
         (lambda (expr)
           (let ((args (cdr expr)) (nargs (length (cdr expr))))
@@ -2557,7 +3189,15 @@
   (setf (gethash 'package-name h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.PackageName")))
   (setf (gethash 'package-error-package h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.PackageErrorPackage")))
   (setf (gethash 'delete-package h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.DeletePackage")))
-  (setf (gethash 'find-symbol h) (lambda (expr) `(,@(compile-args-array (cdr expr)) (:call "Runtime.FindSymbolMv"))))
+  (setf (gethash 'find-symbol h)
+        (lambda (expr)
+          (case (length (cdr expr))
+            (1 `(,@(compile-value-arg (cadr expr))
+                 (:call "Runtime.FindSymbol1")))
+            (2 `(,@(compile-value-args (cdr expr))
+                 (:call "Runtime.FindSymbol2")))
+            (t `(,@(compile-args-array (cdr expr))
+                 (:call "Runtime.FindSymbolMv"))))))
   (setf (gethash 'unintern h) (lambda (expr) `(,@(compile-args-array (cdr expr)) (:call "Runtime.UninternSymbol"))))
   (setf (gethash 'package-used-by-list h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.PackageUsedByList")))
   (setf (gethash 'package-use-list h) (lambda (expr) (compile-unary-call (cdr expr) "Runtime.PackageUseListL")))
@@ -2764,34 +3404,37 @@
           (if (and (= (length expr) 2) (typep (cadr expr) '(integer 0 1000)))
               `((:ldc-i4 ,(cadr expr)) (:call "MultipleValues.BindNthI"))
               (compile-unary-call (cdr expr) "MultipleValues.BindNth"))))
-  ;; (NTH-VALUE n form) with a literal N reads the value straight out of what
-  ;; FORM returned. The macro expansion it otherwise takes is
-  ;; (NTH n (MULTIPLE-VALUE-LIST form)), which builds the whole list of values to
-  ;; hand back one of them -- three conses to read value 1 of three. A computed
-  ;; index still goes through the macro.
+  ;; NTH-VALUE reads the value from the capture; a variable index is evaluated first.
   (setf (gethash 'nth-value h)
         (lambda (expr)
           (let ((n (cadr expr))
                 (form (caddr expr)))
-            (if (and (integerp n) (<= 0 n))
-                `((:call "MultipleValues.Reset")
-                  ;; FORM's values are read the moment it returns.
-                  ,@(%compile-for-capture form)
-                  (:ldc-i4 ,n)
-                  (:call "Runtime.NthValueOf"))
-                (compile-expr `(nth ,n (multiple-value-list ,form)))))))
+            (cond
+              ;; Value zero is the primary value, so in single-value position the
+              ;; form can be compiled as itself and the other values dropped.
+              ((and (eql n 0) (not *in-mv-context*) (not *in-tail-position*))
+               (compile-expr form))
+              ((and (integerp n) (<= 0 n))
+               `((:call "MultipleValues.Reset")
+                 ;; FORM's values are read the moment it returns.
+                 ,@(%compile-for-capture form)
+                 (:ldc-i4 ,n)
+                 (:call "Runtime.NthValueOf")))
+              (t
+               (let ((idx (gen-local "NVN")))
+                 `((:declare-local ,idx "LispObject")
+                   ,@(let ((*in-tail-position* nil) (*in-mv-context* nil))
+                       (compile-for-single-value n))
+                   (:stloc ,idx)
+                   (:call "MultipleValues.Reset")
+                   ,@(%compile-for-capture form)
+                   (:ldloc ,idx)
+                   (:call "Runtime.NthValueOfVariable"))))))))
 
   (setf (gethash 'multiple-value-list h)
         (lambda (expr)
           `((:call "MultipleValues.Reset")
-            ;; Keep MV context (multiple-value-list needs its arg's values) but
-            ;; block tail: a self-tail-call arg would otherwise fire TCO and
-            ;; dead-code the MultipleValuesList1 call.
-            ,@(let ((*in-tail-position* nil) (*in-mv-context* t))
-                ;; No capture mode here: consing the list out of the bind
-                ;; snapshot measured slower than out of an MvReturn, and the
-                ;; list conses anyway.
-                (compile-expr (cadr expr)))
+            ,@(%compile-for-capture (cadr expr))
             (:call "Runtime.MultipleValuesList1"))))
 
   ;; Shorthand
@@ -2838,6 +3481,9 @@
   ;; %dotimes-limit: the DOTIMES count, evaluated once before the loop and
   ;; clamped into int64 (Runtime.DotimesLimit), so the loop test is a raw
   ;; compare. As an object only when the limit slot is not native.
+  ;; %require-real: its argument, checked to be a real number (see DOTIMES).
+  (setf (gethash '%require-real h)
+        (lambda (expr) (compile-unary-call (cdr expr) "Runtime.RequireReal" "%REQUIRE-REAL")))
   (setf (gethash '%dotimes-limit h)
         (lambda (expr)
           `(,@(compile-value-arg (cadr expr))
@@ -2867,16 +3513,21 @@
   (setf (gethash 'progn h) (lambda (expr) (let ((*at-toplevel* *compile-was-toplevel*)) (compile-progn (cdr expr)))))
   (setf (gethash 'let h)
         (lambda (expr)
-          (let ((bad (%malformed-let-binding (cadr expr))))
-            (if bad
-                (compile-static-program-error (format nil "LET: malformed binding ~S" bad))
-                (let* ((*let-subst-size-memo* (or *let-subst-size-memo* (list nil)))
-                       (bindings (%safety3-typed-bindings (cadr expr) (cddr expr)))
-                       (form (or (let-scalar-replace-struct bindings (cddr expr))
-                                 (let-substitute-single-reads bindings (cddr expr)))))
-                  (if form
-                      (compile-expr form)
-                      (compile-let bindings (cddr expr) nil)))))))
+          (let ((bad (%malformed-let-binding (cadr expr)))
+                (dup (%duplicate-let-variable (cadr expr))))
+            (if (or bad dup)
+                (compile-static-program-error
+                 (if bad
+                     (format nil "LET: malformed binding ~S" bad)
+                     (format nil "LET: the variable ~S is bound twice" dup)))
+                (or (try-compile-sign-wrap expr)
+                    (let* ((*let-subst-size-memo* (or *let-subst-size-memo* (list nil)))
+                           (bindings (%safety3-typed-bindings (cadr expr) (cddr expr)))
+                           (form (or (let-scalar-replace-struct bindings (cddr expr))
+                                     (let-substitute-single-reads bindings (cddr expr)))))
+                      (if form
+                          (compile-expr form)
+                          (compile-let bindings (cddr expr) nil))))))))
   (setf (gethash 'let* h)
         (lambda (expr)
           (let ((bad (%malformed-let-binding (cadr expr))))
@@ -2902,6 +3553,14 @@
                             do (push `(setq ,(pop pairs) ,(pop pairs)) forms))
                       (compile-progn (nreverse forms))))))))
   (setf (gethash 'lambda h) (lambda (expr) (compile-function-special expr)))
+  ;; (%with-safety N form...): FORMs compiled at the SAFETY quality N, as the body of a lambda that
+  ;; declares it is (a lambda applied in place keeps its policy).
+  (setf (gethash '%with-safety h)
+        (lambda (expr)
+          (let* ((n (cadr expr))
+                 (*function-safety* n)
+                 (*cstate* (cstate-with *cstate* +cs-no-safepoint+ (eql n 0))))
+            (compile-progn (cddr expr)))))
   (setf (gethash 'funcall h) (lambda (expr) (compile-funcall (cdr expr))))
   (setf (gethash 'defun h) #'compile-defun-toplevel)
   ;; %inline-cs-spliced: dotnet-cs:inline-cs macro expansion target.
@@ -2962,7 +3621,7 @@
         (lambda (expr)
           (let ((name (cadr expr)) (expansion (caddr expr)))
             ;; Only a top-level defining macro has a compile-time effect (CLHS 3.2.3.1.1).
-            (when *compile-was-toplevel*
+            (when (and *compile-was-toplevel* (not (%symbol-macro-name-conflicts-p name)))
               (setf (gethash name *global-symbol-macros*) expansion)
               (incf *global-symbol-macros-epoch*))
             (compile-expr `(%register-symbol-macro-rt ',name ',expansion)))))
@@ -3048,8 +3707,11 @@
                    (compile-expr form)))))))
   (setf (gethash 'load-time-value h)
         (lambda (expr)
-          (let ((ltv-id (%next-ltv-id))
-                (mod-id *current-module-id*))
+          (let* ((site (and *ltv-sites* (gethash expr *ltv-sites*)))
+                 (ltv-id (if (integerp site) site (%next-ltv-id)))
+                 (mod-id *current-module-id*))
+            (when (and *ltv-sites* (null site) (not *ltv-eval-now*))
+              (setf (gethash expr *ltv-sites*) ltv-id))
             (cond
               ;; (LOAD-TIME-VALUE C) of a constant variable C: evaluating C at
               ;; load time or here gives the same object, so read C itself and
@@ -3061,13 +3723,18 @@
               ;; COMPILE and a compiling EVAL run the form now and treat the
               ;; result as a literal.
               (*ltv-eval-now*
-               (compile-expr `(quote ,(eval (cadr expr)))))
+               (let ((cell (or (and (consp site) site)
+                               (let ((c (list (eval (cadr expr)))))
+                                 (when *ltv-sites* (setf (gethash expr *ltv-sites*) c))
+                                 c))))
+                 (compile-expr `(quote ,(car cell)))))
               ;; In a fasl, CLHS LOAD-TIME-VALUE: the form is evaluated when the
               ;; file is loaded, every time it is loaded. COMPILE-TOPLEVEL runs
               ;; the evaluation ahead of the top level form, and the code here
               ;; reads the slot once and keeps it in a field of the loaded fasl.
               ((and mod-id *ltv-hoisted*)
-               (push `(%set-ltv-slot-in ,mod-id ,ltv-id ,(cadr expr)) (car *ltv-hoisted*))
+               (unless (integerp site)
+                 (push `(%set-ltv-slot-in ,mod-id ,ltv-id ,(cadr expr)) (car *ltv-hoisted*)))
                `((:load-const-cached ,(let ((*in-tail-position* nil) (*in-mv-context* nil))
                                         (compile-expr `(%get-ltv-slot-in ,mod-id ,ltv-id))))))
               (mod-id
@@ -3087,8 +3754,13 @@
         (lambda (expr) (let ((*at-toplevel* *compile-was-toplevel*)) (compile-eval-when (cadr expr) (cddr expr)))))
   (setf (gethash 'multiple-value-call h)
         (lambda (expr)
-          (let ((bind (%mv-call-lambda-bind expr)))
+          (let ((bind (%mv-call-lambda-bind expr))
+                (rf (and *rest-forward* (not (local-function-entry 'multiple-value-call))
+                         (not (local-function-entry 'values-list))
+                         (%mvc-values-list-pair expr (first *rest-forward*)))))
             (cond
+              ((and rf (eq (lookup-local (first *rest-forward*)) (second *rest-forward*)))
+               (%rest-forward-mvc expr rf))
               ;; The portable MULTIPLE-VALUE-BIND shape: bind straight from the
               ;; values, as the MULTIPLE-VALUE-BIND macro does.
               (bind (compile-expr bind))

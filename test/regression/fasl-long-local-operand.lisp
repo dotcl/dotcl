@@ -35,8 +35,8 @@
                                collect `(,v (logand (+ x ,i) 255)))
                     (declare (type (unsigned-byte 8) ,@vars))
                     (+ ,@vars))))
-         (src "flo-src-tmp.lisp")
-         (fasl "flo-src-tmp.fasl"))
+         (src (regression-temp-file "flo-src-tmp.lisp"))
+         (fasl (regression-temp-file "flo-src-tmp.fasl")))
     (unwind-protect
         (progn
           (with-open-file (s src :direction :output :if-exists :supersede)

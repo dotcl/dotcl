@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Interpreted closures must reject calls that do not match their lambda list.
 ;;;
 ;;; %mini-bind-params bound whatever it was given: a missing required argument

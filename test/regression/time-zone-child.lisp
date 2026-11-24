@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Local-zone behaviour under TZ in a child process; TZ only works on Unix.
 #-windows
 (progn
@@ -57,5 +58,33 @@
               "(handler-case (progn (encode-universal-time 0 0 0 1 1 1900) :no-error)
                             (type-error () :type-error))")
   :type-error)
+
+(deftest time-zone-child.fall-back-overlap-daylight
+  (tzc-values "America/New_York" "(decode-universal-time 3939602399)")
+  59 59 1 3 11 2024 6 t 5)
+
+(deftest time-zone-child.fall-back-overlap-standard
+  (tzc-values "America/New_York" "(decode-universal-time 3939602400)")
+  0 0 1 3 11 2024 6 nil 5)
+
+(deftest time-zone-child.fall-back-overlap-central-daylight
+  (tzc-values "America/Chicago" "(decode-universal-time 3939604230)")
+  30 30 1 3 11 2024 6 t 6)
+
+(deftest time-zone-child.fall-back-overlap-central-standard
+  (tzc-values "America/Chicago" "(decode-universal-time 3939607830)")
+  30 30 1 3 11 2024 6 nil 6)
+
+(deftest time-zone-child.spring-forward-before
+  (tzc-values "America/New_York" "(decode-universal-time 3919042799)")
+  59 59 1 10 3 2024 6 nil 5)
+
+(deftest time-zone-child.spring-forward-after
+  (tzc-values "America/New_York" "(decode-universal-time 3919042800)")
+  0 0 3 10 3 2024 6 t 5)
+
+(deftest time-zone-child.explicit-zone-not-local
+  (tzc-values "America/New_York" "(decode-universal-time 3939602399 0)")
+  59 59 5 3 11 2024 6 nil 0)
 
 ) ; #-windows

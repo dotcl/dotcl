@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; REMOVE and its family cost their result conses and nothing else.
 ;;;
 ;;; Two things were being paid before the walk even started:

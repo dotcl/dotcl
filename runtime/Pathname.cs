@@ -44,7 +44,7 @@ public class LispPathname : LispObject
     /// STRING expand too, not only (pathname "~/...") (#19).</summary>
     internal static string ExpandHome(string path)
     {
-        if (path != "~" && !path.StartsWith("~/") && !path.StartsWith("~\\"))
+        if (path != "~" && !path.StartsWith("~/", System.StringComparison.Ordinal) && !path.StartsWith("~\\", System.StringComparison.Ordinal))
             return path;
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         if (string.IsNullOrEmpty(home))
@@ -70,14 +70,14 @@ public class LispPathname : LispObject
         return false;
     }
 
-    /// <summary>S as a literal string for the pieces of a make-pathname argument: * ? [ are quoted.</summary>
-    internal static string QuoteLiteral(string s, bool wildOnly = false)
+    /// <summary>S as a literal string for a pathname piece: * ? [ are quoted.</summary>
+    internal static string QuoteLiteral(string s)
     {
         if (Compat.IsWindows()) return s;
         var sb = new System.Text.StringBuilder();
         foreach (var c in s)
         {
-            if (wildOnly ? (c == '*' || c == '?') : IsQuotable(c)) sb.Append('\\');
+            if (IsQuotable(c)) sb.Append('\\');
             sb.Append(c);
         }
         return sb.ToString();
@@ -133,7 +133,7 @@ public class LispPathname : LispObject
         // RemoveEmptyEntries split below and the path resolves to a bogus local
         // "\server\share\..." (directory returns nothing, probe-file is NIL). The
         // share remains the first absolute directory component.
-        if (path.StartsWith("//") && path.Length > 2 && path[2] != '/')
+        if (path.StartsWith("//", System.StringComparison.Ordinal) && path.Length > 2 && path[2] != '/')
         {
             int s = path.IndexOf('/', 2);
             if (s > 2) { host = new LispString(path[2..s]); path = path[s..]; }
@@ -416,7 +416,7 @@ public class LispLogicalPathname : LispPathname
             {
                 if (dotParts[2] == "*") version = Startup.Keyword("WILD");
                 else if (dotParts[2] == "NEWEST") version = Startup.Keyword("NEWEST");
-                else if (int.TryParse(dotParts[2], out int v)) version = Fixnum.Make(v);
+                else if (int.TryParse(dotParts[2], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int v)) version = Fixnum.Make(v);
             }
         }
 

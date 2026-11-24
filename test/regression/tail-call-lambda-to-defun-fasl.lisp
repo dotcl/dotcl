@@ -24,7 +24,7 @@
 ")
 
 (defun %tclf-load ()
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "tail-call-lambda-to-defun.lisp" dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (write-string *tclf-source* s))

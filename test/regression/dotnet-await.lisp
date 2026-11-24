@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Regression tests for dotnet:await: blocking await of .NET awaitables (step A)
 
 ;;; non-generic Task completes -> NIL (void)

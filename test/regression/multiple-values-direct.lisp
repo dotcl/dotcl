@@ -117,9 +117,7 @@
       50000)
   t)
 
-;;; VALUES-LIST of three costs what (VALUES a b c) costs.
-(deftest-compiled-only multiple-values-direct.values-list-costs-the-same
-  (<= (abs (- (%mvd-per-call %mvd-vl (values-list *mvd-l3*))
-              (%mvd-per-call %mvd-v3c (values 1 2 3))))
-      50000)
+;;; VALUES-LIST in single-value position takes the primary mode, so it costs nothing.
+(deftest-compiled-only multiple-values-direct.values-list-costs-nothing
+  (<= (%mvd-per-call %mvd-vl (values-list *mvd-l3*)) 50000)
   t)

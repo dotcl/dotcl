@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A LET variable declared with a bounded integer type that fits int64 --
 ;;; (UNSIGNED-BYTE 32) say -- lives in a raw Int64 slot like one declared
 ;;; FIXNUM, also when it is assigned. ironclad's WITH-WORDS binds the two

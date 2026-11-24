@@ -56,8 +56,9 @@ public static class FaslData
     }
 
     /// <summary>Run a batch of MAKE-LOAD-FORM-SAVING-SLOTS creations: for each
-    /// object, nothing when its key is already interned, else allocate it,
-    /// intern it under the key and set the saved slots.</summary>
+    /// object, allocate it, intern it under its key and set the saved slots,
+    /// unless the key is already interned: then the object is left as it is, but
+    /// its bytes are still read (see the comment in the loop).</summary>
     public static LispObject RunMlfBatch(byte[][] parts, int index, LispObject?[] cache, Symbol[]? gsyms,
         LispObject?[]? shared)
     {
@@ -68,16 +69,22 @@ public static class FaslData
             string key = r.Str();
             int skipTo = (int)r.Varint();
             skipTo += r.Pos;
-            if (LispInstance.IsInterned(key)) { r.Pos = skipTo; continue; }
+            // An object already interned under its key keeps its slots, but its values are
+            // still read: a value can define a shared slot or a local (TShared, TDef) that a
+            // later object of this batch, or a literal after it, refers to. Skipping the
+            // bytes would leave that definition empty and the reader would then read the
+            // wrong bytes (or find null) at the reference.
+            bool interned = LispInstance.IsInterned(key);
             var className = r.Value();
-            var obj = LispInstance.InternAllocateInstance(key, className);
+            var obj = interned ? null : LispInstance.InternAllocateInstance(key, className);
             int slots = (int)r.Varint();
             for (int s = 0; s < slots; s++)
             {
                 var slot = r.Value();
                 var value = r.Value();
-                Runtime.SetSlotValue(obj, slot, value);
+                if (obj != null) Runtime.SetSlotValue(obj, slot, value);
             }
+            r.Pos = skipTo;
         }
         return Nil.Instance;
     }
@@ -136,6 +143,64 @@ public static class FaslData
     {
         slots[slot] = v;
         return v;
+    }
+
+    /// <summary>Make the conses of a freshly built quoted list LIT the ones an
+    /// earlier literal of the same file already built for an EQUAL tree, and
+    /// remember LIT's own for the literals after it (CLHS 3.2.4.4 lets a file
+    /// compiler coalesce similar constants, and code written for SBCL, which
+    /// does, compares such literals with EQL). TABLE is the file's table, made
+    /// on first use. LIT was just built, so its conses are changed in place.
+    /// The caller has checked that LIT is a small tree of conses over symbols,
+    /// numbers, characters and strings with no shared or circular part.</summary>
+    public static LispObject CoalesceLiteral(LispObject lit, ref LispHashTable? table)
+    {
+        table ??= new LispHashTable("EQUAL");
+        return CoalesceNode(lit, table);
+    }
+
+    private static LispObject CoalesceNode(LispObject node, LispHashTable table)
+    {
+        if (node is not Cons c) return node;
+        // The conses of a list are visited from the last one back, so a tail is
+        // coalesced before the cons that points to it.
+        var spine = new List<Cons>();
+        LispObject cur = node;
+        while (cur is Cons cc) { spine.Add(cc); cur = cc.Cdr; }
+        LispObject tail = cur;
+        for (int i = spine.Count - 1; i >= 0; i--)
+        {
+            var cell = spine[i];
+            cell.Car = CoalesceNode(cell.Car, table);
+            cell.Cdr = tail;
+            if (table.TryGet(cell, out var existing)) tail = existing;
+            else { table.Set(cell, cell); tail = cell; }
+        }
+        return tail;
+    }
+
+    /// <summary>Whether a quoted literal is one CoalesceLiteral may rewrite:
+    /// at most 64 conses, over symbols, numbers, characters and strings, none
+    /// reached twice.</summary>
+    internal static bool IsCoalescibleLiteral(LispObject root)
+    {
+        if (root is not Cons) return false;
+        var seen = new HashSet<Cons>(ReferenceEqualityComparer.Instance);
+        var st = new Stack<LispObject>();
+        st.Push(root);
+        while (st.Count > 0)
+        {
+            switch (st.Pop())
+            {
+                case Cons c:
+                    if (!seen.Add(c) || seen.Count > 64) return false;
+                    st.Push(c.Cdr); st.Push(c.Car);
+                    break;
+                case Symbol or Nil or Number or LispChar or LispString: break;
+                default: return false;
+            }
+        }
+        return true;
     }
 
     /// <summary>Intern the symbols a fasl names (see Startup.PreinternSymbol),
@@ -205,7 +270,23 @@ public static class FaslData
         public ulong Varint() => ReadVarint(_b, ref Pos);
         public string Str() => ReadStr(_b, ref Pos);
 
-        public LispObject Value()
+        // The slots listed after a shared region: those that regions inside it define.
+    private bool NestedSlotsFilled()
+    {
+        int n = (int)Varint();
+        bool all = true;
+        for (int i = 0; i < n; i++)
+            if (_shared![(int)Varint()] == null) all = false;
+        return all;
+    }
+
+    private void SkipNestedSlots()
+    {
+        int n = (int)Varint();
+        for (int i = 0; i < n; i++) Varint();
+    }
+
+    public LispObject Value()
         {
             byte tag = _b[Pos++];
             switch (tag)
@@ -233,11 +314,11 @@ public static class FaslData
                     Pos += 8;
                     return new DoubleFloat(BitConverter.Int64BitsToDouble(bits));
                 }
-                case TBignum: return new Bignum(BigInteger.Parse(Str()));
+                case TBignum: return new Bignum(BigInteger.Parse(Str(), System.Globalization.CultureInfo.InvariantCulture));
                 case TRatio:
                 {
-                    var num = BigInteger.Parse(Str());
-                    var den = BigInteger.Parse(Str());
+                    var num = BigInteger.Parse(Str(), System.Globalization.CultureInfo.InvariantCulture);
+                    var den = BigInteger.Parse(Str(), System.Globalization.CultureInfo.InvariantCulture);
                     return Ratio.Make(num, den);
                 }
                 case TComplex:
@@ -293,7 +374,9 @@ public static class FaslData
                     var type = Value();
                     int n = (int)Varint();
                     var slots = new LispObject[n];
-                    for (int i = 0; i < n; i++) slots[i] = Value();
+                    for (int i = 0; i < n; i++)
+                        slots[i] = Value() ?? throw new InvalidOperationException(
+                            "fasl data: slot " + i + " of the structure literal " + key + " read as nothing (a reference to a shared slot or a local that was not defined)");
                     return LispStruct.Intern(key, type, slots);
                 }
                 case THashTable:
@@ -312,8 +395,28 @@ public static class FaslData
                 {
                     int slot = (int)Varint();
                     int len = (int)Varint();
-                    if (_shared![slot] is LispObject known) { Pos += len; return known; }
+                    if (len == 0)
+                    {
+                        // A reference to a region read earlier in this part: nothing follows it.
+                        return _shared![slot]
+                               ?? throw new InvalidOperationException("fasl data: shared slot " + slot + " referenced before it was filled");
+                    }
+                    // A region is followed by the slots that regions inside it define. When the slot is
+                    // filled and so are all of those, nothing in the region is needed and it is skipped;
+                    // otherwise it is read (its nested TShared and TDef define what a later reference,
+                    // a TShared with length 0 or a TRef, relies on) and only the value of an already
+                    // filled slot is dropped.
+                    int start = Pos;
+                    if (_shared![slot] is LispObject filled)
+                    {
+                        Pos = start + len;
+                        if (NestedSlotsFilled()) return filled;
+                        Pos = start;
+                    }
                     var v = Value();
+                    Pos = start + len;
+                    SkipNestedSlots();
+                    if (_shared![slot] is LispObject known) return known;
                     _shared[slot] = v;
                     return v;
                 }
@@ -326,7 +429,12 @@ public static class FaslData
                     _locals[idx] = v;
                     return v;
                 }
-                case TRef: return _locals![(int)Varint()]!;
+                case TRef:
+                {
+                    int idx = (int)Varint();
+                    return (_locals != null && idx < _locals.Count ? _locals[idx] : null)
+                           ?? throw new InvalidOperationException("fasl data: local " + idx + " referenced before it was defined");
+                }
                 case THtPrototype:
                     return LispHashTable.CopyLiteral(HtPrototype(_parts!, (int)Varint(), _cache!, _gsyms));
                 default:
@@ -410,6 +518,10 @@ internal sealed class FaslDataWriter
     }
 
     private readonly HashSet<int> _localOpen = new();
+    private readonly List<int> _regionStack = new();
+    private readonly List<SortedSet<int>> _nestedDefs = new();
+    private readonly Dictionary<int, int> _localRegion = new();
+    private int _regionCounter;
     private readonly HashSet<LispObject> _sharedWritten = new(ReferenceEqualityComparer.Instance);
     private readonly List<LispObject> _sharedOrder = new();
 
@@ -425,7 +537,9 @@ internal sealed class FaslDataWriter
         _sharedOrder.RemoveRange(shareds, _sharedOrder.Count - shareds);
         if (_localIdx.Count != locals)
             foreach (var k in new List<LispObject>(_localIdx.Keys))
-                if (_localIdx[k] >= locals) _localIdx.Remove(k);
+                if (_localIdx[k] >= locals) { _localRegion.Remove(_localIdx[k]); _localIdx.Remove(k); }
+        _regionStack.Clear();
+        _nestedDefs.Clear();
         return false;
     }
 
@@ -464,8 +578,23 @@ internal sealed class FaslDataWriter
                     return true;
                 }
                 int len = ReserveLength();
-                if (!Write(v, seen, depth, here: true)) return false;
+                _regionStack.Add(++_regionCounter);
+                _nestedDefs.Add(new SortedSet<int>());
+                bool written = Write(v, seen, depth, here: true);
+                _regionStack.RemoveAt(_regionStack.Count - 1);
+                var nested = _nestedDefs[_nestedDefs.Count - 1];
+                _nestedDefs.RemoveAt(_nestedDefs.Count - 1);
+                if (!written) return false;
                 PatchLength(len);
+                // the slots that regions inside this one define, for a reader that may skip it
+                Varint((ulong)nested.Count);
+                foreach (var ns in nested) Varint((ulong)ns);
+                if (_nestedDefs.Count > 0)
+                {
+                    var outer = _nestedDefs[_nestedDefs.Count - 1];
+                    outer.Add(slot);
+                    foreach (var ns in nested) outer.Add(ns);
+                }
                 _sharedWritten.Add(v);
                 _sharedOrder.Add(v);
                 return true;
@@ -475,12 +604,18 @@ internal sealed class FaslDataWriter
                 if (_localIdx.TryGetValue(v, out int known))
                 {
                     if (_localOpen.Contains(known)) return false;
+                    // A local defined inside a shared region is only defined when the
+                    // reader reads that region; it skips the region once its slot is
+                    // filled, so a reference from outside the region has nothing to find.
+                    if (_localRegion.TryGetValue(known, out int defRegion) && !_regionStack.Contains(defRegion))
+                        return false;
                     _body.Add(FaslData.TRef);
                     Varint((ulong)known);
                     return true;
                 }
                 int idx = _localIdx.Count;
                 _localIdx[v] = idx;
+                if (_regionStack.Count > 0) _localRegion[idx] = _regionStack[_regionStack.Count - 1];
                 _body.Add(FaslData.TDef);
                 Varint((ulong)idx);
                 _localOpen.Add(idx);

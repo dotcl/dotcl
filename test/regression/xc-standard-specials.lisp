@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; While cross-compiling the core, a LET of a standard special variable
 ;;; (*PACKAGE*, *PRINT-LENGTH*, *READTABLE*, ...) binds it dynamically, with no
 ;;; (declare (special ...)) needed.

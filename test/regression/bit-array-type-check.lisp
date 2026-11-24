@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Only 0 and 1 are of type BIT, so a bit array has to refuse anything else.
 ;;; Every store folded "non-zero" to 1 and everything else to 0 and said nothing:
 ;;; (setf (aref bv 0) 7) left #*100, and :initial-element 'x quietly produced

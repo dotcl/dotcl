@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A store into a typed structure slot is not checked when the value is
 ;;; already known to be of the slot's type. The check boxed the value to test
 ;;; it -- 24 B for every (setf (s-n s) i) of an int64 loop counter into a

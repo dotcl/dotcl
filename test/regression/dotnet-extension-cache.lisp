@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Extension methods from an assembly loaded later in the session.
 ;;;
 ;;; The index of extension methods is keyed by method name and filled the first

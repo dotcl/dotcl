@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; NIL and T need a package prefix in a package that does not inherit them.
 ;;;
 ;;; CLHS 22.1.3.3 prints a symbol with a package prefix unless it is accessible

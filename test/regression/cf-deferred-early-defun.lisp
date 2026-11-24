@@ -6,7 +6,7 @@
 ;;; fasl.
 
 (defun %cfdd-compile (name lines)
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames (format nil "~a.lisp" name) dir))
          (fasl (merge-pathnames (format nil "~a.fasl" name) dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)
@@ -64,3 +64,27 @@
     (list (funcall *cfdd-c-captured*) (eq (fdefinition 'cfdd-c-f) *cfdd-c-captured*)
           (cfdd-c-f)))
   (:early nil :early))
+
+;; A name that is already defined (a loaded file compiled again) gets the
+;; stand-in too: a macro that calls it while expanding sees the new definition,
+;; a function nothing calls is not compiled, and the loaded definition is the
+;; one in place after COMPILE-FILE.
+(defvar *cfdd-d-expansions* 0)
+(defmacro cfdd-d-counted (x) (incf *cfdd-d-expansions*) x)
+
+(deftest-compiled-only cf-deferred-early-defun.recompile-of-loaded-name
+  (let* ((fasl1 (%cfdd-compile "cfdd-d"
+                               '("(defun cfdd-d-f () 1)"
+                                 "(defun cfdd-d-g (x) (cl-user::cfdd-d-counted (+ x 1)))")))
+         (r1 (progn (load fasl1) (list (cfdd-d-f) (cfdd-d-g 1))))
+         (before *cfdd-d-expansions*)
+         (fasl2 (%cfdd-compile "cfdd-d"
+                               '("(defun cfdd-d-f () 2)"
+                                 "(defun cfdd-d-g (x) (cl-user::cfdd-d-counted (+ x 1)))"
+                                 "(defmacro cfdd-d-m () (list 'quote (cfdd-d-f)))"
+                                 "(defun cfdd-d-use () (cfdd-d-m))")))
+         (during-live (cfdd-d-f))
+         (expansions (- *cfdd-d-expansions* before)))
+    (load fasl2)
+    (list r1 during-live expansions (cfdd-d-f) (cfdd-d-use)))
+  ((1 2) 1 1 2 2))

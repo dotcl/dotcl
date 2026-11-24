@@ -80,8 +80,8 @@ class Program
             var a = args[i];
             if (_globalsWithValue.Contains(a)) { i++; continue; }   // skip its value too
             if (_globalFlags.Contains(a)) continue;
-            if (a.StartsWith("--color=")) continue;                 // one token, value included
-            if (a.StartsWith("--")) return -1;                      // unknown flag: leave it alone
+            if (a.StartsWith("--color=", System.StringComparison.Ordinal)) continue;                 // one token, value included
+            if (a.StartsWith("--", System.StringComparison.Ordinal)) return -1;                      // unknown flag: leave it alone
             return i;
         }
         return -1;
@@ -200,7 +200,12 @@ class Program
             if (_replMode)
             {
                 args2.Cancel = true;          // don't kill the process
-                ConditionSystem.RequestInterrupt();
+                // On Unix the SIGINT registration below raises the interrupt. The
+                // console driver can run this handler for the same SIGINT, and a
+                // second request landing after the first was delivered became a
+                // second INTERACTIVE-INTERRUPT in the next form.
+                if (!_posixSigintRaisesInterrupt)
+                    ConditionSystem.RequestInterrupt();
             }
             // else: default behavior: process exits with SIGINT. That exit
             // may skip ProcessExit, so the console code pages are restored here.
@@ -230,6 +235,7 @@ class Program
                                 ConditionSystem.RequestInterrupt();
                             }
                         }));
+                _posixSigintRaisesInterrupt = true;
             }
             catch { /* SIGINT not registerable here; best-effort */ }
         }
@@ -802,7 +808,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         // below, which is a worse surprise than being told how to spell it.
         for (int i = 0; !hasUserFasl && !buildMode && !packMode && !buildLibraryMode && i < rest.Count; i++)
         {
-            if (rest[i] == "--color" || rest[i].StartsWith("--color="))
+            if (rest[i] == "--color" || rest[i].StartsWith("--color=", System.StringComparison.Ordinal))
             {
                 var value = rest[i] == "--color" ? "" : rest[i].Substring("--color=".Length);
                 var mode = ReplColor.ParseMode(value);
@@ -886,7 +892,15 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
                 // Subcommand options are not affected either: the loop header
                 // declines to run at all under build/pack, so the MSBuild
                 // integration is out of scope here.
-                Console.Error.WriteLine($"dotcl: unknown option '{rest[i]}'");
+                var didYouMean = rest[i] switch
+                {
+                    "-e" => " (did you mean '--eval'?)",
+                    "-l" => " (did you mean '--load'?)",
+                    "-h" or "-?" => " (did you mean '--help'?)",
+                    "-v" or "-V" => " (did you mean '--version'?)",
+                    _ => "",
+                };
+                Console.Error.WriteLine($"dotcl: unknown option '{rest[i]}'{didYouMean}");
                 Console.Error.WriteLine("  dotcl --help for usage");
                 Environment.Exit(2);
             }
@@ -1555,7 +1569,7 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
         var work = Path.Combine(Path.GetTempPath(), "dotcl-libr2r-" + Guid.NewGuid().ToString("N"));
         using var zip = System.IO.Compression.ZipFile.Open(nupkg, System.IO.Compression.ZipArchiveMode.Update);
         var fasls = zip.Entries
-            .Where(e => e.FullName.StartsWith("dotcl/") && e.FullName.EndsWith(".fasl"))
+            .Where(e => e.FullName.StartsWith("dotcl/", System.StringComparison.Ordinal) && e.FullName.EndsWith(".fasl", System.StringComparison.Ordinal))
             .Select(e => e.FullName).ToList();
         var faslFiles = new List<string>();
         foreach (var name in fasls)
@@ -2190,6 +2204,10 @@ and invoked by the MSBuild integration; they are intentionally omitted here.");
 
     // Track whether we already restored, so multiple exit paths don't double-write.
     private static int _terminalRestored;
+
+    // True once the SIGINT registration exists (Unix): it is then the only path that
+    // raises the REPL interrupt, and Console.CancelKeyPress only cancels the default.
+    private static volatile bool _posixSigintRaisesInterrupt;
 
     // Roots the PosixSignalRegistration handles for the process lifetime; without
     // a live reference they would be GC'd and the signal handlers unregistered.

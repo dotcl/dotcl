@@ -6,7 +6,7 @@
 (setf dotcl:*save-sil* t)
 
 (defun %lps-write (name lines)
-  (let ((src (merge-pathnames (format nil "~a.lisp" name) (regression-temp-dir))))
+  (let ((src (merge-pathnames (format nil "~a.lisp" name) (regression-temp-dir/))))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (dolist (l lines) (write-line l s)))
     src))
@@ -38,6 +38,6 @@
         (dotcl-internal::*proclaimed-policy* '())
         (src (%lps-write "lps2" '("(declaim (optimize (safety 0) (debug 0)))"))))
     (load (let ((*error-output* (make-broadcast-stream)))
-            (compile-file src :output-file (merge-pathnames "lps2.fasl" (regression-temp-dir)))))
+            (compile-file src :output-file (merge-pathnames "lps2.fasl" (regression-temp-dir/)))))
     (%lps-policy))
   (1 1 nil))

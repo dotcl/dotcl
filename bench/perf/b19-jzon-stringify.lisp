@@ -1,0 +1,15 @@
+(load "bench/perf/pcommon.lisp")
+(setf *bench-group* "19-jzon-stringify")
+;; com.inuoe.jzon:stringify of doubles: a bare double, a 3-key hash table holding one, and a
+;; vector of 100 doubles (the shortest-digits writer is the cost; parse is not measured).
+;; Libraries to install on the runner: com.inuoe.jzon  (perf.yml: libs=com.inuoe.jzon)
+(load-ql-system :com.inuoe.jzon)
+(defvar *table* (let ((h (make-hash-table :test 'equal)))
+                  (setf (gethash "a" h) 1 (gethash "b" h) "two" (gethash "c" h) 3.5d0)
+                  h))
+(defvar *doubles* (let ((v (make-array 100)))
+                    (dotimes (i 100 v) (setf (aref v i) (+ (* i 1.37d0) 0.015625d0)))))
+(defvar *sink* nil)
+(bench "jzon stringify 3.5d0" 20000 (setq *sink* (com.inuoe.jzon:stringify 3.5d0)))
+(bench "jzon stringify 3-key hash table with a double" 20000 (setq *sink* (com.inuoe.jzon:stringify *table*)))
+(bench "jzon stringify vector of 100 doubles" 2000 (setq *sink* (com.inuoe.jzon:stringify *doubles*)))

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Reading a package-qualified NIL or T must yield the same object the bare
 ;;; token does. The CL package's symbol table holds ordinary Symbol entries for
 ;;; NIL and T, so a qualified read that returned the raw entry produced a second

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; COERCE to a simple array type copies a vector that is not simple (fill
 ;;; pointer, adjustable), even when its element type already matches, and a
 ;;; length in the result type is checked.

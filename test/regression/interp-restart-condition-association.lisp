@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; RESTART-CASE over a signaling form must associate its restarts with the
 ;;; condition that form signals: on BOTH evaluator paths.
 ;;;

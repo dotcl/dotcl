@@ -125,9 +125,10 @@
 ;;; Standard-macro bridges with no real expander must not loop.
 (deftest mea-fixed-point-standard-macros-terminate
   (equal (list (mea '(step 1))
-               (mea '(formatter "x"))
+               ;; FORMATTER has a real expansion into a call that builds the function
+               (functionp (eval (mea '(formatter "x"))))
                (mea '(define-symbol-macro mea-fixed-point-sym 1)))
-         '(1 (formatter "x") (define-symbol-macro mea-fixed-point-sym 1)))
+         '(1 t (define-symbol-macro mea-fixed-point-sym 1)))
   t)
 
 ;;; MULTIPLE-VALUE-LIST has a real expansion; series drives MACROEXPAND-1 itself.

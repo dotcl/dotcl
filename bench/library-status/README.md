@@ -303,7 +303,7 @@ Each system gets one verdict in `tests.json`:
 | `no-result` | the run finished but printed nothing a recogniser knows |
 | `no-tests` | the run finished and there was nothing to run: neither `test-op` nor the test systems it depends on have a primary `perform` method of the library's own (only ASDF's empty default; `:around` methods such as the one LIFT adds to every system do not count), a test system it names is in no dist and has no `.asd` in the release, or hu.dwim.asdf reported that no tests were run |
 | `timeout` | the bound (`LIBRARY_STATUS_TEST_TIMEOUT`, default 900 s) was hit |
-| `load-fail` | the system or one of its test systems did not load |
+| `load-fail` | the system or one of its test systems did not load, including a conventionally named test system (`SYS-test`, `SYS/tests`, ...) that exists but does not load while `test-op` itself has nothing to run |
 
 A test entry also carries the optional `native` field described in stage 2 when
 the log shows a missing foreign library or header. The row is then shown as
@@ -464,6 +464,38 @@ overridden: `LIBRARY_STATUS_JSON`, `LIBRARY_STATUS_TARGETS`,
 The JSON reader is part of the script. Rendering the table has to work in a
 checkout where nothing has been installed yet, which a dependency on a JSON
 library would break.
+
+## Comparing two measurements (`delta.sh`)
+
+```
+sh bench/library-status/delta.sh                          # both files, last commit vs working tree
+sh bench/library-status/delta.sh results.json             # one file
+sh bench/library-status/delta.sh results.json OLD NEW     # one file at two revisions
+sh bench/library-status/delta.sh old-results.json new-results.json
+```
+
+Each changed system gets one line, under `WORSE`, `BETTER`, `ADDED` or
+`REMOVED`, followed by the summary counts:
+
+```
+WORSE
+  cl-json  load load-only -> fail
+  lift  passed 105 -> 100; failed 2 -> 7
+BETTER
+  babel  tests error -> fail; passed 0 -> 12
+ADDED
+  trivial-clipboard  load load-only
+REMOVED
+  gone-system  load fail
+worse 2, better 1, added 1, removed 1
+```
+
+The load order is the one the table explains (`ok`, `load-only`, `patched`,
+`native`, `fail`); the test order is the one `run-forks.sh` uses (`pass`,
+`fail`, `no-result`/`no-tests`, `error`, `timeout`/`load-fail`). Only the load
+status, test verdict and the passed and failed counts are compared, so a new
+date, time or note is not a change. The exit status is 1 when there is a
+`WORSE` line, 0 otherwise, which makes it usable after a re-measurement.
 
 ## Not automated yet
 

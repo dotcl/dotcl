@@ -169,6 +169,9 @@
         (%lvl-big-limit-loop (1- most-positive-fixnum)))
   (6 5 t t 6 t 5 5))
 
+;; The fifth (a loop that collects) is expanded twice, for the start-not-constant guard of LOOP, so its boxed copy adds
+;; its own Increment and IsTrue. The last, a loop whose fixnum counter a closure captures and assigns, keeps its counter
+;; in a raw-long cell, so its second expansion has no generic Increment either.
 (deftest-emitting-only loop-variable-limit.shape
   (flet ((counts (fn)
            (let ((s (%lvl-sil fn)))
@@ -179,7 +182,7 @@
                            #'%lvl-after-list #'%lvl-finish #'%lvl-typed
                            #'%lvl-varby-to #'%lvl-varby-down
                            #'%lvl-final #'%lvl-final-macro #'%lvl-captured)))
-  ((0 0 0 0 t) (0 0 0 0 t) (0 0 0 0 t) (0 0 0 0 t) (0 0 1 0 t)
+  ((0 0 0 0 t) (0 0 0 0 t) (0 0 0 0 t) (0 0 0 0 t) (0 0 2 0 t)
    (2 0 0 0 t) (0 0 0 0 t) (0 0 0 0 t) (0 0 0 0 t) (0 0 0 0 t)
    (1 0 1 0 nil) (1 0 1 0 nil) (1 0 1 0 nil)))
 

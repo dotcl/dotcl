@@ -286,8 +286,10 @@
                           (dotnet:invoke s "Replace" #\l #\L))
      (dotnet:invoke (the (dotnet "System.String") s) "Length")
      (dotnet:invoke (the (dotnet "System.Object") s) "ToString")
-     (dotnet:invoke (the (dotnet "System.IComparable") s) "CompareTo"
-                    (the (dotnet "System.Object") (%typed-id "a")))))
+     ;; String.CompareTo promises only the sign: ICU gives 1, the invariant
+     ;; (ordinal) tables give the difference of the first chars.
+     (signum (dotnet:invoke (the (dotnet "System.IComparable") s) "CompareTo"
+                            (the (dotnet "System.Object") (%typed-id "a"))))))
   (t t t t 5 "hello" 1))
 
 (deftest direct-receiver-numbers-and-char

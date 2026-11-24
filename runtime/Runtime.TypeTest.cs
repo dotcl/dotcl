@@ -150,6 +150,7 @@ public static partial class Runtime
 
     private static System.Func<LispObject, bool>? ClNamePredicate(string name) => name switch
     {
+        "*" => static _ => true,
         "NULL" => static o => o is Nil,
         "CONS" => static o => o is Cons,
         "LIST" => static o => o is Cons || o is Nil,
@@ -200,6 +201,30 @@ public static partial class Runtime
                 return TypepGeneral(obj, _sym) is not Nil;
             }
             if (IsPlainTypepObject(obj)) return false;
+            return TypepGeneral(obj, _sym) is not Nil;
+        }
+    }
+
+    /// <summary>A symbol naming an ordinary CLOS class (not a structure, not a .NET type, no
+    /// custom metaclass). An instance of the class, or of a subclass, is answered from the
+    /// instance's class and its class precedence list, read at test time so a changed
+    /// hierarchy is seen; everything else goes to the general TYPEP, which is what answered
+    /// every call before this test existed.</summary>
+    private sealed class StandardClassTypeTest : TypeTest
+    {
+        private readonly Symbol _sym;
+        private readonly LispClass _cls;
+        internal StandardClassTypeTest(Symbol sym, LispClass cls) { _sym = sym; _cls = cls; }
+        internal override bool Test(LispObject obj)
+        {
+            if (obj is LispInstance inst)
+            {
+                var ic = inst.Class;
+                if (ReferenceEquals(ic, _cls)) return true;
+                var cpl = ic.ClassPrecedenceList;
+                for (int i = 0; i < cpl.Length; i++)
+                    if (ReferenceEquals(cpl[i], _cls)) return true;
+            }
             return TypepGeneral(obj, _sym) is not Nil;
         }
     }
@@ -309,8 +334,23 @@ public static partial class Runtime
                 _seen = new Seen(et, ok, epoch);
                 return ok;
             }
+            if (obj is LispString str)
+            {
+                // A LispString is always a simple vector of CHARACTER, so the answer for
+                // one string stands for every string of the same length.
+                if (_length >= 0 && str.Length != _length) return false;
+                var seen = _seen;
+                int epoch = System.Threading.Volatile.Read(ref TypeExpanderEpoch);
+                if (seen != null && seen.Epoch == epoch && seen.Et == StringElementKey)
+                    return seen.Ok;
+                bool ok = TypepGeneral(obj, _spec) is not Nil;
+                _seen = new Seen(StringElementKey, ok, epoch);
+                return ok;
+            }
             return TypepGeneral(obj, _spec) is not Nil;
         }
+        // Not the name of any element type a vector reports.
+        const string StringElementKey = "LISPSTRING";
     }
 
     internal sealed class SymbolTypeTestMemo
@@ -364,6 +404,9 @@ public static partial class Runtime
         }
         if (FindClassOrNil(sym) is LispClass cls && cls.IsStructureClass && ReferenceEquals(cls.Name, sym))
             return new StructClassTypeTest(sym, cls);
+        if (FindClassOrNil(sym) is LispClass std && !std.IsStructureClass && ReferenceEquals(std.Name, sym)
+            && std.Metaclass == null && std.DotNetType == null)
+            return new StandardClassTypeTest(sym, std);
         return null;
     }
 

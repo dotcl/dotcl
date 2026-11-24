@@ -143,17 +143,16 @@
   (:type-error :type-error :type-error))
 
 ;;; A non-simple octet vector under the SIMPLE-ARRAY declaration: above safety 0
-;;; the declaration signals; at safety 0 the octets are read as they are.
+;;; the declaration signals; at safety 0 it signals too (the binding refuses a
+;;; vector that is not the declared simple array).
 (defun %owr-adjustable ()
   (make-array 9 :element-type '(unsigned-byte 8) :adjustable t
                 :initial-contents '(1 2 3 4 5 6 7 #x88 #xff)))
 (deftest-emitting-only octet-word-read.non-simple
   (list (%owr-error #'%owr-r64 (%owr-adjustable) 0)
         (%owr-error #'%owr-undeclared (%owr-adjustable) 0)
-        (%owr-all-0 (%owr-adjustable) 1))
-  (:type-error :type-error
-   (#x0302 #x05040302 #xff88070605040302 #x0203 #x02030405 #x02030405060788ff
-    #x05040302)))
+        (%owr-error #'%owr-all-0 (%owr-adjustable) 1))
+  (:type-error :type-error :type-error))
 
 ;;; The words are single wide reads: no octet loads, no generic LOGIOR / ASH /
 ;;; LOGXOR, and the 64-bit ones are not boxed on their way into the XOR.

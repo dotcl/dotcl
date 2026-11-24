@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A ~[ nested inside a ~[ has to close itself, not the one around it.
 ;;;
 ;;; The scanner that finds the end of a conditional stepped over a directive's

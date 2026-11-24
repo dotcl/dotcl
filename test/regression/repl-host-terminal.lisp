@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A terminal the host supplies (dotcl-repl:make-terminal) in place of
 ;;; System.Console. Standard input here is not a console, so any key read or
 ;;; size asked of System.Console would fail: these pass only if every read,

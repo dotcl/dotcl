@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A declared FIXNUM loop written at top level allocates nothing per iteration.
 ;;;
 ;;; Codegen emits a native-slot store in its boxed form -- store the raw value,

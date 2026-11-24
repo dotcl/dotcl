@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; MISMATCH compares without copying either sequence.
 ;;;
 ;;; It used to collect both sequences into LispObject[] before comparing

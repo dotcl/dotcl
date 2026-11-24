@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; (LENGTH X) carries its range into EXPR-INT-RANGE, not only into
 ;;; FIXNUM-TYPED-P.
 ;;;

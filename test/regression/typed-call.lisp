@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Calls through a typed entry: a caller that knows a global function's
 ;;; declaimed FTYPE (numeric arguments and result, see typed-entry.lisp) computes
 ;;; the arguments raw, fetches the function from the name on every call and

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A variable declared with a DEFTYPE name that expands to a specialized array
 ;;; type gets the same element access as one declared with the expansion. A
 ;;; DEFTYPE name is the same type as its expansion; ironclad declares its

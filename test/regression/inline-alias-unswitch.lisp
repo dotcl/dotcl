@@ -58,6 +58,30 @@
     (loop (let ((q (search needle s :start2 p)))
             (if q (progn (incf k) (setq p (+ q 1))) (return k))))))
 
+;;; The unsigned 64 bit buffers' fetch cannot answer null, so there is nothing to
+;;; unswitch on: no test and no second copy of the body. The one-unswitch property
+;;; is kept for a kind whose fetch can answer null (signed 32 bit), by the same
+;;; shape with that element type.
+(declaim (inline %iau-step32))
+(defun %iau-step32 (n ck tw)
+  (declare (type fixnum n) (type (simple-array (signed-byte 32) (*)) ck)
+           (type (simple-array (signed-byte 32) (2)) tw)
+           (optimize (speed 3) (safety 0)))
+  (loop for i of-type fixnum from 0 below n do
+    (setf (aref ck i) (logxor (aref ck i) (aref tw 0))))
+  (setf (aref tw 1) (logxor (aref tw 0) (aref tw 1)))
+  (setf (aref ck 1) (logxor (aref ck 2) (aref tw 1) (aref ck 3)))
+  (values))
+
+(defun %iau-run32 (ck tw m)
+  (declare (type (simple-array (signed-byte 32) (*)) ck)
+           (type (simple-array (signed-byte 32) (2)) tw)
+           (type fixnum m) (optimize (speed 3) (safety 0)))
+  (loop repeat m do (%iau-step32 8 ck tw) (%iau-step32 8 ck tw) (%iau-step32 8 ck tw))
+  (aref ck 0))
+
 (deftest-compiled-only inline-alias-unswitch.one-unswitch
-  (%iau-count "(LABEL ABUSLOW" (%flat-text (dotcl:function-sil #'%iau-run)))
-  1)
+  (list (%iau-count "(LABEL ABUSLOW" (%flat-text (dotcl:function-sil #'%iau-run)))
+        (%iau-count "ABFALL" (%flat-text (dotcl:function-sil #'%iau-run)))
+        (%iau-count "(LABEL ABUSLOW" (%flat-text (dotcl:function-sil #'%iau-run32))))
+  (0 0 1))

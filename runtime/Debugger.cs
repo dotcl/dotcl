@@ -130,7 +130,7 @@ public static class Debugger
                     if (answer == HookAnswer.Choice)
                     {
                         // The menu only offers restarts that exist.
-                        InvokeRestartByIndex(restarts, int.Parse(line!));
+                        InvokeRestartByIndex(restarts, int.Parse(line!, System.Globalization.CultureInfo.InvariantCulture));
                         continue;
                     }
                     if (answer == HookAnswer.NoMenu)
@@ -168,7 +168,7 @@ public static class Debugger
                 var trimmedLine = line.Trim();
 
                 // Restart by number
-                if (int.TryParse(trimmedLine, out int idx) && idx >= 0 && idx < restarts.Count)
+                if (int.TryParse(trimmedLine, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int idx) && idx >= 0 && idx < restarts.Count)
                 {
                     InvokeRestartByIndex(restarts, idx);
                     continue;
@@ -198,7 +198,7 @@ public static class Debugger
                     case ":f":
                         if (cmdArg.Length == 0)
                             PrintFrame(frame);
-                        else if (int.TryParse(cmdArg, out int wanted))
+                        else if (int.TryParse(cmdArg, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int wanted))
                             SelectFrame(wanted, ref frame);
                         else
                             ReplLoop.Err.WriteLine("; :frame expects a frame number.");

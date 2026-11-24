@@ -75,7 +75,12 @@
     <PackageTags>lisp;common-lisp;dotnet;embeddable</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
 
-    <RuntimeIdentifiers>win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64;android-arm64;android-x64;any</RuntimeIdentifiers>
+    <RuntimeIdentifiers>win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64;any</RuntimeIdentifiers>
+    <!-- The Android runtime packs are about 2 GB (restored once per restore of this
+         project, and again for each runtime version); only a build that wants the
+         Android RIDs asks for them: -p:DotclAndroid=true. Nothing in the repository's
+         builds, tests or the release path uses them (release already leaves them out). -->
+    <RuntimeIdentifiers Condition="'$(DotclAndroid)' == 'true'">win-x64;win-arm64;linux-x64;linux-arm64;osx-x64;osx-arm64;android-arm64;android-x64;any</RuntimeIdentifiers>
     <!-- Building for the browser narrows this to browser-wasm alone. With the wasm
          workload present the SDK resolves a Mono runtime pack for every declared
          RID, and Microsoft.NETCore.App.Runtime.Mono.win-x64 (and the other desktop

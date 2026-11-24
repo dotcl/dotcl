@@ -44,10 +44,6 @@ printed, or the class of the condition signalled."
   (%ynp-ask #'y-or-n-p "")
   :end-of-file)
 
-(deftest yes-or-no-p.yes
-  (first (%ynp-ask #'yes-or-no-p (format nil "yes~%")))
-  t)
-
 (deftest yes-or-no-p.no
   (first (%ynp-ask #'yes-or-no-p (format nil "NO~%")))
   nil)

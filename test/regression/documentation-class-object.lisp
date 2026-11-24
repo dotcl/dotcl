@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; DOCUMENTATION of a class OBJECT, not just of the class name.
 ;;;
 ;;; DEFCLASS files its docstring under the class name, so (documentation 'foo

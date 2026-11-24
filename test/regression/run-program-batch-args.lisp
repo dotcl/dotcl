@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; On Windows, arguments given to a .bat / .cmd file through RUN-PROGRAM /
 ;;; LAUNCH-PROCESS / RUN-PROCESS reach it as text: cmd.exe does not run a
 ;;; second command out of "a&b", expand "%PATH%", or eat a caret.

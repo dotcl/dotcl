@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; OPEN signals FILE-ERROR when the file system refuses the open.
 ;;;
 ;;; The .NET exception for a missing directory, a denied permission or too many

@@ -441,6 +441,10 @@ public static partial class Runtime
         if (metaclass != null)
         {
             ApplyDirectSlotDefinitionClass(cls);
+            if (slotPlists != null && slotPlists.Count == cls.DirectSlots.Length)
+                for (int si = 0; si < slotPlists.Count; si++)
+                    if (!ReferenceEquals(slotPlists[si].Slot, cls.DirectSlots[si]))
+                        slotPlists[si] = (slotPlists[si].Plist, cls.DirectSlots[si]);
             // A class is an instance of its metaclass. Run the real CLOS init protocol
             // on the class object so the metaclass's added slots get their initforms
             // AND any inherited initialize-instance / shared-initialize :after
@@ -533,8 +537,7 @@ public static partial class Runtime
         HashSet<(Symbol, LispObject)>? defclassAccessors = slotPlists == null ? AccessorKeys(slots) : null;
         if (slotPlists == null)
         {
-            existing.StaleAccessorMethods = existing.AccessorMethods;
-            existing.AccessorMethods = new();
+            existing.SwapInStaleAccessors();
         }
         if (slotPlists == null)
         {
@@ -543,7 +546,11 @@ public static partial class Runtime
         }
         // DIRECT-SLOT-DEFINITION-CLASS is consulted for each new slot, as on first
         // definition.
-        foreach (var (_, sd) in slotPlists) ApplyDirectSlotDefinitionClass(existing, sd);
+        for (int si = 0; si < slotPlists.Count; si++)
+        {
+            var adopted = ApplyDirectSlotDefinitionClass(existing, slotPlists[si].Slot);
+            if (!ReferenceEquals(adopted, slotPlists[si].Slot)) slotPlists[si] = (slotPlists[si].Plist, adopted);
+        }
         var plistItems = new LispObject[slotPlists.Count];
         for (int i = 0; i < plistItems.Length; i++) plistItems[i] = slotPlists[i].Plist;
         var riArgs = new List<LispObject> {
@@ -789,7 +796,15 @@ public static partial class Runtime
                 if (!newSlots.SequenceEqual(klass.DirectSlots))
                     klass.DirectSlots = newSlots.ToArray();
                 if (klass.Metaclass != null)
-                    foreach (var sd in fresh) ApplyDirectSlotDefinitionClass(klass, sd);
+                    foreach (var sd in fresh)
+                    {
+                        var adopted = ApplyDirectSlotDefinitionClass(klass, sd);
+                        if (ReferenceEquals(adopted, sd)) continue;
+                        for (int ni = 0; ni < klass.DirectSlots.Length; ni++)
+                            if (ReferenceEquals(klass.DirectSlots[ni], sd)) klass.DirectSlots[ni] = adopted;
+                        for (int ni = 0; ni < newSlots.Count; ni++)
+                            if (ReferenceEquals(newSlots[ni], sd)) newSlots[ni] = adopted;
+                    }
                 NotePendingAccessors(klass, newSlots);
             }
             else if (!dfltSeen && key == Startup.Keyword("DIRECT-DEFAULT-INITARGS"))
@@ -892,14 +907,17 @@ public static partial class Runtime
 
     private static void ApplyDirectSlotDefinitionClass(LispClass cls)
     {
-        foreach (var slot in cls.DirectSlots)
-            ApplyDirectSlotDefinitionClass(cls, slot);
+        for (int i = 0; i < cls.DirectSlots.Length; i++)
+            cls.DirectSlots[i] = ApplyDirectSlotDefinitionClass(cls, cls.DirectSlots[i]);
     }
 
-    private static void ApplyDirectSlotDefinitionClass(LispClass cls, SlotDefinition slot)
+    /// <summary>Consult DIRECT-SLOT-DEFINITION-CLASS for SLOT and return the slot definition
+    /// the class is to keep: SLOT itself, or the object a program's own MAKE-INSTANCE method
+    /// returned for the chosen class.</summary>
+    private static SlotDefinition ApplyDirectSlotDefinitionClass(LispClass cls, SlotDefinition slot)
     {
         if (Startup.Sym("DIRECT-SLOT-DEFINITION-CLASS").Function is not LispFunction gf)
-            return;
+            return slot;
         var stdDirect = FindClassOrNil(Startup.Sym("STANDARD-DIRECT-SLOT-DEFINITION")) as LispClass;
         {
             // AMOP: the initargs are the canonicalized slot specification, the same
@@ -915,6 +933,23 @@ public static partial class Runtime
             var result = gf.Invoke(callArgs);
             var dc = result as LispClass
                 ?? (result is Symbol name ? FindClassOrNil(name) as LispClass : null);
+            // AMOP: the class makes its direct slot definitions with MAKE-INSTANCE on the class
+            // DIRECT-SLOT-DEFINITION-CLASS chose. A program that has a MAKE-INSTANCE method of its
+            // own for that class (hu.dwim.perec returns a slot definition it made earlier when the
+            // :INSTANCE initarg is given) gets it called, and what it returns is the slot
+            // definition. The ordinary case keeps the direct path below.
+            if (dc != null && MakeInstanceOverriddenFor(dc))
+            {
+                if (Startup.Sym("MAKE-INSTANCE").Function is LispFunction miFn)
+                {
+                    var miArgs = new LispObject[initargs.Count + 1];
+                    miArgs[0] = dc;
+                    for (int i = 0; i < initargs.Count; i++) miArgs[i + 1] = initargs[i];
+                    var made = MultipleValues.Primary(miFn.Invoke(miArgs));
+                    if (made is SlotDefinition adopted)
+                        return adopted;
+                }
+            }
             if (dc != null) CheckSlotOptionsKnown(cls, slot, dc);
             if (dc != null && !ReferenceEquals(dc, stdDirect))
             {
@@ -922,6 +957,28 @@ public static partial class Runtime
                 InitializeSlotDefinitionInstance(slot, initargs);
             }
         }
+        return slot;
+    }
+
+    /// <summary>True when the program has a MAKE-INSTANCE method that applies to the class
+    /// object DC itself: one specialized on (EQL DC), or on a class DC is an instance of
+    /// other than the general ones every class object matches (STANDARD-CLASS, CLASS and so on).</summary>
+    private static bool MakeInstanceOverriddenFor(LispClass dc)
+    {
+        if (Startup.Sym("MAKE-INSTANCE").Function is not GenericFunction gf) return false;
+        var dcMeta = ClassOf(dc) as LispClass;
+        foreach (var m in gf.Methods)
+        {
+            if (m.Specializers.Length == 0) continue;
+            var spec = m.Specializers[0];
+            if (spec is EqlSpecializer es) { if (ReferenceEquals(es.Object, dc)) return true; }
+            else if (spec is LispClass sc && dcMeta != null
+                     && sc.Name.Name is not ("T" or "STANDARD-OBJECT" or "STANDARD-CLASS" or "CLASS"
+                                             or "SPECIALIZER" or "METAOBJECT" or "SYMBOL" or "SLOT-DEFINITION")
+                     && Array.IndexOf(dcMeta.ClassPrecedenceList, sc) >= 0)
+                return true;
+        }
+        return false;
     }
 
     /// <summary>A slot option that is not an initarg of the slot definition class the
@@ -939,11 +996,41 @@ public static partial class Runtime
                     if (ia.Name == key.Name) { known = true; break; }
                 if (known) break;
             }
+            // CLHS 7.1.2: an initarg is also valid when a method of INITIALIZE-INSTANCE or
+            // SHARED-INITIALIZE applicable to the new instance names it as a keyword parameter,
+            // or accepts all of them (&ALLOW-OTHER-KEYS).
+            if (!known) known = SlotdInitMethodsAccept(slotdClass, key.Name);
             if (!known)
                 throw new LispErrorException(new LispProgramError(
                     $"Invalid initialization argument {key} for slot {slot.Name.Name} of class "
                     + $"{cls.Name.Name}: not an initarg of {slotdClass.Name.Name}"));
         }
+    }
+
+    /// <summary>True when a method of INITIALIZE-INSTANCE, SHARED-INITIALIZE or ALLOCATE-INSTANCE
+    /// whose first specializer is SLOTDCLASS or one of its superclasses takes the keyword NAME or
+    /// &ALLOW-OTHER-KEYS (CLHS 7.1.2).</summary>
+    private static bool SlotdInitMethodsAccept(LispClass slotdClass, string name)
+    {
+        foreach (var gfName in new[] { "INITIALIZE-INSTANCE", "SHARED-INITIALIZE", "ALLOCATE-INSTANCE" })
+        {
+            if (Startup.Sym(gfName).Function is not GenericFunction gf) continue;
+            foreach (var m in gf.Methods)
+            {
+                if (m.Qualifiers.Length > 0 && LispMethod.QualifierName(m.Qualifiers[0]) == "AROUND"
+                    && false) continue;
+                if (m.Specializers.Length == 0) continue;
+                var sp = m.Specializers[0];
+                bool applies = sp is T || sp is Symbol { Name: "T" };
+                if (!applies && sp is LispClass spc)
+                    foreach (var a in slotdClass.ClassPrecedenceList)
+                        if (ReferenceEquals(a, spc)) { applies = true; break; }
+                if (!applies) continue;
+                if (m.HasAllowOtherKeys) return true;
+                if (m.KeywordNames.Contains(name)) return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>The standard slot-definition initargs that can still change after a

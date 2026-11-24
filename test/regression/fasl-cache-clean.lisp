@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; `dotcl clean`: removing the caches dotcl writes. The shared ASDF compile
 ;;; cache first, and the JIT startup profiles further down.
 ;;;

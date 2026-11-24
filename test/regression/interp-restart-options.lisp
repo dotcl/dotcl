@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; RESTART-CASE / RESTART-BIND options (:report, :test, :interactive) must reach
 ;;; the established restart on BOTH evaluator paths.
 ;;;

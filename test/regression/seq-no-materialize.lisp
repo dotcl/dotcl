@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; REMOVE-family, MAPCAN and SORT walk a list directly instead of collecting it
 ;;; into a List (and, for REMOVE, the dropped indices into a HashSet) first. The
 ;;; general paths are still there for the shapes the fast ones exclude

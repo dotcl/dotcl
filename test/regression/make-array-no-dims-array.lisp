@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; MAKE-ARRAY of a one-dimensional array costs the vector and nothing else.
 ;;;
 ;;; Two things were paid on every call:

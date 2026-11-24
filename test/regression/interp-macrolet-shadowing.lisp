@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; MACROLET shadows a global macro, and NIL / T are legal in operator position.
 ;;;
 ;;; %MINI-EVAL's MACROLET registered its expanders only in *MACROS* (the

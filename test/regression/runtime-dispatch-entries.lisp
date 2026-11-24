@@ -85,7 +85,7 @@
         (%rde-has #'%rde-restart "Runtime.CollectRestArgs")
         (%rde-has #'%rde-restart "Runtime.FindKeyArg")
         (%rde-has #'%rde-left-trim "Runtime.StringLeftTrim")
-        (%rde-has #'%rde-write-line "Runtime.WriteLine)")
+        (%rde-has #'%rde-write-line "Runtime.WriteLine4)")
         (%rde-has #'%rde-register-fallback "CilAssembler.RegisterFunction)"))
   (t t t t t t t t t t))
 

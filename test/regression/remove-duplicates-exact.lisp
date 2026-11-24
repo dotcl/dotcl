@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; REMOVE-DUPLICATES costs its result and the array the scan needs.
 ;;;
 ;;; It grew a List of every element, a bool[] of every index, and a second List

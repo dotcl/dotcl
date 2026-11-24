@@ -613,9 +613,28 @@ public static partial class Runtime
         return a;
     }
 
+    /// <summary>Call F on the arguments in ARGS, handing it the caller's value MODE through the
+    /// fixed-arity entry when there is one (up to four arguments): the entry passes the mode on
+    /// only to a body that reads it, so a method that returns (VALUES ...) to a
+    /// MULTIPLE-VALUE-BIND needs no values record. MODE 0, or more arguments: the array entry.</summary>
+    private static LispObject InvokeArrayM(LispFunction f, LispObject[] args, int mode)
+    {
+        if (mode != 0)
+        {
+            switch (args.Length)
+            {
+                case 1: return f.InvokeFast1M(args[0], mode);
+                case 2: return f.InvokeFast2M(args[0], args[1], mode);
+                case 3: return f.InvokeFast3M(args[0], args[1], args[2], mode);
+                case 4: return f.InvokeFast4M(args[0], args[1], args[2], args[3], mode);
+            }
+        }
+        return f.Invoke(args);
+    }
+
     private static LispObject InvokeStandardCombination(
         GenericFunction gf, List<LispMethod> before, List<LispMethod> primary,
-        List<LispMethod> after, LispObject[] args)
+        List<LispMethod> after, LispObject[] args, int mode = 0)
     {
         ref var nm = ref Nm;
         var savedGf = nm.Gf;
@@ -625,7 +644,7 @@ public static partial class Runtime
             // Fast path: single primary, no before/after -> minimal next-method setup
             if (before.Count == 0 && after.Count == 0 && primary.Count == 1)
             {
-                if (primary[0].IgnoresNextMethodState) return primary[0].Function.Invoke(args);
+                if (primary[0].IgnoresNextMethodState) return InvokeArrayM(primary[0].Function, args, mode);
                 var savedMethod = nm.Method;
                 var savedChain = nm.Chain;
                 var savedIndex = nm.Index;
@@ -643,7 +662,7 @@ public static partial class Runtime
                 nm.CapturedCnm = null;
                 try
                 {
-                    return primary[0].Function.Invoke(args);
+                    return InvokeArrayM(primary[0].Function, args, mode);
                 }
                 finally
                 {
@@ -925,8 +944,10 @@ public static partial class Runtime
         nm.Method = chain[idx];
         // The next body builds its own closures from the chain state if it
         // captures, exactly as INVOKEWITHNEXTMETHODS arranges for the array path.
-        nm.CapturedNmp = null;
-        nm.CapturedCnm = null;
+        // (A store of a reference into the heap-held state costs a write barrier, so an
+        // empty slot is left alone.)
+        if (savedCapturedNmp != null) nm.CapturedNmp = null;
+        if (savedCapturedCnm != null) nm.CapturedCnm = null;
         try
         {
             var fn = chain[idx].Function;
@@ -942,8 +963,8 @@ public static partial class Runtime
         {
             nm.Index = savedIndex;
             nm.Method = savedMethod;
-            nm.CapturedNmp = savedCapturedNmp;
-            nm.CapturedCnm = savedCapturedCnm;
+            if (!ReferenceEquals(nm.CapturedNmp, savedCapturedNmp)) nm.CapturedNmp = savedCapturedNmp;
+            if (!ReferenceEquals(nm.CapturedCnm, savedCapturedCnm)) nm.CapturedCnm = savedCapturedCnm;
         }
     }
 

@@ -19,8 +19,8 @@
 ;;; reports failure-p true).
 
 (deftest-compiled-only compile-file-defconstant-is-visible-to-later-macros
-  (let ((src "cfdc-src-tmp.lisp")
-        (fasl "cfdc-src-tmp.fasl"))
+  (let ((src (regression-temp-file "cfdc-src-tmp.lisp"))
+        (fasl (regression-temp-file "cfdc-src-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)
@@ -50,8 +50,8 @@
 ;;; earlier constant, both read at expansion time.
 
 (deftest-compiled-only compile-file-defconstant-chains
-  (let ((src "cfdc2-src-tmp.lisp")
-        (fasl "cfdc2-src-tmp.fasl"))
+  (let ((src (regression-temp-file "cfdc2-src-tmp.lisp"))
+        (fasl (regression-temp-file "cfdc2-src-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)
@@ -117,8 +117,8 @@
 ;; Loading the same fasl a second time is two load-time evaluations, and that
 ;; is still refused, as in SBCL.
 (deftest-compiled-only defconstant-redefinition.compile-file-then-load-keeps-the-value
-  (let ((src "dcr-tmp.lisp")
-        (fasl "dcr-tmp.fasl"))
+  (let ((src (regression-temp-file "dcr-tmp.lisp"))
+        (fasl (regression-temp-file "dcr-tmp.fasl")))
     (unwind-protect
         (progn
           (with-open-file (s src :direction :output :if-exists :supersede)
@@ -146,8 +146,8 @@
 (defvar *dcr-phase* :load)
 
 (deftest-compiled-only defconstant-redefinition.compile-file-then-load-different-value-reports
-  (let ((src "dcr2-tmp.lisp")
-        (fasl "dcr2-tmp.fasl"))
+  (let ((src (regression-temp-file "dcr2-tmp.lisp"))
+        (fasl (regression-temp-file "dcr2-tmp.fasl")))
     (unwind-protect
         (progn
           (with-open-file (s src :direction :output :if-exists :supersede)

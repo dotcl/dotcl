@@ -187,7 +187,7 @@
    (10 20 :error (10 20))))
 
 (deftest-emitting-only struct-inline-slots.fasl
-  (let ((src "sis-fasl-tmp.lisp") (fasl "sis-fasl-tmp.fasl"))
+  (let ((src (regression-temp-file "sis-fasl-tmp.lisp")) (fasl (regression-temp-file "sis-fasl-tmp.fasl")))
     (unwind-protect
         (progn
           (with-open-file (s src :direction :output :if-exists :supersede)

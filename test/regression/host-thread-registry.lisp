@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Threads that did not come from DOTCL:MAKE-THREAD (a host's own .NET threads)
 ;;; that ask for their CURRENT-THREAD are entered in the thread registry. Their
 ;;; entries must go once they have ended, as a Lisp-made thread's do: they used

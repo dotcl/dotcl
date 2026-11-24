@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; LISTEN and READ-CHAR-NO-HANG on a socket stream answer at once when nothing
 ;;; has arrived yet: LISTEN is NIL, READ-CHAR-NO-HANG is NIL (not end of file).
 ;;;

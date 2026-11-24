@@ -146,7 +146,7 @@ public static class JitProfile
             h ^= b;
             h *= 1099511628211UL;
         }
-        return h.ToString("x16");
+        return h.ToString("x16", System.Globalization.CultureInfo.InvariantCulture);
     }
 
     /// <summary>

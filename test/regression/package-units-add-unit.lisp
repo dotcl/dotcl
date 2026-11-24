@@ -102,6 +102,26 @@
           (err (lambda () (dotcl-lock:use-lock "dotcl-systems.lock")))))
   (:error :error :error))
 
+;;; CALL-IN-UNIT with no name is outside every unit, on the real global bindings:
+;;; a PUSH there is the global one, and one made globally after the unit was
+;;; added is seen from inside the unit.
+(deftest package-units-add-unit-call-in-unit-nil-is-global
+  (let ((a (merge-pathnames "puadd-marker-a/" *puadd-dir*))
+        (b (merge-pathnames "puadd-marker-b/" *puadd-dir*)))
+    (flet ((has (m) (and (member m asdf:*central-registry* :test #'equal) t)))
+      (push b asdf:*central-registry*)
+      (prog1
+          (list (puadd-in-unit (lambda ()
+                                 (dotcl-lock:call-in-unit nil
+                                   (lambda () (push a asdf:*central-registry*) (has b)))))
+                (has a)
+                (puadd-in-unit (lambda () (has a)))
+                (puadd-in-unit (lambda ()
+                                 (dotcl-lock:call-in-unit nil (lambda () (has a))))))
+        (setf asdf:*central-registry*
+              (remove b (remove a asdf:*central-registry* :test #'equal) :test #'equal)))))
+  (t t nil t))
+
 (setf asdf:*system-definition-search-functions*
       (remove 'dotcl-lock::sysdef-lock-search asdf:*system-definition-search-functions*)
       dotcl-lock::*lock* nil

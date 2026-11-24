@@ -2,10 +2,218 @@ namespace DotCL;
 
 public static partial class Runtime
 {
+    private static LispObject FormatDestinationType()
+        => List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("BOOLEAN"), Startup.Sym("STREAM"));
+
     // --- Format ---
 
     public static LispObject Format(LispObject dest, LispObject[] args)
         => MultipleValues.Alone(FormatTo(dest, args));
+
+    // The decimal text of the small non-negative integers, built on first use: the counts,
+    // ids and indexes a page is made of print without allocating a string each time.
+    private static readonly string?[] s_smallIntegerText = new string?[1024];
+    private static string SmallIntegerText(long n)
+    {
+        if ((ulong)n >= (ulong)s_smallIntegerText.Length)
+            return n.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return s_smallIntegerText[n] ??= n.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>What a parameterless ~D writes to STREAM: the decimal digits of an integer, any
+    /// other object as ~A with *PRINT-BASE* 10. The compiler writes (FORMAT dest "~D" x) this way.</summary>
+    public static LispObject FormatD(LispObject x, LispObject stream)
+    {
+        if (x is Fixnum f)
+        {
+            // A file or string stream itself, with no logical block open: the digits go
+            // straight to its writer, with no string object around them.
+            if (IsPlainOutputStream(stream))
+            {
+                try
+                {
+                    var w = GetTextWriter(stream);
+                    if (w.GetType() == typeof(System.IO.StringWriter))
+                        ((System.IO.StringWriter)w).GetStringBuilder().Append(f.Value);
+                    else
+                        w.Write(SmallIntegerText(f.Value));
+                    ((LispStream)stream).AtLineStart = false;
+                }
+                catch (System.IO.IOException ex) { throw StreamIOError(stream, ex); }
+                catch (System.ObjectDisposedException ex) { throw StreamIOError(stream, ex); }
+                catch (System.Net.Sockets.SocketException ex) { throw StreamIOError(stream, ex); }
+            }
+            else
+                WriteString2(new LispString(SmallIntegerText(f.Value)), stream);
+        }
+        else if (x is Bignum b)
+        {
+            if (IsPlainOutputStream(stream))
+            {
+                try
+                {
+                    var w = GetTextWriter(stream);
+                    if (w.GetType() == typeof(System.IO.StringWriter))
+                        AppendBigIntRadix(((System.IO.StringWriter)w).GetStringBuilder(), b.Value, 10);
+                    else
+                        w.Write(b.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    ((LispStream)stream).AtLineStart = false;
+                }
+                catch (System.IO.IOException ex) { throw StreamIOError(stream, ex); }
+                catch (System.ObjectDisposedException ex) { throw StreamIOError(stream, ex); }
+                catch (System.Net.Sockets.SocketException ex) { throw StreamIOError(stream, ex); }
+            }
+            else
+                WriteString2(new LispString(b.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)), stream);
+        }
+        else
+        {
+            var baseSym = Startup.Sym("*PRINT-BASE*");
+            DynamicBindings.Push(baseSym, Fixnum.Make(10));
+            try { Princ2(x, stream); }
+            finally { DynamicBindings.Pop(baseSym); }
+        }
+        return Nil.Instance;
+    }
+
+    public static LispObject FormatX(LispObject x, LispObject stream)
+        => FormatRadix(x, stream, 16);
+
+    public static LispObject FormatB(LispObject x, LispObject stream)
+        => FormatRadix(x, stream, 2);
+
+    private static LispObject FormatRadix(LispObject x, LispObject stream, int radix)
+    {
+        if (x is Fixnum f)
+        {
+            if (IsPlainOutputStream(stream))
+            {
+                try
+                {
+                    var w = GetTextWriter(stream);
+                    if (w.GetType() == typeof(System.IO.StringWriter))
+                        AppendLongRadix(((System.IO.StringWriter)w).GetStringBuilder(), f.Value, radix);
+                    else
+                        w.Write(ToRadixString(f.Value, radix));
+                    ((LispStream)stream).AtLineStart = false;
+                }
+                catch (System.IO.IOException ex) { throw StreamIOError(stream, ex); }
+                catch (System.ObjectDisposedException ex) { throw StreamIOError(stream, ex); }
+                catch (System.Net.Sockets.SocketException ex) { throw StreamIOError(stream, ex); }
+            }
+            else
+                WriteString2(new LispString(ToRadixString(f.Value, radix)), stream);
+        }
+        else if (x is Bignum b)
+        {
+            if (IsPlainOutputStream(stream))
+            {
+                try
+                {
+                    var w = GetTextWriter(stream);
+                    if (w.GetType() == typeof(System.IO.StringWriter))
+                        AppendBigIntRadix(((System.IO.StringWriter)w).GetStringBuilder(), b.Value, radix);
+                    else
+                        w.Write(BigIntToRadixString(b.Value, radix));
+                    ((LispStream)stream).AtLineStart = false;
+                }
+                catch (System.IO.IOException ex) { throw StreamIOError(stream, ex); }
+                catch (System.ObjectDisposedException ex) { throw StreamIOError(stream, ex); }
+                catch (System.Net.Sockets.SocketException ex) { throw StreamIOError(stream, ex); }
+            }
+            else
+                WriteString2(new LispString(BigIntToRadixString(b.Value, radix)), stream);
+        }
+        else
+        {
+            var baseSym = Startup.Sym("*PRINT-BASE*");
+            DynamicBindings.Push(baseSym, Fixnum.Make(radix));
+            try { Princ2(x, stream); }
+            finally { DynamicBindings.Pop(baseSym); }
+        }
+        return Nil.Instance;
+    }
+
+    [ThreadStatic] private static LispObject[][]? _fmtArgCache;
+    [ThreadStatic] private static int _fmtArgDepth;
+
+    private static LispObject[] RentFormatArgs(int n)
+    {
+        _fmtArgCache ??= new LispObject[8][];
+        if (_fmtArgDepth == _fmtArgCache.Length)
+            Array.Resize(ref _fmtArgCache, _fmtArgCache.Length * 2);
+        var args = _fmtArgCache[_fmtArgDepth];
+        if (args == null || args.Length != n)
+            _fmtArgCache[_fmtArgDepth] = args = new LispObject[n];
+        _fmtArgDepth++;
+        return args;
+    }
+
+    private static string FormatNilTemplate(LispObject control)
+        => control is LispString s ? s.Value
+           : control is LispVector v && v.IsCharVector ? v.ToCharString()
+           : throw new LispErrorException(new LispTypeError("FORMAT: format string must be a string", control));
+
+    private static LispObject FormatNilCore(string template, LispObject[] formatArgs)
+    {
+        if (!_pprintActive && !_fmtToPretty)
+            return new LispString(FormatStringTop(template, formatArgs));
+        var suspended = PprintSuspend();
+        bool savedToPretty = _fmtToPretty;
+        _fmtToPretty = false;
+        try { return new LispString(FormatStringTop(template, formatArgs)); }
+        finally { _fmtToPretty = savedToPretty; PprintResume(suspended); }
+    }
+
+    public static LispObject FormatNil0(LispObject control)
+        => FormatNilCore(FormatNilTemplate(control), Array.Empty<LispObject>());
+
+    public static LispObject FormatNil1(LispObject control, LispObject a)
+    {
+        string template = FormatNilTemplate(control);
+        if (!_pprintActive && !_fmtToPretty && template.Length == 2 && template[0] == '~')
+        {
+            switch (CharCase.AsciiUpper(template[1]))
+            {
+                case 'A': return new LispString(FormatAesthetic(a));
+                case 'S': return new LispString(FormatTop(a, true));
+                case 'D':
+                    if (a is Fixnum f)
+                        return new LispString(f.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    if (a is Bignum b)
+                        return new LispString(b.Value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    break;
+            }
+        }
+        var args = RentFormatArgs(1);
+        try { args[0] = a; return FormatNilCore(template, args); }
+        finally { _fmtArgDepth--; }
+    }
+
+    public static LispObject FormatNil2(LispObject control, LispObject a, LispObject b)
+    {
+        var args = RentFormatArgs(2);
+        try { args[0] = a; args[1] = b; return FormatNilCore(FormatNilTemplate(control), args); }
+        finally { _fmtArgDepth--; }
+    }
+
+    public static LispObject FormatNil3(LispObject control, LispObject a, LispObject b, LispObject c)
+    {
+        var args = RentFormatArgs(3);
+        try { args[0] = a; args[1] = b; args[2] = c; return FormatNilCore(FormatNilTemplate(control), args); }
+        finally { _fmtArgDepth--; }
+    }
+
+    public static LispObject FormatNil4(LispObject control, LispObject a, LispObject b, LispObject c, LispObject d)
+    {
+        var args = RentFormatArgs(4);
+        try
+        {
+            args[0] = a; args[1] = b; args[2] = c; args[3] = d;
+            return FormatNilCore(FormatNilTemplate(control), args);
+        }
+        finally { _fmtArgDepth--; }
+    }
 
     /// <summary>A fill-pointer string destination, written as by VECTOR-PUSH-EXTEND.</summary>
     private static LispObject FormatDestination(LispObject dest)
@@ -57,7 +265,8 @@ public static partial class Runtime
         else if (args[0] is LispVector lv0 && lv0.IsCharVector)
             formatString = lv0.ToCharString();
         else
-            throw new LispErrorException(new LispTypeError("FORMAT: format string must be a string", args[0]));
+            throw new LispErrorException(new LispTypeError("FORMAT: format string must be a string", args[0],
+                List(Startup.Sym("OR"), Startup.Sym("STRING"), Startup.Sym("FUNCTION"))));
 
         // (format dest "no directives") is common enough that the empty argument
         // array is worth not allocating.
@@ -91,9 +300,7 @@ public static partial class Runtime
         if (dest is T)
             resolvedStream = DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
         LispObject resolved = resolvedStream;
-        while (resolved is LispEchoStream es2) resolved = es2.OutputStream;
-        while (resolved is LispTwoWayStream tw2) resolved = tw2.OutputStream;
-        while (resolved is LispSynonymStream syn2) resolved = DynamicBindings.Get(syn2.Symbol);
+        resolved = ResolveOutputWrappers(resolved);
         // A Gray stream answers for itself (STREAM-START-LINE-P), so ~& at the
         // start of the control string is a fresh line on it as on any stream.
         // Only asked when the control string can contain ~&.
@@ -142,6 +349,7 @@ public static partial class Runtime
         }
         else if (dest is LispBroadcastStream bs)
         {
+            if (bs.IsClosed) throw new LispErrorException(MakeStreamError(dest, "WRITE"));
             foreach (var s in bs.Streams)
                 GetTextWriter(s).Write(result2);
             if (_pprintActive) PprintTrackWrite(result2);
@@ -157,7 +365,7 @@ public static partial class Runtime
         }
         else
         {
-            throw new LispErrorException(new LispTypeError("FORMAT: invalid destination", dest));
+            throw new LispErrorException(new LispTypeError("FORMAT: invalid destination", dest, FormatDestinationType()));
         }
 
         // Update AtLineStart on the resolved stream
@@ -187,26 +395,93 @@ public static partial class Runtime
         if (value == 0) return "0";
         bool neg = value < 0;
         ulong v = neg ? (ulong)(-value) : (ulong)value;
+#if NETSTANDARD2_0
         var chars = new List<char>();
         while (v > 0) { chars.Add(digits[(int)(v % (ulong)radix)]); v /= (ulong)radix; }
         if (neg) chars.Add('-');
         chars.Reverse();
         return new string(chars.ToArray());
+#else
+        Span<char> buf = stackalloc char[65];
+        int pos = buf.Length;
+        while (v > 0) { buf[--pos] = digits[(int)(v % (ulong)radix)]; v /= (ulong)radix; }
+        if (neg) buf[--pos] = '-';
+        return new string(buf.Slice(pos, buf.Length - pos));
+#endif
     }
 
-    private static string BigIntToRadixString(System.Numerics.BigInteger value, int radix)
+    /// <summary>VALUE in RADIX (2..36), upper-case digits, a leading minus for a negative.
+    /// Up to about a thousand decimal digits it is one conversion; past that the number
+    /// is split by radix^(L * 2^k), the halves converted the same way and the low half
+    /// padded with zeros to the width of its power, so the cost is a few multiplications
+    /// and divisions instead of the quadratic digit-by-digit loop BigInteger.ToString
+    /// is.</summary>
+    internal static string BigIntToRadixString(System.Numerics.BigInteger value, int radix)
     {
-        const string digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
         CheckRadix(radix);
-        if (value == 0) return "0";
-        bool neg = value < 0;
-        var v = neg ? -value : value;
-        var chars = new List<char>();
-        var bigRadix = new System.Numerics.BigInteger(radix);
-        while (v > 0) { chars.Add(digits[(int)(v % bigRadix)]); v /= bigRadix; }
-        if (neg) chars.Add('-');
-        chars.Reverse();
-        return new string(chars.ToArray());
+        if (value.IsZero) return "0";
+        bool neg = value.Sign < 0;
+        var v = neg ? System.Numerics.BigInteger.Negate(value) : value;
+        // L digits of this radix take about 3500 bits.
+        int leafDigits = Math.Max(1, (int)(3500.0 / (Math.Log(radix) / Math.Log(2))));
+        string body;
+        if (v.GetBitLength() <= 3500)
+            body = BigLeafToRadixString(v, radix);
+        else
+        {
+            var powers = new List<System.Numerics.BigInteger> { System.Numerics.BigInteger.Pow(radix, leafDigits) };
+            while (powers[powers.Count - 1] <= v)
+                powers.Add(powers[powers.Count - 1] * powers[powers.Count - 1]);
+            var sb = new System.Text.StringBuilder((int)(v.GetBitLength() / (Math.Log(radix) / Math.Log(2))) + 8);
+            BigEmitRadix(v, powers.Count - 1, false, radix, leafDigits, powers, sb);
+            body = sb.ToString();
+        }
+        return neg ? "-" + body : body;
+    }
+
+    private static void BigEmitRadix(System.Numerics.BigInteger v, int level, bool pad, int radix,
+                                     int leafDigits, List<System.Numerics.BigInteger> powers,
+                                     System.Text.StringBuilder sb)
+    {
+        if (level == 0)
+        {
+            string leaf = BigLeafToRadixString(v, radix);
+            if (pad) sb.Append('0', leafDigits - leaf.Length);
+            sb.Append(leaf);
+            return;
+        }
+        if (!pad && v < powers[level - 1])
+        {
+            BigEmitRadix(v, level - 1, false, radix, leafDigits, powers, sb);
+            return;
+        }
+        var q = System.Numerics.BigInteger.DivRem(v, powers[level - 1], out var r);
+        BigEmitRadix(q, level - 1, pad, radix, leafDigits, powers, sb);
+        BigEmitRadix(r, level - 1, true, radix, leafDigits, powers, sb);
+    }
+
+    /// <summary>The digits of a non-negative V of at most about 3500 bits.</summary>
+    private static string BigLeafToRadixString(System.Numerics.BigInteger v, int radix)
+    {
+        if (radix == 10) return v.ToString();
+        const string digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        if (v.IsZero) return "0";
+        // Chunks of radix^m < 2^62, so each division yields a ulong that is printed alone.
+        int m = 1; ulong chunk = (ulong)radix;
+        while (chunk <= (1UL << 62) / (ulong)radix) { chunk *= (ulong)radix; m++; }
+        var bigChunk = new System.Numerics.BigInteger(chunk);
+        var parts = new List<ulong>();
+        while (!v.IsZero) { v = System.Numerics.BigInteger.DivRem(v, bigChunk, out var rem); parts.Add((ulong)rem); }
+        var sb = new System.Text.StringBuilder(parts.Count * m);
+        for (int i = parts.Count - 1; i >= 0; i--)
+        {
+            ulong c = parts[i];
+            var tmp = new char[m]; int n = 0;
+            while (c > 0) { tmp[n++] = digits[(int)(c % (ulong)radix)]; c /= (ulong)radix; }
+            if (i != parts.Count - 1) sb.Append('0', m - n);
+            for (int j = n - 1; j >= 0; j--) sb.Append(tmp[j]);
+        }
+        return sb.ToString();
     }
 
     private static readonly string[] FormatScaleNames =
@@ -377,12 +652,12 @@ public static partial class Runtime
     /// shortest round-trip decimal instead of the exact binary expansion. Set
     /// only by ~G, which derived d from that same representation.</param>
     private static string FormatFixedFloat(double value, int? w, int? d, int k, char? overflowChar, char padChar, bool atSign, bool isSingle, bool isDouble,
-        bool shortestDigits = false)
+        bool shortestDigits = false, bool kOmitted = false)
         => FormatFixedFloatCore(value, w, d, k, overflowChar, padChar, atSign, isSingle, isDouble,
-                                shortestDigits, out _);
+                                shortestDigits, out _, kOmitted);
 
     private static string FormatFixedFloatCore(double value, int? w, int? d, int k, char? overflowChar, char padChar, bool atSign, bool isSingle, bool isDouble,
-        bool shortestDigits, out bool overflowed)
+        bool shortestDigits, out bool overflowed, bool kOmitted = false)
     {
         overflowed = false;
         double scaled = value * Math.Pow(10.0, k);
@@ -393,11 +668,7 @@ public static partial class Runtime
 
         if (d == null && w == null)
         {
-            string raw;
-            if (isSingle)
-                raw = FloatText.R(((float)absVal));
-            else
-                raw = FloatText.R(absVal);
+            string raw = ScaledRoundTripText(value, k, isSingle);
 
             if (raw.Contains('E') || raw.Contains('e'))
                 raw = ExpandScientificToFixed(raw);
@@ -419,22 +690,29 @@ public static partial class Runtime
             string str;
             if (spaceleft <= 1)
             {
+                // SBCL: no room to choose, the shortest digits as they are.
                 ExtractScientificDigits(raw, out var digits, out int exponent);
-                str = intText == "0" ? ".0" : RenderFixedShortest(digits, exponent);
+                // (with no scale factor given the suite expects (format nil "~1f" 0.01) to be ".0": a
+                // value that rounds to no integer digit and has no column to spare)
+                str = (absVal == 0 || (kOmitted && intText == "0" && absVal < 0.1)) ? ".0" : RenderFixedShortest(digits, exponent);
             }
             else
             {
-                ExtractScientificDigits(raw, out var all, out int exponent);
-                int leadingZeros = exponent < 0 ? -(exponent + 1) : 0;
-                int significant = spaceleft - 1 - leadingZeros;
-                RoundShortestToSignificant(raw, significant, Math.Abs(value), k,
-                                           out var digitsW, out int exponentW);
+                // SBCL's FLONUM-TO-STRING with a width: the digits of |x| rounded to W-1 places
+                // counted from the units digit (so for |x| < 1, W-1 places after the point, not
+                // significant digits), or, when that is longer, the integer digits of the scaled
+                // value. The longer one wins; a tie goes to the width-limited one.
+                int position = Math.Max(1, spaceleft - 1 + (k < 0 ? k : 0));
+                SbclRelativeDigits(Math.Abs(value), isSingle, position, out var digitsW, out int exponentW);
+                exponentW += k;
                 string digitsI = intText.TrimEnd('0');
                 if (digitsI.Length == 0) digitsI = "0";
-                int exponentI = intText.Length - 1;
-                str = digitsW.Length >= digitsI.Length
-                    ? RenderFixedShortest(digitsW, exponentW)
-                    : RenderFixedShortest(digitsI, exponentI);
+                int exponentI = digitsI == "0" ? k - 1 : intText.Length - 1;
+                str = absVal == 0
+                    ? ".0"
+                    : digitsW.Length >= digitsI.Length
+                        ? RenderFixedShortest(digitsW, exponentW)
+                        : RenderFixedShortest(digitsI, exponentI);
             }
 
             int space = spaceleft - str.Length;
@@ -449,7 +727,13 @@ public static partial class Runtime
             }
             if (trailingPoint)
             {
-                if (space >= 0)
+                // The zero after a final point is optional: it is dropped unless a column is
+                // left for it (SBCL: (> spaceleft 0)), so (format nil "~3,,2F" 0.5d0) is "50.".
+                // With no scale factor given and a single integer digit the suite's expectation
+                // is kept instead: (format nil "~2f" 1.0) is "1.0", the zero stays when it takes
+                // the last column (SBCL gives "1." for a double). With more integer digits the
+                // zero is dropped as above: (format nil "~3f" 12.5) is "13.".
+                if (space > 0 || (kOmitted && space >= 0 && str.Length <= 2))
                     space--;
                 else
                     trailingPoint = false;
@@ -487,12 +771,12 @@ public static partial class Runtime
                         string fracPart = result.Substring(dotPos);
                         string signPart = "";
                         string digits3 = intPart;
-                        if (intPart.StartsWith("-") || intPart.StartsWith("+"))
+                        if (intPart.StartsWith("-", System.StringComparison.Ordinal) || intPart.StartsWith("+", System.StringComparison.Ordinal))
                         {
                             signPart = intPart.Substring(0, 1);
                             digits3 = intPart.Substring(1);
                         }
-                        if (digits3 == "0" && fracPart.Length > 1)
+                        if (digits3 == "0" && (fracPart.Length > 1 || !kOmitted))
                             result = signPart + fracPart;
                     }
                 }
@@ -512,10 +796,70 @@ public static partial class Runtime
         return result;
     }
 
+    /// <summary>Whether the exact value of ABSVAL is at least 10^kInt - 10^(kInt-position)/2: rounding it half
+    /// up to POSITION places counted from the units digit reaches the next power of ten.</summary>
+    private static bool ExactAbsAtLeastCarryThreshold(double absVal, int kInt, int position)
+    {
+        long bits = BitConverter.DoubleToInt64Bits(absVal);
+        int expBits = (int)((bits >> 52) & 0x7FF);
+        long frac = bits & 0xFFFFFFFFFFFFFL;
+        System.Numerics.BigInteger m = expBits == 0 ? frac : (frac | (1L << 52));
+        int e = (expBits == 0 ? 1 : expBits) - 1075;
+        // Scale by 10^S so that both sides are integers: S covers the binary fraction and the half unit.
+        int s = Math.Max(Math.Max(-e, position - kInt + 1), 1);
+        var ten = new System.Numerics.BigInteger(10);
+        System.Numerics.BigInteger scaled = e >= 0
+            ? m * System.Numerics.BigInteger.Pow(2, e) * System.Numerics.BigInteger.Pow(ten, s)
+            : m * System.Numerics.BigInteger.Pow(5, -e) * System.Numerics.BigInteger.Pow(ten, s + e);
+        // threshold = 10^(kInt+S) - 5 * 10^(kInt-position+S-1)
+        var threshold = System.Numerics.BigInteger.Pow(ten, kInt + s)
+                        - 5 * System.Numerics.BigInteger.Pow(ten, kInt - position + s - 1);
+        return scaled >= threshold;
+    }
+
+    /// <summary>SBCL's (FLONUM-TO-DIGITS x POSITION T): the digits of |x| rounded POSITION places counted from
+    /// the units digit. For |x| >= 1 that is POSITION significant digits; for |x| below 1 it is POSITION
+    /// places after the point (0.05 at 1 is "1" times 10^-1, at 2 it is "5" times 10^-2). MsdExp is the
+    /// power of ten of the first digit.</summary>
+    private static void SbclRelativeDigits(double absVal, bool isSingle, int position,
+                                           out string digits, out int msdExp)
+    {
+        string raw = RoundTripText(absVal, isSingle);
+        ExtractScientificDigits(raw, out var all, out int e10);
+        if (all == "0") { digits = "0"; msdExp = 0; return; }
+        // K: the number of digits left of the point (0 below 1). SBCL rounds at 10^(K - POSITION),
+        // except when rounding up there would carry |x| into the next power of ten: then it keeps one
+        // more place, so that 99.9 at 2 is "99.9" and not "100".
+        int kInt = e10 >= 0 ? e10 + 1 : 0;
+        int fracDigits = Math.Max(0, all.Length - 1 - e10);
+        int q = position - kInt;
+        int f = Math.Max(Math.Max(fracDigits, q), 0) + 1;
+        var big10 = new System.Numerics.BigInteger(10);
+        var x = System.Numerics.BigInteger.Parse(all, System.Globalization.CultureInfo.InvariantCulture)
+                * System.Numerics.BigInteger.Pow(big10, f - fracDigits);
+        // Whether rounding |x| at 10^-q reaches 10^kInt is decided on the exact binary value, not on the
+        // shortest digits: 9.95 reads back from "9.95" but is 9.949999..., so at one place it is 9.9.
+        bool carry = ExactAbsAtLeastCarryThreshold(absVal, kInt, position);
+        int p = kInt - position - (carry ? 1 : 0);   // the power of ten of the last digit kept
+        if (kInt >= 1)
+        {
+            RoundShortestToSignificant(raw, kInt - p, absVal, 0, out digits, out msdExp);
+            return;
+        }
+        string fixedText = RoundShortestToFixed(raw, -p, absVal, 0);
+        int dot = fixedText.IndexOf('.');
+        string flat = fixedText.Remove(dot, 1);
+        int firstNonZero = 0;
+        while (firstNonZero < flat.Length && flat[firstNonZero] == '0') firstNonZero++;
+        if (firstNonZero == flat.Length) { digits = "0"; msdExp = -1; return; }
+        digits = flat.Substring(firstNonZero).TrimEnd('0');
+        msdExp = dot - firstNonZero - 1;
+    }
+
     /// <summary>Render significant digits in fixed notation, always with a point.</summary>
     private static string RenderFixedShortest(string digits, int msdExp)
     {
-        if (digits.Length == 0 || digits == "0")
+        if (digits.Length == 0)
             return ".0";
         int point = msdExp + 1;
         if (point >= digits.Length)
@@ -785,8 +1129,15 @@ public static partial class Runtime
     /// 767 significant digits) and leaves the caller's tie rule to act on a real tie.</summary>
     private static void SignificantDigitsForRounding(double absVal, int n,
                                                      out string allDigits, out int msdExp,
-                                                     bool isSingle = false)
+                                                     bool isSingle = false, bool shortestDouble = false)
     {
+        if (shortestDouble && !isSingle)
+        {
+            // ~G with d omitted took d from the shortest round-trip decimal: digits past it are
+            // zeros, not the binary expansion ((format nil "~G" 1d-20) is 1.000...d-20).
+            ExtractScientificDigits(FloatText.R(absVal), out allDigits, out msdExp);
+            return;
+        }
         if (isSingle)
         {
             // A single-float carries only the digits of its shortest round-trip
@@ -1069,7 +1420,7 @@ public static partial class Runtime
     /// <summary>Digits of a fixed-notation float text ("1234567.9", "0.0012", "-3.5") as "d.ddde<exp>".</summary>
     private static string FixedToScientific(string fixedText)
     {
-        bool neg = fixedText.StartsWith("-");
+        bool neg = fixedText.StartsWith("-", System.StringComparison.Ordinal);
         string t = neg ? fixedText.Substring(1) : fixedText;
         int dot = t.IndexOf('.');
         string ip = dot < 0 ? t : t.Substring(0, dot);
@@ -1159,7 +1510,9 @@ public static partial class Runtime
             // off the same shortest representation.
             string gs = (isSingle && shortestDigits)
                 ? FloatText.R(((float)absVal))
-                : absVal.ToString("G17", System.Globalization.CultureInfo.InvariantCulture);
+                : shortestDigits
+                    ? FloatText.R(absVal)
+                    : absVal.ToString("G17", System.Globalization.CultureInfo.InvariantCulture);
             int eIdxG = gs.IndexOf('E');
             if (eIdxG < 0) eIdxG = gs.IndexOf('e');
             if (eIdxG >= 0)
@@ -1196,6 +1549,9 @@ public static partial class Runtime
         if (d.HasValue)
         {
             dActual = d.Value;
+            // CLHS 22.3.3.2: a negative k has to be greater than -d; where it is not, a
+            // larger d is used (one more digit than the zeros k asks for), as SBCL and CLISP do.
+            if (k < 0 && dActual + k < 1) dActual = 1 - k;
         }
         else if (!w.HasValue)
         {
@@ -1216,8 +1572,8 @@ public static partial class Runtime
             {
                 string rSigFull = rStr.Substring(0, rEIdx).TrimStart('-'); // e.g. "1.23456789"
                 string rExpStr = rStr.Substring(rEIdx + 1);                // e.g. "7" or "-4"
-                bool rExpNeg = rExpStr.StartsWith("-");
-                int rExp = (rExpNeg ? -1 : 1) * int.Parse(rExpStr.TrimStart('-')); // exponent in "1-digit-before-dot" form
+                bool rExpNeg = rExpStr.StartsWith("-", System.StringComparison.Ordinal);
+                int rExp = (rExpNeg ? -1 : 1) * int.Parse(rExpStr.TrimStart('-'), System.Globalization.CultureInfo.InvariantCulture); // exponent in "1-digit-before-dot" form
 
                 // Apply k shift: move decimal point (k-1) places right, adjust exponent
                 // For default k=1: no shift needed, exponent stays at rExp
@@ -1235,9 +1591,10 @@ public static partial class Runtime
                 if (newDotPos <= 0)
                 {
                     // All digits are after the decimal: "0.00..." prefix
-                    sigStr2 = "0." + new string('0', -newDotPos) + allDigitsR;
-                    finalExp -= kShift; // recalculate
-                    sigStr2 = rSigFull; // fallback: just use as-is for k<=0
+                    string sigDigits = allDigitsR.TrimEnd('0');
+                    if (sigDigits.Length == 0) sigDigits = "0";
+                    sigStr2 = "0." + new string('0', -k) + sigDigits;
+                    finalExp = rExp + 1 - k;
                 }
                 else if (newDotPos >= allDigitsR.Length)
                 {
@@ -1318,7 +1675,7 @@ public static partial class Runtime
 
         // Digits to round from: enough that rounding them equals rounding the value.
         SignificantDigitsForRounding(absVal, totalDigitsToEmit, out string allDigits, out int msdExp,
-                                     isSingle && shortestDigits);
+                                     isSingle && shortestDigits, !isSingle && shortestDigits);
 
         // Round allDigits to totalDigitsToEmit significant digits (round-half-up, then normalize).
         bool carry = false;
@@ -1431,6 +1788,23 @@ public static partial class Runtime
 
         string sign = negative ? "-" : (atSign ? "+" : "");
         string full = sign + sigStr + expChar + expSign + expDigitsStr;
+
+        // CLHS 22.3.3.2: the zero before the decimal point is printed "if the total field
+        // width will permit it". When it makes the text longer than w, it is left out; with an
+        // overflow character the text does not fit instead (SBCL and CLISP agree).
+        // (A negative k leaves it out even then, as they do.)
+        // A rounding carry (9.99 -> 10.0) is the exception: SBCL and CLISP print the
+        // carried digits there, which do not fit, and so overflow.
+        bool shortestCarry = false;
+        if (carry && overflowChar.HasValue)
+        {
+            // The G17 digits of 1.0d-7 end in 99999..5 and carry; the number is 1.0e-7.
+            ShortestWidthDigits(absVal, isSingle, out string shortestForCarry, out _);
+            shortestCarry = shortestForCarry.Length > 0 && shortestForCarry[0] == '9';
+        }
+        if (w.HasValue && (!overflowChar.HasValue || k < 0 || !shortestCarry) && full.Length > w.Value
+            && sigStr.Length > 2 && sigStr.StartsWith("0.", StringComparison.Ordinal))
+            full = sign + sigStr.Substring(1) + expChar + expSign + expDigitsStr;
 
         if (w.HasValue)
         {
@@ -1621,7 +1995,7 @@ public static partial class Runtime
             return ex.PartialOutput;
         }
     }
-    private static string FormatString(string template, LispObject[] args, bool streamAtLineStart = true,
+    private static string FormatString(string template, LispObject[] args, bool? streamAtLineStart = null,
                                        int initialColumn = 0)
     {
         // CLHS 22.3.6.1: ~I, ~_, ~W, ~:T cannot coexist with ~<...~:;...~> in same format string
@@ -1724,9 +2098,7 @@ public static partial class Runtime
         if (dest is T)
             resolvedStream = DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
         LispObject resolved = resolvedStream;
-        while (resolved is LispEchoStream es2) resolved = es2.OutputStream;
-        while (resolved is LispTwoWayStream tw2) resolved = tw2.OutputStream;
-        while (resolved is LispSynonymStream syn2) resolved = DynamicBindings.Get(syn2.Symbol);
+        resolved = ResolveOutputWrappers(resolved);
         // A Gray stream answers for itself (STREAM-START-LINE-P), so ~& at the
         // start of the control string is a fresh line on it as on any stream.
         // Only asked when the control string can contain ~&.
@@ -1772,6 +2144,7 @@ public static partial class Runtime
         }
         else if (dest is LispBroadcastStream bs2)
         {
+            if (bs2.IsClosed) throw new LispErrorException(MakeStreamError(dest, "WRITE"));
             foreach (var s in bs2.Streams)
                 GetTextWriter(s).Write(result);
             if (_pprintActive) PprintTrackWrite(result);
@@ -1785,7 +2158,7 @@ public static partial class Runtime
             if (_pprintActive) PprintTrackWrite(result);
         }
         else
-            throw new LispErrorException(new LispTypeError("FORMAT: invalid destination", dest));
+            throw new LispErrorException(new LispTypeError("FORMAT: invalid destination", dest, FormatDestinationType()));
 
         // Update AtLineStart
         if (resolved is LispStream ls3 && result.Length > 0)
@@ -1854,6 +2227,17 @@ public static partial class Runtime
             st.RemoveAt(st.Count - 1);
     }
 
+    /// <summary>True when SB is the text of a logical block that is still open: the current one, or
+    /// one of the enclosing blocks saved on the stack.</summary>
+    private static bool IsOpenBlockBuffer(System.Text.StringBuilder sb)
+    {
+        if (_pprintStream is System.IO.StringWriter own && ReferenceEquals(own.GetStringBuilder(), sb)) return true;
+        if (_pprintStack != null)
+            foreach (var e in _pprintStack)
+                if (e.stream is System.IO.StringWriter sw && ReferenceEquals(sw.GetStringBuilder(), sb)) return true;
+        return false;
+    }
+
     private static void PprintFlushStagedOuter()
     {
         var st = _pprintStaged;
@@ -1862,6 +2246,9 @@ public static partial class Runtime
         {
             var (osb, ostream) = st[k];
             if (osb.Length == 0) continue;
+            // A buffer that is the text of the block being laid out now is that block's own
+            // output, not text waiting for an outer stream.
+            if (IsOpenBlockBuffer(osb)) continue;
             var text = osb.ToString();
             ostream.Write(text);
             if (ReferenceEquals(ostream, _pprintStream)) PprintTrackWrite(text);
@@ -1869,11 +2256,29 @@ public static partial class Runtime
         }
     }
 
-    private static string FormatAestheticStaged(LispObject obj, System.Text.StringBuilder sb)
+    /// <summary>True in the outermost body of a FORMAT call and in the body of an iteration it runs,
+    /// where the column an object starts at is known.</summary>
+    private static bool FmtStartColumnKnownDepth()
+        => _fmtCoreDepth == 1 || (_fmtCoreDepth == 2 && _fmtIterOuterSb != null);
+
+    private static string FormatAestheticStaged(LispObject obj, System.Text.StringBuilder sb, bool padded = false)
+    {
+        // Inside a FORMAT logical block the object is one level deeper per enclosing
+        // block, for *PRINT-LEVEL* (as FormatTopStaged does for ~S).
+        int logicalDepth = PprintLogicalBlockDepth();
+        if (logicalDepth == 0) return FormatAestheticStagedCore(obj, sb, padded);
+        int savedConsDepth = _formatConsDepth;
+        _formatConsDepth += logicalDepth;
+        try { return FormatAestheticStagedCore(obj, sb, padded); }
+        finally { _formatConsDepth = savedConsDepth; }
+    }
+
+    private static string FormatAestheticStagedCore(LispObject obj, System.Text.StringBuilder sb, bool padded = false)
     {
         if (!_pprintActive || _pprintStream == null)
         {
-            if (_fmtCoreDepth != 1 || _pprintActive) return FormatAesthetic(obj);
+            // A padded field (~mincolA) is built in a string of its own, which starts at column 0.
+            if (!FmtStartColumnKnownDepth() || _pprintActive || padded) return FormatAesthetic(obj);
             int saved = _printStartColumn;
             var savedDest = _printStartDest;
             var savedSb = _printStartFormatSb;
@@ -1888,23 +2293,23 @@ public static partial class Runtime
         finally { PprintPopStaged(sb); }
     }
 
-    private static string FormatTopStaged(LispObject obj, bool escape, System.Text.StringBuilder sb)
+    private static string FormatTopStaged(LispObject obj, bool escape, System.Text.StringBuilder sb, bool padded = false)
     {
         // Inside a FORMAT logical block the object is one level deeper per enclosing
         // block, for *PRINT-LEVEL*.
         int logicalDepth = PprintLogicalBlockDepth();
-        if (logicalDepth == 0) return FormatTopStagedCore(obj, escape, sb);
+        if (logicalDepth == 0) return FormatTopStagedCore(obj, escape, sb, padded);
         int savedConsDepth = _formatConsDepth;
         _formatConsDepth += logicalDepth;
-        try { return FormatTopStagedCore(obj, escape, sb); }
+        try { return FormatTopStagedCore(obj, escape, sb, padded); }
         finally { _formatConsDepth = savedConsDepth; }
     }
 
-    private static string FormatTopStagedCore(LispObject obj, bool escape, System.Text.StringBuilder sb)
+    private static string FormatTopStagedCore(LispObject obj, bool escape, System.Text.StringBuilder sb, bool padded = false)
     {
         if (!_pprintActive || _pprintStream == null)
         {
-            if (_fmtCoreDepth != 1 || _pprintActive) return FormatTop(obj, escape);
+            if (!FmtStartColumnKnownDepth() || _pprintActive || padded) return FormatTop(obj, escape);
             int saved = _printStartColumn;
             var savedDest = _printStartDest;
             var savedSb = _printStartFormatSb;
@@ -1978,6 +2383,28 @@ public static partial class Runtime
         return true;
     }
 
+    [ThreadStatic] private static System.Collections.Generic.List<object?>? t_formatParams;
+    /// <summary>The list one directive's prefix parameters are collected in. They are copied into
+    /// the resolved-parameter array before the directive does anything that could format again, so
+    /// one list per thread serves every directive (a fresh list and its array were 88 bytes each).</summary>
+    private static System.Collections.Generic.List<object?> FormatParamList()
+    {
+        var l = t_formatParams ??= new System.Collections.Generic.List<object?>(8);
+        l.Clear();
+        return l;
+    }
+
+    private static readonly object[] s_formatIntBoxes = MakeFormatIntBoxes();
+    private static object[] MakeFormatIntBoxes()
+    {
+        var boxes = new object[256];
+        for (int k = 0; k < boxes.Length; k++) boxes[k] = k;
+        return boxes;
+    }
+    /// <summary>A prefix parameter as the boxed int the directives read it as; small values (every
+    /// width and count a real format string has) share one box instead of allocating one each.</summary>
+    private static object BoxFormatInt(int v) => (uint)v < 256u ? s_formatIntBoxes[v] : v;
+
     /// <summary>Pretty printer state set aside while a ~mincol<...~> segment is
     /// formatted. The segment is built as a string of its own (as in SBCL, a plain
     /// string stream), so a ~_ reached from it must not write to the enclosing
@@ -2041,7 +2468,7 @@ public static partial class Runtime
     [ThreadStatic] private static System.Text.StringBuilder? _fmtBuilder;
     [ThreadStatic] private static bool _fmtBuilderInUse;
 
-    private static string FormatString(string template, LispObject[] args, ref int argIdx, bool streamAtLineStart = true,
+    private static string FormatString(string template, LispObject[] args, ref int argIdx, bool? streamAtLineStart = null,
                                        int initialColumn = 0)
     {
         System.Text.StringBuilder sb;
@@ -2096,10 +2523,23 @@ public static partial class Runtime
         return _fmtCoreInitialColumn;
     }
 
+    // The text built so far by the FORMAT body being run, and whether the stream was at the
+    // start of a line before it: what ~& in a nested body (~{, ~[, ~(, ~?) takes as its own start.
+    [ThreadStatic] private static System.Text.StringBuilder? _fmtOuterSb;
+    [ThreadStatic] private static bool _fmtOuterStreamAtStart;
+
     private static string FormatStringCore(string template, LispObject[] args, ref int argIdx,
-                                           System.Text.StringBuilder sb, bool streamAtLineStart = true,
+                                           System.Text.StringBuilder sb, bool? streamAtLineStartArg = null,
                                            int initialColumn = 0)
     {
+        var savedOuterSb = _fmtOuterSb;
+        bool savedOuterStart = _fmtOuterStreamAtStart;
+        bool streamAtLineStart = streamAtLineStartArg
+            ?? (savedOuterSb == null || (savedOuterSb.Length > 0
+                    ? savedOuterSb[savedOuterSb.Length - 1] == '\n'
+                    : savedOuterStart));
+        _fmtOuterSb = sb;
+        _fmtOuterStreamAtStart = streamAtLineStart;
         int savedDepth = _fmtCoreDepth, savedInitCol = _fmtCoreInitialColumn;
         var savedColumnDest = _fmtCoreColumnDest;
         int savedBodyBase = _fmtBodyBase;
@@ -2110,7 +2550,7 @@ public static partial class Runtime
         _fmtCoreColumnDest = initialColumn == PrintStartColumnPending ? _fmtPendingColumnDest : null;
         _fmtPendingColumnDest = null;
         try { return FormatStringCoreBody(template, args, ref argIdx, sb, streamAtLineStart); }
-        finally { _fmtCoreDepth = savedDepth; _fmtCoreInitialColumn = savedInitCol; _fmtCoreColumnDest = savedColumnDest; _fmtBodyBase = savedBodyBase; }
+        finally { _fmtCoreDepth = savedDepth; _fmtCoreInitialColumn = savedInitCol; _fmtCoreColumnDest = savedColumnDest; _fmtBodyBase = savedBodyBase; _fmtOuterSb = savedOuterSb; _fmtOuterStreamAtStart = savedOuterStart; }
     }
 
     // The column at which the text being built in a FORMAT body starts. An iteration
@@ -2182,17 +2622,58 @@ public static partial class Runtime
         _fmtNextBodyBase = body.IndexOf('<') >= 0 || body.IndexOf('?') >= 0 || body.IndexOf('/') >= 0
             ? ColumnAfter(sb)
             : 0;
-        return FormatString(body, args, ref argIdx);
+        // An object a pass prints with ~A / ~S starts at the column the iteration's text has reached;
+        // that is worked out when an object is printed, not for every pass.
+        var savedSb = _fmtIterOuterSb;
+        int savedBase = _fmtIterOuterBase, savedInit = _fmtIterOuterInit;
+        var savedDest = _fmtIterOuterDest;
+        _fmtIterOuterSb = sb;
+        _fmtIterOuterBase = _fmtBodyBase;
+        _fmtIterOuterInit = _fmtCoreInitialColumn;
+        _fmtIterOuterDest = _fmtCoreColumnDest;
+        try { return FormatString(body, args, ref argIdx); }
+        finally { _fmtIterOuterSb = savedSb; _fmtIterOuterBase = savedBase; _fmtIterOuterInit = savedInit; _fmtIterOuterDest = savedDest; }
+    }
+
+    [ThreadStatic] private static System.Text.StringBuilder? _fmtIterOuterSb;
+    [ThreadStatic] private static int _fmtIterOuterBase, _fmtIterOuterInit;
+    [ThreadStatic] private static LispObject? _fmtIterOuterDest;
+
+    /// <summary>The column the text of the FORMAT body that runs an iteration has reached.</summary>
+    private static int IterationOuterColumn()
+    {
+        var sb = _fmtIterOuterSb!;
+        for (int ci = sb.Length - 1; ci >= 0; ci--)
+            if (sb[ci] == '\n') return sb.Length - 1 - ci;
+        int b = _fmtIterOuterBase;
+        if (b == PrintStartColumnPending)
+        {
+            int init = _fmtIterOuterInit;
+            if (init == PrintStartColumnPending) init = _fmtIterOuterDest == null ? 0 : StreamInitialColumn(_fmtIterOuterDest);
+            b = init;
+        }
+        return sb.Length + b;
     }
 
     /// <summary>The start column to tell a top-level object printed next into SB,
     /// or -1 when unknown.</summary>
     private static int FormatObjectStartColumn(System.Text.StringBuilder sb)
     {
-        if (_fmtCoreDepth != 1 || _pprintActive) return -1;
+        if (_pprintActive) return -1;
         int count = 0;
-        if (TailAfterNewline(sb, ref count)) return count;
-        return FmtCoreInitialColumn() + count;
+        if (_fmtCoreDepth == 1)
+        {
+            if (TailAfterNewline(sb, ref count)) return count;
+            return FmtCoreInitialColumn() + count;
+        }
+        // The body of an iteration (~{ ~}) run from the outermost body: its text goes after what the
+        // outer body has written.
+        if (_fmtCoreDepth == 2 && _fmtIterOuterSb != null)
+        {
+            if (TailAfterNewline(sb, ref count)) return count;
+            return IterationOuterColumn() + count;
+        }
+        return -1;
     }
 
     private static string FormatStringCoreBody(string template, LispObject[] args, ref int argIdx,
@@ -2231,34 +2712,46 @@ public static partial class Runtime
 
                     if (i < template.Length && (template[i] == 'v' || template[i] == 'V'))
                     {
-                        (prefixParams ??= new System.Collections.Generic.List<object?>()).Add("V"); // marker: use next format arg
+                        (prefixParams ??= FormatParamList()).Add("V"); // marker: use next format arg
                         i++;
                     }
                     else if (i < template.Length && template[i] == '#')
                     {
-                        (prefixParams ??= new System.Collections.Generic.List<object?>()).Add("#"); // marker: remaining arg count (resolved after V params)
+                        (prefixParams ??= FormatParamList()).Add("#"); // marker: remaining arg count (resolved after V params)
                         i++;
                     }
                     else if (i < template.Length && template[i] == '\'' && i + 1 < template.Length)
                     {
-                        (prefixParams ??= new System.Collections.Generic.List<object?>()).Add(template[i + 1]); // character param
+                        (prefixParams ??= FormatParamList()).Add(template[i + 1]); // character param
                         i += 2;
                     }
                     else if (i < template.Length && (char.IsDigit(template[i]) || ((template[i] == '-' || template[i] == '+') && i + 1 < template.Length && char.IsDigit(template[i + 1]))))
                     {
                         int numStart = i;
                         if (template[i] == '-' || template[i] == '+') i++;
+                        // ASCII digits are accumulated in place (a prefix parameter is almost always
+                        // 1-3 of them, and a substring for each was an allocation per directive);
+                        // anything longer than a long or non-ASCII goes the way it always went.
+                        long acc = 0; bool simple = true; int nd = 0;
                         while (i < template.Length && char.IsDigit(template[i]))
+                        {
+                            char dc = template[i];
+                            if (dc < '0' || dc > '9' || ++nd > 17) simple = false;
+                            else acc = acc * 10 + (dc - '0');
                             i++;
-                        if (long.TryParse(template[numStart..i], out long lv))
-                            (prefixParams ??= new System.Collections.Generic.List<object?>()).Add((int)Compat.Clamp(lv, int.MinValue, int.MaxValue));
+                        }
+                        if (simple)
+                            (prefixParams ??= FormatParamList()).Add(
+                                BoxFormatInt((int)Compat.Clamp(template[numStart] == '-' ? -acc : acc, int.MinValue, int.MaxValue)));
+                        else if (long.TryParse(template[numStart..i], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out long lv))
+                            (prefixParams ??= FormatParamList()).Add((int)Compat.Clamp(lv, int.MinValue, int.MaxValue));
                         else
-                            (prefixParams ??= new System.Collections.Generic.List<object?>()).Add(template[numStart] == '-' ? int.MinValue : int.MaxValue);
+                            (prefixParams ??= FormatParamList()).Add(template[numStart] == '-' ? int.MinValue : int.MaxValue);
                     }
                     else if (i < template.Length && template[i] == ',')
                     {
                         // empty parameter (just comma): add null placeholder
-                        (prefixParams ??= new System.Collections.Generic.List<object?>()).Add(null);
+                        (prefixParams ??= FormatParamList()).Add(null);
                     }
                     else
                     {
@@ -2266,7 +2759,7 @@ public static partial class Runtime
                         if (prefixParams == null || prefixParams.Count == 0)
                             break;
                         // Otherwise this was after a comma with no value: empty param
-                        (prefixParams ??= new System.Collections.Generic.List<object?>()).Add(null);
+                        (prefixParams ??= FormatParamList()).Add(null);
                         break;
                     }
                 }
@@ -2276,6 +2769,10 @@ public static partial class Runtime
                 var resolvedParams = pcount == 0
                     ? System.Array.Empty<object?>()
                     : new object?[pcount];
+                // The argument a V parameter took, as is: ~/function/ hands every
+                // parameter to its function, whatever its type.
+                // (allocated at the first V parameter: most parameters are plain numbers)
+                var rawVParams = System.Array.Empty<LispObject?>();
                 // First pass: resolve V params (which consume args)
                 for (int pi = 0; pi < pcount; pi++)
                 {
@@ -2285,6 +2782,8 @@ public static partial class Runtime
                         if (argIdx < args.Length)
                         {
                             var a = args[argIdx++];
+                            if (rawVParams.Length == 0) rawVParams = new LispObject?[pcount];
+                            rawVParams[pi] = a;
                             if (a is Fixnum fv) resolvedParams[pi] = (int)Compat.Clamp(fv.Value, int.MinValue, int.MaxValue);
                             else if (a is Bignum) resolvedParams[pi] = a; // keep Bignum for ~^ comparison
                             else if (a is LispChar cv) resolvedParams[pi] = cv.Value;
@@ -2328,7 +2827,7 @@ public static partial class Runtime
                 if (i >= template.Length)
                     throw new LispErrorException(new LispProgramError(
                         "FORMAT: string ended before directive was found"));
-                char directive = char.ToUpperInvariant(template[i]);
+                char directive = CharCase.AsciiUpper(template[i]);
                 i++;
                 ValidateFormatParams(directive, resolvedParams);
 
@@ -2336,6 +2835,11 @@ public static partial class Runtime
                 {
                     case 'A': // aesthetic (princ-like)
                         if (argIdx >= args.Length) MissingFormatArg(directive);
+                        else if (!colonMod && !atMod && resolvedParams.Length == 0
+                                 && TryAppendPlainPrintText(args[argIdx], false, sb))
+                        {
+                            argIdx++;
+                        }
                         else if (!colonMod && !atMod && resolvedParams.Length == 0
                                  && TryPlainPrincText(args[argIdx], out var plainA))
                         {
@@ -2358,7 +2862,7 @@ public static partial class Runtime
                             {
                                 s = (colonMod && args[argIdx] is Nil)
                                     ? "()"
-                                    : FormatAestheticStaged(args[argIdx], sb);
+                                    : FormatAestheticStaged(args[argIdx], sb, resolvedParams.Length != 0);
                             }
                             finally { _pprintIntegrate = savedIntA; }
                             // ~mincol,colinc,minpad,padcharA
@@ -2377,15 +2881,11 @@ public static partial class Runtime
                                 int colRound = (extra + aColinc - 1) / aColinc * aColinc;
                                 padNeeded += colRound;
                             }
-                            if (padNeeded > 0)
-                            {
-                                string pad = new string(aPadchar, padNeeded);
-                                if (atMod)
-                                    s = pad + s; // @ means pad on left
-                                else
-                                    s = s + pad; // default: pad on right
-                            }
+                            // @ means pad on left, the default pads on right; appended in place, with no
+                            // padding string and no concatenation of the two
+                            if (padNeeded > 0 && atMod) sb.Append(aPadchar, padNeeded);
                             sb.Append(s);
+                            if (padNeeded > 0 && !atMod) sb.Append(aPadchar, padNeeded);
                             argIdx++;
                         }
                         break;
@@ -2401,7 +2901,7 @@ public static partial class Runtime
                             {
                                 s = (colonMod && args[argIdx] is Nil)
                                     ? "()"
-                                    : FormatTopStaged(args[argIdx], true, sb);
+                                    : FormatTopStaged(args[argIdx], true, sb, resolvedParams.Length != 0);
                             }
                             finally { _pprintIntegrate = savedIntS; }
                             // ~mincol,colinc,minpad,padcharS
@@ -2418,15 +2918,9 @@ public static partial class Runtime
                                 int colRound = (extra + sColinc - 1) / sColinc * sColinc;
                                 sPadNeeded += colRound;
                             }
-                            if (sPadNeeded > 0)
-                            {
-                                string pad = new string(sPadchar, sPadNeeded);
-                                if (atMod)
-                                    s = pad + s;
-                                else
-                                    s = s + pad;
-                            }
+                            if (sPadNeeded > 0 && atMod) sb.Append(sPadchar, sPadNeeded);
                             sb.Append(s);
+                            if (sPadNeeded > 0 && !atMod) sb.Append(sPadchar, sPadNeeded);
                             argIdx++;
                         }
                         break;
@@ -2447,12 +2941,21 @@ public static partial class Runtime
                                 DynamicBindings.Push(baseSym, Fixnum.Make(nonIntRadix));
                                 try
                                 {
-                                    sb.Append(FormatAesthetic(arg, topLevel: false));
+                                    // As ~A does: FormatTop establishes *print-circle* for the argument,
+                                    // and the staged form keeps the column for pretty printing.
+                                    sb.Append(FormatAestheticStaged(arg, sb));
                                 }
                                 finally
                                 {
                                     DynamicBindings.Pop(baseSym);
                                 }
+                                argIdx++;
+                                break;
+                            }
+                            if (directive == 'D' && !colonMod && !atMod && resolvedParams.Length == 0
+                                && arg is Fixnum plainD)
+                            {
+                                sb.Append(plainD.Value);
                                 argIdx++;
                                 break;
                             }
@@ -2526,7 +3029,7 @@ public static partial class Runtime
                             // : modifier: insert commachar between groups of comma-interval digits
                             if (colonMod && isNum)
                             {
-                                bool neg = numStr.StartsWith("-");
+                                bool neg = numStr.StartsWith("-", System.StringComparison.Ordinal);
                                 string digits = neg ? numStr.Substring(1) : numStr;
                                 if (digits.Length > radixCommaInterval)
                                 {
@@ -2547,16 +3050,14 @@ public static partial class Runtime
                             }
 
                             // @ modifier: prepend + for non-negative
-                            if (atMod && isNum && !numStr.StartsWith("-"))
+                            if (atMod && isNum && !numStr.StartsWith("-", System.StringComparison.Ordinal))
                             {
                                 numStr = "+" + numStr;
                             }
 
                             // mincol: pad with padchar on the left
                             if (radixMincol > numStr.Length)
-                            {
-                                numStr = new string(radixPadchar, radixMincol - numStr.Length) + numStr;
-                            }
+                                sb.Append(radixPadchar, radixMincol - numStr.Length);
 
                             sb.Append(numStr);
                             argIdx++;
@@ -2620,7 +3121,7 @@ public static partial class Runtime
                                 // : modifier: insert commachar between groups
                                 if (colonMod && rIsNum)
                                 {
-                                    bool neg = rNumStr.StartsWith("-");
+                                    bool neg = rNumStr.StartsWith("-", System.StringComparison.Ordinal);
                                     string digs = neg ? rNumStr.Substring(1) : rNumStr;
                                     if (digs.Length > rCommaInterval)
                                     {
@@ -2640,7 +3141,7 @@ public static partial class Runtime
                                 }
 
                                 // @ modifier: prepend + for non-negative
-                                if (atMod && rIsNum && !rNumStr.StartsWith("-"))
+                                if (atMod && rIsNum && !rNumStr.StartsWith("-", System.StringComparison.Ordinal))
                                     rNumStr = "+" + rNumStr;
 
                                 // mincol: pad with padchar on the left
@@ -2710,7 +3211,7 @@ public static partial class Runtime
                                     Fixnum or Bignum or Ratio => (double)Arithmetic.ToSingle((Number)dArg),
                                     _ => 0.0
                                 };
-                                bool negative = dDv < 0;
+                                bool negative = Compat.IsNegative(dDv);
                                 bool dIsSingle = dArg is SingleFloat or Fixnum or Bignum or Ratio;
                                 double absVal = Math.Abs(dDv);
                                 // Format fractional part
@@ -2780,7 +3281,7 @@ public static partial class Runtime
                                     Fixnum or Bignum or Ratio => (double)Arithmetic.ToSingle((Number)fArg),
                                     _ => 0.0
                                 };
-                                sb.Append(FormatFixedFloat(dv, fW, fD, fK, fOverflowChar, fPadChar, atMod, fIsSingle, fIsDouble));
+                                sb.Append(FormatFixedFloat(dv, fW, fD, fK, fOverflowChar, fPadChar, atMod, fIsSingle, fIsDouble, kOmitted: GetIntParam(2) == null));
                             }
                             argIdx++;
                         }
@@ -3058,6 +3559,12 @@ public static partial class Runtime
                                 // Bignum or other integer type: out of range, but still consume the arg
                                 ci = -1;
                                 consumed = true;
+                            }
+                            else if (argIdx < args.Length)
+                            {
+                                // The selector has to be an integer (CLHS 22.3.7.2).
+                                throw new LispErrorException(new LispTypeError(
+                                    "FORMAT: ~[ needs an integer argument", args[argIdx], Startup.Sym("INTEGER")));
                             }
                             else
                             {
@@ -3543,7 +4050,11 @@ public static partial class Runtime
                     case 'P': // plural
                     {
                         if (colonMod)
-                            argIdx = Math.Max(0, argIdx - 1); // back up one arg
+                        {
+                            // Backing up past the first argument is an error, as for ~:*.
+                            if (argIdx < 1) MissingFormatArg(directive);
+                            argIdx--;
+                        }
                         if (argIdx >= args.Length) MissingFormatArg(directive);
                         else
                         {
@@ -3565,7 +4076,9 @@ public static partial class Runtime
                         int caseSubIdx = argIdx;
                         try
                         {
-                            inner = FormatString(body2, args, ref caseSubIdx);
+                            // Run as the body of an iteration is: its text goes after what SB holds, so an
+                            // object printed in it, and a stream handed to ~/fn/, start at that column.
+                            inner = FormatIterationBody(sb, body2, args, ref caseSubIdx);
                         }
                         catch (FormatUpAndOutException ex)
                         {
@@ -3648,6 +4161,10 @@ public static partial class Runtime
                                         // ~@<...~:>: use remaining format args directly
                                         bodyArgs = args.SubArray(argIdx);
                                         argIdx = args.Length;
+                                        // The remaining arguments are the block's list: *print-circle*
+                                        // finds structure the arguments share, as ~<...~:> does for its list.
+                                        if (bodyArgs.Length > 0 && Runtime.PprintCircleScan(Runtime.List(bodyArgs)))
+                                            circleSetup = true;
                                     }
                                     else
                                     {
@@ -3669,7 +4186,7 @@ public static partial class Runtime
                                             if ((circleSetup || _circleTable != null) && listArg is Cons)
                                             {
                                                 var labelStr = Runtime.PprintCircleCheckList(listArg);
-                                                if (labelStr != null && labelStr.EndsWith("#"))
+                                                if (labelStr != null && labelStr.EndsWith("#", System.StringComparison.Ordinal))
                                                 {
                                                     // Entire list is a back-reference
                                                     rawArg = new LispString(labelStr);
@@ -3812,11 +4329,14 @@ public static partial class Runtime
                                                 ? InsertFillNewlinesInBody(body) : body;
                                             string formatted;
                                             _fmtToPretty = true;
+                                            bool blockEscaped = false;
                                             try { formatted = FormatString(effectiveBody, bodyArgs, ref bodyArgIdx); }
+                                            // ~^ inside the block ends the block, which still prints its suffix.
+                                            catch (FormatUpAndOutException ex) { formatted = ex.PartialOutput; blockEscaped = true; }
                                             finally { _fmtToPretty = savedToPretty; }
                                             blockWriter.Write(formatted);
                                             PprintTrackWrite(formatted);
-                                            if (dottedTail != null)
+                                            if (dottedTail != null && !blockEscaped)
                                             {
                                                 string dt = " . " + FormatObject(dottedTail, false);
                                                 blockWriter.Write(dt);
@@ -3843,9 +4363,13 @@ public static partial class Runtime
                                     {
                                         sb.Append(prefixStr);
                                         int bodyArgIdx = 0;
-                                        string formatted = FormatString(body, bodyArgs, ref bodyArgIdx);
+                                        string formatted;
+                                        bool blockEscaped = false;
+                                        // ~^ inside the block ends the block, which still prints its suffix.
+                                        try { formatted = FormatString(body, bodyArgs, ref bodyArgIdx); }
+                                        catch (FormatUpAndOutException ex) { formatted = ex.PartialOutput; blockEscaped = true; }
                                         sb.Append(formatted);
-                                        if (dottedTail != null)
+                                        if (dottedTail != null && !blockEscaped)
                                             sb.Append(" . " + FormatObject(dottedTail, false));
                                         sb.Append(suffixStr);
                                     }
@@ -3896,9 +4420,9 @@ public static partial class Runtime
                             if (firstSepParams != null)
                             {
                                 var parts = firstSepParams.Split(',');
-                                if (parts.Length > 0 && parts[0].Length > 0 && int.TryParse(parts[0], out int sp))
+                                if (parts.Length > 0 && parts[0].Length > 0 && int.TryParse(parts[0], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int sp))
                                     overflowSpare = sp;
-                                if (parts.Length > 1 && parts[1].Length > 0 && int.TryParse(parts[1], out int lw))
+                                if (parts.Length > 1 && parts[1].Length > 0 && int.TryParse(parts[1], System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int lw))
                                     overflowLineWidth = lw;
                             }
                         }
@@ -3920,7 +4444,7 @@ public static partial class Runtime
                             try
                             {
                                 overflowPrefixFormatted = FormatString(
-                                    overflowPrefix, args.SubArray(localArgIdx), ref prefixArgIdx);
+                                    overflowPrefix, args.SubArray(localArgIdx), ref prefixArgIdx, true);
                             }
                             catch (FormatUpAndOutException) { overflowPrefixFormatted = ""; }
                             localArgIdx += prefixArgIdx;
@@ -3930,7 +4454,7 @@ public static partial class Runtime
                             try
                             {
                                 int secArgIdx = 0;
-                                string formatted = FormatString(sec, args.SubArray(localArgIdx), ref secArgIdx);
+                                string formatted = FormatString(sec, args.SubArray(localArgIdx), ref secArgIdx, true);
                                 formattedSections.Add(formatted);
                                 localArgIdx += secArgIdx;
                             }
@@ -4062,38 +4586,38 @@ public static partial class Runtime
                         // treated as omitted, reducing the effective parameter count.
                         bool shouldEscape = false;
 
-                        // Collect non-null parameters (null = V consumed nil = omitted)
-                        var effectiveParams = new System.Collections.Generic.List<object>();
-                        for (int pi = 0; pi < resolvedParams.Length; pi++)
+                        // Positional, as SBCL: an omitted parameter (or a V that took NIL) keeps its
+                        // place, so ~,0^ is two parameters whose first is missing, not one.
+                        object?[] pos = new object?[3];
+                        for (int pi = 0; pi < resolvedParams.Length && pi < 3; pi++)
                         {
-                            if (resolvedParams[pi] is int iv2) effectiveParams.Add(iv2);
-                            else if (resolvedParams[pi] is char cv2) effectiveParams.Add((int)cv2);
-                            else if (resolvedParams[pi] is Bignum bv2) effectiveParams.Add(bv2);
-                            else if (resolvedParams[pi] != null) effectiveParams.Add(0);
-                            // null (from V consuming nil) is skipped -> omitted
+                            if (resolvedParams[pi] is int iv2) pos[pi] = iv2;
+                            else if (resolvedParams[pi] is char cv2) pos[pi] = (int)cv2;
+                            else if (resolvedParams[pi] is Bignum bv2) pos[pi] = bv2;
+                            else if (resolvedParams[pi] != null) pos[pi] = 0;
                         }
-                        int paramCount = effectiveParams.Count;
 
-                        if (paramCount == 0)
+                        if (pos[2] != null)
                         {
-                            // No params: ~^ escapes if no more args; ~:^ escapes if last sublist
-                            shouldEscape = colonMod ? _isLastSublist : (argIdx >= args.Length);
+                            // 3 params: escape if p1 <= p2 && p2 <= p3
+                            shouldEscape = pos[0] != null && pos[1] != null
+                                        && EscapeParamLessOrEqual(pos[0]!, pos[1]!)
+                                        && EscapeParamLessOrEqual(pos[1]!, pos[2]!);
                         }
-                        else if (paramCount == 1)
-                        {
-                            // 1 param: escape if n == 0
-                            shouldEscape = EscapeParamIsZero(effectiveParams[0]);
-                        }
-                        else if (paramCount == 2)
+                        else if (pos[1] != null)
                         {
                             // 2 params: escape if n == m
-                            shouldEscape = EscapeParamsEqual(effectiveParams[0], effectiveParams[1]);
+                            shouldEscape = pos[0] != null && EscapeParamsEqual(pos[0]!, pos[1]!);
+                        }
+                        else if (pos[0] != null)
+                        {
+                            // 1 param: escape if n == 0
+                            shouldEscape = EscapeParamIsZero(pos[0]!);
                         }
                         else
                         {
-                            // 3 params: escape if p1 <= p2 && p2 <= p3
-                            shouldEscape = EscapeParamLessOrEqual(effectiveParams[0], effectiveParams[1])
-                                        && EscapeParamLessOrEqual(effectiveParams[1], effectiveParams[2]);
+                            // No params: ~^ escapes if no more args; ~:^ escapes if last sublist
+                            shouldEscape = colonMod ? _isLastSublist : (argIdx >= args.Length);
                         }
 
                         if (shouldEscape)
@@ -4116,7 +4640,10 @@ public static partial class Runtime
                         int slashStart = i;
                         while (i < template.Length && template[i] != '/') i++;
                         string funcName = template[slashStart..i];
-                        if (i < template.Length) i++; // skip closing '/'
+                        if (i >= template.Length)
+                            throw new LispErrorException(new LispProgramError(
+                                "FORMAT: ~/ has no closing slash"));
+                        i++; // skip closing '/'
 
                         // Get the argument: running out is an error, as for ~A
                         if (argIdx >= args.Length) MissingFormatArg('/');
@@ -4124,7 +4651,7 @@ public static partial class Runtime
 
                         // Look up the function - handle package prefix
                         Symbol? slashSym = null;
-                        string upperName = funcName.ToUpperInvariant();
+                        string upperName = CharCase.SimpleUpper(funcName);
                         int colonPos = upperName.IndexOf(':');
                         if (colonPos >= 0)
                         {
@@ -4147,6 +4674,21 @@ public static partial class Runtime
                         }
 
                         var slashFunc = slashSym?.Function as LispFunction;
+                        // A name that is no function is an error, not a directive that prints
+                        // nothing: it would hide a misspelt name.
+                        if (slashFunc == null)
+                        {
+                            Symbol named;
+                            if (slashSym != null) named = slashSym;
+                            else
+                            {
+                                var namePkg = colonPos >= 0 ? Package.FindPackage(upperName[..colonPos]) : null;
+                                named = (namePkg ?? Package.FindPackage("CL-USER") ?? Startup.CL)
+                                    .Intern(colonPos >= 0 && namePkg != null
+                                        ? upperName[(colonPos + 1)..].TrimStart(':') : upperName).symbol;
+                            }
+                            throw new LispErrorException(new LispUndefinedFunction(named));
+                        }
                         if (slashFunc != null)
                         {
                             // Keep a buffering block's section positions in its XP buffer.
@@ -4162,7 +4704,9 @@ public static partial class Runtime
                             else
                             {
                                 sw = new System.IO.StringWriter();
-                                stream = new LispOutputStream(sw);
+                                // The function's stream begins at the column FORMAT has reached, so
+                                // a logical block it opens (and ~T in it) count the text before it.
+                                stream = new LispStringOutputStream(sw) { StartColumn = ColumnAfter(sb) };
                             }
 
                             // Build args: (stream arg colonp atp &rest params)
@@ -4174,7 +4718,8 @@ public static partial class Runtime
                             for (int pi = 0; pi < resolvedParams.Length; pi++)
                             {
                                 var p = resolvedParams[pi];
-                                if (p is int iv) callArgs.Add(Fixnum.Make(iv));
+                                if (pi < rawVParams.Length && rawVParams[pi] is { } rawV) callArgs.Add(rawV);
+                                else if (p is int iv) callArgs.Add(Fixnum.Make(iv));
                                 else if (p is char cv) callArgs.Add(LispChar.Make(cv));
                                 else callArgs.Add(Nil.Instance);
                             }
@@ -4341,7 +4886,9 @@ public static partial class Runtime
             }
             else
             {
-                sb.Append(template[i]);
+                // A literal newline in the control string is a newline of the block, as ~% is.
+                if (template[i] == '\n') AppendNewlineInBlock(sb);
+                else sb.Append(template[i]);
                 i++;
             }
         }
@@ -4494,7 +5041,7 @@ public static partial class Runtime
                     pos++;
                 }
                 if (pos >= template.Length) break;
-                char d = char.ToUpperInvariant(template[pos]);
+                char d = CharCase.AsciiUpper(template[pos]);
                 pos++;
                 if (d == '>' && depth == 1)
                 {
@@ -4564,7 +5111,7 @@ public static partial class Runtime
                 while (j < fmt.Length && (char.IsDigit(fmt[j]) || fmt[j] == ',' || fmt[j] == '\'' || fmt[j] == ':' || fmt[j] == '@')) j++;
                 if (j < fmt.Length)
                 {
-                    char d = char.ToUpperInvariant(fmt[j]);
+                    char d = CharCase.AsciiUpper(fmt[j]);
                     if (d is 'A' or 'S' or 'D' or 'B' or 'O' or 'X' or 'R' or 'F' or 'C' or 'W')
                         count++;
                 }
@@ -4588,7 +5135,7 @@ public static partial class Runtime
                 pos++;
                 SkipDirectivePrefix(template, ref pos, out _);
                 if (pos >= template.Length) break;
-                char d = char.ToUpperInvariant(template[pos]);
+                char d = CharCase.AsciiUpper(template[pos]);
                 pos++;
                 if (d == ')')
                 {
@@ -4660,7 +5207,7 @@ public static partial class Runtime
                 pos++;
                 SkipDirectivePrefix(template, ref pos, out bool hasColonMod);
                 if (pos >= template.Length) break;
-                char d = char.ToUpperInvariant(template[pos]);
+                char d = CharCase.AsciiUpper(template[pos]);
                 pos++;
                 if (d == ']' && otherDepth == 0)
                 {
@@ -4738,7 +5285,7 @@ public static partial class Runtime
                 di++;
             }
             if (di >= template.Length) break;
-            char dc = char.ToUpperInvariant(template[di]);
+            char dc = CharCase.AsciiUpper(template[di]);
             ci = di; // advance past this directive
             if (dc == '<') depth++;
             else if (dc == '>')
@@ -4823,7 +5370,7 @@ public static partial class Runtime
                 }
                 if (di < s.Length)
                 {
-                    char dc = char.ToUpperInvariant(s[di]);
+                    char dc = CharCase.AsciiUpper(s[di]);
                     if (dc == '<') depth++;
                     else if (dc == '>')
                     {
@@ -4895,26 +5442,27 @@ public static partial class Runtime
     private static string ApplyCaseConversion(string inner, bool colonMod, bool atMod)
     {
         if (colonMod && atMod)
-            return inner.ToUpperInvariant();
+            return CharCase.SimpleUpper(inner);
         if (colonMod)
             return CapitalizeWords(inner);
         if (atMod)
         {
-            string lowered = inner.ToLowerInvariant();
+            string lowered = CharCase.SimpleLower(inner);
             var csb = new System.Text.StringBuilder(lowered.Length);
             bool found = false;
             for (int ci = 0; ci < lowered.Length; ci++)
             {
-                if (!found && char.IsLetter(lowered[ci]))
+                // The first word starts at the first letter or digit: "3rd place" stays "3rd place".
+                if (!found && char.IsLetterOrDigit(lowered[ci]))
                 {
-                    csb.Append(char.ToUpperInvariant(lowered[ci]));
+                    csb.Append(char.IsLetter(lowered[ci]) ? CharCase.SimpleUpper(lowered[ci]) : lowered[ci]);
                     found = true;
                 }
                 else csb.Append(lowered[ci]);
             }
             return csb.ToString();
         }
-        return inner.ToLowerInvariant();
+        return CharCase.SimpleLower(inner);
     }
 
     private static bool IsRealNumber(LispObject arg) =>
@@ -5095,7 +5643,7 @@ public static partial class Runtime
                 }
                 if (pos >= template.Length) break;
                 char d = template[pos];
-                char du = char.ToUpperInvariant(d);
+                char du = CharCase.AsciiUpper(d);
                 pos++;
                 if (du == '}')
                 {

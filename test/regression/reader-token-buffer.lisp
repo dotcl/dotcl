@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; The reader turns a token into its string through a per-thread scratch buffer
 ;;; rather than a StringBuilder, hands READ-ATOM's string to PARSE-SYMBOL instead
 ;;; of building it twice, and READ-FROM-STRING does not copy its input when

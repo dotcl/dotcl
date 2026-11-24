@@ -8,6 +8,8 @@ Libraries for your programs:
 
 - Common Lisp compatibility: `dotcl-thread`, `dotcl-socket`, `dotcl-gray`,
   `dotcl-float`, `dotcl-rotate-byte`, `dotcl-simd`
+- Arrays on a GPU (ILGPU): `dotcl-gpu`
+- Pseudo-terminals and signals (Unix): `dotcl-posix`
 - The REPL and editors: `dotcl-repl`, `dotcl-code-info`, `dotcl-lsp`,
   `dotcl-lsp-coalton`
 - .NET: `dotnet-class`, `dotnet-library`, `dotnet-ffi`, `dotnet-nuget`,

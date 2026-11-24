@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A function with a typed entry that records a frame also has a framed typed
 ;;; entry: it links the frame itself (raw arguments) around the typed body, and
 ;;; a caller that knows the FTYPE enters it by its address. The frame list must

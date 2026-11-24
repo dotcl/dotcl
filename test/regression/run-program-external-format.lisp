@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; RUN-PROGRAM / LAUNCH-PROCESS honour :EXTERNAL-FORMAT for the child's
 ;;; standard input, output and error output.
 ;;;

@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; SCALE-FLOAT multiplies by 2^SCALE with one rounding. It was FLOAT times
 ;;; (EXPT 2 SCALE), so the answer was lost whenever that power of two did not
 ;;; fit the float format by itself: a single-float denormal came out as 0.0 and

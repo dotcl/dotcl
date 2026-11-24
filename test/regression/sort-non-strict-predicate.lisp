@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; SORT and STABLE-SORT with a non-strict predicate (#'>=, #'<=) still sort.
 ;;; Such a predicate is true both ways for equal keys; the three-way comparator
 ;;; built from it contradicted itself, the underlying sort gave up, and the

@@ -61,6 +61,22 @@ if [ -n "$unfinished" ]; then
   exit 1
 fi
 
+# A category that finished but ran no test ("Doing 0 pending tests of 0 tests total.") has no
+# failures to report either, and passes the set comparison below like a category whose tests all
+# passed. A run of nothing must not read as a pass.
+empty=""
+for cat in "$@"; do
+  f="$dir/ansi-$cat.txt"
+  [ -f "$f" ] || continue
+  total=$(grep -a 'tests total' "$f" | sed -n 's/.* \([0-9][0-9]*\) tests total.*/\1/p' | head -1)
+  [ "${total:-0}" = 0 ] && empty="$empty $cat"
+done
+if [ -n "$empty" ]; then
+  echo "ansi-gate: categories that ran 0 tests in $dir:$empty" >&2
+  echo "  (a finished run of nothing: the suite did not look at them)" >&2
+  exit 1
+fi
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 

@@ -10,7 +10,11 @@ public static partial class Runtime
     public static int _pprintBlockColumnPublic => _pprintBlockColumn;
     [ThreadStatic] private static int _pprintIndent;        // indentation level (absolute column)
     [ThreadStatic] private static bool _pprintActive;       // are we inside a logical block?
+    /// <summary>True while a pretty-printing logical block is open on this thread: the writers of console
+    /// and file streams then hold trailing blanks back (IBlankTrimmingWriter).</summary>
+    internal static bool PprintHoldsBlanks => _pprintActive;
     [ThreadStatic] private static TextWriter? _pprintStream; // stream being tracked
+    [ThreadStatic] private static int _pprintBufferPrefixLength; // chars of the outermost block's own prefix just before the buffer
     [ThreadStatic] private static string? _pprintPerLinePrefix; // per-line prefix string (output at start of each line)
     // Pending fill break: deferred newline that fires before the next write
     [ThreadStatic] private static bool _pprintPendingFillBreak;
@@ -22,6 +26,11 @@ public static partial class Runtime
     [ThreadStatic] private static int _pprintBufferStart;       // StringWriter position at outermost block start
     [ThreadStatic] private static List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)>? _pprintDeferredNewlines;
     [ThreadStatic] private static List<int>? _pprintBlockStarts;
+    // A block whose text goes to a buffer of its own (a PRINT-OBJECT method's stream, inside
+    // a block of another buffer) is laid out on its own, as a finished text, so its tokens
+    // never mix with the outer buffer's. This holds the outer buffering state it set aside,
+    // one entry per block on _pprintStack (null for the blocks that did not set any aside).
+    [ThreadStatic] private static Stack<(int nest, int start, List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)>? deferred, List<int>? starts)?>? _pprintBufSaves;
     // Saved state stack for nested logical blocks
     [ThreadStatic] private static Stack<(int col, int blockCol, int indent, bool active, TextWriter? stream, string? perLinePrefix,
         bool pendingFill, int colAtFillCheck)>? _pprintStack;
@@ -49,6 +58,17 @@ public static partial class Runtime
 
         bool wasActive = _pprintActive;
         string? outerPerLinePrefix = wasActive ? _pprintPerLinePrefix : null;
+        _pprintBufSaves ??= new();
+        if (wasActive && _pprintBuffering && writer is StringWriter fsw && !ReferenceEquals(fsw, _pprintStream))
+        {
+            _pprintBufSaves.Push((_pprintBufferNestLevel, _pprintBufferStart, _pprintDeferredNewlines, _pprintBlockStarts));
+            _pprintBuffering = false;
+            _pprintBufferNestLevel = 0;
+            _pprintDeferredNewlines = null;
+            _pprintBlockStarts = null;
+        }
+        else
+            _pprintBufSaves.Push(null);
         // If not already in a logical block, compute column from stream content
         if (!wasActive)
         {
@@ -99,6 +119,7 @@ public static partial class Runtime
             _pprintBuffering = true;
             _pprintBufferNestLevel = 0;
             _pprintBufferStart = sw.GetStringBuilder().Length;
+            _pprintBufferPrefixLength = prefixLength;
             _pprintDeferredNewlines = new();
             _pprintBlockStarts = new();
             // Record block-start for the outermost block
@@ -173,6 +194,18 @@ public static partial class Runtime
             _pprintPendingFillBreak = pendingFill;
             _pprintColumnAtLastFillCheck = colAtFillCheck;
             // Don't restore column - the outer block needs to track where we are now
+            if (_pprintBufSaves != null && _pprintBufSaves.Count > 0)
+            {
+                var saved = _pprintBufSaves.Pop();
+                if (saved is { } sv)
+                {
+                    _pprintBuffering = true;
+                    _pprintBufferNestLevel = sv.nest;
+                    _pprintBufferStart = sv.start;
+                    _pprintDeferredNewlines = sv.deferred;
+                    _pprintBlockStarts = sv.starts;
+                }
+            }
         }
         else
         {
@@ -215,6 +248,19 @@ public static partial class Runtime
     }
 
     /// <summary>The indent of a pending fill newline, when one is waiting.</summary>
+    /// <summary>The pending fill newline (see PprintPendingFill) becomes a linear one, which breaks
+    /// whenever its block does not fit: the section after it holds a forced newline.</summary>
+    internal static void PprintForcePendingFill()
+    {
+        if (!_pprintBuffering || _pprintDeferredNewlines == null) return;
+        for (int i = _pprintDeferredNewlines.Count - 1; i >= 0; i--)
+        {
+            var t = _pprintDeferredNewlines[i];
+            if (t.kind == "FILL") { _pprintDeferredNewlines[i] = (t.pos, "LINEAR", t.blockCol, t.indent, t.plp, t.suffixLen); return; }
+            if (t.kind == "LINEAR" || t.kind == "MANDATORY" || t.kind == "MISER") return;
+        }
+    }
+
     internal static bool PprintPendingFill(out int indent)
     {
         indent = 0;
@@ -224,7 +270,7 @@ public static partial class Runtime
             var kind = _pprintDeferredNewlines[i].kind;
             if (kind == "FILL") { indent = _pprintDeferredNewlines[i].indent; return true; }
             if (kind == "LINEAR" || kind == "MANDATORY" || kind == "MISER") return false;
-            if (kind == "BLOCK_START" || kind == "BLOCK_END" || kind.StartsWith("TAB:")) continue;
+            if (kind == "BLOCK_START" || kind == "BLOCK_END" || kind.StartsWith("TAB:", System.StringComparison.Ordinal)) continue;
         }
         return false;
     }
@@ -240,7 +286,7 @@ public static partial class Runtime
             if (kind == "LINEAR" || kind == "MANDATORY") return _pprintDeferredNewlines[i].indent;
             if (kind == "MISER") return IsMiserMode() ? _pprintDeferredNewlines[i].indent : _pprintColumn;
             if (kind == "FILL") return _pprintColumn;
-            if (kind == "BLOCK_START" || kind == "BLOCK_END" || kind.StartsWith("TAB:")) continue;
+            if (kind == "BLOCK_START" || kind == "BLOCK_END" || kind.StartsWith("TAB:", System.StringComparison.Ordinal)) continue;
         }
         return _pprintColumn;
     }
@@ -295,6 +341,11 @@ public static partial class Runtime
         {
             // WITH-OUTPUT-TO-STRING into a string with a fill pointer.
             _pprintColumn = Math.Max(0, _pprintColumn - fw.TrimTrailingBlanks());
+        }
+        else if (writer is IBlankTrimmingWriter bw)
+        {
+            // Console and file streams hold trailing blanks back for this.
+            _pprintColumn = Math.Max(0, _pprintColumn - bw.TrimTrailingBlanks());
         }
     }
 
@@ -446,8 +497,15 @@ public static partial class Runtime
         if (GetPrintLinesLimit() is int maxLines)
             ApplyPrintLines(result, content, tokens, _pprintBufferStart, maxLines);
 
+        // A block that opens on a mandatory newline leaves its first line empty: the blanks that end
+        // the block's own prefix (already in the stream before the buffer) are trimmed with the
+        // other blanks before a newline; the text the caller wrote before the block is left alone.
+        int keep = _pprintBufferStart;
+        if (content.Length > 0 && content[0] == '\n' && tokens.Count > 1 && tokens[1].kind == "MANDATORY")
+            for (int n = _pprintBufferPrefixLength; n > 0 && keep > 0 && sb[keep - 1] == ' '; n--) keep--;
+
         // Replace content in StringWriter
-        sb.Length = _pprintBufferStart;
+        sb.Length = keep;
         sb.Append(result);
 
         _pprintColumn = col;
@@ -487,6 +545,11 @@ public static partial class Runtime
             while (j < content.Length && char.IsWhiteSpace(content[j])) j++;
             if (j < content.Length && content[j] == rc) ci = j + 1;
         }
+        // The blanks at the end of the last line go, as before a conditional newline; before a
+        // newline the program wrote itself the line is kept as it is, indentation included.
+        int resultNewlines = 1;   // the cut itself
+        for (int ri = end; ri < cut; ri++) if (result[ri] == '\n') resultNewlines++;
+        if (NewlineAfterIsLiteral(content, tokens, bufStart, ci, resultNewlines)) end = cut;
         var closers = new System.Text.StringBuilder();
         var open = new Stack<int>();
         for (int i = 0; i < tokens.Count; i++)
@@ -501,6 +564,33 @@ public static partial class Runtime
         }
         result.Length = end;
         result.Append(" ..").Append(closers);
+    }
+
+    /// <summary>True when the first newline in CONTENT after position CI, before the next
+    /// character that is not blank, is one the program wrote (not a queued mandatory newline's).</summary>
+    private static bool NewlineAfterIsLiteral(string content,
+        List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)> tokens,
+        int bufStart, int ci, int resultNewlines)
+    {
+        // The newlines of CONTENT in the stretch of blanks after position CI are the ones the
+        // program wrote or a queued mandatory newline wrote. The cut is the last of them only
+        // when the layout made none of its own in that stretch (the counts agree); otherwise
+        // there is no telling which is which, and the blanks go.
+        int q = ci, last = -1, count = 0;
+        while (q < content.Length)
+        {
+            if (content[q] == '\n') { last = q; count++; }
+            else if (!char.IsWhiteSpace(content[q])) break;
+            q++;
+        }
+        if (last < 0 || count != resultNewlines) return false;
+        foreach (var t in tokens)
+        {
+            if (t.kind != "MANDATORY") continue;
+            int p = t.pos - bufStart;
+            if (p > last && content.LastIndexOf('\n', System.Math.Min(p, content.Length) - 1) == last) return false;
+        }
+        return true;
     }
 
     /// <summary>Remove the spaces kept before buffered mandatory newlines when buffering stops.</summary>
@@ -525,7 +615,7 @@ public static partial class Runtime
 
     private static bool IsXpNewline(string kind)
         => kind is "FILL" or "LINEAR" or "MISER" or "MANDATORY"
-           or "STD:FILL" or "STD:LINEAR" or "STD:MISER";
+           or "STD:FILL" or "STD:LINEAR" or "STD:MISER" or "STD:MANDATORY";
 
     /// <summary>Section end for each block start and newline: next newline at depth <= its depth.</summary>
     private static int[] ComputeXpSectionEnds(string content,
@@ -552,6 +642,19 @@ public static partial class Runtime
             bool newline = IsXpNewline(kind);
             if (kind == "BLOCK_START" || newline)
                 sectionEnds[i] = next[depth[i]];
+            if (newline && i + 1 < n)
+            {
+                // A literal newline written before the next token (FORMAT ~&, ~%) ends the
+                // section too: what follows it starts a line of its own and is not part of
+                // what has to fit on this one.
+                int from = System.Math.Min(tokens[i].pos - bufStart, content.Length);
+                int limit = System.Math.Min(tokens[i + 1].pos - bufStart, content.Length);
+                if (limit > from)
+                {
+                    int lit = content.IndexOf('\n', from, limit - from);
+                    if (lit >= 0 && (sectionEnds[i] < 0 || lit < sectionEnds[i])) sectionEnds[i] = lit;
+                }
+            }
             if (newline)
             {
                 int pos = tokens[i].pos - bufStart;
@@ -675,6 +778,10 @@ public static partial class Runtime
         bool hasTab = false;
         for (int ti = tokenStart; ti < tokenEnd; ti++)
             if (tokens[ti].kind.StartsWith("TAB:", StringComparison.Ordinal)) { hasTab = true; break; }
+        // A mandatory newline queued by a standard pprint function: this block and the
+        // ones around it cannot print flat.
+        for (int ti = tokenStart; ti < tokenEnd; ti++)
+            if (tokens[ti].kind == "STD:MANDATORY") { hasHardNewline = true; break; }
         int blockSectionEnd = tokenStart < sectionEnds.Length ? sectionEnds[tokenStart] : -1;
         int fitEnd = blockSectionEnd >= contentStart ? blockSectionEnd : content.Length;
         int fitWidth = MeasureXpWidth(content, tokens, bufStart, contentStart, fitEnd, blockCol);
@@ -764,6 +871,8 @@ public static partial class Runtime
         // was printed. The preceding section then did not fit on one line, so the
         // next fill newline breaks (CLHS PPRINT-NEWLINE :FILL).
         bool innerBlockBroke = false;
+        // The indentation the layout worked out from this block's pprint-indent calls so far.
+        int? xpIndent = null;
 
         for (int ti = 0; ti < ownTokens2.Count; ti++)
         {
@@ -775,13 +884,26 @@ public static partial class Runtime
             bool std = kind.StartsWith("STD:", StringComparison.Ordinal);
             string kindBase = std ? kind[4..] : kind;
 
+            if (kind.StartsWith("XPINDENT:", StringComparison.Ordinal))
+            {
+                result.Append(segment);
+                col = CountColumnAfter(segment, col);
+                if (segment.Contains('\n')) sectionStart = col;
+                var xp = kind.Split(':');
+                int xpAmount = int.Parse(xp[2], System.Globalization.CultureInfo.InvariantCulture);
+                // In miser mode every indentation is the block's own column (CLHS 22.2.1.1).
+                xpIndent = blockMiserMode ? blockCol
+                    : System.Math.Max(0, (xp[1] == "BLOCK" ? blockCol : col) + xpAmount);
+                lastPos = adjPos;
+                continue;
+            }
             if (kind.StartsWith("STDINDENT:", StringComparison.Ordinal))
             {
                 result.Append(segment);
                 col = CountColumnAfter(segment, col);
                 if (segment.Contains('\n')) sectionStart = col;
                 var ip = kind.Split(':');
-                int amount = int.Parse(ip[2]);
+                int amount = int.Parse(ip[2], System.Globalization.CultureInfo.InvariantCulture);
                 blockIndent = System.Math.Max(0, (ip[1] == "BLOCK" ? blockCol : col) + amount);
                 lastPos = adjPos;
                 continue;
@@ -793,8 +915,8 @@ public static partial class Runtime
                 if (segment.Contains('\n')) sectionStart = col;
                 var tabParts = kind.Split(':');
                 string tabKind = tabParts[1];
-                int colnum = int.Parse(tabParts[2]);
-                int colinc = int.Parse(tabParts[3]);
+                int colnum = int.Parse(tabParts[2], System.Globalization.CultureInfo.InvariantCulture);
+                int colinc = int.Parse(tabParts[3], System.Globalization.CultureInfo.InvariantCulture);
                 int target;
                 if (tabKind == "LINE")
                 {
@@ -842,7 +964,7 @@ public static partial class Runtime
                             result.Length--;
                     int spaces = nl;
                     while (spaces > 0 && segment[spaces - 1] == ' ') spaces--;
-                    if (spaces < nl) segment = segment[..spaces] + segment[nl..];
+                    if (spaces < nl) { segment = segment[..spaces] + segment[nl..]; nl = spaces; }
                     // The prefix and indentation after the newline were written for the
                     // column the blocks had when they were buffered; blocks moved right
                     // (by a tab before them) keep their lines under their new start.
@@ -860,12 +982,34 @@ public static partial class Runtime
                             int at = nl + 1 + plpLen - ownLen;
                             segment = segment[..at] + new string(' ', ownerShift) + segment[at..];
                         }
+                        else if (ownerShift < 0 && ownLen > 0 && plpLen >= ownLen
+                                 && nl + 1 + plpLen <= segment.Length
+                                 && string.CompareOrdinal(segment, nl + 1, tokPlp!, 0, plpLen) == 0)
+                        {
+                            // The block moved left (a fill newline before it broke the line):
+                            // the prefix was written for the column it had before the break.
+                            int at = nl + 1 + plpLen - ownLen;
+                            int drop = 0;
+                            while (drop < -ownerShift && at - drop - 1 > nl && segment[at - drop - 1] == ' ') drop++;
+                            segment = segment[..(at - drop)] + segment[at..];
+                        }
                         int more = colShift - ownerShift;
                         if (more > 0) segment += new string(' ', more);
                         else if (more < 0)
                             for (int k = -more; k > 0 && segment.Length > nl + 1 && segment[^1] == ' '; k--)
                                 segment = segment[..^1];
                     }
+                }
+                // The indentation written after the newline is the one the buffered text had;
+                // a pprint-indent the layout has worked out since says what it is to be.
+                if (xpIndent is int wantIndent)
+                {
+                    int nlAt = segment.LastIndexOf('\n');
+                    int delta = wantIndent - tokIndent;
+                    if (nlAt >= 0 && delta > 0) segment += new string(' ', delta);
+                    else if (nlAt >= 0 && delta < 0)
+                        for (int k = -delta; k > 0 && segment.Length > nlAt + 1 && segment[^1] == ' '; k--)
+                            segment = segment[..^1];
                 }
                 result.Append(segment);
                 col = CountColumnAfter(segment, col);
@@ -874,7 +1018,7 @@ public static partial class Runtime
                 lastPos = adjPos;
                 continue;
             }
-            else if (kindBase == "LINEAR")
+            else if (kindBase == "LINEAR" || (std && kindBase == "MANDATORY"))
             {
                 doBreak = true;
             }
@@ -908,10 +1052,28 @@ public static partial class Runtime
                     {
                         int sec = tokenIdx >= 0 && tokenIdx < sectionEnds.Length ? sectionEnds[tokenIdx] : -1;
                         int nextEnd = sec >= adjPos ? sec : content.Length;
-                        int nextWidth = MeasureXpWidth(content, tokens, bufStart, adjPos, nextEnd, tempCol);
+                        int nextWidth = MeasureXpWidth(content, tokens, bufStart, adjPos, nextEnd, tempCol, tokenIdx,
+                                                       trailingTabCounts: sec < 0 && rootSuffixLen > 0);
                         // The outermost block's suffix is outside the buffer.
                         if (sec < 0) nextWidth += rootSuffixLen;
-                        doBreak = (tempCol + nextWidth > margin);
+                        // A section that holds a mandatory newline (of a nested block)
+                        // cannot be printed on the end of this line; a literal newline
+                        // does not end the section and does not count.
+                        bool sectionHasMandatory = false;
+                        for (int mj = tokenIdx + 1; mj < tokens.Count && !sectionHasMandatory; mj++)
+                        {
+                            int mpos = tokens[mj].pos - bufStart;
+                            if (mpos > nextEnd + 1 + (tokens[mj].plp?.Length ?? 0) + tokens[mj].indent) break;
+                            if (tokens[mj].kind == "STD:MANDATORY")
+                            {
+                                sectionHasMandatory = mpos > adjPos && mpos < nextEnd;
+                                continue;
+                            }
+                            if (tokens[mj].kind != "MANDATORY") continue;
+                            int nl = mpos > 0 ? content.LastIndexOf('\n', System.Math.Min(mpos, content.Length) - 1) : -1;
+                            sectionHasMandatory = nl >= adjPos && nl < nextEnd;
+                        }
+                        doBreak = sectionHasMandatory || (tempCol + nextWidth > margin);
                     }
                 }
             }
@@ -924,12 +1086,19 @@ public static partial class Runtime
 
                 // Process inner block recursively with current actual column
                 var innerResult = new System.Text.StringBuilder();
+                int innerStartCol = col;
                 col = ProcessXpBlock(content, tokens, sectionEnds, tokenIdx, tokenEndIdx, bufStart, margin, innerResult, rootSuffixLen, col);
+                if (innerResult.ToString().IndexOf('\n') < 0) sectionStart = innerStartCol;
                 // Track if inner block produced multi-line output
                 for (int ri = 0; ri < innerResult.Length; ri++)
                 {
                     if (innerResult[ri] == '\n') { innerBlockBroke = true; break; }
                 }
+                // A block that begins with a conditional newline ends the line before it, and a line
+                // end takes the blanks off, the block's own prefix ("> ", "[ ") among them.
+                if (innerResult.Length > 0 && innerResult[0] == '\n'
+                    && !BlockStartsWithLiteralNewline(content, tokens, bufStart, tokenIdx))
+                    while (result.Length > 0 && result[result.Length - 1] == ' ') result.Length--;
                 result.Append(innerResult);
                 // Skip past inner block content
                 int innerContentEnd = tokens[tokenEndIdx - 1].pos - bufStart;
@@ -948,23 +1117,40 @@ public static partial class Runtime
                 while (result.Length > 0 && result[result.Length - 1] == ' ')
                     result.Length--;
                 result.Append('\n');
-                // If remaining content starts with \n (mandatory newline), skip indent;
-                // the mandatory newline will immediately override it, and the indent
-                // would produce orphaned whitespace on an otherwise empty line.
-                bool remainingStartsNewline = (adjPos < contentEnd && content[adjPos] == '\n');
-                if (!remainingStartsNewline)
+                // The new line gets its prefix and indentation even when a mandatory newline
+                // follows at once: the prefix stays on the line it began (a line end takes the
+                // blanks off, the prefix's own blanks among them), as SBCL lays it out.
                 {
                     string? breakPlp = tokPlp;
-                    int breakIndent = std ? blockIndent : tokIndent;
+                    // A block that a break before it moved left: its per-line prefix was built
+                    // for the column it had in the buffer, so the spaces between the enclosing
+                    // prefix and its own prefix are too many by the amount it moved.
+                    if (breakPlp != null && _xpOwners.Count > 0)
+                    {
+                        var (ownerShift, ownLenHere) = _xpOwners[^1];
+                        if (ownerShift < 0 && ownLenHere == 0)
+                        {
+                            // A blank prefix of its own: the blanks to shorten cannot be told from
+                            // its own, so the blanks at the end give up the amount it moved.
+                            int run = 0;
+                            while (run < breakPlp.Length && breakPlp[breakPlp.Length - 1 - run] == ' ') run++;
+                            int cut = System.Math.Min(-ownerShift, run);
+                            breakPlp = breakPlp[..(breakPlp.Length - cut)];
+                        }
+                        else if (ownerShift < 0 && ownLenHere > 0 && breakPlp.Length >= ownLenHere)
+                        {
+                            int at = breakPlp.Length - ownLenHere;
+                            int drop = 0;
+                            while (drop < -ownerShift && at - drop > 0 && breakPlp[at - drop - 1] == ' ') drop++;
+                            if (drop > 0) breakPlp = breakPlp[..(at - drop)] + breakPlp[at..];
+                        }
+                    }
+                    int breakIndent = std ? blockIndent : xpIndent ?? tokIndent;
                     int breakPlpLen = breakPlp?.Length ?? 0;
                     if (breakPlp != null) result.Append(breakPlp);
                     int indentSpaces = Math.Max(0, breakIndent - breakPlpLen);
                     if (indentSpaces > 0) result.Append(new string(' ', indentSpaces));
                     col = Math.Max(breakPlpLen, breakIndent);
-                }
-                else
-                {
-                    col = 0; // will be updated by the mandatory newline
                 }
             }
             else
@@ -989,6 +1175,35 @@ public static partial class Runtime
         return col;
     }
 
+    /// <summary>True when the block opened by token BLOCKTOKEN begins with a newline the program wrote
+    /// (not a queued mandatory newline's).</summary>
+    private static bool BlockStartsWithLiteralNewline(string content,
+        List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)> tokens,
+        int bufStart, int blockToken)
+    {
+        int p = tokens[blockToken].pos - bufStart;
+        if (p < 0 || p >= content.Length || content[p] != '\n') return false;
+        return !NextTokenIsMandatoryEndingAt(tokens, blockToken, bufStart, p, content);
+    }
+
+    /// <summary>True when the newline at ADJPOS (content position) is the one a queued mandatory
+    /// newline wrote: the next token after TOKENIDX is that newline's own, positioned after it.</summary>
+    private static bool NextTokenIsMandatoryEndingAt(
+        List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)> tokens,
+        int tokenIdx, int bufStart, int adjPos, string content)
+    {
+        for (int j = tokenIdx + 1; j < tokens.Count; j++)
+        {
+            var t = tokens[j];
+            int p = t.pos - bufStart;
+            if (p <= adjPos) continue;
+            if (t.kind != "MANDATORY") { if (IsXpNewline(t.kind)) return false; continue; }
+            int nl = p > 0 ? content.LastIndexOf('\n', System.Math.Min(p, content.Length) - 1) : -1;
+            return nl == adjPos;
+        }
+        return false;
+    }
+
     /// <summary>Expand a block that fits on one line, including its queued tabs.</summary>
     private static (string text, int col) ExpandFlatBlock(string content,
         List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)> tokens,
@@ -1009,7 +1224,7 @@ public static partial class Runtime
             if (tok.kind.StartsWith("TAB:", StringComparison.Ordinal))
             {
                 var tp = tok.kind.Split(':');
-                int target = TabTarget(tp[1], col, sections[^1], int.Parse(tp[2]), int.Parse(tp[3]));
+                int target = TabTarget(tp[1], col, sections[^1], int.Parse(tp[2], System.Globalization.CultureInfo.InvariantCulture), int.Parse(tp[3], System.Globalization.CultureInfo.InvariantCulture));
                 if (target > col) result.Append(' ', target - col);
                 col = Math.Max(col, target);
             }
@@ -1019,10 +1234,12 @@ public static partial class Runtime
             }
             else if (tok.kind == "BLOCK_END")
             {
-                if (sections.Count > 1) sections.RemoveAt(sections.Count - 1);
+                // The section that was open inside the block stays the current one (SBCL): a tab of
+                // the enclosing block measures from where the closed block's text began.
+                if (sections.Count > 1) { sections[^2] = sections[^1]; sections.RemoveAt(sections.Count - 1); }
             }
             else if (tok.kind is "FILL" or "LINEAR" or "MISER"
-                     or "STD:FILL" or "STD:LINEAR" or "STD:MISER")
+                     or "STD:FILL" or "STD:LINEAR" or "STD:MISER" or "STD:MANDATORY")
             {
                 sections[^1] = col;
             }
@@ -1092,29 +1309,34 @@ public static partial class Runtime
     /// tabs at the columns the layout will put them.</summary>
     private static int MeasureXpWidth(string content,
         List<(int pos, string kind, int blockCol, int indent, string? plp, int suffixLen)> tokens,
-        int bufStart, int startPos, int endPos, int startCol)
+        int bufStart, int startPos, int endPos, int startCol, int afterToken = -1, bool trailingTabCounts = false)
     {
         int col = startCol;
+        int sectionStart = startCol;
         int width = 0;
         int lastPos = startPos;
         for (int i = 0; i < tokens.Count; i++)
         {
             int pos = tokens[i].pos - bufStart;
-            if (pos <= startPos || pos >= endPos || pos < lastPos) continue;
+            // A tab queued right at the end of the section moves only what follows it (the
+            // suffix of the block); with nothing after it, the spaces it makes do not count.
+            bool tab = tokens[i].kind.StartsWith("TAB:", StringComparison.Ordinal);
+            // A tab queued after the newline, with no text between them, sits at the same position.
+            if (pos < startPos || (pos == startPos && !(tab && i > afterToken)) || pos > endPos
+                || (pos == endPos && !(tab && trailingTabCounts)) || pos < lastPos) continue;
             string segment = content[lastPos..pos];
             foreach (char c in segment)
             {
-                if (c == '\n') { col = 0; width = 0; }
+                if (c == '\n') { col = 0; width = 0; sectionStart = 0; }
                 else { col++; width++; }
             }
             if (tokens[i].kind.StartsWith("TAB:", StringComparison.Ordinal))
             {
                 var tp = tokens[i].kind.Split(':');
-                if (tp[1] == "LINE" || tp[1] == "LINE-RELATIVE")
-                {
-                    int target = TabTarget(tp[1], col, 0, int.Parse(tp[2]), int.Parse(tp[3]));
-                    if (target > col) { width += target - col; col = target; }
-                }
+                // A section tab counts from where the measured section starts: the column the
+                // newline in front of it is at (the text up to a line break in it starts over).
+                int target = TabTarget(tp[1], col, sectionStart, int.Parse(tp[2], System.Globalization.CultureInfo.InvariantCulture), int.Parse(tp[3], System.Globalization.CultureInfo.InvariantCulture));
+                if (target > col) { width += target - col; col = target; }
             }
             lastPos = pos;
         }
@@ -1143,9 +1365,27 @@ public static partial class Runtime
         return false;
     }
 
-    /// <summary>Set pprint indentation level.</summary>
-    public static void PprintSetIndent(string relativeTo, int n)
+    /// <summary>True when a logical block opened on STREAM is laid out in a shadow string stream: a file
+    /// or console stream (LispFileStream or a LispOutputStream whose writer is not a string's), with
+    /// no block open yet and *print-pretty* on.</summary>
+    internal static bool PprintShadowWanted(LispObject stream)
     {
+        if (_pprintActive) return false;
+        var prettyVal = DynamicBindings.TryGet(Startup.Sym("*PRINT-PRETTY*"), out var pv) ? pv : Startup.Sym("*PRINT-PRETTY*").Value;
+        if (prettyVal is Nil) return false;
+        return stream is LispFileStream { IsOutput: true }
+            || (stream is LispOutputStream os && os is not LispStringOutputStream && os.Writer is not StringWriter);
+    }
+
+    /// <summary>Set pprint indentation level.</summary>
+    public static void PprintSetIndent(string relativeTo, int n, TextWriter? writer = null)
+    {
+        // While the output is buffered the columns are those of the text before any line
+        // break is chosen, so the indentation is queued and worked out when the layout
+        // reaches it (a :CURRENT indent is relative to where the text really is by then).
+        if (_pprintBuffering && writer is StringWriter qsw && _pprintActive)
+            _pprintDeferredNewlines?.Add((qsw.GetStringBuilder().Length,
+                "XPINDENT:" + relativeTo + ":" + n, 0, 0, null, 0));
         // Per CLHS 22.2.1.1: in miser mode, all indentations revert to body indent (blockColumn)
         if (IsMiserMode())
         {
@@ -1628,6 +1868,25 @@ public static partial class Runtime
     internal static System.Text.Encoding? ParseExternalFormat(LispObject spec, out NewlineStyle newline,
                                                               string who = "OPEN")
     {
+        var enc = ParseExternalFormatCore(spec, out newline, who);
+        // (name :replacement #\? ...) says what an undecodable byte and an
+        // unencodable character become, in place of the encoding's own default.
+        if (enc != null && spec is Cons opts)
+            for (var rest = opts.Cdr; rest is Cons k && k.Cdr is Cons v; rest = v.Cdr)
+                if (k.Car is Symbol ks && ks.Name == "REPLACEMENT" && v.Car is LispChar rc)
+                {
+                    var repl = rc.Value.ToString();
+                    var copy = (System.Text.Encoding)enc.Clone();
+                    copy.EncoderFallback = new System.Text.EncoderReplacementFallback(repl);
+                    copy.DecoderFallback = new System.Text.DecoderReplacementFallback(repl);
+                    return copy;
+                }
+        return enc;
+    }
+
+    private static System.Text.Encoding? ParseExternalFormatCore(LispObject spec, out NewlineStyle newline,
+                                                                 string who)
+    {
         newline = NewlineStyle.Lf;
         if (spec is Cons opts)
         {
@@ -1914,8 +2173,21 @@ public static partial class Runtime
         UnauthorizedAccessException => "permission denied",
         PathTooLongException => "file name too long",
         ArgumentException or NotSupportedException => "invalid file name",
+        IOException => StripHostPathSuffix(ex.Message),
         _ => ex.Message,
     };
+
+    // The host's strerror-style text without its trailing " : '/host/path'" part,
+    // in lower case like the other reasons ("Read-only file system : '/x'" ->
+    // "read-only file system").
+    private static string StripHostPathSuffix(string msg)
+    {
+        int i = msg.IndexOf(" : '", StringComparison.Ordinal);
+        if (i >= 0) msg = msg.Substring(0, i);
+        msg = msg.TrimEnd(' ', '.');
+        return msg.Length > 1 && char.IsUpper(msg[0]) && char.IsLower(msg[1])
+            ? char.ToLowerInvariant(msg[0]) + msg.Substring(1) : msg;
+    }
 
     private static readonly string[] OpenKeys =
         { "DIRECTION", "ELEMENT-TYPE", "IF-EXISTS", "IF-DOES-NOT-EXIST", "EXTERNAL-FORMAT" };
@@ -2095,11 +2367,13 @@ public static partial class Runtime
                         }
                         case "APPEND":
                         {
+                            long appendBase0 = new FileInfo(filePath).Length;
                             var writer = MakeWriter(OpenForAppend(filePath, create: false), encoding, newline);
                             var ofs = new LispFileStream(writer, filePath);
                             ofs.ElementType = elementType; ofs.Bivalent = bivalent;
                             ofs.ExternalFormat = externalFormat;
                             ofs.OriginalPathname = originalPathname;
+                            ofs.AbortTruncateLength = appendBase0;
                             return ofs;
                         }
                         case "NIL": return Nil.Instance;
@@ -2129,6 +2403,7 @@ public static partial class Runtime
                     // :IF-EXISTS :APPEND with a missing file: another appender may
                     // create it between the check above and here, and FileMode.Create
                     // would then truncate what it wrote. Open appending, creating.
+                    long appendBase = ifExists == "APPEND" && File.Exists(filePath) ? new FileInfo(filePath).Length : -1;
                     System.IO.Stream netFsOut = ifExists == "APPEND"
                         ? OpenForAppend(filePath, create: true)
                         : CreateForOutput(filePath);
@@ -2140,6 +2415,7 @@ public static partial class Runtime
                     fs.AbortDeletePath = abortDeletePath ?? (fileExisted ? null : filePath);
                     fs.BackupPath = backupPath;
                     fs.KeepBackup = keepBackup;
+                    if (ifExists == "APPEND") fs.AbortTruncateLength = appendBase;
                     return fs;
                 }
             }
@@ -2195,7 +2471,7 @@ public static partial class Runtime
                         case "APPEND":
                         {
                             // Open for append + read
-                            var netFs = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+                            var netFs = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite, FileBufferSize);
                             netFs.Seek(0, SeekOrigin.End); // Position at end for append
                             var reader = MakeReader(netFs, encoding, binaryElement, newline);
                             var writer = MakeWriter(netFs, encoding, newline); writer.AutoFlush = true;
@@ -2224,7 +2500,7 @@ public static partial class Runtime
                     }
                 }
                 {
-                    var netFs = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite);
+                    var netFs = new FileStream(filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite, FileBufferSize);
                     var reader = MakeReader(netFs, encoding, binaryElement, newline);
                     var writer = MakeWriter(netFs, encoding, newline); writer.AutoFlush = true;
                     var fs = new LispFileStream(reader, writer, filePath);
@@ -2303,6 +2579,7 @@ public static partial class Runtime
         }
         if (stream is LispStream ls2) ls2.IsClosed = true;
         else if (stream is LispInstance gi && IsGrayStream(gi)) MarkGrayClosed(gi);
+        else throw new LispErrorException(new LispTypeError("CLOSE: not a stream", stream, Startup.Sym("STREAM")));
         return T.Instance;
     }
 
@@ -2336,6 +2613,7 @@ public static partial class Runtime
             }
             return r;
         }
+        if (streamObj is LispSynonymStream) RequireInputDirection(streamObj, "READ-CHAR-NO-HANG");
         var lispStream = ResolveLispStream(streamObj);
         if (lispStream.UnreadCharValue != -1)
         {
@@ -2343,7 +2621,7 @@ public static partial class Runtime
             lispStream.UnreadCharValue = -1;
             return LispChar.Make(ch);
         }
-        TextReader reader = GetTextReader(lispStream);
+        TextReader reader = GetTextReader(streamObj);
         // Nothing has arrived on a socket yet: no character, and not end of file.
         // Peek would wait for the peer (see LISTEN).
         if (reader is BivalentStreamReader bsr && bsr.DataReady() == false)
@@ -2359,13 +2637,6 @@ public static partial class Runtime
             return eofValue;
         }
         int c = reader.Read();
-        // Echo if reading from echo stream
-        var echoStream = FindEchoStream(streamObj);
-        if (echoStream != null && c != -1)
-        {
-            TextWriter echoWriter = GetTextWriter(echoStream.OutputStream);
-            echoWriter.Write((char)c);
-        }
         return LispChar.Make((char)c);
     }
 
@@ -2440,6 +2711,9 @@ public static partial class Runtime
             resolved = tw.InputStream;
         if (resolved is LispEchoStream echo)
             resolved = echo.InputStream;
+        if (resolved is LispFileStream notInput && !notInput.IsInput)   // SBCL answers NIL for a string output stream
+            throw new LispErrorException(new LispTypeError(
+                "LISTEN: not an input stream", resolved, Startup.Sym("STREAM")));
         // Check unread-char buffer first
         if (resolved is LispStream ls && ls.UnreadCharValue != -1)
             return T.Instance;
@@ -2517,6 +2791,7 @@ public static partial class Runtime
         // Validate: must be a stream designator (stream, nil, or t)
         if (stream is not (LispStream or Nil or T))
             throw new LispErrorException(new LispTypeError("CLEAR-INPUT: not a stream designator", stream, Startup.Sym("STREAM")));
+        RequireOpen(ResolveInputWrappers(stream), "CLEAR-INPUT");
         // For most streams, this is a no-op in our implementation
         return Nil.Instance;
     }
@@ -2530,7 +2805,7 @@ public static partial class Runtime
             (sym.Name is "UNSIGNED-BYTE" or "SIGNED-BYTE" or "INTEGER" or "MOD")) return true;
         // General: subtype of INTEGER but not CHARACTER
         if (et is Nil || et is T) return false;
-        try { return Runtime.IsTruthy(Runtime.Subtypep(et, Startup.Sym("INTEGER"))); } catch { return false; }
+        try { return Runtime.SubtypepClean(et, Startup.Sym("INTEGER")) is not Nil; } catch { return false; }
     }
 
     private static bool IsBinaryOutputStream(LispObject s) => s switch {
@@ -2805,6 +3080,28 @@ public static partial class Runtime
             WriteStreamByte(tw.OutputStream, b);
     }
 
+    /// <summary>READ-SEQUENCE into an (unsigned-byte 8) vector held in a byte[]: read
+    /// straight into the array instead of one boxed element per byte. POS advances
+    /// by the number of bytes read; the loop stops at end of file, as the
+    /// per-element loop does. Returns false when the vector or the stream is not one
+    /// this handles.</summary>
+    private static bool TryReadRawBytes(LispObject stream, LispVector vec, ref int pos, int end)
+    {
+        if (vec._numKind != 1 || vec._displacedTo != null || vec._numData is not byte[] raw) return false;
+        if (pos < 0 || end < pos || end > raw.Length) return false;
+        System.IO.Stream? src = null;
+        if (stream is LispFileStream fs && fs.InputReader is ByteTrackingReader sr) src = sr.BaseStream;
+        else if (stream is LispBinaryStream bin) src = bin.BaseStream;
+        if (src == null) return false;
+        while (pos < end)
+        {
+            int got = src.Read(raw, pos, end - pos);
+            if (got <= 0) break;
+            pos += got;
+        }
+        return true;
+    }
+
     /// <summary>Bulk path of WRITE-SEQUENCE for an octet vector going to a
     /// one-byte-per-element native stream: one Stream.Write for the whole range
     /// instead of WriteStreamByte per element. Like WRITE-BYTE it leaves the
@@ -3042,41 +3339,26 @@ public static partial class Runtime
         if (!binary && stream is LispBidirectionalStream rsbi && rsbi.Reader is BivalentStreamReader
             && seq is LispVector rsv && !rsv.IsCharVector && !rsv.IsBitVector && rsv.ElementTypeName != "T")
             binary = true;
-        var echoStream = FindEchoStream(stream);
-        TextWriter? echoWriter = echoStream != null ? GetTextWriter(echoStream.OutputStream) : null;
-
         if (seq is LispString ls)
         {
             if (end < 0) end = ls.Length;
             TextReader reader = GetTextReader(stream);
             int pos = start;
             int pend = pos < end ? TakePendingUnread(stream) : -1;
-            if (echoWriter == null)
+            // Read a block at a time into the string's own array. A reader may return fewer
+            // characters than asked for before the end, so loop until the block is full or
+            // it returns 0 (end of input). An echo stream's reader echoes what it returns.
+            if (pos < end)
             {
-                // Without an echo, read a block at a time into the string's own array. A
-                // reader may return fewer characters than asked for before the end, so
-                // loop until the block is full or it returns 0 (end of input).
-                if (pos < end)
+                var target = ls.RawChars;
+                // A character UNREAD-CHAR left pending comes first (and is not echoed again).
+                if (pend != -1) { target[pos++] = (char)pend; pend = -1; }
+                while (pos < end)
                 {
-                    var target = ls.RawChars;
-                    // A character UNREAD-CHAR left pending comes first.
-                    if (pend != -1) { target[pos++] = (char)pend; pend = -1; }
-                    while (pos < end)
-                    {
-                        int got = reader.Read(target, pos, end - pos);
-                        if (got <= 0) break;
-                        pos += got;
-                    }
+                    int got = reader.Read(target, pos, end - pos);
+                    if (got <= 0) break;
+                    pos += got;
                 }
-                return Fixnum.Make(pos);
-            }
-            while (pos < end)
-            {
-                int ch = pend != -1 ? pend : reader.Read();
-                pend = -1;
-                if (ch == -1) break;
-                ls[pos++] = (char)ch;
-                echoWriter?.Write((char)ch);
             }
             return Fixnum.Make(pos);
         }
@@ -3087,6 +3369,7 @@ public static partial class Runtime
             if (binary)
             {
                 int byteWidth = GetBinaryFormat(stream, out bool signedElems);
+                if (byteWidth == 1 && !signedElems && TryReadRawBytes(stream, vec, ref pos, end)) return Fixnum.Make(pos);
                 while (pos < end)
                 {
                     var elem = ReadBinaryElement(stream, byteWidth, signedElems);
@@ -3104,7 +3387,6 @@ public static partial class Runtime
                     pend = -1;
                     if (ch == -1) break;
                     vec.SetElement(pos++, LispChar.Make((char)ch));
-                    echoWriter?.Write((char)ch);
                 }
             }
             return Fixnum.Make(pos);
@@ -3145,7 +3427,6 @@ public static partial class Runtime
                     pend = -1;
                     if (ch == -1) break;
                     cc.Car = LispChar.Make((char)ch);
-                    echoWriter?.Write((char)ch);
                     cell = cc.Cdr;
                     pos++;
                 }
@@ -3214,6 +3495,10 @@ public static partial class Runtime
             }
         }
 
+        if (stream is LispStream notOut && !notOut.IsOutput)
+            throw new LispErrorException(new LispTypeError(
+                "WRITE-SEQUENCE: not an output stream", stream, Startup.Sym("STREAM")));
+
         // A bivalent stream takes each element as what it is, as SBCL's do: a
         // character is written as a character (UTF-8), an integer as one octet.
         // Its element type is CHARACTER, so the character path below would turn
@@ -3229,6 +3514,9 @@ public static partial class Runtime
 
         if (binary)
         {
+            if (seq is LispString)
+                throw new LispErrorException(new LispTypeError(
+                    "WRITE-SEQUENCE: a string is not written to a byte stream", seq, Startup.Sym("VECTOR")));
             int byteWidth = GetBinaryFormat(stream, out bool signedElems);
             // Binary write via BaseStream
             if (seq is LispVector vec)
@@ -3315,13 +3603,7 @@ public static partial class Runtime
     /// reader works on the TextReader underneath the wrapper, so without this it
     /// bypasses the echo entirely.</summary>
     internal static TextReader GetReaderTextReader(LispObject stream)
-    {
-        var inner = GetTextReader(stream);
-        var echo = FindEchoStream(stream);
-        if (echo == null) return inner;
-        var echoWriter = GetTextWriter(echo.OutputStream);
-        return echoWriter == null ? inner : new EchoingTextReader(inner, echoWriter);
-    }
+        => GetTextReader(stream);   // an echo stream's reader echoes by itself
 
     private static LispObject ReadPreservingWhitespaceUnguarded(LispObject stream, LispObject eofErrorP,
                                                                  LispObject eofValue, bool recursiveP)
@@ -3375,6 +3657,26 @@ public static partial class Runtime
     public static LispObject ReadLinePrimary(LispObject stream, LispObject eofErrorP, LispObject eofValue)
         => MultipleValues.Alone(ReadLine(stream, eofErrorP, eofValue));
 
+    // The builder one READ-LINE collects its characters in. A line of any length was growing a
+    // fresh builder chunk by chunk (about 500 bytes for 60 characters); one per thread keeps
+    // its capacity. It is taken out of the field while in use, so a stream that reads another
+    // line from inside this one (a Gray stream behind an echo or two-way stream) gets its own.
+    [ThreadStatic] private static System.Text.StringBuilder? t_lineBuilder;
+    private static System.Text.StringBuilder TakeLineBuilder()
+    {
+        var sb = t_lineBuilder;
+        if (sb == null) return new System.Text.StringBuilder(128);
+        t_lineBuilder = null;
+        return sb;
+    }
+    private static void ReturnLineBuilder(System.Text.StringBuilder sb)
+    {
+        // A very long line is not worth keeping the memory of.
+        if (sb.Capacity > 8192) return;
+        sb.Clear();
+        t_lineBuilder = sb;
+    }
+
     private static LispObject ReadLineUnguarded(LispObject stream, LispObject eofErrorP, LispObject eofValue)
     {
         if (stream is LispInstance gli && IsGrayStream(gli)
@@ -3394,12 +3696,9 @@ public static partial class Runtime
             return line;
         }
         CheckCharacterInput(stream);
-        var echoStream = FindEchoStream(stream);
-        TextWriter? echoWriter = echoStream != null ? GetTextWriter(echoStream.OutputStream) : null;
-
         // A character file whose line is wholly in the buffer and ASCII: the line comes out
         // of the byte buffer as one string.
-        if (echoStream == null && stream is LispFileStream plainFile && plainFile.IsInput
+        if (stream is LispFileStream plainFile && plainFile.IsInput
             && !plainFile.IsClosed && plainFile.UnreadCharValue == -1
             && plainFile.InputReader is ByteTrackingReader bytesIn
             && bytesIn.TryReadLineAscii(out var fastLine, out var fastNl))
@@ -3410,13 +3709,15 @@ public static partial class Runtime
         }
 
         // Read character by character to handle concatenated streams crossing boundaries
-        var sb = new System.Text.StringBuilder();
+        var sb = TakeLineBuilder();
         bool foundNewline = false;
         bool gotAny = false;
         int pendingChar = TakePendingUnread(stream);
+        // One reader for the whole line (an echo stream's reader is made per call); it is
+        // fetched again only after a concatenated stream has moved to its next component.
+        TextReader reader = GetTextReader(stream);
         while (true)
         {
-            TextReader reader = GetTextReader(stream); // Re-resolve each iteration for concatenated streams
             int ch = pendingChar != -1 ? pendingChar : reader.Read();
             pendingChar = -1;
             if (ch == -1)
@@ -3425,6 +3726,7 @@ public static partial class Runtime
                 if (stream is LispConcatenatedStream cs && cs.CurrentIndex < cs.Streams.Length - 1)
                 {
                     cs.CurrentIndex++;
+                    reader = GetTextReader(stream);
                     continue;
                 }
                 // Also check if the original stream wraps a concatenated stream
@@ -3435,6 +3737,7 @@ public static partial class Runtime
                 if (resolved is LispConcatenatedStream cs2 && cs2.CurrentIndex < cs2.Streams.Length - 1)
                 {
                     cs2.CurrentIndex++;
+                    reader = GetTextReader(stream);
                     continue;
                 }
                 break; // True EOF
@@ -3443,15 +3746,14 @@ public static partial class Runtime
             if (ch == '\n')
             {
                 foundNewline = true;
-                echoWriter?.Write('\n');
                 break;
             }
             sb.Append((char)ch);
-            echoWriter?.Write((char)ch);
         }
 
         if (!gotAny)
         {
+            ReturnLineBuilder(sb);
             if (IsTruthy(eofErrorP))
                 throw new LispErrorException(MakeEndOfFileError(stream));
             MultipleValues.SetPair(eofValue, T.Instance);
@@ -3459,6 +3761,7 @@ public static partial class Runtime
         }
 
         var result = new LispString(sb.ToString());
+        ReturnLineBuilder(sb);
         var missingNewlineP = foundNewline ? (LispObject)Nil.Instance : T.Instance;
         MultipleValues.SetPair(result, missingNewlineP);
         return result;
@@ -3572,6 +3875,22 @@ public static partial class Runtime
     }
 
     public static LispObject ReadChar(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
+    {
+        // A string input stream with nothing unread: the character straight from its reader (no
+        // I/O error can come from a string). End of input, or anything else, takes the long way.
+        if (streamObj.GetType() == typeof(LispStringInputStream))
+        {
+            var sis = System.Runtime.CompilerServices.Unsafe.As<LispStringInputStream>(streamObj);
+            if (sis.UnreadCharValue == -1 && !sis.IsClosed && sis.Reader is StringPositionReader spr)
+            {
+                int c = spr.Read();
+                if (c != -1) return LispChar.Make((char)c);
+            }
+        }
+        return ReadCharGuarded(streamObj, eofErrorP, eofValue);
+    }
+
+    private static LispObject ReadCharGuarded(LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
         => GuardStreamIO(streamObj, streamObj, eofErrorP, eofValue,
                          static (st, ee, ev) => ReadCharUnguarded(st, ee, ev));
 
@@ -3609,6 +3928,7 @@ public static partial class Runtime
         // A file or string input stream itself (not a composite or a synonym): nothing to
         // look through, no echo to feed, and the stream is its own resolved stream.
         if ((streamObj is LispFileStream || streamObj is LispInputStream)
+            && ((LispStream)streamObj).IsInput
             && ((LispStream)streamObj).UnreadCharValue == -1 && !IsBinaryStream(streamObj))
         {
             int pc = GetTextReader(streamObj).Read();
@@ -3621,8 +3941,6 @@ public static partial class Runtime
             return LispChar.Make((char)pc);
         }
         CheckCharacterInput(streamObj);
-        // Check if this is an echo stream BEFORE resolving
-        var echoStream = FindEchoStream(streamObj);
         var stream = ResolveLispStream(streamObj);
         if (stream.UnreadCharValue != -1)
         {
@@ -3631,19 +3949,15 @@ public static partial class Runtime
             // Don't echo unread characters (CLHS: unread-char reverses the echo)
             return LispChar.Make(ch);
         }
-        TextReader reader = GetTextReader(stream);
+        // The reader of the designator itself, not of the stream it resolves to: an echo
+        // stream's reader echoes what it reads.
+        TextReader reader = GetTextReader(streamObj);
         int c = reader.Read();
         if (c == -1)
         {
             if (IsTruthy(eofErrorP))
                 throw new LispErrorException(MakeEndOfFileError(streamObj));
             return eofValue;
-        }
-        // Echo if reading from echo stream
-        if (echoStream != null)
-        {
-            var outWriter = GetTextWriter(echoStream.OutputStream);
-            outWriter.Write((char)c);
         }
         return LispChar.Make((char)c);
     }
@@ -3716,6 +4030,24 @@ public static partial class Runtime
     }
 
     public static LispObject PeekChar(LispObject peekType, LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
+    {
+        if (peekType is not Nil && peekType is not T && peekType is not LispChar)
+            throw new LispErrorException(new LispTypeError("PEEK-CHAR: peek-type is not NIL, T or a character", peekType,
+                List(Startup.Sym("OR"), List(Startup.Sym("MEMBER"), Nil.Instance, T.Instance), Startup.Sym("CHARACTER"))));
+        // The next character of a string input stream with nothing unread, the plain PEEK-CHAR NIL.
+        if (peekType is Nil && streamObj.GetType() == typeof(LispStringInputStream))
+        {
+            var sis = System.Runtime.CompilerServices.Unsafe.As<LispStringInputStream>(streamObj);
+            if (sis.UnreadCharValue == -1 && !sis.IsClosed && sis.Reader is StringPositionReader spr)
+            {
+                int c = spr.Peek();
+                if (c != -1) return LispChar.Make((char)c);
+            }
+        }
+        return PeekCharGuarded(peekType, streamObj, eofErrorP, eofValue);
+    }
+
+    private static LispObject PeekCharGuarded(LispObject peekType, LispObject streamObj, LispObject eofErrorP, LispObject eofValue)
         => GuardStreamIO(streamObj, peekType, streamObj, eofErrorP, eofValue,
                          static (pt, st, ee, ev) => PeekCharUnguarded(pt, st, ee, ev));
 
@@ -3725,12 +4057,10 @@ public static partial class Runtime
         // stream-read-char generics (ResolveLispStream would drop the instance
         // to *standard-input*, and the LispStream path below assumes a
         // resolvable stream with an UnreadCharValue slot).
-        LispEchoStream? echoStream;
         LispStream stream;
         var plainIn = PlainCharInput(streamObj);
         if (plainIn != null)
         {
-            echoStream = null;
             stream = plainIn;
         }
         else
@@ -3739,10 +4069,12 @@ public static partial class Runtime
                 return PeekCharGray(peekType, grIn, eofErrorP, eofValue);
 
             CheckCharacterInput(streamObj);
-            echoStream = FindEchoStream(streamObj);
             stream = ResolveLispStream(streamObj);
         }
-        TextWriter? echoWriter = echoStream != null ? GetTextWriter(echoStream.OutputStream) : null;
+        // PEEK-CHAR echoes only the characters it passes over (they are consumed, by the
+        // echo stream's own reader); the character it stops at is not consumed and is
+        // echoed when it is read. CLHS does not say whether a peeked character is echoed;
+        // SBCL echoes it at the peek, CLISP at the read, and this follows CLISP.
 
         if (peekType is LispChar targetChar)
         {
@@ -3760,7 +4092,6 @@ public static partial class Runtime
             while ((ch = PeekCharFromStream(streamObj)) != -1 && (char)ch != targetChar.Value)
             {
                 ReadCharFromStream(streamObj);
-                echoWriter?.Write((char)ch);
             }
             if (ch == -1)
             {
@@ -3788,7 +4119,6 @@ public static partial class Runtime
             while ((ch = PeekCharFromStream(streamObj)) != -1 && readtable.GetSyntaxType((char)ch) == SyntaxType.Whitespace)
             {
                 ReadCharFromStream(streamObj);
-                echoWriter?.Write((char)ch);
             }
             if (ch == -1)
             {
@@ -3841,6 +4171,9 @@ public static partial class Runtime
         if (args.Length < 1)
             throw new LispErrorException(new LispProgramError("FILE-POSITION: wrong number of arguments"));
         if (args.Length > 2) throw new LispErrorException(new LispProgramError($"FILE-POSITION: wrong number of arguments: {args.Length} (expected 1-2)"));
+        if (args[0] is not LispStream && !(args[0] is LispInstance grStream && IsGrayStream(grStream)))
+            throw new LispErrorException(new LispTypeError(
+                $"FILE-POSITION: not a stream: {FormatObject(args[0], true)}", args[0], Startup.Sym("STREAM")));
         // A closed stream is a stream-error here, as it already is for read/write.
         // FILE-LENGTH deliberately does not check: SBCL answers it on a closed
         // stream too, and matching that keeps portable code working.
@@ -3859,6 +4192,12 @@ public static partial class Runtime
                     List(Startup.Sym("OR"),
                          List(Startup.Sym("MEMBER"), Startup.Keyword("START"), Startup.Keyword("END")),
                          List(Startup.Sym("INTEGER"), Fixnum.Make(0), Startup.Sym("*")))));
+        }
+        // Synonym stream: the query is about the stream in the symbol's value.
+        if (args[0] is LispSynonymStream syn)
+        {
+            args[0] = DynamicBindings.Get(syn.Symbol);
+            return FilePosition(args);
         }
         // Broadcast stream: return file-position of last component, or 0 if empty
         if (args[0] is LispBroadcastStream bs)
@@ -3884,7 +4223,13 @@ public static partial class Runtime
                 return Fixnum.Make(sis.ReportsFileBytes ? sis.FileByteOf(at) : at - sis.Origin);
             }
             // Setf position: reposition the underlying StringReader
-            if (args[1] is Fixnum pos)
+            LispObject posArg = args[1];
+            if (posArg is Symbol kwPos && kwPos.HomePackage?.Name == "KEYWORD" && !sis.ReportsFileBytes)
+            {
+                if (kwPos.Name == "START") posArg = Fixnum.Make(0);
+                else if (kwPos.Name == "END") posArg = Fixnum.Make(sis.EndOffset - sis.Origin);
+            }
+            if (posArg is Fixnum pos)
             {
                 if (pos.Value < 0) return Nil.Instance;
                 long target = pos.Value + sis.Origin;
@@ -4021,6 +4366,8 @@ public static partial class Runtime
                     else
                         sr.BaseStream.Seek(newPos, SeekOrigin.Begin);
                     sr.ResetTo(sr.BaseStream.Position);
+                    // The pushed-back character belonged to the old position.
+                    fs.UnreadCharValue = -1;
                     return T.Instance;
                 }
                 if (fs.OutputWriter is StreamWriter sw)
@@ -4082,20 +4429,78 @@ public static partial class Runtime
         return GetTextWriter(stream);
     }
 
+    /// <summary>The output stream behind echo, two-way and synonym wrappers, in any nesting
+    /// (a synonym of an echo stream, an echo stream of a two-way stream).</summary>
+    internal static LispObject ResolveOutputWrappers(LispObject stream)
+    {
+        while (true)
+        {
+            switch (stream)
+            {
+                case LispEchoStream es: stream = es.OutputStream; continue;
+                case LispTwoWayStream tw: stream = tw.OutputStream; continue;
+                case LispSynonymStream syn: stream = DynamicBindings.Get(syn.Symbol); continue;
+                default: return stream;
+            }
+        }
+    }
+
+    /// <summary>The input stream behind echo, two-way and synonym wrappers.</summary>
+    internal static LispObject ResolveInputWrappers(LispObject stream)
+    {
+        while (true)
+        {
+            switch (stream)
+            {
+                case LispEchoStream es: stream = es.InputStream; continue;
+                case LispTwoWayStream tw: stream = tw.InputStream; continue;
+                case LispSynonymStream syn: stream = DynamicBindings.Get(syn.Symbol); continue;
+                default: return stream;
+            }
+        }
+    }
+
+    /// <summary>An input operation on a stream that is not an input stream (reached through any
+    /// wrappers, a synonym of an output-only stream for one) is a TYPE-ERROR.</summary>
+    internal static void RequireInputDirection(LispObject stream, string op)
+    {
+        var resolved = ResolveInputWrappers(stream);
+        if (resolved is LispStream ls && !ls.IsInput)
+            throw new LispErrorException(new LispTypeError(
+                $"{op}: not an input stream", resolved, Startup.Sym("INPUT-STREAM")));
+    }
+
+    /// <summary>A stream operation on a closed component of a composite stream signals, as on a closed stream itself.</summary>
+    internal static void RequireOpen(LispObject resolved, string op)
+    {
+        if (resolved is LispStream ls && ls.IsClosed)
+            throw new LispErrorException(MakeStreamError(resolved, op));
+    }
+
     /// <summary>Update AtLineStart on the underlying LispStream after writing lastChar.</summary>
     internal static void UpdateAtLineStart(LispObject stream, char lastChar)
     {
         LispObject resolved = stream;
         if (resolved is Nil) resolved = DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
         else if (resolved is T) resolved = DynamicBindings.Get(Startup.Sym("*TERMINAL-IO*"));
-        while (resolved is LispEchoStream es) resolved = es.OutputStream;
-        while (resolved is LispTwoWayStream tw) resolved = tw.OutputStream;
-        while (resolved is LispSynonymStream syn) resolved = DynamicBindings.Get(syn.Symbol);
+        resolved = ResolveOutputWrappers(resolved);
         if (resolved is LispStream ls) ls.AtLineStart = (lastChar == '\n');
     }
 
     public static LispObject WriteChar(LispObject ch, LispObject stream)
-        => GuardStreamIO(stream, ch, stream, static (c, st) => WriteCharUnguarded(c, st));
+    {
+        // A character to an open host-writer stream (a string output stream, a
+        // WITH-OUTPUT-TO-STRING), no pretty-printer block active: the writer is the stream's own
+        // and cannot fail the way a file or socket can, so there is no guard to enter either.
+        if (ch is LispChar c && stream is LispOutputStream os && !_pprintActive && !os.IsClosed
+            && os.Writer is System.IO.StringWriter sw)
+        {
+            sw.Write(c.Value);
+            os.AtLineStart = c.Value == '\n';
+            return ch;
+        }
+        return GuardStreamIO(stream, ch, stream, static (c, st) => WriteCharUnguarded(c, st));
+    }
 
     private static LispObject WriteCharUnguarded(LispObject ch, LispObject stream)
     {
@@ -4157,11 +4562,111 @@ public static partial class Runtime
     public static LispObject WriteString1(LispObject str)
         => WriteString2(str, DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*")));
 
+    public static LispObject WriteString4(LispObject str, LispObject stream, LispObject start, LispObject end)
+        => GuardStreamIO(stream, str, stream, start, end,
+                         static (t, st, a, b) => WriteStringRange(t, st, a, b, false));
+
     public static LispObject WriteLine2(LispObject str, LispObject stream)
         => GuardStreamIO(stream, str, stream, static (t, st) => WriteStringSimple(t, st, true));
 
+    public static LispObject WriteLine4(LispObject str, LispObject stream, LispObject start, LispObject end)
+        => GuardStreamIO(stream, str, stream, start, end,
+                         static (t, st, a, b) => WriteStringRange(t, st, a, b, true));
+
     public static LispObject WriteLine1(LispObject str)
         => WriteLine2(str, DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*")));
+
+    private static string StringDesignatorText(LispObject str, bool newline)
+        => str switch
+        {
+            LispString ls => ls.Value,
+            LispVector vec when vec.IsCharVector || vec.ElementTypeName == "NIL" => vec.ToCharString(),
+            _ => throw NotAString(newline ? "WRITE-LINE" : "WRITE-STRING", str)
+        };
+
+    private static void WriteTextRange(TextWriter writer, string s, int start, int end)
+    {
+        if (start == 0 && end == s.Length) { writer.Write(s); return; }
+        if (writer.GetType() == typeof(System.IO.StringWriter))
+        {
+#if NETSTANDARD2_0
+            ((System.IO.StringWriter)writer).GetStringBuilder().Append(s, start, end - start);
+#else
+            ((System.IO.StringWriter)writer).GetStringBuilder().Append(s.AsSpan(start, end - start));
+#endif
+            return;
+        }
+#if NETSTANDARD2_0
+        writer.Write(s.Substring(start, end - start));
+#else
+        // The span overload: a writer that takes spans (StreamWriter, StringWriter, ours) copies
+        // from the string itself; the base class rents a pooled buffer. No substring is made.
+        writer.Write(s.AsSpan(start, end - start));
+#endif
+    }
+
+    private static LispObject WriteStringRange(LispObject str, LispObject stream,
+                                               LispObject startArg, LispObject endArg, bool newline)
+    {
+        string s = StringDesignatorText(str, newline);
+        string fname = newline ? "WRITE-LINE" : "WRITE-STRING";
+        CheckNotByteStream(stream, fname);
+        if (startArg is not Fixnum sf || sf.Value < 0)
+            throw new LispErrorException(new LispTypeError(fname + ": invalid :START value", startArg));
+        int start = Runtime.ClampIndex(sf.Value);
+        int end = s.Length;
+        if (endArg is not Nil)
+        {
+            if (endArg is not Fixnum ef || ef.Value < 0)
+                throw new LispErrorException(new LispTypeError(fname + ": invalid :END value", endArg));
+            end = Runtime.ClampIndex(ef.Value);
+        }
+        CheckStringBounds(fname, s, start, end);
+        if (!_pprintActive && (stream is LispFileStream || stream is LispOutputStream))
+        {
+            var plainWriter = GetTextWriter(stream);
+            WriteTextRange(plainWriter, s, start, end);
+            if (newline)
+            {
+                plainWriter.Write('\n');
+                ((LispStream)stream).AtLineStart = true;
+            }
+            else if (end > start)
+                ((LispStream)stream).AtLineStart = s[end - 1] == '\n';
+            return str;
+        }
+        var writer = ResolveOutputStreamDesignator(stream);
+        bool unrelated = PprintUnrelatedWriter(writer);
+        bool partial = start != 0 || end != s.Length;
+        if (newline)
+        {
+            if (writer is GrayStreamTextWriter grayWriter && partial && (!_pprintActive || unrelated))
+            {
+                grayWriter.WriteRange(s, start, end);
+                writer.Write('\n');
+                UpdateAtLineStart(stream, '\n');
+                return str;
+            }
+            WriteLineText(writer, start == 0 && end == s.Length ? s : s.Substring(start, end - start));
+            UpdateAtLineStart(stream, '\n');
+        }
+        else
+        {
+            if (!unrelated) PprintFlushPendingBreak(writer);
+            if (writer is GrayStreamTextWriter grayWriter && partial && (!_pprintActive || unrelated))
+            {
+                grayWriter.WriteRange(s, start, end);
+                if (end > start) UpdateAtLineStart(stream, s[end - 1]);
+                return str;
+            }
+            string text = (start == 0 && end == s.Length) ? s : s.Substring(start, end - start);
+            if (!unrelated) text = PprintPrefixLiteralNewlines(text);
+            writer.Write(text);
+            if (!unrelated) PprintTrackWrite(text);
+            if (text.Length > 0) UpdateAtLineStart(stream, text[text.Length - 1]);
+        }
+        return str;
+    }
 
     /// <summary>The output of WRITE-LINE: TEXT and a newline. Inside a logical
     /// block (on its stream) the lines it starts begin with the block's per-line
@@ -4180,6 +4685,14 @@ public static partial class Runtime
         PprintTrackWrite(t);
     }
 
+    // A file opened for bytes (not :element-type :default, which takes both) is not a
+    // character stream.
+    private static void CheckNotByteStream(LispObject stream, string fname)
+    {
+        if (stream is LispFileStream bfs && bfs.IsOutput && !bfs.Bivalent && IsIntegerElementType(bfs.ElementType))
+            throw new LispErrorException(new LispTypeError(fname + ": not a character output stream", stream, Startup.Sym("STREAM")));
+    }
+
     private static LispObject WriteStringSimple(LispObject str, LispObject stream, bool newline)
     {
         string s = str switch
@@ -4188,6 +4701,7 @@ public static partial class Runtime
             LispVector vec when vec.IsCharVector || vec.ElementTypeName == "NIL" => vec.ToCharString(),
             _ => throw NotAString(newline ? "WRITE-LINE" : "WRITE-STRING", str)
         };
+        CheckNotByteStream(stream, newline ? "WRITE-LINE" : "WRITE-STRING");
         // A file or string output stream itself, with no pretty-printer block open: the
         // text goes to the stream's own writer and only the line-start flag is kept.
         if (!_pprintActive && (stream is LispFileStream || stream is LispOutputStream))
@@ -4237,6 +4751,7 @@ public static partial class Runtime
             _ => throw NotAString("WRITE-STRING", str)
         };
         var stream = args.Length > 1 ? args[1] : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
+        CheckNotByteStream(stream, "WRITE-STRING");
 
         int start = 0, end = s.Length;
         int kwCount = args.Length - 2;
@@ -4286,6 +4801,13 @@ public static partial class Runtime
         }
 
         CheckStringBounds("WRITE-STRING", s, start, end);
+        if (!_pprintActive && (stream is LispFileStream || stream is LispOutputStream))
+        {
+            var plainWriter = GetTextWriter(stream);
+            WriteTextRange(plainWriter, s, start, end);
+            if (end > start) ((LispStream)stream).AtLineStart = s[end - 1] == '\n';
+            return str;
+        }
         var writer = ResolveOutputStreamDesignator(stream);
         bool unrelated = PprintUnrelatedWriter(writer);
         if (!unrelated) PprintFlushPendingBreak(writer);
@@ -4322,6 +4844,7 @@ public static partial class Runtime
             _ => throw NotAString("WRITE-LINE", str)
         };
         var stream = args.Length > 1 ? args[1] : DynamicBindings.Get(Startup.Sym("*STANDARD-OUTPUT*"));
+        CheckNotByteStream(stream, "WRITE-LINE");
 
         int start = 0, end = s.Length;
         int kwCount = args.Length - 2;
@@ -4371,6 +4894,14 @@ public static partial class Runtime
         }
 
         CheckStringBounds("WRITE-LINE", s, start, end);
+        if (!_pprintActive && (stream is LispFileStream || stream is LispOutputStream))
+        {
+            var plainWriter = GetTextWriter(stream);
+            WriteTextRange(plainWriter, s, start, end);
+            plainWriter.Write('\n');
+            ((LispStream)stream).AtLineStart = true;
+            return str;
+        }
         var writer = ResolveOutputStreamDesignator(stream);
         if (writer is GrayStreamTextWriter grayWriter && (start != 0 || end != s.Length)
             && (!_pprintActive || PprintUnrelatedWriter(writer)))
@@ -4380,7 +4911,7 @@ public static partial class Runtime
             UpdateAtLineStart(stream, '\n');
             return str;
         }
-        WriteLineText(writer, s.Substring(start, end - start));
+        WriteLineText(writer, start == 0 && end == s.Length ? s : s.Substring(start, end - start));
         UpdateAtLineStart(stream, '\n');
         return str;
     }
@@ -4394,26 +4925,26 @@ public static partial class Runtime
             pn = LispPathname.FromString(vec.ToCharString()) as LispPathname;
         if (pn != null && pn.DirectoryComponent is Cons dirList)
         {
-            bool isAbsolute = false;
-            bool sawWildInferiors = false;
+            // CLHS 19.2.2.4.3: :UP and :BACK may not directly follow :ABSOLUTE (the
+            // root has no parent) or :WILD-INFERIORS (it is not one directory). Later
+            // in the list they are ordinary: "/tmp/a/../" is (:ABSOLUTE "tmp" "a" :UP).
+            string? previous = null;
             var cur = (LispObject)dirList;
             while (cur is Cons cc)
             {
                 if (cc.Car is Symbol sym)
                 {
-                    if (sym.Name == "ABSOLUTE") isAbsolute = true;
-                    if (sym.Name == "WILD-INFERIORS") sawWildInferiors = true;
-                    if (sym.Name == "UP" || sym.Name == "BACK")
+                    if ((sym.Name == "UP" || sym.Name == "BACK")
+                        && (previous == "ABSOLUTE" || previous == "WILD-INFERIORS"))
                     {
-                        if (isAbsolute || sawWildInferiors)
-                        {
-                            var err = new LispError("DIRECTORY: invalid directory component");
-                            err.ConditionTypeName = "FILE-ERROR";
-                            err.FileErrorPathnameRef = pn;
-                            throw new LispErrorException(err);
-                        }
+                        var err = new LispError("DIRECTORY: invalid directory component");
+                        err.ConditionTypeName = "FILE-ERROR";
+                        err.FileErrorPathnameRef = pn;
+                        throw new LispErrorException(err);
                     }
+                    previous = sym.Name;
                 }
+                else previous = null;
                 cur = cc.Cdr;
             }
         }
@@ -4539,7 +5070,7 @@ public static partial class Runtime
         }
         if (firstWild < 0)
             return System.IO.Directory.Exists(dirPath)
-                ? System.IO.Directory.GetFiles(dirPath).Where(f => EntryMatchesPathname(f, filePattern)).ToArray()
+                ? System.IO.Directory.GetFileSystemEntries(dirPath).Where(f => EntryMatchesPathname(f, filePattern)).ToArray()
                 : Array.Empty<string>();
 
         // Build the non-wild root
@@ -4577,7 +5108,7 @@ public static partial class Runtime
         {
             try
             {
-                result.AddRange(System.IO.Directory.GetFiles(d)
+                result.AddRange(System.IO.Directory.GetFileSystemEntries(d)
                     .Where(f => EntryMatchesPathname(f, filePattern)));
             }
             catch { }
@@ -4671,7 +5202,7 @@ public static partial class Runtime
         // Both answers are the TRUENAME (CLHS 20.1.3): links along the path are
         // resolved, as TRUENAME does.
         if (File.Exists(filePath))
-            return LispPathname.FromString(LispPathname.QuoteLiteral(Path.GetFullPath(Compat.ResolveSymlinks(filePath)), wildOnly: true));
+            return LispPathname.FromString(LispPathname.QuoteLiteral(Path.GetFullPath(Compat.ResolveSymlinks(filePath))));
         if (Directory.Exists(filePath))
         {
             // CLHS 21.4: probe-file answers the TRUENAME. A directory's truename
@@ -4684,7 +5215,7 @@ public static partial class Runtime
             // the slash, and uiop:file-exists-p said yes.
             var full = Path.GetFullPath(Compat.ResolveSymlinks(filePath));
             if (!full.EndsWith('/')) full += "/";
-            return LispPathname.FromString(LispPathname.QuoteLiteral(full, wildOnly: true));
+            return LispPathname.FromString(LispPathname.QuoteLiteral(full));
         }
         return Nil.Instance;
     }
@@ -4735,7 +5266,7 @@ public static partial class Runtime
             // For directories, ensure trailing / so last component is in directory, not name
             if (Directory.Exists(fullPath) && !fullPath.EndsWith('/'))
                 fullPath += "/";
-            return LispPathname.FromString(LispPathname.QuoteLiteral(fullPath, wildOnly: true));
+            return LispPathname.FromString(LispPathname.QuoteLiteral(fullPath));
         }
         var fileErr = new LispError($"TRUENAME: file not found: {filePath}");
         fileErr.ConditionTypeName = "FILE-ERROR";
@@ -4830,7 +5361,7 @@ public static partial class Runtime
             // literally named "NIL": the classic unset-config-variable bug,
             // silently succeeding with a side effect instead of signalling.
             throw new LispErrorException(new LispTypeError(
-                "Not a pathname designator (expected pathname, string, or file stream)",
+                $"Not a pathname designator: {FormatObject(pathSpec, true)} (expected pathname, string, or file stream)",
                 pathSpec));
 
         // Expand a leading ~ for STRING/char-vector specs (LispPathname args were
@@ -4886,7 +5417,7 @@ public static partial class Runtime
             catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException
                                        || ex is NotSupportedException || ex is ArgumentException)
             {
-                var err = new LispError($"ENSURE-DIRECTORIES-EXIST: could not create {dir}: {ex.Message}")
+                var err = new LispError($"ENSURE-DIRECTORIES-EXIST: could not create {dir}: {FsFailureReason(ex)}")
                     { ConditionTypeName = "FILE-ERROR" };
                 err.FileErrorPathnameRef = pn;
                 throw new LispErrorException(err);
@@ -5007,7 +5538,24 @@ public static partial class Runtime
         {
             TryDeleteFile(created);
         }
+        else if (fs.AbortTruncateLength >= 0)
+        {
+            // An append stream on an existing file: the side effects of its output are
+            // undone by cutting the file back to the length it had when it was opened.
+            try
+            {
+                string? path = fs.FilePath;
+                if (path != null)
+                    using (var f = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+                        f.SetLength(fs.AbortTruncateLength);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+        }
     }
+
+    /// <summary>Buffer of the FileStream under an OPEN output stream: 64 KB, so a stream written a
+    /// line at a time reaches the file in blocks, not one write per 4 KB.</summary>
+    private const int FileBufferSize = 65536;
 
     /// <summary>A new file at FILEPATH for :IF-EXISTS :SUPERSEDE and the like. A
     /// fasl may be mapped by a loaded assembly, so it is never truncated in place:
@@ -5017,13 +5565,13 @@ public static partial class Runtime
     {
         if (!Compat.IsWindows() && File.Exists(filePath) && Compat.MayMoveAside(filePath))
             File.Delete(filePath);
-        try { return new FileStream(filePath, FileMode.Create, access, FileShare.ReadWrite); }
+        try { return new FileStream(filePath, FileMode.Create, access, FileShare.ReadWrite, FileBufferSize); }
         catch (Exception e) when (Compat.IsWindows()
                                   && (e is IOException || e is UnauthorizedAccessException)
                                   && Compat.MayMoveAside(filePath))
         {
             Compat.MoveAside(filePath);
-            return new FileStream(filePath, FileMode.CreateNew, access, FileShare.ReadWrite);
+            return new FileStream(filePath, FileMode.CreateNew, access, FileShare.ReadWrite, FileBufferSize);
         }
     }
 
@@ -5069,7 +5617,7 @@ public static partial class Runtime
         // name a directory is not a file, so it signals, as SBCL does. tmpdir
         // makes its directory where UIOP's temporary file was, and UIOP then
         // deletes "the file" by its file-form name.
-        bool directoryForm = filePath.EndsWith("/") || filePath.EndsWith("\\");
+        bool directoryForm = filePath.EndsWith("/", System.StringComparison.Ordinal) || filePath.EndsWith("\\", System.StringComparison.Ordinal);
         if (directoryForm && Directory.Exists(filePath))
         {
             try
@@ -5305,9 +5853,9 @@ public static partial class Runtime
             && full[full.Length - 1] != Path.DirectorySeparatorChar
             && full[full.Length - 1] != Path.AltDirectorySeparatorChar)
             full += Path.DirectorySeparatorChar;
-        // The file's own spelling: a * or ? in it is a literal character, quoted
+        // The file's own spelling: a * ? or [ in it is a literal character, quoted
         // so that the pathname is not wild and its namestring reads back as itself.
-        return LispPathname.FromString(LispPathname.QuoteLiteral(full, wildOnly: true));
+        return LispPathname.FromString(LispPathname.QuoteLiteral(full));
     }
 
     /// <summary>Kept only so FASLs compiled before the two DIRECTORY
@@ -5358,7 +5906,12 @@ public static partial class Runtime
         // Get pathname from first arg: translate logical pathnames
         // The pattern keeps its quoting (\* is a literal *) while it is matched.
         string namestring = ResolvePhysicalPathQuoted(args[0]);
-        if (string.IsNullOrEmpty(namestring)) namestring = ".";
+        if (string.IsNullOrEmpty(namestring))
+        {
+            // An empty pathspec names *default-pathname-defaults* itself.
+            var dpdDir = GetDefaultPathnameDefaults();
+            namestring = string.IsNullOrEmpty(dpdDir) ? "." : dpdDir;
+        }
         // A NUL ends a host path, so nothing can match.
         if (namestring.Contains('\0')) return Nil.Instance;
         var patternPn = args[0] as LispPathname ?? LispPathname.FromString(namestring);
@@ -5370,7 +5923,7 @@ public static partial class Runtime
             wantsDirs = (pnCheck.NameComponent is Nil || pnCheck.NameComponent == null)
                      && (pnCheck.TypeComponent is Nil || pnCheck.TypeComponent == null);
         else
-            wantsDirs = namestring.EndsWith("/") || namestring.EndsWith("\\");
+            wantsDirs = namestring.EndsWith("/", System.StringComparison.Ordinal) || namestring.EndsWith("\\", System.StringComparison.Ordinal);
 
         // Check if pattern contains wildcards
         bool hasWild = LispPathname.HasWildChar(namestring);
@@ -5529,24 +6082,25 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("MAKE-STRING-INPUT-STREAM: not a string", args[0]));
         // CLHS: START is a non-negative integer, END an integer or NIL, START <= END <= length.
         int start = 0, end = val.Length;
-        var indexType = List(Startup.Sym("INTEGER"), Fixnum.Make(0), Fixnum.Make(val.Length));
+        // The (INTEGER 0 length) type is built where it is reported, not for every stream made.
+        LispObject IndexType() => List(Startup.Sym("INTEGER"), Fixnum.Make(0), Fixnum.Make(val.Length));
         if (args.Length > 1)
         {
             if (args[1] is not Fixnum startFx || startFx.Value < 0 || startFx.Value > val.Length)
                 throw new LispErrorException(new LispTypeError(
-                    "MAKE-STRING-INPUT-STREAM: :START is not a valid index", args[1], indexType));
+                    "MAKE-STRING-INPUT-STREAM: :START is not a valid index", args[1], IndexType()));
             start = Runtime.ClampIndex(startFx.Value);
         }
         if (args.Length > 2 && args[2] is not Nil)
         {
             if (args[2] is not Fixnum endFx || endFx.Value < start || endFx.Value > val.Length)
                 throw new LispErrorException(new LispTypeError(
-                    "MAKE-STRING-INPUT-STREAM: :END is not a valid index", args[2], indexType));
+                    "MAKE-STRING-INPUT-STREAM: :END is not a valid index", args[2], IndexType()));
             end = Runtime.ClampIndex(endFx.Value);
         }
-        var sliced = val.Substring(start, end - start);
-        var sr = new StringReader(sliced);
-        return new LispStringInputStream(sr, start, val, end);
+        // The whole string: the string itself (a .NET string is immutable), not a copy.
+        var sliced = (start == 0 && end == val.Length) ? val : val.Substring(start, end - start);
+        return new LispStringInputStream(new StringPositionReader(sliced), start, val, end);
     }
 
 
@@ -5673,12 +6227,13 @@ public static partial class Runtime
             }
             } finally { lispReader.ExitRecursiveRead(); }
             // Under *READ-SUPPRESS* the elements were read and thrown away: the result is NIL.
-            if (DynamicBindings.Get(Startup.Sym("*READ-SUPPRESS*")) is not Nil) return Nil.Instance;
+            // A reader macro that returned no values left that state behind; the list is one value.
+            if (DynamicBindings.Get(Startup.Sym("*READ-SUPPRESS*")) is not Nil) return MultipleValues.Alone(Nil.Instance);
             // Build list from items
             LispObject result = Nil.Instance;
             for (int i = items.Count - 1; i >= 0; i--)
                 result = new Cons(items[i], result);
-            return result;
+            return MultipleValues.Alone(result);
         }, "READ-DELIMITED-LIST", -1));
 
         // --- Stream predicates/accessors ---
@@ -5748,6 +6303,22 @@ public static partial class Runtime
             throw new LispErrorException(new LispTypeError("STREAM-ELEMENT-TYPE: not a stream", obj, Startup.Sym("STREAM")));
         });
         Startup.RegisterUnary("STREAM-EXTERNAL-FORMAT", obj => {
+            // Synonym and broadcast streams answer for their target / last component.
+            while (true)
+            {
+                if (obj is LispSynonymStream syn)
+                {
+                    obj = DynamicBindings.Get(syn.Symbol);
+                    continue;
+                }
+                if (obj is LispBroadcastStream bcs)
+                {
+                    if (bcs.Streams.Length == 0) return Startup.Keyword("DEFAULT");
+                    obj = bcs.Streams[^1];
+                    continue;
+                }
+                break;
+            }
             // Accept Gray streams (streamp=T); they carry no format, so :default.
             if (obj is not LispStream && !(obj is LispInstance ei && Runtime.IsGrayStream(ei)))
                 throw new LispErrorException(new LispTypeError("STREAM-EXTERNAL-FORMAT: not a stream", obj, Startup.Sym("STREAM")));
@@ -5805,6 +6376,12 @@ public static partial class Runtime
         Emitter.CilAssembler.RegisterFunction("FILE-STRING-LENGTH", new LispFunction(args => {
             Runtime.CheckArityExact("FILE-STRING-LENGTH", args, 2);
             var stream = args[0];
+            // Synonym stream: the query is about the stream in the symbol's value.
+            if (stream is LispSynonymStream syn)
+            {
+                args[0] = DynamicBindings.Get(syn.Symbol);
+                return Runtime.Funcall(Startup.Sym("FILE-STRING-LENGTH").Function!, args);
+            }
             // Broadcast stream: delegate to last component, or return 1 if empty
             if (stream is LispBroadcastStream bs)
             {
@@ -5812,13 +6389,21 @@ public static partial class Runtime
                 args[0] = bs.Streams[^1];
                 return Runtime.Funcall(Startup.Sym("FILE-STRING-LENGTH").Function!, args);
             }
-            if (stream is not LispFileStream fsl) throw new LispErrorException(new LispTypeError("FILE-STRING-LENGTH: not a file stream", stream, Startup.Sym("FILE-STREAM")));
+            if (stream is not (LispFileStream or LispStringOutputStream or LispFillPointerStringOutputStream
+                    or LispStringInputStream or LispOutputStream or LispBidirectionalStream))
+                throw new LispErrorException(new LispTypeError("FILE-STRING-LENGTH: not a file stream", stream, Startup.Sym("FILE-STREAM")));
             string str = args[1] switch {
                 LispChar lch => lch.Value.ToString(),
                 LispString ls => ls.Value,
                 LispVector vec when vec.IsCharVector => vec.ToCharString(),
                 _ => throw new LispErrorException(new LispTypeError("FILE-STRING-LENGTH: not a string or character", args[1]))
             };
+            // A string stream has no encoding to count in: NIL, as SBCL answers.
+            if (stream is LispStringOutputStream or LispFillPointerStringOutputStream or LispStringInputStream)
+                return Nil.Instance;
+            // A console stream counts as UTF-8.
+            if (stream is not LispFileStream fsl)
+                return new Fixnum(System.Text.Encoding.UTF8.GetByteCount(str));
             // Count in the stream's own encoding and line end.
             var (enc, nl) = fsl.OutputWriter is ColumnStreamWriter cw ? (cw.Encoding, cw.Newline)
                 : fsl.InputReader is ByteTrackingReader br ? (br.CurrentEncoding, br.Newline)
@@ -6132,6 +6717,7 @@ public static partial class Runtime
         }
         if (streamArg is not (LispStream or Nil or T))
             throw new LispErrorException(new LispTypeError($"{fn}: not a stream designator", streamArg, Startup.Sym("STREAM")));
+        RequireOpen(ResolveOutputWrappers(target), fn);
         return Runtime.GuardStreamIO(target, target,
                                      static st => { FlushStream(st); return Nil.Instance; });
     }

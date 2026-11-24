@@ -1,3 +1,4 @@
+;;; regression: full-tier-only
 ;;; What the REPL does with a transfer of control that happens while it is
 ;;; reading input through the line editor.
 ;;;

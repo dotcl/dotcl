@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; A closure from a .fasl with up to four required parameters is called through
 ;;; an entry pointer, the way a DEFUN is: FUNCALL goes straight to the body
 ;;; instead of through InvokeN and the body delegate. The entry does what InvokeN

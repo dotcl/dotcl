@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Reading a string must not make every later read of it allocate.
 ;;;
 ;;; LispString is copy-on-write over two backings: the System.String it was made

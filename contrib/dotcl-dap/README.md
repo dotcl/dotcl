@@ -112,7 +112,7 @@ lines, or to a stream to send them there.
 
 In VS Code, after Attach:
 
-- The Debug Console shows `Attached to dotcl 0.1.35 (pid 12345)`.
+- The Debug Console shows `Attached to dotcl <version> (pid 12345)`.
 - The debug toolbar (continue, step, stop) appears and the status bar turns orange.
 - Under CALL STACK every live Lisp thread is listed by name: the thread that
   called `start-server` (the REPL) first, then the threads Lisp made, the

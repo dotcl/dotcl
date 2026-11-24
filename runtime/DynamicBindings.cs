@@ -198,6 +198,34 @@ public static class DynamicBindings
 
     public static void Push(Symbol sym, LispObject value) => PushOn(sym, value, Current);
 
+    /// <summary>The position of SYM's innermost binding on this thread, plus one
+    /// (0: none, its global value is in effect). For SETTOP.</summary>
+    internal static int PeekTop(Symbol sym)
+    {
+        var st = _stack;
+        int idx = sym.BindIndex;
+        if (st == null || idx == 0 || (uint)idx >= (uint)st.Tops.Length) return 0;
+        return st.Tops[idx];
+    }
+
+    /// <summary>Make the binding at POS - 1 (0: none) SYM's innermost one on this
+    /// thread, without removing the entries above it: the bindings in between
+    /// stay on the stack, out of sight, until the caller puts the old position
+    /// back. Only a caller that restores it before anything above is popped may
+    /// use this.</summary>
+    internal static void SetTop(Symbol sym, int pos)
+    {
+        var st = Current;
+        int idx = BindIndexOf(sym);
+        if (idx >= st.Tops.Length)
+        {
+            var bigger = new int[Math.Max(idx + 1, st.Tops.Length * 2)];
+            Array.Copy(st.Tops, bigger, st.Tops.Length);
+            st.Tops = bigger;
+        }
+        st.Tops[idx] = pos;
+    }
+
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     public static void PushOn(Symbol sym, LispObject value, BindingStack st)
     {
@@ -652,28 +680,52 @@ public static class DynamicBindings
         return sym;
     }
 
-    private static List<LispObject> ProgvList(LispObject obj)
+    private static void CheckProgvProperList(LispObject obj)
     {
-        var result = new List<LispObject>();
         var cur = obj;
-        while (cur is Cons c) { result.Add(c.Car); cur = c.Cdr; }
+        while (cur is Cons c) cur = c.Cdr;
         if (cur is not Nil)
             throw new LispErrorException(new LispTypeError(
                 $"PROGV: not a proper list: {obj}", obj, Startup.Sym("LIST")));
-        return result;
+    }
+
+    private static void CheckProgvSymbols(LispObject symsObj)
+    {
+        var cur = symsObj;
+        while (cur is Cons c)
+        {
+            var item = c.Car;
+            // NIL and T are objects of their own here, not Symbol instances; they and the
+            // keywords and the DEFCONSTANT variables are constants all the same.
+            if (item is Nil || item is T)
+                throw new LispErrorException(new LispProgramError(
+                    $"PROGV: {(item is Nil ? "NIL" : "T")} is a constant and cannot be bound"));
+            if (item is not Symbol checkSym)
+                throw new LispErrorException(new LispTypeError(
+                    $"PROGV: not a symbol: {item}", item, Startup.Sym("SYMBOL")));
+            if (checkSym.IsConstant || checkSym.HomePackage?.Name == "KEYWORD")
+                throw new LispErrorException(new LispProgramError(
+                    $"PROGV: {checkSym.Name} is a constant and cannot be bound"));
+            cur = c.Cdr;
+        }
     }
 
     public static LispObject ProgvBind(LispObject symsObj, LispObject valsObj)
     {
-        var syms = ProgvList(symsObj);
-        var vals = ProgvList(valsObj);
-        for (int i = 0; i < syms.Count; i++)
+        // Walk both lists in place: two Lists per call was the old cost.
+        CheckProgvProperList(symsObj);
+        CheckProgvProperList(valsObj);
+        // Check them all first, so that a bad symbol leaves nothing bound.
+        CheckProgvSymbols(symsObj);
+        var symCur = symsObj;
+        var valCur = valsObj;
+        while (symCur is Cons sc)
         {
-            if (syms[i] is not Symbol sym)
-                throw new LispErrorException(new LispTypeError(
-                    $"PROGV: not a symbol: {syms[i]}", syms[i], Startup.Sym("SYMBOL")));
-            var val = i < vals.Count ? vals[i] : Unbound;
-            Push(sym, val);
+            LispObject val;
+            if (valCur is Cons vc) { val = vc.Car; valCur = vc.Cdr; }
+            else val = Unbound;
+            Push((Symbol)sc.Car, val);
+            symCur = sc.Cdr;
         }
         return symsObj;
     }
@@ -774,11 +826,12 @@ public static class DynamicBindings
 
     public static LispObject ProgvUnbind(LispObject symsObj)
     {
-        var syms = Runtime.ToList(symsObj);
-        for (int i = syms.Count - 1; i >= 0; i--)
+        // Source order is safe: POP removes a symbol's innermost binding.
+        var cur = symsObj;
+        while (cur is Cons c)
         {
-            if (syms[i] is Symbol sym)
-                Pop(sym);
+            if (c.Car is Symbol sym) Pop(sym);
+            cur = c.Cdr;
         }
         return Nil.Instance;
     }

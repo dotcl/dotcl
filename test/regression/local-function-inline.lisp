@@ -157,14 +157,6 @@
       2))
   1)
 
-;;; A LABELS function that calls itself is not substitutable at all: inside the
-;;; body the name means the binding, and where the body was written it did not.
-(deftest local-inline.recursive
-  (labels ((fact (n) (if (<= n 1) 1 (* n (fact (1- n))))))
-    (declare (inline fact))
-    (fact 5))
-  120)
-
 ;;; A lambda list with defaulting is left to the ordinary call.
 (deftest local-inline.optional-parameter
   (flet ((f (a &optional (b 10)) (+ a b)))

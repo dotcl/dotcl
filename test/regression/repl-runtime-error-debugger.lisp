@@ -1,3 +1,4 @@
+;;; regression: full-tier-only
 ;;; An error the runtime signals itself -- CAR of a non-list, an undefined
 ;;; function, an index out of bounds, division by zero -- enters the debugger
 ;;; at the REPL when nothing handles it, the way an unhandled ERROR does.

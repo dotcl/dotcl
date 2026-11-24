@@ -38,7 +38,7 @@
            (aref (the (simple-array fixnum (*)) b) 0))))
 
 (defun %tacsl-load-fasl ()
-  (let* ((dir (regression-temp-dir))
+  (let* ((dir (regression-temp-dir/))
          (src (merge-pathnames "the-array-check-shared-locals.lisp" dir)))
     (with-open-file (s src :direction :output :if-exists :supersede)
       (with-standard-io-syntax

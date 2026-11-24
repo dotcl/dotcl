@@ -53,6 +53,8 @@
                     ;; every store into an element is a single-value position.
                     svref schar sbit bit row-major-aref elt
                     setq %absent-key %key-value
+                    ;; The walk of an opened MAPHASH.
+                    %hash-walk-begin %hash-walk-next %hash-walk-key %hash-walk-value
                     ;; The step of a counting DO / LOOP variable: a macro
                     ;; that expands to 1+, 1- or a two-argument +.
                     %induction-next)))
@@ -130,6 +132,40 @@
         (progn
          `(progn ,@(butlast (cdr form)) (setq ,var ,(car (last form)))))))))
 
+(defun %lexical-declared-type (var)
+  "The type a declaration around the current position gives the lexical variable VAR, or NIL: the
+   first TYPE declaration among the frames from the innermost out to the one that binds VAR."
+  (dolist (frame *lexical-decl-frames* nil)
+    (dolist (spec (%body-declaration-specs (cddr frame)))
+      (let ((e (%variable-decl-entry spec var)))
+        (when (and (consp e) (eq (car e) 'type))
+          (return-from %lexical-declared-type (cdr e)))))
+    (when (member var (%frame-variables frame))
+      (return nil))))
+
+(defun %safety3-setq-checked-value (var val-expr)
+  "VAL-EXPR, wrapped in (%CHECK-DECLARED-TYPE 'type VAL-EXPR) when the code is at SAFETY 3 and the
+   lexical variable VAR has a declared type: the store into a boxed slot (a variable a closure
+   captures, a LET* variable whose init the compiler could not prove) is otherwise unchecked,
+   where an Int64 or float slot is checked by its unbox. Else VAL-EXPR itself."
+  (if (and (boundp '*cstate*) (compiling-at-safety-3-p) (lookup-local var))
+      (let ((type (%lexical-declared-type var)))
+        (if (and type (not (eq type t)))
+            (list '%check-declared-type (list 'quote type) val-expr)
+            val-expr))
+      val-expr))
+
+(defun %safety3-range-setq-value (var val-expr)
+  "VAL-EXPR for a store into the Int64 slot of VAR: at SAFETY 3, wrapped in a check against the
+   declared type when that is narrower than a fixnum (BIT, (INTEGER 0 3), ...), since the slot
+   itself only holds a 64-bit integer and would take any value in that range. Else VAL-EXPR."
+  (if (and (boundp '*cstate*) (compiling-at-safety-3-p))
+      (let ((type (%lexical-declared-type var)))
+        (if (and type (not (member type '(t fixnum integer cl:fixnum cl:integer))))
+            (list '%check-declared-type (list 'quote type) val-expr)
+            val-expr))
+      val-expr))
+
 (defun compile-setq (var val-expr)
   "Compile (setq var value). Returns the assigned value on stack (single value)."
   ;; If var is a symbol-macro, delegate to SETF of the expansion (branch on found-p,
@@ -162,8 +198,9 @@
       (let ((step (and exit (%induction-overflow-step var key val-expr (cdr exit)))))
         (when step (return-from compile-setq step))))
     (when key
+      (setf val-expr (%safety3-range-setq-value var val-expr))
       (return-from compile-setq
-        `(,@(compile-expr-to-long val-expr)
+        `(,@(let ((*slot-init-checked* t)) (compile-expr-to-long val-expr))
           (:dup)
           (:stloc ,key)
           ,@(%frame-set-instrs key var :long)
@@ -220,12 +257,24 @@
           ,@(%frame-set-instrs key var :char)
           (:conv-i4)
           (:call "LispChar.Make")))))
+  ;; The cell of a captured, assigned FIXNUM variable holds a raw long: store it, then box once
+  ;; for the value of the form (the peephole drops the box in statement position). A value that
+  ;; is not a fixnum signals the declaration's TYPE-ERROR.
+  (let ((key (lookup-local var)))
+    (when (and key (%long-box-var-p var))
+      (let ((tmp (gen-local "LSETQ")))
+        (return-from compile-setq
+          `((:declare-local ,tmp "Int64")
+            ,@(let ((*slot-init-checked* t)) (compile-expr-to-long val-expr))
+            (:stloc ,tmp)
+            (:ldloc ,key) (:ldloc ,tmp) (:stfld "LongBox.Value")
+            (:ldloc ,tmp) (:call "Fixnum.Make"))))))
   ;; Variable assignment binds a single value. Force *in-mv-context* nil
   ;; and *in-tail-position* nil when compiling val-expr so MvReturn is
   ;; unwrapped before storage (mirrors compile-let).
   (let ((val-instrs (let ((*in-tail-position* nil)
                           (*in-mv-context* nil))
-                      (compile-expr val-expr))))
+                      (compile-expr (%safety3-setq-checked-value var val-expr)))))
     ;; Check lexical binding BEFORE special: mirrors compile-var-ref ordering
     (let ((key (lookup-local var)))
       (if key
@@ -321,15 +370,39 @@
 (defun %lambda-key-direct-specs (params body)
   "The typed entries of an anonymous &key lambda that captures nothing, as a
    DEFUN of the same lambda list gets them, or NIL."
-  (multiple-value-bind (required optional key rest-param aux allow-other-keys-p)
+  (multiple-value-bind (required optional key rest-param aux allow-other-keys-p has-key-p)
       (parse-lambda-list params)
-    (when (and (%key-direct-eligible-p required optional key rest-param aux)
+    ;; An anonymous lambda can be a method body, which dispatch calls with a
+    ;; calling convention of its own: no direct entry for a bare &KEY.
+    (declare (ignore has-key-p))
+    (when (and (%key-direct-eligible-p required optional key rest-param aux nil)
                (not (%declares-special-p body (mapcar #'second key))))
       (let ((checked (insert-simple-decl-checks
                       body (append required (mapcar #'second key)))))
         (%build-key-direct-specs required key checked "" nil nil allow-other-keys-p
                                  (every (lambda (k) (null (fifth k))) key)
                                  checked)))))
+
+(defun %lambda-positional-direct-specs (params body)
+  "Typed entries for an anonymous &optional lambda, or NIL."
+  (multiple-value-bind (required optional key rest-param aux allow-other-keys-p has-key-p)
+      (parse-lambda-list params)
+    (declare (ignore allow-other-keys-p))
+    (when (and (null key)
+               (%optional-direct-eligible-p required optional has-key-p rest-param aux)
+               (not (%declares-special-p body (mapcar #'car optional))))
+      (let ((checked (insert-simple-decl-checks
+                      body (append required (mapcar #'car optional)))))
+        (multiple-value-bind (shared arity0 backing)
+            (%build-positional-shared-specs required optional nil checked "" nil nil)
+          (or shared
+              (append (and backing (list backing))
+                      (%build-optional-direct-specs
+                       required optional checked "" nil nil arity0))))))))
+
+(defun %lambda-direct-specs (params body)
+  (or (%lambda-key-direct-specs params body)
+      (%lambda-positional-direct-specs params body)))
 
 (defun compile-lambda (params body &optional (fn-name "") (fn-label ""))
   "Compile (lambda (params) body...). FN-NAME enables self-TCO when non-empty.
@@ -370,7 +443,7 @@
                          params (%direct-body-with-aux params body) fn-name)))
               (let* ((label (if (string/= fn-label "") fn-label fn-name))
                      (direct-specs (and (string= label "")
-                                        (%lambda-key-direct-specs params body))))
+                                        (%lambda-direct-specs params body))))
                 `((:make-function
                    :param-count ,(length required)
                    :ll-shape ,(lambda-list-shape-tag params)
@@ -382,12 +455,15 @@
                    ;; the debug frame report, and the runtime-registration DEFUN
                    ;; paths carry the name there (FN-NAME stays "" so self-TCO,
                    ;; which only the direct path implements, is not enabled).
-                   :body ,(if (eq (car (first direct-specs)) :shared)
+                   :body ,(if (and direct-specs (eq (car (first direct-specs)) :shared))
                               (multiple-value-bind (required optional key rest-param aux
                                                     allow-other-keys-p)
                                   (parse-lambda-list params)
-                                (declare (ignore optional rest-param aux))
-                                (%compile-key-shared-xep required key allow-other-keys-p label))
+                                (declare (ignore aux))
+                                (if key
+                                    (%compile-key-shared-xep required key allow-other-keys-p label)
+                                    (%compile-positional-shared-xep
+                                     required optional rest-param label)))
                               (compile-function-body params body label))))))
           ;; Closure: build env array, then :make-closure
           (compile-closure params body free-vars fn-name)))))
@@ -537,12 +613,16 @@
                                      (if (boxed-var-p (car entry))
                                          ;; Data var: LispBox under debug (so the
                                          ;; body loads env[i] as LispBox), else
-                                         ;; LispObject[1]. Labels function cells
-                                         ;; stay LispObject[1] even under debug.
+                                         ;; LispObject[1]; a captured, assigned FIXNUM
+                                         ;; variable's cell is a LongBox. Labels function
+                                         ;; cells stay LispObject[1] even under debug.
                                          (list name i
-                                               (if (and *emit-source-lines*
-                                                        (not (labels-cell-var-p (car entry))))
-                                                   "lispbox" "boxed"))
+                                               (cond ((and (symbolp (cdr entry)) (get (cdr entry) 'long-box))
+                                                      "longbox")
+                                                     ((and *emit-source-lines*
+                                                           (not (labels-cell-var-p (car entry))))
+                                                      "lispbox")
+                                                     (t "boxed")))
                                          (list name i "value"))
                                      ;; Only check *local-functions* when not in *locals*
                                      (let ((lf (local-function-entry name)))
@@ -618,16 +698,20 @@
    ((:RANGE LO . HI)), a fixnum, a single-float, a double-float or an array of
    a known type ((:ARRAY . SPEC), see CSTATE-ARRAY-SPEC-LOCALS)."
   (loop for fv in free-vars
-        for ty = (and (symbolp fv) fv
-                      (not (member fv boxed-fvs :test #'eq))
-                      (lookup-local fv)
-                      (not (boxed-var-p fv))
-                      (let ((r (small-int-local-range fv)))
-                        (cond (r (cons :range r))
-                              ((fixnum-exact-p fv) '(:fixnum))
-                              ((single-float-typed-p fv) '(:single))
-                              ((double-float-typed-p fv) '(:double))
-                              ((array-spec-local fv) (cons :array (array-spec-local fv))))))
+        for ty = (if (and (symbolp fv) fv (member fv boxed-fvs :test #'eq) (%long-box-var-p fv))
+                     ;; The cell is a LongBox (see EMIT-LONG-BOX-CREATE): the body declares its
+                     ;; local of that type.
+                     '(:longbox)
+                     (and (symbolp fv) fv
+                          (not (member fv boxed-fvs :test #'eq))
+                          (lookup-local fv)
+                          (not (boxed-var-p fv))
+                          (let ((r (small-int-local-range fv)))
+                            (cond (r (cons :range r))
+                                  ((fixnum-exact-p fv) '(:fixnum))
+                                  ((single-float-typed-p fv) '(:single))
+                                  ((double-float-typed-p fv) '(:double))
+                                  ((array-spec-local fv) (cons :array (array-spec-local fv)))))))
         when ty collect (cons fv ty)))
 
 (defun capture-compile-env (boxed-fvs lispbox-fvs &optional free-vars)
@@ -657,7 +741,7 @@
         (when (and inner (eq (local-function-entry (seventh outer)) inner))
           (push (cons inner (nth 5 outer)) carried))))
     (dolist (c carried)
-      (destructuring-bind (name params decls body blockp snapshot count) (cdr c)
+      (destructuring-bind (name params decls body blockp snapshot count &optional rest-var) (cdr c)
         (let ((new-snapshot
                 (loop for (sym . outer-bs) in snapshot
                       for inner-bs = (%local-inline-bindings sym)
@@ -673,7 +757,7 @@
                       collect (cons sym inner-bs))))
           (unless (eq new-snapshot :refuse)
             (setf (nth 5 (car c))
-                  (list name params decls body blockp new-snapshot count))))))
+                  (list name params decls body blockp new-snapshot count rest-var))))))
     carried))
 
 (defun closure-self-tco-key (self-tco-name special-param-syms optional key rest-param)
@@ -864,7 +948,17 @@
                 (find-mutated-and-captured-vars body all-var-names)))
            (mutated (first mc))
            (captured-inner (second mc))
-           (needs-boxing (%strings-in-both mutated captured-inner))
+           ;; A captured free variable has a cell only when the enclosing scope made one: it came
+           ;; in by value otherwise, and a walk of this body that cannot see through a macro (it
+           ;; assumes everything in scope may be assigned) must not box it here, or the inner
+           ;; closures would be told to expect a cell the slot does not hold.
+           (needs-boxing
+             (remove-if (lambda (n)
+                          (let ((fv (find n free-vars :key #'var-name :test #'string=)))
+                            (and fv
+                                 (not (find n all-params :key #'var-name :test #'string=))
+                                 (not (member fv (compile-env-boxed-fvs outer-env) :test #'eq)))))
+                        (%strings-in-both mutated captured-inner)))
            ;; Env slot locals
            (env-instrs '())
            (env-locals '()))
@@ -879,6 +973,8 @@
                       ;; name fallback to reconnect them.)
                       (fv-sym fv)
                       (is-lispbox (member fv (compile-env-lispbox-fvs outer-env)))
+                      (is-longbox (let ((p (assoc fv (compile-env-fv-types outer-env) :test #'eq)))
+                                    (and p (eq (cadr p) :longbox))))
                       (is-outer-boxed (member fv (compile-env-boxed-fvs outer-env)))
                       ;; Name the captured slot in the closure body's Locals, but
                       ;; only for real user variables (not labels cells / block /
@@ -895,6 +991,14 @@
                  (setf env-instrs
                        (append env-instrs
                                (cond
+                                 ;; A captured, assigned FIXNUM variable: the cell is a LongBox, and
+                                 ;; the local is marked so references read the raw long.
+                                 (is-longbox
+                                  (setf (get key 'long-box) t)
+                                  `((:declare-local ,key "LongBox")
+                                    (:load-env ,i)
+                                    (:stloc ,key)
+                                    ,@box-marker))
                                  ;; Debug data-var box: LispBox cell from env.
                                  (is-lispbox
                                   `((:declare-local ,key "LispBox")
@@ -1094,6 +1198,7 @@
                         (not (member rest-param special-param-syms))
                         (not (member (var-name rest-param) needs-boxing :test #'string=))
                         (null (find-mutated-and-captured-vars body (list (var-name rest-param))))
+                        (%rest-var-only-applied-p body rest-param)
                         (list rest-param (cdr (assoc rest-param param-locals)) 1 key-start)))
                  (body-instrs (let ((*mv-mode-local* mv-key))
                                 (call-with-param-type-locals
@@ -1135,6 +1240,15 @@
   (when (null args)
     (return-from compile-funcall
       (compile-static-program-error "FUNCALL: too few arguments (expected function designator)")))
+  ;; (funcall (lambda (x) ...) a): the lambda is applied in place, without a closure.
+  (let ((lam (let ((f (car args)))
+               (cond ((and (consp f) (eq (car f) 'lambda)) f)
+                     ((and (consp f) (eq (car f) 'function) (consp (cdr f)) (null (cddr f))
+                           (consp (cadr f)) (eq (car (cadr f)) 'lambda))
+                      (cadr f))))))
+    (when (and lam (not (member 'funcall *notinline-functions* :test #'equal))
+               (%lambda-call-as-let lam (cdr args)))
+      (return-from compile-funcall (compile-expr (%lambda-call-as-let lam (cdr args))))))
   (let ((fn-expr (car args)))
     ;; (funcall #'(setf f) v args...) for a (SETF F) function proclaimed
     ;; INLINE: the form a SETF of (F args...) expands to when F has no setf

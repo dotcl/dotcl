@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; FILE-POSITION on a character file stream reports where the next character is.
 ;;;
 ;;; It used to answer the underlying StreamReader's BaseStream.Position, which is

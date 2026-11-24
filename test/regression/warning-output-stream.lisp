@@ -20,3 +20,18 @@
       (warn "wos-3")))
   "WARNING: wos-3
 ")
+
+;;; A STYLE-WARNING nobody handles is reported as one, so a log that looks for
+;;; "WARNING:" finds only the warnings that are not about style.
+(define-condition wos-style (style-warning) ()
+  (:report (lambda (c s) (declare (ignore c)) (write-string "wos-4" s))))
+
+(deftest warning-output-stream.style-warning-is-labelled
+  (with-output-to-string (*error-output*) (warn 'wos-style))
+  "STYLE-WARNING: wos-4
+")
+
+(deftest warning-output-stream.plain-warning-keeps-its-label
+  (with-output-to-string (*error-output*) (warn "wos-5"))
+  "WARNING: wos-5
+")

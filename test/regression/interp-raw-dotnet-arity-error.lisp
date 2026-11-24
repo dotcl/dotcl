@@ -1,3 +1,4 @@
+;;; regression: skip-under-interp
 ;;; Builtins that raised an argument-count error as a RAW .NET exception.
 ;;;
 ;;; (/) (write) (write-to-string) (parse-namestring) threw

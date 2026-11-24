@@ -29,8 +29,8 @@
 ;; load, so the fasl has to create it, and the created one must be a proper
 ;; keyword.
 (deftest-compiled-only keyword-literal-cache.fasl-creates-keyword
-  (let ((src "klc-src-tmp.lisp")
-        (fasl "klc-src-tmp.fasl"))
+  (let ((src (regression-temp-file "klc-src-tmp.lisp"))
+        (fasl (regression-temp-file "klc-src-tmp.fasl")))
     (unwind-protect
          (progn
            (with-open-file (s src :direction :output :if-exists :supersede)

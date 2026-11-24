@@ -41,8 +41,10 @@
 
 (deftest-compiled-only dsc-out16-no-box
   (list (%dsc-sil-count #'%dsc-out16 "Fixnum.Make")
+        ;; One more UnwrapMv than before (3, not 2): the DOTIMES block, now compiled for its
+        ;; primary value only, unwraps its result once outside the loop.
         (%dsc-sil-count #'%dsc-out16 "UnwrapMv"))
-  (0 2))
+  (0 3))
 
 (deftest dsc-out16-value
   (let ((buf (make-array 64 :element-type '(unsigned-byte 8)))
